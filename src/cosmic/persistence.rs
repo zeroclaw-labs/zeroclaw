@@ -339,9 +339,8 @@ mod tests {
     #[test]
     fn gather_snapshot_collects_modules() {
         use crate::cosmic::{
-            CausalGraph, ConsolidationEngine, CosmicMemoryGraph, DriftDetector,
-            EmotionalModulator, GlobalWorkspace, NormativeEngine, SelfModel, SensoryThalamus,
-            WorldModel,
+            CausalGraph, ConsolidationEngine, CosmicMemoryGraph, DriftDetector, EmotionalModulator,
+            GlobalWorkspace, NormativeEngine, SelfModel, SensoryThalamus, WorldModel,
         };
         let m = EmotionalModulator::new();
         let d = DriftDetector::new(50, 0.1);
@@ -354,7 +353,16 @@ mod tests {
         let causal = CausalGraph::new(100);
         let graph = CosmicMemoryGraph::new(100);
         let snap = super::gather_snapshot(
-            &m, &d, &t, &w, &sm, &wm, &consolidation, &normative, &causal, &graph,
+            &m,
+            &d,
+            &t,
+            &w,
+            &sm,
+            &wm,
+            &consolidation,
+            &normative,
+            &causal,
+            &graph,
         );
         assert!(snap.modules.contains_key("modulation"));
         assert!(snap.modules.contains_key("drift"));

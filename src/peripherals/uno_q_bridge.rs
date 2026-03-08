@@ -149,3 +149,42 @@ impl Tool for UnoQGpioWriteTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uno_q_gpio_read_tool_metadata() {
+        let tool = UnoQGpioReadTool;
+        assert_eq!(tool.name(), "gpio_read");
+        assert!(!tool.description().is_empty());
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"].get("pin").is_some());
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("pin")));
+    }
+
+    #[test]
+    fn uno_q_gpio_write_tool_metadata() {
+        let tool = UnoQGpioWriteTool;
+        assert_eq!(tool.name(), "gpio_write");
+        assert!(!tool.description().is_empty());
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"].get("pin").is_some());
+        assert!(schema["properties"].get("value").is_some());
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.contains(&json!("pin")));
+        assert!(required.contains(&json!("value")));
+    }
+
+    #[test]
+    fn bridge_constants() {
+        assert_eq!(BRIDGE_HOST, "127.0.0.1");
+        assert_eq!(BRIDGE_PORT, 9999);
+    }
+}

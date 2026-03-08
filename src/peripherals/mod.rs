@@ -299,3 +299,95 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
 pub async fn create_peripheral_tools(_config: &PeripheralsConfig) -> Result<Vec<Box<dyn Tool>>> {
     Ok(Vec::new())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{PeripheralBoardConfig, PeripheralsConfig};
+
+    #[test]
+    fn list_configured_boards_disabled_returns_empty() {
+        let config = PeripheralsConfig {
+            enabled: false,
+            boards: vec![PeripheralBoardConfig {
+                board: "nucleo-f401re".into(),
+                transport: "serial".into(),
+                path: Some("/dev/ttyACM0".into()),
+                baud: 115_200,
+            }],
+            datasheet_dir: None,
+        };
+        assert!(list_configured_boards(&config).is_empty());
+    }
+
+    #[test]
+    fn list_configured_boards_enabled_returns_all() {
+        let config = PeripheralsConfig {
+            enabled: true,
+            boards: vec![
+                PeripheralBoardConfig {
+                    board: "nucleo-f401re".into(),
+                    transport: "serial".into(),
+                    path: Some("/dev/ttyACM0".into()),
+                    baud: 115_200,
+                },
+                PeripheralBoardConfig {
+                    board: "esp32".into(),
+                    transport: "serial".into(),
+                    path: Some("/dev/ttyUSB0".into()),
+                    baud: 115_200,
+                },
+            ],
+            datasheet_dir: None,
+        };
+        let boards = list_configured_boards(&config);
+        assert_eq!(boards.len(), 2);
+        assert_eq!(boards[0].board, "nucleo-f401re");
+        assert_eq!(boards[1].board, "esp32");
+    }
+
+    #[test]
+    fn list_configured_boards_enabled_empty_returns_empty() {
+        let config = PeripheralsConfig {
+            enabled: true,
+            boards: vec![],
+            datasheet_dir: None,
+        };
+        assert!(list_configured_boards(&config).is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_peripheral_tools_disabled_returns_empty() {
+        let config = PeripheralsConfig {
+            enabled: false,
+            boards: vec![PeripheralBoardConfig {
+                board: "nucleo-f401re".into(),
+                transport: "serial".into(),
+                path: Some("/dev/ttyACM0".into()),
+                baud: 115_200,
+            }],
+            datasheet_dir: None,
+        };
+        let tools = create_peripheral_tools(&config).await.unwrap();
+        assert!(tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_peripheral_tools_empty_boards_returns_empty() {
+        let config = PeripheralsConfig {
+            enabled: true,
+            boards: vec![],
+            datasheet_dir: None,
+        };
+        let tools = create_peripheral_tools(&config).await.unwrap();
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn peripherals_config_default_is_disabled() {
+        let config = PeripheralsConfig::default();
+        assert!(!config.enabled);
+        assert!(config.boards.is_empty());
+        assert!(config.datasheet_dir.is_none());
+    }
+}

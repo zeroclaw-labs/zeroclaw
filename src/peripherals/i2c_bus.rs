@@ -293,8 +293,8 @@ impl Tool for I2cReadTool {
             .get("length")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| anyhow::anyhow!("Missing 'length' parameter"))?;
-        let length = usize::try_from(length_raw)
-            .map_err(|_| anyhow::anyhow!("length out of range"))?;
+        let length =
+            usize::try_from(length_raw).map_err(|_| anyhow::anyhow!("length out of range"))?;
 
         if !is_valid_i2c_address(address) {
             return Ok(ToolResult {
@@ -395,8 +395,8 @@ impl Tool for I2cWriteTool {
             .get("register")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| anyhow::anyhow!("Missing 'register' parameter"))?;
-        let _register = u8::try_from(_register_raw)
-            .map_err(|_| anyhow::anyhow!("register out of u8 range"))?;
+        let _register =
+            u8::try_from(_register_raw).map_err(|_| anyhow::anyhow!("register out of u8 range"))?;
         let data = args
             .get("data")
             .and_then(|v| v.as_array())

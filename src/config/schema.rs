@@ -168,6 +168,12 @@ pub struct Config {
     pub cosmic_brain: CosmicBrainConfig,
 
     #[serde(default)]
+    pub consciousness: ConsciousnessConfig,
+
+    #[serde(default)]
+    pub cognitive: CognitiveConfig,
+
+    #[serde(default)]
     pub life: LifeConfig,
 }
 
@@ -2905,6 +2911,48 @@ impl Default for CosmicBrainConfig {
     }
 }
 
+// ── Consciousness Config ────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConsciousnessConfig {
+    pub enabled: bool,
+    pub debate_rounds: usize,
+    pub approval_threshold: f64,
+    pub bus_capacity: usize,
+}
+
+impl Default for ConsciousnessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            debate_rounds: 3,
+            approval_threshold: 0.65,
+            bus_capacity: 256,
+        }
+    }
+}
+
+// ── Cognitive Config ─────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CognitiveConfig {
+    pub enabled: bool,
+    pub persistence_path: String,
+    pub save_interval: u64,
+}
+
+impl Default for CognitiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            persistence_path: "data/cognitive".to_string(),
+            save_interval: 10,
+        }
+    }
+}
+
 // ── Life Config ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2982,6 +3030,8 @@ impl Default for Config {
             skillforge: SkillForgeConfig::default(),
             security: SecurityConfig::default(),
             cosmic_brain: CosmicBrainConfig::default(),
+            consciousness: ConsciousnessConfig::default(),
+            cognitive: CognitiveConfig::default(),
             life: LifeConfig::default(),
             query_classification: QueryClassificationConfig::default(),
         }
@@ -3821,6 +3871,8 @@ default_temperature = 0.7
             hardware: HardwareConfig::default(),
             security: SecurityConfig::default(),
             cosmic_brain: CosmicBrainConfig::default(),
+            consciousness: ConsciousnessConfig::default(),
+            cognitive: CognitiveConfig::default(),
             life: LifeConfig::default(),
             skillforge: SkillForgeConfig::default(),
         };
@@ -3970,6 +4022,8 @@ tool_dispatcher = "xml"
             hardware: HardwareConfig::default(),
             security: SecurityConfig::default(),
             cosmic_brain: CosmicBrainConfig::default(),
+            consciousness: ConsciousnessConfig::default(),
+            cognitive: CognitiveConfig::default(),
             life: LifeConfig::default(),
             skillforge: SkillForgeConfig::default(),
         };

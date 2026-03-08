@@ -159,3 +159,42 @@ impl Tool for ArduinoUploadTool {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upload_tool_metadata() {
+        let tool = ArduinoUploadTool::new("/dev/cu.usbmodem14101".into());
+        assert_eq!(tool.name(), "arduino_upload");
+        assert!(!tool.description().is_empty());
+        assert_eq!(tool.port, "/dev/cu.usbmodem14101");
+    }
+
+    #[test]
+    fn upload_tool_schema_requires_code() {
+        let tool = ArduinoUploadTool::new("/dev/cu.usbmodem14101".into());
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"].get("code").is_some());
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.contains(&json!("code")));
+    }
+
+    #[tokio::test]
+    async fn upload_tool_rejects_empty_code() {
+        let tool = ArduinoUploadTool::new("/dev/cu.usbmodem14101".into());
+        let result = tool.execute(json!({ "code": "  " })).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn upload_tool_rejects_missing_code() {
+        let tool = ArduinoUploadTool::new("/dev/cu.usbmodem14101".into());
+        let result = tool.execute(json!({})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("code"));
+    }
+}

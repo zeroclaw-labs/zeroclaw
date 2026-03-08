@@ -48,6 +48,9 @@ mod rag {
 }
 mod config;
 mod control;
+mod consciousness {
+    pub use zeroclaw::consciousness::*;
+}
 mod continuity {
     pub use zeroclaw::continuity::*;
 }
@@ -59,6 +62,9 @@ mod cost {
 }
 mod skillforge {
     pub use zeroclaw::skillforge::*;
+}
+mod cognitive {
+    pub use zeroclaw::cognitive::*;
 }
 mod cron;
 mod daemon;
@@ -260,6 +266,26 @@ enum Commands {
 
     /// Run SkillForge: discover, evaluate, and integrate skills
     Forge,
+
+    /// Inspect consciousness subsystem
+    Consciousness {
+        #[command(subcommand)]
+        command: ConsciousnessCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConsciousnessCommands {
+    /// Show consciousness state (coherence, tick count, agent status)
+    Status,
+    /// Print current consciousness state (coherence, tick, phenomenal, flow, wisdom count)
+    ConsciousnessStatus,
+    /// Export full consciousness state to a JSON file
+    ConsciousnessExport {
+        /// Output file path
+        #[arg(long, default_value = "consciousness-export.json")]
+        output: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -779,6 +805,125 @@ async fn main() -> Result<()> {
             println!("  Skipped:         {}", report.skipped);
             Ok(())
         }
+
+        Commands::Consciousness { command } => match command {
+            ConsciousnessCommands::Status => {
+                println!("🧠 Consciousness Status");
+                println!();
+                println!("Config:");
+                println!("  Enabled:            {}", config.consciousness.enabled);
+                println!(
+                    "  Debate rounds:      {}",
+                    config.consciousness.debate_rounds
+                );
+                println!(
+                    "  Approval threshold: {:.2}",
+                    config.consciousness.approval_threshold
+                );
+                println!(
+                    "  Bus capacity:       {}",
+                    config.consciousness.bus_capacity
+                );
+
+                let persistence =
+                    cosmic::CosmicPersistence::new(&config.cosmic_brain.persistence_dir);
+                match persistence.load_module("consciousness") {
+                    Ok(data) => {
+                        let coherence = data
+                            .get("coherence")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(1.0);
+                        let tick_count =
+                            data.get("tick_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                        println!();
+                        println!("Persisted state:");
+                        println!("  Coherence:          {coherence:.4}");
+                        println!("  Tick count:         {tick_count}");
+                    }
+                    Err(cosmic::PersistenceError::NotFound(_)) => {
+                        println!();
+                        println!("Persisted state:    (none — no prior run)");
+                    }
+                    Err(e) => {
+                        println!();
+                        println!("Persisted state:    error loading: {e}");
+                    }
+                }
+
+                Ok(())
+            }
+            ConsciousnessCommands::ConsciousnessStatus => {
+                let persistence =
+                    cosmic::CosmicPersistence::new(&config.cosmic_brain.persistence_dir);
+                match persistence.load_module("consciousness") {
+                    Ok(data) => {
+                        let coherence = data
+                            .get("coherence")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(1.0);
+                        let tick_count =
+                            data.get("tick_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let phenomenal = data.get("phenomenal");
+                        let flow_state = data.get("flow_state");
+                        let wisdom_count = data
+                            .get("wisdom")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0);
+
+                        println!("Consciousness Status");
+                        println!();
+                        println!("  Coherence:     {coherence:.4}");
+                        println!("  Tick count:    {tick_count}");
+                        if let Some(p) = phenomenal {
+                            let att = p.get("attention").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            let aro = p.get("arousal").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            let val = p.get("valence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            println!("  Attention:     {att:.4}");
+                            println!("  Arousal:       {aro:.4}");
+                            println!("  Valence:       {val:.4}");
+                        }
+                        if let Some(fs) = flow_state {
+                            let in_flow =
+                                fs.get("in_flow").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let duration = fs
+                                .get("flow_duration")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            println!("  In flow:       {in_flow}");
+                            println!("  Flow duration: {duration}");
+                        }
+                        println!("  Wisdom count:  {wisdom_count}");
+                    }
+                    Err(cosmic::PersistenceError::NotFound(_)) => {
+                        println!("No persisted consciousness state found.");
+                    }
+                    Err(e) => {
+                        println!("Error loading consciousness state: {e}");
+                    }
+                }
+                Ok(())
+            }
+            ConsciousnessCommands::ConsciousnessExport { output } => {
+                let persistence =
+                    cosmic::CosmicPersistence::new(&config.cosmic_brain.persistence_dir);
+                match persistence.load_module("consciousness") {
+                    Ok(data) => {
+                        let json = serde_json::to_string_pretty(&data)
+                            .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
+                        std::fs::write(&output, json)?;
+                        println!("Consciousness state exported to {output}");
+                    }
+                    Err(cosmic::PersistenceError::NotFound(_)) => {
+                        println!("No persisted consciousness state to export.");
+                    }
+                    Err(e) => {
+                        println!("Error loading consciousness state: {e}");
+                    }
+                }
+                Ok(())
+            }
+        },
     }
 }
 
@@ -788,6 +933,7 @@ struct PendingOpenAiLogin {
     code_verifier: String,
     state: String,
     created_at: String,
+    redirect_uri: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -799,6 +945,12 @@ struct PendingOpenAiLoginFile {
     encrypted_code_verifier: Option<String>,
     state: String,
     created_at: String,
+    #[serde(default = "default_redirect_uri")]
+    redirect_uri: String,
+}
+
+fn default_redirect_uri() -> String {
+    auth::openai_oauth::OPENAI_OAUTH_REDIRECT_URI.to_string()
 }
 
 fn pending_openai_login_path(config: &Config) -> std::path::PathBuf {
@@ -837,6 +989,7 @@ fn save_pending_openai_login(config: &Config, pending: &PendingOpenAiLogin) -> R
         encrypted_code_verifier: Some(encrypted_code_verifier),
         state: pending.state.clone(),
         created_at: pending.created_at.clone(),
+        redirect_uri: pending.redirect_uri.clone(),
     };
     let tmp = path.with_extension(format!(
         "tmp.{}.{}",
@@ -874,6 +1027,7 @@ fn load_pending_openai_login(config: &Config) -> Result<Option<PendingOpenAiLogi
         code_verifier,
         state: persisted.state,
         created_at: persisted.created_at,
+        redirect_uri: persisted.redirect_uri,
     }))
 }
 
@@ -981,26 +1135,46 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             }
 
             let pkce = auth::openai_oauth::generate_pkce_state();
+
+            let (loopback_tx, loopback_rx) = tokio::sync::oneshot::channel::<u16>();
+
+            let state_clone = pkce.state.clone();
+            let loopback_handle = tokio::spawn(async move {
+                match auth::openai_oauth::receive_loopback_code(
+                    &state_clone,
+                    std::time::Duration::from_secs(180),
+                )
+                .await
+                {
+                    Ok((code, port)) => {
+                        let _ = loopback_tx.send(port);
+                        Ok(code)
+                    }
+                    Err(e) => {
+                        let _ = loopback_tx.send(0);
+                        Err(e)
+                    }
+                }
+            });
+
+            let port = loopback_rx.await.unwrap_or(1455);
+            let redirect_uri = auth::openai_oauth::loopback_redirect_uri(port);
+
             let pending = PendingOpenAiLogin {
                 profile: profile.clone(),
                 code_verifier: pkce.code_verifier.clone(),
                 state: pkce.state.clone(),
                 created_at: chrono::Utc::now().to_rfc3339(),
+                redirect_uri: redirect_uri.clone(),
             };
             save_pending_openai_login(config, &pending)?;
-
-            let authorize_url = auth::openai_oauth::build_authorize_url(&pkce);
+            let authorize_url = auth::openai_oauth::build_authorize_url(&pkce, &redirect_uri);
             println!("Open this URL in your browser and authorize access:");
             println!("{authorize_url}");
             println!();
-            println!("Waiting for callback at http://localhost:1455/auth/callback ...");
+            println!("Waiting for callback at {redirect_uri} ...");
 
-            let code = match auth::openai_oauth::receive_loopback_code(
-                &pkce.state,
-                std::time::Duration::from_secs(180),
-            )
-            .await
-            {
+            let code = match loopback_handle.await? {
                 Ok(code) => code,
                 Err(e) => {
                     println!("Callback capture failed: {e}");
@@ -1012,7 +1186,8 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             };
 
             let token_set =
-                auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
+                auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce, &redirect_uri)
+                    .await?;
             let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
 
             let saved = auth_service.store_openai_tokens(&profile, token_set, account_id, true)?;
@@ -1064,8 +1239,13 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             };
 
             let client = reqwest::Client::new();
-            let token_set =
-                auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
+            let token_set = auth::openai_oauth::exchange_code_for_tokens(
+                &client,
+                &code,
+                &pkce,
+                &pending.redirect_uri,
+            )
+            .await?;
             let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
 
             let saved = auth_service.store_openai_tokens(&profile, token_set, account_id, true)?;

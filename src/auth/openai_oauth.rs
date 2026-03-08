@@ -82,11 +82,11 @@ pub fn generate_pkce_state() -> PkceState {
     }
 }
 
-pub fn build_authorize_url(pkce: &PkceState) -> String {
+pub fn build_authorize_url(pkce: &PkceState, redirect_uri: &str) -> String {
     let mut params = BTreeMap::new();
     params.insert("response_type", "code");
     params.insert("client_id", OPENAI_OAUTH_CLIENT_ID);
-    params.insert("redirect_uri", OPENAI_OAUTH_REDIRECT_URI);
+    params.insert("redirect_uri", redirect_uri);
     params.insert("scope", "openid profile email offline_access");
     params.insert("code_challenge", pkce.code_challenge.as_str());
     params.insert("code_challenge_method", "S256");
@@ -106,12 +106,13 @@ pub async fn exchange_code_for_tokens(
     client: &Client,
     code: &str,
     pkce: &PkceState,
+    redirect_uri: &str,
 ) -> Result<TokenSet> {
     let form = [
         ("grant_type", "authorization_code"),
         ("code", code),
         ("client_id", OPENAI_OAUTH_CLIENT_ID),
-        ("redirect_uri", OPENAI_OAUTH_REDIRECT_URI),
+        ("redirect_uri", redirect_uri),
         ("code_verifier", pkce.code_verifier.as_str()),
     ];
 
@@ -239,10 +240,17 @@ pub async fn poll_device_code_tokens(
     }
 }
 
-pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> Result<String> {
-    let listener = TcpListener::bind("127.0.0.1:1455")
+pub async fn receive_loopback_code(
+    expected_state: &str,
+    timeout: Duration,
+) -> Result<(String, u16)> {
+    let listener = TcpListener::bind("127.0.0.1:0")
         .await
-        .context("Failed to bind callback listener at 127.0.0.1:1455")?;
+        .context("Failed to bind callback listener on loopback")?;
+    let port = listener
+        .local_addr()
+        .context("Failed to get listener address")?
+        .port();
 
     let accepted = tokio::time::timeout(timeout, listener.accept())
         .await
@@ -278,7 +286,11 @@ pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> R
     );
     let _ = stream.write_all(response.as_bytes()).await;
 
-    Ok(code)
+    Ok((code, port))
+}
+
+pub fn loopback_redirect_uri(port: u16) -> String {
+    format!("http://localhost:{port}/auth/callback")
 }
 
 pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Result<String> {
@@ -506,5 +518,70 @@ mod tests {
 
         let account = extract_account_id_from_jwt(&token);
         assert_eq!(account.as_deref(), Some("acct_123"));
+    }
+
+    #[test]
+    fn extract_account_id_from_jwt_missing_payload() {
+        assert!(extract_account_id_from_jwt("only-one-part").is_none());
+    }
+
+    #[test]
+    fn extract_account_id_from_jwt_empty_claim_skipped() {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{}");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"account_id":"  ","sub":"zeroclaw_user"}"#);
+        let token = format!("{header}.{payload}.sig");
+
+        let account = extract_account_id_from_jwt(&token);
+        assert_eq!(account.as_deref(), Some("zeroclaw_user"));
+    }
+
+    #[test]
+    fn url_encode_decode_roundtrip() {
+        let input = "hello world&foo=bar/baz";
+        let encoded = url_encode(input);
+        let decoded = url_decode(&encoded);
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn url_decode_plus_as_space() {
+        assert_eq!(url_decode("hello+world"), "hello world");
+    }
+
+    #[test]
+    fn build_authorize_url_contains_required_params() {
+        let pkce = PkceState {
+            code_verifier: "verifier".into(),
+            code_challenge: "challenge".into(),
+            state: "state_abc".into(),
+        };
+        let url = build_authorize_url(&pkce, "http://localhost:9999/cb");
+        assert!(url.starts_with(OPENAI_OAUTH_AUTHORIZE_URL));
+        assert!(url.contains("code_challenge=challenge"));
+        assert!(url.contains("state=state_abc"));
+        assert!(url.contains("response_type=code"));
+        assert!(url.contains("code_challenge_method=S256"));
+    }
+
+    #[test]
+    fn parse_code_from_redirect_empty_input_rejected() {
+        let err = parse_code_from_redirect("", None).unwrap_err();
+        assert!(err.to_string().contains("No OAuth code"));
+    }
+
+    #[test]
+    fn parse_query_params_handles_empty_value() {
+        let params = parse_query_params("key=&other=val");
+        assert_eq!(params.get("key").map(String::as_str), Some(""));
+        assert_eq!(params.get("other").map(String::as_str), Some("val"));
+    }
+
+    #[test]
+    fn loopback_redirect_uri_format() {
+        assert_eq!(
+            loopback_redirect_uri(8080),
+            "http://localhost:8080/auth/callback"
+        );
     }
 }

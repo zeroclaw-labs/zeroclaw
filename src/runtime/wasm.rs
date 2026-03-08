@@ -687,4 +687,84 @@ mod tests {
             assert!(result.unwrap_err().to_string().contains("not available"));
         }
     }
+
+    #[test]
+    fn wasm_construction() {
+        let cfg = default_config();
+        let rt = WasmRuntime::new(cfg.clone());
+        assert_eq!(rt.name(), "wasm");
+
+        let rt_with_ws = WasmRuntime::with_workspace(cfg, PathBuf::from("/home/user/project"));
+        assert_eq!(rt_with_ws.name(), "wasm");
+    }
+
+    #[test]
+    fn wasm_capabilities_builder() {
+        let caps = WasmCapabilities {
+            read_workspace: true,
+            write_workspace: false,
+            allowed_hosts: vec!["api.example.com".into(), "cdn.example.com".into()],
+            fuel_override: 5000,
+            memory_override_mb: 256,
+        };
+        assert!(caps.read_workspace);
+        assert!(!caps.write_workspace);
+        assert_eq!(caps.allowed_hosts.len(), 2);
+        assert_eq!(caps.fuel_override, 5000);
+        assert_eq!(caps.memory_override_mb, 256);
+    }
+
+    #[test]
+    fn wasm_filesystem_access_readonly() {
+        let mut cfg = default_config();
+        cfg.allow_workspace_read = true;
+        cfg.allow_workspace_write = false;
+        let rt = WasmRuntime::new(cfg);
+        assert!(rt.has_filesystem_access());
+    }
+
+    #[test]
+    fn wasm_filesystem_access_writeonly() {
+        let mut cfg = default_config();
+        cfg.allow_workspace_read = false;
+        cfg.allow_workspace_write = true;
+        let rt = WasmRuntime::new(cfg);
+        assert!(rt.has_filesystem_access());
+    }
+
+    #[test]
+    fn wasm_error_message_on_shell_access_attempt() {
+        let rt = WasmRuntime::new(default_config());
+        let result = rt.build_shell_command("exit 0", Path::new("/tmp"));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("does not support shell"));
+        assert!(err_msg.contains("execute_module"));
+    }
+
+    #[test]
+    fn wasm_validate_memory_overflow_edge_case() {
+        let mut cfg = default_config();
+        cfg.memory_limit_mb = u64::MAX;
+        let rt = WasmRuntime::new(cfg);
+        let result = rt.validate_config();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn wasm_config_clone_preserves_state() {
+        let mut cfg = default_config();
+        cfg.memory_limit_mb = 256;
+        cfg.fuel_limit = 2_000_000;
+        cfg.allow_workspace_read = true;
+
+        let rt1 = WasmRuntime::new(cfg.clone());
+        let rt2 = WasmRuntime::new(cfg);
+
+        assert_eq!(rt1.memory_budget(), rt2.memory_budget());
+        assert_eq!(
+            rt1.effective_fuel(&WasmCapabilities::default()),
+            rt2.effective_fuel(&WasmCapabilities::default())
+        );
+    }
 }

@@ -19,6 +19,7 @@ pub mod image_info;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod multi_delegate;
 pub mod proxy_config;
 pub mod pushover;
 pub mod schedule;
@@ -66,6 +67,7 @@ pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use multi_delegate::MultiDelegateTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
@@ -327,6 +329,11 @@ pub fn all_tools_with_runtime(
             (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
         });
         tools.push(Box::new(DelegateTool::new(
+            delegate_agents.clone(),
+            delegate_fallback_credential.clone(),
+            security.clone(),
+        )));
+        tools.push(Box::new(MultiDelegateTool::new(
             delegate_agents,
             delegate_fallback_credential,
             security.clone(),

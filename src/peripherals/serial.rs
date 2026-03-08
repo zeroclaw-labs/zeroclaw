@@ -64,6 +64,7 @@ async fn send_request(port: &mut SerialStream, cmd: &str, args: Value) -> anyhow
 }
 
 /// Shared serial transport for tools. Pub(crate) for capabilities tool.
+#[derive(Debug)]
 pub(crate) struct SerialTransport {
     port: Mutex<SerialStream>,
 }
@@ -104,6 +105,7 @@ impl SerialTransport {
 }
 
 /// Serial peripheral for STM32, Arduino, etc. over USB CDC.
+#[derive(Debug)]
 pub struct SerialPeripheral {
     name: String,
     board_type: String,
@@ -227,6 +229,13 @@ impl Tool for GpioReadTool {
     }
 }
 
+fn validate_baud_rate(baud: u32) -> bool {
+    const STANDARD_BAUDS: &[u32] = &[
+        300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115_200, 230_400, 460_800, 921_600,
+    ];
+    STANDARD_BAUDS.contains(&baud)
+}
+
 /// Tool: write GPIO pin value.
 struct GpioWriteTool {
     transport: Arc<SerialTransport>,
@@ -271,5 +280,95 @@ impl Tool for GpioWriteTool {
         self.transport
             .request("gpio_write", json!({ "pin": pin, "value": value }))
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serial_path_allowed_valid_linux() {
+        assert!(is_path_allowed("/dev/ttyACM0"));
+        assert!(is_path_allowed("/dev/ttyACM1"));
+        assert!(is_path_allowed("/dev/ttyUSB0"));
+        assert!(is_path_allowed("/dev/ttyUSB1"));
+    }
+
+    #[test]
+    fn serial_path_allowed_valid_macos() {
+        assert!(is_path_allowed("/dev/tty.usbmodem14101"));
+        assert!(is_path_allowed("/dev/cu.usbmodem33000283452"));
+        assert!(is_path_allowed("/dev/tty.usbserial-1410"));
+        assert!(is_path_allowed("/dev/cu.usbserial-1410"));
+    }
+
+    #[test]
+    fn serial_path_allowed_valid_windows() {
+        assert!(is_path_allowed("COM3"));
+        assert!(is_path_allowed("COM10"));
+    }
+
+    #[test]
+    fn serial_path_rejects_arbitrary_paths() {
+        assert!(!is_path_allowed("/dev/sda1"));
+        assert!(!is_path_allowed("/etc/passwd"));
+        assert!(!is_path_allowed("/tmp/exploit"));
+        assert!(!is_path_allowed(""));
+        assert!(!is_path_allowed("/dev/null"));
+    }
+
+    #[test]
+    fn baud_rate_validation() {
+        assert!(validate_baud_rate(9600));
+        assert!(validate_baud_rate(115_200));
+        assert!(validate_baud_rate(57600));
+        assert!(!validate_baud_rate(0));
+        assert!(!validate_baud_rate(12345));
+        assert!(!validate_baud_rate(1_000_000));
+    }
+
+    #[test]
+    fn serial_name_format() {
+        let name = format!("{}-{}", "nucleo-f401re", "/dev/ttyACM0".replace('/', "_"));
+        assert_eq!(name, "nucleo-f401re-_dev_ttyACM0");
+    }
+
+    #[tokio::test]
+    async fn serial_connect_rejects_no_path() {
+        let config = PeripheralBoardConfig {
+            board: "nucleo-f401re".into(),
+            transport: "serial".into(),
+            path: None,
+            baud: 115_200,
+        };
+        let result = SerialPeripheral::connect(&config).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("requires path"));
+    }
+
+    #[tokio::test]
+    async fn serial_connect_rejects_disallowed_path() {
+        let config = PeripheralBoardConfig {
+            board: "nucleo-f401re".into(),
+            transport: "serial".into(),
+            path: Some("/etc/passwd".into()),
+            baud: 115_200,
+        };
+        let result = SerialPeripheral::connect(&config).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not allowed"));
+    }
+
+    #[test]
+    fn allowed_path_prefixes_coverage() {
+        for prefix in ALLOWED_PATH_PREFIXES {
+            let test_path = format!("{}999", prefix);
+            assert!(
+                is_path_allowed(&test_path),
+                "Expected {} to be allowed",
+                test_path
+            );
+        }
     }
 }

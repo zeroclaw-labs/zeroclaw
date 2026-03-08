@@ -7,6 +7,9 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+#[allow(clippy::unused_async)]
+mod dashboard;
+
 use crate::channels::{Channel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -28,11 +31,23 @@ use axum::{
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
+
+static CONSCIOUSNESS_SNAPSHOT: OnceLock<Arc<Mutex<Option<ConsciousnessSnapshot>>>> =
+    OnceLock::new();
+
+fn consciousness_snapshot_arc() -> Arc<Mutex<Option<ConsciousnessSnapshot>>> {
+    Arc::clone(CONSCIOUSNESS_SNAPSHOT.get_or_init(|| Arc::new(Mutex::new(None))))
+}
+
+pub fn update_consciousness_snapshot(snap: ConsciousnessSnapshot) {
+    let arc = consciousness_snapshot_arc();
+    *arc.lock() = Some(snap);
+}
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -256,6 +271,37 @@ fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConsciousnessSnapshot {
+    pub enabled: bool,
+    pub coherence: f64,
+    pub tick_count: u64,
+    pub last_tick_proposals: usize,
+    pub last_tick_approved: usize,
+    pub last_tick_vetoed: usize,
+    pub last_tick_contradictions: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phenomenal: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow_state: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wisdom_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub somatic_marker_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collective_field: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metacognition_observation_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metacognition_adjustment_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collective_peer_states: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metacognition_observations: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metacognition_adjustments: Option<serde_json::Value>,
+}
+
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -278,6 +324,7 @@ pub struct AppState {
     pub observer: Arc<dyn crate::observability::Observer>,
     pub control_store: Option<Arc<crate::control::ControlStore>>,
     pub control_events_tx: Option<tokio::sync::broadcast::Sender<String>>,
+    pub consciousness_snapshot: Arc<Mutex<Option<ConsciousnessSnapshot>>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -444,6 +491,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     }
     println!("  GET  /health    — health check");
     println!("  GET  /metrics   — Prometheus metrics");
+    println!("  GET  /api/consciousness — consciousness status");
     if let Some(code) = pairing.pairing_code() {
         println!();
         println!("  🔐 PAIRING REQUIRED — use this one-time code:");
@@ -464,6 +512,19 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let observer: Arc<dyn crate::observability::Observer> =
         Arc::from(crate::observability::create_observer(&config.observability));
 
+    let control_store = match crate::control::ControlStore::open(&config.workspace_dir) {
+        Ok(store) => {
+            tracing::info!("Control store initialized");
+            Some(Arc::new(store))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to initialize control store; control API disabled");
+            None
+        }
+    };
+    let (control_events_tx, _rx) = tokio::sync::broadcast::channel(64);
+    let control_events_tx = control_store.as_ref().map(|_| control_events_tx);
+
     let state = AppState {
         config: config_state,
         provider,
@@ -479,8 +540,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
         observer,
-        control_store: None,
-        control_events_tx: None,
+        control_store,
+        control_events_tx,
+        consciousness_snapshot: consciousness_snapshot_arc(),
     };
 
     // Build router with middleware
@@ -491,6 +553,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
+        .route("/api/consciousness", get(handle_consciousness_status))
+        .route("/api/consciousness/state", get(handle_consciousness_state))
+        .route(
+            "/api/consciousness/collective",
+            get(handle_consciousness_collective),
+        )
+        .route(
+            "/api/consciousness/metacognition",
+            get(handle_consciousness_metacognition),
+        )
         .route(
             "/api/control/metrics",
             get(crate::control::handlers::handle_control_metrics),
@@ -515,6 +587,87 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 // ══════════════════════════════════════════════════════════════════════════════
 // AXUM HANDLERS
 // ══════════════════════════════════════════════════════════════════════════════
+
+/// GET /api/consciousness — consciousness subsystem status
+async fn handle_consciousness_status(State(state): State<AppState>) -> impl IntoResponse {
+    let guard = state.consciousness_snapshot.lock();
+    match guard.as_ref() {
+        Some(snap) => (StatusCode::OK, Json(serde_json::to_value(snap).unwrap())).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "consciousness subsystem not active"})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/consciousness/state — detailed consciousness state
+async fn handle_consciousness_state(State(state): State<AppState>) -> impl IntoResponse {
+    let guard = state.consciousness_snapshot.lock();
+    match guard.as_ref() {
+        Some(snap) => {
+            let body = serde_json::json!({
+                "coherence": snap.coherence,
+                "tick_count": snap.tick_count,
+                "phenomenal": snap.phenomenal,
+                "flow_state": snap.flow_state,
+                "wisdom_count": snap.wisdom_count,
+                "somatic_marker_count": snap.somatic_marker_count,
+                "collective_field": snap.collective_field,
+                "metacognition": {
+                    "observation_count": snap.metacognition_observation_count,
+                    "adjustment_count": snap.metacognition_adjustment_count,
+                },
+            });
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "consciousness subsystem not active"})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/consciousness/collective — collective consciousness field and peer states
+async fn handle_consciousness_collective(State(state): State<AppState>) -> impl IntoResponse {
+    let guard = state.consciousness_snapshot.lock();
+    match guard.as_ref() {
+        Some(snap) => {
+            let body = serde_json::json!({
+                "field": snap.collective_field,
+                "peers": snap.collective_peer_states,
+            });
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "consciousness subsystem not active"})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/consciousness/metacognition — recent metacognitive observations and adjustments
+async fn handle_consciousness_metacognition(State(state): State<AppState>) -> impl IntoResponse {
+    let guard = state.consciousness_snapshot.lock();
+    match guard.as_ref() {
+        Some(snap) => {
+            let body = serde_json::json!({
+                "observations": snap.metacognition_observations,
+                "adjustments": snap.metacognition_adjustments,
+                "observation_count": snap.metacognition_observation_count,
+                "adjustment_count": snap.metacognition_adjustment_count,
+            });
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "consciousness subsystem not active"})),
+        )
+            .into_response(),
+    }
+}
 
 /// GET /health — always public (no secrets leaked)
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
@@ -1073,6 +1226,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             control_store: None,
             control_events_tx: None,
+            consciousness_snapshot: Arc::new(Mutex::new(None)),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1116,6 +1270,7 @@ mod tests {
             observer,
             control_store: None,
             control_events_tx: None,
+            consciousness_snapshot: Arc::new(Mutex::new(None)),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1469,6 +1624,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             control_store: None,
             control_events_tx: None,
+            consciousness_snapshot: Arc::new(Mutex::new(None)),
         };
 
         let mut headers = HeaderMap::new();
@@ -1527,6 +1683,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             control_store: None,
             control_events_tx: None,
+            consciousness_snapshot: Arc::new(Mutex::new(None)),
         };
 
         let headers = HeaderMap::new();
@@ -1594,6 +1751,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             control_store: None,
             control_events_tx: None,
+            consciousness_snapshot: Arc::new(Mutex::new(None)),
         };
 
         let response = handle_webhook(
@@ -1634,6 +1792,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             control_store: None,
             control_events_tx: None,
+            consciousness_snapshot: Arc::new(Mutex::new(None)),
         };
 
         let mut headers = HeaderMap::new();
@@ -1677,6 +1836,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             control_store: None,
             control_events_tx: None,
+            consciousness_snapshot: Arc::new(Mutex::new(None)),
         };
 
         let mut headers = HeaderMap::new();

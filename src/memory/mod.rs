@@ -8,6 +8,7 @@ pub mod none;
 pub mod postgres;
 pub mod rerank;
 pub mod response_cache;
+pub mod search;
 pub mod snapshot;
 pub mod sqlite;
 pub mod traits;
@@ -23,6 +24,8 @@ pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
 pub use postgres::PostgresMemory;
 pub use response_cache::ResponseCache;
+#[allow(unused_imports)]
+pub use search::{MatchType, SearchFilter, SearchResult, SearchableMemory};
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]

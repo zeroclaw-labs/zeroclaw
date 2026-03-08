@@ -681,4 +681,68 @@ mod tests {
         let contents = fs::read_to_string(path).unwrap();
         assert!(contents.contains("\"schema_version\": 1"));
     }
+
+    #[test]
+    fn profile_id_trims_whitespace() {
+        assert_eq!(profile_id("  openai  ", "  default  "), "openai:default");
+    }
+
+    #[test]
+    fn parse_profile_kind_rejects_unknown() {
+        let err = parse_profile_kind("bearer").unwrap_err();
+        assert!(err.to_string().contains("Unsupported"));
+    }
+
+    #[test]
+    fn profile_kind_roundtrip() {
+        assert_eq!(
+            parse_profile_kind(profile_kind_to_string(AuthProfileKind::OAuth)).unwrap(),
+            AuthProfileKind::OAuth
+        );
+        assert_eq!(
+            parse_profile_kind(profile_kind_to_string(AuthProfileKind::Token)).unwrap(),
+            AuthProfileKind::Token
+        );
+    }
+
+    #[test]
+    fn token_set_no_expiry_not_expiring() {
+        let token_set = TokenSet {
+            access_token: "token".into(),
+            refresh_token: None,
+            id_token: None,
+            expires_at: None,
+            token_type: None,
+            scope: None,
+        };
+        assert!(!token_set.is_expiring_within(Duration::from_secs(9999)));
+    }
+
+    #[test]
+    fn new_token_profile_sets_correct_fields() {
+        let profile = AuthProfile::new_token("anthropic", "work", "sk-test".into());
+        assert_eq!(profile.id, "anthropic:work");
+        assert_eq!(profile.kind, AuthProfileKind::Token);
+        assert_eq!(profile.token.as_deref(), Some("sk-test"));
+        assert!(profile.token_set.is_none());
+        assert!(profile.metadata.is_empty());
+    }
+
+    #[test]
+    fn new_oauth_profile_sets_correct_fields() {
+        let ts = TokenSet {
+            access_token: "access".into(),
+            refresh_token: Some("refresh".into()),
+            id_token: None,
+            expires_at: None,
+            token_type: None,
+            scope: None,
+        };
+        let profile = AuthProfile::new_oauth("openai-codex", "default", ts);
+        assert_eq!(profile.id, "openai-codex:default");
+        assert_eq!(profile.kind, AuthProfileKind::OAuth);
+        assert!(profile.token.is_none());
+        assert!(profile.token_set.is_some());
+        assert_eq!(profile.token_set.as_ref().unwrap().access_token, "access");
+    }
 }

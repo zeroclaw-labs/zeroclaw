@@ -34,11 +34,10 @@ impl Tunnel for CloudflareTunnel {
                 "tunnel",
                 "--no-autoupdate",
                 "run",
-                "--token",
-                &self.token,
                 "--url",
                 &format!("http://localhost:{local_port}"),
             ])
+            .env("TUNNEL_TOKEN", &self.token)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)

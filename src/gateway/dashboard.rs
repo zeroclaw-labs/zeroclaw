@@ -414,19 +414,9 @@ pub async fn handle_api_config(State(state): State<AppState>) -> impl IntoRespon
             if let Some(ch_obj) = channels.as_object_mut() {
                 for (_name, ch_config) in ch_obj.iter_mut() {
                     if let Some(ch) = ch_config.as_object_mut() {
-                        ch.remove("bot_token");
-                        ch.remove("app_token");
-                        ch.remove("app_secret");
-                        ch.remove("api_key");
-                        ch.remove("access_token");
-                        ch.remove("client_secret");
-                        ch.remove("server_password");
-                        ch.remove("nickserv_password");
-                        ch.remove("sasl_password");
-                        ch.remove("password");
-                        ch.remove("verify_token");
-                        ch.remove("encrypt_key");
-                        ch.remove("verification_token");
+                        for field in SECRET_FIELDS {
+                            ch.remove(*field);
+                        }
                     }
                 }
             }
@@ -499,30 +489,7 @@ pub async fn handle_admin_provider(
     }
     let mut config = state.config.lock();
     if let Some(provider) = body.get("provider").and_then(|v| v.as_str()) {
-        let valid = [
-            "openai",
-            "anthropic",
-            "google",
-            "ollama",
-            "groq",
-            "mistral",
-            "cohere",
-            "deepseek",
-            "xai",
-            "openrouter",
-            "fireworks",
-            "together",
-            "perplexity",
-            "aws_bedrock",
-            "azure",
-            "cloudflare_ai",
-            "cerebras",
-            "sambanova",
-            "hyperbolic",
-            "lmstudio",
-            "custom",
-        ];
-        if !valid.contains(&provider) {
+        if !VALID_PROVIDERS.contains(&provider) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": format!("Unknown provider: {provider}")})),
@@ -801,8 +768,7 @@ pub async fn handle_admin_memory(
     }
     let mut config = state.config.lock();
     if let Some(backend) = body.get("backend").and_then(|v| v.as_str()) {
-        let valid = ["sqlite", "lucid", "postgres", "markdown", "none"];
-        if !valid.contains(&backend) {
+        if !VALID_MEMORY_BACKENDS.contains(&backend) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": format!("Unknown memory backend: {backend}")})),
@@ -835,8 +801,7 @@ pub async fn handle_admin_observer(
     }
     let mut config = state.config.lock();
     if let Some(backend) = body.get("backend").and_then(|v| v.as_str()) {
-        let valid = ["none", "log", "prometheus", "otel"];
-        if !valid.contains(&backend) {
+        if !VALID_OBSERVER_BACKENDS.contains(&backend) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": format!("Unknown observer backend: {backend}")})),
@@ -869,8 +834,7 @@ pub async fn handle_admin_runtime(
     }
     let mut config = state.config.lock();
     if let Some(kind) = body.get("kind").and_then(|v| v.as_str()) {
-        let valid = ["native", "docker", "wasm"];
-        if !valid.contains(&kind) {
+        if !VALID_RUNTIME_KINDS.contains(&kind) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": format!("Unknown runtime kind: {kind}")})),
@@ -943,8 +907,7 @@ pub async fn handle_admin_tunnel(
     }
     let mut config = state.config.lock();
     if let Some(provider) = body.get("provider").and_then(|v| v.as_str()) {
-        let valid = ["none", "cloudflare", "tailscale", "ngrok", "custom"];
-        if !valid.contains(&provider) {
+        if !VALID_TUNNEL_PROVIDERS.contains(&provider) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": format!("Unknown tunnel provider: {provider}")})),
@@ -2303,3 +2266,229 @@ if (oldNav) {
 </script>
 </body>
 </html>"##;
+
+const VALID_PROVIDERS: &[&str] = &[
+    "openai",
+    "anthropic",
+    "google",
+    "ollama",
+    "groq",
+    "mistral",
+    "cohere",
+    "deepseek",
+    "xai",
+    "openrouter",
+    "fireworks",
+    "together",
+    "perplexity",
+    "aws_bedrock",
+    "azure",
+    "cloudflare_ai",
+    "cerebras",
+    "sambanova",
+    "hyperbolic",
+    "lmstudio",
+    "custom",
+];
+
+const VALID_MEMORY_BACKENDS: &[&str] = &["sqlite", "lucid", "postgres", "markdown", "none"];
+
+const VALID_OBSERVER_BACKENDS: &[&str] = &["none", "log", "prometheus", "otel"];
+
+const VALID_RUNTIME_KINDS: &[&str] = &["native", "docker", "wasm"];
+
+const VALID_TUNNEL_PROVIDERS: &[&str] = &["none", "cloudflare", "tailscale", "ngrok", "custom"];
+
+const SECRET_FIELDS: &[&str] = &[
+    "bot_token",
+    "app_token",
+    "app_secret",
+    "api_key",
+    "access_token",
+    "client_secret",
+    "server_password",
+    "nickserv_password",
+    "sasl_password",
+    "password",
+    "verify_token",
+    "encrypt_key",
+    "verification_token",
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dashboard_html_is_valid_document() {
+        assert!(DASHBOARD_HTML.starts_with("<!DOCTYPE html>"));
+        assert!(DASHBOARD_HTML.ends_with("</html>"));
+        assert!(DASHBOARD_HTML.contains("<head>"));
+        assert!(DASHBOARD_HTML.contains("</head>"));
+        assert!(DASHBOARD_HTML.contains("<body"));
+        assert!(DASHBOARD_HTML.contains("</body>"));
+    }
+
+    #[test]
+    fn dashboard_html_contains_zeroclaw_branding() {
+        assert!(DASHBOARD_HTML.contains("ZeroClaw"));
+        assert!(DASHBOARD_HTML.contains("Admin Dashboard"));
+    }
+
+    #[test]
+    fn dashboard_html_references_all_api_endpoints() {
+        let expected_endpoints = [
+            "/api/system",
+            "/api/channels",
+            "/api/status",
+            "/api/config",
+            "/api/memories",
+            "/api/metrics",
+            "/api/admin/",
+            "/api/control/",
+        ];
+        for ep in &expected_endpoints {
+            assert!(
+                DASHBOARD_HTML.contains(ep),
+                "Dashboard HTML missing endpoint reference: {ep}"
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_html_has_all_nav_sections() {
+        let nav_sections = [
+            "overview",
+            "providers",
+            "channels",
+            "tools",
+            "memory",
+            "observers",
+            "runtimes",
+            "security",
+            "tunnels",
+            "memories",
+            "config",
+            "metrics",
+            "bots",
+            "commands",
+            "approvals",
+            "audit",
+            "events",
+        ];
+        for section in &nav_sections {
+            let section_id = format!("section-{section}");
+            assert!(
+                DASHBOARD_HTML.contains(&section_id),
+                "Dashboard HTML missing section: {section_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_providers_contains_major_providers() {
+        let required = ["openai", "anthropic", "ollama", "openrouter", "deepseek"];
+        for p in &required {
+            assert!(
+                VALID_PROVIDERS.contains(p),
+                "Missing required provider: {p}"
+            );
+        }
+        assert_eq!(VALID_PROVIDERS.len(), 21);
+    }
+
+    #[test]
+    fn valid_memory_backends_are_complete() {
+        assert!(VALID_MEMORY_BACKENDS.contains(&"sqlite"));
+        assert!(VALID_MEMORY_BACKENDS.contains(&"none"));
+        assert_eq!(VALID_MEMORY_BACKENDS.len(), 5);
+    }
+
+    #[test]
+    fn valid_observer_backends_are_complete() {
+        assert!(VALID_OBSERVER_BACKENDS.contains(&"none"));
+        assert!(VALID_OBSERVER_BACKENDS.contains(&"prometheus"));
+        assert_eq!(VALID_OBSERVER_BACKENDS.len(), 4);
+    }
+
+    #[test]
+    fn valid_runtime_kinds_are_complete() {
+        assert!(VALID_RUNTIME_KINDS.contains(&"native"));
+        assert_eq!(VALID_RUNTIME_KINDS.len(), 3);
+    }
+
+    #[test]
+    fn valid_tunnel_providers_are_complete() {
+        assert!(VALID_TUNNEL_PROVIDERS.contains(&"none"));
+        assert!(VALID_TUNNEL_PROVIDERS.contains(&"cloudflare"));
+        assert_eq!(VALID_TUNNEL_PROVIDERS.len(), 5);
+    }
+
+    #[test]
+    fn secret_fields_covers_sensitive_keys() {
+        let critical = [
+            "bot_token",
+            "access_token",
+            "api_key",
+            "password",
+            "client_secret",
+        ];
+        for field in &critical {
+            assert!(
+                SECRET_FIELDS.contains(field),
+                "Missing secret field: {field}"
+            );
+        }
+        assert!(SECRET_FIELDS.len() >= 10);
+    }
+
+    #[test]
+    fn no_duplicate_entries_in_validation_lists() {
+        fn has_duplicates<'a>(items: &'a [&'a str]) -> Option<&'a str> {
+            let mut seen = std::collections::HashSet::new();
+            items.iter().find(|&item| !seen.insert(item)).copied()
+        }
+
+        assert_eq!(
+            has_duplicates(VALID_PROVIDERS),
+            None,
+            "Duplicate in VALID_PROVIDERS"
+        );
+        assert_eq!(
+            has_duplicates(VALID_MEMORY_BACKENDS),
+            None,
+            "Duplicate in VALID_MEMORY_BACKENDS"
+        );
+        assert_eq!(
+            has_duplicates(VALID_OBSERVER_BACKENDS),
+            None,
+            "Duplicate in VALID_OBSERVER_BACKENDS"
+        );
+        assert_eq!(
+            has_duplicates(VALID_RUNTIME_KINDS),
+            None,
+            "Duplicate in VALID_RUNTIME_KINDS"
+        );
+        assert_eq!(
+            has_duplicates(VALID_TUNNEL_PROVIDERS),
+            None,
+            "Duplicate in VALID_TUNNEL_PROVIDERS"
+        );
+        assert_eq!(
+            has_duplicates(SECRET_FIELDS),
+            None,
+            "Duplicate in SECRET_FIELDS"
+        );
+    }
+
+    #[test]
+    fn dashboard_html_does_not_contain_inline_secrets() {
+        let forbidden = ["sk-", "xoxb-", "ghp_", "AKIA", "password123"];
+        for pattern in &forbidden {
+            assert!(
+                !DASHBOARD_HTML.contains(pattern),
+                "Dashboard HTML contains potential secret pattern: {pattern}"
+            );
+        }
+    }
+}

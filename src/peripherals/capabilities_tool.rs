@@ -97,3 +97,37 @@ impl Tool for HardwareCapabilitiesTool {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capabilities_tool_metadata() {
+        let tool = HardwareCapabilitiesTool::new(vec![]);
+        assert_eq!(tool.name(), "hardware_capabilities");
+        assert!(!tool.description().is_empty());
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"].get("board").is_some());
+    }
+
+    #[tokio::test]
+    async fn capabilities_tool_no_boards_returns_not_supported() {
+        let tool = HardwareCapabilitiesTool::new(vec![]);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("No serial boards configured"));
+    }
+
+    #[tokio::test]
+    async fn capabilities_tool_no_boards_with_filter() {
+        let tool = HardwareCapabilitiesTool::new(vec![]);
+        let result = tool
+            .execute(json!({ "board": "nonexistent" }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("No matching board"));
+    }
+}

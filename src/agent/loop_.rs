@@ -1,5 +1,8 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
+use crate::cognitive::CognitiveProcessor;
 use crate::config::Config;
+use crate::consciousness::{CollectiveConsciousness, ConsciousnessOrchestrator};
+use crate::continuity::ContinuityGuard;
 use crate::cosmic::{
     AgentPool, BeliefSource, CausalGraph, ConsolidationEngine, Constitution, CosmicGate,
     CosmicMemoryGraph, CosmicPersistence, CounterfactualEngine, DriftDetector, EmotionalModulator,
@@ -26,6 +29,9 @@ struct CosmicBrain {
     agent_pool: Arc<Mutex<AgentPool>>,
     thalamus: Arc<Mutex<SensoryThalamus>>,
     workspace: Arc<Mutex<GlobalWorkspace>>,
+    continuity_guard: Arc<Mutex<ContinuityGuard>>,
+    consciousness: Option<ConsciousnessOrchestrator>,
+    collective: Option<CollectiveConsciousness>,
 }
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
@@ -72,7 +78,7 @@ static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// Scrub credentials from tool output to prevent accidental exfiltration.
 /// Replaces known credential patterns with a redacted placeholder while preserving
 /// a small prefix for context.
-fn scrub_credentials(input: &str) -> String {
+pub(crate) fn scrub_credentials(input: &str) -> String {
     SENSITIVE_KV_REGEX
         .replace_all(input, |caps: &regex::Captures| {
             let full_match = &caps[0];
@@ -1417,7 +1423,7 @@ pub async fn run(
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
-    let cosmic_brain: Option<CosmicBrain> = if config.cosmic_brain.enabled {
+    let mut cosmic_brain: Option<CosmicBrain> = if config.cosmic_brain.enabled {
         let graph = Arc::new(Mutex::new(CosmicMemoryGraph::new(
             config.cosmic_brain.graph_max_nodes,
         )));
@@ -1548,11 +1554,80 @@ pub async fn run(
             ws.register_subsystem(SubsystemId::Constitution, 1.0);
         }
 
+        let continuity_guard = Arc::new(Mutex::new(ContinuityGuard::new(
+            crate::continuity::DriftLimits::default(),
+        )));
+
         tracing::info!(
             graph_capacity = config.cosmic_brain.graph_max_nodes,
             fe_capacity = config.cosmic_brain.free_energy_capacity,
             "Cosmic brain initialized (17 modules)"
         );
+        let consciousness = if config.consciousness.enabled {
+            use crate::consciousness::agents::build_all_agents;
+            use crate::consciousness::ConsciousnessConfig as CConfig;
+
+            let agents = build_all_agents(
+                Arc::clone(&workspace),
+                Arc::clone(&agent_pool),
+                Arc::clone(&continuity_guard),
+                Arc::clone(&graph),
+                Arc::clone(&consolidation),
+                Arc::clone(&world_model),
+                Arc::clone(&counterfactual),
+                Arc::clone(&policy),
+                Arc::clone(&free_energy),
+                Arc::clone(&causal),
+                Arc::clone(&modulator),
+                Arc::clone(&normative),
+                Arc::clone(&constitution),
+                Arc::clone(&self_model),
+                Arc::clone(&drift),
+                Arc::clone(&integration),
+            );
+
+            let cc = CConfig {
+                debate_rounds: config.consciousness.debate_rounds,
+                approval_threshold: config.consciousness.approval_threshold,
+                bus_capacity: config.consciousness.bus_capacity,
+                ..CConfig::default()
+            };
+
+            let mut orch = ConsciousnessOrchestrator::new(cc);
+            for agent in agents {
+                orch.register_agent(agent);
+            }
+            {
+                let p = persistence.lock();
+                match orch.load_consciousness(&p) {
+                    Ok(()) => {
+                        tracing::info!(
+                            coherence = orch.state().coherence,
+                            tick_count = orch.state().tick_count,
+                            "Restored consciousness state from persisted data"
+                        );
+                    }
+                    Err(crate::cosmic::PersistenceError::NotFound(_)) => {
+                        tracing::info!("No persisted consciousness state — starting fresh");
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to load consciousness state: {e} — starting fresh");
+                    }
+                }
+            }
+            tracing::info!("Consciousness orchestrator initialized (7 agents)");
+            Some(orch)
+        } else {
+            None
+        };
+
+        let collective = if config.consciousness.enabled {
+            let node_id = format!("zeroclaw_{}", Uuid::new_v4());
+            Some(CollectiveConsciousness::new(node_id))
+        } else {
+            None
+        };
+
         Some(CosmicBrain {
             graph,
             free_energy,
@@ -1571,7 +1646,19 @@ pub async fn run(
             agent_pool,
             thalamus,
             workspace,
+            continuity_guard,
+            consciousness,
+            collective,
         })
+    } else {
+        None
+    };
+
+    let mut cognitive = if config.cognitive.enabled {
+        Some(CognitiveProcessor::new(
+            &config.cognitive.persistence_path,
+            config.cognitive.save_interval,
+        ))
     } else {
         None
     };
@@ -1584,10 +1671,14 @@ pub async fn run(
         )
     });
 
-    let cosmic_ws = cosmic_brain.as_ref().map(|b| &*b.workspace);
-    let cosmic_fe = cosmic_brain.as_ref().map(|b| &*b.free_energy);
-    let cosmic_wm = cosmic_brain.as_ref().map(|b| &*b.world_model);
-    let cosmic_thal = cosmic_brain.as_ref().map(|b| &*b.thalamus);
+    let cosmic_ws_arc = cosmic_brain.as_ref().map(|b| Arc::clone(&b.workspace));
+    let cosmic_fe_arc = cosmic_brain.as_ref().map(|b| Arc::clone(&b.free_energy));
+    let cosmic_wm_arc = cosmic_brain.as_ref().map(|b| Arc::clone(&b.world_model));
+    let cosmic_thal_arc = cosmic_brain.as_ref().map(|b| Arc::clone(&b.thalamus));
+    let cosmic_ws = cosmic_ws_arc.as_deref();
+    let cosmic_fe = cosmic_fe_arc.as_deref();
+    let cosmic_wm = cosmic_wm_arc.as_deref();
+    let cosmic_thal = cosmic_thal_arc.as_deref();
     let mut bias_temperature_adj: f64 = 0.0;
 
     // ── Cost tracking (budget enforcement) ──────────────────────────
@@ -1922,7 +2013,70 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
-        let effective_temp = (temperature + bias_temperature_adj).clamp(0.0, 1.5);
+        let _cognitive_ctx = cognitive.as_mut().map(|cp| cp.pre_message());
+
+        if let Some(ref mut brain) = cosmic_brain {
+            if let Some(ref mut orch) = brain.consciousness {
+                let tick_result = orch.tick();
+                tracing::debug!(
+                    proposals = tick_result.proposals_generated,
+                    approved = tick_result.proposals_approved,
+                    vetoed = tick_result.proposals_vetoed,
+                    contradictions = tick_result.contradictions.len(),
+                    outcomes = tick_result.outcomes.len(),
+                    coherence = %format!("{:.3}", tick_result.coherence),
+                    "Consciousness tick"
+                );
+
+                let mut collective_field = None;
+                let mut collective_peer_states = None;
+
+                if let Some(ref mut collective) = brain.collective {
+                    let local_snapshot = collective.broadcast_local_state(
+                        &orch.state().phenomenal,
+                        orch.state().coherence,
+                        orch.state().tick_count,
+                    );
+                    collective_field = serde_json::to_value(collective.field()).ok();
+                    let mut peers: Vec<crate::consciousness::collective::PeerState> =
+                        collective.active_peers().into_iter().cloned().collect();
+                    peers.push(local_snapshot);
+                    collective_peer_states = serde_json::to_value(&peers).ok();
+
+                    let mut phenomenal = orch.state().phenomenal;
+                    collective.influence_local_state(&mut phenomenal, 0.1);
+                }
+
+                let meta = orch.metacognition();
+                crate::gateway::update_consciousness_snapshot(
+                    crate::gateway::ConsciousnessSnapshot {
+                        enabled: true,
+                        coherence: tick_result.coherence,
+                        tick_count: orch.state().tick_count,
+                        last_tick_proposals: tick_result.proposals_generated,
+                        last_tick_approved: tick_result.proposals_approved,
+                        last_tick_vetoed: tick_result.proposals_vetoed,
+                        last_tick_contradictions: tick_result.contradictions.len(),
+                        phenomenal: serde_json::to_value(tick_result.phenomenal).ok(),
+                        flow_state: serde_json::to_value(&tick_result.flow_state).ok(),
+                        wisdom_count: Some(tick_result.wisdom_count),
+                        somatic_marker_count: Some(tick_result.somatic_marker_count),
+                        collective_field,
+                        metacognition_observation_count: Some(meta.observations().len()),
+                        metacognition_adjustment_count: Some(meta.adjustments().len()),
+                        collective_peer_states,
+                        metacognition_observations: serde_json::to_value(meta.observations()).ok(),
+                        metacognition_adjustments: serde_json::to_value(meta.adjustments()).ok(),
+                    },
+                );
+            }
+        }
+
+        let effective_temp = if let Some(ref cp) = cognitive {
+            cp.modulated_temperature(temperature + bias_temperature_adj)
+        } else {
+            (temperature + bias_temperature_adj).clamp(0.0, 1.5)
+        };
         let response = run_tool_call_loop(LoopContext {
             provider: provider.as_ref(),
             history: &mut history,
@@ -1948,6 +2102,16 @@ pub async fn run(
         })
         .await?;
         final_output = response.clone();
+        if let Some(ref mut cp) = cognitive {
+            let episode = cp.post_message(&msg, &response);
+            tracing::debug!(
+                message_type = ?episode.message_type,
+                surprise = episode.surprise,
+                significance = episode.significance,
+                topic = ?episode.topic,
+                "Cognitive episode recorded"
+            );
+        }
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
 
@@ -2268,7 +2432,13 @@ pub async fn run(
 
             history.push(ChatMessage::user(&enriched));
 
-            let effective_temp = (temperature + bias_temperature_adj).clamp(0.0, 1.5);
+            let _cognitive_ctx = cognitive.as_mut().map(|cp| cp.pre_message());
+
+            let effective_temp = if let Some(ref cp) = cognitive {
+                cp.modulated_temperature(temperature + bias_temperature_adj)
+            } else {
+                (temperature + bias_temperature_adj).clamp(0.0, 1.5)
+            };
             let response = match run_tool_call_loop(LoopContext {
                 provider: provider.as_ref(),
                 history: &mut history,
@@ -2301,6 +2471,16 @@ pub async fn run(
                 }
             };
             final_output = response.clone();
+            if let Some(ref mut cp) = cognitive {
+                let episode = cp.post_message(&user_input, &response);
+                tracing::debug!(
+                    message_type = ?episode.message_type,
+                    surprise = episode.surprise,
+                    significance = episode.significance,
+                    topic = ?episode.topic,
+                    "Cognitive episode recorded"
+                );
+            }
             if let Err(e) = crate::channels::Channel::send(
                 &cli,
                 &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
@@ -2354,6 +2534,28 @@ pub async fn run(
         tokens_used,
         cost_usd: session_cost_usd,
     });
+
+    if let Some(ref cp) = cognitive {
+        cp.force_save();
+    }
+
+    if let Some(ref brain) = cosmic_brain {
+        if let Some(ref orch) = brain.consciousness {
+            let p = brain.persistence.lock();
+            match orch.save_consciousness(&p) {
+                Ok(()) => {
+                    tracing::info!(
+                        coherence = orch.state().coherence,
+                        tick_count = orch.state().tick_count,
+                        "Saved consciousness state"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to save consciousness state: {e}");
+                }
+            }
+        }
+    }
 
     Ok(final_output)
 }

@@ -143,3 +143,63 @@ pub fn resolve_port(config: &crate::config::Config, path_override: Option<&str>)
         .find(|b| b.board == "arduino-uno" && b.transport == "serial")
         .and_then(|b| b.path.clone())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{PeripheralBoardConfig, PeripheralsConfig};
+
+    #[test]
+    fn resolve_port_override_wins() {
+        let config = crate::config::Config::default();
+        let result = resolve_port(&config, Some("/dev/cu.usbmodem14101"));
+        assert_eq!(result, Some("/dev/cu.usbmodem14101".into()));
+    }
+
+    #[test]
+    fn resolve_port_from_config() {
+        let mut config = crate::config::Config::default();
+        config.peripherals = PeripheralsConfig {
+            enabled: true,
+            boards: vec![PeripheralBoardConfig {
+                board: "arduino-uno".into(),
+                transport: "serial".into(),
+                path: Some("/dev/ttyACM0".into()),
+                baud: 115_200,
+            }],
+            datasheet_dir: None,
+        };
+        let result = resolve_port(&config, None);
+        assert_eq!(result, Some("/dev/ttyACM0".into()));
+    }
+
+    #[test]
+    fn resolve_port_no_match_returns_none() {
+        let mut config = crate::config::Config::default();
+        config.peripherals = PeripheralsConfig {
+            enabled: true,
+            boards: vec![PeripheralBoardConfig {
+                board: "esp32".into(),
+                transport: "serial".into(),
+                path: Some("/dev/ttyUSB0".into()),
+                baud: 115_200,
+            }],
+            datasheet_dir: None,
+        };
+        let result = resolve_port(&config, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_port_empty_config_returns_none() {
+        let config = crate::config::Config::default();
+        let result = resolve_port(&config, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn flash_constants() {
+        assert_eq!(FQBN, "arduino:avr:uno");
+        assert_eq!(SKETCH_NAME, "zeroclaw-arduino");
+    }
+}

@@ -89,4 +89,33 @@ mod tests {
         let debug = format!("{command:?}");
         assert!(debug.contains("echo hello"));
     }
+
+    #[test]
+    fn native_shell_command_uses_sh() {
+        let cwd = std::env::temp_dir();
+        let cmd = NativeRuntime::new()
+            .build_shell_command("exit 0", &cwd)
+            .unwrap();
+        let debug = format!("{cmd:?}");
+        assert!(debug.contains("sh") || debug.contains("sh"));
+    }
+
+    #[test]
+    fn native_storage_path_is_absolute() {
+        let path = NativeRuntime::new().storage_path();
+        assert!(
+            path.is_absolute(),
+            "storage_path must be absolute for reproducible behavior"
+        );
+    }
+
+    #[test]
+    fn native_default_instance() {
+        let rt = NativeRuntime::new();
+        assert_eq!(rt.name(), "native");
+        assert!(rt.has_shell_access());
+        assert!(rt.has_filesystem_access());
+        assert!(rt.supports_long_running());
+        assert_eq!(rt.memory_budget(), 0);
+    }
 }

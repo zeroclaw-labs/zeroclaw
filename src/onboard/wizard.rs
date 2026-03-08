@@ -147,6 +147,8 @@ pub fn run_wizard() -> Result<Config> {
         skillforge: crate::skillforge::SkillForgeConfig::default(),
         security: crate::config::SecurityConfig::default(),
         cosmic_brain: crate::config::CosmicBrainConfig::default(),
+        consciousness: crate::config::ConsciousnessConfig::default(),
+        cognitive: crate::config::CognitiveConfig::default(),
         life: crate::config::LifeConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
     };
@@ -382,6 +384,8 @@ pub fn run_quick_setup(
         skillforge: crate::skillforge::SkillForgeConfig::default(),
         security: crate::config::SecurityConfig::default(),
         cosmic_brain: crate::config::CosmicBrainConfig::default(),
+        consciousness: crate::config::ConsciousnessConfig::default(),
+        cognitive: crate::config::CognitiveConfig::default(),
         life: crate::config::LifeConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
     };

@@ -99,7 +99,6 @@ struct ModelCacheEntry {
     models: Vec<String>,
 }
 
-#[derive(Clone)]
 struct ChannelRuntimeContext {
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
     provider: Arc<dyn Provider>,
@@ -121,6 +120,11 @@ struct ChannelRuntimeContext {
     reliability: Arc<crate::config::ReliabilityConfig>,
     provider_runtime_options: providers::ProviderRuntimeOptions,
     workspace_dir: Arc<PathBuf>,
+    cosmic_gate: Option<crate::cosmic::CosmicGate>,
+    cosmic_workspace: Option<parking_lot::Mutex<crate::cosmic::GlobalWorkspace>>,
+    cosmic_free_energy: Option<parking_lot::Mutex<crate::cosmic::FreeEnergyState>>,
+    cosmic_world_model: Option<parking_lot::Mutex<crate::cosmic::WorldModel>>,
+    cosmic_thalamus: Option<parking_lot::Mutex<crate::cosmic::SensoryThalamus>>,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
@@ -718,11 +722,11 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             model_strategy: None,
             cost_tracker: None,
             model_prices: None,
-            cosmic_gate: None,
-            cosmic_workspace: None,
-            cosmic_free_energy: None,
-            cosmic_world_model: None,
-            cosmic_thalamus: None,
+            cosmic_gate: ctx.cosmic_gate.as_ref(),
+            cosmic_workspace: ctx.cosmic_workspace.as_ref(),
+            cosmic_free_energy: ctx.cosmic_free_energy.as_ref(),
+            cosmic_world_model: ctx.cosmic_world_model.as_ref(),
+            cosmic_thalamus: ctx.cosmic_thalamus.as_ref(),
         }),
     )
     .await;
@@ -1498,6 +1502,127 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     Ok(())
 }
 
+pub fn create_channels(config: &Config) -> Result<Vec<Arc<dyn Channel>>> {
+    let mut channels: Vec<Arc<dyn Channel>> = Vec::new();
+
+    if let Some(ref tg) = config.channels_config.telegram {
+        channels.push(Arc::new(
+            TelegramChannel::new(
+                tg.bot_token.clone(),
+                tg.allowed_users.clone(),
+                tg.mention_only,
+            )
+            .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+            .with_voice(tg.voice.clone()),
+        ));
+    }
+
+    if let Some(ref dc) = config.channels_config.discord {
+        channels.push(Arc::new(DiscordChannel::new(
+            dc.bot_token.clone(),
+            dc.guild_id.clone(),
+            dc.allowed_users.clone(),
+            dc.listen_to_bots,
+            dc.mention_only,
+        )));
+    }
+
+    if let Some(ref sl) = config.channels_config.slack {
+        channels.push(Arc::new(SlackChannel::new(
+            sl.bot_token.clone(),
+            sl.channel_id.clone(),
+            sl.allowed_users.clone(),
+        )));
+    }
+
+    if let Some(ref mm) = config.channels_config.mattermost {
+        channels.push(Arc::new(MattermostChannel::new(
+            mm.url.clone(),
+            mm.bot_token.clone(),
+            mm.channel_id.clone(),
+            mm.allowed_users.clone(),
+            mm.thread_replies.unwrap_or(true),
+            mm.mention_only.unwrap_or(false),
+        )));
+    }
+
+    if let Some(ref im) = config.channels_config.imessage {
+        channels.push(Arc::new(IMessageChannel::new(im.allowed_contacts.clone())));
+    }
+
+    if let Some(ref mx) = config.channels_config.matrix {
+        channels.push(Arc::new(MatrixChannel::new_with_session_hint(
+            mx.homeserver.clone(),
+            mx.access_token.clone(),
+            mx.room_id.clone(),
+            mx.allowed_users.clone(),
+            mx.user_id.clone(),
+            mx.device_id.clone(),
+        )));
+    }
+
+    if let Some(ref sig) = config.channels_config.signal {
+        channels.push(Arc::new(SignalChannel::new(
+            sig.http_url.clone(),
+            sig.account.clone(),
+            sig.group_id.clone(),
+            sig.allowed_from.clone(),
+            sig.ignore_attachments,
+            sig.ignore_stories,
+        )));
+    }
+
+    if let Some(ref wa) = config.channels_config.whatsapp {
+        channels.push(Arc::new(WhatsAppChannel::new(
+            wa.access_token.clone(),
+            wa.phone_number_id.clone(),
+            wa.verify_token.clone(),
+            wa.allowed_numbers.clone(),
+        )));
+    }
+
+    if let Some(ref email_cfg) = config.channels_config.email {
+        channels.push(Arc::new(EmailChannel::new(email_cfg.clone())));
+    }
+
+    if let Some(ref irc) = config.channels_config.irc {
+        channels.push(Arc::new(IrcChannel::new(irc::IrcChannelConfig {
+            server: irc.server.clone(),
+            port: irc.port,
+            nickname: irc.nickname.clone(),
+            username: irc.username.clone(),
+            channels: irc.channels.clone(),
+            allowed_users: irc.allowed_users.clone(),
+            server_password: irc.server_password.clone(),
+            nickserv_password: irc.nickserv_password.clone(),
+            sasl_password: irc.sasl_password.clone(),
+            verify_tls: irc.verify_tls.unwrap_or(true),
+        })));
+    }
+
+    if let Some(ref lk) = config.channels_config.lark {
+        channels.push(Arc::new(LarkChannel::from_config(lk)));
+    }
+
+    if let Some(ref dt) = config.channels_config.dingtalk {
+        channels.push(Arc::new(DingTalkChannel::new(
+            dt.client_id.clone(),
+            dt.client_secret.clone(),
+            dt.allowed_users.clone(),
+        )));
+    }
+
+    if let Some(ref qq) = config.channels_config.qq {
+        channels.push(Arc::new(QQChannel::new(
+            qq.app_id.clone(),
+            qq.app_secret.clone(),
+            qq.allowed_users.clone(),
+        )));
+    }
+
+    Ok(channels)
+}
+
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
@@ -1651,123 +1776,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         );
     }
 
-    // Collect active channels
-    let mut channels: Vec<Arc<dyn Channel>> = Vec::new();
-
-    if let Some(ref tg) = config.channels_config.telegram {
-        channels.push(Arc::new(
-            TelegramChannel::new(
-                tg.bot_token.clone(),
-                tg.allowed_users.clone(),
-                tg.mention_only,
-            )
-            .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-            .with_voice(tg.voice.clone()),
-        ));
-    }
-
-    if let Some(ref dc) = config.channels_config.discord {
-        channels.push(Arc::new(DiscordChannel::new(
-            dc.bot_token.clone(),
-            dc.guild_id.clone(),
-            dc.allowed_users.clone(),
-            dc.listen_to_bots,
-            dc.mention_only,
-        )));
-    }
-
-    if let Some(ref sl) = config.channels_config.slack {
-        channels.push(Arc::new(SlackChannel::new(
-            sl.bot_token.clone(),
-            sl.channel_id.clone(),
-            sl.allowed_users.clone(),
-        )));
-    }
-
-    if let Some(ref mm) = config.channels_config.mattermost {
-        channels.push(Arc::new(MattermostChannel::new(
-            mm.url.clone(),
-            mm.bot_token.clone(),
-            mm.channel_id.clone(),
-            mm.allowed_users.clone(),
-            mm.thread_replies.unwrap_or(true),
-            mm.mention_only.unwrap_or(false),
-        )));
-    }
-
-    if let Some(ref im) = config.channels_config.imessage {
-        channels.push(Arc::new(IMessageChannel::new(im.allowed_contacts.clone())));
-    }
-
-    if let Some(ref mx) = config.channels_config.matrix {
-        channels.push(Arc::new(MatrixChannel::new_with_session_hint(
-            mx.homeserver.clone(),
-            mx.access_token.clone(),
-            mx.room_id.clone(),
-            mx.allowed_users.clone(),
-            mx.user_id.clone(),
-            mx.device_id.clone(),
-        )));
-    }
-
-    if let Some(ref sig) = config.channels_config.signal {
-        channels.push(Arc::new(SignalChannel::new(
-            sig.http_url.clone(),
-            sig.account.clone(),
-            sig.group_id.clone(),
-            sig.allowed_from.clone(),
-            sig.ignore_attachments,
-            sig.ignore_stories,
-        )));
-    }
-
-    if let Some(ref wa) = config.channels_config.whatsapp {
-        channels.push(Arc::new(WhatsAppChannel::new(
-            wa.access_token.clone(),
-            wa.phone_number_id.clone(),
-            wa.verify_token.clone(),
-            wa.allowed_numbers.clone(),
-        )));
-    }
-
-    if let Some(ref email_cfg) = config.channels_config.email {
-        channels.push(Arc::new(EmailChannel::new(email_cfg.clone())));
-    }
-
-    if let Some(ref irc) = config.channels_config.irc {
-        channels.push(Arc::new(IrcChannel::new(irc::IrcChannelConfig {
-            server: irc.server.clone(),
-            port: irc.port,
-            nickname: irc.nickname.clone(),
-            username: irc.username.clone(),
-            channels: irc.channels.clone(),
-            allowed_users: irc.allowed_users.clone(),
-            server_password: irc.server_password.clone(),
-            nickserv_password: irc.nickserv_password.clone(),
-            sasl_password: irc.sasl_password.clone(),
-            verify_tls: irc.verify_tls.unwrap_or(true),
-        })));
-    }
-
-    if let Some(ref lk) = config.channels_config.lark {
-        channels.push(Arc::new(LarkChannel::from_config(lk)));
-    }
-
-    if let Some(ref dt) = config.channels_config.dingtalk {
-        channels.push(Arc::new(DingTalkChannel::new(
-            dt.client_id.clone(),
-            dt.client_secret.clone(),
-            dt.allowed_users.clone(),
-        )));
-    }
-
-    if let Some(ref qq) = config.channels_config.qq {
-        channels.push(Arc::new(QQChannel::new(
-            qq.app_id.clone(),
-            qq.app_secret.clone(),
-            qq.allowed_users.clone(),
-        )));
-    }
+    let channels = create_channels(&config)?;
 
     if channels.is_empty() {
         println!("No channels configured. Run `zeroclaw onboard` to set up channels.");
@@ -1836,6 +1845,161 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
 
+    let (cosmic_gate, cosmic_workspace, cosmic_free_energy, cosmic_world_model, cosmic_thalamus) =
+        if config.cosmic_brain.enabled {
+            use crate::cosmic::{
+                AgentPool, CausalGraph, ConsolidationEngine, Constitution, CosmicGate,
+                CosmicMemoryGraph, CosmicPersistence, CounterfactualEngine, DriftDetector,
+                EmotionalModulator, FreeEnergyState, GlobalWorkspace, IntegrationMeter,
+                NormativeEngine, PolicyEngine, SelfModel, SubsystemId, WorldModel,
+            };
+            use parking_lot::Mutex as PMutex;
+
+            let _graph = CosmicMemoryGraph::new(config.cosmic_brain.graph_max_nodes);
+            let free_energy = PMutex::new(FreeEnergyState::new(
+                config.cosmic_brain.free_energy_capacity,
+            ));
+            let _integration = {
+                let mut meter = IntegrationMeter::new();
+                meter.register_subsystem("memory", vec!["provider".into(), "conscience".into()]);
+                meter.register_subsystem("provider", vec!["memory".into(), "tools".into()]);
+                meter.register_subsystem("tools", vec!["provider".into(), "security".into()]);
+                meter.register_subsystem("security", vec!["tools".into(), "conscience".into()]);
+                meter.register_subsystem("conscience", vec!["memory".into(), "security".into()]);
+                meter.register_subsystem("causal", vec!["memory".into(), "provider".into()]);
+                meter.register_subsystem("normative", vec!["security".into(), "provider".into()]);
+                meter.register_subsystem("modulation", vec!["memory".into(), "conscience".into()]);
+                meter
+            };
+
+            let _causal = CausalGraph::new(1000);
+            let self_model = Arc::new(PMutex::new(SelfModel::new(500)));
+            let world_model_inner = Arc::new(PMutex::new(WorldModel::new(500)));
+            let normative = Arc::new(PMutex::new(NormativeEngine::new(500, 500)));
+            let _modulator = EmotionalModulator::new();
+            let _drift = DriftDetector::new(
+                config.cosmic_brain.drift_window_size,
+                config.cosmic_brain.drift_threshold,
+            );
+            let counterfactual = Arc::new(PMutex::new(CounterfactualEngine::new(
+                config.cosmic_brain.counterfactual_max_scenarios,
+                500,
+            )));
+            let policy = Arc::new(PMutex::new(PolicyEngine::new(500)));
+            let _constitution = {
+                let mut c = Constitution::new();
+                c.register_value("safety", "Never cause harm to users or systems", 1.0, true);
+                c.register_value(
+                    "honesty",
+                    "Always provide truthful accurate information",
+                    1.0,
+                    true,
+                );
+                c.register_value(
+                    "helpfulness",
+                    "Assist users in achieving their goals",
+                    0.9,
+                    true,
+                );
+                c.register_value(
+                    "privacy",
+                    "Protect user data and maintain confidentiality",
+                    0.95,
+                    true,
+                );
+                c.register_value(
+                    "autonomy",
+                    "Respect user agency and decision-making",
+                    0.85,
+                    false,
+                );
+                c.seal();
+                c
+            };
+            let _consolidation = ConsolidationEngine::new(0.7);
+            let persistence = CosmicPersistence::new(&config.cosmic_brain.persistence_dir);
+            let _agent_pool = AgentPool::new(config.cosmic_brain.multi_agent_pool_size, 100);
+
+            match persistence.load_all() {
+                Ok(snapshot) => {
+                    if let Some(data) = snapshot.modules.get("self_model") {
+                        if let Some(restored) = SelfModel::restore(data, 500) {
+                            *self_model.lock() = restored;
+                            tracing::info!("Restored self_model from persisted state");
+                        }
+                    }
+                    if let Some(data) = snapshot.modules.get("world_model") {
+                        if let Some(restored) = WorldModel::restore(data, 500) {
+                            *world_model_inner.lock() = restored;
+                            tracing::info!("Restored world_model from persisted state");
+                        }
+                    }
+                    tracing::info!(
+                        version = snapshot.version,
+                        modules = snapshot.modules.len(),
+                        saved_at = %snapshot.saved_at,
+                        "Loaded persisted cosmic state (channels)"
+                    );
+                }
+                Err(crate::cosmic::PersistenceError::NotFound(_)) => {
+                    tracing::info!("No persisted cosmic state found — starting fresh");
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load cosmic state: {e} — starting fresh");
+                }
+            }
+
+            let thalamus = PMutex::new(crate::cosmic::SensoryThalamus::new(
+                config.cosmic_brain.thalamus_threshold,
+                500,
+            ));
+            let workspace = {
+                let mut ws =
+                    GlobalWorkspace::new(0.3, config.cosmic_brain.workspace_max_active, 100);
+                ws.register_subsystem(SubsystemId::Memory, 0.8);
+                ws.register_subsystem(SubsystemId::FreeEnergy, 0.7);
+                ws.register_subsystem(SubsystemId::Causality, 0.6);
+                ws.register_subsystem(SubsystemId::SelfModel, 0.7);
+                ws.register_subsystem(SubsystemId::WorldModel, 0.7);
+                ws.register_subsystem(SubsystemId::Normative, 0.9);
+                ws.register_subsystem(SubsystemId::Modulation, 0.6);
+                ws.register_subsystem(SubsystemId::Policy, 0.8);
+                ws.register_subsystem(SubsystemId::Counterfactual, 0.5);
+                ws.register_subsystem(SubsystemId::Consolidation, 0.4);
+                ws.register_subsystem(SubsystemId::Drift, 0.5);
+                ws.register_subsystem(SubsystemId::Constitution, 1.0);
+                PMutex::new(ws)
+            };
+
+            tracing::info!(
+                graph_capacity = config.cosmic_brain.graph_max_nodes,
+                fe_capacity = config.cosmic_brain.free_energy_capacity,
+                "Cosmic brain initialized for channels (17 modules)"
+            );
+
+            let gate = CosmicGate::new(
+                Arc::clone(&normative),
+                Arc::clone(&policy),
+                Arc::clone(&counterfactual),
+            );
+
+            let world_model_ctx = PMutex::new(
+                Arc::try_unwrap(world_model_inner)
+                    .expect("single Arc owner for world_model")
+                    .into_inner(),
+            );
+
+            (
+                Some(gate),
+                Some(workspace),
+                Some(free_energy),
+                Some(world_model_ctx),
+                Some(thalamus),
+            )
+        } else {
+            (None, None, None, None, None)
+        };
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
@@ -1857,6 +2021,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         reliability: Arc::new(config.reliability.clone()),
         provider_runtime_options,
         workspace_dir: Arc::new(config.workspace_dir.clone()),
+        cosmic_gate,
+        cosmic_workspace,
+        cosmic_free_energy,
+        cosmic_world_model,
+        cosmic_thalamus,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -2247,6 +2416,11 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            cosmic_gate: None,
+            cosmic_workspace: None,
+            cosmic_free_energy: None,
+            cosmic_world_model: None,
+            cosmic_thalamus: None,
         });
 
         process_channel_message(
@@ -2299,6 +2473,11 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            cosmic_gate: None,
+            cosmic_workspace: None,
+            cosmic_free_energy: None,
+            cosmic_world_model: None,
+            cosmic_thalamus: None,
         });
 
         process_channel_message(
@@ -2360,6 +2539,11 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            cosmic_gate: None,
+            cosmic_workspace: None,
+            cosmic_free_energy: None,
+            cosmic_world_model: None,
+            cosmic_thalamus: None,
         });
 
         process_channel_message(
@@ -2442,6 +2626,11 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            cosmic_gate: None,
+            cosmic_workspace: None,
+            cosmic_free_energy: None,
+            cosmic_world_model: None,
+            cosmic_thalamus: None,
         });
 
         process_channel_message(
@@ -2500,6 +2689,11 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            cosmic_gate: None,
+            cosmic_workspace: None,
+            cosmic_free_energy: None,
+            cosmic_world_model: None,
+            cosmic_thalamus: None,
         });
 
         process_channel_message(
@@ -2553,6 +2747,11 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            cosmic_gate: None,
+            cosmic_workspace: None,
+            cosmic_free_energy: None,
+            cosmic_world_model: None,
+            cosmic_thalamus: None,
         });
 
         process_channel_message(
@@ -2657,6 +2856,11 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            cosmic_gate: None,
+            cosmic_workspace: None,
+            cosmic_free_energy: None,
+            cosmic_world_model: None,
+            cosmic_thalamus: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -2727,6 +2931,11 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            cosmic_gate: None,
+            cosmic_workspace: None,
+            cosmic_free_energy: None,
+            cosmic_world_model: None,
+            cosmic_thalamus: None,
         });
 
         process_channel_message(
@@ -3113,6 +3322,11 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            cosmic_gate: None,
+            cosmic_workspace: None,
+            cosmic_free_energy: None,
+            cosmic_world_model: None,
+            cosmic_thalamus: None,
         });
 
         process_channel_message(

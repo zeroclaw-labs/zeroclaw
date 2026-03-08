@@ -94,4 +94,98 @@ mod tests {
             Ok(_) => panic!("empty runtime should error"),
         }
     }
+
+    #[test]
+    fn factory_created_runtime_is_correct_type() {
+        let cfg = RuntimeConfig {
+            kind: "native".into(),
+            ..RuntimeConfig::default()
+        };
+        let rt = create_runtime(&cfg).unwrap();
+        assert_eq!(rt.name(), "native");
+        assert!(rt.has_shell_access());
+        assert!(rt.has_filesystem_access());
+        assert!(rt.supports_long_running());
+    }
+
+    #[test]
+    fn factory_docker_created_from_config() {
+        let cfg = RuntimeConfig {
+            kind: "docker".into(),
+            ..RuntimeConfig::default()
+        };
+        let rt = create_runtime(&cfg).unwrap();
+        assert_eq!(rt.name(), "docker");
+    }
+
+    #[test]
+    fn factory_whitespace_kind_errors() {
+        let cfg = RuntimeConfig {
+            kind: "   ".into(),
+            ..RuntimeConfig::default()
+        };
+        match create_runtime(&cfg) {
+            Err(err) => assert!(err.to_string().contains("cannot be empty")),
+            Ok(_) => panic!("whitespace-only runtime should error"),
+        }
+    }
+
+    #[test]
+    fn factory_case_sensitive() {
+        let cfg = RuntimeConfig {
+            kind: "NATIVE".into(),
+            ..RuntimeConfig::default()
+        };
+        match create_runtime(&cfg) {
+            Err(err) => assert!(err.to_string().contains("Unknown runtime kind")),
+            Ok(_) => panic!("case-sensitive matching should fail"),
+        }
+    }
+
+    #[test]
+    fn factory_adapters_impl_runtime_trait() {
+        let native_cfg = RuntimeConfig {
+            kind: "native".into(),
+            ..RuntimeConfig::default()
+        };
+        let docker_cfg = RuntimeConfig {
+            kind: "docker".into(),
+            ..RuntimeConfig::default()
+        };
+
+        let native_rt = create_runtime(&native_cfg).unwrap();
+        let docker_rt = create_runtime(&docker_cfg).unwrap();
+
+        assert_eq!(native_rt.name(), "native");
+        assert_eq!(docker_rt.name(), "docker");
+
+        assert!(native_rt.has_shell_access());
+        assert!(docker_rt.has_shell_access());
+    }
+
+    #[test]
+    fn factory_returns_boxed_trait_object() {
+        let cfg = RuntimeConfig {
+            kind: "native".into(),
+            ..RuntimeConfig::default()
+        };
+        let rt: Box<dyn crate::runtime::RuntimeAdapter> = create_runtime(&cfg).unwrap();
+        assert_eq!(rt.name(), "native");
+    }
+
+    #[test]
+    fn factory_cloudflare_message_clear() {
+        let cfg = RuntimeConfig {
+            kind: "cloudflare".into(),
+            ..RuntimeConfig::default()
+        };
+        match create_runtime(&cfg) {
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(msg.contains("cloudflare"));
+                assert!(msg.contains("not implemented"));
+            }
+            Ok(_) => panic!("cloudflare should error"),
+        }
+    }
 }

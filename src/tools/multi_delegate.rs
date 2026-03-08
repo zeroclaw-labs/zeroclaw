@@ -285,12 +285,14 @@ impl MultiDelegateTool {
                 if !accumulated_context.is_empty() {
                     accumulated_context.push_str("\n\n---\n\n");
                 }
-                accumulated_context.push_str(&format!(
+                use std::fmt::Write;
+                let _ = write!(
+                    accumulated_context,
                     "Task {}: {}\nResult: {}",
                     i + 1,
                     task.description,
                     result.output
-                ));
+                );
             }
             results.push(result);
         }
@@ -367,18 +369,21 @@ impl MultiDelegateTool {
         );
 
         for r in results {
+            use std::fmt::Write;
             if r.success {
-                output.push_str(&format!(
+                let _ = write!(
+                    output,
                     "--- Task {} [OK] ---\n{}\n\n",
                     r.index + 1,
                     r.output
-                ));
+                );
             } else {
-                output.push_str(&format!(
+                let _ = write!(
+                    output,
                     "--- Task {} [FAILED] ---\n{}\n\n",
                     r.index + 1,
                     r.error.as_deref().unwrap_or("Unknown error")
-                ));
+                );
             }
         }
 

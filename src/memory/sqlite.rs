@@ -839,6 +839,253 @@ impl Memory for SqliteMemory {
     }
 }
 
+#[async_trait]
+impl super::search::SearchableMemory for SqliteMemory {
+    async fn search(
+        &self,
+        query: &str,
+        filter: &super::search::SearchFilter,
+        limit: usize,
+    ) -> anyhow::Result<Vec<super::search::SearchResult>> {
+        use super::search::{MatchType, SearchResult};
+
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query_embedding = self.get_or_compute_embedding(query).await?;
+
+        let conn = self.conn.clone();
+        let query = query.to_string();
+        let filter = filter.clone();
+        let vector_weight = self.vector_weight;
+        let keyword_weight = self.keyword_weight;
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<SearchResult>> {
+            let conn = conn.lock();
+            let fetch_limit = limit * 3;
+
+            let keyword_results = Self::fts5_search(&conn, &query, fetch_limit).unwrap_or_default();
+
+            let vector_results = if let Some(ref qe) = query_embedding {
+                Self::vector_search(&conn, qe, fetch_limit, None, filter.session_id.as_deref())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            let merged = if vector_results.is_empty() {
+                keyword_results
+                    .iter()
+                    .map(|(id, score)| vector::ScoredResult {
+                        id: id.clone(),
+                        vector_score: None,
+                        keyword_score: Some(*score),
+                        final_score: *score,
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                vector::hybrid_merge(
+                    &vector_results,
+                    &keyword_results,
+                    vector_weight,
+                    keyword_weight,
+                    fetch_limit,
+                )
+            };
+
+            let mut results = Vec::new();
+            if merged.is_empty() {
+                return Ok(results);
+            }
+
+            let placeholders: String = (1..=merged.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, key, content, category, created_at, session_id \
+                 FROM memories WHERE id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let id_params: Vec<Box<dyn rusqlite::types::ToSql>> = merged
+                .iter()
+                .map(|s| Box::new(s.id.clone()) as Box<dyn rusqlite::types::ToSql>)
+                .collect();
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                id_params.iter().map(AsRef::as_ref).collect();
+            let rows = stmt.query_map(params_ref.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })?;
+
+            let mut entry_map = HashMap::new();
+            for row in rows {
+                let (id, key, content, cat, ts, sid) = row?;
+                entry_map.insert(id, (key, content, cat, ts, sid));
+            }
+
+            for scored in &merged {
+                if let Some((key, content, cat, ts, sid)) = entry_map.remove(&scored.id) {
+                    if let Some(ref filter_cat) = filter.category {
+                        let entry_cat = Self::str_to_category(&cat);
+                        if &entry_cat != filter_cat {
+                            continue;
+                        }
+                    }
+
+                    if let Some(ref filter_sid) = filter.session_id {
+                        if sid.as_deref() != Some(filter_sid.as_str()) {
+                            continue;
+                        }
+                    }
+
+                    if let Some(min_score) = filter.min_score {
+                        if f64::from(scored.final_score) < min_score {
+                            continue;
+                        }
+                    }
+
+                    if let Some(ref after) = filter.after {
+                        if ts.as_str() < after.as_str() {
+                            continue;
+                        }
+                    }
+
+                    if let Some(ref before) = filter.before {
+                        if ts.as_str() > before.as_str() {
+                            continue;
+                        }
+                    }
+
+                    let match_type = match (scored.vector_score, scored.keyword_score) {
+                        (Some(_), Some(_)) => MatchType::Hybrid,
+                        (Some(_), None) => MatchType::Semantic,
+                        (None, _) => MatchType::Keyword,
+                    };
+
+                    let entry = MemoryEntry {
+                        id: scored.id.clone(),
+                        key,
+                        content,
+                        category: Self::str_to_category(&cat),
+                        timestamp: ts,
+                        session_id: sid,
+                        score: Some(f64::from(scored.final_score)),
+                    };
+
+                    results.push(SearchResult {
+                        entry,
+                        relevance_score: f64::from(scored.final_score),
+                        match_type,
+                    });
+
+                    if results.len() >= limit {
+                        break;
+                    }
+                }
+            }
+
+            Ok(results)
+        })
+        .await?
+    }
+
+    async fn semantic_search(
+        &self,
+        query: &str,
+        limit: usize,
+        min_score: f64,
+    ) -> anyhow::Result<Vec<super::search::SearchResult>> {
+        let filter = super::search::SearchFilter::new().with_min_score(min_score);
+        self.search(query, &filter, limit).await
+    }
+
+    async fn keyword_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<super::search::SearchResult>> {
+        use super::search::{MatchType, SearchResult};
+
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.clone();
+        let query = query.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<SearchResult>> {
+            let conn = conn.lock();
+            let keyword_results = Self::fts5_search(&conn, &query, limit).unwrap_or_default();
+
+            let mut results = Vec::new();
+            if keyword_results.is_empty() {
+                return Ok(results);
+            }
+
+            let placeholders: String = (1..=keyword_results.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, key, content, category, created_at, session_id \
+                 FROM memories WHERE id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let id_params: Vec<Box<dyn rusqlite::types::ToSql>> = keyword_results
+                .iter()
+                .map(|(id, _)| Box::new(id.clone()) as Box<dyn rusqlite::types::ToSql>)
+                .collect();
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                id_params.iter().map(AsRef::as_ref).collect();
+            let rows = stmt.query_map(params_ref.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })?;
+
+            let mut entry_map = HashMap::new();
+            for row in rows {
+                let (id, key, content, cat, ts, sid) = row?;
+                entry_map.insert(id, (key, content, cat, ts, sid));
+            }
+
+            for (id, score) in &keyword_results {
+                if let Some((key, content, cat, ts, sid)) = entry_map.remove(id) {
+                    results.push(SearchResult {
+                        entry: MemoryEntry {
+                            id: id.clone(),
+                            key,
+                            content,
+                            category: Self::str_to_category(&cat),
+                            timestamp: ts,
+                            session_id: sid,
+                            score: Some(f64::from(*score)),
+                        },
+                        relevance_score: f64::from(*score),
+                        match_type: MatchType::Keyword,
+                    });
+                }
+            }
+
+            Ok(results)
+        })
+        .await?
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

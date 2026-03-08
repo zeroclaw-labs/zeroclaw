@@ -100,4 +100,51 @@ mod tests {
         assert!(output.status.success());
         assert!(stdout.contains("hello-runtime"));
     }
+
+    #[test]
+    fn runtime_trait_object() {
+        let runtime: Box<dyn RuntimeAdapter> = Box::new(DummyRuntime);
+        assert_eq!(runtime.name(), "dummy-runtime");
+        assert!(runtime.has_shell_access());
+        assert!(runtime.has_filesystem_access());
+        assert!(runtime.supports_long_running());
+    }
+
+    #[test]
+    fn memory_budget_default_zero() {
+        struct NoMemoryRuntime;
+        impl RuntimeAdapter for NoMemoryRuntime {
+            fn name(&self) -> &str {
+                "no-memory"
+            }
+            fn has_shell_access(&self) -> bool {
+                false
+            }
+            fn has_filesystem_access(&self) -> bool {
+                false
+            }
+            fn storage_path(&self) -> PathBuf {
+                PathBuf::from("/tmp")
+            }
+            fn supports_long_running(&self) -> bool {
+                false
+            }
+            fn build_shell_command(
+                &self,
+                _command: &str,
+                _workspace_dir: &Path,
+            ) -> anyhow::Result<tokio::process::Command> {
+                anyhow::bail!("unsupported")
+            }
+        }
+
+        let rt = NoMemoryRuntime;
+        assert_eq!(rt.memory_budget(), 0);
+    }
+
+    #[test]
+    fn runtime_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<DummyRuntime>();
+    }
 }

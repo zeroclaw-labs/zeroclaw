@@ -83,4 +83,42 @@ mod tests {
         let kind = detect_auth_kind("sk-ant-api-123", None);
         assert_eq!(kind, AnthropicAuthKind::ApiKey);
     }
+
+    #[test]
+    fn detect_unknown_token_defaults_to_api_key() {
+        let kind = detect_auth_kind("some-random-key", None);
+        assert_eq!(kind, AnthropicAuthKind::ApiKey);
+    }
+
+    #[test]
+    fn as_metadata_value_roundtrips() {
+        let api_key = AnthropicAuthKind::ApiKey;
+        let auth = AnthropicAuthKind::Authorization;
+        assert_eq!(
+            AnthropicAuthKind::from_metadata_value(api_key.as_metadata_value()),
+            Some(AnthropicAuthKind::ApiKey)
+        );
+        assert_eq!(
+            AnthropicAuthKind::from_metadata_value(auth.as_metadata_value()),
+            Some(AnthropicAuthKind::Authorization)
+        );
+    }
+
+    #[test]
+    fn from_metadata_value_case_insensitive() {
+        assert_eq!(
+            AnthropicAuthKind::from_metadata_value("AUTHORIZATION"),
+            Some(AnthropicAuthKind::Authorization)
+        );
+        assert_eq!(
+            AnthropicAuthKind::from_metadata_value("X-API-KEY"),
+            Some(AnthropicAuthKind::ApiKey)
+        );
+    }
+
+    #[test]
+    fn detect_whitespace_token_defaults_to_api_key() {
+        let kind = detect_auth_kind("   ", None);
+        assert_eq!(kind, AnthropicAuthKind::ApiKey);
+    }
 }

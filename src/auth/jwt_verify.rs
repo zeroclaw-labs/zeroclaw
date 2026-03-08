@@ -585,4 +585,62 @@ mod tests {
 
         assert!(parse_ec_jwk(&key).is_none());
     }
+
+    #[test]
+    fn strip_leading_zeros_single_zero_preserved() {
+        assert_eq!(strip_leading_zeros(&[0x00]), &[0x00]);
+    }
+
+    #[test]
+    fn strip_leading_zeros_removes_padding() {
+        assert_eq!(strip_leading_zeros(&[0x00, 0x00, 0x42]), &[0x42]);
+    }
+
+    #[test]
+    fn encode_der_length_short_form() {
+        let mut out = Vec::new();
+        encode_der_length(0x7F, &mut out);
+        assert_eq!(out, vec![0x7F]);
+    }
+
+    #[test]
+    fn encode_der_length_medium_form() {
+        let mut out = Vec::new();
+        encode_der_length(0xFF, &mut out);
+        assert_eq!(out, vec![0x81, 0xFF]);
+    }
+
+    #[test]
+    fn encode_der_length_long_form() {
+        let mut out = Vec::new();
+        encode_der_length(0x0102, &mut out);
+        assert_eq!(out, vec![0x82, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn verify_jwt_no_account_id_in_claims() {
+        let (key_pair, jwk) = make_ec_test_key();
+        let header = r#"{"alg":"ES256","typ":"JWT","kid":"test-key-1"}"#;
+        let payload = r#"{"email":"zeroclaw_user@example.com"}"#;
+        let token = sign_jwt(&key_pair, header, payload);
+
+        let result = verify_and_extract_account_id(&token, &[jwk]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no account ID"));
+    }
+
+    #[test]
+    fn parse_jwk_unknown_kty_returns_none() {
+        let key = JwksKey {
+            kty: "OKP".to_string(),
+            kid: None,
+            alg: None,
+            n: None,
+            e: None,
+            x: None,
+            y: None,
+            crv: None,
+        };
+        assert!(parse_jwk(&key).is_none());
+    }
 }

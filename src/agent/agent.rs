@@ -1,6 +1,7 @@
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
+use crate::agent::loop_::scrub_credentials;
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
@@ -12,6 +13,7 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use futures::future::join_all;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
@@ -411,11 +413,7 @@ impl Agent {
             return results;
         }
 
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            results.push(self.execute_tool_call(call).await);
-        }
-        results
+        join_all(calls.iter().map(|call| self.execute_tool_call(call))).await
     }
 
     fn classify_model(&self, user_message: &str) -> String {
@@ -522,7 +520,10 @@ impl Agent {
                 tool_calls: response.tool_calls.clone(),
             });
 
-            let results = self.execute_tools(&calls).await;
+            let mut results = self.execute_tools(&calls).await;
+            for r in &mut results {
+                r.output = scrub_credentials(&r.output);
+            }
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
             self.trim_history();

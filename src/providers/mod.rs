@@ -8,8 +8,14 @@ pub mod openai_codex;
 pub mod openrouter;
 pub mod reliable;
 pub mod router;
+pub mod streaming;
+pub mod tool_calling;
 pub mod traits;
 
+#[allow(unused_imports)]
+pub use streaming::ProviderStreaming;
+#[allow(unused_imports)]
+pub use tool_calling::ProviderToolCalling;
 #[allow(unused_imports)]
 pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ResponseUsage, ToolCall,

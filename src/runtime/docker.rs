@@ -272,4 +272,128 @@ mod tests {
             "should not include --memory when not configured"
         );
     }
+
+    #[test]
+    fn docker_filesystem_access_depends_on_mount_workspace() {
+        let cfg_unmounted = DockerRuntimeConfig {
+            mount_workspace: false,
+            ..DockerRuntimeConfig::default()
+        };
+        assert!(!DockerRuntime::new(cfg_unmounted).has_filesystem_access());
+
+        let cfg_mounted = DockerRuntimeConfig {
+            mount_workspace: true,
+            ..DockerRuntimeConfig::default()
+        };
+        assert!(DockerRuntime::new(cfg_mounted).has_filesystem_access());
+    }
+
+    #[test]
+    fn docker_storage_path_depends_on_mount() {
+        let cfg_unmounted = DockerRuntimeConfig {
+            mount_workspace: false,
+            ..DockerRuntimeConfig::default()
+        };
+        assert_eq!(
+            DockerRuntime::new(cfg_unmounted).storage_path(),
+            PathBuf::from("/tmp/.zeroclaw")
+        );
+
+        let cfg_mounted = DockerRuntimeConfig {
+            mount_workspace: true,
+            ..DockerRuntimeConfig::default()
+        };
+        assert_eq!(
+            DockerRuntime::new(cfg_mounted).storage_path(),
+            PathBuf::from("/workspace/.zeroclaw")
+        );
+    }
+
+    #[test]
+    fn docker_no_cpu_flag_when_zero() {
+        let cfg = DockerRuntimeConfig {
+            cpu_limit: Some(0.0),
+            ..DockerRuntimeConfig::default()
+        };
+        let runtime = DockerRuntime::new(cfg);
+        let workspace = std::env::temp_dir();
+        let cmd = runtime.build_shell_command("test", &workspace).unwrap();
+        let debug = format!("{cmd:?}");
+        assert!(
+            !debug.contains("--cpus"),
+            "should not include --cpus when limit is 0"
+        );
+    }
+
+    #[test]
+    fn docker_cpu_flag_when_positive() {
+        let cfg = DockerRuntimeConfig {
+            cpu_limit: Some(2.0),
+            ..DockerRuntimeConfig::default()
+        };
+        let runtime = DockerRuntime::new(cfg);
+        let workspace = std::env::temp_dir();
+        let cmd = runtime.build_shell_command("test", &workspace).unwrap();
+        let debug = format!("{cmd:?}");
+        assert!(debug.contains("--cpus"));
+        assert!(debug.contains('2'));
+    }
+
+    #[test]
+    fn docker_allows_valid_workspace_in_allowlist() {
+        let temp_dir = std::env::temp_dir();
+        let absolute_path = temp_dir.canonicalize().unwrap_or(temp_dir.clone());
+        let allowed_root = absolute_path.to_string_lossy().to_string();
+
+        let cfg = DockerRuntimeConfig {
+            mount_workspace: true,
+            allowed_workspace_roots: vec![allowed_root],
+            ..DockerRuntimeConfig::default()
+        };
+        let runtime = DockerRuntime::new(cfg);
+        let workspace = std::env::temp_dir();
+        let result = runtime.build_shell_command("echo test", &workspace);
+        assert!(result.is_ok(), "should allow workspace within allowlist");
+    }
+
+    #[test]
+    fn docker_image_name_in_command() {
+        let cfg = DockerRuntimeConfig {
+            image: "ubuntu:22.04".into(),
+            ..DockerRuntimeConfig::default()
+        };
+        let runtime = DockerRuntime::new(cfg);
+        let workspace = std::env::temp_dir();
+        let cmd = runtime
+            .build_shell_command("echo test", &workspace)
+            .unwrap();
+        let debug = format!("{cmd:?}");
+        assert!(debug.contains("ubuntu:22.04"));
+    }
+
+    #[test]
+    fn docker_does_not_support_long_running() {
+        let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
+        assert!(!runtime.supports_long_running());
+    }
+
+    #[test]
+    fn docker_memory_budget_calculation() {
+        let cfg = DockerRuntimeConfig {
+            memory_limit_mb: Some(512),
+            ..DockerRuntimeConfig::default()
+        };
+        let runtime = DockerRuntime::new(cfg);
+        assert_eq!(runtime.memory_budget(), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn docker_memory_budget_zero_when_none() {
+        let cfg = DockerRuntimeConfig {
+            memory_limit_mb: None,
+            ..DockerRuntimeConfig::default()
+        };
+        let runtime = DockerRuntime::new(cfg);
+        assert_eq!(runtime.memory_budget(), 0);
+    }
 }
