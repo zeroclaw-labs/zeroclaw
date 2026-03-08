@@ -8,10 +8,9 @@
 //! For long-running services like zeroclaw, this backend implements:
 //! - Message count threshold triggering (default: 10 messages)
 //! - Periodic background flush (default: every 5 minutes)
-//! - Concurrency limiting to prevent resource exhaustion
 //!
-//! This ensures user/agent memories are extracted and L0/L2 layers
-//! are generated without requiring explicit session close calls.
+//! Concurrency limiting and vector deduplication are handled internally
+//! by cortex-mem's AutomationManager and AutoIndexer.
 
 use super::cortex_config_resolver::{resolve_cortex_config, ResolvedCortexConfig};
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
@@ -19,26 +18,12 @@ use crate::config::{Config, MemoryConfig};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use cortex_mem_core::FilesystemOperations;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::{RwLock, Semaphore};
-
-// ==================== Helper Functions ====================
-
-/// Get current Unix timestamp in seconds
-///
-/// Uses SystemTime for reliable wall-clock time, suitable for
-/// persistent timing across process lifetime.
-#[inline]
-fn current_timestamp_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 
 // ==================== Auto-Processing Configuration ====================
 
@@ -46,6 +31,8 @@ fn current_timestamp_secs() -> u64 {
 ///
 /// This enables automatic memory extraction and layer generation
 /// suitable for long-running services.
+///
+/// Note: Concurrency limiting is handled by cortex-mem's AutomationManager.
 #[derive(Debug, Clone, Copy)]
 pub struct AutoProcessConfig {
     /// Minimum message count before triggering processing
@@ -57,9 +44,6 @@ pub struct AutoProcessConfig {
     /// Interval for periodic background flush (in seconds)
     /// Set to 0 to disable periodic flush
     pub periodic_flush_interval_secs: u64,
-    /// Maximum concurrent processing tasks
-    /// Prevents resource exhaustion when many sessions need processing
-    pub max_concurrent_processing: usize,
 }
 
 impl Default for AutoProcessConfig {
@@ -69,7 +53,6 @@ impl Default for AutoProcessConfig {
             min_process_interval_secs: 600,    // At most once ever n minutes
             enable_threshold_trigger: true,
             periodic_flush_interval_secs: 600, // Periodic flush every n minutes
-            max_concurrent_processing: 1,      // Max concurrent sessions
         }
     }
 }
@@ -100,7 +83,8 @@ impl Default for SessionState {
 /// - Automatic memory extraction and organization
 /// - Session-scoped memory isolation
 /// - Periodic background processing for long-running services
-/// - Concurrency limiting to prevent resource exhaustion
+///
+/// Concurrency limiting and vector deduplication are handled by cortex-mem.
 pub struct CortexMemory {
     operations: Arc<cortex_mem_tools::MemoryOperations>,
     workspace_dir: PathBuf,
@@ -111,11 +95,6 @@ pub struct CortexMemory {
     session_states: Arc<RwLock<HashMap<String, SessionState>>>,
     /// Last global processing time (Unix timestamp in seconds)
     last_process_time: Arc<AtomicU64>,
-    /// Set of directories already indexed for L0/L1
-    /// Prevents redundant vector indexing of the same directory
-    indexed_dirs: Arc<RwLock<HashSet<String>>>,
-    /// Semaphore for limiting concurrent processing tasks
-    processing_semaphore: Arc<Semaphore>,
 }
 
 impl CortexMemory {
@@ -186,8 +165,6 @@ impl CortexMemory {
         .await
         .context("Failed to initialize Cortex-Memory operations")?;
 
-        let processing_semaphore = Arc::new(Semaphore::new(auto_process_config.max_concurrent_processing));
-
         let instance = Self {
             operations: Arc::new(operations),
             workspace_dir,
@@ -195,8 +172,6 @@ impl CortexMemory {
             auto_process_config,
             session_states: Arc::new(RwLock::new(HashMap::new())),
             last_process_time: Arc::new(AtomicU64::new(0)),
-            indexed_dirs: Arc::new(RwLock::new(HashSet::new())),
-            processing_semaphore,
         };
 
         // Start periodic flush task if enabled
@@ -212,8 +187,6 @@ impl CortexMemory {
         let operations = self.operations.clone();
         let session_states = self.session_states.clone();
         let last_process_time = self.last_process_time.clone();
-        let indexed_dirs = self.indexed_dirs.clone();
-        let semaphore = self.processing_semaphore.clone();
         let interval_secs = self.auto_process_config.periodic_flush_interval_secs;
         let min_interval_secs = self.auto_process_config.min_process_interval_secs;
 
@@ -224,9 +197,11 @@ impl CortexMemory {
                 interval.tick().await;
 
                 // Check if enough time has passed since last processing
-                // FIX: Use SystemTime-based Unix timestamp instead of Instant::now().elapsed()
                 let last = last_process_time.load(Ordering::Relaxed);
-                let now = current_timestamp_secs();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
 
                 if last > 0 && now.saturating_sub(last) < min_interval_secs {
                     tracing::trace!(
@@ -263,70 +238,48 @@ impl CortexMemory {
                     sessions_to_process.len()
                 );
 
-                // FIX: Acquire semaphore permit to limit concurrency
-                let permit = match semaphore.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => {
-                        tracing::warn!("Semaphore closed, stopping periodic flush");
-                        break;
-                    }
-                };
+                // Update last process time
+                last_process_time.store(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    Ordering::Relaxed,
+                );
 
-                // Update last process time before spawning
-                last_process_time.store(current_timestamp_secs(), Ordering::Relaxed);
+                // Send SessionClosed events for each session
+                // Note: cortex-mem handles concurrency and deduplication internally
+                if let Some(tx) = operations.memory_event_tx() {
+                    use cortex_mem_core::memory_events::MemoryEvent;
 
-                // Spawn processing task with concurrency control
-                let operations_clone = operations.clone();
-                let indexed_dirs_clone = indexed_dirs.clone();
-                let last_process_time_clone = last_process_time.clone();
+                    let user_id = operations.default_user_id().to_string();
+                    let agent_id = operations.default_agent_id().to_string();
 
-                tokio::spawn(async move {
-                    // Send SessionClosed events for each session
-                    if let Some(tx) = operations_clone.memory_event_tx() {
-                        use cortex_mem_core::memory_events::MemoryEvent;
-
-                        let user_id = operations_clone.default_user_id().to_string();
-                        let agent_id = operations_clone.default_agent_id().to_string();
-
-                        for session_id in &sessions_to_process {
-                            // Mark directory as being processed (avoid redundant L0/L1 indexing)
-                            {
-                                let mut dirs = indexed_dirs_clone.write().await;
-                                dirs.insert(format!("cortex://session/{}/timeline", session_id));
-                            }
-
-                            if let Err(e) = tx.send(MemoryEvent::SessionClosed {
-                                session_id: session_id.clone(),
-                                user_id: user_id.clone(),
-                                agent_id: agent_id.clone(),
-                            }) {
-                                tracing::warn!("Failed to send SessionClosed event for {}: {}", session_id, e);
-                            }
+                    for session_id in &sessions_to_process {
+                        if let Err(e) = tx.send(MemoryEvent::SessionClosed {
+                            session_id: session_id.clone(),
+                            user_id: user_id.clone(),
+                            agent_id: agent_id.clone(),
+                        }) {
+                            tracing::warn!("Failed to send SessionClosed event for {}: {}", session_id, e);
                         }
                     }
+                }
 
-                    // Wait for background processing to complete
-                    let completed = operations_clone.flush_and_wait(Some(1)).await;
+                // Wait for background processing to complete
+                let completed = operations.flush_and_wait(Some(1)).await;
 
-                    // Update last process time after completion
-                    last_process_time_clone.store(current_timestamp_secs(), Ordering::Relaxed);
-
-                    if completed {
-                        tracing::debug!("Periodic flush completed successfully");
-                    } else {
-                        tracing::warn!("Periodic flush initiated but some tasks may still be in progress");
-                    }
-
-                    // Release semaphore permit by dropping
-                    drop(permit);
-                });
+                if completed {
+                    tracing::debug!("Periodic flush completed successfully");
+                } else {
+                    tracing::warn!("Periodic flush initiated but some tasks may still be in progress");
+                }
             }
         });
 
         tracing::debug!(
-            "Started periodic flush task (interval: {}s, max concurrent: {})",
-            interval_secs,
-            self.auto_process_config.max_concurrent_processing
+            "Started periodic flush task (interval: {}s)",
+            interval_secs
         );
     }
 
@@ -360,26 +313,20 @@ impl CortexMemory {
             }
         }
 
-        // Try to acquire semaphore permit (non-blocking)
-        let permit = match self.processing_semaphore.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => {
-                tracing::debug!(
-                    "Threshold trigger for session {} skipped: too many concurrent processing tasks",
-                    thread_id
-                );
-                return false;
-            }
-        };
-
         // Trigger processing
         state.message_count = 0;
         state.last_processed = Some(Instant::now());
 
-        // FIX: Use SystemTime-based timestamp
-        self.last_process_time.store(current_timestamp_secs(), Ordering::Relaxed);
+        self.last_process_time.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            Ordering::Relaxed,
+        );
 
         // Send SessionClosed event
+        // Note: cortex-mem handles concurrency and deduplication internally
         if let Some(tx) = self.operations.memory_event_tx() {
             use cortex_mem_core::memory_events::MemoryEvent;
 
@@ -395,24 +342,23 @@ impl CortexMemory {
                 return false;
             }
 
-            // Mark directory as being processed
-            {
-                let mut dirs = self.indexed_dirs.write().await;
-                dirs.insert(format!("cortex://session/{}/timeline", thread_id));
-            }
-
             tracing::debug!(
                 "Threshold-triggered processing for session {}",
                 thread_id
             );
 
-            // Spawn async task to release permit after processing
+            // Spawn async task to wait for completion
             let operations = self.operations.clone();
             let last_process_time = self.last_process_time.clone();
             tokio::spawn(async move {
                 let _ = operations.flush_and_wait(Some(1)).await;
-                last_process_time.store(current_timestamp_secs(), Ordering::Relaxed);
-                drop(permit); // Release permit
+                last_process_time.store(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    Ordering::Relaxed,
+                );
             });
 
             return true;
