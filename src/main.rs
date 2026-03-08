@@ -181,7 +181,7 @@ Examples:
 
         /// Session ID for -m mode: loads this session's history and saves messages into it.
         /// Enables stateful multi-call workflows: zeroclaw agent -m "..." --session-id my-task
-        #[arg(long)]
+        #[arg(long, requires = "message")]
         session_id: Option<String>,
 
         /// Provider to use (openrouter, anthropic, openai, openai-codex)
