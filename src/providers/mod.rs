@@ -1490,6 +1490,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "azure-openai",
+            display_name: "Azure OpenAI",
+            aliases: &["azure_openai"],
+            local: false,
+        },
+        ProviderInfo {
             name: "openai-codex",
             display_name: "OpenAI Codex (OAuth)",
             aliases: &["openai_codex", "codex"],
