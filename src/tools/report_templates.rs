@@ -58,11 +58,37 @@ impl ReportTemplate {
     }
 }
 
+/// Single-pass placeholder substitution.
+///
+/// Scans `template` left-to-right for `{{key}}` tokens and replaces them with
+/// the corresponding value from `vars`.  Because the scan is single-pass,
+/// values that themselves contain `{{...}}` sequences are emitted literally
+/// and never re-expanded, preventing injection of new placeholders.
 fn substitute(template: &str, vars: &HashMap<String, String>) -> String {
-    let mut result = template.to_string();
-    for (key, value) in vars {
-        result = result.replace(&format!("{{{{{key}}}}}"), value);
+    let mut result = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        if i + 1 < len && bytes[i] == b'{' && bytes[i + 1] == b'{' {
+            // Find the closing `}}`.
+            if let Some(close) = template[i + 2..].find("}}") {
+                let key = &template[i + 2..i + 2 + close];
+                if let Some(value) = vars.get(key) {
+                    result.push_str(value);
+                } else {
+                    // Unknown placeholder: emit as-is.
+                    result.push_str(&template[i..i + 2 + close + 2]);
+                }
+                i += 2 + close + 2;
+                continue;
+            }
+        }
+        result.push(template.as_bytes()[i] as char);
+        i += 1;
     }
+
     result
 }
 

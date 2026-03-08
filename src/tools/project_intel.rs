@@ -57,11 +57,13 @@ impl ProjectIntelTool {
         let project_name = args
             .get("project_name")
             .and_then(|v| v.as_str())
-            .unwrap_or("Unknown Project");
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("missing required 'project_name' for status_report"))?;
         let period = args
             .get("period")
             .and_then(|v| v.as_str())
-            .unwrap_or("week");
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("missing required 'period' for status_report"))?;
         let lang = args
             .get("language")
             .and_then(|v| v.as_str())
@@ -100,15 +102,15 @@ impl ProjectIntelTool {
         let deadlines = args
             .get("deadlines")
             .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .unwrap_or_default();
         let velocity = args
             .get("velocity")
             .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .unwrap_or_default();
         let blockers = args
             .get("blockers")
             .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .unwrap_or_default();
         let lang = args
             .get("language")
             .and_then(|v| v.as_str())
@@ -201,7 +203,8 @@ impl ProjectIntelTool {
         let project_name = args
             .get("project_name")
             .and_then(|v| v.as_str())
-            .unwrap_or("the project");
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("missing required 'project_name' for draft_update"))?;
         let audience = args
             .get("audience")
             .and_then(|v| v.as_str())
@@ -213,7 +216,8 @@ impl ProjectIntelTool {
         let highlights = args
             .get("highlights")
             .and_then(|v| v.as_str())
-            .unwrap_or("Progress is on track.");
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("missing required 'highlights' for draft_update"))?;
         let concerns = args
             .get("concerns")
             .and_then(|v| v.as_str())
