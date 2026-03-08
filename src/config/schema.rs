@@ -2399,7 +2399,7 @@ pub struct ClassificationRule {
 pub struct HeartbeatConfig {
     /// Enable periodic heartbeat pings. Default: `false`.
     pub enabled: bool,
-    /// Interval in minutes between heartbeat pings. Default: `30`.
+    /// Interval in minutes between heartbeat pings. Default: `5`.
     pub interval_minutes: u32,
     /// Optional fallback task text when `HEARTBEAT.md` has no task entries.
     #[serde(default)]
@@ -2416,7 +2416,7 @@ impl Default for HeartbeatConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            interval_minutes: 30,
+            interval_minutes: 5,
             message: None,
             target: None,
             to: None,
@@ -4974,7 +4974,7 @@ mod tests {
     async fn heartbeat_config_default() {
         let h = HeartbeatConfig::default();
         assert!(!h.enabled);
-        assert_eq!(h.interval_minutes, 30);
+        assert_eq!(h.interval_minutes, 5);
         assert!(h.message.is_none());
         assert!(h.target.is_none());
         assert!(h.to.is_none());

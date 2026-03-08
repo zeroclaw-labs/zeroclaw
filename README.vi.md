@@ -663,7 +663,7 @@ allowed_workspace_roots = []   # allowlist tùy chọn để xác thực workspa
 
 [heartbeat]
 enabled = false
-interval_minutes = 30
+interval_minutes = 5
 
 [tunnel]
 provider = "none"              # "none", "cloudflare", "tailscale", "ngrok", "custom"

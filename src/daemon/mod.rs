@@ -183,7 +183,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     );
     let delivery = heartbeat_delivery_target(&config)?;
 
-    let interval_mins = config.heartbeat.interval_minutes.max(5);
+    let interval_mins = config.heartbeat.interval_minutes.max(1);
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
 
     loop {

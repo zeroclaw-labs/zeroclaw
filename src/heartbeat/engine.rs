@@ -33,7 +33,7 @@ impl HeartbeatEngine {
             return Ok(());
         }
 
-        let interval_mins = self.config.interval_minutes.max(5);
+        let interval_mins = self.config.interval_minutes.max(1);
         info!("💓 Heartbeat started: every {} minutes", interval_mins);
 
         let mut interval = time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
@@ -247,7 +247,7 @@ mod tests {
         let engine = HeartbeatEngine::new(
             HeartbeatConfig {
                 enabled: true,
-                interval_minutes: 30,
+                interval_minutes: 5,
                 ..HeartbeatConfig::default()
             },
             dir.clone(),
@@ -273,7 +273,7 @@ mod tests {
         let engine = HeartbeatEngine::new(
             HeartbeatConfig {
                 enabled: true,
-                interval_minutes: 30,
+                interval_minutes: 5,
                 ..HeartbeatConfig::default()
             },
             dir.clone(),
@@ -291,7 +291,7 @@ mod tests {
         let engine = HeartbeatEngine::new(
             HeartbeatConfig {
                 enabled: false,
-                interval_minutes: 30,
+                interval_minutes: 5,
                 ..HeartbeatConfig::default()
             },
             std::env::temp_dir(),
