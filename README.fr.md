@@ -459,7 +459,7 @@ Voir [Référence de Configuration](docs/config-reference.md#memory) pour toutes
 | ----------------- | ----------- | ------------------- | ---------------------------------------------------- |
 | **Anthropic**     | ✅ Stable   | `ANTHROPIC_API_KEY`       | `claude-sonnet-4-20250514`, `claude-opus-4-20250514`                       |
 | **OpenAI**        | ✅ Stable   | `OPENAI_API_KEY`          | `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini`                                   |
-| **Azure OpenAI**  | ✅ Stable   | `AZURE_OPENAI_API_KEY`    | Via `default_provider = "azure-openai"` et `api_url = "https://..."` |
+| **Azure OpenAI**  | ✅ Stable   | `AZURE_OPENAI_API_KEY`    | Via `default_provider = "azure-openai"` et `base_url = "https://..."` |
 | **Google Gemini** | ✅ Stable   | `GOOGLE_API_KEY`    | `gemini-2.0-flash-exp`, `gemini-exp-1206`            |
 | **Ollama**        | ✅ Stable   | N/A (local)         | `llama3.3`, `qwen2.5`, `phi4`                        |
 | **Cerebras**      | ✅ Stable   | `CEREBRAS_API_KEY`  | `llama-3.3-70b`                                      |
