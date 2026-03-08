@@ -1,4 +1,5 @@
 pub mod log;
+pub mod metrics;
 pub mod multi;
 pub mod noop;
 #[cfg(feature = "observability-otel")]

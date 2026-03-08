@@ -2352,6 +2352,22 @@ pub struct ObservabilityConfig {
     /// Maximum entries retained when runtime_trace_mode = "rolling".
     #[serde(default = "default_runtime_trace_max_entries")]
     pub runtime_trace_max_entries: usize,
+
+    /// Enable the `/health` and `/ready` endpoints on the gateway.
+    #[serde(default = "default_true")]
+    pub health_enabled: bool,
+
+    /// Enable the `/metrics` endpoint on the gateway.
+    #[serde(default = "default_true")]
+    pub metrics_enabled: bool,
+
+    /// Prefix for lightweight atomic metrics (Prometheus metric names).
+    #[serde(default = "default_metrics_prefix")]
+    pub metrics_prefix: String,
+
+    /// Interval (in seconds) between background health check sweeps.
+    #[serde(default = "default_health_check_interval_secs")]
+    pub health_check_interval_secs: u64,
 }
 
 impl Default for ObservabilityConfig {
@@ -2363,6 +2379,10 @@ impl Default for ObservabilityConfig {
             runtime_trace_mode: default_runtime_trace_mode(),
             runtime_trace_path: default_runtime_trace_path(),
             runtime_trace_max_entries: default_runtime_trace_max_entries(),
+            health_enabled: true,
+            metrics_enabled: true,
+            metrics_prefix: default_metrics_prefix(),
+            health_check_interval_secs: default_health_check_interval_secs(),
         }
     }
 }
@@ -2377,6 +2397,14 @@ fn default_runtime_trace_path() -> String {
 
 fn default_runtime_trace_max_entries() -> usize {
     200
+}
+
+fn default_metrics_prefix() -> String {
+    "zeroclaw".to_string()
+}
+
+fn default_health_check_interval_secs() -> u64 {
+    30
 }
 
 // ── Hooks ────────────────────────────────────────────────────────
