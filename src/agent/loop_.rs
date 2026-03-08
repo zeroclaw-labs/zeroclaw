@@ -14,7 +14,7 @@ use anyhow::Result;
 use regex::{Regex, RegexSet};
 use std::collections::HashSet;
 use std::fmt::Write;
-use std::io::Write as _;
+use std::io::{BufRead as _, Write as _};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -3054,8 +3054,9 @@ pub async fn run(
             print!("> ");
             let _ = std::io::stdout().flush();
 
-            let mut input = String::new();
-            match std::io::stdin().read_line(&mut input) {
+            // 使用字节级读取避免 kubectl exec PTY 链路中 UTF-8 多字节字符被拆帧导致的解码错误
+            let mut raw_buf = Vec::new();
+            match std::io::stdin().lock().read_until(b'\n', &mut raw_buf) {
                 Ok(0) => break,
                 Ok(_) => {}
                 Err(e) => {
@@ -3064,7 +3065,7 @@ pub async fn run(
                 }
             }
 
-            let user_input = input.trim().to_string();
+            let user_input = String::from_utf8_lossy(&raw_buf).trim().to_string();
             if user_input.is_empty() {
                 continue;
             }
@@ -3085,10 +3086,11 @@ pub async fn run(
                     print!("Continue? [y/N] ");
                     let _ = std::io::stdout().flush();
 
-                    let mut confirm = String::new();
-                    if std::io::stdin().read_line(&mut confirm).is_err() {
+                    let mut confirm_buf = Vec::new();
+                    if std::io::stdin().lock().read_until(b'\n', &mut confirm_buf).is_err() {
                         continue;
                     }
+                    let confirm = String::from_utf8_lossy(&confirm_buf);
                     if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
                         println!("Cancelled.\n");
                         continue;
