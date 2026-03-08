@@ -373,12 +373,22 @@ impl KnowledgeGraph {
         Ok(results)
     }
 
+    /// Maximum allowed subgraph traversal depth.
+    const MAX_SUBGRAPH_DEPTH: usize = 100;
+
     /// Extract a subgraph starting from `root_id` up to `depth` hops.
+    ///
+    /// `depth` must be between 1 and [`Self::MAX_SUBGRAPH_DEPTH`] (100).
     pub fn get_subgraph(
         &self,
         root_id: &str,
         depth: usize,
     ) -> anyhow::Result<(Vec<KnowledgeNode>, Vec<KnowledgeEdge>)> {
+        if depth == 0 {
+            anyhow::bail!("subgraph depth must be greater than 0");
+        }
+        let depth = depth.min(Self::MAX_SUBGRAPH_DEPTH);
+
         let mut visited: HashSet<String> = HashSet::new();
         let mut frontier = vec![root_id.to_string()];
         let mut nodes = Vec::new();
