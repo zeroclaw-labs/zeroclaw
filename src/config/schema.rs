@@ -668,42 +668,122 @@ fn default_transcription_max_duration_secs() -> u64 {
     120
 }
 
-/// Voice transcription configuration (Whisper API via Groq).
+fn default_transcription_provider() -> String {
+    "groq".into()
+}
+
+fn default_openai_stt_model() -> String {
+    "whisper-1".into()
+}
+
+fn default_deepgram_stt_model() -> String {
+    "nova-2".into()
+}
+
+fn default_google_stt_language_code() -> String {
+    "en-US".into()
+}
+
+/// Voice transcription configuration with multi-provider support.
+///
+/// The top-level `api_url`, `model`, and `api_key` fields remain for backward
+/// compatibility with existing Groq-based configurations.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
     #[serde(default)]
     pub enabled: bool,
-    /// API key used for transcription requests.
+    /// Default STT provider: "groq", "openai", "deepgram", "assemblyai", "google".
+    #[serde(default = "default_transcription_provider")]
+    pub default_provider: String,
+    /// API key used for transcription requests (Groq provider).
     ///
     /// If unset, runtime falls back to `GROQ_API_KEY` for backward compatibility.
     #[serde(default)]
     pub api_key: Option<String>,
-    /// Whisper API endpoint URL.
+    /// Whisper API endpoint URL (Groq provider).
     #[serde(default = "default_transcription_api_url")]
     pub api_url: String,
-    /// Whisper model name.
+    /// Whisper model name (Groq provider).
     #[serde(default = "default_transcription_model")]
     pub model: String,
-    /// Optional language hint (ISO-639-1, e.g. "en", "ru").
+    /// Optional language hint (ISO-639-1, e.g. "en", "ru") for Groq provider.
     #[serde(default)]
     pub language: Option<String>,
     /// Maximum voice duration in seconds (messages longer than this are skipped).
     #[serde(default = "default_transcription_max_duration_secs")]
     pub max_duration_secs: u64,
+    /// OpenAI Whisper STT provider configuration.
+    #[serde(default)]
+    pub openai: Option<OpenAiSttConfig>,
+    /// Deepgram STT provider configuration.
+    #[serde(default)]
+    pub deepgram: Option<DeepgramSttConfig>,
+    /// AssemblyAI STT provider configuration.
+    #[serde(default)]
+    pub assemblyai: Option<AssemblyAiSttConfig>,
+    /// Google Cloud Speech-to-Text provider configuration.
+    #[serde(default)]
+    pub google: Option<GoogleSttConfig>,
 }
 
 impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            default_provider: default_transcription_provider(),
             api_key: None,
             api_url: default_transcription_api_url(),
             model: default_transcription_model(),
             language: None,
             max_duration_secs: default_transcription_max_duration_secs(),
+            openai: None,
+            deepgram: None,
+            assemblyai: None,
+            google: None,
         }
     }
+}
+
+/// OpenAI Whisper STT provider configuration (`[transcription.openai]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OpenAiSttConfig {
+    /// OpenAI API key for Whisper transcription.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Whisper model name (default: "whisper-1").
+    #[serde(default = "default_openai_stt_model")]
+    pub model: String,
+}
+
+/// Deepgram STT provider configuration (`[transcription.deepgram]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DeepgramSttConfig {
+    /// Deepgram API key.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Deepgram model name (default: "nova-2").
+    #[serde(default = "default_deepgram_stt_model")]
+    pub model: String,
+}
+
+/// AssemblyAI STT provider configuration (`[transcription.assemblyai]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AssemblyAiSttConfig {
+    /// AssemblyAI API key.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+/// Google Cloud Speech-to-Text provider configuration (`[transcription.google]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GoogleSttConfig {
+    /// Google Cloud API key.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// BCP-47 language code (default: "en-US").
+    #[serde(default = "default_google_stt_language_code")]
+    pub language_code: String,
 }
 
 // ── MCP ─────────────────────────────────────────────────────────
@@ -6818,10 +6898,7 @@ pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Re
         );
     }
 
-    #[cfg(unix)]
     sync_directory(&default_config_dir).await?;
-    #[cfg(not(unix))]
-    sync_directory(&default_config_dir)?;
     Ok(())
 }
 
@@ -9749,10 +9826,7 @@ impl Config {
                 })?;
         }
 
-        #[cfg(unix)]
         sync_directory(parent_dir).await?;
-        #[cfg(not(unix))]
-        sync_directory(parent_dir)?;
 
         if had_existing_config {
             let _ = fs::remove_file(&backup_path).await;
@@ -9774,7 +9848,7 @@ async fn sync_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn sync_directory(path: &Path) -> Result<()> {
+async fn sync_directory(path: &Path) -> Result<()> {
     let _ = path;
     Ok(())
 }
@@ -10830,10 +10904,7 @@ denied_tools = ["shell"]
         ));
         fs::create_dir_all(&dir).await.unwrap();
 
-        #[cfg(unix)]
         sync_directory(&dir).await.unwrap();
-        #[cfg(not(unix))]
-        sync_directory(&dir).unwrap();
 
         let _ = fs::remove_dir_all(&dir).await;
     }
