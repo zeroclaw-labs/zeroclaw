@@ -442,7 +442,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
             custom_provider_auth_header: config.effective_custom_provider_auth_header(),
             max_tokens_override: None,
-            model_support_vision: config.model_support_vision,
+            model_support_vision: None,
+            service_tier: config.provider.service_tier.clone(),
         },
     )?);
     let model = config
