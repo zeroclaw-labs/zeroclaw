@@ -512,7 +512,16 @@ impl Channel for WhatsAppWebChannel {
             *self.client.lock() = None;
             if let Some(handle) = self.bot_handle.lock().take() {
                 handle.abort();
+                // Await the aborted task so background I/O finishes before
+                // we delete session files.
+                let _ = handle.await;
             }
+
+            // Drop bot/device/backend so the SQLite connection is closed
+            // before we remove session files (releases WAL/SHM locks).
+            drop(bot);
+            drop(device);
+            drop(backend);
 
             if should_reconnect {
                 let attempts = retry_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -523,17 +532,23 @@ impl Channel for WhatsAppWebChannel {
                     );
                 }
 
-                // Remove the session file so the next iteration triggers fresh QR pairing.
-                match tokio::fs::remove_file(&expanded_session_path).await {
-                    Ok(()) => tracing::info!(
-                        "WhatsApp Web: session file removed, restarting for QR pairing"
-                    ),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => tracing::warn!(
-                        "WhatsApp Web: failed to remove session file {}: {e}",
-                        expanded_session_path
-                    ),
+                // Remove the session DB and its WAL/SHM sidecars so the next
+                // iteration triggers fresh QR pairing.
+                for path in [
+                    expanded_session_path.clone(),
+                    format!("{expanded_session_path}-wal"),
+                    format!("{expanded_session_path}-shm"),
+                ] {
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => tracing::warn!(
+                            "WhatsApp Web: failed to remove session file {}: {e}",
+                            path
+                        ),
+                    }
                 }
+                tracing::info!("WhatsApp Web: session files removed, restarting for QR pairing");
 
                 let delay = std::cmp::min(
                     BASE_DELAY_SECS.saturating_mul(2u64.saturating_pow(attempts - 1)),
