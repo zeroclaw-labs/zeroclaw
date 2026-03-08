@@ -288,14 +288,21 @@ impl Channel for WhatsAppWebChannel {
         use wa_rs_tokio_transport::TokioWebSocketTransportFactory;
         use wa_rs_ureq_http::UreqHttpClient;
 
+        let mut retry_count = 0u32;
+        const MAX_RETRIES: u32 = 10;
+        const BASE_DELAY_SECS: u64 = 3;
+        const MAX_DELAY_SECS: u64 = 300;
+
         loop {
+            let expanded_session_path = shellexpand::tilde(&self.session_path).to_string();
+
             tracing::info!(
                 "WhatsApp Web channel starting (session: {})",
-                self.session_path
+                expanded_session_path
             );
 
             // Initialize storage backend
-            let storage = RusqliteStore::new(&self.session_path)?;
+            let storage = RusqliteStore::new(&expanded_session_path)?;
             let backend = Arc::new(storage);
 
             // Check if we have a saved device to load
@@ -349,9 +356,13 @@ impl Channel for WhatsAppWebChannel {
                                 let chat = info.source.chat.to_string();
 
                                 tracing::info!(
-                                    "WhatsApp Web message from {} in {}: {}",
+                                    "WhatsApp Web message from {} in {} (len={})",
                                     sender,
                                     chat,
+                                    text.len()
+                                );
+                                tracing::debug!(
+                                    "WhatsApp Web message content: {}",
                                     text
                                 );
 
@@ -473,6 +484,10 @@ impl Channel for WhatsAppWebChannel {
             // Store the bot handle for later shutdown
             *self.bot_handle.lock() = Some(bot_handle);
 
+            // Bot started successfully — reset retry counter so transient
+            // disconnects don't accumulate toward the cap.
+            retry_count = 0;
+
             // Wait for a logout signal or process shutdown.
             let should_reconnect = select! {
                 res = logout_rx.recv() => {
@@ -492,19 +507,37 @@ impl Channel for WhatsAppWebChannel {
             }
 
             if should_reconnect {
+                retry_count += 1;
+                if retry_count > MAX_RETRIES {
+                    anyhow::bail!(
+                        "WhatsApp Web: exceeded {} reconnect attempts, giving up",
+                        MAX_RETRIES
+                    );
+                }
+
                 // Remove the session file so the next iteration triggers fresh QR pairing.
-                let expanded = shellexpand::tilde(&self.session_path).to_string();
-                match tokio::fs::remove_file(&expanded).await {
+                match tokio::fs::remove_file(&expanded_session_path).await {
                     Ok(()) => tracing::info!(
                         "WhatsApp Web: session file removed, restarting for QR pairing"
                     ),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => tracing::warn!(
-                        "WhatsApp Web: failed to remove session file {expanded}: {e}"
+                        "WhatsApp Web: failed to remove session file {}: {e}",
+                        expanded_session_path
                     ),
                 }
-                // Brief pause before reconnect to avoid hammering the server.
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                let delay = std::cmp::min(
+                    BASE_DELAY_SECS.saturating_mul(2u64.saturating_pow(retry_count - 1)),
+                    MAX_DELAY_SECS,
+                );
+                tracing::info!(
+                    "WhatsApp Web: reconnecting in {}s (attempt {}/{})",
+                    delay,
+                    retry_count,
+                    MAX_RETRIES
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 continue;
             }
 
