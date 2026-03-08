@@ -2004,25 +2004,28 @@ mod tests {
         // Azure OpenAI requires api_url, should fail without it
         assert!(create_provider("azure-openai", Some("test-key")).is_err());
         assert!(create_provider("azure_openai", Some("test-key")).is_err());
-        
+
         // Should succeed with base_url
         assert!(create_provider_with_url(
-            "azure-openai", 
-            Some("test-key"), 
+            "azure-openai",
+            Some("test-key"),
             Some("https://test.openai.azure.com")
-        ).is_ok());
+        )
+        .is_ok());
         assert!(create_provider_with_url(
-            "azure_openai", 
-            Some("test-key"), 
+            "azure_openai",
+            Some("test-key"),
             Some("https://test.openai.azure.com")
-        ).is_ok());
-        
+        )
+        .is_ok());
+
         // Should work without API key (will be checked at runtime)
         assert!(create_provider_with_url(
-            "azure-openai", 
-            None, 
+            "azure-openai",
+            None,
             Some("https://test.openai.azure.com")
-        ).is_ok());
+        )
+        .is_ok());
     }
 
     #[test]

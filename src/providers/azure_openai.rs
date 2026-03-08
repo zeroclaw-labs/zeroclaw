@@ -5,7 +5,8 @@ use crate::providers::traits::{
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};use std::time::Duration;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
 pub struct AzureOpenAiProvider {
     base_url: String,
     api_key: Option<String>,
@@ -241,7 +242,10 @@ impl AzureOpenAiProvider {
                         if let Some(tool_call_id) = parsed.get("tool_call_id") {
                             return NativeMessage {
                                 role: m.role.clone(),
-                                content: parsed.get("content").and_then(|c| c.as_str()).map(ToString::to_string),
+                                content: parsed
+                                    .get("content")
+                                    .and_then(|c| c.as_str())
+                                    .map(ToString::to_string),
                                 tool_call_id: tool_call_id.as_str().map(ToString::to_string),
                                 tool_calls: None,
                                 reasoning_content: None,
@@ -267,13 +271,13 @@ impl AzureOpenAiProvider {
         let content = message.content.clone();
         let reasoning_content = message.reasoning_content.clone();
         let tool_calls_data = message.tool_calls.clone();
-        
+
         // Generate text using the same logic as effective_content
         let text = match &content {
             Some(c) if !c.is_empty() => c.clone(),
             _ => reasoning_content.clone().unwrap_or_default(),
         };
-        
+
         let tool_calls = tool_calls_data
             .unwrap_or_default()
             .into_iter()
@@ -333,7 +337,9 @@ impl Provider for AzureOpenAiProvider {
             })
             .collect();
 
-        ToolsPayload::OpenAI { tools: openai_tools }
+        ToolsPayload::OpenAI {
+            tools: openai_tools,
+        }
     }
 
     async fn chat_with_system(
@@ -344,7 +350,9 @@ impl Provider for AzureOpenAiProvider {
         temperature: f64,
     ) -> anyhow::Result<String> {
         let api_key = self.api_key.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("Azure OpenAI API key not set. Set AZURE_OPENAI_API_KEY or edit config.toml.")
+            anyhow::anyhow!(
+                "Azure OpenAI API key not set. Set AZURE_OPENAI_API_KEY or edit config.toml."
+            )
         })?;
 
         let mut messages = Vec::new();
@@ -397,7 +405,9 @@ impl Provider for AzureOpenAiProvider {
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
         let api_key = self.api_key.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("Azure OpenAI API key not set. Set AZURE_OPENAI_API_KEY or edit config.toml.")
+            anyhow::anyhow!(
+                "Azure OpenAI API key not set. Set AZURE_OPENAI_API_KEY or edit config.toml."
+            )
         })?;
 
         let tools = Self::convert_tools(request.tools);
@@ -427,14 +437,14 @@ impl Provider for AzureOpenAiProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         });
-        
+
         let message = native_response
             .choices
             .into_iter()
             .next()
             .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from Azure OpenAI"))?;
-        
+
         let mut result = Self::parse_native_response(message);
         result.usage = usage;
         Ok(result)
@@ -452,7 +462,9 @@ impl Provider for AzureOpenAiProvider {
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
         let api_key = self.api_key.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("Azure OpenAI API key not set. Set AZURE_OPENAI_API_KEY or edit config.toml.")
+            anyhow::anyhow!(
+                "Azure OpenAI API key not set. Set AZURE_OPENAI_API_KEY or edit config.toml."
+            )
         })?;
 
         let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
@@ -493,14 +505,14 @@ impl Provider for AzureOpenAiProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         });
-        
+
         let message = native_response
             .choices
             .into_iter()
             .next()
             .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from Azure OpenAI"))?;
-        
+
         let mut result = Self::parse_native_response(message);
         result.usage = usage;
         Ok(result)
@@ -529,29 +541,22 @@ mod tests {
 
     #[test]
     fn creates_with_all_params() {
-        let provider = AzureOpenAiProvider::new(
-            "https://my-resource.openai.azure.com",
-            Some("test-key")
-        );
+        let provider =
+            AzureOpenAiProvider::new("https://my-resource.openai.azure.com", Some("test-key"));
         assert_eq!(provider.base_url, "https://my-resource.openai.azure.com");
         assert_eq!(provider.api_key.as_deref(), Some("test-key"));
     }
 
     #[test]
     fn creates_without_key() {
-        let provider = AzureOpenAiProvider::new(
-            "https://my-resource.openai.azure.com",
-            None
-        );
+        let provider = AzureOpenAiProvider::new("https://my-resource.openai.azure.com", None);
         assert!(provider.api_key.is_none());
     }
 
     #[test]
     fn chat_completions_url_is_correct() {
-        let provider = AzureOpenAiProvider::new(
-            "https://my-resource.openai.azure.com",
-            Some("test-key")
-        );
+        let provider =
+            AzureOpenAiProvider::new("https://my-resource.openai.azure.com", Some("test-key"));
         let url = provider.chat_completions_url("gpt-5.2-chat");
         assert_eq!(
             url,
@@ -561,20 +566,17 @@ mod tests {
 
     #[test]
     fn strips_trailing_slash_from_base_url() {
-        let provider = AzureOpenAiProvider::new(
-            "https://my-resource.openai.azure.com/",
-            Some("test-key")
-        );
+        let provider =
+            AzureOpenAiProvider::new("https://my-resource.openai.azure.com/", Some("test-key"));
         assert_eq!(provider.base_url, "https://my-resource.openai.azure.com");
     }
 
     #[tokio::test]
     async fn chat_fails_without_key() {
-        let provider = AzureOpenAiProvider::new(
-            "https://my-resource.openai.azure.com",
-            None
-        );
-        let result = provider.chat_with_system(None, "hello", "gpt-5.2-chat", 0.7).await;
+        let provider = AzureOpenAiProvider::new("https://my-resource.openai.azure.com", None);
+        let result = provider
+            .chat_with_system(None, "hello", "gpt-5.2-chat", 0.7)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key not set"));
     }
@@ -653,10 +655,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_fails_without_key() {
-        let provider = AzureOpenAiProvider::new(
-            "https://my-resource.openai.azure.com",
-            None
-        );
+        let provider = AzureOpenAiProvider::new("https://my-resource.openai.azure.com", None);
         let messages = vec![ChatMessage::user("hello".to_string())];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -672,28 +671,28 @@ mod tests {
                 }
             }
         })];
-        let result = provider.chat_with_tools(&messages, &tools, "gpt-5.2-chat", 0.7).await;
+        let result = provider
+            .chat_with_tools(&messages, &tools, "gpt-5.2-chat", 0.7)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key not set"));
     }
 
     #[test]
     fn url_generation_with_different_models() {
-        let provider = AzureOpenAiProvider::new(
-            "https://my-resource.openai.azure.com",
-            Some("test-key")
-        );
-        
+        let provider =
+            AzureOpenAiProvider::new("https://my-resource.openai.azure.com", Some("test-key"));
+
         // Test different model/deployment names
         let url1 = provider.chat_completions_url("gpt-5.2-chat");
         assert!(url1.contains("/deployments/gpt-5.2-chat/"));
-        
+
         let url2 = provider.chat_completions_url("gpt-4o");
         assert!(url2.contains("/deployments/gpt-4o/"));
-        
+
         let url3 = provider.chat_completions_url("custom-deployment");
         assert!(url3.contains("/deployments/custom-deployment/"));
-        
+
         // All URLs should have the correct API version
         assert!(url1.contains("api-version=2024-10-21"));
         assert!(url2.contains("api-version=2024-10-21"));
@@ -702,19 +701,15 @@ mod tests {
 
     #[test]
     fn supports_native_tools() {
-        let provider = AzureOpenAiProvider::new(
-            "https://my-resource.openai.azure.com",
-            Some("test-key")
-        );
+        let provider =
+            AzureOpenAiProvider::new("https://my-resource.openai.azure.com", Some("test-key"));
         assert!(provider.supports_native_tools());
     }
 
     #[test]
     fn capabilities_include_native_tool_calling() {
-        let provider = AzureOpenAiProvider::new(
-            "https://my-resource.openai.azure.com",
-            Some("test-key")
-        );
+        let provider =
+            AzureOpenAiProvider::new("https://my-resource.openai.azure.com", Some("test-key"));
         let capabilities = provider.capabilities();
         assert!(capabilities.native_tool_calling);
         assert!(!capabilities.vision); // Azure OpenAI doesn't support vision in this implementation
@@ -735,7 +730,7 @@ mod tests {
             tools: None,
             tool_choice: None,
         };
-        
+
         let json = serde_json::to_string(&native_request).unwrap();
         assert!(json.contains("max_completion_tokens"));
         assert!(json.contains("2048"));
@@ -755,7 +750,7 @@ mod tests {
                 parameters: serde_json::json!({"type": "object"}),
             },
         }];
-        
+
         let native_request = NativeChatRequest {
             messages: vec![NativeMessage {
                 role: "user".to_string(),
@@ -769,7 +764,7 @@ mod tests {
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
         };
-        
+
         let json = serde_json::to_string(&native_request).unwrap();
         assert!(json.contains("tools"));
         assert!(json.contains("tool_choice"));
@@ -780,7 +775,7 @@ mod tests {
     #[test]
     fn convert_tools_creates_correct_format() {
         use crate::tools::ToolSpec;
-        
+
         let tools = vec![ToolSpec {
             name: "shell".to_string(),
             description: "Run shell command".to_string(),
@@ -791,10 +786,10 @@ mod tests {
                 }
             }),
         }];
-        
+
         let converted = AzureOpenAiProvider::convert_tools(Some(&tools));
         assert!(converted.is_some());
-        
+
         let converted_tools = converted.unwrap();
         assert_eq!(converted_tools.len(), 1);
         assert_eq!(converted_tools[0].kind, "function");
@@ -812,10 +807,13 @@ mod tests {
                 "parameters": {}
             }
         });
-        
+
         let result = parse_native_tool_spec(invalid_json);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unsupported tool type"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported tool type"));
     }
 
     #[test]
