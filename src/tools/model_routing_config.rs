@@ -787,6 +787,7 @@ impl ModelRoutingConfigTool {
             max_tokens: None,
             api_key: None,
             transport: None,
+            message_timeout_secs: None,
         });
 
         next_route.hint = hint.clone();

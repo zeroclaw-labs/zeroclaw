@@ -4183,6 +4183,12 @@ pub struct ModelRouteConfig {
     /// Existing configs without this field remain valid.
     #[serde(default)]
     pub transport: Option<String>,
+    /// Optional per-route message timeout override in seconds.
+    /// When set, overrides the global `channels.message_timeout_secs` for this route only.
+    /// Useful for slow reasoning models that need a larger budget than fast models.
+    /// Must be >= 30 when set. Falls back to global setting when absent.
+    #[serde(default)]
+    pub message_timeout_secs: Option<u64>,
 }
 
 // ── Embedding routing ───────────────────────────────────────────
@@ -8698,6 +8704,11 @@ impl Config {
             {
                 anyhow::bail!("model_routes[{i}].transport must be one of: auto, websocket, sse");
             }
+            if let Some(t) = route.message_timeout_secs {
+                if t < 30 {
+                    anyhow::bail!("model_routes[{i}].message_timeout_secs must be >= 30 seconds");
+                }
+            }
         }
 
         if let Some(default_hint) = self
@@ -12625,6 +12636,7 @@ provider_api = "not-a-real-mode"
             max_tokens: Some(0),
             api_key: None,
             transport: None,
+            message_timeout_secs: None,
         }];
 
         let err = config
@@ -12646,6 +12658,7 @@ provider_api = "not-a-real-mode"
             max_tokens: None,
             api_key: None,
             transport: None,
+            message_timeout_secs: None,
         }];
 
         let err = config
@@ -12667,6 +12680,7 @@ provider_api = "not-a-real-mode"
             max_tokens: None,
             api_key: None,
             transport: None,
+            message_timeout_secs: None,
         }];
 
         let result = config.validate();
@@ -12687,6 +12701,7 @@ provider_api = "not-a-real-mode"
             max_tokens: None,
             api_key: None,
             transport: None,
+            message_timeout_secs: None,
         }];
 
         let result = config.validate();
@@ -12728,6 +12743,7 @@ provider_api = "not-a-real-mode"
             max_tokens: None,
             api_key: None,
             transport: Some("udp".to_string()),
+            message_timeout_secs: None,
         }];
 
         let err = config
@@ -12736,6 +12752,67 @@ provider_api = "not-a-real-mode"
         assert!(err
             .to_string()
             .contains("model_routes[0].transport must be one of: auto, websocket, sse"));
+    }
+
+    #[test]
+    async fn model_route_message_timeout_secs_is_optional() {
+        // existing configs without the field deserialize fine
+        let toml = r#"
+            hint = "reasoning"
+            provider = "openai-codex"
+            model = "gpt-5.2"
+        "#;
+        let route: ModelRouteConfig = toml::from_str(toml).unwrap();
+        assert_eq!(route.message_timeout_secs, None);
+    }
+
+    #[test]
+    async fn model_route_message_timeout_secs_parses_when_set() {
+        let toml = r#"
+            hint = "reasoning"
+            provider = "openai-codex"
+            model = "gpt-5.2"
+            message_timeout_secs = 300
+        "#;
+        let route: ModelRouteConfig = toml::from_str(toml).unwrap();
+        assert_eq!(route.message_timeout_secs, Some(300));
+    }
+
+    #[test]
+    async fn model_route_message_timeout_secs_below_minimum_is_rejected() {
+        let mut config = Config::default();
+        config.model_routes = vec![ModelRouteConfig {
+            hint: "reasoning".to_string(),
+            provider: "openai-codex".to_string(),
+            model: "gpt-5.2".to_string(),
+            max_tokens: None,
+            api_key: None,
+            transport: None,
+            message_timeout_secs: Some(10),
+        }];
+        let err = config
+            .validate()
+            .expect_err("message_timeout_secs < 30 should be rejected");
+        assert!(err
+            .to_string()
+            .contains("model_routes[0].message_timeout_secs must be >= 30 seconds"));
+    }
+
+    #[test]
+    async fn model_route_message_timeout_secs_at_minimum_is_accepted() {
+        let mut config = Config::default();
+        config.model_routes = vec![ModelRouteConfig {
+            hint: "reasoning".to_string(),
+            provider: "openai-codex".to_string(),
+            model: "gpt-5.2".to_string(),
+            max_tokens: None,
+            api_key: None,
+            transport: None,
+            message_timeout_secs: Some(30),
+        }];
+        config
+            .validate()
+            .expect("message_timeout_secs = 30 should be accepted");
     }
 
     #[test]
@@ -15607,6 +15684,7 @@ reserve_percent = 15
             api_key: None,
             max_tokens: None,
             transport: None,
+            message_timeout_secs: None,
         }];
 
         config

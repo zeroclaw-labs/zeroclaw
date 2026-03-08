@@ -210,6 +210,7 @@ fn channel_message_timeout_budget_secs(
 struct ChannelRouteSelection {
     provider: String,
     model: String,
+    message_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1942,6 +1943,7 @@ fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection
     ChannelRouteSelection {
         provider: defaults.default_provider,
         model: defaults.model,
+        message_timeout_secs: None,
     }
 }
 
@@ -1978,6 +1980,7 @@ fn classify_message_route(
     Some(ChannelRouteSelection {
         provider: route.provider.clone(),
         model: route.model.clone(),
+        message_timeout_secs: route.message_timeout_secs,
     })
 }
 
@@ -4117,8 +4120,11 @@ If this input is legitimate, rephrase the request and avoid instruction-override
         Cancelled,
     }
 
+    let effective_timeout_secs = route
+        .message_timeout_secs
+        .unwrap_or(runtime_defaults.message_timeout_secs);
     let timeout_budget_secs = channel_message_timeout_budget_secs(
-        runtime_defaults.message_timeout_secs,
+        effective_timeout_secs,
         runtime_defaults.max_tool_iterations,
     );
     let cost_enforcement_context = crate::agent::loop_::create_cost_enforcement_context(
@@ -4573,9 +4579,10 @@ If this input is legitimate, rephrase the request and avoid instruction-override
         }
         LlmExecutionResult::Completed(Err(_)) => {
             let timeout_msg = format!(
-                "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
+                "LLM response timed out after {}s (base={}s, route_override={}, max_tool_iterations={})",
                 timeout_budget_secs,
-                runtime_defaults.message_timeout_secs,
+                effective_timeout_secs,
+                route.message_timeout_secs.is_some(),
                 runtime_defaults.max_tool_iterations
             );
             runtime_trace::record_event(
@@ -6307,6 +6314,20 @@ mod tests {
             channel_message_timeout_budget_secs(300, 10),
             300 * CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
         );
+    }
+
+    #[test]
+    fn timeout_budget_uses_route_override_when_present() {
+        // Route has message_timeout_secs = 300; global = 120; iterations = 20 (cap=4)
+        // Expected: 300 * 4 = 1200s
+        assert_eq!(channel_message_timeout_budget_secs(300, 20), 1200);
+    }
+
+    #[test]
+    fn timeout_budget_falls_back_to_global_when_route_has_no_override() {
+        // No route override; global = 120; iterations = 20 (cap=4)
+        // Expected: 120 * 4 = 480s
+        assert_eq!(channel_message_timeout_budget_secs(120, 20), 480);
     }
 
     #[test]
@@ -9861,6 +9882,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ChannelRouteSelection {
                 provider: "openrouter".to_string(),
                 model: "route-model".to_string(),
+                message_timeout_secs: None,
             },
         );
 
@@ -10360,6 +10382,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tokens: Some(512),
             api_key: None,
             transport: None,
+            message_timeout_secs: None,
         }];
         cfg.save().await.expect("save updated config");
 
@@ -10436,6 +10459,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tokens: Some(512),
             api_key: Some("route-specific-key".to_string()),
             transport: Some("sse".to_string()),
+            message_timeout_secs: None,
         }];
 
         let config_path = cfg.config_path.clone();
@@ -13131,6 +13155,7 @@ BTC is currently around $65,000 based on latest tool output."#;
         let current = ChannelRouteSelection {
             provider: "gemini:gemini-1".to_string(),
             model: "gemini-2.5-flash".to_string(),
+            message_timeout_secs: None,
         };
         let configured = vec![
             "gemini:gemini-1".to_string(),
@@ -13158,6 +13183,7 @@ BTC is currently around $65,000 based on latest tool output."#;
         let current = ChannelRouteSelection {
             provider: "openai-codex".to_string(),
             model: "gpt-5.2".to_string(),
+            message_timeout_secs: None,
         };
         let configured = vec!["gemini:gemini-1".to_string(), "openai-codex".to_string()];
         let opened = vec!["gemini:gemini-1".to_string()];
@@ -13178,6 +13204,7 @@ BTC is currently around $65,000 based on latest tool output."#;
         let current = ChannelRouteSelection {
             provider: "openai-codex".to_string(),
             model: "gpt-5.2".to_string(),
+            message_timeout_secs: None,
         };
         let configured = vec![
             "gemini:gemini-1".to_string(),
