@@ -79,7 +79,7 @@ credential is not reused for fallback providers.
 - Uses Azure OpenAI API endpoint format: `{api_url}/openai/deployments/{model}/chat/completions`
 - Uses `api-key` header instead of `Authorization: Bearer` for authentication
 - Request format uses `max_completion_tokens` instead of `max_tokens`
-- API version: `2024-02-15-preview`
+- API version: `2024-10-21`
 - Supports native tool calling
 - **Important**: The `model` parameter represents the Azure deployment name (e.g., "gpt-5.2-chat", "gpt-4o")
 
