@@ -691,7 +691,7 @@ const MINIMAX_ONBOARD_MODELS: [(&str, &str); 5] = [
 fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
-        "azure-openai" => "gpt-4o".into(),
+        "azure-openai" => "gpt-5.2-chat".into(),
         "openai" => "gpt-5.2".into(),
         "openai-codex" => "gpt-5-codex".into(),
         "venice" => "zai-org-glm-5".into(),
@@ -768,21 +768,29 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "azure-openai" => vec![
             (
-                "gpt-4o".to_string(),
-                "gpt-4o deployment (common default — must match your Azure deployment name)"
+                "gpt-5.2-chat".to_string(),
+                "gpt-5.2 chat deployment (latest flagship — must match your Azure deployment name)"
                     .to_string(),
             ),
             (
-                "gpt-4o-mini".to_string(),
-                "gpt-4o-mini deployment (faster, cheaper)".to_string(),
+                "gpt-5-mini".to_string(),
+                "gpt-5-mini deployment (faster, cheaper — must match your Azure deployment name)".to_string(),
+            ),
+            (
+                "gpt-4.1".to_string(),
+                "gpt-4.1 deployment (stable, widely available — must match your Azure deployment name)".to_string(),
+            ),
+            (
+                "gpt-4o".to_string(),
+                "gpt-4o deployment (legacy, broadly deployed — must match your Azure deployment name)".to_string(),
+            ),
+            (
+                "o4-mini".to_string(),
+                "o4-mini deployment (reasoning — must match your Azure deployment name)".to_string(),
             ),
             (
                 "o3-mini".to_string(),
-                "o3-mini deployment (reasoning)".to_string(),
-            ),
-            (
-                "gpt-4-turbo".to_string(),
-                "gpt-4-turbo deployment".to_string(),
+                "o3-mini deployment (reasoning, legacy — must match your Azure deployment name)".to_string(),
             ),
         ],
         "openai" => vec![
@@ -7296,9 +7304,10 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
 
+        assert!(ids.contains(&"gpt-5.2-chat".to_string()));
         assert!(ids.contains(&"gpt-4o".to_string()));
-        assert!(ids.contains(&"gpt-4o-mini".to_string()));
         assert!(ids.contains(&"o3-mini".to_string()));
+        assert!(ids.contains(&"o4-mini".to_string()));
     }
 
     #[test]
@@ -7310,9 +7319,9 @@ mod tests {
     }
 
     #[test]
-    fn default_model_for_azure_openai_is_gpt4o() {
-        assert_eq!(default_model_for_provider("azure-openai"), "gpt-4o");
-        assert_eq!(default_model_for_provider("azure_openai"), "gpt-4o");
+    fn default_model_for_azure_openai_is_gpt52_chat() {
+        assert_eq!(default_model_for_provider("azure-openai"), "gpt-5.2-chat");
+        assert_eq!(default_model_for_provider("azure_openai"), "gpt-5.2-chat");
     }
 
     #[test]
