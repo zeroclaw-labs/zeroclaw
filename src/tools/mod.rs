@@ -51,6 +51,8 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
+pub mod subagent_spawn;
+pub mod subagents;
 pub mod traits;
 pub mod web_fetch;
 pub mod web_search_tool;
@@ -91,12 +93,15 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
+pub use subagent_spawn::SubagentSpawnTool;
+pub use subagents::SubagentsTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 
+use crate::agent::subagent_registry::SubagentRegistry;
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
@@ -189,6 +194,7 @@ pub fn all_tools(
         agents,
         fallback_api_key,
         root_config,
+        None,
     )
 }
 
@@ -208,6 +214,7 @@ pub fn all_tools_with_runtime(
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
+    subagent_registry: Option<Arc<SubagentRegistry>>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ShellTool::new(security.clone(), runtime)),
@@ -312,6 +319,35 @@ pub fn all_tools_with_runtime(
                 security.clone(),
             )));
         }
+    }
+
+    // Add subagent tools when a registry is provided
+    if let Some(registry) = subagent_registry {
+        let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
+            auth_profile_override: None,
+            provider_api_url: root_config.api_url.clone(),
+            zeroclaw_dir: root_config
+                .config_path
+                .parent()
+                .map(std::path::PathBuf::from),
+            secrets_encrypt: root_config.secrets.encrypt,
+            reasoning_enabled: root_config.runtime.reasoning_enabled,
+        };
+        let fallback_cred = fallback_api_key.and_then(|v| {
+            let trimmed = v.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        });
+        let default_provider = root_config
+            .default_provider
+            .clone()
+            .unwrap_or_else(|| "openrouter".to_string());
+        tool_arcs.push(Arc::new(SubagentSpawnTool::new(
+            registry.clone(),
+            provider_runtime_options,
+            fallback_cred,
+            default_provider,
+        )));
+        tool_arcs.push(Arc::new(SubagentsTool::new(registry)));
     }
 
     // Add delegation tool when agents are configured

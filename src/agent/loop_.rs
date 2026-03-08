@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
-const STREAM_CHUNK_MIN_CHARS: usize = 80;
+const STREAM_CHUNK_MIN_CHARS: usize = 20;
 
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
@@ -105,6 +105,32 @@ pub(crate) const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
 /// Sentinel value sent through on_delta to signal the draft updater to clear accumulated text.
 /// Used before streaming the final answer so progress lines are replaced by the clean response.
 pub(crate) const DRAFT_CLEAR_SENTINEL: &str = "\x00CLEAR\x00";
+
+/// Strip internal block tags (thinking, tool_call) from text before
+/// forwarding to channel draft updates. Mirrors OpenClaw's stripBlockTags.
+fn strip_block_tags(text: &str) -> String {
+    let mut result = text.to_string();
+    // Remove <think>...</think> blocks
+    while let Some(start) = result.find("<think>") {
+        if let Some(end) = result[start..].find("</think>") {
+            result = format!("{}{}", &result[..start], &result[start + end + 8..]);
+        } else {
+            // Unclosed tag — remove from <think> to end
+            result = result[..start].to_string();
+            break;
+        }
+    }
+    // Remove <tool_call>...</tool_call> blocks
+    while let Some(start) = result.find("<tool_call>") {
+        if let Some(end) = result[start..].find("</tool_call>") {
+            result = format!("{}{}", &result[..start], &result[start + end + 12..]);
+        } else {
+            result = result[..start].to_string();
+            break;
+        }
+    }
+    result.trim().to_string()
+}
 
 /// Extract a short hint from tool call arguments for progress display.
 fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len: usize) -> String {
@@ -1891,6 +1917,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         &[],
+        None,
     )
     .await
 }
@@ -2081,6 +2108,7 @@ pub(crate) async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    partial_result: Option<std::sync::Arc<tokio::sync::Mutex<String>>>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2097,7 +2125,15 @@ pub(crate) async fn run_tool_call_loop(
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
-    for iteration in 0..max_iterations {
+    let mut loop_detector = crate::agent::loop_detection::ToolLoopDetector::new();
+    let mut last_assistant_text = String::new();
+
+    let mut iteration: usize = 0;
+    loop {
+        iteration += 1;
+        if iteration > max_iterations {
+            anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})");
+        }
         if cancellation_token
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
@@ -2120,15 +2156,7 @@ pub(crate) async fn run_tool_call_loop(
         let prepared_messages =
             multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
 
-        // ── Progress: LLM thinking ────────────────────────────
-        if let Some(ref tx) = on_delta {
-            let phase = if iteration == 0 {
-                "\u{1f914} Thinking...\n".to_string()
-            } else {
-                format!("\u{1f914} Thinking (round {})...\n", iteration + 1)
-            };
-            let _ = tx.send(phase).await;
-        }
+        // Progress messages suppressed — OpenClaw-style clean output.
 
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
@@ -2164,6 +2192,11 @@ pub(crate) async fn run_tool_call_loop(
             None
         };
 
+        // NOTE: We do NOT set_on_delta here.  SSE deltas include everything
+        // the model outputs (tool call markup, reasoning tags, etc.) which
+        // should never be shown to the user.  Instead, the final non-tool-call
+        // response is streamed word-by-word below (after DRAFT_CLEAR_SENTINEL).
+
         let chat_future = provider.chat(
             ChatRequest {
                 messages: &prepared_messages.messages,
@@ -2181,6 +2214,9 @@ pub(crate) async fn run_tool_call_loop(
         } else {
             chat_future.await
         };
+
+        // No streaming sender to clear — delta forwarding is disabled
+        // during tool iterations to keep output clean.
 
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
             match chat_result {
@@ -2202,6 +2238,13 @@ pub(crate) async fn run_tool_call_loop(
                     });
 
                     let response_text = resp.text_or_empty().to_string();
+                    // Save the latest non-empty model text so the channel can
+                    // deliver a partial result if the overall request times out.
+                    if !response_text.is_empty() {
+                        if let Some(ref pr) = partial_result {
+                            *pr.lock().await = response_text.clone();
+                        }
+                    }
                     // First try native structured tool calls (OpenAI-format).
                     // Fall back to text-based parsing (XML tags, markdown blocks,
                     // GLM format) only if the provider returned no native calls —
@@ -2321,18 +2364,7 @@ pub(crate) async fn run_tool_call_loop(
             parsed_text
         };
 
-        // ── Progress: LLM responded ─────────────────────────────
-        if let Some(ref tx) = on_delta {
-            let llm_secs = llm_started_at.elapsed().as_secs();
-            if !tool_calls.is_empty() {
-                let _ = tx
-                    .send(format!(
-                        "\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
-                        tool_calls.len()
-                    ))
-                    .await;
-            }
-        }
+        // ── Progress: LLM responded (suppressed) ──────────────────
 
         if tool_calls.is_empty() {
             runtime_trace::record_event(
@@ -2379,10 +2411,26 @@ pub(crate) async fn run_tool_call_loop(
             return Ok(display_text);
         }
 
+        // Track last assistant text for circuit breaker fallback.
+        last_assistant_text = display_text.clone();
+
         // Print any text the LLM produced alongside tool calls (unless silent)
         if !silent && !display_text.is_empty() {
-            print!("{display_text}");
-            let _ = std::io::stdout().flush();
+            eprint!("{display_text}");
+            let _ = std::io::stderr().flush();
+        }
+
+        // Stream intermediate assistant text during tool iterations so channel
+        // users (e.g. Telegram) see progress instead of a blank screen.
+        // Don't send DRAFT_CLEAR_SENTINEL — that's only for the final response.
+        if !display_text.is_empty() {
+            if let Some(ref tx) = on_delta {
+                // Strip thinking/tool tags before forwarding to avoid leaking internals
+                let clean = strip_block_tags(&display_text);
+                if !clean.is_empty() {
+                    let _ = tx.send(clean).await;
+                }
+            }
         }
 
         // Execute tool calls and build results. `individual_results` tracks per-call output so
@@ -2539,17 +2587,7 @@ pub(crate) async fn run_tool_call_loop(
                 }),
             );
 
-            // ── Progress: tool start ────────────────────────────
-            if let Some(ref tx) = on_delta {
-                let hint = truncate_tool_args_for_progress(&tool_name, &tool_args, 60);
-                let progress = if hint.is_empty() {
-                    format!("\u{23f3} {}\n", tool_name)
-                } else {
-                    format!("\u{23f3} {}: {hint}\n", tool_name)
-                };
-                tracing::debug!(tool = %tool_name, "Sending progress start to draft");
-                let _ = tx.send(progress).await;
-            }
+            // Tool progress suppressed — clean output like OpenClaw.
 
             executable_indices.push(idx);
             executable_calls.push(ParsedToolCall {
@@ -2577,6 +2615,7 @@ pub(crate) async fn run_tool_call_loop(
             .await?
         };
 
+        let mut circuit_break = false;
         for ((idx, call), outcome) in executable_indices
             .iter()
             .zip(executable_calls.iter())
@@ -2610,16 +2649,22 @@ pub(crate) async fn run_tool_call_loop(
                     .await;
             }
 
-            // ── Progress: tool completion ───────────────────────
-            if let Some(ref tx) = on_delta {
-                let secs = outcome.duration.as_secs();
-                let icon = if outcome.success {
-                    "\u{2705}"
-                } else {
-                    "\u{274c}"
-                };
-                tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
-                let _ = tx.send(format!("{icon} {} ({secs}s)\n", call.name)).await;
+            // ── Progress: tool completion (suppressed) ────────────
+
+            // Loop detection: record call+result and check for stall.
+            let params_repr = call.arguments.to_string();
+            match loop_detector.record(&call.name, &params_repr, &outcome.output) {
+                crate::agent::loop_detection::LoopDetectionResult::Warning(msg) => {
+                    tracing::warn!(tool = %call.name, "{}", msg);
+                }
+                crate::agent::loop_detection::LoopDetectionResult::Critical(msg) => {
+                    tracing::error!(tool = %call.name, "{}", msg);
+                }
+                crate::agent::loop_detection::LoopDetectionResult::CircuitBreaker(msg) => {
+                    tracing::error!(tool = %call.name, "circuit breaker: {}", msg);
+                    circuit_break = true;
+                }
+                crate::agent::loop_detection::LoopDetectionResult::Ok => {}
             }
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
@@ -2634,6 +2679,12 @@ pub(crate) async fn run_tool_call_loop(
                     tool_name, outcome.output
                 );
             }
+        }
+
+        if circuit_break {
+            tracing::error!("Tool loop circuit breaker triggered — aborting loop and returning best available response");
+            history.push(ChatMessage::assistant(last_assistant_text.clone()));
+            return Ok(last_assistant_text);
         }
 
         // Add assistant message with tool calls + tool results to history.
@@ -2671,19 +2722,10 @@ pub(crate) async fn run_tool_call_loop(
         }
     }
 
-    runtime_trace::record_event(
-        "tool_loop_exhausted",
-        Some(channel_name),
-        Some(provider_name),
-        Some(model),
-        Some(&turn_id),
-        Some(false),
-        Some("agent exceeded maximum tool iterations"),
-        serde_json::json!({
-            "max_iterations": max_iterations,
-        }),
-    );
-    anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+    // Unreachable — the loop exits via `return Ok(...)` when the model
+    // produces a response without tool calls.
+    #[allow(unreachable_code)]
+    Ok(String::new())
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -2782,6 +2824,7 @@ pub async fn run(
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        None,
     );
 
     let peripheral_tools: Vec<Box<dyn Tool>> =
@@ -3037,6 +3080,7 @@ pub async fn run(
             None,
             None,
             &[],
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -3159,6 +3203,7 @@ pub async fn run(
                 None,
                 None,
                 &[],
+                None,
             )
             .await
             {
@@ -3250,6 +3295,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        None,
     );
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
@@ -3703,6 +3749,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3749,6 +3796,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3789,6 +3837,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -3915,6 +3964,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -3984,6 +4034,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4040,6 +4091,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("native fallback id flow should complete");

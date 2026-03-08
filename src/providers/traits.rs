@@ -388,6 +388,12 @@ pub trait Provider: Send + Sync {
         self.capabilities().vision
     }
 
+    /// Set a channel for forwarding streaming text deltas to the caller.
+    fn set_on_delta(&self, _tx: tokio::sync::mpsc::Sender<String>) {}
+
+    /// Clear the streaming delta channel.
+    fn clear_on_delta(&self) {}
+
     /// Warm up the HTTP connection pool (TLS handshake, DNS, HTTP/2 setup).
     /// Default implementation is a no-op; providers with HTTP clients should override.
     async fn warmup(&self) -> anyhow::Result<()> {

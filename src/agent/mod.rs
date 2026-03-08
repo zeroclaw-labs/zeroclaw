@@ -3,8 +3,10 @@ pub mod agent;
 pub mod classifier;
 pub mod dispatcher;
 pub mod loop_;
+pub mod loop_detection;
 pub mod memory_loader;
 pub mod prompt;
+pub mod subagent_registry;
 
 #[cfg(test)]
 mod tests;

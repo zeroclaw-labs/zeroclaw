@@ -1,19 +1,312 @@
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::auth::AuthService;
 use crate::multimodal;
-use crate::providers::traits::{ChatMessage, Provider, ProviderCapabilities};
+use crate::providers::traits::{
+    ChatMessage, ChatRequest, ChatResponse, Provider, ProviderCapabilities, ToolCall,
+    ToolsPayload, TokenUsage,
+};
 use crate::providers::ProviderRuntimeOptions;
 use async_trait::async_trait;
+use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+/// Internal response from Codex API carrying both text and optional native tool calls.
+struct CodexResponse {
+    text: String,
+    tool_calls: Vec<ToolCall>,
+    usage: Option<TokenUsage>,
+}
 
 const DEFAULT_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const CODEX_RESPONSES_URL_ENV: &str = "ZEROCLAW_CODEX_RESPONSES_URL";
 const CODEX_BASE_URL_ENV: &str = "ZEROCLAW_CODEX_BASE_URL";
 const DEFAULT_CODEX_INSTRUCTIONS: &str =
     "You are ZeroClaw, a concise and helpful coding assistant.";
+
+/// Transport mode for the OpenAI Codex Responses API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    /// Try WebSocket first, fall back to SSE on failure.
+    Auto,
+    /// Always use a persistent WebSocket connection.
+    WebSocket,
+    /// Always use HTTP POST + SSE streaming (original behavior).
+    Sse,
+}
+
+impl Transport {
+    fn from_str_lossy(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "websocket" | "ws" => Self::WebSocket,
+            "sse" | "http" => Self::Sse,
+            _ => Self::Auto,
+        }
+    }
+}
+
+/// Type alias for the WebSocket stream to avoid long generic signatures.
+type WsStream = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
+/// Manages a persistent WebSocket connection to the OpenAI Responses API.
+struct WsConnectionManager {
+    conn: tokio::sync::Mutex<Option<WsStream>>,
+    url: String,
+}
+
+impl WsConnectionManager {
+    fn new(url: String) -> Self {
+        Self {
+            conn: tokio::sync::Mutex::new(None),
+            url,
+        }
+    }
+
+    /// Convert an HTTPS URL to its WSS equivalent.
+    fn to_ws_url(url: &str) -> String {
+        if url.starts_with("https://") {
+            format!("wss://{}", &url["https://".len()..])
+        } else if url.starts_with("http://") {
+            format!("ws://{}", &url["http://".len()..])
+        } else {
+            url.to_string()
+        }
+    }
+
+    /// Establish a new WebSocket connection with auth headers.
+    async fn connect(
+        &self,
+        bearer_token: &str,
+        account_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let ws_url = Self::to_ws_url(&self.url);
+        tracing::info!(url = %ws_url, "Opening WebSocket connection to OpenAI Codex");
+
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = ws_url
+            .into_client_request()
+            .map_err(|e| anyhow::anyhow!("Failed to build WS request: {e}"))?;
+
+        let headers = request.headers_mut();
+        headers.insert(
+            "Authorization",
+            format!("Bearer {bearer_token}")
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Invalid auth header: {e}"))?,
+        );
+        headers.insert(
+            "OpenAI-Beta",
+            "responses-websocket=v1"
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid OpenAI-Beta header"))?,
+        );
+        if let Some(acct) = account_id {
+            headers.insert(
+                "chatgpt-account-id",
+                acct.parse()
+                    .map_err(|e| anyhow::anyhow!("Invalid account-id header: {e}"))?,
+            );
+        }
+
+        let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("WebSocket connection failed: {e}"))?;
+
+        tracing::info!("WebSocket connection established");
+        let mut guard = self.conn.lock().await;
+        *guard = Some(ws_stream);
+        Ok(())
+    }
+
+    /// Ensure the connection is alive, reconnecting with exponential backoff if needed.
+    async fn ensure_connected(
+        &self,
+        bearer_token: &str,
+        account_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        // Check if we already have a connection.
+        {
+            let guard = self.conn.lock().await;
+            if guard.is_some() {
+                return Ok(());
+            }
+        }
+
+        // Reconnect with exponential backoff: 1s, 2s, 4s, 8s, 16s
+        let mut delay = std::time::Duration::from_secs(1);
+        const MAX_RETRIES: u32 = 5;
+
+        for attempt in 1..=MAX_RETRIES {
+            match self.connect(bearer_token, account_id).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if attempt == MAX_RETRIES {
+                        return Err(anyhow::anyhow!(
+                            "WebSocket connection failed after {MAX_RETRIES} attempts: {e}"
+                        ));
+                    }
+                    tracing::warn!(
+                        attempt,
+                        error = %e,
+                        delay_secs = delay.as_secs(),
+                        "WebSocket connect failed, retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    /// Send a request over WebSocket and receive streaming events until completion.
+    /// Returns text and any native function calls from the response.
+    async fn send_and_receive(
+        &self,
+        request: Value,
+        delta_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    ) -> anyhow::Result<CodexResponse> {
+        let mut guard = self.conn.lock().await;
+        let ws = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("WebSocket not connected"))?;
+
+        // Build response.create envelope — fields must be at the top level
+        // (not nested under a "response" key). This matches the OpenAI
+        // Responses API WebSocket spec.
+        let mut envelope = if request.is_object() {
+            request.clone()
+        } else {
+            serde_json::json!({})
+        };
+        envelope["type"] = serde_json::json!("response.create");
+        if envelope.get("store").is_none() {
+            envelope["store"] = serde_json::json!(false);
+        }
+        let payload = serde_json::to_string(&envelope)?;
+        tracing::info!(len = payload.len(), "Sending WebSocket request");
+
+        ws.send(WsMessage::Text(payload.into()))
+            .await
+            .map_err(|e| anyhow::anyhow!("WebSocket send failed: {e}"))?;
+
+        // Receive events until response.completed / response.failed / error
+        let mut saw_delta = false;
+        let mut delta_accumulator = String::new();
+        let mut fallback_text: Option<String> = None;
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut usage: Option<TokenUsage> = None;
+
+        const MSG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+        loop {
+            let msg = tokio::time::timeout(MSG_TIMEOUT, ws.next())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "WebSocket read timed out after {}s",
+                        MSG_TIMEOUT.as_secs()
+                    )
+                })?;
+
+            let msg = match msg {
+                Some(Ok(m)) => m,
+                Some(Err(e)) => {
+                    *guard = None;
+                    return Err(anyhow::anyhow!("WebSocket read error: {e}"));
+                }
+                None => {
+                    *guard = None;
+                    break;
+                }
+            };
+
+            match msg {
+                WsMessage::Text(text) => {
+                    let event: Value = match serde_json::from_str(&text) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+
+                    let event_type = event.get("type").and_then(Value::as_str);
+
+                    if let Some(message) = extract_stream_error_message(&event) {
+                        return Err(anyhow::anyhow!(
+                            "OpenAI Codex WebSocket error: {message}"
+                        ));
+                    }
+
+                    if let Some(text) = extract_stream_event_text(&event, saw_delta) {
+                        if event_type == Some("response.output_text.delta") {
+                            saw_delta = true;
+                            delta_accumulator.push_str(&text);
+                            if let Some(tx) = &delta_tx {
+                                let _ = tx.try_send(text);
+                            }
+                        } else if fallback_text.is_none() {
+                            fallback_text = Some(text);
+                        }
+                    }
+
+                    match event_type {
+                        Some("response.completed" | "response.done") => {
+                            // Extract function_call items and usage from the completed response
+                            if let Some(response) = event.get("response") {
+                                tool_calls = extract_function_calls_from_response(response);
+                                usage = extract_usage_from_response(response);
+                            }
+                            break;
+                        }
+                        Some("response.failed") => {
+                            if saw_delta && !delta_accumulator.is_empty() {
+                                break;
+                            }
+                            return Err(anyhow::anyhow!(
+                                "OpenAI Codex response failed (no details)"
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                WsMessage::Close(_) => {
+                    *guard = None;
+                    break;
+                }
+                WsMessage::Ping(data) => {
+                    let _ = ws.send(WsMessage::Pong(data)).await;
+                }
+                _ => {}
+            }
+        }
+
+        let text = if saw_delta {
+            nonempty_preserve(Some(&delta_accumulator)).unwrap_or_default()
+        } else {
+            fallback_text.unwrap_or_default()
+        };
+
+        Ok(CodexResponse { text, tool_calls, usage })
+    }
+
+    /// Discard the current connection so the next call reconnects.
+    async fn invalidate(&self) {
+        let mut guard = self.conn.lock().await;
+        *guard = None;
+    }
+}
+
+/// Resolve the transport mode from the `ZEROCLAW_TRANSPORT` env var.
+fn resolve_transport() -> Transport {
+    std::env::var("ZEROCLAW_TRANSPORT")
+        .ok()
+        .map(|v| Transport::from_str_lossy(&v))
+        .unwrap_or(Transport::Auto)
+}
 
 pub struct OpenAiCodexProvider {
     auth: AuthService,
@@ -22,36 +315,30 @@ pub struct OpenAiCodexProvider {
     custom_endpoint: bool,
     gateway_api_key: Option<String>,
     client: Client,
+    /// Optional real-time streaming delta sender (set by agent loop).
+    on_delta: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<String>>>,
+    /// WebSocket connection manager for persistent connections.
+    ws_manager: WsConnectionManager,
+    /// Transport mode (Auto/WebSocket/Sse).
+    transport: Transport,
 }
 
 #[derive(Debug, Serialize)]
 struct ResponsesRequest {
     model: String,
-    input: Vec<ResponsesInput>,
+    input: Vec<serde_json::Value>,
     instructions: String,
     store: bool,
     stream: bool,
     text: ResponsesTextOptions,
     reasoning: ResponsesReasoningOptions,
     include: Vec<String>,
-    tool_choice: String,
-    parallel_tool_calls: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesInput {
-    role: String,
-    content: Vec<ResponsesInputContent>,
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesInputContent {
-    #[serde(rename = "type")]
-    kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<String>,
+    tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    image_url: Option<String>,
+    tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +385,9 @@ impl OpenAiCodexProvider {
         let auth = AuthService::new(&state_dir, options.secrets_encrypt);
         let responses_url = resolve_responses_url(options)?;
 
+        let transport = resolve_transport();
+        let ws_manager = WsConnectionManager::new(responses_url.clone());
+
         Ok(Self {
             auth,
             auth_profile_override: options.auth_profile_override.clone(),
@@ -105,10 +395,15 @@ impl OpenAiCodexProvider {
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                // No total-lifecycle timeout — SSE streams can run for
+                // minutes.  Per-chunk timeouts are applied inside
+                // decode_responses_body via tokio::time::timeout.
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
+            on_delta: std::sync::Mutex::new(None),
+            ws_manager,
+            transport,
         })
     }
 }
@@ -207,9 +502,9 @@ fn normalize_model_id(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
-fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<ResponsesInput>) {
+fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<serde_json::Value>) {
     let mut system_parts: Vec<&str> = Vec::new();
-    let mut input: Vec<ResponsesInput> = Vec::new();
+    let mut input: Vec<serde_json::Value> = Vec::new();
 
     for msg in messages {
         match msg.role.as_str() {
@@ -217,49 +512,84 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<ResponsesInpu
             "user" => {
                 let (cleaned_text, image_refs) = multimodal::parse_image_markers(&msg.content);
 
-                let mut content_items = Vec::new();
+                let mut content_items: Vec<serde_json::Value> = Vec::new();
 
                 // Add text if present
                 if !cleaned_text.trim().is_empty() {
-                    content_items.push(ResponsesInputContent {
-                        kind: "input_text".to_string(),
-                        text: Some(cleaned_text),
-                        image_url: None,
-                    });
+                    content_items.push(serde_json::json!({
+                        "type": "input_text",
+                        "text": cleaned_text,
+                    }));
                 }
 
                 // Add images
                 for image_ref in image_refs {
-                    content_items.push(ResponsesInputContent {
-                        kind: "input_image".to_string(),
-                        text: None,
-                        image_url: Some(image_ref),
-                    });
+                    content_items.push(serde_json::json!({
+                        "type": "input_image",
+                        "image_url": image_ref,
+                    }));
                 }
 
                 // If no content at all, add empty text
                 if content_items.is_empty() {
-                    content_items.push(ResponsesInputContent {
-                        kind: "input_text".to_string(),
-                        text: Some(String::new()),
-                        image_url: None,
-                    });
+                    content_items.push(serde_json::json!({
+                        "type": "input_text",
+                        "text": "",
+                    }));
                 }
 
-                input.push(ResponsesInput {
-                    role: "user".to_string(),
-                    content: content_items,
-                });
+                input.push(serde_json::json!({
+                    "role": "user",
+                    "content": content_items,
+                }));
             }
             "assistant" => {
-                input.push(ResponsesInput {
-                    role: "assistant".to_string(),
-                    content: vec![ResponsesInputContent {
-                        kind: "output_text".to_string(),
-                        text: Some(msg.content.clone()),
-                        image_url: None,
-                    }],
-                });
+                // Check if this is a native tool call history message (JSON with tool_calls)
+                if let Ok(parsed) = serde_json::from_str::<Value>(&msg.content) {
+                    if let Some(tool_calls_arr) = parsed.get("tool_calls").and_then(Value::as_array) {
+                        // Emit assistant text as output_text if present
+                        if let Some(text) = parsed.get("content").and_then(Value::as_str) {
+                            if !text.is_empty() {
+                                input.push(serde_json::json!({
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{"type": "output_text", "text": text}],
+                                }));
+                            }
+                        }
+                        // Emit each tool call as a function_call input item
+                        for tc in tool_calls_arr {
+                            let call_id = tc.get("id").and_then(Value::as_str).unwrap_or_default();
+                            let name = tc.get("name").and_then(Value::as_str).unwrap_or_default();
+                            let arguments = tc.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+                            input.push(serde_json::json!({
+                                "type": "function_call",
+                                "call_id": call_id,
+                                "name": name,
+                                "arguments": arguments,
+                            }));
+                        }
+                        continue;
+                    }
+                }
+                // Plain assistant text
+                input.push(serde_json::json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": msg.content}],
+                }));
+            }
+            "tool" => {
+                // Tool result message: parse JSON with tool_call_id and content
+                if let Ok(parsed) = serde_json::from_str::<Value>(&msg.content) {
+                    let call_id = parsed.get("tool_call_id").and_then(Value::as_str).unwrap_or_default();
+                    let output = parsed.get("content").and_then(Value::as_str).unwrap_or("");
+                    input.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": output,
+                    }));
+                }
             }
             _ => {}
         }
@@ -285,7 +615,7 @@ fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
             _ => "high".to_string(),
         };
     }
-    if (id.starts_with("gpt-5.2") || id.starts_with("gpt-5.3")) && effort == "minimal" {
+    if (id.starts_with("gpt-5.2") || id.starts_with("gpt-5.3") || id.starts_with("gpt-5.4")) && effort == "minimal" {
         return "low".to_string();
     }
     if id.starts_with("gpt-5-codex") && effort == "xhigh" {
@@ -473,38 +803,226 @@ fn extract_stream_error_message(event: &Value) -> Option<String> {
     None
 }
 
-async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<String> {
-    let body = response.text().await?;
+/// Decode an OpenAI Codex Responses API response by streaming SSE chunks
+/// incrementally.  This avoids holding the entire response in memory and —
+/// critically — prevents the global reqwest timeout from killing long-running
+/// model generations, because `chunk()` yields data as soon as the server
+/// sends it.
+async fn decode_responses_body(
+    mut response: reqwest::Response,
+    delta_tx: Option<tokio::sync::mpsc::Sender<String>>,
+) -> anyhow::Result<CodexResponse> {
+    // ── Incremental SSE streaming ────────────────────────────────
+    let mut pending = String::new();
+    let mut saw_delta = false;
+    let mut delta_accumulator = String::new();
+    let mut fallback_text: Option<String> = None;
+    let mut is_sse = false;
+    let mut json_buf = String::new();
+    let mut completed_response: Option<Value> = None;
 
-    if let Some(text) = parse_sse_text(&body)? {
-        return Ok(text);
+    // Per-chunk read timeout (5 minutes).  Matches OpenClaw's undici
+    // bodyTimeout approach: each individual chunk has time to arrive, but
+    // the overall SSE stream can run indefinitely.
+    const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+    while let Some(chunk) = tokio::time::timeout(CHUNK_TIMEOUT, response.chunk())
+        .await
+        .map_err(|_| anyhow::anyhow!("OpenAI Codex SSE chunk read timed out after {}s", CHUNK_TIMEOUT.as_secs()))?? {
+        let chunk_str = String::from_utf8_lossy(&chunk);
+
+        // Detect whether this is an SSE stream on the first chunk.
+        if !is_sse && pending.is_empty() && json_buf.is_empty() {
+            let trimmed = chunk_str.trim_start();
+            if trimmed.starts_with("event:") || trimmed.starts_with("data:") {
+                is_sse = true;
+            }
+        }
+
+        if !is_sse {
+            // Not SSE — accumulate raw JSON.
+            json_buf.push_str(&chunk_str);
+            continue;
+        }
+
+        pending.push_str(&chunk_str);
+
+        // Process every complete SSE event block (separated by \n\n).
+        while let Some(idx) = pending.find("\n\n") {
+            let block = pending[..idx].to_string();
+            pending = pending[idx + 2..].to_string();
+            process_sse_block(
+                &block,
+                &mut saw_delta,
+                &mut delta_accumulator,
+                &mut fallback_text,
+                &delta_tx,
+                &mut completed_response,
+            )?;
+        }
     }
 
-    let body_trimmed = body.trim_start();
-    let looks_like_sse = body_trimmed.starts_with("event:") || body_trimmed.starts_with("data:");
-    if looks_like_sse {
-        return Err(anyhow::anyhow!(
-            "No response from OpenAI Codex stream payload: {}",
-            super::sanitize_api_error(&body)
-        ));
+    // Flush remaining pending data.
+    if is_sse && !pending.trim().is_empty() {
+        process_sse_block(
+            &pending,
+            &mut saw_delta,
+            &mut delta_accumulator,
+            &mut fallback_text,
+            &delta_tx,
+            &mut completed_response,
+        )?;
     }
 
-    let parsed: ResponsesResponse = serde_json::from_str(&body).map_err(|err| {
+    let (tool_calls, usage) = completed_response
+        .as_ref()
+        .map(|r| (extract_function_calls_from_response(r), extract_usage_from_response(r)))
+        .unwrap_or_default();
+
+    if is_sse {
+        if saw_delta {
+            let text = nonempty_preserve(Some(&delta_accumulator))
+                .ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex (empty delta)"))?;
+            return Ok(CodexResponse { text, tool_calls, usage });
+        }
+        let text = fallback_text
+            .ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex stream"))?;
+        return Ok(CodexResponse { text, tool_calls, usage });
+    }
+
+    // ── Non-SSE JSON fallback ────────────────────────────────────
+    let parsed: ResponsesResponse = serde_json::from_str(&json_buf).map_err(|err| {
         anyhow::anyhow!(
             "OpenAI Codex JSON parse failed: {err}. Payload: {}",
-            super::sanitize_api_error(&body)
+            super::sanitize_api_error(&json_buf)
         )
     })?;
-    extract_responses_text(&parsed).ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex"))
+    let text = extract_responses_text(&parsed).ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex"))?;
+    Ok(CodexResponse { text, tool_calls, usage })
+}
+
+/// Process a single SSE event block (the text between `\n\n` boundaries).
+fn process_sse_block(
+    block: &str,
+    saw_delta: &mut bool,
+    delta_accumulator: &mut String,
+    fallback_text: &mut Option<String>,
+    delta_tx: &Option<tokio::sync::mpsc::Sender<String>>,
+    completed_response: &mut Option<Value>,
+) -> anyhow::Result<()> {
+    let data_lines: Vec<String> = block
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|line| line.trim().to_string())
+        .collect();
+    if data_lines.is_empty() {
+        return Ok(());
+    }
+
+    let joined = data_lines.join("\n");
+    let trimmed = joined.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return Ok(());
+    }
+
+    // Try parsing as a single JSON object first.
+    if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
+        return process_sse_event(event, saw_delta, delta_accumulator, fallback_text, delta_tx, completed_response);
+    }
+
+    // Fall back to per-line parsing.
+    for line in data_lines {
+        let line = line.trim();
+        if line.is_empty() || line == "[DONE]" {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<Value>(line) {
+            process_sse_event(event, saw_delta, delta_accumulator, fallback_text, delta_tx, completed_response)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Process a single parsed SSE JSON event.
+fn process_sse_event(
+    event: Value,
+    saw_delta: &mut bool,
+    delta_accumulator: &mut String,
+    fallback_text: &mut Option<String>,
+    delta_tx: &Option<tokio::sync::mpsc::Sender<String>>,
+    completed_response: &mut Option<Value>,
+) -> anyhow::Result<()> {
+    if let Some(message) = extract_stream_error_message(&event) {
+        return Err(anyhow::anyhow!("OpenAI Codex stream error: {message}"));
+    }
+    if let Some(text) = extract_stream_event_text(&event, *saw_delta) {
+        let event_type = event.get("type").and_then(Value::as_str);
+        if event_type == Some("response.output_text.delta") {
+            *saw_delta = true;
+            delta_accumulator.push_str(&text);
+            // Forward delta to channel for real-time streaming
+            if let Some(tx) = delta_tx {
+                let _ = tx.try_send(text);
+            }
+        } else if fallback_text.is_none() {
+            *fallback_text = Some(text);
+        }
+    }
+    // Capture the completed response for function call / usage extraction
+    let event_type = event.get("type").and_then(Value::as_str);
+    if matches!(event_type, Some("response.completed" | "response.done")) {
+        if let Some(response) = event.get("response") {
+            *completed_response = Some(response.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Extract native function_call items from a completed response object.
+fn extract_function_calls_from_response(response: &Value) -> Vec<ToolCall> {
+    let mut tool_calls = Vec::new();
+    let output = match response.get("output").and_then(Value::as_array) {
+        Some(arr) => arr,
+        None => return tool_calls,
+    };
+    for item in output {
+        let item_type = item.get("type").and_then(Value::as_str);
+        if item_type == Some("function_call") {
+            let id = item.get("call_id").and_then(Value::as_str)
+                .or_else(|| item.get("id").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            let name = item.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+            let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("{}").to_string();
+            tool_calls.push(ToolCall { id, name, arguments });
+        }
+    }
+    tool_calls
+}
+
+/// Extract usage/token information from a completed response object.
+fn extract_usage_from_response(response: &Value) -> Option<TokenUsage> {
+    let usage = response.get("usage")?;
+    let input = usage.get("input_tokens").and_then(Value::as_u64);
+    let output = usage.get("output_tokens").and_then(Value::as_u64);
+    if input.is_none() && output.is_none() {
+        return None;
+    }
+    Some(TokenUsage {
+        input_tokens: input,
+        output_tokens: output,
+    })
 }
 
 impl OpenAiCodexProvider {
     async fn send_responses_request(
         &self,
-        input: Vec<ResponsesInput>,
+        input: Vec<serde_json::Value>,
         instructions: String,
         model: &str,
-    ) -> anyhow::Result<String> {
+        tools: Option<Vec<serde_json::Value>>,
+    ) -> anyhow::Result<CodexResponse> {
         let use_gateway_api_key_auth = self.custom_endpoint && self.gateway_api_key.is_some();
         let profile = match self
             .auth
@@ -562,6 +1080,7 @@ impl OpenAiCodexProvider {
         };
         let normalized_model = normalize_model_id(model);
 
+        let has_tools = tools.as_ref().map_or(false, |t| !t.is_empty());
         let request = ResponsesRequest {
             model: normalized_model.to_string(),
             input,
@@ -576,8 +1095,9 @@ impl OpenAiCodexProvider {
                 summary: "auto".to_string(),
             },
             include: vec!["reasoning.encrypted_content".to_string()],
-            tool_choice: "auto".to_string(),
-            parallel_tool_calls: true,
+            tools,
+            tool_choice: if has_tools { Some("auto".to_string()) } else { None },
+            parallel_tool_calls: if has_tools { Some(true) } else { None },
         };
 
         let bearer_token = if use_gateway_api_key_auth {
@@ -586,6 +1106,61 @@ impl OpenAiCodexProvider {
             access_token.as_deref().unwrap_or_default()
         };
 
+        let delta_tx = self.on_delta.lock().ok().and_then(|g| g.clone());
+
+        // ── WebSocket transport path ───────────────────────────────
+        let use_ws = match self.transport {
+            Transport::WebSocket => true,
+            Transport::Sse => false,
+            Transport::Auto => true, // try WS first, fall back to SSE
+        };
+
+        if use_ws {
+            let request_value = serde_json::to_value(&request)?;
+
+            let ws_result = async {
+                self.ws_manager
+                    .ensure_connected(bearer_token, account_id.as_deref())
+                    .await?;
+
+                tracing::info!(
+                    url = %self.responses_url,
+                    model = %normalized_model,
+                    transport = "websocket",
+                    "Sending OpenAI Codex request via WebSocket"
+                );
+
+                self.ws_manager
+                    .send_and_receive(request_value, delta_tx.clone())
+                    .await
+            }
+            .await;
+
+            match ws_result {
+                Ok(codex_resp) => {
+                    tracing::info!(
+                        len = codex_resp.text.len(),
+                        tool_calls = codex_resp.tool_calls.len(),
+                        "WebSocket response completed"
+                    );
+                    return Ok(codex_resp);
+                }
+                Err(e) => {
+                    if self.transport == Transport::WebSocket {
+                        // Strict WS mode — do not fall back.
+                        return Err(e);
+                    }
+                    // Auto mode — fall back to SSE.
+                    tracing::warn!(
+                        error = %e,
+                        "WebSocket request failed, falling back to SSE"
+                    );
+                    self.ws_manager.invalidate().await;
+                }
+            }
+        }
+
+        // ── SSE transport path (original) ──────────────────────────
         let mut request_builder = self
             .client
             .post(&self.responses_url)
@@ -608,13 +1183,31 @@ impl OpenAiCodexProvider {
             }
         }
 
+        tracing::info!(
+            url = %self.responses_url,
+            model = %normalized_model,
+            transport = "sse",
+            "Sending OpenAI Codex request"
+        );
+
         let response = request_builder.json(&request).send().await?;
+
+        tracing::info!(
+            status = %response.status(),
+            "OpenAI Codex response received"
+        );
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI Codex", response).await);
         }
 
-        decode_responses_body(response).await
+        tracing::info!(has_delta_tx = delta_tx.is_some(), "Starting SSE decode");
+        let result = decode_responses_body(response, delta_tx).await;
+        match &result {
+            Ok(resp) => tracing::info!(len = resp.text.len(), tool_calls = resp.tool_calls.len(), "SSE decode completed"),
+            Err(e) => tracing::error!(error = %e, "SSE decode failed"),
+        }
+        result
     }
 }
 
@@ -622,8 +1215,20 @@ impl OpenAiCodexProvider {
 impl Provider for OpenAiCodexProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
-            native_tool_calling: false,
+            native_tool_calling: true,
             vision: true,
+        }
+    }
+
+    fn set_on_delta(&self, tx: tokio::sync::mpsc::Sender<String>) {
+        if let Ok(mut guard) = self.on_delta.lock() {
+            *guard = Some(tx);
+        }
+    }
+
+    fn clear_on_delta(&self) {
+        if let Ok(mut guard) = self.on_delta.lock() {
+            *guard = None;
         }
     }
 
@@ -646,8 +1251,8 @@ impl Provider for OpenAiCodexProvider {
         let prepared = crate::multimodal::prepare_messages_for_provider(&messages, &config).await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
-        self.send_responses_request(input, instructions, model)
-            .await
+        let resp = self.send_responses_request(input, instructions, model, None).await?;
+        Ok(resp.text)
     }
 
     async fn chat_with_history(
@@ -661,8 +1266,69 @@ impl Provider for OpenAiCodexProvider {
         let prepared = crate::multimodal::prepare_messages_for_provider(messages, &config).await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
-        self.send_responses_request(input, instructions, model)
-            .await
+        let resp = self.send_responses_request(input, instructions, model, None).await?;
+        Ok(resp.text)
+    }
+
+    fn convert_tools(&self, tools: &[crate::tools::traits::ToolSpec]) -> ToolsPayload {
+        let openai_tools: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|spec| {
+                serde_json::json!({
+                    "type": "function",
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": spec.parameters,
+                })
+            })
+            .collect();
+        ToolsPayload::OpenAI { tools: openai_tools }
+    }
+
+    async fn chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let config = crate::config::MultimodalConfig::default();
+        let prepared = crate::multimodal::prepare_messages_for_provider(request.messages, &config).await?;
+        let (instructions, input) = build_responses_input(&prepared.messages);
+
+        // Convert tool specs to OpenAI function tool definitions
+        let tools = request.tools.and_then(|specs| {
+            if specs.is_empty() {
+                return None;
+            }
+            let openai_tools: Vec<serde_json::Value> = specs
+                .iter()
+                .map(|spec| {
+                    serde_json::json!({
+                        "type": "function",
+                        "name": spec.name,
+                        "description": spec.description,
+                        "parameters": spec.parameters,
+                    })
+                })
+                .collect();
+            Some(openai_tools)
+        });
+
+        let resp = self.send_responses_request(input, instructions, model, tools).await?;
+
+        let stop_reason = if resp.tool_calls.is_empty() { "stop" } else { "toolUse" };
+        tracing::debug!(
+            stop_reason,
+            tool_calls = resp.tool_calls.len(),
+            "Chat response completed"
+        );
+
+        Ok(ChatResponse {
+            text: if resp.text.is_empty() { None } else { Some(resp.text) },
+            tool_calls: resp.tool_calls,
+            usage: resp.usage,
+            reasoning_content: None,
+        })
     }
 }
 
@@ -958,22 +1624,17 @@ data: [DONE]
         let (_, input) = build_responses_input(&messages);
 
         assert_eq!(input.len(), 1);
-        assert_eq!(input[0].role, "user");
-        assert_eq!(input[0].content.len(), 2);
-
-        let json: Vec<Value> = input[0]
-            .content
-            .iter()
-            .map(|item| serde_json::to_value(item).unwrap())
-            .collect();
+        assert_eq!(input[0]["role"], "user");
+        let content = input[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
 
         // First content = text
-        assert_eq!(json[0]["type"], "input_text");
-        assert!(json[0]["text"].as_str().unwrap().contains("Describe this"));
+        assert_eq!(content[0]["type"], "input_text");
+        assert!(content[0]["text"].as_str().unwrap().contains("Describe this"));
 
         // Second content = image
-        assert_eq!(json[1]["type"], "input_image");
-        assert_eq!(json[1]["image_url"], "data:image/png;base64,abc");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,abc");
     }
 
     #[test]
@@ -982,11 +1643,10 @@ data: [DONE]
         let (_, input) = build_responses_input(&messages);
 
         assert_eq!(input.len(), 1);
-        assert_eq!(input[0].content.len(), 1);
-
-        let json = serde_json::to_value(&input[0].content[0]).unwrap();
-        assert_eq!(json["type"], "input_text");
-        assert_eq!(json["text"], "Hello without images");
+        let content = input[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "Hello without images");
     }
 
     #[test]
@@ -997,17 +1657,12 @@ data: [DONE]
         let (_, input) = build_responses_input(&messages);
 
         assert_eq!(input.len(), 1);
-        assert_eq!(input[0].content.len(), 3); // text + 2 images
+        let content = input[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3); // text + 2 images
 
-        let json: Vec<Value> = input[0]
-            .content
-            .iter()
-            .map(|item| serde_json::to_value(item).unwrap())
-            .collect();
-
-        assert_eq!(json[0]["type"], "input_text");
-        assert_eq!(json[1]["type"], "input_image");
-        assert_eq!(json[2]["type"], "input_image");
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[2]["type"], "input_image");
     }
 
     #[test]
@@ -1023,7 +1678,62 @@ data: [DONE]
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");
         let caps = provider.capabilities();
 
-        assert!(!caps.native_tool_calling);
+        assert!(caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn transport_from_str_lossy_parses_known_values() {
+        assert_eq!(Transport::from_str_lossy("websocket"), Transport::WebSocket);
+        assert_eq!(Transport::from_str_lossy("ws"), Transport::WebSocket);
+        assert_eq!(Transport::from_str_lossy("WS"), Transport::WebSocket);
+        assert_eq!(Transport::from_str_lossy("sse"), Transport::Sse);
+        assert_eq!(Transport::from_str_lossy("http"), Transport::Sse);
+        assert_eq!(Transport::from_str_lossy("SSE"), Transport::Sse);
+        assert_eq!(Transport::from_str_lossy("auto"), Transport::Auto);
+        assert_eq!(Transport::from_str_lossy("anything"), Transport::Auto);
+        assert_eq!(Transport::from_str_lossy(""), Transport::Auto);
+    }
+
+    #[test]
+    fn ws_connection_manager_converts_urls() {
+        assert_eq!(
+            WsConnectionManager::to_ws_url("https://api.openai.com/v1/responses"),
+            "wss://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            WsConnectionManager::to_ws_url("http://localhost:8080/v1/responses"),
+            "ws://localhost:8080/v1/responses"
+        );
+        assert_eq!(
+            WsConnectionManager::to_ws_url("wss://already.ws/path"),
+            "wss://already.ws/path"
+        );
+    }
+
+    #[test]
+    fn resolve_transport_defaults_to_auto() {
+        let _guard = EnvGuard::set("ZEROCLAW_TRANSPORT", None);
+        assert_eq!(resolve_transport(), Transport::Auto);
+    }
+
+    #[test]
+    fn resolve_transport_reads_env_var() {
+        let _guard = EnvGuard::set("ZEROCLAW_TRANSPORT", Some("websocket"));
+        assert_eq!(resolve_transport(), Transport::WebSocket);
+    }
+
+    #[test]
+    fn resolve_transport_reads_sse_from_env() {
+        let _guard = EnvGuard::set("ZEROCLAW_TRANSPORT", Some("sse"));
+        assert_eq!(resolve_transport(), Transport::Sse);
+    }
+
+    #[test]
+    fn constructor_defaults_to_auto_transport() {
+        let _guard = EnvGuard::set("ZEROCLAW_TRANSPORT", None);
+        let options = ProviderRuntimeOptions::default();
+        let provider = OpenAiCodexProvider::new(&options, None).expect("provider should initialize");
+        assert_eq!(provider.transport, Transport::Auto);
     }
 }

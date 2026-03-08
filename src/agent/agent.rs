@@ -283,6 +283,7 @@ impl Agent {
             &config.agents,
             config.api_key.as_deref(),
             config,
+            None,
         );
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
@@ -542,8 +543,8 @@ impl Agent {
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         text.clone(),
                     )));
-                print!("{text}");
-                let _ = std::io::stdout().flush();
+                eprint!("{text}");
+                let _ = std::io::stderr().flush();
             }
 
             self.history.push(ConversationMessage::AssistantToolCalls {
