@@ -59,7 +59,8 @@ pub async fn handle_liveness(State(_state): State<AppState>) -> impl IntoRespons
 /// synthesizing fake healthy states.
 pub async fn handle_readiness(State(_state): State<AppState>) -> impl IntoResponse {
     let mut checks = BTreeMap::new();
-    let mut all_ok = true;
+    let mut has_error = false;
+    let mut has_degraded = false;
 
     // Check component health from the health registry.
     // Components register themselves on startup (gateway, channels, etc.).
@@ -69,7 +70,7 @@ pub async fn handle_readiness(State(_state): State<AppState>) -> impl IntoRespon
 
     if snapshot.components.is_empty() {
         // No components registered yet — service is still initializing.
-        all_ok = false;
+        has_degraded = true;
         checks.insert(
             "startup".to_string(),
             CheckResult {
@@ -83,15 +84,15 @@ pub async fn handle_readiness(State(_state): State<AppState>) -> impl IntoRespon
         let status = match component.status.as_str() {
             "ok" => "ok",
             "error" => {
-                all_ok = false;
+                has_error = true;
                 "unhealthy"
             }
             "starting" => {
-                all_ok = false;
+                has_degraded = true;
                 "degraded"
             }
             _ => {
-                all_ok = false;
+                has_degraded = true;
                 "degraded"
             }
         };
@@ -104,11 +105,19 @@ pub async fn handle_readiness(State(_state): State<AppState>) -> impl IntoRespon
         );
     }
 
-    let overall = if all_ok { "ok" } else { "unhealthy" };
-    let status_code = if all_ok {
-        StatusCode::OK
+    let overall = if has_error {
+        "unhealthy"
+    } else if has_degraded {
+        "degraded"
     } else {
+        "ok"
+    };
+    let status_code = if has_error {
         StatusCode::SERVICE_UNAVAILABLE
+    } else if has_degraded {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
     };
 
     let resp = ReadinessResponse {
