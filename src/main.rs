@@ -788,20 +788,9 @@ async fn main() -> Result<()> {
             model,
             temperature,
             peripheral,
-        } => {
-            Box::pin(agent::run(
-                config,
-                message,
-                session_id,
-                provider,
-                model,
-                temperature,
-                peripheral,
-                true,
-            ))
+        } => agent::run(config, message, session_id, provider, model, temperature, peripheral, true)
             .await
-            .map(|_| ())
-        }
+            .map(|_| ()),
 
         Commands::Gateway { port, host } => {
             let port = port.unwrap_or(config.gateway.port);
@@ -1867,6 +1856,23 @@ mod tests {
     #[test]
     fn cli_definition_has_no_flag_conflicts() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn agent_session_id_rejects_blank_and_whitespace_values() {
+        for blank in ["", "   ", "\t", "\n"] {
+            let result = Cli::try_parse_from(["zeroclaw", "agent", "-m", "hello", "--session-id", blank]);
+            assert!(
+                result.is_err(),
+                "blank --session-id {:?} should be rejected",
+                blank
+            );
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("session-id") || err.contains("session_id"),
+                "error message should mention session-id, got: {err}"
+            );
+        }
     }
 
     #[test]
