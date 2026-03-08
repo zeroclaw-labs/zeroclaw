@@ -2,6 +2,15 @@
 //!
 //! Provides advanced memory management with L0/L1/L2 layered architecture
 //! and semantic vector search through cortex-mem-tools integration.
+//!
+//! ## Automatic Processing
+//!
+//! For long-running services like zeroclaw, this backend implements:
+//! - Message count threshold triggering (default: 10 messages)
+//! - Periodic background flush (default: every 5 minutes)
+//!
+//! This ensures user/agent memories are extracted and L0/L2 layers
+//! are generated without requiring explicit session close calls.
 
 use super::cortex_config_resolver::{resolve_cortex_config, ResolvedCortexConfig};
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
@@ -9,8 +18,60 @@ use crate::config::{Config, MemoryConfig};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use cortex_mem_core::FilesystemOperations;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
+
+// ==================== Auto-Processing Configuration ====================
+
+/// Configuration for automatic memory processing
+///
+/// This enables automatic memory extraction and layer generation
+/// suitable for long-running services.
+#[derive(Debug, Clone, Copy)]
+pub struct AutoProcessConfig {
+    /// Minimum message count before triggering processing
+    pub message_count_threshold: usize,
+    /// Minimum time interval between processing (in seconds)
+    pub min_process_interval_secs: u64,
+    /// Enable auto-trigger on message count threshold
+    pub enable_threshold_trigger: bool,
+    /// Interval for periodic background flush (in seconds)
+    /// Set to 0 to disable periodic flush
+    pub periodic_flush_interval_secs: u64,
+}
+
+impl Default for AutoProcessConfig {
+    fn default() -> Self {
+        Self {
+            message_count_threshold: 10,       // Trigger after 10 messages
+            min_process_interval_secs: 300,    // At most once every 5 minutes
+            enable_threshold_trigger: true,
+            periodic_flush_interval_secs: 300, // Periodic flush every 5 minutes
+        }
+    }
+}
+
+/// Session state for auto-processing tracking
+#[derive(Debug)]
+struct SessionState {
+    /// Number of messages since last processing
+    message_count: usize,
+    /// Time of last processing
+    last_processed: Option<Instant>,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            message_count: 0,
+            last_processed: None,
+        }
+    }
+}
 
 /// Cortex-Memory backend using direct crate integration
 ///
@@ -19,24 +80,40 @@ use std::sync::Arc;
 /// - Semantic vector search with Qdrant
 /// - Automatic memory extraction and organization
 /// - Session-scoped memory isolation
+/// - Periodic background processing for long-running services
 pub struct CortexMemory {
     operations: Arc<cortex_mem_tools::MemoryOperations>,
     workspace_dir: PathBuf,
     config: ResolvedCortexConfig,
+    /// Auto-processing configuration
+    auto_process_config: AutoProcessConfig,
+    /// Session states for tracking auto-processing conditions
+    session_states: Arc<RwLock<HashMap<String, SessionState>>>,
+    /// Last global processing time
+    last_process_time: Arc<AtomicU64>,
 }
 
 impl CortexMemory {
     /// Create a new Cortex-Memory backend
-    ///
-    /// This function:
-    /// 1. Resolves configuration from zeroclaw's global settings
-    /// 2. Initializes LLM client for memory extraction
-    /// 3. Connects to Qdrant vector database
-    /// 4. Sets up MemoryOperations for high-level memory management
     pub async fn new(
         memory_config: &MemoryConfig,
         workspace_dir: PathBuf,
         zeroclaw_config: &Config,
+    ) -> Result<Self> {
+        Self::new_with_config(
+            memory_config,
+            workspace_dir,
+            zeroclaw_config,
+            AutoProcessConfig::default(),
+        ).await
+    }
+
+    /// Create a new Cortex-Memory backend with custom auto-process config
+    pub async fn new_with_config(
+        memory_config: &MemoryConfig,
+        workspace_dir: PathBuf,
+        zeroclaw_config: &Config,
+        auto_process_config: AutoProcessConfig,
     ) -> Result<Self> {
         // Resolve configuration (auto-derive from zeroclaw settings)
         let config = resolve_cortex_config(zeroclaw_config, memory_config, &workspace_dir)?;
@@ -84,11 +161,174 @@ impl CortexMemory {
         .await
         .context("Failed to initialize Cortex-Memory operations")?;
         
-        Ok(Self {
+        let instance = Self {
             operations: Arc::new(operations),
             workspace_dir,
             config,
-        })
+            auto_process_config,
+            session_states: Arc::new(RwLock::new(HashMap::new())),
+            last_process_time: Arc::new(AtomicU64::new(0)),
+        };
+
+        // Start periodic flush task if enabled
+        if instance.auto_process_config.periodic_flush_interval_secs > 0 {
+            instance.start_periodic_flush();
+        }
+
+        Ok(instance)
+    }
+
+    /// Start the periodic background flush task
+    fn start_periodic_flush(&self) {
+        let operations = self.operations.clone();
+        let session_states = self.session_states.clone();
+        let last_process_time = self.last_process_time.clone();
+        let interval_secs = self.auto_process_config.periodic_flush_interval_secs;
+        let min_interval_secs = self.auto_process_config.min_process_interval_secs;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+            
+            loop {
+                interval.tick().await;
+
+                // Check if enough time has passed since last processing
+                let last = last_process_time.load(Ordering::Relaxed);
+                let now = Instant::now().elapsed().as_secs();
+                
+                if last > 0 && now.saturating_sub(last) < min_interval_secs {
+                    tracing::trace!(
+                        "Skipping periodic flush: min interval not reached ({}s < {}s)",
+                        now.saturating_sub(last),
+                        min_interval_secs
+                    );
+                    continue;
+                }
+
+                // Find sessions with pending messages
+                let sessions_to_process = {
+                    let mut states = session_states.write().await;
+                    let mut to_process = Vec::new();
+                    
+                    for (session_id, state) in states.iter_mut() {
+                        if state.message_count > 0 {
+                            to_process.push(session_id.clone());
+                            state.message_count = 0;
+                            state.last_processed = Some(Instant::now());
+                        }
+                    }
+                    
+                    to_process
+                };
+
+                if sessions_to_process.is_empty() {
+                    tracing::trace!("Periodic flush: no sessions with pending messages");
+                    continue;
+                }
+
+                tracing::debug!(
+                    "Periodic flush: processing {} sessions",
+                    sessions_to_process.len()
+                );
+
+                // Send SessionClosed events for each session
+                if let Some(tx) = operations.memory_event_tx() {
+                    use cortex_mem_core::memory_events::MemoryEvent;
+                    
+                    let user_id = operations.default_user_id().to_string();
+                    let agent_id = operations.default_agent_id().to_string();
+
+                    for session_id in sessions_to_process {
+                        let _ = tx.send(MemoryEvent::SessionClosed {
+                            session_id,
+                            user_id: user_id.clone(),
+                            agent_id: agent_id.clone(),
+                        });
+                    }
+                }
+
+                // Update last process time
+                last_process_time.store(
+                    Instant::now().elapsed().as_secs(),
+                    Ordering::Relaxed,
+                );
+
+                // Wait for background processing to complete
+                let completed = operations.flush_and_wait(Some(1)).await;
+                
+                if completed {
+                    tracing::debug!("Periodic flush completed successfully");
+                } else {
+                    tracing::warn!("Periodic flush initiated but some tasks may still be in progress");
+                }
+            }
+        });
+
+        tracing::debug!(
+            "Started periodic flush task (interval: {}s)",
+            interval_secs
+        );
+    }
+
+    /// Check if threshold-based processing should be triggered
+    async fn check_threshold_trigger(&self, thread_id: &str) -> bool {
+        if !self.auto_process_config.enable_threshold_trigger {
+            return false;
+        }
+
+        let mut states = self.session_states.write().await;
+        let state = states.entry(thread_id.to_string()).or_default();
+
+        // Increment message count
+        state.message_count += 1;
+
+        // Check threshold
+        if state.message_count < self.auto_process_config.message_count_threshold {
+            return false;
+        }
+
+        // Check minimum interval
+        if let Some(last_processed) = state.last_processed {
+            let elapsed = last_processed.elapsed().as_secs();
+            if elapsed < self.auto_process_config.min_process_interval_secs {
+                tracing::trace!(
+                    "Threshold reached but min interval not met ({}s < {}s)",
+                    elapsed,
+                    self.auto_process_config.min_process_interval_secs
+                );
+                return false;
+            }
+        }
+
+        // Trigger processing
+        state.message_count = 0;
+        state.last_processed = Some(Instant::now());
+        self.last_process_time.store(
+            Instant::now().elapsed().as_secs(),
+            Ordering::Relaxed,
+        );
+
+        // Send SessionClosed event
+        if let Some(tx) = self.operations.memory_event_tx() {
+            use cortex_mem_core::memory_events::MemoryEvent;
+            
+            let user_id = self.operations.default_user_id().to_string();
+            let agent_id = self.operations.default_agent_id().to_string();
+
+            let _ = tx.send(MemoryEvent::SessionClosed {
+                session_id: thread_id.to_string(),
+                user_id,
+                agent_id,
+            });
+
+            tracing::debug!(
+                "Threshold-triggered processing for session {}",
+                thread_id
+            );
+            return true;
+        }
+
+        false
     }
 }
 
@@ -128,27 +368,8 @@ impl Memory for CortexMemory {
             .await
             .context("Failed to store memory in Cortex-Memory")?;
 
-        // 🔧 Auto-trigger: Check if we should trigger memory extraction
-        // This mimics the cortex-mem-mcp pattern
-        if let Some(tx) = self.operations.memory_event_tx() {
-            use cortex_mem_core::memory_events::MemoryEvent;
-            
-            let user_id = self.operations.default_user_id().to_string();
-            let agent_id = self.operations.default_agent_id().to_string();
-
-            // Send SessionClosed event to trigger extraction and layer generation
-            let _ = tx.send(MemoryEvent::SessionClosed {
-                session_id: thread_id.to_string(),
-                user_id,
-                agent_id,
-            });
-
-            tracing::debug!(
-                "Triggered SessionClosed event for memory extraction: thread={}, uri={}",
-                thread_id,
-                message_uri
-            );
-        }
+        // Check threshold-based trigger
+        self.check_threshold_trigger(thread_id).await;
 
         tracing::debug!(
             "Cortex stored memory: key={}, thread={}, uri={}",
@@ -223,7 +444,6 @@ impl Memory for CortexMemory {
                 Ok(Some(entry))
             }
             Err(_) => {
-                // File not found or other error
                 tracing::debug!("Cortex get failed for key: {}", key);
                 Ok(None)
             }
@@ -257,7 +477,7 @@ impl Memory for CortexMemory {
             .map(|e| MemoryEntry {
                 id: e.uri.clone(),
                 key: e.uri,
-                content: String::new(), // Content not loaded for list
+                content: String::new(),
                 category: category.cloned().unwrap_or(MemoryCategory::Conversation),
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 session_id: session_id.map(str::to_string),
@@ -297,7 +517,6 @@ impl Memory for CortexMemory {
     }
     
     async fn health_check(&self) -> bool {
-        // Try a simple search to verify connection
         use cortex_mem_core::SearchOptions;
         
         self.operations
