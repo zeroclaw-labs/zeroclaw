@@ -65,7 +65,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 
 # UUID generation
-uuid = { version = "1.11", default-features = false, features = ["v4", "std"] }
+uuid = { version = "1.11", default-features = false, features = ["v4", "std", "serde"] }
 
 # Authenticated encryption (AEAD) for secret store
 chacha20poly1305 = "0.10"
@@ -146,6 +146,9 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = ["
 
 # Serial port for peripheral communication (STM32, etc.)
 tokio-serial = { version = "5", default-features = false, optional = true }
+url = "2.5.8"
+base64-url = "3.0.2"
+dirs = "6.0.0"
 
 # USB device enumeration (hardware discovery) — only on platforms nusb supports
 # (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.

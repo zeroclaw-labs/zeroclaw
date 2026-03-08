@@ -168,6 +168,8 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
+        cluster: crate::config::ClusterConfig::default(),
+        openclaw_node: None,
     };
 
     println!(
@@ -516,6 +518,8 @@ async fn run_quick_setup_with_home(
         hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
+        cluster: crate::config::ClusterConfig::default(),
+        openclaw_node: None,
     };
 
     config.save().await?;
@@ -865,12 +869,10 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Mixtral 8x22B".to_string(),
             ),
         ],
-        "novita" => vec![
-            (
-                "minimax/minimax-m2.5".to_string(),
-                "MiniMax M2.5".to_string(),
-            ),
-        ],
+        "novita" => vec![(
+            "minimax/minimax-m2.5".to_string(),
+            "MiniMax M2.5".to_string(),
+        )],
         "together-ai" => vec![
             (
                 "meta-llama/Llama-3.3-70B-Instruct-Turbo".to_string(),

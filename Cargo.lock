@@ -517,6 +517,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64-url"
+version = "3.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5b428e9fb429c6fda7316e9b006f993e6b4c33005e4659339fb5214479dddec"
+dependencies = [
+ "base64",
+]
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7996,6 +8005,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "base64-url",
  "chacha20poly1305",
  "chrono",
  "chrono-tz",
@@ -8006,6 +8016,7 @@ dependencies = [
  "cron",
  "dialoguer",
  "directories",
+ "dirs",
  "fantoccini",
  "futures-util",
  "glob",
@@ -8059,6 +8070,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "urlencoding",
  "uuid",
  "wa-rs",

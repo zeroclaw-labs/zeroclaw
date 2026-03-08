@@ -208,6 +208,14 @@ pub struct Config {
     /// Voice transcription configuration (Whisper API via Groq).
     #[serde(default)]
     pub transcription: TranscriptionConfig,
+
+    /// OpenClaw node configuration for connecting to OpenClaw gateways.
+    #[serde(default)]
+    pub openclaw_node: Option<OpenClawNodeConfig>,
+
+    /// Cluster configuration for multi-node multi-agent setups.
+    #[serde(default)]
+    pub cluster: ClusterConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -240,6 +248,10 @@ pub struct DelegateAgentConfig {
     /// Maximum tool-call iterations in agentic mode.
     #[serde(default = "default_max_tool_iterations")]
     pub max_iterations: usize,
+    /// Node name to delegate to (for cross-node delegation in cluster mode).
+    /// If not specified, delegation happens locally.
+    #[serde(default)]
+    pub node: Option<String>,
 }
 
 fn default_max_depth() -> u32 {
@@ -366,6 +378,140 @@ impl Default for TranscriptionConfig {
     }
 }
 
+// ── Cluster ───────────────────────────────────────────────────────
+
+/// Node role in the cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterNodeRole {
+    /// Gateway node that handles external requests and coordinates tasks.
+    Coordinator,
+    /// Worker node that executes agent tasks.
+    #[default]
+    Worker,
+}
+
+/// OpenClaw node configuration for connecting to OpenClaw gateways as agent-delegation nodes.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OpenClawNodeConfig {
+    /// Enable OpenClaw node mode. When false, this ZeroClaw instance does not connect to OpenClaw.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Gateway WebSocket URL (e.g. "ws://openclaw.example.com:18789" or "wss://openclaw.example.com/gateway")
+    #[serde(default)]
+    pub gateway_url: Option<String>,
+
+    /// Shared auth token for the gateway
+    #[serde(default)]
+    pub gateway_token: Option<String>,
+
+    /// Node ID (UUID). Auto-generated if not provided.
+    #[serde(default)]
+    pub node_id: Option<String>,
+
+    /// Display name for this node. Defaults to hostname.
+    #[serde(default)]
+    pub display_name: Option<String>,
+
+    /// Path to persist Ed25519 device identity keypair (default: ~/.zeroclaw/openclaw-device-key)
+    #[serde(default)]
+    pub device_key_path: Option<String>,
+
+    /// Maximum reconnect backoff in seconds (default: 30)
+    #[serde(default = "default_openclaw_reconnect_backoff")]
+    pub reconnect_max_backoff_secs: u64,
+}
+
+fn default_openclaw_reconnect_backoff() -> u64 {
+    30
+}
+
+/// Cluster configuration for multi-node multi-agent setups.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ClusterConfig {
+    /// Enable cluster mode. When false, node runs standalone.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Unique node name (must be unique in cluster).
+    #[serde(default)]
+    pub node_name: Option<String>,
+    /// Bind address for cluster WebSocket server.
+    #[serde(default = "default_cluster_bind_host")]
+    pub bind_host: String,
+    /// Bind port for cluster WebSocket server (use same port on all nodes).
+    #[serde(default = "default_cluster_bind_port")]
+    pub bind_port: u16,
+    /// List of peer addresses (host:port) to connect to.
+    #[serde(default)]
+    pub peers: Vec<String>,
+    /// Shared secret token for node authentication.
+    #[serde(default)]
+    pub node_token: Option<String>,
+    /// Coordinator election timeout in seconds.
+    #[serde(default = "default_cluster_election_timeout_secs")]
+    pub election_timeout_secs: u64,
+    /// Heartbeat interval in seconds.
+    #[serde(default = "default_cluster_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+    /// Node capabilities (e.g., gateway, ollama, gpu).
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Static role assignment (overrides election if set).
+    #[serde(default)]
+    pub static_role: Option<ClusterNodeRole>,
+    /// Enable peer discovery via UDP broadcast (default: true).
+    #[serde(default)]
+    pub discovery_enabled: bool,
+    /// Discovery broadcast port (default: same as bind_port).
+    /// All nodes must use the same discovery port for UDP broadcast to work.
+    #[serde(default)]
+    pub discovery_port: Option<u16>,
+    /// Discovery broadcast interval in seconds (default: 5).
+    #[serde(default = "default_discovery_interval")]
+    pub discovery_interval_secs: u64,
+}
+
+fn default_cluster_bind_host() -> String {
+    "0.0.0.0".to_string()
+}
+
+fn default_cluster_bind_port() -> u16 {
+    9090
+}
+
+fn default_cluster_election_timeout_secs() -> u64 {
+    10
+}
+
+fn default_cluster_heartbeat_interval_secs() -> u64 {
+    5
+}
+
+fn default_discovery_interval() -> u64 {
+    5
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            node_name: None,
+            bind_host: default_cluster_bind_host(),
+            bind_port: default_cluster_bind_port(),
+            peers: Vec::new(),
+            node_token: None,
+            election_timeout_secs: default_cluster_election_timeout_secs(),
+            heartbeat_interval_secs: default_cluster_heartbeat_interval_secs(),
+            capabilities: Vec::new(),
+            static_role: None,
+            discovery_enabled: true,
+            discovery_port: None,
+            discovery_interval_secs: default_discovery_interval(),
+        }
+    }
+}
+
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentConfig {
@@ -431,7 +577,7 @@ fn parse_skills_prompt_injection_mode(raw: &str) -> Option<SkillsPromptInjection
 }
 
 /// Skills loading configuration (`[skills]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct SkillsConfig {
     /// Enable loading and syncing the community open-skills repository.
     /// Default: `false` (opt-in).
@@ -445,16 +591,6 @@ pub struct SkillsConfig {
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
-}
-
-impl Default for SkillsConfig {
-    fn default() -> Self {
-        Self {
-            open_skills_enabled: false,
-            open_skills_dir: None,
-            prompt_injection_mode: SkillsPromptInjectionMode::default(),
-        }
-    }
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
@@ -644,6 +780,31 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 0.15,
             output: 0.60,
+        },
+    );
+
+    // GPT-5-mini is a cost-efficient, high-performance option aimed at
+    // well-defined fast-response tasks. Pricing is intentionally low so
+    // several variants (provider-specific names) are included.
+    prices.insert(
+        "copilot/gpt-5-mini".into(),
+        ModelPricing {
+            input: 0.25,
+            output: 2.00,
+        },
+    );
+    prices.insert(
+        "github_copilot/gpt-5-mini".into(),
+        ModelPricing {
+            input: 0.25,
+            output: 2.00,
+        },
+    );
+    prices.insert(
+        "openai/gpt-5-mini".into(),
+        ModelPricing {
+            input: 0.25,
+            output: 2.00,
         },
     );
     prices.insert(
@@ -1827,18 +1988,10 @@ impl Default for HooksConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct BuiltinHooksConfig {
     /// Enable the command-logger hook (logs tool calls for auditing).
     pub command_logger: bool,
-}
-
-impl Default for BuiltinHooksConfig {
-    fn default() -> Self {
-        Self {
-            command_logger: false,
-        }
-    }
 }
 
 // ── Autonomy / Security ──────────────────────────────────────────
@@ -2403,7 +2556,7 @@ pub struct CustomTunnelConfig {
 struct ConfigWrapper<T: ChannelConfig>(std::marker::PhantomData<T>);
 
 impl<T: ChannelConfig> ConfigWrapper<T> {
-    fn new(_: &Option<T>) -> Self {
+    fn new(_: Option<&T>) -> Self {
         Self(std::marker::PhantomData)
     }
 }
@@ -2479,79 +2632,79 @@ impl ChannelsConfig {
     pub fn channels_except_webhook(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
         vec![
             (
-                Box::new(ConfigWrapper::new(&self.telegram)),
+                Box::new(ConfigWrapper::new(self.telegram.as_ref())),
                 self.telegram.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.discord)),
+                Box::new(ConfigWrapper::new(self.discord.as_ref())),
                 self.discord.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.slack)),
+                Box::new(ConfigWrapper::new(self.slack.as_ref())),
                 self.slack.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.mattermost)),
+                Box::new(ConfigWrapper::new(self.mattermost.as_ref())),
                 self.mattermost.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.imessage)),
+                Box::new(ConfigWrapper::new(self.imessage.as_ref())),
                 self.imessage.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.matrix)),
+                Box::new(ConfigWrapper::new(self.matrix.as_ref())),
                 self.matrix.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.signal)),
+                Box::new(ConfigWrapper::new(self.signal.as_ref())),
                 self.signal.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.whatsapp)),
+                Box::new(ConfigWrapper::new(self.whatsapp.as_ref())),
                 self.whatsapp.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.linq)),
+                Box::new(ConfigWrapper::new(self.linq.as_ref())),
                 self.linq.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.wati)),
+                Box::new(ConfigWrapper::new(self.wati.as_ref())),
                 self.wati.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.nextcloud_talk)),
+                Box::new(ConfigWrapper::new(self.nextcloud_talk.as_ref())),
                 self.nextcloud_talk.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.email)),
+                Box::new(ConfigWrapper::new(self.email.as_ref())),
                 self.email.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.irc)),
+                Box::new(ConfigWrapper::new(self.irc.as_ref())),
                 self.irc.is_some()
             ),
             (
-                Box::new(ConfigWrapper::new(&self.lark)),
+                Box::new(ConfigWrapper::new(self.lark.as_ref())),
                 self.lark.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.feishu)),
+                Box::new(ConfigWrapper::new(self.feishu.as_ref())),
                 self.feishu.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.dingtalk)),
+                Box::new(ConfigWrapper::new(self.dingtalk.as_ref())),
                 self.dingtalk.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.qq)),
+                Box::new(ConfigWrapper::new(self.qq.as_ref())),
                 self.qq.is_some()
             ),
             (
-                Box::new(ConfigWrapper::new(&self.nostr)),
+                Box::new(ConfigWrapper::new(self.nostr.as_ref())),
                 self.nostr.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.clawdtalk)),
+                Box::new(ConfigWrapper::new(self.clawdtalk.as_ref())),
                 self.clawdtalk.is_some(),
             ),
         ]
@@ -2560,7 +2713,7 @@ impl ChannelsConfig {
     pub fn channels(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
         let mut ret = self.channels_except_webhook();
         ret.push((
-            Box::new(ConfigWrapper::new(&self.webhook)),
+            Box::new(ConfigWrapper::new(self.webhook.as_ref())),
             self.webhook.is_some(),
         ));
         ret
@@ -3500,6 +3653,8 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
+            cluster: ClusterConfig::default(),
+            openclaw_node: None,
         }
     }
 }
@@ -4481,7 +4636,7 @@ async fn sync_directory(path: &Path) -> Result<()> {
         dir.sync_all()
             .await
             .with_context(|| format!("Failed to fsync directory metadata: {}", path.display()))?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]
@@ -4772,6 +4927,8 @@ default_temperature = 0.7
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            cluster: ClusterConfig::default(),
+            openclaw_node: None,
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -4815,6 +4972,23 @@ default_temperature = 0.7
         assert_eq!(parsed.memory.archive_after_days, 7);
         assert_eq!(parsed.memory.purge_after_days, 30);
         assert_eq!(parsed.memory.conversation_retention_days, 30);
+    }
+
+    #[test]
+    async fn default_pricing_contains_gpt_5_mini() {
+        let pricing = get_default_pricing();
+        // check several common identifiers for the mini variant
+        for key in &[
+            "copilot/gpt-5-mini",
+            "github_copilot/gpt-5-mini",
+            "openai/gpt-5-mini",
+        ] {
+            let entry = pricing
+                .get(*key)
+                .unwrap_or_else(|| panic!("pricing missing for {}", key));
+            assert_eq!(entry.input, 0.25, "{} input price", key);
+            assert_eq!(entry.output, 2.0, "{} output price", key);
+        }
     }
 
     #[test]
@@ -4946,6 +5120,8 @@ tool_dispatcher = "xml"
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            cluster: ClusterConfig::default(),
+            openclaw_node: None,
         };
 
         config.save().await.unwrap();
@@ -4995,6 +5171,7 @@ tool_dispatcher = "xml"
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                node: None,
             },
         );
 
