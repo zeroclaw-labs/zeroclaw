@@ -276,7 +276,7 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
 /// Load recent conversation entries for a session from memory in chronological order.
 /// Used in single-shot (`-m`) mode with `--session-id` to provide history context
 /// across invocations of the same named session.
-/// Filters to user-message autosave entries only; skips assistant entries.
+/// Includes both user_msg_* and assistant_msg_* entries to replay full turn context.
 async fn load_recent_conversation(
     mem: &dyn Memory,
     max_messages: usize,
@@ -3057,8 +3057,12 @@ pub async fn run(
         let mem_context =
             build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
 
-        // Auto-save user message to memory, scoped to session when provided.
-        if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+        // Persist user message. When a session ID is set, always save regardless of
+        // auto_save or minimum-length gates so short follow-ups like "why?" are
+        // never silently dropped from session history.
+        let should_save_user = sid.is_some()
+            || (config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS);
+        if should_save_user {
             let user_key = autosave_memory_key("user_msg");
             let _ = mem
                 .store(&user_key, &msg, MemoryCategory::Conversation, sid)
@@ -3105,8 +3109,9 @@ pub async fn run(
         println!("{response}");
 
         // Persist the assistant reply so the next --session-id invocation can replay it.
+        // Always save when sid is set; do not gate on auto_save or length.
         if let Some(sid) = sid {
-            if config.memory.auto_save && !response.is_empty() {
+            if !response.is_empty() {
                 let assistant_key = autosave_memory_key("assistant_msg");
                 let _ = mem
                     .store(

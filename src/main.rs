@@ -40,6 +40,13 @@ use std::io::Write;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
+fn parse_session_id(s: &str) -> std::result::Result<String, String> {
+    if s.trim().is_empty() {
+        return Err("--session-id must not be blank or whitespace-only".to_string());
+    }
+    Ok(s.to_string())
+}
+
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
     if !(0.0..=2.0).contains(&t) {
@@ -181,7 +188,7 @@ Examples:
 
         /// Session ID for -m mode: loads this session's history and saves messages into it.
         /// Enables stateful multi-call workflows: zeroclaw agent -m "..." --session-id my-task
-        #[arg(long, requires = "message")]
+        #[arg(long, requires = "message", value_parser = parse_session_id)]
         session_id: Option<String>,
 
         /// Provider to use (openrouter, anthropic, openai, openai-codex)
