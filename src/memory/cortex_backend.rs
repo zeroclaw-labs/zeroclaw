@@ -44,13 +44,14 @@ impl CortexMemory {
         tracing::info!(
             "🧠 Initializing Cortex-Memory:\n\
              ├─ LLM: {} @ {}\n\
-             ├─ Embedding: {} ({} dims)\n\
+             ├─ Embedding: {} ({} dims) @ {}\n\
              ├─ Qdrant: {} / {}\n\
              └─ Tenant: {}",
             config.llm_model,
             config.llm_api_base_url,
             config.embedding_model,
             config.embedding_dimensions,
+            config.embedding_api_base_url,
             config.qdrant_url,
             config.qdrant_collection,
             config.tenant_id,

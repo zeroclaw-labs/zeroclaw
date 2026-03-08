@@ -4201,6 +4201,14 @@ impl Config {
 
             config.apply_env_overrides();
             config.validate()?;
+            
+            tracing::info!(
+                "After load: api_url={:?}, default_provider={:?}, default_model={:?}",
+                config.api_url,
+                config.default_provider,
+                config.default_model
+            );
+            
             tracing::info!(
                 path = %config.config_path.display(),
                 workspace = %config.workspace_dir.display(),

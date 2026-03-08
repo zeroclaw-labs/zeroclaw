@@ -17,6 +17,7 @@ use axum::{
     },
     response::IntoResponse,
 };
+use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 
@@ -76,6 +77,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         let content = parsed["content"].as_str().unwrap_or("").to_string();
         if content.is_empty() {
             continue;
+        }
+
+        // 🔧 Auto-save user message to memory (mimics webhook pattern)
+        if state.auto_save && content.chars().count() >= 20 {
+            use crate::memory::traits::MemoryCategory;
+            let key = format!("ws_msg_{}", Utc::now().timestamp());
+            let _ = state
+                .mem
+                .store(&key, &content, MemoryCategory::Conversation, None)
+                .await;
+            tracing::info!("WebSocket message auto-saved to memory: key={}", key);
         }
 
         // Process message with the LLM provider

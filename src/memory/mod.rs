@@ -186,7 +186,7 @@ pub fn create_memory(
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes(config, &[], None, workspace_dir, api_key)
+    create_memory_with_storage_and_routes(config, &[], None, workspace_dir, api_key, None)
 }
 
 /// Factory: create memory with optional storage-provider override.
@@ -196,16 +196,20 @@ pub fn create_memory_with_storage(
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes(config, &[], storage_provider, workspace_dir, api_key)
+    create_memory_with_storage_and_routes(config, &[], storage_provider, workspace_dir, api_key, None)
 }
 
 /// Factory: create memory with optional storage-provider override and embedding routes.
+///
+/// `zeroclaw_config` is required for cortex backend to derive LLM settings.
+/// Pass `None` for non-cortex backends or when no full config is available.
 pub fn create_memory_with_storage_and_routes(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
     storage_provider: Option<&StorageProviderConfig>,
     workspace_dir: &Path,
     api_key: Option<&str>,
+    zeroclaw_config: Option<&crate::config::Config>,
 ) -> anyhow::Result<Box<dyn Memory>> {
     let backend_name = effective_memory_backend_name(&config.backend, storage_provider);
     let backend_kind = classify_memory_backend(&backend_name);
@@ -227,24 +231,30 @@ pub fn create_memory_with_storage_and_routes(
         let memory_config = config.clone();
         let workspace_dir = workspace_dir.to_path_buf();
         
-        // Build a minimal config context for Cortex-Memory initialization
-        // api_key priority: embedding route key > cortex override > passed api_key parameter
-        let api_key = embedding_routes
-            .iter()
-            .find(|r| r.hint == config.embedding_model.strip_prefix("hint:").unwrap_or(""))
-            .and_then(|r| r.api_key.clone())
-            .or_else(|| config.cortex.embedding_api_key_override.clone())
-            .or_else(|| api_key.map(|s| s.to_string()));
-        
-        let config_clone = crate::config::Config {
-            memory: config.clone(),
-            embedding_routes: embedding_routes.to_vec(),
-            storage: crate::config::StorageConfig::default(),
-            workspace_dir: workspace_dir.clone(),
-            api_key,
-            default_provider: Some("openai".to_string()),
-            default_model: Some("gpt-4o-mini".to_string()),
-            ..crate::config::Config::default()
+        // Get the full zeroclaw config, or construct a minimal one from available params
+        let config_clone = if let Some(full_config) = zeroclaw_config {
+            full_config.clone()
+        } else {
+            // Fallback: build a minimal config from available parameters
+            // api_key priority: embedding route key > cortex override > passed api_key parameter
+            let resolved_api_key = embedding_routes
+                .iter()
+                .find(|r| r.hint == config.embedding_model.strip_prefix("hint:").unwrap_or(""))
+                .and_then(|r| r.api_key.clone())
+                .or_else(|| config.cortex.embedding_api_key_override.clone())
+                .or_else(|| api_key.map(|s| s.to_string()));
+            
+            crate::config::Config {
+                memory: config.clone(),
+                embedding_routes: embedding_routes.to_vec(),
+                storage: crate::config::StorageConfig::default(),
+                workspace_dir: workspace_dir.clone(),
+                api_key: resolved_api_key,
+                default_provider: None,
+                default_model: None,
+                api_url: None,
+                ..crate::config::Config::default()
+            }
         };
 
         return tokio::task::block_in_place(|| {

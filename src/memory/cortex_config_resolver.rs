@@ -92,21 +92,34 @@ fn resolve_llm_config(
     zeroclaw_config: &Config,
     cortex_config: &CortexMemConfig,
 ) -> Result<(String, String, String)> {
+    tracing::info!(
+        "Resolving LLM config: api_url={:?}, default_provider={:?}, default_model={:?}",
+        zeroclaw_config.api_url,
+        zeroclaw_config.default_provider,
+        zeroclaw_config.default_model
+    );
+
     // Get API key (required)
     let llm_api_key = zeroclaw_config.api_key.clone()
         .context("Cortex-Memory requires api_key in zeroclaw config")?;
-    
+
     // Get API base URL
     let llm_api_base_url = zeroclaw_config.api_url.clone()
         .unwrap_or_else(|| {
-            derive_provider_base_url(zeroclaw_config.default_provider.as_deref())
+            let derived = derive_provider_base_url(zeroclaw_config.default_provider.as_deref());
+            tracing::info!(
+                "LLM API base URL derived from provider {:?}: {}",
+                zeroclaw_config.default_provider,
+                derived
+            );
+            derived
         });
-    
+
     // Get model
     let llm_model = cortex_config.llm_model_override.clone()
         .or_else(|| zeroclaw_config.default_model.clone())
         .unwrap_or_else(|| "gpt-3.5-turbo".to_string());
-    
+
     Ok((llm_api_base_url, llm_api_key, llm_model))
 }
 
@@ -121,21 +134,32 @@ fn resolve_embedding_config(
     memory_config: &MemoryConfig,
     cortex_config: &CortexMemConfig,
 ) -> Result<(String, String, String, usize)> {
+    tracing::info!(
+        "Resolving embedding config: provider={}, model={}",
+        memory_config.embedding_provider,
+        memory_config.embedding_model
+    );
+
     // Check if using hint routing
     if let Some(hint) = memory_config.embedding_model.strip_prefix("hint:") {
         return resolve_embedding_from_route(zeroclaw_config, hint, cortex_config);
     }
-    
+
     // Direct configuration
     let embedding_api_base_url = provider_to_base_url(&memory_config.embedding_provider);
     let embedding_model = memory_config.embedding_model.clone();
     let embedding_dimensions = memory_config.embedding_dimensions;
-    
+
+    tracing::info!(
+        "Embedding API base URL resolved to: {}",
+        embedding_api_base_url
+    );
+
     // API key: cortex override > global api_key
     let embedding_api_key = cortex_config.embedding_api_key_override.clone()
         .or_else(|| zeroclaw_config.api_key.clone())
         .context("Embedding requires api_key (set globally or via cortex.embedding_api_key_override)")?;
-    
+
     Ok((embedding_api_base_url, embedding_api_key, embedding_model, embedding_dimensions))
 }
 
