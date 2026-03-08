@@ -742,7 +742,7 @@ impl std::fmt::Debug for TranscriptionConfig {
                     None::<&str>
                 },
             )
-            .field("api_url", &self.api_url)
+            .field("api_url", &"<redacted>")
             .field("model", &self.model)
             .field("language", &self.language)
             .field("max_duration_secs", &self.max_duration_secs)
