@@ -81,6 +81,7 @@ credential is not reused for fallback providers.
 - Request format uses `max_completion_tokens` instead of `max_tokens`
 - API version: `2024-10-21`
 - Supports native tool calling
+- **Note**: Some models only support a temperature value of 1 so the configuration needs to be updated accordingly as required.
 - **Important**: The `model` parameter represents the Azure deployment name (e.g., "gpt-5.2-chat", "gpt-4o")
 
 Configuration example:
