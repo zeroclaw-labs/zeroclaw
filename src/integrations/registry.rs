@@ -768,6 +768,18 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         // ── Productivity ────────────────────────────────────────
         IntegrationEntry {
+            name: "Google Workspace",
+            description: "Drive, Gmail, Calendar, Sheets, Docs via gws CLI",
+            category: IntegrationCategory::Productivity,
+            status_fn: |c| {
+                if c.google_workspace.enabled {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
             name: "GitHub",
             description: "Native issue/PR comment channel",
             category: IntegrationCategory::Productivity,
