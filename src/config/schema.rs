@@ -360,18 +360,36 @@ fn default_transcription_max_duration_secs() -> u64 {
     120
 }
 
-/// Voice transcription configuration (Whisper API via Groq).
+/// Supported transcription providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+pub enum TranscriptionProvider {
+    /// Whisper API via Groq (Cloud).
+    #[default]
+    #[serde(rename = "groq")]
+    Groq,
+    /// Local transcription via whisper-rs (CPU/Metal).
+    #[serde(rename = "local")]
+    Local,
+}
+
+/// Voice transcription configuration (Whisper API via Groq or Local).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
     #[serde(default)]
     pub enabled: bool,
-    /// Whisper API endpoint URL.
+    /// Transcription provider selection.
+    #[serde(default)]
+    pub provider: TranscriptionProvider,
+    /// Whisper API endpoint URL (Groq only).
     #[serde(default = "default_transcription_api_url")]
     pub api_url: String,
-    /// Whisper model name.
+    /// Whisper model name (Groq or local filename hint).
     #[serde(default = "default_transcription_model")]
     pub model: String,
+    /// Path to a local GGML model file (Local only).
+    #[serde(default)]
+    pub whisper_model_path: Option<String>,
     /// Optional language hint (ISO-639-1, e.g. "en", "ru").
     #[serde(default)]
     pub language: Option<String>,
@@ -384,8 +402,10 @@ impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            provider: TranscriptionProvider::default(),
             api_url: default_transcription_api_url(),
             model: default_transcription_model(),
+            whisper_model_path: None,
             language: None,
             max_duration_secs: default_transcription_max_duration_secs(),
         }
@@ -2761,6 +2781,12 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// Parse and transcribe voice messages using local `whisper-rs`
+    #[serde(default)]
+    pub voice_messages: bool,
+    /// Optional path to the whisper model (e.g. `ggml-tiny.bin`). Defaults to downloading it.
+    #[serde(default)]
+    pub whisper_model: Option<String>,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -3608,7 +3634,30 @@ impl Default for Config {
             embedding_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
-            channels_config: ChannelsConfig::default(),
+            channels_config: ChannelsConfig {
+                cli: true,
+                telegram: None,
+                discord: None,
+                slack: None,
+                mattermost: None,
+                webhook: None,
+                imessage: None,
+                matrix: None,
+                signal: None,
+                whatsapp: None,
+                linq: None,
+                wati: None,
+                nextcloud_talk: None,
+                email: None,
+                irc: None,
+                lark: None,
+                feishu: None,
+                dingtalk: None,
+                qq: None,
+                nostr: None,
+                clawdtalk: None,
+                message_timeout_secs: default_channel_message_timeout_secs(),
+            },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -4121,7 +4170,8 @@ impl Config {
             // Restrict permissions on newly created config file (may contain API keys)
             #[cfg(unix)]
             {
-                use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+                use std::fs::Permissions;
+                use std::os::unix::fs::PermissionsExt;
                 let _ = fs::set_permissions(&config_path, Permissions::from_mode(0o600)).await;
             }
 
@@ -4792,7 +4842,8 @@ impl Config {
 
         #[cfg(unix)]
         {
-            use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+            use std::fs::Permissions;
+            use std::os::unix::fs::PermissionsExt;
             if let Err(err) =
                 fs::set_permissions(&self.config_path, Permissions::from_mode(0o600)).await
             {
@@ -5119,6 +5170,8 @@ default_temperature = 0.7
                     draft_update_interval_ms: default_draft_update_interval_ms(),
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    voice_messages: false,
+                    whisper_model: None,
                 }),
                 discord: None,
                 slack: None,
@@ -5488,8 +5541,10 @@ tool_dispatcher = "xml"
             allowed_users: vec!["alice".into(), "bob".into()],
             stream_mode: StreamMode::Partial,
             draft_update_interval_ms: 500,
-            interrupt_on_new_message: true,
+            interrupt_on_new_message: false,
             mention_only: false,
+            voice_messages: false,
+            whisper_model: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();

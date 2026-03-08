@@ -488,8 +488,15 @@ Notes:
 - If using cloud APIs (OpenAI, Anthropic, etc.), you can reduce this to `60` or lower.
 - Values below `30` are clamped to `30` to avoid immediate timeout churn.
 - When a timeout occurs, users receive: `⚠️ Request timed out while waiting for the model. Please try again.`
-- Telegram-only interruption behavior is controlled with `channels_config.telegram.interrupt_on_new_message` (default `false`).
-  When enabled, a newer message from the same sender in the same chat cancels the in-flight request and preserves interrupted user context.
+- Telegram-only configuration options:
+  ```toml
+  [channels_config.telegram]
+  mention_only = false              # optional: require @mention in groups
+  interrupt_on_new_message = false  # optional: cancel in-flight same-sender same-chat request
+  voice_messages = true             # optional: enable local voice-to-text transcription (requires ffmpeg)
+  whisper_model = "models/tiny.bin" # optional: path to ggml model bin
+  ```
+  When `interrupt_on_new_message` is enabled, a newer message from the same sender in the same chat cancels the in-flight request and preserves interrupted user context.
 - While `zeroclaw channel start` is running, updates to `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
 
 ### `[channels_config.nostr]`
@@ -628,6 +635,26 @@ Notes:
 
 - Place `.md`/`.txt` datasheet files named by board (e.g. `nucleo-f401re.md`, `rpi-gpio.md`) in `datasheet_dir` for RAG retrieval.
 - See [hardware-peripherals-design.md](hardware-peripherals-design.md) for board protocol and firmware notes.
+
+## Transcription Configuration
+
+Global settings for voice-to-text transcription.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable transcription globally |
+| `provider` | `"groq"` | Transcription provider: `"groq"` or `"local"` |
+| `api_url` | Groq API URL | API endpoint (Groq only) |
+| `model` | `"whisper-large-v3-turbo"` | Model name (Groq or local hint) |
+| `whisper_model_path` | unset | Custom path to local GGML `.bin` model (Local only) |
+| `max_duration_secs` | `120` | Max audio duration to process |
+
+```toml
+[transcription]
+enabled = true
+provider = "local"
+# whisper_model_path = "models/ggml-base.bin"
+```
 
 ## Security-Relevant Defaults
 

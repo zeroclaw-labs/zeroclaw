@@ -35,6 +35,7 @@ enum IncomingAttachmentKind {
     Photo,
 }
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
+const TELEGRAM_DEFAULT_VOICE_MAX_DURATION_SECS: u64 = 300; // 5 minutes default
 
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
@@ -311,6 +312,8 @@ pub struct TelegramChannel {
     transcription: Option<crate::config::TranscriptionConfig>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
+    voice_messages_enabled: bool,
+    whisper_model: Option<String>,
 }
 
 impl TelegramChannel {
@@ -342,6 +345,8 @@ impl TelegramChannel {
             transcription: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
+            voice_messages_enabled: false,
+            whisper_model: None,
         }
     }
 
@@ -374,6 +379,18 @@ impl TelegramChannel {
         if config.enabled {
             self.transcription = Some(config);
         }
+        self
+    }
+
+    /// Explicitly enable Telegram-specific voice message parsing (independent of Groq-based transcription config).
+    pub fn with_voice_messages(mut self, enabled: bool) -> Self {
+        self.voice_messages_enabled = enabled;
+        self
+    }
+
+    /// Set an optional path to a local whisper model.
+    pub fn with_whisper_model(mut self, path: Option<String>) -> Self {
+        self.whisper_model = path;
         self
     }
 
@@ -1040,15 +1057,19 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Returns `None` if the message is not a voice message, transcription is disabled,
     /// or the message exceeds duration limits.
     async fn try_parse_voice_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
-        let config = self.transcription.as_ref()?;
         let message = update.get("message")?;
 
         let (file_id, duration) = Self::parse_voice_metadata(message)?;
 
-        if duration > config.max_duration_secs {
+        let max_duration = self
+            .transcription
+            .as_ref()
+            .map(|c| c.max_duration_secs)
+            .unwrap_or(TELEGRAM_DEFAULT_VOICE_MAX_DURATION_SECS);
+
+        if duration > max_duration {
             tracing::info!(
-                "Skipping voice message: duration {duration}s exceeds limit {}s",
-                config.max_duration_secs
+                "Skipping voice message: duration {duration}s exceeds limit {max_duration}s"
             );
             return None;
         }
@@ -1109,14 +1130,47 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        let text =
+        let text = if self.voice_messages_enabled {
+            // Download audio data and save to a temporary file
+            let temp_dir = std::env::temp_dir();
+            let temp_path = temp_dir.join(format!("tg_voice_{}_{}.ogg", chat_id, message_id));
+            if let Err(e) = fs::write(&temp_path, &audio_data).await {
+                tracing::warn!("Failed to save temp voice file for whisper-rs: {e}");
+                return None;
+            }
+
+            // We need a workspace_dir for the default model download path
+            let workspace = self.workspace_dir.as_ref().cloned().unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
+
+            let res = super::transcription::transcribe_audio_whisper_rs(
+                &temp_path,
+                self.whisper_model.as_deref(),
+                &workspace,
+            )
+            .await;
+            
+            // Clean up
+            let _ = fs::remove_file(&temp_path).await;
+
+            match res {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("whisper-rs Voice transcription failed: {e}");
+                    return None;
+                }
+            }
+        } else {
+            let config = self.transcription.as_ref()?;
             match super::transcription::transcribe_audio(audio_data, &file_name, config).await {
                 Ok(t) => t,
                 Err(e) => {
-                    tracing::warn!("Voice transcription failed: {e}");
+                    tracing::warn!("Groq Voice transcription failed: {e}");
                     return None;
                 }
-            };
+            }
+        };
 
         if text.trim().is_empty() {
             tracing::info!("Voice transcription returned empty text, skipping");

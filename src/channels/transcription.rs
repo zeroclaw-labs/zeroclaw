@@ -1,7 +1,9 @@
 use anyhow::{bail, Context, Result};
 use reqwest::multipart::{Form, Part};
 
+use crate::config::schema::TranscriptionProvider;
 use crate::config::TranscriptionConfig;
+use uuid::Uuid;
 
 /// Maximum upload size accepted by the Groq Whisper API (25 MB).
 const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
@@ -37,6 +39,38 @@ fn normalize_audio_filename(file_name: &str) -> String {
 /// environment.  The caller is responsible for enforcing duration limits
 /// *before* downloading the file; this function enforces the byte-size cap.
 pub async fn transcribe_audio(
+    audio_data: Vec<u8>,
+    file_name: &str,
+    config: &TranscriptionConfig,
+) -> Result<String> {
+    match config.provider {
+        TranscriptionProvider::Groq => {
+            transcribe_audio_groq(audio_data, file_name, config).await
+        }
+        TranscriptionProvider::Local => {
+            // Local whisper-rs expects a file path. We write the bytes to a temporary file.
+            let temp_dir = std::env::temp_dir();
+            let temp_path = temp_dir.join(format!("transcribe_{}", Uuid::new_v4()));
+            tokio::fs::write(&temp_path, &audio_data).await.context("Failed to write temporary audio file for local transcription")?;
+            
+            // We use the current directory as a fallback for workspace_dir if not easily available here,
+            // but ideally we'd pass it in. TranscriptionConfig doesn't have it.
+            // However, transcribe_audio_whisper_rs uses it mainly for model download.
+            let workspace_dir = std::path::PathBuf::from("."); 
+
+            let res = transcribe_audio_whisper_rs(
+                &temp_path,
+                config.whisper_model_path.as_deref(),
+                &workspace_dir,
+            ).await;
+
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            res
+        }
+    }
+}
+
+async fn transcribe_audio_groq(
     audio_data: Vec<u8>,
     file_name: &str,
     config: &TranscriptionConfig,
@@ -103,6 +137,93 @@ pub async fn transcribe_audio(
         .to_string();
 
     Ok(text)
+}
+
+/// Transcribe audio file using local `whisper-rs` and `ffmpeg`
+///
+/// Requires `ffmpeg` to be installed and available in PATH.
+/// Downloads `ggml-tiny.bin` to `workspace_dir/models` if no custom model is specified.
+pub async fn transcribe_audio_whisper_rs(
+    file_path: &std::path::Path,
+    model_path: Option<&str>,
+    workspace_dir: &std::path::Path,
+) -> Result<String> {
+    let actual_model_path = match model_path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            let models_dir = workspace_dir.join("models");
+            tokio::fs::create_dir_all(&models_dir).await?;
+            let default_model = models_dir.join("ggml-tiny.bin");
+            if !default_model.exists() {
+                tracing::info!("Downloading default whisper model (ggml-tiny.bin) to {:?}", default_model);
+                let response = reqwest::get("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin")
+                    .await?
+                    .error_for_status()?;
+                let bytes = response.bytes().await?;
+                tokio::fs::write(&default_model, bytes).await?;
+            }
+            default_model
+        }
+    };
+
+    let output = tokio::process::Command::new("ffmpeg")
+        .arg("-i")
+        .arg(file_path)
+        .args(["-ar", "16000"])
+        .args(["-ac", "1"])
+        .args(["-f", "f32le"])
+        .arg("-")
+        .output()
+        .await
+        .context("Failed to execute ffmpeg for audio decoding. Is it installed?")?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        bail!("ffmpeg failed to decode audio: {}", err);
+    }
+
+    let audio_bytes = output.stdout;
+    if audio_bytes.len() % 4 != 0 {
+        bail!("ffmpeg output is not a multiple of 4 bytes");
+    }
+
+    let audio_f32: Vec<f32> = audio_bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+
+    let actual_model_path_str = actual_model_path.to_string_lossy().to_string();
+
+    let transcript = tokio::task::spawn_blocking(move || -> Result<String> {
+        let ctx = whisper_rs::WhisperContext::new_with_params(
+            &actual_model_path_str,
+            whisper_rs::WhisperContextParameters::default(),
+        )
+        .context("failed to load whisper model")?;
+
+        let params = whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
+
+        let mut state = ctx.create_state().context("failed to create whisper state")?;
+        state
+            .full(params, &audio_f32[..])
+            .context("failed to run whisper model")?;
+
+        let mut transcript = String::new();
+        // whisper-rs >= 0.15 has a native iterator that implements Display
+        for segment in state.as_iter() {
+            transcript.push_str(&segment.to_string());
+        }
+        Ok(transcript)
+    })
+    .await
+    .context("spawn_blocking panicked")??;
+
+    let transcript = transcript.trim().to_string();
+    if transcript.is_empty() {
+        bail!("whisper-rs returned empty transcription");
+    }
+
+    Ok(transcript)
 }
 
 #[cfg(test)]

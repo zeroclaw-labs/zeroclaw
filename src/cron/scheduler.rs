@@ -316,7 +316,9 @@ pub(crate) async fn deliver_announcement(
                 tg.bot_token.clone(),
                 tg.allowed_users.clone(),
                 tg.mention_only,
-            );
+            )
+            .with_voice_messages(tg.voice_messages)
+            .with_whisper_model(tg.whisper_model.clone());
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "discord" => {
