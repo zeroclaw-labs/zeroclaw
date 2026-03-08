@@ -188,7 +188,18 @@ impl AzureOpenAiProvider {
         })
     }
 
-    fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
+    /// Convert agent chat history into the Azure OpenAI native message format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a message with `role == "tool"` is malformed:
+    /// - JSON content cannot be parsed, or
+    /// - the parsed JSON is missing a `tool_call_id` field.
+    ///
+    /// Malformed tool history must fail fast here rather than producing a
+    /// `NativeMessage` with `tool_call_id: None`, which would be rejected or
+    /// misinterpreted by the Azure OpenAI API.
+    fn convert_messages(messages: &[ChatMessage]) -> anyhow::Result<Vec<NativeMessage>> {
         messages
             .iter()
             .map(|m| {
@@ -225,43 +236,61 @@ impl AzureOpenAiProvider {
                                 .and_then(|rc| rc.as_str())
                                 .map(ToString::to_string);
 
-                            return NativeMessage {
+                            return Ok(NativeMessage {
                                 role: m.role.clone(),
                                 content: content_val.as_str().map(ToString::to_string),
                                 tool_call_id: None,
                                 tool_calls,
                                 reasoning_content,
-                            };
+                            });
                         }
                     }
                 }
 
-                // Handle tool result messages
+                // Handle tool result messages — malformed entries are rejected with
+                // an explicit error rather than silently producing a NativeMessage
+                // with tool_call_id: None.
                 if m.role == "tool" {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&m.content) {
-                        if let Some(tool_call_id) = parsed.get("tool_call_id") {
-                            return NativeMessage {
-                                role: m.role.clone(),
-                                content: parsed
-                                    .get("content")
-                                    .and_then(|c| c.as_str())
-                                    .map(ToString::to_string),
-                                tool_call_id: tool_call_id.as_str().map(ToString::to_string),
-                                tool_calls: None,
-                                reasoning_content: None,
-                            };
-                        }
-                    }
+                    let parsed =
+                        serde_json::from_str::<serde_json::Value>(&m.content).map_err(|e| {
+                            anyhow::anyhow!(
+                                "tool-role message has invalid JSON content: {e}. \
+                                 Content was: {:?}",
+                                m.content
+                            )
+                        })?;
+
+                    let tool_call_id = parsed
+                        .get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "tool-role message is missing required \"tool_call_id\" field. \
+                                 Content was: {:?}",
+                                m.content
+                            )
+                        })?;
+
+                    return Ok(NativeMessage {
+                        role: m.role.clone(),
+                        content: parsed
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .map(ToString::to_string),
+                        tool_call_id: Some(tool_call_id.to_string()),
+                        tool_calls: None,
+                        reasoning_content: None,
+                    });
                 }
 
                 // Default message conversion
-                NativeMessage {
+                Ok(NativeMessage {
                     role: m.role.clone(),
                     content: Some(m.content.clone()),
                     tool_call_id: None,
                     tool_calls: None,
                     reasoning_content: None,
-                }
+                })
             })
             .collect()
     }
@@ -311,6 +340,18 @@ impl AzureOpenAiProvider {
             self.base_url, model
         )
     }
+
+    /// Returns an error if `base_url` was not configured, giving a clear message
+    /// rather than a cryptic "relative URL without a base" from reqwest.
+    fn require_base_url(&self) -> anyhow::Result<()> {
+        if self.base_url.is_empty() {
+            anyhow::bail!(
+                "Azure OpenAI api_url is not configured. \
+                 Add `api_url = \"https://your-resource.openai.azure.com\"` to config.toml."
+            );
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -354,6 +395,7 @@ impl Provider for AzureOpenAiProvider {
                 "Azure OpenAI API key not set. Set AZURE_OPENAI_API_KEY or edit config.toml."
             )
         })?;
+        self.require_base_url()?;
 
         let mut messages = Vec::new();
 
@@ -409,10 +451,11 @@ impl Provider for AzureOpenAiProvider {
                 "Azure OpenAI API key not set. Set AZURE_OPENAI_API_KEY or edit config.toml."
             )
         })?;
+        self.require_base_url()?;
 
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
-            messages: Self::convert_messages(request.messages),
+            messages: Self::convert_messages(request.messages)?,
             temperature,
             max_completion_tokens: Some(4096),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
@@ -466,6 +509,7 @@ impl Provider for AzureOpenAiProvider {
                 "Azure OpenAI API key not set. Set AZURE_OPENAI_API_KEY or edit config.toml."
             )
         })?;
+        self.require_base_url()?;
 
         let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
             None
@@ -480,7 +524,7 @@ impl Provider for AzureOpenAiProvider {
         };
 
         let native_request = NativeChatRequest {
-            messages: Self::convert_messages(messages),
+            messages: Self::convert_messages(messages)?,
             temperature,
             max_completion_tokens: Some(4096),
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
@@ -841,5 +885,58 @@ mod tests {
             reasoning_content: None,
         };
         assert_eq!(msg.effective_content(), "");
+    }
+
+    // ── convert_messages error-path tests ────────────────────────────────────
+
+    #[test]
+    fn convert_messages_tool_role_invalid_json_returns_error() {
+        let messages = vec![ChatMessage {
+            role: "tool".to_string(),
+            content: "this is not valid json".to_string(),
+        }];
+        let result = AzureOpenAiProvider::convert_messages(&messages);
+        assert!(
+            result.is_err(),
+            "expected Err for tool-role with invalid JSON"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("invalid JSON"),
+            "error message should mention invalid JSON"
+        );
+    }
+
+    #[test]
+    fn convert_messages_tool_role_missing_tool_call_id_returns_error() {
+        let messages = vec![ChatMessage {
+            role: "tool".to_string(),
+            content: r#"{"content": "some result"}"#.to_string(),
+        }];
+        let result = AzureOpenAiProvider::convert_messages(&messages);
+        assert!(
+            result.is_err(),
+            "expected Err for tool-role missing tool_call_id"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("tool_call_id"),
+            "error message should mention tool_call_id"
+        );
+    }
+
+    #[test]
+    fn convert_messages_tool_role_well_formed_succeeds() {
+        let messages = vec![ChatMessage {
+            role: "tool".to_string(),
+            content: r#"{"tool_call_id": "call_abc123", "content": "42"}"#.to_string(),
+        }];
+        let result = AzureOpenAiProvider::convert_messages(&messages);
+        assert!(
+            result.is_ok(),
+            "expected Ok for well-formed tool-role message"
+        );
+        let native = &result.unwrap()[0];
+        assert_eq!(native.role, "tool");
+        assert_eq!(native.tool_call_id.as_deref(), Some("call_abc123"));
+        assert_eq!(native.content.as_deref(), Some("42"));
     }
 }

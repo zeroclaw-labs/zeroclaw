@@ -974,9 +974,10 @@ fn create_provider_with_url_and_options(
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
         "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
         "azure-openai" | "azure_openai" => {
-            let base_url = api_url.ok_or_else(|| {
-                anyhow::anyhow!("Azure OpenAI requires api_url configuration (e.g., https://your-resource.openai.azure.com)")
-            })?;
+            // api_url is required for actual requests; default to "" so construction
+            // succeeds and the error is surfaced at request time, consistent with
+            // how other providers defer URL validation.
+            let base_url = api_url.unwrap_or("");
             Ok(Box::new(azure_openai::AzureOpenAiProvider::new(base_url, key)))
         },
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
@@ -2007,9 +2008,10 @@ mod tests {
 
     #[test]
     fn factory_azure_openai() {
-        // Azure OpenAI requires api_url, should fail without it
-        assert!(create_provider("azure-openai", Some("test-key")).is_err());
-        assert!(create_provider("azure_openai", Some("test-key")).is_err());
+        // Construction without api_url succeeds; the empty base URL is rejected at
+        // request time (consistent with how other providers defer URL validation).
+        assert!(create_provider("azure-openai", Some("test-key")).is_ok());
+        assert!(create_provider("azure_openai", Some("test-key")).is_ok());
 
         // Should succeed with base_url
         assert!(create_provider_with_url(
