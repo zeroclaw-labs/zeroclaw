@@ -1,4 +1,13 @@
 {
+  nixConfig = {
+    extra-substituters = [
+      "https://nix-community.cachix.org"
+    ];
+    extra-trusted-public-keys = [
+      "nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs="
+    ];
+  };
+
   inputs = {
     flake-utils.url = "github:numtide/flake-utils";
     fenix = {
@@ -47,5 +56,17 @@
     )
     // {
       overlays.default = import ./overlay.nix;
+
+      nixosModules = {
+        default = self.nixosModules.zeroclaw;
+        zeroclaw =
+          { pkgs, ... }:
+          {
+            imports = [
+              (import ./nixos/module.nix)
+            ];
+            services.zeroclaw.package = self.packages.${pkgs.stdenv.hostPlatform.system}.zeroclaw;
+          };
+      };
     };
 }
