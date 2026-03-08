@@ -298,6 +298,8 @@ pub struct LarkChannel {
     mention_only: bool,
     /// When true, use Feishu (CN) endpoints; when false, use Lark (international).
     use_feishu: bool,
+    /// The platform (Lark vs Feishu) for selecting base URLs and locale headers.
+    platform: LarkPlatform,
     /// How to receive events: WebSocket long-connection or HTTP webhook.
     receive_mode: crate::config::schema::LarkReceiveMode,
     /// Cached tenant access token
@@ -321,6 +323,7 @@ impl LarkChannel {
             verification_token,
             port,
             allowed_users,
+            mention_only,
             LarkPlatform::Lark,
         )
     }
@@ -331,6 +334,7 @@ impl LarkChannel {
         verification_token: String,
         port: Option<u16>,
         allowed_users: Vec<String>,
+        mention_only: bool,
         platform: LarkPlatform,
     ) -> Self {
         Self {
@@ -341,7 +345,8 @@ impl LarkChannel {
             allowed_users,
             resolved_bot_open_id: Arc::new(StdRwLock::new(None)),
             mention_only,
-            use_feishu: true,
+            use_feishu: platform == LarkPlatform::Feishu,
+            platform,
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
@@ -363,8 +368,28 @@ impl LarkChannel {
             config.port,
             config.allowed_users.clone(),
             config.mention_only,
+            platform,
         );
         ch.receive_mode = config.receive_mode.clone();
+        ch
+    }
+
+    pub fn from_lark_config(config: &crate::config::schema::LarkConfig) -> Self {
+        Self::from_config(config)
+    }
+
+    pub fn from_feishu_config(config: &crate::config::schema::FeishuConfig) -> Self {
+        let mut ch = Self::new_with_platform(
+            config.app_id.clone(),
+            config.app_secret.clone(),
+            config.verification_token.clone().unwrap_or_default(),
+            config.port,
+            config.allowed_users.clone(),
+            config.mention_only,
+            LarkPlatform::Feishu,
+        );
+        ch.receive_mode = config.receive_mode.clone();
+        ch.use_feishu = true;
         ch
     }
 
@@ -1024,16 +1049,12 @@ impl LarkChannel {
 
         let (text, post_mentioned_open_ids): (String, Vec<String>) = match msg_type {
             "text" => {
-                let extracted = serde_json::from_str::<serde_json::Value>(content_str)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("text")
-                            .and_then(|t| t.as_str())
-                            .filter(|s| !s.is_empty())
-                            .map(String::from)
-                    });
-                match extracted {
-                    Some(t) => (t, Vec::new()),
+                let v: serde_json::Value = match serde_json::from_str::<serde_json::Value>(content_str) {
+                    Ok(v) => v,
+                    Err(_) => return messages,
+                };
+                match v.get("text").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
+                    Some(t) => (t.to_string(), Vec::new()),
                     None => return messages,
                 }
             }

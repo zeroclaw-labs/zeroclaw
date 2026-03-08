@@ -318,7 +318,9 @@ pub(crate) async fn deliver_announcement(
                 tg.mention_only,
             )
             .with_voice_messages(tg.voice_messages)
-            .with_whisper_model(tg.whisper_model.clone());
+            .with_whisper_model(tg.whisper_model.clone())
+            .with_transcription(config.transcription.clone())
+            .with_workspace_dir(config.workspace_dir.clone());
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "discord" => {

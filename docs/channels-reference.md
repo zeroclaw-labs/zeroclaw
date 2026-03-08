@@ -162,7 +162,7 @@ Telegram notes:
 
 - `interrupt_on_new_message = true` preserves interrupted user turns in conversation history, then restarts generation on the newest message.
 - Interruption scope is strict: same sender in the same chat. Messages from different chats are processed independently.
-- **Voice Transcription**: Telegram voice notes (`.ogg`) can be transcribed using the global transcription service (configured in the `[transcription]` section). 
+- **Voice Transcription**: Telegram voice notes (`.ogg`) can be transcribed using the global transcription service (configured in the `[transcription]` section).
   - Supported providers: **Groq** (Cloud) and **Local** (Whisper-RS).
   - Local transcription requires `ffmpeg` and automatically downloads a small model on first use.
   - Transcribed text is prepended with `🎙️ [Voice transcription]:`.

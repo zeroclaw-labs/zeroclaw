@@ -7,7 +7,6 @@
 use landlock::{AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr};
 
 use crate::security::traits::Sandbox;
-use std::path::Path;
 
 /// Landlock sandbox backend for Linux
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]

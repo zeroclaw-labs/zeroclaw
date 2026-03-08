@@ -3633,7 +3633,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     stream_mode: StreamMode::default(),
                     draft_update_interval_ms: 1000,
                     interrupt_on_new_message: false,
-                    mention_only: false,
+                    mention_only: true, // Defaulting to mention_only for new group setups is safer
+                    allow_group_mentions: true,
                     voice_messages,
                     whisper_model: None,
                 });
@@ -4956,6 +4957,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     encrypt_key: None,
                     allowed_users,
                     mention_only: false,
+                    allow_group_mentions: true,
                     use_feishu: is_feishu,
                     receive_mode,
                     port,
@@ -5134,7 +5136,12 @@ fn setup_transcription() -> Result<crate::config::TranscriptionConfig> {
                 .with_prompt("  Path to GGML model file (.bin)")
                 .interact_text()?;
             if !path.trim().is_empty() {
-                config.whisper_model_path = Some(path.trim().to_string());
+                let trimmed = path.trim();
+                let model_path = std::path::Path::new(trimmed);
+                if !model_path.is_file() {
+                    bail!("Whisper model file not found: {}", model_path.display());
+                }
+                config.whisper_model_path = Some(trimmed.to_string());
             }
         }
     } else {
@@ -7290,6 +7297,8 @@ mod tests {
             encrypt_key: None,
             verification_token: None,
             allowed_users: vec!["*".into()],
+            mention_only: false,
+            allow_group_mentions: true,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
         });

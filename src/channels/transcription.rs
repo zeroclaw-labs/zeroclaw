@@ -33,35 +33,42 @@ fn normalize_audio_filename(file_name: &str) -> String {
     }
 }
 
+/// Maximum file size for local transcription to avoid OOM (20 MB).
+const MAX_LOCAL_AUDIO_BYTES: usize = 20 * 1024 * 1024;
+
 /// Transcribe audio bytes via a Whisper-compatible transcription API.
 ///
 /// Returns the transcribed text on success.  Requires `GROQ_API_KEY` in the
-/// environment.  The caller is responsible for enforcing duration limits
-/// *before* downloading the file; this function enforces the byte-size cap.
+/// environment for Groq provider.  The caller is responsible for enforcing
+/// duration limits *before* downloading the file.
 pub async fn transcribe_audio(
     audio_data: Vec<u8>,
     file_name: &str,
     config: &TranscriptionConfig,
+    workspace_path: &std::path::Path,
 ) -> Result<String> {
     match config.provider {
         TranscriptionProvider::Groq => {
             transcribe_audio_groq(audio_data, file_name, config).await
         }
         TranscriptionProvider::Local => {
+            if audio_data.len() > MAX_LOCAL_AUDIO_BYTES {
+                bail!(
+                    "Local audio file too large ({} bytes, max {MAX_LOCAL_AUDIO_BYTES}) to prevent OOM",
+                    audio_data.len()
+                );
+            }
+
             // Local whisper-rs expects a file path. We write the bytes to a temporary file.
             let temp_dir = std::env::temp_dir();
             let temp_path = temp_dir.join(format!("transcribe_{}", Uuid::new_v4()));
             tokio::fs::write(&temp_path, &audio_data).await.context("Failed to write temporary audio file for local transcription")?;
             
-            // We use the current directory as a fallback for workspace_dir if not easily available here,
-            // but ideally we'd pass it in. TranscriptionConfig doesn't have it.
-            // However, transcribe_audio_whisper_rs uses it mainly for model download.
-            let workspace_dir = std::path::PathBuf::from("."); 
-
             let res = transcribe_audio_whisper_rs(
                 &temp_path,
                 config.whisper_model_path.as_deref(),
-                &workspace_dir,
+                workspace_path,
+                None, // propagate language if needed, but voice notes don't have it explicitly stored yet
             ).await;
 
             let _ = tokio::fs::remove_file(&temp_path).await;
@@ -147,83 +154,99 @@ pub async fn transcribe_audio_whisper_rs(
     file_path: &std::path::Path,
     model_path: Option<&str>,
     workspace_dir: &std::path::Path,
+    language: Option<&str>,
 ) -> Result<String> {
-    let actual_model_path = match model_path {
-        Some(p) => std::path::PathBuf::from(p),
-        None => {
-            let models_dir = workspace_dir.join("models");
-            tokio::fs::create_dir_all(&models_dir).await?;
-            let default_model = models_dir.join("ggml-tiny.bin");
-            if !default_model.exists() {
-                tracing::info!("Downloading default whisper model (ggml-tiny.bin) to {:?}", default_model);
-                let response = reqwest::get("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin")
-                    .await?
-                    .error_for_status()?;
-                let bytes = response.bytes().await?;
-                tokio::fs::write(&default_model, bytes).await?;
+    #[cfg(feature = "transcription-local")]
+    {
+        use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+
+        let actual_model_path = match model_path {
+            Some(p) => std::path::PathBuf::from(p),
+            None => {
+                let models_dir = workspace_dir.join("models");
+                tokio::fs::create_dir_all(&models_dir).await?;
+                let default_model = models_dir.join("ggml-tiny.bin");
+                if !default_model.exists() {
+                    tracing::info!("Downloading default whisper model (ggml-tiny.bin) to {:?}", default_model);
+                    let response = reqwest::get("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin")
+                        .await?
+                        .error_for_status()?;
+                    let bytes = response.bytes().await?;
+                    
+                    // Atomic download: write to temp file then rename
+                    let temp_model_path = default_model.with_extension("tmp");
+                    tokio::fs::write(&temp_model_path, bytes).await?;
+                    if let Err(e) = tokio::fs::rename(&temp_model_path, &default_model).await {
+                        // If rename fails because file now exists, that's fine (concurrent download won)
+                        if default_model.exists() {
+                            let _ = tokio::fs::remove_file(&temp_model_path).await;
+                        } else {
+                            return Err(e).context("Failed to rename temporary model file to target path");
+                        }
+                    }
+                }
+                default_model
             }
-            default_model
+        };
+
+        let output = tokio::process::Command::new("ffmpeg")
+            .arg("-i")
+            .arg(file_path)
+            .args(["-ar", "16000"])
+            .args(["-ac", "1"])
+            .args(["-f", "f32le"])
+            .arg("-")
+            .output()
+            .await
+            .context("Failed to execute ffmpeg for audio decoding. Is it installed?")?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            bail!("ffmpeg failed to decode audio: {}", err);
         }
-    };
 
-    let output = tokio::process::Command::new("ffmpeg")
-        .arg("-i")
-        .arg(file_path)
-        .args(["-ar", "16000"])
-        .args(["-ac", "1"])
-        .args(["-f", "f32le"])
-        .arg("-")
-        .output()
-        .await
-        .context("Failed to execute ffmpeg for audio decoding. Is it installed?")?;
+        let audio_bytes = output.stdout;
+        if audio_bytes.len() % 4 != 0 {
+            bail!("ffmpeg output is not a multiple of 4 bytes");
+        }
 
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        bail!("ffmpeg failed to decode audio: {}", err);
-    }
+        let audio_f32: Vec<f32> = audio_bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
 
-    let audio_bytes = output.stdout;
-    if audio_bytes.len() % 4 != 0 {
-        bail!("ffmpeg output is not a multiple of 4 bytes");
-    }
-
-    let audio_f32: Vec<f32> = audio_bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
-
-    let actual_model_path_str = actual_model_path.to_string_lossy().to_string();
-
-    let transcript = tokio::task::spawn_blocking(move || -> Result<String> {
-        let ctx = whisper_rs::WhisperContext::new_with_params(
-            &actual_model_path_str,
-            whisper_rs::WhisperContextParameters::default(),
+        // transcription-local feature enables whisper-rs
+        let ctx = WhisperContext::new_with_params(
+            actual_model_path.to_string_lossy().as_ref(),
+            WhisperContextParameters::default(),
         )
-        .context("failed to load whisper model")?;
+        .context("Failed to create WhisperContext")?;
 
-        let params = whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
-
-        let mut state = ctx.create_state().context("failed to create whisper state")?;
-        state
-            .full(params, &audio_f32[..])
-            .context("failed to run whisper model")?;
-
-        let mut transcript = String::new();
-        // whisper-rs >= 0.15 has a native iterator that implements Display
-        for segment in state.as_iter() {
-            transcript.push_str(&segment.to_string());
+        let mut state = ctx.create_state().context("Failed to create WhisperState")?;
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        
+        if let Some(lang) = language {
+            params.set_language(Some(lang));
         }
-        Ok(transcript)
-    })
-    .await
-    .context("spawn_blocking panicked")??;
 
-    let transcript = transcript.trim().to_string();
-    if transcript.is_empty() {
-        bail!("whisper-rs returned empty transcription");
+        state
+            .full(params, &audio_f32)
+            .context("Failed to run full Whisper transcription")?;
+
+        let mut result = String::new();
+        for segment in state.as_iter() {
+            if let Ok(text) = segment.to_str() {
+                result.push_str(text);
+            }
+        }
+        Ok(result)
     }
-
-    Ok(transcript)
+    
+    #[cfg(not(feature = "transcription-local"))]
+    {
+        let _ = (file_path, model_path, workspace_dir, language);
+        bail!("Local transcription requires the 'transcription-local' cargo feature")
+    }
 }
 
 #[cfg(test)]
@@ -235,7 +258,8 @@ mod tests {
         let big = vec![0u8; MAX_AUDIO_BYTES + 1];
         let config = TranscriptionConfig::default();
 
-        let err = transcribe_audio(big, "test.ogg", &config)
+        let workspace = std::path::Path::new(".");
+        let err = transcribe_audio(big, "test.ogg", &config, workspace)
             .await
             .unwrap_err();
         assert!(
@@ -252,7 +276,8 @@ mod tests {
         let data = vec![0u8; 100];
         let config = TranscriptionConfig::default();
 
-        let err = transcribe_audio(data, "test.ogg", &config)
+        let workspace = std::path::Path::new(".");
+        let err = transcribe_audio(data, "test.ogg", &config, workspace)
             .await
             .unwrap_err();
         assert!(
@@ -323,7 +348,8 @@ mod tests {
         let data = vec![0u8; 100];
         let config = TranscriptionConfig::default();
 
-        let err = transcribe_audio(data, "recording.aac", &config)
+        let workspace = std::path::Path::new(".");
+        let err = transcribe_audio(data, "recording.aac", &config, workspace)
             .await
             .unwrap_err();
         let msg = err.to_string();

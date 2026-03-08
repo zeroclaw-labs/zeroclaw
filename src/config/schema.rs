@@ -2781,10 +2781,18 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
-    /// Parse and transcribe voice messages using local `whisper-rs`
+    /// When true, allow any group member to prompt the bot via @mentions (even if not in allowed_users).
+    /// Direct messages still require being in allowed_users.
+    #[serde(default)]
+    pub allow_group_mentions: bool,
+    /// Parse and transcribe voice messages.
+    /// Enabling this allows Telegram-specific voice note handling.
+    /// If global `[transcription].provider` is "local", it uses `whisper_model` or fallback.
     #[serde(default)]
     pub voice_messages: bool,
-    /// Optional path to the whisper model (e.g. `ggml-tiny.bin`). Defaults to downloading it.
+    /// Optional path to a local whisper model (.bin) for this channel.
+    /// If set, this overrides the global `transcription.whisper_model_path`.
+    /// Only used when `transcription.provider` is "local".
     #[serde(default)]
     pub whisper_model: Option<String>,
 }
@@ -3207,6 +3215,9 @@ pub struct LarkConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// When true, allow any group member to prompt the bot via @mentions (even if not in allowed_users).
+    #[serde(default = "default_true")]
+    pub allow_group_mentions: bool,
     /// Whether to use the Feishu (Chinese) endpoint instead of Lark (International)
     #[serde(default)]
     pub use_feishu: bool,
@@ -3244,6 +3255,12 @@ pub struct FeishuConfig {
     /// Allowed user IDs or union IDs (empty = deny all, "*" = allow all)
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, only respond to messages that @-mention the bot in groups.
+    #[serde(default)]
+    pub mention_only: bool,
+    /// When true, allow any group member to prompt the bot via @mentions (even if not in allowed_users).
+    #[serde(default = "default_true")]
+    pub allow_group_mentions: bool,
     /// Event receive mode: "websocket" (default) or "webhook"
     #[serde(default)]
     pub receive_mode: LarkReceiveMode,
@@ -3634,30 +3651,7 @@ impl Default for Config {
             embedding_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
-            channels_config: ChannelsConfig {
-                cli: true,
-                telegram: None,
-                discord: None,
-                slack: None,
-                mattermost: None,
-                webhook: None,
-                imessage: None,
-                matrix: None,
-                signal: None,
-                whatsapp: None,
-                linq: None,
-                wati: None,
-                nextcloud_talk: None,
-                email: None,
-                irc: None,
-                lark: None,
-                feishu: None,
-                dingtalk: None,
-                qq: None,
-                nostr: None,
-                clawdtalk: None,
-                message_timeout_secs: default_channel_message_timeout_secs(),
-            },
+            channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -5552,7 +5546,7 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.allowed_users.len(), 2);
         assert_eq!(parsed.stream_mode, StreamMode::Partial);
         assert_eq!(parsed.draft_update_interval_ms, 500);
-        assert!(parsed.interrupt_on_new_message);
+        assert!(!parsed.interrupt_on_new_message);
     }
 
     #[test]

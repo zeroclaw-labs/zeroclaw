@@ -1148,6 +1148,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 &temp_path,
                 self.whisper_model.as_deref(),
                 &workspace,
+                None,
             )
             .await;
             
@@ -1163,7 +1164,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         } else {
             let config = self.transcription.as_ref()?;
-            match super::transcription::transcribe_audio(audio_data, &file_name, config).await {
+            let workspace = self.workspace_dir.as_deref().unwrap_or(std::path::Path::new("."));
+            match super::transcription::transcribe_audio(audio_data, &file_name, config, workspace).await {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!("Groq Voice transcription failed: {e}");

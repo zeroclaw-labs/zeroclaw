@@ -30,4 +30,4 @@ venv/
 credentials.json
 .worktrees/
 
-./vscode
+.vscode/
