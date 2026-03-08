@@ -255,6 +255,9 @@ pub struct Config {
     /// Dynamic node discovery configuration (`[nodes]`).
     #[serde(default)]
     pub nodes: NodesConfig,
+    /// Production resilience patterns: rate limiting, circuit breakers, backpressure (`[resilience]`).
+    #[serde(default)]
+    pub resilience: ResilienceConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -683,6 +686,97 @@ impl Default for TtsConfig {
     }
 }
 
+// ── Resilience ────────────────────────────────────────────────────────────────
+
+/// Production resilience configuration (`[resilience]` section).
+///
+/// Controls rate limiting, circuit breaker, backpressure, and graceful shutdown
+/// settings for enterprise deployments.
+///
+/// All fields use `#[serde(default)]` for backward compatibility — existing configs
+/// without a `[resilience]` section will use safe defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ResilienceConfig {
+    /// Enable the token-bucket rate limiter for gateway requests. Default: false.
+    #[serde(default)]
+    pub rate_limit_enabled: bool,
+
+    /// Maximum requests per minute per key (steady state). Default: 60.
+    #[serde(default = "default_resilience_requests_per_minute")]
+    pub requests_per_minute: u32,
+
+    /// Burst capacity above steady-state rate. Default: 10.
+    #[serde(default = "default_resilience_burst")]
+    pub burst: u32,
+
+    /// Enable the circuit breaker on provider calls. Default: false.
+    #[serde(default)]
+    pub circuit_breaker_enabled: bool,
+
+    /// Consecutive provider failures before the circuit opens. Default: 5.
+    #[serde(default = "default_resilience_failure_threshold")]
+    pub circuit_breaker_failure_threshold: u32,
+
+    /// Seconds to keep the circuit open before attempting recovery. Default: 30.
+    #[serde(default = "default_resilience_recovery_timeout_secs")]
+    pub circuit_breaker_recovery_timeout_secs: u64,
+
+    /// Maximum probe requests in half-open state. Default: 1.
+    #[serde(default = "default_resilience_half_open_max")]
+    pub circuit_breaker_half_open_max_requests: u32,
+
+    /// Enable backpressure-based load shedding. Default: false.
+    #[serde(default)]
+    pub backpressure_enabled: bool,
+
+    /// Maximum queue depth before non-critical work is shed. Default: 1000.
+    #[serde(default = "default_resilience_max_queue_depth")]
+    pub backpressure_max_queue_depth: u64,
+
+    /// Graceful shutdown timeout in seconds. Default: 30.
+    #[serde(default = "default_resilience_graceful_shutdown_timeout_secs")]
+    pub graceful_shutdown_timeout_secs: u64,
+}
+
+fn default_resilience_requests_per_minute() -> u32 {
+    60
+}
+fn default_resilience_burst() -> u32 {
+    10
+}
+fn default_resilience_failure_threshold() -> u32 {
+    5
+}
+fn default_resilience_recovery_timeout_secs() -> u64 {
+    30
+}
+fn default_resilience_half_open_max() -> u32 {
+    1
+}
+fn default_resilience_max_queue_depth() -> u64 {
+    1000
+}
+fn default_resilience_graceful_shutdown_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for ResilienceConfig {
+    fn default() -> Self {
+        Self {
+            rate_limit_enabled: false,
+            requests_per_minute: default_resilience_requests_per_minute(),
+            burst: default_resilience_burst(),
+            circuit_breaker_enabled: false,
+            circuit_breaker_failure_threshold: default_resilience_failure_threshold(),
+            circuit_breaker_recovery_timeout_secs: default_resilience_recovery_timeout_secs(),
+            circuit_breaker_half_open_max_requests: default_resilience_half_open_max(),
+            backpressure_enabled: false,
+            backpressure_max_queue_depth: default_resilience_max_queue_depth(),
+            graceful_shutdown_timeout_secs: default_resilience_graceful_shutdown_timeout_secs(),
+        }
+    }
+}
+
 /// OpenAI TTS provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct OpenAiTtsConfig {
@@ -777,6 +871,7 @@ pub struct ToolFilterGroup {
     #[serde(default)]
     pub keywords: Vec<String>,
 }
+>>>>>>> b672a41c (feat(resilience): add rate limiting, circuit breaker, and backpressure)
 
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -4202,8 +4297,11 @@ impl Default for Config {
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+<<<<<<< HEAD
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+=======
+            resilience: ResilienceConfig::default(),
         }
     }
 }
@@ -6310,6 +6408,7 @@ default_temperature = 0.7
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            resilience: ResilienceConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -6601,6 +6700,7 @@ tool_dispatcher = "xml"
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            resilience: ResilienceConfig::default(),
         };
 
         config.save().await.unwrap();
