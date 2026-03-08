@@ -9,6 +9,7 @@
 - [x] [CLI Provider Interface](docs/tasks/cli-provider-interface.md)
 - [ ] [Distributed Node Registry](docs/tasks/distributed-node-registry.md)
 - [x] [Unified Browser Integration](docs/tasks/unified-browser-integration.md)
+- [ ] [ACP Integration](docs/tasks/acp-integration.md)
 - [ ] [Autonomous Skill Creation](docs/tasks/autonomous-skill-creation.md)
 
 ## High Priority
