@@ -58,17 +58,14 @@ pub async fn handle_ws_chat(
 
 fn parse_requested_subprotocols(headers: &HeaderMap) -> Vec<String> {
     headers
-        .get(header::SEC_WEBSOCKET_PROTOCOL)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|part| !part.is_empty())
-                .map(ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+        .get_all(header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
@@ -199,6 +196,7 @@ mod tests {
     use crate::providers::Provider;
     use crate::security::pairing::PairingGuard;
     use async_trait::async_trait;
+    use axum::http::HeaderValue;
     use axum::routing::get;
     use axum::Router;
     use parking_lot::Mutex;
@@ -252,6 +250,22 @@ mod tests {
             .is_none());
         drop(socket);
         server_task.abort();
+    }
+
+    #[test]
+    fn parse_requested_subprotocols_reads_all_duplicate_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("agent-chat, json"),
+        );
+        headers.append(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("telemetry"),
+        );
+
+        let parsed = parse_requested_subprotocols(&headers);
+        assert_eq!(parsed, vec!["agent-chat", "json", "telemetry"]);
     }
 
     async fn spawn_test_server(app: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
