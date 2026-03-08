@@ -2781,10 +2781,6 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
-    /// When true, allow any group member to prompt the bot via @mentions (even if not in allowed_users).
-    /// Direct messages still require being in allowed_users.
-    #[serde(default)]
-    pub allow_group_mentions: bool,
     /// Parse and transcribe voice messages.
     /// Enabling this allows Telegram-specific voice note handling.
     /// If global `[transcription].provider` is "local", it uses `whisper_model` or fallback.
@@ -3215,9 +3211,6 @@ pub struct LarkConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
-    /// When true, allow any group member to prompt the bot via @mentions (even if not in allowed_users).
-    #[serde(default = "default_true")]
-    pub allow_group_mentions: bool,
     /// Whether to use the Feishu (Chinese) endpoint instead of Lark (International)
     #[serde(default)]
     pub use_feishu: bool,
@@ -3258,9 +3251,6 @@ pub struct FeishuConfig {
     /// When true, only respond to messages that @-mention the bot in groups.
     #[serde(default)]
     pub mention_only: bool,
-    /// When true, allow any group member to prompt the bot via @mentions (even if not in allowed_users).
-    #[serde(default = "default_true")]
-    pub allow_group_mentions: bool,
     /// Event receive mode: "websocket" (default) or "webhook"
     #[serde(default)]
     pub receive_mode: LarkReceiveMode,
@@ -7384,7 +7374,7 @@ default_model = "legacy-model"
             app_id: "cli_123456".into(),
             app_secret: "secret_abc".into(),
             encrypt_key: Some("encrypt_key".into()),
-            verification_token: Some("verify_token".into()),
+            verification_token: None,
             allowed_users: vec!["*".into()],
             mention_only: false,
             use_feishu: false,

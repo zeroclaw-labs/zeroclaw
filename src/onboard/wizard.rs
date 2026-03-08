@@ -4957,7 +4957,6 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     encrypt_key: None,
                     allowed_users,
                     mention_only: false,
-                    allow_group_mentions: true,
                     use_feishu: is_feishu,
                     receive_mode,
                     port,
@@ -7298,7 +7297,6 @@ mod tests {
             verification_token: None,
             allowed_users: vec!["*".into()],
             mention_only: false,
-            allow_group_mentions: true,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
         });

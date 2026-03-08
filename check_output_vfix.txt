@@ -1,0 +1,36 @@
+    Checking zeroclaw v0.1.7 (/Users/antonvice/Documents/programming/zeroclaw)
+error[E0609]: no field `voice_messages_enabled` on type `&TelegramChannel`
+    --> src/channels/telegram.rs:1132:28
+     |
+1132 |         let text = if self.voice_messages_enabled {
+     |                            ^^^^^^^^^^^^^^^^^^^^^^ unknown field
+     |
+     = note: available fields are: `bot_token`, `allowed_users`, `pairing`, `client`, `typing_handle` ... and 10 others
+
+error[E0560]: struct `TelegramChannel` has no field named `voice_messages_enabled`
+   --> src/channels/telegram.rs:347:13
+    |
+347 |             voice_messages_enabled: false,
+    |             ^^^^^^^^^^^^^^^^^^^^^^ `TelegramChannel` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0609]: no field `voice_messages_enabled` on type `TelegramChannel`
+   --> src/channels/telegram.rs:386:14
+    |
+386 |         self.voice_messages_enabled = enabled;
+    |              ^^^^^^^^^^^^^^^^^^^^^^ unknown field
+    |
+    = note: available fields are: `bot_token`, `allowed_users`, `pairing`, `client`, `typing_handle` ... and 10 others
+
+error[E0560]: struct `LarkConfig` has no field named `allow_group_mentions`
+    --> src/onboard/wizard.rs:4960:21
+     |
+4960 |                     allow_group_mentions: true,
+     |                     ^^^^^^^^^^^^^^^^^^^^ `LarkConfig` does not have this field
+     |
+     = note: all struct fields are already assigned
+
+Some errors have detailed explanations: E0560, E0609.
+For more information about an error, try `rustc --explain E0560`.
+error: could not compile `zeroclaw` (lib) due to 4 previous errors
