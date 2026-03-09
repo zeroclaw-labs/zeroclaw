@@ -168,6 +168,10 @@ fn expand_user_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn starts_with_allowed_root(path: &Path, allowed_roots: &[PathBuf]) -> bool {
+    allowed_roots.iter().any(|root| path.starts_with(root))
+}
+
 // ── Shell Command Parsing Utilities ───────────────────────────────────────
 // These helpers implement a minimal quote-aware shell lexer. They exist
 // because security validation must reason about the *structure* of a
@@ -922,8 +926,12 @@ impl SecurityPolicy {
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
 
-        // Block absolute paths when workspace_only is set
-        if self.workspace_only && expanded_path.is_absolute() {
+        // Block absolute paths when workspace_only is set, unless the path is
+        // explicitly covered by allowed_roots.
+        if self.workspace_only
+            && expanded_path.is_absolute()
+            && !starts_with_allowed_root(&expanded_path, &self.allowed_roots)
+        {
             return false;
         }
 
@@ -936,6 +944,19 @@ impl SecurityPolicy {
         }
 
         true
+    }
+
+    /// Resolve a user-supplied path into an absolute filesystem path.
+    ///
+    /// Relative paths are resolved from `workspace_dir`. Absolute paths and
+    /// `~/...` paths remain absolute after expansion.
+    pub fn resolve_user_path(&self, path: &str) -> PathBuf {
+        let expanded = expand_user_path(path);
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            self.workspace_dir.join(expanded)
+        }
     }
 
     /// Validate that a resolved path is inside the workspace or an allowed root.
@@ -1382,6 +1403,19 @@ mod tests {
         assert!(!p.is_path_allowed("/etc/passwd"));
         assert!(!p.is_path_allowed("/root/.ssh/id_rsa"));
         assert!(!p.is_path_allowed("/tmp/file.txt"));
+    }
+
+    #[test]
+    fn absolute_paths_allowed_when_inside_allowed_roots_even_if_workspace_only() {
+        let allowed_root = std::env::temp_dir().join("zeroclaw_allowed_root_abs");
+        let p = SecurityPolicy {
+            workspace_only: true,
+            allowed_roots: vec![allowed_root.clone()],
+            forbidden_paths: vec!["/etc".into(), "/root".into()],
+            ..SecurityPolicy::default()
+        };
+        let allowed_file = allowed_root.join("notes.txt");
+        assert!(p.is_path_allowed(&allowed_file.to_string_lossy()));
     }
 
     #[test]

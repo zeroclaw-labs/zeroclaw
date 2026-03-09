@@ -57,21 +57,20 @@ impl Tool for GlobSearchTool {
             });
         }
 
-        // Security: reject absolute paths
-        if pattern.starts_with('/') || pattern.starts_with('\\') {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Absolute paths are not allowed. Use a relative glob pattern.".into()),
-            });
-        }
-
         // Security: reject path traversal
         if pattern.contains("../") || pattern.contains("..\\") || pattern == ".." {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some("Path traversal ('..') is not allowed in glob patterns.".into()),
+            });
+        }
+
+        if !self.security.is_path_allowed(pattern) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Path not allowed by security policy: {pattern}")),
             });
         }
 
@@ -84,9 +83,20 @@ impl Tool for GlobSearchTool {
             });
         }
 
-        // Build full pattern anchored to workspace
+        // Build full pattern anchored to workspace unless the user supplied
+        // an absolute / `~/...` pattern that is permitted by policy.
         let workspace = &self.security.workspace_dir;
-        let full_pattern = workspace.join(pattern).to_string_lossy().to_string();
+        let full_pattern = {
+            let resolved = self.security.resolve_user_path(pattern);
+            if std::path::Path::new(pattern).is_absolute()
+                || pattern == "~"
+                || pattern.starts_with("~/")
+            {
+                resolved.to_string_lossy().to_string()
+            } else {
+                workspace.join(pattern).to_string_lossy().to_string()
+            }
+        };
 
         let entries = match glob::glob(&full_pattern) {
             Ok(paths) => paths,
@@ -134,9 +144,12 @@ impl Tool for GlobSearchTool {
                 continue;
             }
 
-            // Convert to workspace-relative path
+            // Convert to workspace-relative path when possible, otherwise keep
+            // the canonical absolute path (e.g. results from allowed_roots).
             if let Ok(rel) = resolved.strip_prefix(&workspace_canon) {
                 results.push(rel.to_string_lossy().to_string());
+            } else {
+                results.push(resolved.to_string_lossy().to_string());
             }
 
             if results.len() >= MAX_RESULTS {
@@ -278,12 +291,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn glob_search_rejects_absolute_path() {
+    async fn glob_search_rejects_absolute_path_outside_allowed_roots() {
         let tool = GlobSearchTool::new(test_security(std::env::temp_dir()));
         let result = tool.execute(json!({"pattern": "/etc/**/*"})).await.unwrap();
 
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("Absolute paths"));
+        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn glob_search_allows_absolute_pattern_inside_allowed_roots() {
+        let root = TempDir::new().unwrap();
+        let workspace = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("a.md"), "alpha").unwrap();
+        std::fs::write(outside.join("b.txt"), "beta").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            workspace_only: true,
+            allowed_roots: vec![outside.clone()],
+            forbidden_paths: vec![],
+            ..SecurityPolicy::default()
+        });
+        let tool = GlobSearchTool::new(security);
+        let pattern = outside.join("*.md").to_string_lossy().to_string();
+        let result = tool.execute(json!({"pattern": pattern})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("a.md"));
     }
 
     #[tokio::test]
