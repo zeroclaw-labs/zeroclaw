@@ -30,7 +30,7 @@ venv/
 *.pem
 credentials.json
 .worktrees/
-.zeroclaw/*
+web/dist/.zeroclaw/*
 
 # Skill eval workspaces (test outputs, transcripts, grading)
 .claude/skills/*-workspace/
