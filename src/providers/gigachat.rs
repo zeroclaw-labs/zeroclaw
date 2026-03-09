@@ -88,8 +88,6 @@ struct Model {
 }
 
 const OAUTH_API_ENDPOINT: &str = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth";
-const CHAT_COMPLETIONS_ENDPOINT: &str =
-    "https://gigachat.devices.sberbank.ru/api/v1/chat/completions";
 
 pub struct GigaChatProvider {
     base_url: String,
@@ -102,7 +100,9 @@ pub struct GigaChatProvider {
 impl GigaChatProvider {
     pub fn new(base_url: Option<&str>, credentials: Option<&str>) -> Self {
         Self {
-            base_url: base_url.unwrap_or("http://localhost:11434").to_string(),
+            base_url: base_url
+                .unwrap_or("https://gigachat.devices.sberbank.ru/api/")
+                .to_string(),
             scope: "GIGACHAT_API_PERS".to_string(),
             credentials: credentials.unwrap_or("").to_string(),
             client: Self::build_client().unwrap(),
@@ -122,7 +122,7 @@ impl GigaChatProvider {
 
         let response = self
             .client
-            .get("https://gigachat.devices.sberbank.ru/api/v1/models")
+            .get(format!("{}/v1/models", self.base_url))
             .header(
                 "Authorization",
                 format!("Bearer {}", access_token.access_token),
@@ -179,7 +179,7 @@ impl GigaChatProvider {
 
         let response = self
             .client
-            .post(CHAT_COMPLETIONS_ENDPOINT)
+            .post(format!("{}/v1/chat/completions", self.base_url))
             .json(&request)
             // .header("X-Client-Id", "gigachat-web") // FIXME: need to find out what to put there
             .header("X-Request-Id", req_id.to_string())
@@ -213,13 +213,13 @@ impl Provider for GigaChatProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        tracing::info!(
-            "chat with system model: '{}', message: '{}', temperature: '{}', syestem_prompt: '{}'",
-            model,
-            message,
-            temperature,
-            system_prompt.unwrap_or_default()
-        );
+        // tracing::info!(
+        //     "chat with system model: '{}', message: '{}', temperature: '{}', system_prompt: '{}'",
+        //     model,
+        //     message,
+        //     temperature,
+        //     system_prompt.unwrap_or_default()
+        // );
 
         let access_token = self.fetch_auth_token().await?;
 
@@ -255,6 +255,7 @@ impl Provider for GigaChatProvider {
         };
 
         let chat_response = self.fetch_chat_completions(&request, &access_token).await?;
+
         tracing::debug!("Chat Response: {:?}", chat_response);
 
         // join the response messages to single string
