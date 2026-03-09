@@ -5,7 +5,6 @@ use super::Provider;
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 // ── Error Classification ─────────────────────────────────────────────────
@@ -228,18 +227,15 @@ fn push_failure(
 // Loop invariant: `failures` accumulates every failed attempt so the final
 // error message gives operators a complete diagnostic trail.
 
-/// Provider wrapper with retry, fallback, auth rotation, and model failover.
+/// Provider wrapper with retry, fallback, and model failover.
 pub struct ReliableProvider {
     providers: Vec<(String, Box<dyn Provider>)>,
     max_retries: u32,
     base_backoff_ms: u64,
-    /// Extra API keys for rotation (index tracks round-robin position).
-    api_keys: Vec<String>,
-    key_index: AtomicUsize,
     /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
     model_fallbacks: HashMap<String, Vec<String>>,
     /// Provider-scoped model remaps: provider_name → [model_1, model_2, ...]
-    provider_model_fallbacks: HashMap<String, Vec<String>>,
+    provider_model_remaps: HashMap<String, Vec<String>>,
     /// Vision support override from config (`None` = defer to provider).
     vision_override: Option<bool>,
 }
@@ -254,21 +250,17 @@ impl ReliableProvider {
             providers,
             max_retries,
             base_backoff_ms: base_backoff_ms.max(50),
-            api_keys: Vec::new(),
-            key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
-            provider_model_fallbacks: HashMap::new(),
+            provider_model_remaps: HashMap::new(),
             vision_override: None,
         }
     }
 
-    /// Set additional API keys for round-robin rotation on rate-limit errors.
-    pub fn with_api_keys(mut self, keys: Vec<String>) -> Self {
-        self.api_keys = keys;
-        self
-    }
-
     /// Set per-model fallback chains.
+    ///
+    /// All keys are treated as model names. Keys that previously matched provider
+    /// names were auto-routed into provider-scoped remaps; that behavior is removed.
+    /// Use `with_provider_model_remaps` for per-provider model substitution instead.
     pub fn with_model_fallbacks(mut self, fallbacks: HashMap<String, Vec<String>>) -> Self {
         let provider_names: HashSet<&str> = self
             .providers
@@ -276,16 +268,26 @@ impl ReliableProvider {
             .map(|(name, _)| name.as_str())
             .collect();
         self.model_fallbacks.clear();
-        self.provider_model_fallbacks.clear();
 
         for (key, chain) in fallbacks {
             if provider_names.contains(key.as_str()) {
-                self.provider_model_fallbacks.insert(key, chain);
-            } else {
-                self.model_fallbacks.insert(key, chain);
+                tracing::warn!(
+                    key = %key,
+                    "model_fallbacks key matches a provider name; use provider_model_remaps \
+                     for per-provider model substitution. This key is treated as a model name."
+                );
             }
+            self.model_fallbacks.insert(key, chain);
         }
 
+        self
+    }
+
+    /// Set per-provider model remap chains. When a named provider is active, these
+    /// models are tried in order (plus the original request model for the primary
+    /// provider).
+    pub fn with_provider_model_remaps(mut self, remaps: HashMap<String, Vec<String>>) -> Self {
+        self.provider_model_remaps = remaps;
         self
     }
 
@@ -306,8 +308,8 @@ impl ReliableProvider {
 
     /// Build provider-specific model candidates for this request.
     ///
-    /// Compatibility behavior: keys in `model_fallbacks` that match provider names
-    /// are interpreted as provider-scoped remap chains.
+    /// Returns the model chain for a given provider, combining the request model
+    /// (for the primary provider) with any configured `provider_model_remaps`.
     fn provider_model_chain<'a>(
         &'a self,
         model: &'a str,
@@ -320,7 +322,7 @@ impl ReliableProvider {
             chain.push(model);
         }
 
-        if let Some(remaps) = self.provider_model_fallbacks.get(provider_name) {
+        if let Some(remaps) = self.provider_model_remaps.get(provider_name) {
             for remapped_model in remaps {
                 let remapped_model = remapped_model.as_str();
                 if !chain.contains(&remapped_model) {
@@ -334,15 +336,6 @@ impl ReliableProvider {
         }
 
         chain
-    }
-
-    /// Advance to the next API key and return it, or None if no extra keys configured.
-    fn rotate_key(&self) -> Option<&str> {
-        if self.api_keys.is_empty() {
-            return None;
-        }
-        let idx = self.key_index.fetch_add(1, Ordering::Relaxed) % self.api_keys.len();
-        Some(&self.api_keys[idx])
     }
 
     /// Compute backoff duration, respecting Retry-After if present.
@@ -423,21 +416,6 @@ impl Provider for ReliableProvider {
                                     failure_reason,
                                     &error_detail,
                                 );
-
-                                // Rate-limit with rotatable keys: cycle to the next API key
-                                // so the retry hits a different quota bucket.
-                                if rate_limited && !non_retryable_rate_limit {
-                                    if let Some(new_key) = self.rotate_key() {
-                                        tracing::warn!(
-                                            provider = provider_name,
-                                            error = %error_detail,
-                                            "Rate limited; key rotation selected key ending ...{} \
-                                             but cannot apply (Provider trait has no set_api_key). \
-                                             Retrying with original key.",
-                                            &new_key[new_key.len().saturating_sub(4)..]
-                                        );
-                                    }
-                                }
 
                                 if non_retryable {
                                     tracing::warn!(
@@ -548,19 +526,6 @@ impl Provider for ReliableProvider {
                                     failure_reason,
                                     &error_detail,
                                 );
-
-                                if rate_limited && !non_retryable_rate_limit {
-                                    if let Some(new_key) = self.rotate_key() {
-                                        tracing::warn!(
-                                            provider = provider_name,
-                                            error = %error_detail,
-                                            "Rate limited; key rotation selected key ending ...{} \
-                                             but cannot apply (Provider trait has no set_api_key). \
-                                             Retrying with original key.",
-                                            &new_key[new_key.len().saturating_sub(4)..]
-                                        );
-                                    }
-                                }
 
                                 if non_retryable {
                                     tracing::warn!(
@@ -680,19 +645,6 @@ impl Provider for ReliableProvider {
                                     &error_detail,
                                 );
 
-                                if rate_limited && !non_retryable_rate_limit {
-                                    if let Some(new_key) = self.rotate_key() {
-                                        tracing::warn!(
-                                            provider = provider_name,
-                                            error = %error_detail,
-                                            "Rate limited; key rotation selected key ending ...{} \
-                                             but cannot apply (Provider trait has no set_api_key). \
-                                             Retrying with original key.",
-                                            &new_key[new_key.len().saturating_sub(4)..]
-                                        );
-                                    }
-                                }
-
                                 if non_retryable {
                                     tracing::warn!(
                                         provider = provider_name,
@@ -795,19 +747,6 @@ impl Provider for ReliableProvider {
                                     failure_reason,
                                     &error_detail,
                                 );
-
-                                if rate_limited && !non_retryable_rate_limit {
-                                    if let Some(new_key) = self.rotate_key() {
-                                        tracing::warn!(
-                                            provider = provider_name,
-                                            error = %error_detail,
-                                            "Rate limited; key rotation selected key ending ...{} \
-                                             but cannot apply (Provider trait has no set_api_key). \
-                                             Retrying with original key.",
-                                            &new_key[new_key.len().saturating_sub(4)..]
-                                        );
-                                    }
-                                }
 
                                 if non_retryable {
                                     tracing::warn!(
@@ -951,6 +890,7 @@ impl Provider for ReliableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     struct MockProvider {
@@ -1436,7 +1376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_keyed_model_fallbacks_remap_fallback_provider_models() {
+    async fn provider_model_remaps_remap_per_provider_models() {
         let primary = Arc::new(ModelAwareMock {
             calls: Arc::new(AtomicUsize::new(0)),
             models_seen: parking_lot::Mutex::new(Vec::new()),
@@ -1450,9 +1390,9 @@ mod tests {
             response: "ok from remap",
         });
 
-        let mut fallbacks = HashMap::new();
-        fallbacks.insert("zai".to_string(), vec!["glm-4.7".to_string()]);
-        fallbacks.insert(
+        let mut remaps = HashMap::new();
+        remaps.insert("zai".to_string(), vec!["glm-4.7".to_string()]);
+        remaps.insert(
             "openrouter".to_string(),
             vec!["anthropic/claude-sonnet-4".to_string()],
         );
@@ -1468,7 +1408,7 @@ mod tests {
             0,
             1,
         )
-        .with_model_fallbacks(fallbacks);
+        .with_provider_model_remaps(remaps);
 
         let result = provider.simple_chat("hello", "glm-5", 0.0).await.unwrap();
         assert_eq!(result, "ok from remap");
@@ -1484,34 +1424,149 @@ mod tests {
         assert!(!fallback_seen.iter().any(|m| m == "glm-5"));
     }
 
-    // ── New tests: auth rotation ──
-
     #[tokio::test]
-    async fn auth_rotation_cycles_keys() {
+    async fn model_fallbacks_does_not_split_by_provider_name() {
+        // When a key in model_fallbacks matches a provider name, it is now
+        // treated as a model name (no longer auto-routed to provider_model_remaps).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(ModelAwareMock {
+            calls: Arc::clone(&calls),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec!["openai-codex"],
+            response: "ok from fallback model",
+        });
+
+        let mut fallbacks = HashMap::new();
+        fallbacks.insert("openai-codex".to_string(), vec!["gpt-4o".to_string()]);
+
         let provider = ReliableProvider::new(
             vec![(
-                "p".into(),
-                Box::new(MockProvider {
-                    calls: Arc::new(AtomicUsize::new(0)),
-                    fail_until_attempt: 0,
-                    response: "ok",
-                    error: "",
-                }),
+                "openai-codex".into(),
+                Box::new(mock.clone()) as Box<dyn Provider>,
             )],
             0,
             1,
         )
-        .with_api_keys(vec!["key-a".into(), "key-b".into(), "key-c".into()]);
+        .with_model_fallbacks(fallbacks);
 
-        // Rotate 5 times, verify round-robin
-        let keys: Vec<&str> = (0..5).map(|_| provider.rotate_key().unwrap()).collect();
-        assert_eq!(keys, vec!["key-a", "key-b", "key-c", "key-a", "key-b"]);
+        // "openai-codex" key is a model name → model chain: [openai-codex, gpt-4o]
+        // Primary model fails, fallback model "gpt-4o" succeeds.
+        let result = provider
+            .simple_chat("hello", "openai-codex", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "ok from fallback model");
+
+        let seen = mock.models_seen.lock();
+        assert_eq!(seen[0], "openai-codex");
+        assert_eq!(seen[1], "gpt-4o");
     }
 
     #[tokio::test]
-    async fn auth_rotation_returns_none_when_empty() {
-        let provider = ReliableProvider::new(vec![], 0, 1);
-        assert!(provider.rotate_key().is_none());
+    async fn provider_model_remaps_explicit_field_works() {
+        // Explicit provider_model_remaps substitutes models per-provider.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(ModelAwareMock {
+            calls: Arc::clone(&calls),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec!["bad-model"],
+            response: "ok from remapped",
+        });
+
+        let mut remaps = HashMap::new();
+        remaps.insert("my-provider".to_string(), vec!["good-model".to_string()]);
+
+        let provider = ReliableProvider::new(
+            vec![(
+                "my-provider".into(),
+                Box::new(mock.clone()) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        )
+        .with_provider_model_remaps(remaps);
+
+        let result = provider
+            .simple_chat("hello", "bad-model", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "ok from remapped");
+
+        let seen = mock.models_seen.lock();
+        // primary gets both: original model + remap
+        assert!(seen.contains(&"bad-model".to_string()));
+        assert!(seen.contains(&"good-model".to_string()));
+    }
+
+    // ── New tests: api_keys → multi-provider pool ──
+
+    #[test]
+    fn api_keys_create_additional_provider_instances() {
+        // ReliableProvider itself no longer stores api_keys — the factory
+        // (create_resilient_provider_with_options) creates one provider per
+        // extra key. This test verifies the provider pool can grow correctly.
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "ok",
+                        error: "",
+                    }),
+                ),
+                (
+                    "primary[key1]".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "ok-key1",
+                        error: "",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+        assert_eq!(provider.providers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn api_keys_rate_limit_tries_next_key_provider() {
+        // Primary fails with 429, fallback (second key) succeeds.
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "p".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::clone(&primary_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "429 Too Many Requests: rate limit exceeded",
+                    }),
+                ),
+                (
+                    "p[key1]".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "from key1",
+                        error: "",
+                    }),
+                ),
+            ],
+            1,
+            1,
+        );
+
+        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
+        assert_eq!(result, "from key1");
+        assert!(primary_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
     // ── New tests: Retry-After parsing ──

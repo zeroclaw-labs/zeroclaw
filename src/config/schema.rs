@@ -496,6 +496,10 @@ pub struct DelegateAgentConfig {
     /// Maximum tool-call iterations in agentic mode.
     #[serde(default = "default_max_tool_iterations")]
     pub max_iterations: usize,
+    /// Override retry count for this agent's provider calls.
+    /// `None` = inherit from global `[reliability].provider_retries`.
+    #[serde(default)]
+    pub provider_retries: Option<u32>,
 }
 
 fn default_max_depth() -> u32 {
@@ -525,6 +529,7 @@ impl std::fmt::Debug for DelegateAgentConfig {
             .field("agentic", &self.agentic)
             .field("allowed_tools", &self.allowed_tools)
             .field("max_iterations", &self.max_iterations)
+            .field("provider_retries", &self.provider_retries)
             .finish()
     }
 }
@@ -4051,11 +4056,13 @@ pub struct ReliabilityConfig {
     pub api_keys: Vec<String>,
     /// Per-model fallback chains. When a model fails, try these alternatives in order.
     /// Example: `{ "claude-opus-4-20250514" = ["claude-sonnet-4-20250514", "gpt-4o"] }`
-    ///
-    /// Compatibility behavior: keys matching configured provider names are treated
-    /// as provider-scoped remap chains during provider fallback.
     #[serde(default)]
     pub model_fallbacks: std::collections::HashMap<String, Vec<String>>,
+    /// Per-provider model remap chains. When a provider is active, its model is
+    /// substituted according to this map on first attempt and on per-provider failure.
+    /// Example: `{ "openai-codex" = ["gpt-4o", "gpt-4o-mini"] }`
+    #[serde(default)]
+    pub provider_model_remaps: std::collections::HashMap<String, Vec<String>>,
     /// Initial backoff for channel/daemon restarts.
     #[serde(default = "default_channel_backoff_secs")]
     pub channel_initial_backoff_secs: u64,
@@ -4103,6 +4110,7 @@ impl Default for ReliabilityConfig {
             fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            provider_model_remaps: std::collections::HashMap::new(),
             channel_initial_backoff_secs: default_channel_backoff_secs(),
             channel_max_backoff_secs: default_channel_backoff_max_secs(),
             scheduler_poll_secs: default_scheduler_poll_secs(),
@@ -9981,6 +9989,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                provider_retries: None,
             },
         );
 
@@ -10994,6 +11003,7 @@ denied_tools = ["shell"]
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                provider_retries: None,
             },
         );
 

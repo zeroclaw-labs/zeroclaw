@@ -985,8 +985,7 @@ async fn b2_iterative_search_makes_multiple_tool_calls() {
 #[ignore = "requires live daemon + authorized zverozabr_session + [agents.telegram_searcher] config"]
 async fn b3_bangkok_search_returns_contacts() {
     let bot = "zGsR_bot";
-    let query =
-        "Поищи в Telegram сантехника в Бангкоке. Нужны контакты — телефон или @username.";
+    let query = "Поищи в Telegram сантехника в Бангкоке. Нужны контакты — телефон или @username.";
 
     println!("Sending to @{bot}: {query}");
     let sent_id = send_to_bot(bot, query).await;

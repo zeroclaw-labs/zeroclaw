@@ -1701,13 +1701,35 @@ pub fn create_resilient_provider_with_options(
         }
     }
 
+    // Extra api_keys each get their own provider instance so rate-limit on
+    // one key causes automatic failover to the next, rather than retrying
+    // the same key (which the Provider trait cannot swap at runtime).
+    for (idx, extra_key) in reliability.api_keys.iter().enumerate() {
+        let label = format!("{primary_name}[key{}]", idx + 1);
+        match create_provider_with_url_and_options(
+            primary_name,
+            Some(extra_key.as_str()),
+            api_url,
+            options,
+        ) {
+            Ok(p) => providers.push((label, p)),
+            Err(_) => {
+                tracing::warn!(
+                    provider = primary_name,
+                    key_index = idx + 1,
+                    "Ignoring invalid extra api_keys provider during initialization"
+                );
+            }
+        }
+    }
+
     let reliable = ReliableProvider::new(
         providers,
         reliability.provider_retries,
         reliability.provider_backoff_ms,
     )
-    .with_api_keys(reliability.api_keys.clone())
     .with_model_fallbacks(reliability.model_fallbacks.clone())
+    .with_provider_model_remaps(reliability.provider_model_remaps.clone())
     .with_vision_override(options.model_support_vision);
 
     Ok(Box::new(reliable))
@@ -3157,6 +3179,7 @@ providers = ["demo-plugin-provider"]
             fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            provider_model_remaps: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -3197,6 +3220,7 @@ providers = ["demo-plugin-provider"]
             fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            provider_model_remaps: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -3220,6 +3244,7 @@ providers = ["demo-plugin-provider"]
             fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            provider_model_remaps: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -3247,6 +3272,7 @@ providers = ["demo-plugin-provider"]
             fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            provider_model_remaps: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -3280,6 +3306,7 @@ providers = ["demo-plugin-provider"]
             fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            provider_model_remaps: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -3824,6 +3851,7 @@ providers = ["demo-plugin-provider"]
             fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            provider_model_remaps: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -3854,6 +3882,7 @@ providers = ["demo-plugin-provider"]
             fallback_api_keys: std::collections::HashMap::new(),
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            provider_model_remaps: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,

@@ -37,6 +37,8 @@ pub struct DelegateTool {
     fallback_credential: Option<String>,
     /// Provider runtime options inherited from root config.
     provider_runtime_options: providers::ProviderRuntimeOptions,
+    /// Reliability config for delegate provider builds (retries, fallbacks, etc.).
+    reliability: crate::config::ReliabilityConfig,
     /// Depth at which this tool instance lives in the delegation chain.
     depth: u32,
     /// Parent tool registry for agentic sub-agents.
@@ -81,6 +83,7 @@ impl DelegateTool {
             security,
             fallback_credential,
             provider_runtime_options,
+            reliability: crate::config::ReliabilityConfig::default(),
             depth: 0,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
@@ -123,6 +126,7 @@ impl DelegateTool {
             security,
             fallback_credential,
             provider_runtime_options,
+            reliability: crate::config::ReliabilityConfig::default(),
             depth,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
@@ -132,6 +136,12 @@ impl DelegateTool {
             load_tracker: AgentLoadTracker::new(),
             runtime_config_path: None,
         }
+    }
+
+    /// Attach reliability config for delegate provider builds.
+    pub fn with_reliability(mut self, reliability: crate::config::ReliabilityConfig) -> Self {
+        self.reliability = reliability;
+        self
     }
 
     /// Attach parent tools used to build sub-agent allowlist registries.
@@ -391,10 +401,18 @@ impl Tool for DelegateTool {
         #[allow(clippy::option_as_ref_deref)]
         let provider_credential = provider_credential_owned.as_ref().map(String::as_str);
 
-        let provider: Box<dyn Provider> = match providers::create_provider_with_options(
+        let mut agent_reliability = self.reliability.clone();
+        if let Some(retries) = agent_config.provider_retries {
+            agent_reliability.provider_retries = retries;
+        }
+
+        let provider_runtime_options_for_agent = &self.provider_runtime_options;
+        let provider: Box<dyn Provider> = match providers::create_resilient_provider_with_options(
             &agent_config.provider,
             provider_credential,
-            &self.provider_runtime_options,
+            None,
+            &agent_reliability,
+            provider_runtime_options_for_agent,
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -897,6 +915,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                provider_retries: None,
             },
         );
         agents.insert(
@@ -914,6 +933,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                provider_retries: None,
             },
         );
         agents
@@ -1109,6 +1129,7 @@ max_concurrent = {subagents_max_concurrent}
             agentic: true,
             allowed_tools,
             max_iterations,
+            provider_retries: None,
         }
     }
 
@@ -1219,6 +1240,7 @@ max_concurrent = {subagents_max_concurrent}
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                provider_retries: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1329,6 +1351,7 @@ max_concurrent = {subagents_max_concurrent}
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                provider_retries: None,
             },
         );
 
@@ -1410,6 +1433,7 @@ max_concurrent = {subagents_max_concurrent}
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                provider_retries: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1448,6 +1472,7 @@ max_concurrent = {subagents_max_concurrent}
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                provider_retries: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1634,6 +1659,7 @@ max_concurrent = {subagents_max_concurrent}
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                provider_retries: None,
             },
         );
 
@@ -1706,6 +1732,7 @@ max_concurrent = {subagents_max_concurrent}
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                provider_retries: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());

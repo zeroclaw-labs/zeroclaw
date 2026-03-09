@@ -23,7 +23,11 @@ async fn execute_one_tool(
     });
     let args_preview = {
         let s = call_arguments.to_string();
-        if s.len() > 400 { format!("{}…", &s[..400]) } else { s }
+        if s.len() > 400 {
+            format!("{}…", &s[..400])
+        } else {
+            s
+        }
     };
     tracing::info!(tool = %call_name, args = %args_preview, "tool.invoke");
     let start = Instant::now();
