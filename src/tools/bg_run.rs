@@ -467,10 +467,20 @@ impl Tool for BgStatusTool {
             match self.job_store.get(id).await {
                 Some(job) => format_job(&job),
                 None => {
+                    let all = self.job_store.all().await;
+                    let output = if all.is_empty() {
+                        format!("Job '{id}' not found. No background jobs are running.")
+                    } else {
+                        let known: Vec<String> = all
+                            .iter()
+                            .map(|j| format!("{} ({})", j.id, j.tool_name))
+                            .collect();
+                        format!("Job '{id}' not found. Known jobs: {}", known.join(", "))
+                    };
                     return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("job not found: {id}")),
+                        success: true,
+                        output,
+                        error: None,
                     });
                 }
             }
@@ -663,6 +673,59 @@ mod tests {
         // Second drain should return nothing (already delivered)
         let drained2 = store.drain_completed(None).await;
         assert!(drained2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bg_status_unknown_id_is_not_a_tool_error() {
+        let store = BgJobStore::new();
+        store
+            .insert(BgJob {
+                id: "j-aabb1122ccdd3344".to_string(),
+                tool_name: "telegram_search_global".to_string(),
+                sender: None,
+                status: BgJobStatus::Running,
+                result: None,
+                error: None,
+                started_at: Instant::now(),
+                completed_at: None,
+                delivered: false,
+                delivered_at: None,
+            })
+            .await;
+        let tool = BgStatusTool::new(store);
+
+        let result = tool
+            .execute(serde_json::json!({"job_id": "bg_hallucinated_id"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "unknown job_id must not count as a tool error"
+        );
+        assert!(
+            result.output.contains("j-aabb1122ccdd3344"),
+            "output must list known job IDs so LLM can self-correct: got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn bg_status_unknown_id_no_jobs_returns_success() {
+        let store = BgJobStore::new();
+        let tool = BgStatusTool::new(store);
+
+        let result = tool
+            .execute(serde_json::json!({"job_id": "bg_fake"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("bg_fake") || result.output.to_lowercase().contains("not found"),
+            "output should mention the missing id or 'not found': got: {}",
+            result.output
+        );
     }
 
     #[test]
