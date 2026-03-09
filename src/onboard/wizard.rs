@@ -1763,9 +1763,18 @@ pub async fn run_models_refresh(
     }
 
     let api_key = config.api_key.clone().unwrap_or_default();
+    let api_url = config.api_url.clone();
 
-    match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()) {
-        Ok(models) if !models.is_empty() => {
+    // Run fetch in separate thread to avoid "Cannot drop a runtime" panic
+    // (reqwest::blocking creates its own Tokio runtime internally)
+    let provider_name_for_thread = provider_name.clone();
+    let fetch_result = std::thread::spawn(move || {
+        fetch_live_models_for_provider(&provider_name_for_thread, &api_key, api_url.as_deref())
+    })
+    .join();
+
+    match fetch_result {
+        Ok(Ok(models)) if !models.is_empty() => {
             cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models).await?;
             println!(
                 "Refreshed '{}' model cache with {} models.",
@@ -1775,7 +1784,7 @@ pub async fn run_models_refresh(
             print_model_preview(&models);
             Ok(())
         }
-        Ok(_) => {
+        Ok(Ok(_)) => {
             if let Some(stale_cache) =
                 load_any_cached_models_for_provider(&config.workspace_dir, &provider_name).await?
             {
@@ -1789,7 +1798,7 @@ pub async fn run_models_refresh(
 
             anyhow::bail!("Provider '{}' returned an empty model list", provider_name)
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             if let Some(stale_cache) =
                 load_any_cached_models_for_provider(&config.workspace_dir, &provider_name).await?
             {
@@ -1804,6 +1813,9 @@ pub async fn run_models_refresh(
 
             Err(error)
                 .with_context(|| format!("failed to refresh models for provider '{provider_name}'"))
+        }
+        Err(_) => {
+            anyhow::bail!("Model refresh thread panicked for provider '{provider_name}'")
         }
     }
 }
@@ -2696,12 +2708,22 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 .interact()?;
 
             if should_fetch_now {
-                match fetch_live_models_for_provider(
-                    provider_name,
-                    &api_key,
-                    provider_api_url.as_deref(),
-                ) {
-                    Ok(live_model_ids) if !live_model_ids.is_empty() => {
+                // Run fetch in separate thread to avoid "Cannot drop a runtime" panic
+                // (reqwest::blocking creates its own Tokio runtime internally)
+                let provider_name_for_thread = provider_name.to_string();
+                let api_key = api_key.clone();
+                let provider_api_url = provider_api_url.clone();
+                let fetch_result = std::thread::spawn(move || {
+                    fetch_live_models_for_provider(
+                        &provider_name_for_thread,
+                        &api_key,
+                        provider_api_url.as_deref(),
+                    )
+                })
+                .join();
+
+                match fetch_result {
+                    Ok(Ok(live_model_ids)) if !live_model_ids.is_empty() => {
                         cache_live_models_for_provider(
                             workspace_dir,
                             provider_name,
@@ -2726,10 +2748,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
                         live_options = Some(build_model_options(shown_models, "live"));
                     }
-                    Ok(_) => {
+                    Ok(Ok(_)) => {
                         print_bullet("Provider returned no models; using curated list.");
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         print_bullet(&format!(
                             "Live fetch failed ({}); using cached/curated list.",
                             style(error.to_string()).yellow()
@@ -2755,6 +2777,9 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                                 ));
                             }
                         }
+                    }
+                    Err(_) => {
+                        print_bullet("Live fetch thread panicked; using cached/curated list.");
                     }
                 }
             }
