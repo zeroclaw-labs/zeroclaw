@@ -25,8 +25,8 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             name          TEXT NOT NULL UNIQUE,
             description   TEXT,
-            from_type_id  INTEGER NOT NULL REFERENCES ontology_object_types(id),
-            to_type_id    INTEGER NOT NULL REFERENCES ontology_object_types(id)
+            from_type_id  INTEGER NOT NULL DEFAULT 0,
+            to_type_id    INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS ontology_action_types (

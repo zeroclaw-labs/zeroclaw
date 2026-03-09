@@ -109,7 +109,12 @@ fn summarize_json(val: &serde_json::Value, max_keys: usize) -> serde_json::Value
                 // Truncate long string values.
                 let truncated = match v {
                     serde_json::Value::String(s) if s.len() > 100 => {
-                        serde_json::Value::String(format!("{}...", &s[..100]))
+                        let boundary = s.char_indices()
+                            .take_while(|(i, _)| *i < 100)
+                            .last()
+                            .map(|(i, c)| i + c.len_utf8())
+                            .unwrap_or(0);
+                        serde_json::Value::String(format!("{}...", &s[..boundary]))
                     }
                     other => other.clone(),
                 };

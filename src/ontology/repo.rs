@@ -431,17 +431,16 @@ impl OntologyRepo {
         limit: usize,
     ) -> anyhow::Result<Vec<OntologyAction>> {
         let conn = self.conn.lock();
-        let (sql, limit_val) = if let Some(ch) = channel {
+        let (sql, limit_val) = if channel.is_some() {
             (
-                format!(
-                    "SELECT id, action_type_id, actor_user_id, actor_kind,
-                            primary_object_id, related_object_ids, params, result,
-                            channel, context_id, status, error_message,
-                            created_at, updated_at
-                     FROM ontology_actions
-                     WHERE actor_user_id = ?1 AND channel = '{ch}'
-                     ORDER BY created_at DESC LIMIT ?2"
-                ),
+                "SELECT id, action_type_id, actor_user_id, actor_kind,
+                        primary_object_id, related_object_ids, params, result,
+                        channel, context_id, status, error_message,
+                        created_at, updated_at
+                 FROM ontology_actions
+                 WHERE actor_user_id = ?1 AND channel = ?3
+                 ORDER BY created_at DESC LIMIT ?2"
+                    .to_string(),
                 limit as i64,
             )
         } else {
@@ -459,7 +458,19 @@ impl OntologyRepo {
         };
 
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![owner_user_id, limit_val], |r| {
+        let params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = if let Some(ch) = channel {
+            vec![
+                Box::new(owner_user_id.to_string()),
+                Box::new(limit_val),
+                Box::new(ch.to_string()),
+            ]
+        } else {
+            vec![
+                Box::new(owner_user_id.to_string()),
+                Box::new(limit_val),
+            ]
+        };
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec.iter()), |r| {
             Ok(OntologyAction {
                 id: r.get(0)?,
                 action_type_id: r.get(1)?,
