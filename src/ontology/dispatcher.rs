@@ -14,8 +14,21 @@ use super::rules::RuleEngine;
 use super::types::*;
 use crate::tools::traits::{Tool, ToolResult};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// Commands explicitly allowed through the RunCommand action.
+///
+/// Deny-by-default: only commands in this set can be dispatched via the
+/// ontology `RunCommand` action type.  Everything else is rejected before
+/// reaching the shell tool.  Extend this set deliberately — each addition
+/// widens the attack surface.
+const RUNCOMMAND_ALLOWLIST: &[&str] = &[
+    "ls", "cat", "head", "tail", "wc", "grep", "find", "echo", "date",
+    "pwd", "whoami", "uname", "df", "du", "env", "printenv", "which",
+    "file", "stat", "id", "uptime", "free", "ps", "cargo", "rustc",
+    "git", "npm", "node", "python3", "python", "pip",
+];
 
 /// Central action dispatcher that maps ontology action types to tool execution.
 pub struct ActionDispatcher {
@@ -23,6 +36,8 @@ pub struct ActionDispatcher {
     rule_engine: Arc<RuleEngine>,
     /// Map of ZeroClaw tool name → tool instance (populated from `all_tools()`).
     tools: HashMap<String, Arc<dyn Tool>>,
+    /// Allowlisted base command names for RunCommand.
+    runcommand_allowlist: HashSet<String>,
 }
 
 impl ActionDispatcher {
@@ -35,10 +50,15 @@ impl ActionDispatcher {
         for tool in tool_list {
             tools.insert(tool.name().to_string(), tool);
         }
+        let runcommand_allowlist = RUNCOMMAND_ALLOWLIST
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         Self {
             repo,
             rule_engine,
             tools,
+            runcommand_allowlist,
         }
     }
 
@@ -64,8 +84,9 @@ impl ActionDispatcher {
         // 2. Route to the appropriate handler.
         let result = self.route_action(&req).await;
 
-        // 3. Update action log based on result.
-        match &result {
+        // 3. Update action log based on result, tracking whether the action
+        //    actually succeeded so we can gate rule execution.
+        let action_succeeded = match &result {
             Ok(value) => {
                 // Check if the tool explicitly reported failure via success field.
                 let tool_failed = value
@@ -78,27 +99,33 @@ impl ActionDispatcher {
                         .and_then(|v| v.as_str())
                         .unwrap_or("tool reported failure");
                     self.repo.fail_action(action_id, err_msg)?;
+                    false
                 } else {
                     self.repo.complete_action(action_id, value)?;
+                    true
                 }
             }
             Err(e) => {
                 self.repo.fail_action(action_id, &e.to_string())?;
+                false
             }
-        }
+        };
 
-        // 4. Trigger post-action rules (only on success).
-        if let Ok(ref value) = result {
-            if let Err(rule_err) = self.rule_engine.apply_post_action_rules(
-                &req.action_type_name,
-                &req,
-                value,
-            ) {
-                tracing::warn!(
-                    action_type = %req.action_type_name,
-                    error = %rule_err,
-                    "post-action rule failed (non-fatal)"
-                );
+        // 4. Trigger post-action rules only when the action truly succeeded.
+        //    Skipping on failure prevents rules from operating on invalid state.
+        if action_succeeded {
+            if let Ok(ref value) = result {
+                if let Err(rule_err) = self.rule_engine.apply_post_action_rules(
+                    &req.action_type_name,
+                    &req,
+                    value,
+                ) {
+                    tracing::warn!(
+                        action_type = %req.action_type_name,
+                        error = %rule_err,
+                        "post-action rule failed (non-fatal)"
+                    );
+                }
             }
         }
 
@@ -158,7 +185,7 @@ impl ActionDispatcher {
                 self.call_tool_or_fallback(&tool_name, &req.params).await
             }
 
-            "RunCommand" => self.call_tool_or_fallback("shell", &req.params).await,
+            "RunCommand" => self.handle_run_command(req).await,
 
             "PlanTasks" => self.call_tool_or_fallback("task_plan", &req.params).await,
 
@@ -208,7 +235,9 @@ impl ActionDispatcher {
                     link_val.get("link_type").and_then(|v| v.as_str()),
                     link_val.get("to_object_id").and_then(|v| v.as_i64()),
                 ) {
-                    let _ = self.repo.create_link(link_type, task_id, to_id, None);
+                    if let Err(e) = self.repo.create_link(link_type, task_id, to_id, None) {
+                        tracing::debug!(error = %e, "handle_create_task: link creation failed (non-fatal)");
+                    }
                 }
             }
         }
@@ -222,10 +251,9 @@ impl ActionDispatcher {
             .or_else(|| req.params.get("object_id").and_then(|v| v.as_i64()))
             .ok_or_else(|| anyhow::anyhow!("UpdateTask requires primary_object_id"))?;
 
-        let title = req.params.get("title").and_then(|v| v.as_str());
-        let properties = req.params.get("properties");
-
-        self.repo.update_object(object_id, title, properties)?;
+        // Verify owner before allowing update (horizontal privilege escalation guard).
+        self.repo
+            .update_object_for_owner(object_id, &req.owner_user_id, req.params.get("title").and_then(|v| v.as_str()), req.params.get("properties"))?;
         Ok(json!({"success": true, "updated_object_id": object_id}))
     }
 
@@ -318,7 +346,7 @@ impl ActionDispatcher {
             "EndSession" => {
                 if let Some(obj_id) = req.primary_object_id {
                     self.repo
-                        .update_object(obj_id, None, Some(&json!({"status": "ended"})))?;
+                        .update_object_for_owner(obj_id, &req.owner_user_id, None, Some(&json!({"status": "ended"})))?;
                 }
                 Ok(json!({"success": true, "ended": true}))
             }
@@ -330,42 +358,90 @@ impl ActionDispatcher {
     // ZeroClaw tool helpers
     // -----------------------------------------------------------------------
 
-    /// Call a ZeroClaw tool by name, falling back to an error if not found.
+    /// Call a ZeroClaw tool by name.
+    ///
+    /// Only tries exact name and dash-to-underscore normalization.  The old
+    /// `_tool` suffix fallback was too loose and could match unintended tools.
     async fn call_tool_or_fallback(
         &self,
         tool_name: &str,
         params: &serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
-        if let Some(tool) = self.tools.get(tool_name) {
-            let result: ToolResult = tool.execute(params.clone()).await?;
-            Ok(json!({
-                "success": result.success,
-                "output": result.output,
-                "error": result.error,
-            }))
-        } else {
-            // Try a looser match — some tools have different naming.
-            let alt_names = [
-                format!("{tool_name}_tool"),
-                tool_name.replace('-', "_"),
-            ];
-            for alt in &alt_names {
-                if let Some(tool) = self.tools.get(alt.as_str()) {
-                    let result: ToolResult = tool.execute(params.clone()).await?;
-                    return Ok(json!({
-                        "success": result.success,
-                        "output": result.output,
-                        "error": result.error,
-                    }));
-                }
+        let candidates = [
+            tool_name.to_string(),
+            tool_name.replace('-', "_"),
+        ];
+        for name in &candidates {
+            if let Some(tool) = self.tools.get(name.as_str()) {
+                let result: ToolResult = tool.execute(params.clone()).await?;
+                return Ok(json!({
+                    "success": result.success,
+                    "output": result.output,
+                    "error": result.error,
+                }));
             }
-
-            anyhow::bail!(
-                "ZeroClaw tool '{}' not found in registry. Available tools: {:?}",
-                tool_name,
-                self.tools.keys().take(10).collect::<Vec<_>>()
-            )
         }
+
+        // Do NOT expose the tool registry in error messages — that leaks
+        // internal capability surface to potentially untrusted callers.
+        anyhow::bail!(
+            "tool '{}' is not available for this action",
+            tool_name,
+        )
+    }
+
+    /// Security-gated RunCommand handler.
+    ///
+    /// Extracts the base command from params, checks it against the allowlist,
+    /// and rejects anything not explicitly permitted.
+    async fn handle_run_command(
+        &self,
+        req: &ExecuteActionRequest,
+    ) -> anyhow::Result<serde_json::Value> {
+        let command = req
+            .params
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if command.is_empty() {
+            anyhow::bail!("RunCommand: empty command");
+        }
+
+        // Extract the base executable name (first whitespace-separated token,
+        // stripped of any path prefix).
+        let base_cmd = command
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .rsplit('/')
+            .next()
+            .unwrap_or("");
+
+        if !self.runcommand_allowlist.contains(base_cmd) {
+            tracing::warn!(
+                command = command,
+                base_cmd = base_cmd,
+                "RunCommand blocked: command not in allowlist"
+            );
+            anyhow::bail!(
+                "RunCommand denied: '{}' is not in the allowed command list",
+                base_cmd,
+            );
+        }
+
+        // Reject shell meta-characters that could bypass the allowlist
+        // (pipes, command chaining, subshells, redirects).
+        const SHELL_META: &[char] = &['|', ';', '&', '`', '$', '(', ')', '<', '>'];
+        if command.contains(SHELL_META) {
+            tracing::warn!(
+                command = command,
+                "RunCommand blocked: shell metacharacters detected"
+            );
+            anyhow::bail!("RunCommand denied: shell operators are not permitted");
+        }
+
+        self.call_tool_or_fallback("shell", &req.params).await
     }
 
     /// Select the appropriate document-reading tool based on file extension.
@@ -430,11 +506,18 @@ impl ActionDispatcher {
 
         // The actual summarization would be done by the LLM in the agent loop.
         // Here we return the content and style so the agent can process it.
+        // Use char-boundary-safe truncation to avoid panic on multibyte (e.g. Korean).
+        let preview_boundary = doc_content
+            .char_indices()
+            .take_while(|(i, _)| *i < 500)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
         Ok(json!({
             "success": true,
             "content_length": doc_content.len(),
             "summary_style": style,
-            "content_preview": &doc_content[..doc_content.len().min(500)],
+            "content_preview": &doc_content[..preview_boundary],
             "requires_llm_summarization": true,
         }))
     }

@@ -298,6 +298,12 @@ impl SyncEngine {
         } else {
             let id = DeviceId::generate();
             std::fs::write(&device_id_path, &id.0)?;
+            // Restrict key file to owner-only access (0o600).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&device_id_path, std::fs::Permissions::from_mode(0o600))?;
+            }
             id
         };
 
@@ -315,6 +321,12 @@ impl SyncEngine {
             let mut key = [0u8; 32];
             rand::fill(&mut key);
             std::fs::write(&key_path, key)?;
+            // Restrict key file to owner-only access (0o600).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+            }
             key
         };
 

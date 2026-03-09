@@ -77,7 +77,8 @@ impl Tool for OntologyGetContextTool {
             limit_recent_actions: args
                 .get("limit_recent_actions")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(20) as usize,
+                .unwrap_or(20)
+                .min(50) as usize,
         };
 
         match self.context_builder.build(&req) {
