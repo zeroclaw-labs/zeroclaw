@@ -34,6 +34,9 @@ const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
 const SLACK_HISTORY_DEFAULT_RETRY_AFTER_SECS: u64 = 1;
 const SLACK_HISTORY_MAX_BACKOFF_SECS: u64 = 120;
 const SLACK_HISTORY_MAX_JITTER_MS: u64 = 500;
+const SLACK_SOCKET_MODE_INITIAL_BACKOFF_SECS: u64 = 3;
+const SLACK_SOCKET_MODE_MAX_BACKOFF_SECS: u64 = 120;
+const SLACK_SOCKET_MODE_MAX_JITTER_MS: u64 = 500;
 const SLACK_USER_CACHE_TTL_SECS: u64 = 6 * 60 * 60;
 const SLACK_ATTACHMENT_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
 const SLACK_ATTACHMENT_IMAGE_INLINE_FALLBACK_MAX_BYTES: usize = 512 * 1024;
@@ -1463,22 +1466,42 @@ impl SlackChannel {
         scoped_channels: Option<Vec<String>>,
     ) -> anyhow::Result<()> {
         let mut last_ts_by_channel: HashMap<String, String> = HashMap::new();
+        let mut open_url_attempt: u32 = 0;
+        let mut socket_reconnect_attempt: u32 = 0;
 
         loop {
             let ws_url = match self.open_socket_mode_url().await {
-                Ok(url) => url,
+                Ok(url) => {
+                    open_url_attempt = 0;
+                    url
+                }
                 Err(e) => {
-                    tracing::warn!("Slack Socket Mode: failed to open websocket URL: {e}");
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    let wait = Self::compute_socket_mode_retry_delay(open_url_attempt);
+                    tracing::warn!(
+                        "Slack Socket Mode: failed to open websocket URL: {e}; retrying in {:.3}s (attempt #{})",
+                        wait.as_secs_f64(),
+                        open_url_attempt.saturating_add(1),
+                    );
+                    open_url_attempt = open_url_attempt.saturating_add(1);
+                    tokio::time::sleep(wait).await;
                     continue;
                 }
             };
 
             let (ws_stream, _) = match tokio_tungstenite::connect_async(&ws_url).await {
-                Ok(connection) => connection,
+                Ok(connection) => {
+                    socket_reconnect_attempt = 0;
+                    connection
+                }
                 Err(e) => {
-                    tracing::warn!("Slack Socket Mode: websocket connect failed: {e}");
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    let wait = Self::compute_socket_mode_retry_delay(socket_reconnect_attempt);
+                    tracing::warn!(
+                        "Slack Socket Mode: websocket connect failed: {e}; retrying in {:.3}s (attempt #{})",
+                        wait.as_secs_f64(),
+                        socket_reconnect_attempt.saturating_add(1),
+                    );
+                    socket_reconnect_attempt = socket_reconnect_attempt.saturating_add(1);
+                    tokio::time::sleep(wait).await;
                     continue;
                 }
             };
@@ -1621,8 +1644,14 @@ impl SlackChannel {
                 }
             }
 
-            tracing::warn!("Slack Socket Mode: reconnecting in 3 seconds...");
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            let wait = Self::compute_socket_mode_retry_delay(socket_reconnect_attempt);
+            tracing::warn!(
+                "Slack Socket Mode: reconnecting in {:.3}s (attempt #{})...",
+                wait.as_secs_f64(),
+                socket_reconnect_attempt.saturating_add(1),
+            );
+            socket_reconnect_attempt = socket_reconnect_attempt.saturating_add(1);
+            tokio::time::sleep(wait).await;
         }
     }
 
@@ -1662,12 +1691,36 @@ impl SlackChannel {
         nanos % (max_jitter_ms + 1)
     }
 
-    fn compute_retry_delay(base_retry_after_secs: u64, attempt: u32, jitter_ms: u64) -> Duration {
+    fn compute_exponential_backoff_delay(
+        base_retry_after_secs: u64,
+        attempt: u32,
+        max_backoff_secs: u64,
+        jitter_ms: u64,
+    ) -> Duration {
         let multiplier = 1_u64.checked_shl(attempt).unwrap_or(u64::MAX);
         let backoff_secs = base_retry_after_secs
             .saturating_mul(multiplier)
-            .min(SLACK_HISTORY_MAX_BACKOFF_SECS);
+            .min(max_backoff_secs);
         Duration::from_secs(backoff_secs) + Duration::from_millis(jitter_ms)
+    }
+
+    fn compute_retry_delay(base_retry_after_secs: u64, attempt: u32, jitter_ms: u64) -> Duration {
+        Self::compute_exponential_backoff_delay(
+            base_retry_after_secs,
+            attempt,
+            SLACK_HISTORY_MAX_BACKOFF_SECS,
+            jitter_ms,
+        )
+    }
+
+    fn compute_socket_mode_retry_delay(attempt: u32) -> Duration {
+        let jitter_ms = Self::jitter_ms_from_clock(SLACK_SOCKET_MODE_MAX_JITTER_MS);
+        Self::compute_exponential_backoff_delay(
+            SLACK_SOCKET_MODE_INITIAL_BACKOFF_SECS,
+            attempt,
+            SLACK_SOCKET_MODE_MAX_BACKOFF_SECS,
+            jitter_ms,
+        )
     }
 
     fn next_retry_timestamp(wait: Duration) -> String {

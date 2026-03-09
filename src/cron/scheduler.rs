@@ -346,7 +346,8 @@ pub(crate) async fn deliver_announcement(
                 sl.channel_id.clone(),
                 Vec::new(),
                 sl.allowed_users.clone(),
-            );
+            )
+            .with_workspace_dir(config.workspace_dir.clone());
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "mattermost" => {
