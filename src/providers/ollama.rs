@@ -554,6 +554,13 @@ impl Provider for OllamaProvider {
             return Ok(content);
         }
 
+        if let Some(thinking_text) = Self::thinking_text_for_tool_mode(
+            &normalized_model,
+            response.message.thinking.as_deref(),
+        ) {
+            return Ok(thinking_text);
+        }
+
         Ok(Self::fallback_text_for_empty_content(
             &normalized_model,
             response.message.thinking.as_deref(),
@@ -593,6 +600,13 @@ impl Provider for OllamaProvider {
         let content = response.message.content;
         if let Some(content) = Self::normalize_response_text(content) {
             return Ok(content);
+        }
+
+        if let Some(thinking_text) = Self::thinking_text_for_tool_mode(
+            &normalized_model,
+            response.message.thinking.as_deref(),
+        ) {
+            return Ok(thinking_text);
         }
 
         Ok(Self::fallback_text_for_empty_content(
