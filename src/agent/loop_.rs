@@ -1856,6 +1856,18 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
     parts.join("\n")
 }
 
+fn resolve_display_text(response_text: &str, parsed_text: &str, has_tool_calls: bool) -> String {
+    if has_tool_calls {
+        return parsed_text.to_string();
+    }
+
+    if parsed_text.is_empty() {
+        response_text.to_string()
+    } else {
+        parsed_text.to_string()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ParsedToolCall {
     name: String,
@@ -2344,11 +2356,8 @@ pub(crate) async fn run_tool_call_loop(
                 }
             };
 
-        let display_text = if parsed_text.is_empty() {
-            response_text.clone()
-        } else {
-            parsed_text
-        };
+        let display_text =
+            resolve_display_text(&response_text, &parsed_text, !tool_calls.is_empty());
         let display_text = strip_tool_result_blocks(&display_text);
 
         // ── Progress: LLM responded ─────────────────────────────
@@ -4086,6 +4095,32 @@ mod tests {
                 .all(|msg| !(msg.role == "user" && msg.content.starts_with("[Tool results]"))),
             "native mode should use role=tool history instead of prompt fallback wrapper"
         );
+    }
+
+    #[test]
+    fn resolve_display_text_hides_raw_payload_for_tool_only_turns() {
+        let display = resolve_display_text(
+            "<tool_call>{\"name\":\"memory_store\"}</tool_call>",
+            "",
+            true,
+        );
+        assert!(display.is_empty());
+    }
+
+    #[test]
+    fn resolve_display_text_keeps_plain_text_for_tool_turns() {
+        let display = resolve_display_text(
+            "<tool_call>{\"name\":\"shell\"}</tool_call>",
+            "Let me check that.",
+            true,
+        );
+        assert_eq!(display, "Let me check that.");
+    }
+
+    #[test]
+    fn resolve_display_text_uses_response_text_for_final_turns() {
+        let display = resolve_display_text("Final answer", "", false);
+        assert_eq!(display, "Final answer");
     }
 
     #[test]
