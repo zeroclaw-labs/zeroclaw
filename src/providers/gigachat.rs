@@ -238,8 +238,7 @@ impl Provider for GigaChatProvider {
         }
 
         if messages.is_empty() {
-            tracing::error!("No messages provided");
-            return Err(super::api_error("GigaChat", response).await);
+            return Err(anyhow::anyhow!("No messages provided"));
         }
 
         // TODO: better handling - get rid of hardcoded values
