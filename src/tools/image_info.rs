@@ -167,16 +167,29 @@ impl Tool for ImageInfoTool {
         }
 
         let path = self.security.resolve_user_path(path_str);
+        let resolved_path = match tokio::fs::canonicalize(&path).await {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("File not found or cannot be resolved: {e}")),
+                });
+            }
+        };
 
-        if !path.exists() {
+        if !self.security.is_resolved_path_allowed(&resolved_path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("File not found: {path_str}")),
+                error: Some(
+                    self.security
+                        .resolved_path_violation_message(&resolved_path),
+                ),
             });
         }
 
-        let metadata = tokio::fs::metadata(&path)
+        let metadata = tokio::fs::metadata(&resolved_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read file metadata: {e}"))?;
 
@@ -192,7 +205,7 @@ impl Tool for ImageInfoTool {
             });
         }
 
-        let bytes = tokio::fs::read(&path)
+        let bytes = tokio::fs::read(&resolved_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read image file: {e}"))?;
 
@@ -488,5 +501,53 @@ mod tests {
         assert!(result.output.contains("data:image/png;base64,"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn execute_blocks_symlink_escape_outside_allowed_roots() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let root = std::env::temp_dir().join("zeroclaw_image_info_symlink_escape");
+            let workspace = root.join("workspace");
+            let outside = root.join("outside");
+            let _ = tokio::fs::remove_dir_all(&root).await;
+            tokio::fs::create_dir_all(&workspace).await.unwrap();
+            tokio::fs::create_dir_all(&outside).await.unwrap();
+
+            let png_path = outside.join("outside.png");
+            let png_bytes: Vec<u8> = vec![
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49,
+                0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02,
+                0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44,
+                0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00,
+                0x01, 0xE2, 0x21, 0xBC, 0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44,
+                0xAE, 0x42, 0x60, 0x82,
+            ];
+            tokio::fs::write(&png_path, &png_bytes).await.unwrap();
+
+            let link_path = workspace.join("link.png");
+            symlink(&png_path, &link_path).unwrap();
+
+            let security = Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Full,
+                workspace_dir: workspace,
+                workspace_only: true,
+                allowed_roots: vec![],
+                forbidden_paths: vec![],
+                ..SecurityPolicy::default()
+            });
+            let tool = ImageInfoTool::new(security);
+            let result = tool
+                .execute(json!({"path": "link.png"}))
+                .await
+                .unwrap();
+
+            assert!(!result.success);
+            assert!(result.error.as_ref().unwrap().contains("allowed"));
+
+            let _ = tokio::fs::remove_dir_all(&root).await;
+        }
     }
 }

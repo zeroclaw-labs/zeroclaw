@@ -531,6 +531,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_read_outside_workspace_allowed_with_tilde_path_inside_allowed_roots() {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+
+        let root = home.join("zeroclaw_test_allowed_roots_tilde");
+        let workspace = root.join("workspace");
+        let outside = root.join("projects_root");
+        let outside_file = outside.join("notes.txt");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        tokio::fs::write(&outside_file, "tilde-allowed")
+            .await
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            workspace_only: true,
+            allowed_roots: vec![outside.clone()],
+            forbidden_paths: vec![],
+            ..SecurityPolicy::default()
+        });
+        let tool = FileReadTool::new(security);
+
+        let path = "~/zeroclaw_test_allowed_roots_tilde/projects_root/notes.txt";
+        let result = tool.execute(json!({"path": path})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.error.is_none());
+        assert!(result.output.contains("tilde-allowed"));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
     async fn file_read_nonexistent_consumes_rate_limit_budget() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_probe");
         let _ = tokio::fs::remove_dir_all(&dir).await;
