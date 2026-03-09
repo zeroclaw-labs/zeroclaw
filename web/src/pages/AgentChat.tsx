@@ -2,13 +2,13 @@ import { useState, useEffect, useRef } from 'react';
 import { Send, Bot, User, AlertCircle } from 'lucide-react';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
-
-interface ChatMessage {
-  id: string;
-  role: 'user' | 'agent';
-  content: string;
-  timestamp: Date;
-}
+import {
+  createMessageId,
+  loadStoredMessages,
+  mergeHistoryMessages,
+  saveStoredMessages,
+  type ChatMessage,
+} from '@/lib/agentChatState';
 
 export default function AgentChat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -16,6 +16,7 @@ export default function AgentChat() {
   const [typing, setTyping] = useState(false);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string>('');
 
   const wsRef = useRef<WebSocketClient | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -24,6 +25,9 @@ export default function AgentChat() {
 
   useEffect(() => {
     const ws = new WebSocketClient();
+    const activeSessionId = ws.activeSessionId;
+    setSessionId(activeSessionId);
+    setMessages(loadStoredMessages(activeSessionId));
 
     ws.onOpen = () => {
       setConnected(true);
@@ -40,6 +44,10 @@ export default function AgentChat() {
 
     ws.onMessage = (msg: WsMessage) => {
       switch (msg.type) {
+        case 'history':
+          setMessages((prev) => mergeHistoryMessages(prev, msg.messages ?? []));
+          break;
+
         case 'chunk':
           setTyping(true);
           pendingContentRef.current += msg.content ?? '';
@@ -52,7 +60,7 @@ export default function AgentChat() {
             setMessages((prev) => [
               ...prev,
               {
-                id: crypto.randomUUID(),
+                id: createMessageId(),
                 role: 'agent',
                 content,
                 timestamp: new Date(),
@@ -68,7 +76,7 @@ export default function AgentChat() {
           setMessages((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: createMessageId(),
               role: 'agent',
               content: `[Tool Call] ${msg.name ?? 'unknown'}(${JSON.stringify(msg.args ?? {})})`,
               timestamp: new Date(),
@@ -80,7 +88,7 @@ export default function AgentChat() {
           setMessages((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: createMessageId(),
               role: 'agent',
               content: `[Tool Result] ${msg.output ?? ''}`,
               timestamp: new Date(),
@@ -92,7 +100,7 @@ export default function AgentChat() {
           setMessages((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: createMessageId(),
               role: 'agent',
               content: `[Error] ${msg.message ?? 'Unknown error'}`,
               timestamp: new Date(),
@@ -113,6 +121,13 @@ export default function AgentChat() {
   }, []);
 
   useEffect(() => {
+    if (!sessionId) {
+      return;
+    }
+    saveStoredMessages(sessionId, messages);
+  }, [messages, sessionId]);
+
+  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, typing]);
 
@@ -123,7 +138,7 @@ export default function AgentChat() {
     setMessages((prev) => [
       ...prev,
       {
-        id: crypto.randomUUID(),
+        id: createMessageId(),
         role: 'user',
         content: trimmed,
         timestamp: new Date(),

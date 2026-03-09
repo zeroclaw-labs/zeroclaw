@@ -95,11 +95,16 @@ export interface SSEEvent {
 }
 
 export interface WsMessage {
-  type: 'message' | 'chunk' | 'tool_call' | 'tool_result' | 'done' | 'error';
+  type: 'message' | 'chunk' | 'tool_call' | 'tool_result' | 'done' | 'error' | 'history';
   content?: string;
   full_response?: string;
   name?: string;
   args?: any;
   output?: string;
   message?: string;
+  session_id?: string;
+  messages?: Array<{
+    role: string;
+    content?: string;
+  }>;
 }
