@@ -1390,9 +1390,7 @@ async fn fetch_gigachat_models(api_key: Option<&str>) -> Result<Vec<String>> {
         bail!("GigaChat model fetch requires API key");
     };
 
-    let models = GigaChatProvider::new(None, Some(api_key))
-        .fetch_models()
-        .await?;
+    let models = GigaChatProvider::new(Some(api_key)).fetch_models().await?;
 
     Ok(models)
 }

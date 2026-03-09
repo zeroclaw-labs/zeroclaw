@@ -970,7 +970,7 @@ fn create_provider_with_url_and_options(
             )?))
         }
         // ── Primary providers (custom implementations) ───────
-        "gigachat" => Ok(Box::new(gigachat::GigaChatProvider::new(api_url,key))),
+        "gigachat" => Ok(Box::new(gigachat::GigaChatProvider::new(key))),
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
         "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),

@@ -1,7 +1,5 @@
-//! Example: Implementing a custom Provider for ZeroClaw
+//! Implementing a GigaChat Provider for ZeroClaw
 //!
-//! This shows how to add a new LLM backend in ~30 lines of code.
-//! Copy this file, modify the API call, and register in `src/providers/mod.rs`.
 
 use crate::providers::Provider;
 use anyhow::Result;
@@ -88,9 +86,9 @@ struct Model {
 }
 
 const OAUTH_API_ENDPOINT: &str = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth";
+const BASE_URL: &str = "https://gigachat.devices.sberbank.ru/api/v1/";
 
 pub struct GigaChatProvider {
-    base_url: String,
     credentials: String,
     scope: String,
     client: reqwest::Client,
@@ -98,11 +96,8 @@ pub struct GigaChatProvider {
 }
 
 impl GigaChatProvider {
-    pub fn new(base_url: Option<&str>, credentials: Option<&str>) -> Self {
+    pub fn new(credentials: Option<&str>) -> Self {
         Self {
-            base_url: base_url
-                .unwrap_or("https://gigachat.devices.sberbank.ru/api/")
-                .to_string(),
             scope: "GIGACHAT_API_PERS".to_string(),
             credentials: credentials.unwrap_or("").to_string(),
             client: Self::build_client().unwrap(),
@@ -122,7 +117,7 @@ impl GigaChatProvider {
 
         let response = self
             .client
-            .get(format!("{}/v1/models", self.base_url))
+            .get(format!("{}/models", BASE_URL))
             .header(
                 "Authorization",
                 format!("Bearer {}", access_token.access_token),
@@ -179,7 +174,7 @@ impl GigaChatProvider {
 
         let response = self
             .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
+            .post(format!("{}/chat/completions", BASE_URL))
             .json(&request)
             // .header("X-Client-Id", "gigachat-web") // FIXME: need to find out what to put there
             .header("X-Request-Id", req_id.to_string())
