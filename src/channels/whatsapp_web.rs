@@ -233,6 +233,48 @@ impl WhatsAppWebChannel {
 
         Ok(wa_rs_binary::jid::Jid::pn(digits))
     }
+
+    // ── Reconnect state-machine helpers (used by listen() and tested directly) ──
+
+    /// Reconnect retry constants.
+    const MAX_RETRIES: u32 = 10;
+    const BASE_DELAY_SECS: u64 = 3;
+    const MAX_DELAY_SECS: u64 = 300;
+
+    /// Compute the exponential-backoff delay for a given 1-based attempt number.
+    /// Doubles each attempt from `BASE_DELAY_SECS`, capped at `MAX_DELAY_SECS`.
+    fn compute_retry_delay(attempt: u32) -> u64 {
+        std::cmp::min(
+            Self::BASE_DELAY_SECS.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1))),
+            Self::MAX_DELAY_SECS,
+        )
+    }
+
+    /// Determine whether session files should be purged.
+    /// Returns `true` only when `Event::LoggedOut` was explicitly observed.
+    fn should_purge_session(session_revoked: &std::sync::atomic::AtomicBool) -> bool {
+        session_revoked.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record a reconnect attempt and return `(attempt_number, exceeded_max)`.
+    fn record_retry(retry_count: &std::sync::atomic::AtomicU32) -> (u32, bool) {
+        let attempts = retry_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        (attempts, attempts > Self::MAX_RETRIES)
+    }
+
+    /// Reset the retry counter (called on `Event::Connected`).
+    fn reset_retry(retry_count: &std::sync::atomic::AtomicU32) {
+        retry_count.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Return the session file paths to remove (primary + WAL + SHM sidecars).
+    fn session_file_paths(expanded_session_path: &str) -> [String; 3] {
+        [
+            expanded_session_path.to_string(),
+            format!("{expanded_session_path}-wal"),
+            format!("{expanded_session_path}-shm"),
+        ]
+    }
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -289,9 +331,6 @@ impl Channel for WhatsAppWebChannel {
         use wa_rs_ureq_http::UreqHttpClient;
 
         let retry_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        const MAX_RETRIES: u32 = 10;
-        const BASE_DELAY_SECS: u64 = 3;
-        const MAX_DELAY_SECS: u64 = 300;
 
         loop {
             let expanded_session_path = shellexpand::tilde(&self.session_path).to_string();
@@ -424,7 +463,7 @@ impl Channel for WhatsAppWebChannel {
                             }
                             Event::Connected(_) => {
                                 tracing::info!("WhatsApp Web connected successfully");
-                                retry_count.store(0, std::sync::atomic::Ordering::Relaxed);
+                                WhatsAppWebChannel::reset_retry(&retry_count);
                             }
                             Event::LoggedOut(_) => {
                                 session_revoked.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -529,22 +568,18 @@ impl Channel for WhatsAppWebChannel {
             drop(backend);
 
             if should_reconnect {
-                let attempts = retry_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if attempts > MAX_RETRIES {
+                let (attempts, exceeded) = Self::record_retry(&retry_count);
+                if exceeded {
                     anyhow::bail!(
                         "WhatsApp Web: exceeded {} reconnect attempts, giving up",
-                        MAX_RETRIES
+                        Self::MAX_RETRIES
                     );
                 }
 
                 // Only purge session files when LoggedOut was explicitly observed.
                 // A transient task crash (Err from recv) should not wipe a valid session.
-                if session_revoked.load(std::sync::atomic::Ordering::Relaxed) {
-                    for path in [
-                        expanded_session_path.clone(),
-                        format!("{expanded_session_path}-wal"),
-                        format!("{expanded_session_path}-shm"),
-                    ] {
+                if Self::should_purge_session(&session_revoked) {
+                    for path in Self::session_file_paths(&expanded_session_path) {
                         match tokio::fs::remove_file(&path).await {
                             Ok(()) => {}
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -561,15 +596,12 @@ impl Channel for WhatsAppWebChannel {
                     );
                 }
 
-                let delay = std::cmp::min(
-                    BASE_DELAY_SECS.saturating_mul(2u64.saturating_pow(attempts - 1)),
-                    MAX_DELAY_SECS,
-                );
+                let delay = Self::compute_retry_delay(attempts);
                 tracing::info!(
                     "WhatsApp Web: reconnecting in {}s (attempt {}/{})",
                     delay,
                     attempts,
-                    MAX_RETRIES
+                    Self::MAX_RETRIES
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 continue;
@@ -817,96 +849,94 @@ mod tests {
         assert!(!ch.health_check().await);
     }
 
-    // ── Reconnect retry state machine tests ──────────────────────────────
+    // ── Reconnect retry state machine tests (exercise production helpers) ──
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
-    fn retry_backoff_doubles_with_cap() {
-        const BASE: u64 = 3;
-        const CAP: u64 = 300;
+    fn compute_retry_delay_doubles_with_cap() {
+        // Uses the production helper that listen() calls for backoff.
         // attempt 1 → 3s, 2 → 6s, 3 → 12s, … 7 → 192s, 8 → 300s (capped)
         let expected = [3, 6, 12, 24, 48, 96, 192, 300, 300, 300];
         for (i, &want) in expected.iter().enumerate() {
             let attempt = (i + 1) as u32;
-            let delay = std::cmp::min(
-                BASE.saturating_mul(2u64.saturating_pow(attempt - 1)),
-                CAP,
+            assert_eq!(
+                WhatsAppWebChannel::compute_retry_delay(attempt),
+                want,
+                "attempt {attempt}"
             );
-            assert_eq!(delay, want, "attempt {attempt}");
         }
     }
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
-    fn retry_count_resets_on_connected() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        let retry_count = Arc::new(AtomicU32::new(0));
+    fn compute_retry_delay_zero_attempt() {
+        // Edge case: attempt 0 should still produce BASE (saturating_sub clamps).
+        assert_eq!(WhatsAppWebChannel::compute_retry_delay(0), WhatsAppWebChannel::BASE_DELAY_SECS);
+    }
 
-        // Simulate 5 failed reconnects
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn record_retry_increments_and_detects_exceeded() {
+        use std::sync::atomic::AtomicU32;
+        let counter = AtomicU32::new(0);
+
+        // First MAX_RETRIES attempts should not exceed.
+        for i in 1..=WhatsAppWebChannel::MAX_RETRIES {
+            let (attempt, exceeded) = WhatsAppWebChannel::record_retry(&counter);
+            assert_eq!(attempt, i);
+            assert!(!exceeded, "attempt {i} should not exceed max");
+        }
+
+        // Next attempt exceeds the limit.
+        let (attempt, exceeded) = WhatsAppWebChannel::record_retry(&counter);
+        assert_eq!(attempt, WhatsAppWebChannel::MAX_RETRIES + 1);
+        assert!(exceeded);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn reset_retry_clears_counter() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let counter = AtomicU32::new(0);
+
+        // Simulate several reconnect attempts via the production helper.
         for _ in 0..5 {
-            retry_count.fetch_add(1, Ordering::Relaxed);
+            WhatsAppWebChannel::record_retry(&counter);
         }
-        assert_eq!(retry_count.load(Ordering::Relaxed), 5);
+        assert_eq!(counter.load(Ordering::Relaxed), 5);
 
-        // Event::Connected resets counter
-        retry_count.store(0, Ordering::Relaxed);
-        assert_eq!(retry_count.load(Ordering::Relaxed), 0);
+        // Event::Connected calls reset_retry — verify it zeroes the counter.
+        WhatsAppWebChannel::reset_retry(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        // After reset, record_retry starts from 1 again.
+        let (attempt, exceeded) = WhatsAppWebChannel::record_retry(&counter);
+        assert_eq!(attempt, 1);
+        assert!(!exceeded);
     }
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
-    fn retry_exceeds_max_retries() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        const MAX_RETRIES: u32 = 10;
-        let retry_count = Arc::new(AtomicU32::new(0));
+    fn should_purge_session_only_when_revoked() {
+        use std::sync::atomic::AtomicBool;
+        let flag = AtomicBool::new(false);
 
-        for i in 1..=MAX_RETRIES {
-            let attempts = retry_count.fetch_add(1, Ordering::Relaxed) + 1;
-            assert_eq!(attempts, i);
-            assert!(attempts <= MAX_RETRIES);
-        }
-        // Next attempt exceeds limit
-        let attempts = retry_count.fetch_add(1, Ordering::Relaxed) + 1;
-        assert!(attempts > MAX_RETRIES);
+        // Transient crash: flag is false → should NOT purge.
+        assert!(!WhatsAppWebChannel::should_purge_session(&flag));
+
+        // Explicit LoggedOut: flag set to true → should purge.
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(WhatsAppWebChannel::should_purge_session(&flag));
     }
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
-    fn session_revoked_flag_guards_file_deletion() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let session_revoked = Arc::new(AtomicBool::new(false));
-
-        // Transient crash: flag is false → should NOT purge
-        assert!(!session_revoked.load(Ordering::Relaxed));
-
-        // Explicit LoggedOut: flag set to true → should purge
-        session_revoked.store(true, Ordering::Relaxed);
-        assert!(session_revoked.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    #[cfg(feature = "whatsapp-web")]
-    fn logout_broadcast_channel_signals_reconnect() {
-        let (tx, mut rx) = tokio::sync::broadcast::channel::<()>(1);
-        let tx_clone = tx.clone();
-
-        // Simulate LoggedOut handler sending signal
-        let _ = tx_clone.send(());
-
-        // Receiver gets the signal
-        assert!(rx.try_recv().is_ok());
-    }
-
-    #[test]
-    #[cfg(feature = "whatsapp-web")]
-    fn logout_broadcast_dropped_sender_returns_err() {
-        let (tx, mut rx) = tokio::sync::broadcast::channel::<()>(1);
-
-        // Drop all senders (simulates bot task dying without LoggedOut)
-        drop(tx);
-
-        // recv returns Err when all senders dropped
-        assert!(rx.try_recv().is_err());
+    fn session_file_paths_includes_wal_and_shm() {
+        let paths = WhatsAppWebChannel::session_file_paths("/tmp/test.db");
+        assert_eq!(paths, [
+            "/tmp/test.db".to_string(),
+            "/tmp/test.db-wal".to_string(),
+            "/tmp/test.db-shm".to_string(),
+        ]);
     }
 }
