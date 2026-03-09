@@ -1,0 +1,10 @@
+id = "echo"
+version = "1.0.0"
+module_path = "examples/plugins/echo/echo.wasm"
+wit_packages = ["zeroclaw:tools@1.0.0", "zeroclaw:providers@1.0.0"]
+
+[[tools]]
+name = "echo_tool"
+description = "Return the incoming tool payload as text"
+
+providers = ["echo-provider"]
