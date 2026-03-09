@@ -177,6 +177,9 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         tts: crate::config::TtsConfig::default(),
         mcp: crate::config::McpConfig::default(),
         nodes: crate::config::NodesConfig::default(),
+        cloud_ops: crate::config::CloudOpsConfig::default(),
+        security_ops: crate::config::SecurityOpsConfig::default(),
+        conversational_ai: crate::config::ConversationalAiConfig::default(),
     };
 
     println!(
@@ -534,6 +537,9 @@ async fn run_quick_setup_with_home(
         tts: crate::config::TtsConfig::default(),
         mcp: crate::config::McpConfig::default(),
         nodes: crate::config::NodesConfig::default(),
+        cloud_ops: crate::config::CloudOpsConfig::default(),
+        security_ops: crate::config::SecurityOpsConfig::default(),
+        conversational_ai: crate::config::ConversationalAiConfig::default(),
     };
 
     config.save().await?;

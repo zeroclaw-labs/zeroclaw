@@ -255,6 +255,18 @@ pub struct Config {
     /// Dynamic node discovery configuration (`[nodes]`).
     #[serde(default)]
     pub nodes: NodesConfig,
+
+    /// Cloud operations tool configuration (`[cloud_ops]`).
+    #[serde(default)]
+    pub cloud_ops: CloudOpsConfig,
+
+    /// Managed cybersecurity service configuration (`[security_ops]`).
+    #[serde(default)]
+    pub security_ops: SecurityOpsConfig,
+
+    /// Conversational AI agent builder configuration (`[conversational_ai]`).
+    #[serde(default)]
+    pub conversational_ai: ConversationalAiConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -4148,6 +4160,255 @@ pub fn default_nostr_relays() -> Vec<String> {
     ]
 }
 
+// ── Cloud Ops ──────────────────────────────────────────────────────
+
+/// Cloud operations advisory tool configuration (`[cloud_ops]`).
+///
+/// Controls the read-only cloud transformation analysis tools:
+/// IaC review, migration assessment, cost analysis, and architecture review.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CloudOpsConfig {
+    /// Enable cloud operations tools. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Default cloud provider for analysis context. Default: "aws".
+    #[serde(default = "default_cloud_ops_cloud")]
+    pub default_cloud: String,
+    /// Supported cloud providers. Default: ["aws", "azure", "gcp"].
+    #[serde(default = "default_cloud_ops_supported_clouds")]
+    pub supported_clouds: Vec<String>,
+    /// Supported IaC tools for review. Default: ["terraform"].
+    #[serde(default = "default_cloud_ops_iac_tools")]
+    pub iac_tools: Vec<String>,
+    /// Monthly USD threshold to flag cost items. Default: 100.0.
+    #[serde(default = "default_cloud_ops_cost_threshold")]
+    pub cost_threshold_monthly_usd: f64,
+    /// Well-Architected Frameworks to check against. Default: ["aws-waf"].
+    #[serde(default = "default_cloud_ops_waf")]
+    pub well_architected_frameworks: Vec<String>,
+}
+
+impl Default for CloudOpsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_cloud: default_cloud_ops_cloud(),
+            supported_clouds: default_cloud_ops_supported_clouds(),
+            iac_tools: default_cloud_ops_iac_tools(),
+            cost_threshold_monthly_usd: default_cloud_ops_cost_threshold(),
+            well_architected_frameworks: default_cloud_ops_waf(),
+        }
+    }
+}
+
+impl CloudOpsConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.enabled {
+            if self.default_cloud.trim().is_empty() {
+                anyhow::bail!(
+                    "cloud_ops.default_cloud must not be empty when cloud_ops is enabled"
+                );
+            }
+            if self.supported_clouds.is_empty() {
+                anyhow::bail!(
+                    "cloud_ops.supported_clouds must not be empty when cloud_ops is enabled"
+                );
+            }
+            for (i, cloud) in self.supported_clouds.iter().enumerate() {
+                if cloud.trim().is_empty() {
+                    anyhow::bail!("cloud_ops.supported_clouds[{i}] must not be empty");
+                }
+            }
+            if !self.supported_clouds.contains(&self.default_cloud) {
+                anyhow::bail!(
+                    "cloud_ops.default_cloud '{}' is not in cloud_ops.supported_clouds {:?}",
+                    self.default_cloud,
+                    self.supported_clouds
+                );
+            }
+            if self.cost_threshold_monthly_usd < 0.0 {
+                anyhow::bail!(
+                    "cloud_ops.cost_threshold_monthly_usd must be non-negative, got {}",
+                    self.cost_threshold_monthly_usd
+                );
+            }
+            if self.iac_tools.is_empty() {
+                anyhow::bail!("cloud_ops.iac_tools must not be empty when cloud_ops is enabled");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn default_cloud_ops_cloud() -> String {
+    "aws".into()
+}
+
+fn default_cloud_ops_supported_clouds() -> Vec<String> {
+    vec!["aws".into(), "azure".into(), "gcp".into()]
+}
+
+fn default_cloud_ops_iac_tools() -> Vec<String> {
+    vec!["terraform".into()]
+}
+
+fn default_cloud_ops_cost_threshold() -> f64 {
+    100.0
+}
+
+fn default_cloud_ops_waf() -> Vec<String> {
+    vec!["aws-waf".into()]
+}
+
+// ── Security ops config ─────────────────────────────────────────────
+
+/// Managed Cybersecurity Service (MCSS) dashboard agent configuration (`[security_ops]`).
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SecurityOpsConfig {
+    /// Enable security operations tools.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory containing incident response playbook definitions (JSON).
+    #[serde(default = "default_playbooks_dir")]
+    pub playbooks_dir: String,
+    /// Automatically triage incoming alerts without user prompt.
+    #[serde(default)]
+    pub auto_triage: bool,
+    /// Require human approval before executing playbook actions.
+    #[serde(default = "default_true")]
+    pub require_approval_for_actions: bool,
+    /// Maximum severity level that can be auto-remediated without approval.
+    /// One of: "low", "medium", "high", "critical". Default: "low".
+    #[serde(default = "default_max_auto_severity")]
+    pub max_auto_severity: String,
+    /// Directory for generated security reports.
+    #[serde(default = "default_report_output_dir")]
+    pub report_output_dir: String,
+    /// Optional SIEM webhook URL for alert ingestion.
+    /// Treated as a secret -- encrypted at rest when secrets.encrypt is enabled.
+    #[serde(default)]
+    pub siem_integration: Option<String>,
+}
+
+impl std::fmt::Debug for SecurityOpsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecurityOpsConfig")
+            .field("enabled", &self.enabled)
+            .field("playbooks_dir", &self.playbooks_dir)
+            .field("auto_triage", &self.auto_triage)
+            .field(
+                "require_approval_for_actions",
+                &self.require_approval_for_actions,
+            )
+            .field("max_auto_severity", &self.max_auto_severity)
+            .field("report_output_dir", &self.report_output_dir)
+            .field(
+                "siem_integration_configured",
+                &self.siem_integration.is_some(),
+            )
+            .finish()
+    }
+}
+
+fn default_playbooks_dir() -> String {
+    "~/.zeroclaw/playbooks".into()
+}
+
+fn default_max_auto_severity() -> String {
+    "low".into()
+}
+
+fn default_report_output_dir() -> String {
+    "~/.zeroclaw/security-reports".into()
+}
+
+impl Default for SecurityOpsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            playbooks_dir: default_playbooks_dir(),
+            auto_triage: false,
+            require_approval_for_actions: true,
+            max_auto_severity: default_max_auto_severity(),
+            report_output_dir: default_report_output_dir(),
+            siem_integration: None,
+        }
+    }
+}
+
+// ── Conversational AI ──────────────────────────────────────────────
+
+fn default_conversational_ai_language() -> String {
+    "en".into()
+}
+
+fn default_conversational_ai_supported_languages() -> Vec<String> {
+    vec!["en".into(), "de".into(), "fr".into(), "it".into()]
+}
+
+fn default_conversational_ai_escalation_threshold() -> f64 {
+    0.3
+}
+
+fn default_conversational_ai_max_turns() -> usize {
+    50
+}
+
+fn default_conversational_ai_timeout_secs() -> u64 {
+    1800
+}
+
+/// Conversational AI agent builder configuration (`[conversational_ai]` section).
+///
+/// Controls language detection, escalation behavior, conversation limits, and
+/// analytics for conversational agent workflows. Disabled by default.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ConversationalAiConfig {
+    /// Enable conversational AI features. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Default language for conversations (BCP-47 tag). Default: "en".
+    #[serde(default = "default_conversational_ai_language")]
+    pub default_language: String,
+    /// Supported languages for conversations. Default: ["en", "de", "fr", "it"].
+    #[serde(default = "default_conversational_ai_supported_languages")]
+    pub supported_languages: Vec<String>,
+    /// Automatically detect user language from message content. Default: true.
+    #[serde(default = "default_true")]
+    pub auto_detect_language: bool,
+    /// Intent confidence below this threshold triggers escalation. Default: 0.3.
+    #[serde(default = "default_conversational_ai_escalation_threshold")]
+    pub escalation_confidence_threshold: f64,
+    /// Maximum conversation turns before auto-ending. Default: 50.
+    #[serde(default = "default_conversational_ai_max_turns")]
+    pub max_conversation_turns: usize,
+    /// Conversation timeout in seconds (inactivity). Default: 1800.
+    #[serde(default = "default_conversational_ai_timeout_secs")]
+    pub conversation_timeout_secs: u64,
+    /// Enable conversation analytics tracking. Default: false (privacy-by-default).
+    #[serde(default)]
+    pub analytics_enabled: bool,
+    /// Optional tool name for RAG-based knowledge base lookup during conversations.
+    #[serde(default)]
+    pub knowledge_base_tool: Option<String>,
+}
+
+impl Default for ConversationalAiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_language: default_conversational_ai_language(),
+            supported_languages: default_conversational_ai_supported_languages(),
+            auto_detect_language: true,
+            escalation_confidence_threshold: default_conversational_ai_escalation_threshold(),
+            max_conversation_turns: default_conversational_ai_max_turns(),
+            conversation_timeout_secs: default_conversational_ai_timeout_secs(),
+            analytics_enabled: false,
+            knowledge_base_tool: None,
+        }
+    }
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -4204,6 +4465,9 @@ impl Default for Config {
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            cloud_ops: CloudOpsConfig::default(),
+            security_ops: SecurityOpsConfig::default(),
+            conversational_ai: ConversationalAiConfig::default(),
         }
     }
 }
@@ -4936,6 +5200,12 @@ impl Config {
                 decrypt_secret(&store, token, "config.gateway.paired_tokens[]")?;
             }
 
+            decrypt_optional_secret(
+                &store,
+                &mut config.security_ops.siem_integration,
+                "config.security_ops.siem_integration",
+            )?;
+
             config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
@@ -5235,10 +5505,8 @@ impl Config {
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
 
-        // MCP servers
-        if self.mcp.enabled {
-            validate_mcp_config(&self.mcp)?;
-        }
+        // Cloud ops
+        self.cloud_ops.validate()?;
 
         Ok(())
     }
@@ -6310,6 +6578,9 @@ default_temperature = 0.7
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            cloud_ops: CloudOpsConfig::default(),
+            security_ops: SecurityOpsConfig::default(),
+            conversational_ai: ConversationalAiConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -6601,6 +6872,9 @@ tool_dispatcher = "xml"
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            cloud_ops: CloudOpsConfig::default(),
+            security_ops: SecurityOpsConfig::default(),
+            conversational_ai: ConversationalAiConfig::default(),
         };
 
         config.save().await.unwrap();

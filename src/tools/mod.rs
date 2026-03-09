@@ -18,6 +18,8 @@
 pub mod browser;
 pub mod browser_open;
 pub mod cli_discovery;
+pub mod cloud_ops;
+pub mod cloud_patterns;
 pub mod composio;
 pub mod content_search;
 pub mod cron_add;
@@ -64,6 +66,8 @@ pub mod web_search_tool;
 
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
+pub use cloud_ops::CloudOpsTool;
+pub use cloud_patterns::CloudPatternsTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -337,6 +341,12 @@ pub fn all_tools_with_runtime(
             root_config.config_path.clone(),
             root_config.secrets.encrypt,
         )));
+    }
+
+    // Cloud operations advisory tools (read-only analysis)
+    if root_config.cloud_ops.enabled {
+        tool_arcs.push(Arc::new(CloudOpsTool::new(root_config.cloud_ops.clone())));
+        tool_arcs.push(Arc::new(CloudPatternsTool::new()));
     }
 
     // PDF extraction (feature-gated at compile time via rag-pdf)
