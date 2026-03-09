@@ -293,6 +293,7 @@ pub struct LarkChannel {
     verification_token: String,
     port: Option<u16>,
     allowed_users: Vec<String>,
+    platform: LarkPlatform,
     /// Bot open_id resolved at runtime via `/bot/v3/info`.
     resolved_bot_open_id: Arc<StdRwLock<Option<String>>>,
     mention_only: bool,
@@ -321,6 +322,7 @@ impl LarkChannel {
             verification_token,
             port,
             allowed_users,
+            mention_only,
             LarkPlatform::Lark,
         )
     }
@@ -331,6 +333,7 @@ impl LarkChannel {
         verification_token: String,
         port: Option<u16>,
         allowed_users: Vec<String>,
+        mention_only: bool,
         platform: LarkPlatform,
     ) -> Self {
         Self {
@@ -339,9 +342,10 @@ impl LarkChannel {
             verification_token,
             port,
             allowed_users,
+            platform,
             resolved_bot_open_id: Arc::new(StdRwLock::new(None)),
             mention_only,
-            use_feishu: true,
+            use_feishu: matches!(platform, LarkPlatform::Feishu),
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
@@ -363,6 +367,35 @@ impl LarkChannel {
             config.port,
             config.allowed_users.clone(),
             config.mention_only,
+            platform,
+        );
+        ch.receive_mode = config.receive_mode.clone();
+        ch
+    }
+
+    pub fn from_lark_config(config: &crate::config::schema::LarkConfig) -> Self {
+        let mut ch = Self::new_with_platform(
+            config.app_id.clone(),
+            config.app_secret.clone(),
+            config.verification_token.clone().unwrap_or_default(),
+            config.port,
+            config.allowed_users.clone(),
+            config.mention_only,
+            LarkPlatform::Lark,
+        );
+        ch.receive_mode = config.receive_mode.clone();
+        ch
+    }
+
+    pub fn from_feishu_config(config: &crate::config::schema::FeishuConfig) -> Self {
+        let mut ch = Self::new_with_platform(
+            config.app_id.clone(),
+            config.app_secret.clone(),
+            config.verification_token.clone().unwrap_or_default(),
+            config.port,
+            config.allowed_users.clone(),
+            false,
+            LarkPlatform::Feishu,
         );
         ch.receive_mode = config.receive_mode.clone();
         ch
@@ -2078,6 +2111,7 @@ mod tests {
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             use_feishu: true,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
