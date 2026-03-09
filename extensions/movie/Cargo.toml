@@ -2,6 +2,7 @@
 name = "zeroclaw-movie"
 version = "0.1.0"
 edition = "2021"
+autobins = false
 authors = ["Your Name <your.email@example.com>"]
 description = "Movie showtimes query extension for ZeroClaw - supports China (Maoyan) and US (MovieGlu) cinemas"
 license = "Apache-2.0"
@@ -56,3 +57,5 @@ tokio-test = "0.4"
 [[example]]
 name = "basic_usage"
 path = "examples/basic_usage.rs"
+
+[workspace]

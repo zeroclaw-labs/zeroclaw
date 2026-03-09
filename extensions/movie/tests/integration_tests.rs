@@ -5,20 +5,19 @@ use zeroclaw_movie::{MovieShowtimesTool, MovieConfig};
 #[tokio::test]
 async fn test_tool_creation() {
     // Test creating tool without API keys (should work but APIs won't be functional)
-    let tool = MovieShowtimesTool::new(None, None, None).await;
+    let tool = MovieShowtimesTool::new(None).await;
     assert!(tool.is_ok());
 }
 
 #[tokio::test]
 async fn test_tool_parameters() {
-    let tool = MovieShowtimesTool::new(None, None, None).await.unwrap();
+    let tool = MovieShowtimesTool::new(None).await.unwrap();
     
     let params = tool.parameters();
     assert!(params.is_object());
     
     let props = params.as_object().unwrap().get("properties").unwrap();
-    assert!(props.as_object().unwrap().contains_key("city"));
-    assert!(props.as_object().unwrap().contains_key("hours_ahead"));
+    assert!(props.as_object().unwrap().contains_key("movie_name"));
 }
 
 #[test]
@@ -31,17 +30,11 @@ fn test_config_default() {
 #[test]
 fn test_config_from_env() {
     // Set test environment variables
-    std::env::set_var("MAOYAN_API_KEY", "test_key");
-    std::env::set_var("MOVIEGLU_API_KEY", "test_key");
-    std::env::set_var("MOVIEGLU_CLIENT_ID", "test_client");
+    std::env::set_var("TMDB_API_KEY", "test_key");
     
     let config = MovieConfig::from_env();
-    assert!(config.china.api_key.is_some());
     assert!(config.us.api_key.is_some());
-    assert!(config.us.client_id.is_some());
     
     // Clean up
-    std::env::remove_var("MAOYAN_API_KEY");
-    std::env::remove_var("MOVIEGLU_API_KEY");
-    std::env::remove_var("MOVIEGLU_CLIENT_ID");
+    std::env::remove_var("TMDB_API_KEY");
 }
