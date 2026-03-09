@@ -237,6 +237,11 @@ impl Provider for GigaChatProvider {
             });
         }
 
+        if messages.is_empty() {
+            tracing::error!("No messages provided");
+            return Err(super::api_error("GigaChat", response).await);
+        }
+
         // TODO: better handling - get rid of hardcoded values
         let request = ChatRequest {
             model: model.to_string(),
