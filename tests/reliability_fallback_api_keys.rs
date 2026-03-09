@@ -73,6 +73,7 @@ async fn fallback_api_keys_support_multiple_custom_endpoints() {
         fallback_api_keys,
         api_keys: Vec::new(),
         model_fallbacks: HashMap::new(),
+        provider_model_remaps: HashMap::new(),
         channel_initial_backoff_secs: 2,
         channel_max_backoff_secs: 60,
         scheduler_poll_secs: 15,

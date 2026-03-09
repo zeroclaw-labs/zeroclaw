@@ -1416,6 +1416,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                provider_retries: None,
             },
         );
         config.agents.insert(
@@ -1433,6 +1434,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                provider_retries: None,
             },
         );
 

@@ -691,7 +691,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.success, "unknown job_id must not count as a tool error");
+        assert!(
+            result.success,
+            "unknown job_id must not count as a tool error"
+        );
         assert!(
             result.output.contains("j-aabb1122ccdd3344"),
             "output must list known job IDs so LLM can self-correct: got: {}",
@@ -711,8 +714,7 @@ mod tests {
 
         assert!(result.success);
         assert!(
-            result.output.contains("bg_fake")
-                || result.output.to_lowercase().contains("not found"),
+            result.output.contains("bg_fake") || result.output.to_lowercase().contains("not found"),
             "output should mention the missing id or 'not found': got: {}",
             result.output
         );
