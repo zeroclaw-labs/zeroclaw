@@ -224,6 +224,7 @@ struct ChannelRuntimeContext {
     multimodal: crate::config::MultimodalConfig,
     hooks: Option<Arc<crate::hooks::HookRunner>>,
     non_cli_excluded_tools: Arc<Vec<String>>,
+    subagent_registry: Option<Arc<crate::agent::subagent_registry::SubagentRegistry>>,
 }
 
 #[derive(Clone)]
@@ -1549,6 +1550,18 @@ async fn process_channel_message(
         msg
     };
 
+    // Set parent context on subagent registry so spawn tools know
+    // which conversation to announce completion results back to.
+    if let Some(ref registry) = ctx.subagent_registry {
+        registry
+            .set_current_context(crate::agent::subagent_registry::ParentContext {
+                sender: msg.sender.clone(),
+                reply_target: msg.reply_target.clone(),
+                channel: msg.channel.clone(),
+            })
+            .await;
+    }
+
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
         tracing::warn!("Failed to apply runtime config update: {err}");
@@ -1699,17 +1712,27 @@ async fn process_channel_message(
         None
     };
 
+    // Skip reaction and typing indicator for subagent announce messages —
+    // these are synthetic internal messages, not user interactions.
+    let is_announce = msg.id.starts_with("subagent-announce-");
+
     // React with 👀 to acknowledge the incoming message
-    if let Some(channel) = target_channel.as_ref() {
-        if let Err(e) = channel
-            .add_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
-            .await
-        {
-            tracing::debug!("Failed to add reaction: {e}");
+    if !is_announce {
+        if let Some(channel) = target_channel.as_ref() {
+            if let Err(e) = channel
+                .add_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
+                .await
+            {
+                tracing::debug!("Failed to add reaction: {e}");
+            }
         }
     }
 
-    let typing_cancellation = target_channel.as_ref().map(|_| CancellationToken::new());
+    let typing_cancellation = if !is_announce {
+        target_channel.as_ref().map(|_| CancellationToken::new())
+    } else {
+        None
+    };
     let typing_task = match (target_channel.as_ref(), typing_cancellation.as_ref()) {
         (Some(channel), Some(token)) => Some(spawn_scoped_typing_task(
             Arc::clone(channel),
@@ -3035,6 +3058,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        disable_incremental: false,
     };
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(
@@ -3093,6 +3117,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
+
+    // Create subagent registry for background subagent management.
+    // The announce_tx will be set after the channel message bus is created.
+    let subagent_registry = Arc::new(crate::agent::subagent_registry::SubagentRegistry::new(5, 5));
+
     let tools_registry = Arc::new(tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
@@ -3107,7 +3136,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-        None,
+        Some(subagent_registry.clone()),
     ));
 
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
@@ -3194,6 +3223,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
         system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
     }
 
+    // Append custom system prompt from [agent] config if present
+    if let Some(ref custom) = config.agent.system_prompt {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(custom);
+    }
+
     if !skills.is_empty() {
         println!(
             "  🧩 Skills:   {}",
@@ -3258,6 +3293,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     // Single message bus — all channels send messages here
     let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(100);
+
+    // Wire up push-based subagent completion announcements.
+    // Completed subagents will inject synthetic messages into this bus.
+    {
+        let announce_tx = tx.clone();
+        let registry = subagent_registry.clone();
+        tokio::spawn(async move {
+            registry.set_announce_tx(announce_tx).await;
+        });
+    }
 
     // Spawn a listener for each channel
     let mut handles = Vec::new();
@@ -3325,6 +3370,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             None
         },
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
+        subagent_registry: Some(subagent_registry),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3538,6 +3584,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -3587,6 +3634,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -3639,6 +3687,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4114,6 +4163,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            subagent_registry: None,
         });
 
         process_channel_message(
@@ -4173,6 +4223,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            subagent_registry: None,
         });
 
         process_channel_message(
@@ -4246,6 +4297,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         });
 
         process_channel_message(
@@ -4305,6 +4357,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         });
 
         process_channel_message(
@@ -4373,6 +4426,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         });
 
         process_channel_message(
@@ -4462,6 +4516,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         });
 
         process_channel_message(
@@ -4533,6 +4588,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         });
 
         process_channel_message(
@@ -4619,6 +4675,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         });
 
         process_channel_message(
@@ -4690,6 +4747,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         });
 
         process_channel_message(
@@ -4750,6 +4808,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         });
 
         process_channel_message(
@@ -4921,6 +4980,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -5001,6 +5061,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5093,6 +5154,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5167,6 +5229,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         });
 
         process_channel_message(
@@ -5226,6 +5289,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         });
 
         process_channel_message(
@@ -5742,6 +5806,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         });
 
         process_channel_message(
@@ -5827,6 +5892,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         });
 
         process_channel_message(
@@ -5912,6 +5978,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         });
 
         process_channel_message(
@@ -6461,6 +6528,7 @@ This is an example JSON object for profile settings."#;
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -6527,6 +6595,7 @@ This is an example JSON object for profile settings."#;
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            subagent_registry: None,
         });
 
         process_channel_message(

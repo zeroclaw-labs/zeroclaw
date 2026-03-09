@@ -7,8 +7,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Maximum shell command execution time before kill.
+/// Default shell command execution timeout before kill.
 const SHELL_TIMEOUT_SECS: u64 = 60;
+/// Maximum allowed per-command timeout.
+const SHELL_TIMEOUT_MAX_SECS: u64 = 3_600;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Environment variables safe to pass to shell commands.
@@ -79,6 +81,12 @@ impl Tool for ShellTool {
                     "type": "boolean",
                     "description": "Set true to explicitly approve medium/high-risk commands in supervised mode",
                     "default": false
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 3600,
+                    "description": "Optional command timeout in seconds (default: 60)"
                 }
             },
             "required": ["command"]
@@ -94,6 +102,31 @@ impl Tool for ShellTool {
             .get("approved")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let timeout_seconds = match args.get("timeout_seconds") {
+            Some(raw) => {
+                let parsed = raw
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("'timeout_seconds' must be an integer"))?;
+                if parsed == 0 {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some("'timeout_seconds' must be at least 1".into()),
+                    });
+                }
+                if parsed > SHELL_TIMEOUT_MAX_SECS {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "'timeout_seconds' must be <= {SHELL_TIMEOUT_MAX_SECS}"
+                        )),
+                    });
+                }
+                parsed
+            }
+            None => SHELL_TIMEOUT_SECS,
+        };
 
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
@@ -154,8 +187,7 @@ impl Tool for ShellTool {
             }
         }
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
+        let result = tokio::time::timeout(Duration::from_secs(timeout_seconds), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -191,7 +223,7 @@ impl Tool for ShellTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Command timed out after {SHELL_TIMEOUT_SECS}s and was killed"
+                    "Command timed out after {timeout_seconds}s and was killed"
                 )),
             }),
         }
@@ -238,6 +270,7 @@ mod tests {
             .expect("schema required field should be an array")
             .contains(&json!("command")));
         assert!(schema["properties"]["approved"].is_object());
+        assert!(schema["properties"]["timeout_seconds"].is_object());
     }
 
     #[tokio::test]
@@ -552,6 +585,42 @@ mod tests {
     #[test]
     fn shell_timeout_constant_is_reasonable() {
         assert_eq!(SHELL_TIMEOUT_SECS, 60, "shell timeout must be 60 seconds");
+        assert!(
+            SHELL_TIMEOUT_MAX_SECS >= SHELL_TIMEOUT_SECS,
+            "max timeout must be >= default timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_rejects_zero_timeout_seconds() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime());
+        let result = tool
+            .execute(json!({"command": "echo hi", "timeout_seconds": 0}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("at least 1"));
+    }
+
+    #[tokio::test]
+    async fn shell_honors_custom_timeout_seconds() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["sleep".into()],
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+        let result = tool
+            .execute(json!({"command": "sleep 2", "timeout_seconds": 1}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let error_text = result.error.as_deref().unwrap_or("").to_string();
+        assert!(
+            error_text.contains("timed out after 1s"),
+            "unexpected shell timeout error: {error_text}"
+        );
     }
 
     #[test]

@@ -1281,6 +1281,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                run_timeout_seconds: 0,
             },
         );
         config.agents.insert(
@@ -1295,6 +1296,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                run_timeout_seconds: 0,
             },
         );
 

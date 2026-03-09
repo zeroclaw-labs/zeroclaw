@@ -676,6 +676,9 @@ pub struct ProviderRuntimeOptions {
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
+    /// When `true`, the OpenAI Codex provider skips incremental sends
+    /// (`previous_response_id`) to avoid cross-session race conditions.
+    pub disable_incremental: bool,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -686,6 +689,7 @@ impl Default for ProviderRuntimeOptions {
             zeroclaw_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: None,
+            disable_incremental: false,
         }
     }
 }
@@ -917,9 +921,17 @@ pub fn create_provider_with_options(
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     match name {
-        "openai-codex" | "openai_codex" | "codex" => Ok(Box::new(
-            openai_codex::OpenAiCodexProvider::new(options, api_key)?,
-        )),
+        "openai-codex" | "openai_codex" | "codex" => {
+            if options.disable_incremental {
+                Ok(Box::new(
+                    openai_codex::OpenAiCodexProvider::new_non_incremental(options, api_key)?,
+                ))
+            } else {
+                Ok(Box::new(openai_codex::OpenAiCodexProvider::new(
+                    options, api_key,
+                )?))
+            }
+        }
         _ => create_provider_with_url_and_options(name, api_key, None, options),
     }
 }
@@ -962,10 +974,17 @@ fn create_provider_with_url_and_options(
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string)
                 .or_else(|| options.provider_api_url.clone());
-            Ok(Box::new(openai_codex::OpenAiCodexProvider::new(
-                &codex_options,
-                key,
-            )?))
+            if codex_options.disable_incremental {
+                Ok(Box::new(openai_codex::OpenAiCodexProvider::new_non_incremental(
+                    &codex_options,
+                    key,
+                )?))
+            } else {
+                Ok(Box::new(openai_codex::OpenAiCodexProvider::new(
+                    &codex_options,
+                    key,
+                )?))
+            }
         }
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),

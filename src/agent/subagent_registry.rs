@@ -1,3 +1,4 @@
+use crate::channels::traits::ChannelMessage;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -8,6 +9,15 @@ pub enum SubagentOutcome {
     Success,
     Error(String),
     Cancelled,
+}
+
+/// Context of the parent conversation that spawned the subagent,
+/// used for push-based completion announcements.
+#[derive(Debug, Clone)]
+pub struct ParentContext {
+    pub sender: String,
+    pub reply_target: String,
+    pub channel: String,
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +31,7 @@ pub struct SubagentRunRecord {
     pub outcome: Option<SubagentOutcome>,
     pub result_text: Option<String>,
     pub cancellation_token: CancellationToken,
+    pub parent_context: Option<ParentContext>,
 }
 
 #[derive(Clone)]
@@ -28,6 +39,13 @@ pub struct SubagentRegistry {
     records: Arc<Mutex<HashMap<String, SubagentRunRecord>>>,
     max_concurrent: usize,
     max_depth: usize,
+    /// Channel message sender for push-based completion announcements.
+    /// When set, completed subagents automatically inject a synthetic message
+    /// into the parent conversation's channel message queue.
+    announce_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
+    /// Current parent context, set by the channel message processor before
+    /// each tool loop. Spawn tools read this to populate parent_context on records.
+    current_context: Arc<Mutex<Option<ParentContext>>>,
 }
 
 impl SubagentRegistry {
@@ -36,11 +54,28 @@ impl SubagentRegistry {
             records: Arc::new(Mutex::new(HashMap::new())),
             max_concurrent,
             max_depth,
+            announce_tx: Arc::new(Mutex::new(None)),
+            current_context: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn default() -> Self {
         Self::new(5, 1)
+    }
+
+    /// Set the channel message sender for push-based completion announcements.
+    pub async fn set_announce_tx(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) {
+        *self.announce_tx.lock().await = Some(tx);
+    }
+
+    /// Set the current parent context (called before each tool loop).
+    pub async fn set_current_context(&self, ctx: ParentContext) {
+        *self.current_context.lock().await = Some(ctx);
+    }
+
+    /// Get the current parent context for spawn tools to use.
+    pub async fn current_context(&self) -> Option<ParentContext> {
+        self.current_context.lock().await.clone()
     }
 
     pub async fn active_count(&self) -> usize {
@@ -67,11 +102,75 @@ impl SubagentRegistry {
         outcome: SubagentOutcome,
         result_text: Option<String>,
     ) {
-        let mut records = self.records.lock().await;
-        if let Some(record) = records.get_mut(run_id) {
-            record.ended_at = Some(std::time::Instant::now());
-            record.outcome = Some(outcome);
-            record.result_text = result_text;
+        let parent_ctx;
+        let label;
+        let task;
+        let status_str;
+        {
+            let mut records = self.records.lock().await;
+            if let Some(record) = records.get_mut(run_id) {
+                record.ended_at = Some(std::time::Instant::now());
+                record.outcome = Some(outcome.clone());
+                record.result_text = result_text.clone();
+                parent_ctx = record.parent_context.clone();
+                label = record.label.clone();
+                task = record.task.clone();
+            } else {
+                return;
+            }
+        }
+
+        status_str = match &outcome {
+            SubagentOutcome::Success => "completed",
+            SubagentOutcome::Error(_) => "error",
+            SubagentOutcome::Cancelled => "cancelled",
+        };
+
+        // Push-based announce: send synthetic message to parent conversation
+        if let Some(ref ctx) = parent_ctx {
+            let tx_guard = self.announce_tx.lock().await;
+            if let Some(ref tx) = *tx_guard {
+                let agent_label = label.as_deref().unwrap_or("subagent");
+                let result_summary = result_text.as_deref().unwrap_or("(no output)");
+                // Truncate long results to avoid flooding the conversation
+                let truncated = if result_summary.len() > 2000 {
+                    format!("{}...(truncated)", &result_summary[..2000])
+                } else {
+                    result_summary.to_string()
+                };
+
+                let announce_content = format!(
+                    "[Subagent {status_str}] agent={agent_label} run_id={run_id}\n\n{truncated}"
+                );
+
+                let msg = ChannelMessage {
+                    id: format!("subagent-announce-{run_id}"),
+                    sender: ctx.sender.clone(),
+                    reply_target: ctx.reply_target.clone(),
+                    content: announce_content,
+                    channel: ctx.channel.clone(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    thread_ts: None,
+                };
+
+                if let Err(e) = tx.try_send(msg) {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        error = %e,
+                        "Failed to send subagent completion announce"
+                    );
+                } else {
+                    tracing::info!(
+                        run_id = %run_id,
+                        agent = %agent_label,
+                        status = %status_str,
+                        "Subagent completion announced to parent"
+                    );
+                }
+            }
         }
     }
 
@@ -122,6 +221,7 @@ mod tests {
             outcome: None,
             result_text: None,
             cancellation_token: CancellationToken::new(),
+            parent_context: None,
         };
         registry.register(record).await;
         assert_eq!(registry.active_count().await, 1);
@@ -144,16 +244,13 @@ mod tests {
             outcome: None,
             result_text: None,
             cancellation_token: CancellationToken::new(),
+            parent_context: None,
         };
         registry.register(record).await;
         assert_eq!(registry.active_count().await, 1);
 
         registry
-            .complete(
-                "test-2",
-                SubagentOutcome::Success,
-                Some("done".to_string()),
-            )
+            .complete("test-2", SubagentOutcome::Success, Some("done".to_string()))
             .await;
         assert_eq!(registry.active_count().await, 0);
 
@@ -176,6 +273,7 @@ mod tests {
             outcome: None,
             result_text: None,
             cancellation_token: CancellationToken::new(),
+            parent_context: None,
         };
         registry.register(record).await;
         assert!(!registry.can_spawn().await);
@@ -196,6 +294,7 @@ mod tests {
             outcome: None,
             result_text: None,
             cancellation_token: token,
+            parent_context: None,
         };
         registry.register(record).await;
         assert!(registry.cancel("test-4").await);
@@ -215,6 +314,7 @@ mod tests {
             outcome: None,
             result_text: None,
             cancellation_token: CancellationToken::new(),
+            parent_context: None,
         };
         registry.register(record).await;
         registry
@@ -237,6 +337,7 @@ mod tests {
                 outcome: None,
                 result_text: None,
                 cancellation_token: CancellationToken::new(),
+                parent_context: None,
             };
             registry.register(record).await;
         }

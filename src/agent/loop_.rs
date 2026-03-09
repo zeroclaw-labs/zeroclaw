@@ -1950,16 +1950,42 @@ async fn execute_one_tool(
         });
     };
 
+    tracing::info!(tool = %call_name, "Executing tool");
     let tool_future = tool.execute(call_arguments);
+    const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
     let tool_result = if let Some(token) = cancellation_token {
         tokio::select! {
             () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-            result = tool_future => result,
+            result = tokio::time::timeout(TOOL_TIMEOUT, tool_future) => match result {
+                Ok(r) => r,
+                Err(_) => {
+                    tracing::warn!(tool = %call_name, timeout_secs = TOOL_TIMEOUT.as_secs(), "Tool execution timed out");
+                    Ok(crate::tools::ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Tool '{call_name}' timed out after {}s", TOOL_TIMEOUT.as_secs())),
+                    })
+                }
+            },
         }
     } else {
-        tool_future.await
+        match tokio::time::timeout(TOOL_TIMEOUT, tool_future).await {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!(tool = %call_name, timeout_secs = TOOL_TIMEOUT.as_secs(), "Tool execution timed out");
+                Ok(crate::tools::ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Tool '{call_name}' timed out after {}s",
+                        TOOL_TIMEOUT.as_secs()
+                    )),
+                })
+            }
+        }
     };
 
+    tracing::info!(tool = %call_name, duration_ms = start.elapsed().as_millis() as u64, "Tool execution finished");
     match tool_result {
         Ok(r) => {
             let duration = start.elapsed();
@@ -2670,13 +2696,27 @@ pub(crate) async fn run_tool_call_loop(
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
+        const MAX_TOOL_OUTPUT_CHARS: usize = 16_000;
         for entry in ordered_results {
             if let Some((tool_name, tool_call_id, outcome)) = entry {
-                individual_results.push((tool_call_id, outcome.output.clone()));
+                let output = if outcome.output.len() > MAX_TOOL_OUTPUT_CHARS {
+                    let mut end = MAX_TOOL_OUTPUT_CHARS;
+                    while end > 0 && !outcome.output.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!(
+                        "{}\n\n... [truncated, {} chars total]",
+                        &outcome.output[..end],
+                        outcome.output.len()
+                    )
+                } else {
+                    outcome.output.clone()
+                };
+                individual_results.push((tool_call_id, output.clone()));
                 let _ = writeln!(
                     tool_results,
                     "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                    tool_name, outcome.output
+                    tool_name, output
                 );
             }
         }
@@ -2851,6 +2891,7 @@ pub async fn run(
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        disable_incremental: false,
     };
 
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
@@ -3018,6 +3059,12 @@ pub async fn run(
     // Append structured tool-use instructions with schemas (only for non-native providers)
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    }
+
+    // Append custom system prompt from [agent] config if present
+    if let Some(ref custom) = config.agent.system_prompt {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(custom);
     }
 
     // ── Approval manager (supervised mode) ───────────────────────
@@ -3312,6 +3359,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        disable_incremental: false,
     };
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,

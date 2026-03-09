@@ -322,7 +322,7 @@ pub fn all_tools_with_runtime(
     }
 
     // Add subagent tools when a registry is provided
-    if let Some(registry) = subagent_registry {
+    if let Some(ref registry) = subagent_registry {
         let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
             auth_profile_override: None,
             provider_api_url: root_config.api_url.clone(),
@@ -332,6 +332,7 @@ pub fn all_tools_with_runtime(
                 .map(std::path::PathBuf::from),
             secrets_encrypt: root_config.secrets.encrypt,
             reasoning_enabled: root_config.runtime.reasoning_enabled,
+            disable_incremental: false,
         };
         let fallback_cred = fallback_api_key.and_then(|v| {
             let trimmed = v.trim();
@@ -341,13 +342,24 @@ pub fn all_tools_with_runtime(
             .default_provider
             .clone()
             .unwrap_or_else(|| "openrouter".to_string());
-        tool_arcs.push(Arc::new(SubagentSpawnTool::new(
-            registry.clone(),
-            provider_runtime_options,
-            fallback_cred,
-            default_provider,
-        )));
-        tool_arcs.push(Arc::new(SubagentsTool::new(registry)));
+        let agents_map: Arc<HashMap<String, DelegateAgentConfig>> = Arc::new(
+            agents
+                .iter()
+                .map(|(name, cfg)| (name.clone(), cfg.clone()))
+                .collect(),
+        );
+        tool_arcs.push(Arc::new(
+            SubagentSpawnTool::new(
+                registry.clone(),
+                provider_runtime_options,
+                fallback_cred,
+                default_provider,
+            )
+            .with_agents(agents_map)
+            .with_parent_tools(Arc::new(tool_arcs.clone()))
+            .with_multimodal_config(root_config.multimodal.clone()),
+        ));
+        tool_arcs.push(Arc::new(SubagentsTool::new(registry.clone())));
     }
 
     // Add delegation tool when agents are configured
@@ -374,10 +386,16 @@ pub fn all_tools_with_runtime(
                     .map(std::path::PathBuf::from),
                 secrets_encrypt: root_config.secrets.encrypt,
                 reasoning_enabled: root_config.runtime.reasoning_enabled,
+                disable_incremental: false,
             },
         )
         .with_parent_tools(parent_tools)
         .with_multimodal_config(root_config.multimodal.clone());
+        let delegate_tool = if let Some(ref registry) = subagent_registry {
+            delegate_tool.with_subagent_registry(registry.clone())
+        } else {
+            delegate_tool
+        };
         tool_arcs.push(Arc::new(delegate_tool));
     }
 
@@ -614,6 +632,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                run_timeout_seconds: 0,
             },
         );
 

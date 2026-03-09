@@ -266,6 +266,11 @@ pub struct DelegateAgentConfig {
     /// Maximum tool-call iterations in agentic mode.
     #[serde(default = "default_max_tool_iterations")]
     pub max_iterations: usize,
+    /// Default run timeout for `sessions_spawn` runs of this agent.
+    ///
+    /// `0` disables timeout.
+    #[serde(default = "default_subagent_run_timeout_seconds")]
+    pub run_timeout_seconds: u64,
 }
 
 fn default_max_depth() -> u32 {
@@ -274,6 +279,10 @@ fn default_max_depth() -> u32 {
 
 fn default_max_tool_iterations() -> usize {
     10
+}
+
+fn default_subagent_run_timeout_seconds() -> u64 {
+    0
 }
 
 // ── Hardware Config (wizard-driven) ─────────────────────────────
@@ -411,6 +420,9 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Optional custom system prompt appended after the default system prompt.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -433,6 +445,7 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            system_prompt: None,
         }
     }
 }
@@ -5392,6 +5405,7 @@ tool_dispatcher = "xml"
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                run_timeout_seconds: 0,
             },
         );
 

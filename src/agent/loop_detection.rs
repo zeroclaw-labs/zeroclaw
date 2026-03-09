@@ -1,5 +1,5 @@
-use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 
 /// Sliding-window tool loop detector.

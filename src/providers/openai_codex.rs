@@ -2,8 +2,8 @@ use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::auth::AuthService;
 use crate::multimodal;
 use crate::providers::traits::{
-    ChatMessage, ChatRequest, ChatResponse, Provider, ProviderCapabilities, ToolCall,
-    ToolsPayload, TokenUsage,
+    ChatMessage, ChatRequest, ChatResponse, Provider, ProviderCapabilities, TokenUsage, ToolCall,
+    ToolsPayload,
 };
 use crate::providers::ProviderRuntimeOptions;
 use async_trait::async_trait;
@@ -19,6 +19,8 @@ struct CodexResponse {
     text: String,
     tool_calls: Vec<ToolCall>,
     usage: Option<TokenUsage>,
+    /// The server-assigned response ID, used for `previous_response_id` incremental sends.
+    response_id: Option<String>,
 }
 
 const DEFAULT_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -49,14 +51,17 @@ impl Transport {
 }
 
 /// Type alias for the WebSocket stream to avoid long generic signatures.
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Manages a persistent WebSocket connection to the OpenAI Responses API.
+/// Maximum age of a WebSocket connection before forcing a reconnect (5 minutes).
+const WS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+
 struct WsConnectionManager {
     conn: tokio::sync::Mutex<Option<WsStream>>,
     url: String,
+    connected_at: tokio::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl WsConnectionManager {
@@ -64,6 +69,7 @@ impl WsConnectionManager {
         Self {
             conn: tokio::sync::Mutex::new(None),
             url,
+            connected_at: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -79,11 +85,7 @@ impl WsConnectionManager {
     }
 
     /// Establish a new WebSocket connection with auth headers.
-    async fn connect(
-        &self,
-        bearer_token: &str,
-        account_id: Option<&str>,
-    ) -> anyhow::Result<()> {
+    async fn connect(&self, bearer_token: &str, account_id: Option<&str>) -> anyhow::Result<()> {
         let ws_url = Self::to_ws_url(&self.url);
         tracing::info!(url = %ws_url, "Opening WebSocket connection to OpenAI Codex");
 
@@ -120,20 +122,33 @@ impl WsConnectionManager {
         tracing::info!("WebSocket connection established");
         let mut guard = self.conn.lock().await;
         *guard = Some(ws_stream);
+        *self.connected_at.lock().await = Some(std::time::Instant::now());
         Ok(())
     }
 
     /// Ensure the connection is alive, reconnecting with exponential backoff if needed.
+    /// Returns `true` if a new connection was established (reconnected), `false` if reused.
     async fn ensure_connected(
         &self,
         bearer_token: &str,
         account_id: Option<&str>,
-    ) -> anyhow::Result<()> {
-        // Check if we already have a connection.
+    ) -> anyhow::Result<bool> {
+        // Check if we already have a live, non-stale connection.
         {
             let guard = self.conn.lock().await;
             if guard.is_some() {
-                return Ok(());
+                let age_ok = self
+                    .connected_at
+                    .lock()
+                    .await
+                    .map_or(false, |t| t.elapsed() < WS_MAX_AGE);
+                if age_ok {
+                    return Ok(false);
+                }
+                // Connection too old — drop and reconnect.
+                tracing::info!("WebSocket connection expired, reconnecting");
+                drop(guard);
+                self.invalidate().await;
             }
         }
 
@@ -143,7 +158,7 @@ impl WsConnectionManager {
 
         for attempt in 1..=MAX_RETRIES {
             match self.connect(bearer_token, account_id).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(true),
                 Err(e) => {
                     if attempt == MAX_RETRIES {
                         return Err(anyhow::anyhow!(
@@ -201,6 +216,7 @@ impl WsConnectionManager {
         let mut fallback_text: Option<String> = None;
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut usage: Option<TokenUsage> = None;
+        let mut response_id: Option<String> = None;
 
         const MSG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
@@ -208,10 +224,7 @@ impl WsConnectionManager {
             let msg = tokio::time::timeout(MSG_TIMEOUT, ws.next())
                 .await
                 .map_err(|_| {
-                    anyhow::anyhow!(
-                        "WebSocket read timed out after {}s",
-                        MSG_TIMEOUT.as_secs()
-                    )
+                    anyhow::anyhow!("WebSocket read timed out after {}s", MSG_TIMEOUT.as_secs())
                 })?;
 
             let msg = match msg {
@@ -236,9 +249,10 @@ impl WsConnectionManager {
                     let event_type = event.get("type").and_then(Value::as_str);
 
                     if let Some(message) = extract_stream_error_message(&event) {
-                        return Err(anyhow::anyhow!(
-                            "OpenAI Codex WebSocket error: {message}"
-                        ));
+                        if message.contains("not found") && message.contains("previous_response") {
+                            return Err(anyhow::anyhow!("PREV_RESP_NOT_FOUND:{message}"));
+                        }
+                        return Err(anyhow::anyhow!("OpenAI Codex WebSocket error: {message}"));
                     }
 
                     if let Some(text) = extract_stream_event_text(&event, saw_delta) {
@@ -255,10 +269,12 @@ impl WsConnectionManager {
 
                     match event_type {
                         Some("response.completed" | "response.done") => {
-                            // Extract function_call items and usage from the completed response
+                            // Extract function_call items, usage, and response ID from the completed response
                             if let Some(response) = event.get("response") {
                                 tool_calls = extract_function_calls_from_response(response);
                                 usage = extract_usage_from_response(response);
+                                response_id =
+                                    response.get("id").and_then(Value::as_str).map(String::from);
                             }
                             break;
                         }
@@ -290,13 +306,19 @@ impl WsConnectionManager {
             fallback_text.unwrap_or_default()
         };
 
-        Ok(CodexResponse { text, tool_calls, usage })
+        Ok(CodexResponse {
+            text,
+            tool_calls,
+            usage,
+            response_id,
+        })
     }
 
     /// Discard the current connection so the next call reconnects.
     async fn invalidate(&self) {
         let mut guard = self.conn.lock().await;
         *guard = None;
+        *self.connected_at.lock().await = None;
     }
 }
 
@@ -321,9 +343,18 @@ pub struct OpenAiCodexProvider {
     ws_manager: WsConnectionManager,
     /// Transport mode (Auto/WebSocket/Sse).
     transport: Transport,
+    /// Tracks the last response ID for incremental (delta-only) sends.
+    /// Shared across both WS and SSE transport paths.
+    previous_response_id: tokio::sync::Mutex<Option<String>>,
+    /// Number of input items sent in the last request, used to compute
+    /// the delta for incremental sends.
+    last_input_count: tokio::sync::Mutex<usize>,
+    /// When `false`, always sends full context (never uses `previous_response_id`).
+    /// Subagents set this to `false` to avoid cross-session race conditions.
+    incremental_enabled: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ResponsesRequest {
     model: String,
     input: Vec<serde_json::Value>,
@@ -339,14 +370,16 @@ struct ResponsesRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ResponsesTextOptions {
     verbosity: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ResponsesReasoningOptions {
     effort: String,
     summary: String,
@@ -404,7 +437,22 @@ impl OpenAiCodexProvider {
             on_delta: std::sync::Mutex::new(None),
             ws_manager,
             transport,
+            previous_response_id: tokio::sync::Mutex::new(None),
+            last_input_count: tokio::sync::Mutex::new(0),
+            incremental_enabled: true,
         })
+    }
+
+    /// Create a provider that never uses incremental sends (`previous_response_id`).
+    /// Each request sends the full conversation context, avoiding cross-session
+    /// race conditions when multiple agents share the same OpenAI account.
+    pub fn new_non_incremental(
+        options: &ProviderRuntimeOptions,
+        gateway_api_key: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let mut provider = Self::new(options, gateway_api_key)?;
+        provider.incremental_enabled = false;
+        Ok(provider)
     }
 }
 
@@ -546,7 +594,8 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<serde_json::V
             "assistant" => {
                 // Check if this is a native tool call history message (JSON with tool_calls)
                 if let Ok(parsed) = serde_json::from_str::<Value>(&msg.content) {
-                    if let Some(tool_calls_arr) = parsed.get("tool_calls").and_then(Value::as_array) {
+                    if let Some(tool_calls_arr) = parsed.get("tool_calls").and_then(Value::as_array)
+                    {
                         // Emit assistant text as output_text if present
                         if let Some(text) = parsed.get("content").and_then(Value::as_str) {
                             if !text.is_empty() {
@@ -561,7 +610,8 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<serde_json::V
                         for tc in tool_calls_arr {
                             let call_id = tc.get("id").and_then(Value::as_str).unwrap_or_default();
                             let name = tc.get("name").and_then(Value::as_str).unwrap_or_default();
-                            let arguments = tc.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+                            let arguments =
+                                tc.get("arguments").and_then(Value::as_str).unwrap_or("{}");
                             input.push(serde_json::json!({
                                 "type": "function_call",
                                 "call_id": call_id,
@@ -582,7 +632,10 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<serde_json::V
             "tool" => {
                 // Tool result message: parse JSON with tool_call_id and content
                 if let Ok(parsed) = serde_json::from_str::<Value>(&msg.content) {
-                    let call_id = parsed.get("tool_call_id").and_then(Value::as_str).unwrap_or_default();
+                    let call_id = parsed
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
                     let output = parsed.get("content").and_then(Value::as_str).unwrap_or("");
                     input.push(serde_json::json!({
                         "type": "function_call_output",
@@ -615,7 +668,9 @@ fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
             _ => "high".to_string(),
         };
     }
-    if (id.starts_with("gpt-5.2") || id.starts_with("gpt-5.3") || id.starts_with("gpt-5.4")) && effort == "minimal" {
+    if (id.starts_with("gpt-5.2") || id.starts_with("gpt-5.3") || id.starts_with("gpt-5.4"))
+        && effort == "minimal"
+    {
         return "low".to_string();
     }
     if id.starts_with("gpt-5-codex") && effort == "xhigh" {
@@ -828,7 +883,13 @@ async fn decode_responses_body(
 
     while let Some(chunk) = tokio::time::timeout(CHUNK_TIMEOUT, response.chunk())
         .await
-        .map_err(|_| anyhow::anyhow!("OpenAI Codex SSE chunk read timed out after {}s", CHUNK_TIMEOUT.as_secs()))?? {
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "OpenAI Codex SSE chunk read timed out after {}s",
+                CHUNK_TIMEOUT.as_secs()
+            )
+        })??
+    {
         let chunk_str = String::from_utf8_lossy(&chunk);
 
         // Detect whether this is an SSE stream on the first chunk.
@@ -874,20 +935,35 @@ async fn decode_responses_body(
         )?;
     }
 
-    let (tool_calls, usage) = completed_response
+    let (tool_calls, usage, response_id) = completed_response
         .as_ref()
-        .map(|r| (extract_function_calls_from_response(r), extract_usage_from_response(r)))
+        .map(|r| {
+            let tc = extract_function_calls_from_response(r);
+            let u = extract_usage_from_response(r);
+            let rid = r.get("id").and_then(Value::as_str).map(String::from);
+            (tc, u, rid)
+        })
         .unwrap_or_default();
 
     if is_sse {
         if saw_delta {
             let text = nonempty_preserve(Some(&delta_accumulator))
                 .ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex (empty delta)"))?;
-            return Ok(CodexResponse { text, tool_calls, usage });
+            return Ok(CodexResponse {
+                text,
+                tool_calls,
+                usage,
+                response_id,
+            });
         }
-        let text = fallback_text
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex stream"))?;
-        return Ok(CodexResponse { text, tool_calls, usage });
+        let text =
+            fallback_text.ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex stream"))?;
+        return Ok(CodexResponse {
+            text,
+            tool_calls,
+            usage,
+            response_id,
+        });
     }
 
     // ── Non-SSE JSON fallback ────────────────────────────────────
@@ -897,8 +973,14 @@ async fn decode_responses_body(
             super::sanitize_api_error(&json_buf)
         )
     })?;
-    let text = extract_responses_text(&parsed).ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex"))?;
-    Ok(CodexResponse { text, tool_calls, usage })
+    let text = extract_responses_text(&parsed)
+        .ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex"))?;
+    Ok(CodexResponse {
+        text,
+        tool_calls,
+        usage,
+        response_id: None,
+    })
 }
 
 /// Process a single SSE event block (the text between `\n\n` boundaries).
@@ -927,7 +1009,14 @@ fn process_sse_block(
 
     // Try parsing as a single JSON object first.
     if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
-        return process_sse_event(event, saw_delta, delta_accumulator, fallback_text, delta_tx, completed_response);
+        return process_sse_event(
+            event,
+            saw_delta,
+            delta_accumulator,
+            fallback_text,
+            delta_tx,
+            completed_response,
+        );
     }
 
     // Fall back to per-line parsing.
@@ -937,7 +1026,14 @@ fn process_sse_block(
             continue;
         }
         if let Ok(event) = serde_json::from_str::<Value>(line) {
-            process_sse_event(event, saw_delta, delta_accumulator, fallback_text, delta_tx, completed_response)?;
+            process_sse_event(
+                event,
+                saw_delta,
+                delta_accumulator,
+                fallback_text,
+                delta_tx,
+                completed_response,
+            )?;
         }
     }
 
@@ -989,13 +1085,27 @@ fn extract_function_calls_from_response(response: &Value) -> Vec<ToolCall> {
     for item in output {
         let item_type = item.get("type").and_then(Value::as_str);
         if item_type == Some("function_call") {
-            let id = item.get("call_id").and_then(Value::as_str)
+            let id = item
+                .get("call_id")
+                .and_then(Value::as_str)
                 .or_else(|| item.get("id").and_then(Value::as_str))
                 .unwrap_or_default()
                 .to_string();
-            let name = item.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
-            let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("{}").to_string();
-            tool_calls.push(ToolCall { id, name, arguments });
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let arguments = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}")
+                .to_string();
+            tool_calls.push(ToolCall {
+                id,
+                name,
+                arguments,
+            });
         }
     }
     tool_calls
@@ -1080,10 +1190,56 @@ impl OpenAiCodexProvider {
         };
         let normalized_model = normalize_model_id(model);
 
+        // ── Incremental send logic (previous_response_id) ────────
+        // If we have a previous response ID and the input has grown,
+        // only send the new tool result items instead of the full context.
+        // Keep a clone of full input for SSE fallback (SSE does not support previous_response_id).
+        let input_clone = input.clone();
+        let full_input_count = input.len();
+        let prev_rid = self.previous_response_id.lock().await.clone();
+        let last_count = *self.last_input_count.lock().await;
+
+        let (effective_input, effective_prev_id) = if self.incremental_enabled {
+            if let Some(ref rid) = prev_rid {
+                if last_count > 0 && input.len() > last_count {
+                    // Extract only the new items (tool results) since last request
+                    let new_items: Vec<serde_json::Value> = input[last_count..]
+                        .iter()
+                        .filter(|item| {
+                            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                        })
+                        .cloned()
+                        .collect();
+
+                    if new_items.is_empty() {
+                        // No tool results in new items — new conversation turn, send full context
+                        tracing::info!("No tool results in new items, sending full context");
+                        (input, None)
+                    } else {
+                        tracing::info!(
+                            previous_response_id = %rid,
+                            full_input_count = input.len(),
+                            incremental_count = new_items.len(),
+                            "Using incremental send with previous_response_id"
+                        );
+                        (new_items, Some(rid.clone()))
+                    }
+                } else {
+                    // No growth or first request — send full context
+                    (input, None)
+                }
+            } else {
+                (input, None)
+            }
+        } else {
+            // Incremental disabled — always send full context
+            (input, None)
+        };
+
         let has_tools = tools.as_ref().map_or(false, |t| !t.is_empty());
         let request = ResponsesRequest {
             model: normalized_model.to_string(),
-            input,
+            input: effective_input,
             instructions,
             store: false,
             stream: true,
@@ -1096,8 +1252,13 @@ impl OpenAiCodexProvider {
             },
             include: vec!["reasoning.encrypted_content".to_string()],
             tools,
-            tool_choice: if has_tools { Some("auto".to_string()) } else { None },
+            tool_choice: if has_tools {
+                Some("auto".to_string())
+            } else {
+                None
+            },
             parallel_tool_calls: if has_tools { Some(true) } else { None },
+            previous_response_id: effective_prev_id,
         };
 
         let bearer_token = if use_gateway_api_key_auth {
@@ -1116,12 +1277,25 @@ impl OpenAiCodexProvider {
         };
 
         if use_ws {
-            let request_value = serde_json::to_value(&request)?;
-
             let ws_result = async {
-                self.ws_manager
+                let reconnected = self.ws_manager
                     .ensure_connected(bearer_token, account_id.as_deref())
                     .await?;
+
+                // If we reconnected, the new WS session doesn't know old response IDs.
+                // Clear incremental state and send full context.
+                let ws_request = if reconnected && request.previous_response_id.is_some() {
+                    tracing::info!("WebSocket reconnected, clearing previous_response_id and sending full context");
+                    *self.previous_response_id.lock().await = None;
+                    let full_request = ResponsesRequest {
+                        input: input_clone.clone(),
+                        previous_response_id: None,
+                        ..request.clone()
+                    };
+                    serde_json::to_value(&full_request)?
+                } else {
+                    serde_json::to_value(&request)?
+                };
 
                 tracing::info!(
                     url = %self.responses_url,
@@ -1131,36 +1305,108 @@ impl OpenAiCodexProvider {
                 );
 
                 self.ws_manager
-                    .send_and_receive(request_value, delta_tx.clone())
+                    .send_and_receive(ws_request, delta_tx.clone())
                     .await
             }
             .await;
 
             match ws_result {
                 Ok(codex_resp) => {
-                    tracing::info!(
-                        len = codex_resp.text.len(),
-                        tool_calls = codex_resp.tool_calls.len(),
-                        "WebSocket response completed"
-                    );
-                    return Ok(codex_resp);
+                    // Detect empty/broken response (no text, no tool calls, no ID)
+                    // and treat as WS error to trigger SSE fallback.
+                    if codex_resp.text.is_empty()
+                        && codex_resp.tool_calls.is_empty()
+                        && codex_resp.response_id.is_none()
+                    {
+                        if self.transport == Transport::WebSocket {
+                            return Err(anyhow::anyhow!(
+                                "WebSocket returned empty response (no text, no tool calls)"
+                            ));
+                        }
+                        tracing::warn!(
+                            "WebSocket returned empty response, invalidating connection and falling back to SSE"
+                        );
+                        self.ws_manager.invalidate().await;
+                        // Clear stale incremental state
+                        *self.previous_response_id.lock().await = None;
+                        *self.last_input_count.lock().await = 0;
+                    } else {
+                        tracing::info!(
+                            len = codex_resp.text.len(),
+                            tool_calls = codex_resp.tool_calls.len(),
+                            response_id = ?codex_resp.response_id,
+                            "WebSocket response completed"
+                        );
+                        // Update incremental state for next call
+                        if self.incremental_enabled {
+                            *self.previous_response_id.lock().await =
+                                codex_resp.response_id.clone();
+                            *self.last_input_count.lock().await = full_input_count;
+                        }
+                        return Ok(codex_resp);
+                    }
                 }
                 Err(e) => {
-                    if self.transport == Transport::WebSocket {
-                        // Strict WS mode — do not fall back.
-                        return Err(e);
+                    let err_str = e.to_string();
+                    if err_str.starts_with("PREV_RESP_NOT_FOUND:") && self.incremental_enabled {
+                        tracing::warn!("previous_response_not_found — retrying with full context");
+                        *self.previous_response_id.lock().await = None;
+                        *self.last_input_count.lock().await = 0;
+
+                        let retry_request = ResponsesRequest {
+                            input: input_clone.clone(),
+                            previous_response_id: None,
+                            ..request.clone()
+                        };
+                        let retry_payload = serde_json::to_value(&retry_request)?;
+                        match self
+                            .ws_manager
+                            .send_and_receive(retry_payload, delta_tx.clone())
+                            .await
+                        {
+                            Ok(codex_resp) => {
+                                if self.incremental_enabled {
+                                    *self.previous_response_id.lock().await =
+                                        codex_resp.response_id.clone();
+                                    *self.last_input_count.lock().await = full_input_count;
+                                }
+                                return Ok(codex_resp);
+                            }
+                            Err(retry_err) => {
+                                if self.transport == Transport::WebSocket {
+                                    return Err(retry_err);
+                                }
+                                tracing::warn!(error = %retry_err, "WS retry failed, falling back to SSE");
+                                self.ws_manager.invalidate().await;
+                            }
+                        }
+                    } else {
+                        if self.transport == Transport::WebSocket {
+                            // Strict WS mode — do not fall back.
+                            return Err(e);
+                        }
+                        // Auto mode — fall back to SSE.
+                        tracing::warn!(
+                            error = %e,
+                            "WebSocket request failed, falling back to SSE"
+                        );
+                        self.ws_manager.invalidate().await;
+                        // Clear stale incremental state before SSE fallback
+                        *self.previous_response_id.lock().await = None;
+                        *self.last_input_count.lock().await = 0;
                     }
-                    // Auto mode — fall back to SSE.
-                    tracing::warn!(
-                        error = %e,
-                        "WebSocket request failed, falling back to SSE"
-                    );
-                    self.ws_manager.invalidate().await;
                 }
             }
         }
 
         // ── SSE transport path (original) ──────────────────────────
+        // SSE endpoint does not support previous_response_id — always send full context.
+        let sse_request = ResponsesRequest {
+            input: input_clone,
+            previous_response_id: None,
+            ..request
+        };
+
         let mut request_builder = self
             .client
             .post(&self.responses_url)
@@ -1190,7 +1436,7 @@ impl OpenAiCodexProvider {
             "Sending OpenAI Codex request"
         );
 
-        let response = request_builder.json(&request).send().await?;
+        let response = request_builder.json(&sse_request).send().await?;
 
         tracing::info!(
             status = %response.status(),
@@ -1204,7 +1450,19 @@ impl OpenAiCodexProvider {
         tracing::info!(has_delta_tx = delta_tx.is_some(), "Starting SSE decode");
         let result = decode_responses_body(response, delta_tx).await;
         match &result {
-            Ok(resp) => tracing::info!(len = resp.text.len(), tool_calls = resp.tool_calls.len(), "SSE decode completed"),
+            Ok(resp) => {
+                tracing::info!(
+                    len = resp.text.len(),
+                    tool_calls = resp.tool_calls.len(),
+                    response_id = ?resp.response_id,
+                    "SSE decode completed"
+                );
+                // Update incremental state for next call
+                if self.incremental_enabled {
+                    *self.previous_response_id.lock().await = resp.response_id.clone();
+                    *self.last_input_count.lock().await = full_input_count;
+                }
+            }
             Err(e) => tracing::error!(error = %e, "SSE decode failed"),
         }
         result
@@ -1239,6 +1497,10 @@ impl Provider for OpenAiCodexProvider {
         model: &str,
         _temperature: f64,
     ) -> anyhow::Result<String> {
+        // Fresh conversation — clear incremental state
+        *self.previous_response_id.lock().await = None;
+        *self.last_input_count.lock().await = 0;
+
         // Build temporary messages array
         let mut messages = Vec::new();
         if let Some(sys) = system_prompt {
@@ -1251,7 +1513,9 @@ impl Provider for OpenAiCodexProvider {
         let prepared = crate::multimodal::prepare_messages_for_provider(&messages, &config).await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
-        let resp = self.send_responses_request(input, instructions, model, None).await?;
+        let resp = self
+            .send_responses_request(input, instructions, model, None)
+            .await?;
         Ok(resp.text)
     }
 
@@ -1261,12 +1525,18 @@ impl Provider for OpenAiCodexProvider {
         model: &str,
         _temperature: f64,
     ) -> anyhow::Result<String> {
+        // Fresh conversation — clear incremental state
+        *self.previous_response_id.lock().await = None;
+        *self.last_input_count.lock().await = 0;
+
         // Normalize image markers: convert file paths to data URIs
         let config = crate::config::MultimodalConfig::default();
         let prepared = crate::multimodal::prepare_messages_for_provider(messages, &config).await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
-        let resp = self.send_responses_request(input, instructions, model, None).await?;
+        let resp = self
+            .send_responses_request(input, instructions, model, None)
+            .await?;
         Ok(resp.text)
     }
 
@@ -1282,7 +1552,9 @@ impl Provider for OpenAiCodexProvider {
                 })
             })
             .collect();
-        ToolsPayload::OpenAI { tools: openai_tools }
+        ToolsPayload::OpenAI {
+            tools: openai_tools,
+        }
     }
 
     async fn chat(
@@ -1292,7 +1564,8 @@ impl Provider for OpenAiCodexProvider {
         _temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
         let config = crate::config::MultimodalConfig::default();
-        let prepared = crate::multimodal::prepare_messages_for_provider(request.messages, &config).await?;
+        let prepared =
+            crate::multimodal::prepare_messages_for_provider(request.messages, &config).await?;
         let (instructions, input) = build_responses_input(&prepared.messages);
 
         // Convert tool specs to OpenAI function tool definitions
@@ -1314,9 +1587,15 @@ impl Provider for OpenAiCodexProvider {
             Some(openai_tools)
         });
 
-        let resp = self.send_responses_request(input, instructions, model, tools).await?;
+        let resp = self
+            .send_responses_request(input, instructions, model, tools)
+            .await?;
 
-        let stop_reason = if resp.tool_calls.is_empty() { "stop" } else { "toolUse" };
+        let stop_reason = if resp.tool_calls.is_empty() {
+            "stop"
+        } else {
+            "toolUse"
+        };
         tracing::debug!(
             stop_reason,
             tool_calls = resp.tool_calls.len(),
@@ -1324,7 +1603,11 @@ impl Provider for OpenAiCodexProvider {
         );
 
         Ok(ChatResponse {
-            text: if resp.text.is_empty() { None } else { Some(resp.text) },
+            text: if resp.text.is_empty() {
+                None
+            } else {
+                Some(resp.text)
+            },
             tool_calls: resp.tool_calls,
             usage: resp.usage,
             reasoning_content: None,
@@ -1630,7 +1913,10 @@ data: [DONE]
 
         // First content = text
         assert_eq!(content[0]["type"], "input_text");
-        assert!(content[0]["text"].as_str().unwrap().contains("Describe this"));
+        assert!(content[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Describe this"));
 
         // Second content = image
         assert_eq!(content[1]["type"], "input_image");
@@ -1673,6 +1959,7 @@ data: [DONE]
             secrets_encrypt: false,
             auth_profile_override: None,
             reasoning_enabled: None,
+            disable_incremental: false,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");
@@ -1733,7 +2020,8 @@ data: [DONE]
     fn constructor_defaults_to_auto_transport() {
         let _guard = EnvGuard::set("ZEROCLAW_TRANSPORT", None);
         let options = ProviderRuntimeOptions::default();
-        let provider = OpenAiCodexProvider::new(&options, None).expect("provider should initialize");
+        let provider =
+            OpenAiCodexProvider::new(&options, None).expect("provider should initialize");
         assert_eq!(provider.transport, Transport::Auto);
     }
 }

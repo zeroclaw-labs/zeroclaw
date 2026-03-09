@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 const DEFAULT_AGENT_MAX_DEPTH: u32 = 3;
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 10;
+const DEFAULT_AGENT_RUN_TIMEOUT_SECS: u64 = 0;
 
 pub struct ModelRoutingConfigTool {
     config: Arc<Config>,
@@ -173,6 +174,21 @@ impl ModelRoutingConfigTool {
         Ok(MaybeSet::Set(value))
     }
 
+    fn parse_optional_u64_update(args: &Value, field: &str) -> anyhow::Result<MaybeSet<u64>> {
+        let Some(raw) = args.get(field) else {
+            return Ok(MaybeSet::Unset);
+        };
+
+        if raw.is_null() {
+            return Ok(MaybeSet::Null);
+        }
+
+        let value = raw
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("'{field}' must be a non-negative integer or null"))?;
+        Ok(MaybeSet::Set(value))
+    }
+
     fn parse_optional_i32_update(args: &Value, field: &str) -> anyhow::Result<MaybeSet<i32>> {
         let Some(raw) = args.get(field) else {
             return Ok(MaybeSet::Unset);
@@ -273,6 +289,7 @@ impl ModelRoutingConfigTool {
                     "agentic": agent.agentic,
                     "allowed_tools": agent.allowed_tools,
                     "max_iterations": agent.max_iterations,
+                    "run_timeout_seconds": agent.run_timeout_seconds,
                 }),
             );
         }
@@ -614,6 +631,8 @@ impl ModelRoutingConfigTool {
         let temperature_update = Self::parse_optional_f64_update(args, "temperature")?;
         let max_depth_update = Self::parse_optional_u32_update(args, "max_depth")?;
         let max_iterations_update = Self::parse_optional_usize_update(args, "max_iterations")?;
+        let run_timeout_seconds_update =
+            Self::parse_optional_u64_update(args, "run_timeout_seconds")?;
         let agentic_update = Self::parse_optional_bool(args, "agentic")?;
 
         let allowed_tools_update = if let Some(raw) = args.get("allowed_tools") {
@@ -638,6 +657,7 @@ impl ModelRoutingConfigTool {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: DEFAULT_AGENT_MAX_ITERATIONS,
+                run_timeout_seconds: DEFAULT_AGENT_RUN_TIMEOUT_SECS,
             });
 
         next_agent.provider = provider;
@@ -675,6 +695,12 @@ impl ModelRoutingConfigTool {
         match max_iterations_update {
             MaybeSet::Set(value) => next_agent.max_iterations = value,
             MaybeSet::Null => next_agent.max_iterations = DEFAULT_AGENT_MAX_ITERATIONS,
+            MaybeSet::Unset => {}
+        }
+
+        match run_timeout_seconds_update {
+            MaybeSet::Set(value) => next_agent.run_timeout_seconds = value,
+            MaybeSet::Null => next_agent.run_timeout_seconds = DEFAULT_AGENT_RUN_TIMEOUT_SECS,
             MaybeSet::Unset => {}
         }
 
@@ -847,6 +873,11 @@ impl Tool for ModelRoutingConfigTool {
                     "type": ["integer", "null"],
                     "minimum": 1,
                     "description": "Maximum tool-call iterations for agentic delegate mode"
+                },
+                "run_timeout_seconds": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "Default timeout for sessions_spawn runs by this agent. 0 disables timeout."
                 }
             },
             "additionalProperties": false
@@ -1040,7 +1071,8 @@ mod tests {
                 "model": "gpt-5.3-codex",
                 "agentic": true,
                 "allowed_tools": ["file_read", "file_write", "shell"],
-                "max_iterations": 6
+                "max_iterations": 6,
+                "run_timeout_seconds": 1200
             }))
             .await
             .unwrap();
@@ -1051,6 +1083,10 @@ mod tests {
         assert_eq!(output["agents"]["coder"]["provider"], json!("openai"));
         assert_eq!(output["agents"]["coder"]["model"], json!("gpt-5.3-codex"));
         assert_eq!(output["agents"]["coder"]["agentic"], json!(true));
+        assert_eq!(
+            output["agents"]["coder"]["run_timeout_seconds"],
+            json!(1200)
+        );
 
         let remove = tool
             .execute(json!({

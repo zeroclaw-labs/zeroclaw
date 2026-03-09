@@ -1,5 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::agent::loop_::run_tool_call_loop;
+use crate::agent::subagent_registry::{SubagentOutcome, SubagentRegistry, SubagentRunRecord};
 use crate::config::DelegateAgentConfig;
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
@@ -10,6 +11,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 /// Default timeout for sub-agent provider calls.
 const DELEGATE_TIMEOUT_SECS: u64 = 120;
@@ -33,6 +35,8 @@ pub struct DelegateTool {
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
+    /// Optional subagent registry for background delegation.
+    subagent_registry: Option<Arc<SubagentRegistry>>,
 }
 
 impl DelegateTool {
@@ -63,6 +67,7 @@ impl DelegateTool {
             depth: 0,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
+            subagent_registry: None,
         }
     }
 
@@ -99,6 +104,7 @@ impl DelegateTool {
             depth,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
+            subagent_registry: None,
         }
     }
 
@@ -111,6 +117,12 @@ impl DelegateTool {
     /// Attach multimodal configuration for sub-agent tool loops.
     pub fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
         self.multimodal_config = config;
+        self
+    }
+
+    /// Attach a subagent registry for background delegation support.
+    pub fn with_subagent_registry(mut self, registry: Arc<SubagentRegistry>) -> Self {
+        self.subagent_registry = Some(registry);
         self
     }
 }
@@ -153,6 +165,10 @@ impl Tool for DelegateTool {
                 "context": {
                     "type": "string",
                     "description": "Optional context to prepend (e.g. relevant code, prior findings)"
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "If true, run the sub-agent asynchronously in the background. Returns immediately with a run_id. Use the 'subagents' tool to check status and get results."
                 }
             },
             "required": ["agent", "prompt"]
@@ -274,6 +290,24 @@ impl Tool for DelegateTool {
         };
 
         let temperature = agent_config.temperature.unwrap_or(0.7);
+
+        // ── Background delegation mode ───────────────────────────────
+        let background = args
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if background {
+            return self
+                .execute_background(
+                    agent_name,
+                    agent_config,
+                    provider,
+                    &full_prompt,
+                    temperature,
+                )
+                .await;
+        }
 
         // Agentic mode: run full tool-call loop with allowlisted tools.
         if agent_config.agentic {
@@ -448,6 +482,204 @@ impl DelegateTool {
             }),
         }
     }
+
+    /// Run a sub-agent in the background via `tokio::spawn`.
+    /// Returns immediately with a `run_id` for tracking via the `subagents` tool.
+    async fn execute_background(
+        &self,
+        agent_name: &str,
+        agent_config: &DelegateAgentConfig,
+        provider: Box<dyn Provider>,
+        full_prompt: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ToolResult> {
+        let registry = match &self.subagent_registry {
+            Some(r) => r.clone(),
+            None => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(
+                        "Background delegation is not available (subagent registry not configured)"
+                            .into(),
+                    ),
+                });
+            }
+        };
+
+        if !registry.can_spawn().await {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "Maximum concurrent subagents reached. Wait for one to finish or cancel an existing subagent.".into(),
+                ),
+            });
+        }
+
+        // Build sub-tools for agentic mode
+        let sub_tools: Vec<Arc<dyn Tool>> = if agent_config.agentic {
+            let allowed = agent_config
+                .allowed_tools
+                .iter()
+                .map(|name| name.trim())
+                .filter(|name| !name.is_empty())
+                .collect::<std::collections::HashSet<_>>();
+
+            self.parent_tools
+                .iter()
+                .filter(|tool| allowed.contains(tool.name()))
+                .filter(|tool| tool.name() != "delegate")
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let cancellation_token = CancellationToken::new();
+
+        let record = SubagentRunRecord {
+            run_id: run_id.clone(),
+            task: full_prompt.to_string(),
+            label: Some(agent_name.to_string()),
+            model: agent_config.model.clone(),
+            started_at: std::time::Instant::now(),
+            ended_at: None,
+            outcome: None,
+            result_text: None,
+            cancellation_token: cancellation_token.clone(),
+            parent_context: None,
+        };
+        registry.register(record).await;
+
+        let run_id_spawn = run_id.clone();
+        let agent_name_owned = agent_name.to_string();
+        let prompt_owned = full_prompt.to_string();
+        let system_prompt = agent_config.system_prompt.clone();
+        let provider_name = agent_config.provider.clone();
+        let model_name = agent_config.model.clone();
+        let max_iterations = agent_config.max_iterations;
+        let is_agentic = agent_config.agentic;
+        let multimodal_config = self.multimodal_config.clone();
+
+        tokio::spawn(async move {
+            let run_id = run_id_spawn;
+
+            let result = if is_agentic && !sub_tools.is_empty() {
+                // Full agentic loop with tools
+                let boxed_tools: Vec<Box<dyn Tool>> = sub_tools
+                    .into_iter()
+                    .map(|t| Box::new(ToolArcRef::new(t)) as Box<dyn Tool>)
+                    .collect();
+
+                let mut history = Vec::new();
+                if let Some(ref sp) = system_prompt {
+                    history.push(ChatMessage::system(sp.clone()));
+                }
+                history.push(ChatMessage::user(prompt_owned.clone()));
+
+                let noop_observer = NoopObserver;
+
+                let agentic_result = tokio::select! {
+                    _ = cancellation_token.cancelled() => {
+                        Err("Cancelled".to_string())
+                    }
+                    res = tokio::time::timeout(
+                        Duration::from_secs(DELEGATE_AGENTIC_TIMEOUT_SECS),
+                        run_tool_call_loop(
+                            &*provider,
+                            &mut history,
+                            &boxed_tools,
+                            &noop_observer,
+                            &provider_name,
+                            &model_name,
+                            temperature,
+                            true,
+                            None,
+                            "delegate-bg",
+                            &multimodal_config,
+                            max_iterations,
+                            None,
+                            None,
+                            None,
+                            &[],
+                            None,
+                        ),
+                    ) => {
+                        match res {
+                            Ok(Ok(response)) => Ok(response),
+                            Ok(Err(e)) => Err(e.to_string()),
+                            Err(_) => Err(format!("Timed out after {DELEGATE_AGENTIC_TIMEOUT_SECS}s")),
+                        }
+                    }
+                };
+                agentic_result
+            } else {
+                // Simple single-call mode
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => {
+                        Err("Cancelled".to_string())
+                    }
+                    res = tokio::time::timeout(
+                        Duration::from_secs(DELEGATE_TIMEOUT_SECS),
+                        provider.chat_with_system(
+                            system_prompt.as_deref(),
+                            &prompt_owned,
+                            &model_name,
+                            temperature,
+                        ),
+                    ) => {
+                        match res {
+                            Ok(Ok(response)) => Ok(response),
+                            Ok(Err(e)) => Err(e.to_string()),
+                            Err(_) => Err(format!("Timed out after {DELEGATE_TIMEOUT_SECS}s")),
+                        }
+                    }
+                }
+            };
+
+            match result {
+                Ok(response) => {
+                    tracing::info!(
+                        agent = %agent_name_owned,
+                        run_id = %run_id,
+                        len = response.len(),
+                        "Background delegate completed"
+                    );
+                    registry
+                        .complete(&run_id, SubagentOutcome::Success, Some(response))
+                        .await;
+                }
+                Err(e) if e == "Cancelled" => {
+                    tracing::info!(agent = %agent_name_owned, run_id = %run_id, "Background delegate cancelled");
+                    registry
+                        .complete(&run_id, SubagentOutcome::Cancelled, None)
+                        .await;
+                }
+                Err(e) => {
+                    tracing::error!(agent = %agent_name_owned, run_id = %run_id, error = %e, "Background delegate failed");
+                    registry
+                        .complete(&run_id, SubagentOutcome::Error(e.clone()), Some(e))
+                        .await;
+                }
+            }
+        });
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({
+                "status": "accepted",
+                "run_id": run_id,
+                "agent": agent_name,
+                "model": agent_config.model,
+                "agentic": agent_config.agentic,
+                "note": "Sub-agent running in background. Use 'subagents' tool with action='list' to check status or action='result' to get the completed result."
+            })
+            .to_string(),
+            error: None,
+        })
+    }
 }
 
 struct ToolArcRef {
@@ -520,6 +752,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                run_timeout_seconds: 0,
             },
         );
         agents.insert(
@@ -534,6 +767,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                run_timeout_seconds: 0,
             },
         );
         agents
@@ -687,6 +921,7 @@ mod tests {
             agentic: true,
             allowed_tools,
             max_iterations,
+            run_timeout_seconds: 0,
         }
     }
 
@@ -795,6 +1030,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                run_timeout_seconds: 0,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -901,6 +1137,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                run_timeout_seconds: 0,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -936,6 +1173,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                run_timeout_seconds: 0,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());

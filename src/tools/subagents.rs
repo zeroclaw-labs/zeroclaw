@@ -115,8 +115,7 @@ impl SubagentsTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&entries)
-                .unwrap_or_else(|_| "[]".to_string()),
+            output: serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string()),
             error: None,
         })
     }
@@ -187,8 +186,7 @@ impl SubagentsTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&result)
-                .unwrap_or_else(|_| "{}".to_string()),
+            output: serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
             error: None,
         })
     }
@@ -220,6 +218,7 @@ mod tests {
             outcome: None,
             result_text: None,
             cancellation_token: CancellationToken::new(),
+            parent_context: None,
         };
         if let Some(ref o) = outcome {
             record.ended_at = Some(std::time::Instant::now());
@@ -258,10 +257,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_action() {
         let tool = SubagentsTool::new(test_registry());
-        let result = tool
-            .execute(json!({"action": "unknown"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"action": "unknown"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("Unknown action"));
     }
@@ -309,8 +305,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_completed() {
-        let registry =
-            registry_with_record("run-3", Some(SubagentOutcome::Success), None).await;
+        let registry = registry_with_record("run-3", Some(SubagentOutcome::Success), None).await;
         let tool = SubagentsTool::new(registry);
         let result = tool
             .execute(json!({"action": "kill", "run_id": "run-3"}))

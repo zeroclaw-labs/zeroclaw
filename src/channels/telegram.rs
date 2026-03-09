@@ -1454,17 +1454,71 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                         continue;
                     }
                 }
-                // Default: escape HTML entities
-                let ch = line[i..].chars().next().unwrap();
-                match ch {
-                    '<' => line_out.push_str("&lt;"),
-                    '>' => line_out.push_str("&gt;"),
-                    '&' => line_out.push_str("&amp;"),
-                    '"' => line_out.push_str("&quot;"),
-                    '\'' => line_out.push_str("&#39;"),
-                    _ => line_out.push(ch),
+                // Default: escape HTML entities, but pass through valid Telegram HTML tags
+                if bytes[i] == b'<' {
+                    // Check if this is a valid Telegram HTML tag — pass it through
+                    if let Some(tag_end) = line[i..].find('>') {
+                        let tag_content = &line[i + 1..i + tag_end];
+                        let tag_name = tag_content
+                            .trim_start_matches('/')
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("");
+                        let is_telegram_tag = matches!(
+                            tag_name,
+                            "b" | "strong"
+                                | "i"
+                                | "em"
+                                | "u"
+                                | "ins"
+                                | "s"
+                                | "strike"
+                                | "del"
+                                | "code"
+                                | "pre"
+                                | "a"
+                                | "blockquote"
+                                | "tg-spoiler"
+                                | "tg-emoji"
+                        );
+                        if is_telegram_tag {
+                            line_out.push_str(&line[i..i + tag_end + 1]);
+                            i += tag_end + 1;
+                            continue;
+                        }
+                    }
+                    line_out.push_str("&lt;");
+                    i += 1;
+                } else {
+                    let ch = line[i..].chars().next().unwrap();
+                    if ch == '&' {
+                        // Check if this is already an HTML entity (e.g. &amp; &lt; &gt; &#39; &#123;)
+                        if let Some(semi) = line[i..].find(';') {
+                            let candidate = &line[i..i + semi + 1];
+                            let entity_body = &candidate[1..candidate.len() - 1];
+                            let is_entity = entity_body.starts_with('#')
+                                || matches!(
+                                    entity_body,
+                                    "amp" | "lt" | "gt" | "quot" | "apos" | "nbsp"
+                                );
+                            if is_entity {
+                                line_out.push_str(candidate);
+                                i += candidate.len();
+                                continue;
+                            }
+                        }
+                        line_out.push_str("&amp;");
+                        i += 1;
+                    } else {
+                        match ch {
+                            '>' => line_out.push_str("&gt;"),
+                            '"' => line_out.push_str("&quot;"),
+                            '\'' => line_out.push_str("&#39;"),
+                            _ => line_out.push(ch),
+                        }
+                        i += ch.len_utf8();
+                    }
                 }
-                i += ch.len_utf8();
             }
             result_lines.push(line_out);
         }
@@ -1520,6 +1574,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         chat_id: &str,
         thread_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        if message.trim().is_empty() {
+            return Ok(());
+        }
         let chunks = split_message_for_telegram(message);
 
         for (index, chunk) in chunks.iter().enumerate() {
@@ -2272,6 +2329,22 @@ impl Channel for TelegramChannel {
 
         // Clean up rate-limit tracking for this chat
         self.last_draft_edit.lock().remove(&chat_id);
+
+        // If text is empty after stripping tool tags, just delete the draft
+        if text.trim().is_empty() {
+            if let Ok(id) = message_id.parse::<i64>() {
+                let _ = self
+                    .client
+                    .post(self.api_url("deleteMessage"))
+                    .json(&serde_json::json!({
+                        "chat_id": chat_id,
+                        "message_id": id,
+                    }))
+                    .send()
+                    .await;
+            }
+            return Ok(());
+        }
 
         // Parse attachments before processing
         let (text_without_markers, attachments) = parse_attachment_markers(text);

@@ -150,6 +150,7 @@ Delegate sub-agent configurations. Each key under `[agents]` defines a named sub
 | `agentic` | `false` | Enable multi-turn tool-call loop mode for the sub-agent |
 | `allowed_tools` | `[]` | Tool allowlist for agentic mode |
 | `max_iterations` | `10` | Max tool-call iterations for agentic mode |
+| `run_timeout_seconds` | `0` | Default `sessions_spawn` timeout for this agent (`0` = no timeout) |
 
 Notes:
 
@@ -166,11 +167,13 @@ max_depth = 2
 agentic = true
 allowed_tools = ["web_search", "http_request", "file_read"]
 max_iterations = 8
+run_timeout_seconds = 1200
 
 [agents.coder]
 provider = "ollama"
 model = "qwen2.5-coder:32b"
 temperature = 0.2
+run_timeout_seconds = 0
 ```
 
 ## `[runtime]`
