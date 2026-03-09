@@ -305,6 +305,7 @@ mod tests {
                 allowed_tools: Vec::new(),
                 max_iterations: 8,
                 provider_retries: None,
+                fallback_providers: vec![],
             },
         );
         agents.insert(
@@ -323,6 +324,7 @@ mod tests {
                 allowed_tools: Vec::new(),
                 max_iterations: 8,
                 provider_retries: None,
+                fallback_providers: vec![],
             },
         );
         agents

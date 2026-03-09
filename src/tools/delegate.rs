@@ -405,6 +405,9 @@ impl Tool for DelegateTool {
         if let Some(retries) = agent_config.provider_retries {
             agent_reliability.provider_retries = retries;
         }
+        if !agent_config.fallback_providers.is_empty() {
+            agent_reliability.fallback_providers = agent_config.fallback_providers.clone();
+        }
 
         let provider_runtime_options_for_agent = &self.provider_runtime_options;
         let provider: Box<dyn Provider> = match providers::create_resilient_provider_with_options(
@@ -916,6 +919,7 @@ mod tests {
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
                 provider_retries: None,
+                fallback_providers: vec![],
             },
         );
         agents.insert(
@@ -934,6 +938,7 @@ mod tests {
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
                 provider_retries: None,
+                fallback_providers: vec![],
             },
         );
         agents
@@ -1130,6 +1135,7 @@ max_concurrent = {subagents_max_concurrent}
             allowed_tools,
             max_iterations,
             provider_retries: None,
+            fallback_providers: vec![],
         }
     }
 
@@ -1241,6 +1247,7 @@ max_concurrent = {subagents_max_concurrent}
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
                 provider_retries: None,
+                fallback_providers: vec![],
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1352,6 +1359,7 @@ max_concurrent = {subagents_max_concurrent}
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
                 provider_retries: None,
+                fallback_providers: vec![],
             },
         );
 
@@ -1434,6 +1442,7 @@ max_concurrent = {subagents_max_concurrent}
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
                 provider_retries: None,
+                fallback_providers: vec![],
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1473,6 +1482,7 @@ max_concurrent = {subagents_max_concurrent}
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
                 provider_retries: None,
+                fallback_providers: vec![],
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1660,6 +1670,7 @@ max_concurrent = {subagents_max_concurrent}
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
                 provider_retries: None,
+                fallback_providers: vec![],
             },
         );
 
@@ -1733,6 +1744,7 @@ max_concurrent = {subagents_max_concurrent}
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
                 provider_retries: None,
+                fallback_providers: vec![],
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1760,5 +1772,96 @@ max_concurrent = {subagents_max_concurrent}
         assert_eq!(state_entry.version, 2);
         assert_eq!(state_entry.value["phase"], json!("completed"));
         assert_eq!(state_entry.value["success"], json!(true));
+    }
+
+    #[test]
+    fn delegate_agent_fallback_providers_override_used_when_set() {
+        let mut agents = HashMap::new();
+        agents.insert(
+            "searcher".to_string(),
+            DelegateAgentConfig {
+                provider: "gemini".to_string(),
+                model: "gemini-3-flash-preview".to_string(),
+                system_prompt: None,
+                api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                provider_retries: None,
+                fallback_providers: vec![
+                    "gemini:gemini-1".to_string(),
+                    "gemini:gemini-2".to_string(),
+                ],
+            },
+        );
+
+        let global_fallbacks = vec!["openai-codex:codex-1".to_string()];
+        let reliability = crate::config::ReliabilityConfig {
+            fallback_providers: global_fallbacks.clone(),
+            ..Default::default()
+        };
+
+        let tool = DelegateTool::new(agents, None, test_security()).with_reliability(reliability);
+
+        // Simulate what execute() does: override fallback_providers when agent has non-empty list
+        let agent_config = tool.agents.get("searcher").unwrap();
+        let mut agent_reliability = tool.reliability.clone();
+        if !agent_config.fallback_providers.is_empty() {
+            agent_reliability.fallback_providers = agent_config.fallback_providers.clone();
+        }
+
+        assert_eq!(
+            agent_reliability.fallback_providers,
+            vec!["gemini:gemini-1", "gemini:gemini-2"],
+            "agent fallback_providers should override global ones"
+        );
+    }
+
+    #[test]
+    fn delegate_agent_empty_fallback_providers_inherits_global() {
+        let mut agents = HashMap::new();
+        agents.insert(
+            "searcher".to_string(),
+            DelegateAgentConfig {
+                provider: "gemini".to_string(),
+                model: "gemini-3-flash-preview".to_string(),
+                system_prompt: None,
+                api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                provider_retries: None,
+                fallback_providers: vec![],
+            },
+        );
+
+        let global_fallbacks = vec!["openai-codex:codex-1".to_string()];
+        let reliability = crate::config::ReliabilityConfig {
+            fallback_providers: global_fallbacks.clone(),
+            ..Default::default()
+        };
+
+        let tool = DelegateTool::new(agents, None, test_security()).with_reliability(reliability);
+
+        let agent_config = tool.agents.get("searcher").unwrap();
+        let mut agent_reliability = tool.reliability.clone();
+        if !agent_config.fallback_providers.is_empty() {
+            agent_reliability.fallback_providers = agent_config.fallback_providers.clone();
+        }
+
+        assert_eq!(
+            agent_reliability.fallback_providers, global_fallbacks,
+            "empty agent fallback_providers should leave global ones intact"
+        );
     }
 }

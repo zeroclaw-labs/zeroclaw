@@ -500,6 +500,10 @@ pub struct DelegateAgentConfig {
     /// `None` = inherit from global `[reliability].provider_retries`.
     #[serde(default)]
     pub provider_retries: Option<u32>,
+    /// Fallback provider chain for this agent's calls.
+    /// Overrides global `[reliability].fallback_providers` when non-empty.
+    #[serde(default)]
+    pub fallback_providers: Vec<String>,
 }
 
 fn default_max_depth() -> u32 {
@@ -530,6 +534,7 @@ impl std::fmt::Debug for DelegateAgentConfig {
             .field("allowed_tools", &self.allowed_tools)
             .field("max_iterations", &self.max_iterations)
             .field("provider_retries", &self.provider_retries)
+            .field("fallback_providers", &self.fallback_providers)
             .finish()
     }
 }
@@ -9990,6 +9995,7 @@ mod tests {
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
                 provider_retries: None,
+                fallback_providers: vec![],
             },
         );
 
@@ -11004,6 +11010,7 @@ denied_tools = ["shell"]
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
                 provider_retries: None,
+                fallback_providers: vec![],
             },
         );
 

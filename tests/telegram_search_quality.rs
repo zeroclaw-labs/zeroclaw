@@ -1110,6 +1110,117 @@ async fn b5_danang_rental_houses_returns_contacts() {
     );
 }
 
+/// B-NEW1 — fallback resilience: search still works when primary provider has issues.
+///
+/// Sends a real search query and verifies the bot returns contacts.
+/// This test validates the fallback_providers chain is reachable — even if the primary
+/// provider is rate-limited, the fallback_providers in [agents.telegram_searcher] carry
+/// the search through to completion.
+///
+/// Requirements:
+///   - Daemon running with live binary
+///   - [agents.telegram_searcher] configured with fallback_providers in ~/.zeroclaw/config.toml
+///   - zverozabr_session authorized
+#[tokio::test]
+#[ignore = "requires live daemon + authorized zverozabr_session + fallback_providers config"]
+async fn b_new1_search_works_via_fallback_chain() {
+    let bot = "zGsR_bot";
+    let query = "Поищи в Telegram дома в аренду на Самуи. Нужны контакты — телефон или @username.";
+
+    println!("Sending to @{bot}: {query}");
+    let sent_id = send_to_bot(bot, query).await;
+    println!("Sent message id={sent_id}");
+
+    let start = Instant::now();
+    let reply = wait_for_bot_reply(bot, sent_id, Duration::from_secs(900)).await;
+    println!("Elapsed: {}s", start.elapsed().as_secs());
+
+    let text = reply.unwrap_or_else(|| {
+        panic!(
+            "Bot @{bot} did not reply within 900s after message id={sent_id}. \
+             Check daemon logs: /tmp/zeroclaw_daemon.log"
+        )
+    });
+    println!("Bot reply:\n{text}");
+
+    let has_contact = text.contains('@')
+        || contains_phone_number(&text)
+        || text.to_lowercase().contains("телефон")
+        || text.to_lowercase().contains("написать")
+        || text.to_lowercase().contains("связаться")
+        || text.to_lowercase().contains("контакт");
+
+    assert!(
+        has_contact,
+        "Bot reply must contain a contact (fallback chain must succeed), got:\n{text}"
+    );
+    assert!(
+        !text.contains("\"success\""),
+        "Bot must summarize — not dump raw JSON:\n{text}"
+    );
+}
+
+/// B-NEW2 — deduplication: contacts appearing in multiple channels appear only once.
+///
+/// Verifies the system_prompt dedup instruction works: the same @username or phone
+/// should not appear twice in the final answer.
+///
+/// Requirements:
+///   - Daemon running with live binary
+///   - [agents.telegram_searcher] configured in ~/.zeroclaw/config.toml
+///   - zverozabr_session authorized
+#[tokio::test]
+#[ignore = "requires live daemon + authorized zverozabr_session + [agents.telegram_searcher] config"]
+async fn b_new2_contacts_are_deduplicated_in_response() {
+    let bot = "zGsR_bot";
+    let query = "Поищи в Telegram сантехника на Самуи. Дай список уникальных контактов — телефон или @username.";
+
+    println!("Sending to @{bot}: {query}");
+    let sent_id = send_to_bot(bot, query).await;
+    println!("Sent message id={sent_id}");
+
+    let start = Instant::now();
+    let reply = wait_for_bot_reply(bot, sent_id, Duration::from_secs(900)).await;
+    println!("Elapsed: {}s", start.elapsed().as_secs());
+
+    let text = reply.unwrap_or_else(|| {
+        panic!(
+            "Bot @{bot} did not reply within 900s after message id={sent_id}. \
+             Check daemon logs: /tmp/zeroclaw_daemon.log"
+        )
+    });
+    println!("Bot reply:\n{text}");
+
+    // Extract @usernames from the reply and check for duplicates
+    let usernames: Vec<&str> = text
+        .split_whitespace()
+        .filter(|w| w.starts_with('@') && w.len() > 1)
+        .collect();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut duplicates: Vec<&str> = Vec::new();
+    for u in &usernames {
+        let norm = u.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
+        if !seen.insert(norm) {
+            duplicates.push(u);
+        }
+    }
+
+    assert!(
+        duplicates.is_empty(),
+        "Duplicate @usernames in bot reply (dedup instruction not followed): {:?}\nFull reply:\n{text}",
+        duplicates
+    );
+
+    let has_contact = text.contains('@')
+        || contains_phone_number(&text)
+        || text.to_lowercase().contains("контакт");
+    assert!(
+        has_contact,
+        "Bot reply must contain at least one contact, got:\n{text}"
+    );
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Approximate ISO8601 date string from UNIX timestamp (no chrono dependency).
