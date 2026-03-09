@@ -42,6 +42,9 @@ Notes:
 - `duckduckgo` is free and needs no key, but HTML scraping can be brittle when upstream markup changes.
 - `brave` requires `brave_api_key`.
 - `searxng` expects a standard JSON endpoint at `<base_url>/search?...&format=json`.
+- Runtime overrides for `searxng_base_url` are `ZEROCLAW_SEARXNG_BASE_URL` first, then `SEARXNG_BASE_URL`; if neither is set, ZeroClaw uses `web_search.searxng_base_url` from `config.toml`.
+- `searxng_base_url` is a new config key; existing `duckduckgo` and `brave` setups keep working unchanged.
+- Roll back by unsetting `searxng_base_url` and switching `provider` back to `duckduckgo` or `brave`.
 
 Example:
 

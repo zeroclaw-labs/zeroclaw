@@ -181,7 +181,7 @@ impl WebSearchTool {
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent("ZeroClaw/0.1.7")
+            .user_agent(format!("ZeroClaw/{}", env!("CARGO_PKG_VERSION")))
             .build()?;
 
         let response = client

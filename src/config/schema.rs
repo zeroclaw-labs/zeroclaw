@@ -4236,6 +4236,50 @@ impl Config {
             anyhow::bail!("gateway.host must not be empty");
         }
 
+        match self
+            .web_search
+            .provider
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "duckduckgo" | "ddg" => {}
+            "brave" => {
+                if self
+                    .web_search
+                    .brave_api_key
+                    .as_deref()
+                    .map(str::trim)
+                    .is_none_or(|value| value.is_empty())
+                {
+                    anyhow::bail!(
+                        "web_search.brave_api_key is required when web_search.provider = \"brave\""
+                    );
+                }
+            }
+            "searxng" => {
+                let base_url = self
+                    .web_search
+                    .searxng_base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .context(
+                        "web_search.searxng_base_url is required when web_search.provider = \"searxng\""
+                    )?;
+                let parsed = reqwest::Url::parse(base_url)
+                    .context("web_search.searxng_base_url must be a valid URL")?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    anyhow::bail!("web_search.searxng_base_url must use http/https");
+                }
+            }
+            other => {
+                anyhow::bail!(
+                    "web_search.provider must be one of: duckduckgo, brave, searxng (got {other})"
+                );
+            }
+        }
+
         // Autonomy
         if self.autonomy.max_actions_per_hour == 0 {
             anyhow::bail!("autonomy.max_actions_per_hour must be greater than 0");
@@ -7125,6 +7169,44 @@ default_model = "legacy-model"
 
         std::env::remove_var("WEB_SEARCH_MAX_RESULTS");
         std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS");
+    }
+
+    #[tokio::test]
+    async fn validate_web_search_rejects_unknown_provider() {
+        let mut config = Config::default();
+        config.web_search.provider = "custom-search".into();
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("web_search.provider must be one of"));
+    }
+
+    #[tokio::test]
+    async fn validate_web_search_requires_brave_api_key() {
+        let mut config = Config::default();
+        config.web_search.provider = "brave".into();
+        config.web_search.brave_api_key = None;
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("web_search.brave_api_key is required"));
+    }
+
+    #[tokio::test]
+    async fn validate_web_search_requires_valid_searxng_url() {
+        let mut config = Config::default();
+        config.web_search.provider = "searxng".into();
+        config.web_search.searxng_base_url = Some("not a url".into());
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("web_search.searxng_base_url must be a valid URL"));
+    }
+
+    #[tokio::test]
+    async fn validate_web_search_accepts_valid_searxng_url() {
+        let mut config = Config::default();
+        config.web_search.provider = "searxng".into();
+        config.web_search.searxng_base_url = Some("https://search.example.com".into());
+
+        config.validate().unwrap();
     }
 
     #[test]

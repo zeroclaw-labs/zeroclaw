@@ -2,7 +2,7 @@
 
 Các mục cấu hình thường dùng và giá trị mặc định.
 
-Xác minh lần cuối: **2026-02-19**.
+Xác minh lần cuối: **2026-03-09**.
 
 Thứ tự tìm config khi khởi động:
 
@@ -42,6 +42,9 @@ Lưu ý:
 - `duckduckgo` miễn phí và không cần khóa, nhưng cách scrape HTML có thể hỏng khi markup phía nguồn thay đổi.
 - `brave` yêu cầu `brave_api_key`.
 - `searxng` dùng endpoint JSON chuẩn tại `<base_url>/search?...&format=json`.
+- Biến môi trường runtime cho `searxng_base_url` là `ZEROCLAW_SEARXNG_BASE_URL` ưu tiên trước, rồi đến `SEARXNG_BASE_URL`; nếu cả hai không có, ZeroClaw dùng `web_search.searxng_base_url` trong `config.toml`.
+- `searxng_base_url` là khóa cấu hình mới; các cấu hình `duckduckgo` và `brave` hiện có vẫn hoạt động như cũ.
+- Có thể rollback bằng cách bỏ `searxng_base_url` và chuyển `provider` về `duckduckgo` hoặc `brave`.
 
 Ví dụ:
 
