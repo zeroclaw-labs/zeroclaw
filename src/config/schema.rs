@@ -3270,6 +3270,7 @@ pub enum OtpMethod {
     #[default]
     Totp,
     /// Future method for paired-device confirmations.
+    #[serde(alias = "dm")]
     Pairing,
     /// Future method for local CLI challenge prompts.
     CliPrompt,
@@ -3306,6 +3307,18 @@ pub struct OtpConfig {
     /// Domain-category presets expanded into `gated_domains`.
     #[serde(default)]
     pub gated_domain_categories: Vec<String>,
+
+    /// Legacy delivery-style key retained for compatibility with older configs.
+    #[serde(default)]
+    pub challenge_delivery: Option<String>,
+
+    /// Legacy challenge timeout key kept for backward compatibility.
+    #[serde(default)]
+    pub challenge_timeout_secs: Option<u64>,
+
+    /// Legacy max-attempt key kept for backward compatibility.
+    #[serde(default)]
+    pub challenge_max_attempts: Option<u32>,
 }
 
 fn default_otp_token_ttl_secs() -> u64 {
@@ -3336,6 +3349,9 @@ impl Default for OtpConfig {
             gated_actions: default_otp_gated_actions(),
             gated_domains: Vec::new(),
             gated_domain_categories: Vec::new(),
+            challenge_delivery: None,
+            challenge_timeout_secs: None,
+            challenge_max_attempts: None,
         }
     }
 }
@@ -7612,6 +7628,90 @@ require_otp_to_resume = true
         assert_eq!(parsed.security.otp.gated_actions.len(), 2);
         assert_eq!(parsed.security.otp.gated_domains.len(), 2);
         parsed.validate().unwrap();
+    }
+
+    #[test]
+    async fn security_otp_accepts_legacy_challenge_delivery_alias() {
+        let parsed: Config = toml::from_str(
+            r#"
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4.6"
+default_temperature = 0.7
+
+[security.otp]
+enabled = true
+challenge_delivery = "totp"
+"#,
+        )
+        .unwrap();
+
+        assert!(parsed.security.otp.enabled);
+        assert_eq!(parsed.security.otp.method, OtpMethod::Totp);
+        assert_eq!(
+            parsed.security.otp.challenge_delivery.as_deref(),
+            Some("totp")
+        );
+    }
+
+    #[test]
+    async fn security_otp_accepts_legacy_dm_delivery_value() {
+        let parsed: Config = toml::from_str(
+            r#"
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4.6"
+default_temperature = 0.7
+
+[security.otp]
+enabled = true
+challenge_delivery = "dm"
+"#,
+        )
+        .unwrap();
+
+        assert!(parsed.security.otp.enabled);
+        assert_eq!(parsed.security.otp.method, OtpMethod::Totp);
+        assert_eq!(parsed.security.otp.challenge_delivery.as_deref(), Some("dm"));
+    }
+
+    #[test]
+    async fn security_otp_accepts_method_and_legacy_delivery_together() {
+        let parsed: Config = toml::from_str(
+            r#"
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4.6"
+default_temperature = 0.7
+
+[security.otp]
+enabled = true
+method = "totp"
+challenge_delivery = "dm"
+"#,
+        )
+        .unwrap();
+
+        assert!(parsed.security.otp.enabled);
+        assert_eq!(parsed.security.otp.method, OtpMethod::Totp);
+        assert_eq!(parsed.security.otp.challenge_delivery.as_deref(), Some("dm"));
+    }
+
+    #[test]
+    async fn security_otp_accepts_legacy_challenge_limits() {
+        let parsed: Config = toml::from_str(
+            r#"
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4.6"
+default_temperature = 0.7
+
+[security.otp]
+enabled = true
+challenge_timeout_secs = 120
+challenge_max_attempts = 3
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.security.otp.challenge_timeout_secs, Some(120));
+        assert_eq!(parsed.security.otp.challenge_max_attempts, Some(3));
     }
 
     #[test]
