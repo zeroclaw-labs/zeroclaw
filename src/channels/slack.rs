@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 #[derive(Clone)]
@@ -601,30 +602,70 @@ impl SlackChannel {
             .any(|suffix| normalized == *suffix || normalized.ends_with(&format!(".{suffix}")))
     }
 
+    fn redact_slack_url(url: &reqwest::Url) -> String {
+        let host = url.host_str().unwrap_or("unknown-host");
+        let tail = url
+            .path_segments()
+            .and_then(|segments| {
+                segments
+                    .filter(|segment| !segment.is_empty())
+                    .next_back()
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "root".to_string());
+        format!("{host}/.../{tail}")
+    }
+
+    fn redact_raw_slack_url(raw_url: &str) -> String {
+        reqwest::Url::parse(raw_url)
+            .map(|parsed| Self::redact_slack_url(&parsed))
+            .unwrap_or_else(|_| "<invalid-url>".to_string())
+    }
+
+    fn redact_redirect_location(location: &str) -> String {
+        match reqwest::Url::parse(location) {
+            Ok(url) => Self::redact_slack_url(&url),
+            Err(_) => {
+                let tail = location
+                    .split(['?', '#'])
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .filter(|segment| !segment.is_empty())
+                    .unwrap_or("relative");
+                format!("relative/.../{tail}")
+            }
+        }
+    }
+
     fn validate_slack_private_file_url(raw_url: &str) -> Option<reqwest::Url> {
         let parsed = match reqwest::Url::parse(raw_url) {
             Ok(url) => url,
             Err(err) => {
-                tracing::warn!("Slack file URL parse failed for {raw_url}: {err}");
+                let redacted_raw = Self::redact_raw_slack_url(raw_url);
+                tracing::warn!("Slack file URL parse failed for {redacted_raw}: {err}");
                 return None;
             }
         };
+        let redacted = Self::redact_slack_url(&parsed);
 
         if parsed.scheme() != "https" {
             tracing::warn!(
                 "Slack file URL rejected due to non-HTTPS scheme for {}: {}",
-                raw_url,
+                redacted,
                 parsed.scheme()
             );
             return None;
         }
 
         let Some(host) = parsed.host_str() else {
-            tracing::warn!("Slack file URL rejected due to missing host: {raw_url}");
+            tracing::warn!("Slack file URL rejected due to missing host: {redacted}");
             return None;
         };
         if !Self::is_allowed_slack_media_hostname(host) {
-            tracing::warn!("Slack file URL rejected due to non-Slack host: {raw_url}");
+            tracing::warn!("Slack file URL rejected due to non-Slack host: {redacted}");
             return None;
         }
 
@@ -632,36 +673,39 @@ impl SlackChannel {
     }
 
     fn resolve_https_redirect_target(base: &reqwest::Url, location: &str) -> Option<reqwest::Url> {
+        let redacted_base = Self::redact_slack_url(base);
+        let redacted_location = Self::redact_redirect_location(location);
         let target = match base.join(location) {
             Ok(url) => url,
             Err(err) => {
                 tracing::warn!(
                     "Slack file redirect URL parse failed for base {} and location {}: {}",
-                    base,
-                    location,
+                    redacted_base,
+                    redacted_location,
                     err
                 );
                 return None;
             }
         };
+        let redacted_target = Self::redact_slack_url(&target);
         if target.scheme() != "https" {
             tracing::warn!(
                 "Slack file redirect rejected due to non-HTTPS scheme for {}",
-                target
+                redacted_target
             );
             return None;
         }
         let Some(host) = target.host_str() else {
             tracing::warn!(
                 "Slack file redirect rejected due to missing host for {}",
-                target
+                redacted_target
             );
             return None;
         };
         if !Self::is_allowed_slack_media_hostname(host) {
             tracing::warn!(
                 "Slack file redirect rejected due to non-Slack host for {}",
-                target
+                redacted_target
             );
             return None;
         }
@@ -683,6 +727,7 @@ impl SlackChannel {
 
     async fn fetch_slack_private_file(&self, raw_url: &str) -> Option<reqwest::Response> {
         let parsed = Self::validate_slack_private_file_url(raw_url)?;
+        let redacted_parsed = Self::redact_slack_url(&parsed);
         let client = self.slack_media_http_client_no_redirect();
         let initial = match client
             .get(parsed.clone())
@@ -692,7 +737,7 @@ impl SlackChannel {
         {
             Ok(response) => response,
             Err(err) => {
-                tracing::warn!("Slack file fetch failed for {}: {}", parsed, err);
+                tracing::warn!("Slack file fetch failed for {}: {}", redacted_parsed, err);
                 return None;
             }
         };
@@ -707,13 +752,14 @@ impl SlackChannel {
         let Ok(location) = location.to_str() else {
             tracing::warn!(
                 "Slack file redirect location header is not valid UTF-8 for {}",
-                parsed
+                redacted_parsed
             );
             return Some(initial);
         };
         let Some(redirect_url) = Self::resolve_https_redirect_target(&parsed, location) else {
             return Some(initial);
         };
+        let redacted_redirect = Self::redact_slack_url(&redirect_url);
 
         match self
             .http_client()
@@ -726,7 +772,7 @@ impl SlackChannel {
             Err(err) => {
                 tracing::warn!(
                     "Slack redirected file fetch failed for {}: {}",
-                    redirect_url,
+                    redacted_redirect,
                     err
                 );
                 None
@@ -760,6 +806,7 @@ impl SlackChannel {
         url: &str,
         file: &serde_json::Value,
     ) -> Option<String> {
+        let redacted_url = Self::redact_raw_slack_url(url);
         let resp = self.fetch_slack_private_file(url).await?;
 
         let status = resp.status();
@@ -769,7 +816,10 @@ impl SlackChannel {
                 .await
                 .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
             let sanitized = crate::providers::sanitize_api_error(&body);
-            tracing::warn!("Slack image fetch failed for {url} ({status}): {sanitized}");
+            tracing::warn!(
+                "Slack image fetch failed for {} ({status}): {sanitized}",
+                redacted_url
+            );
             return None;
         }
 
@@ -783,7 +833,7 @@ impl SlackChannel {
             if content_length > SLACK_ATTACHMENT_IMAGE_MAX_BYTES {
                 tracing::warn!(
                     "Slack image fetch skipped for {}: content-length {} exceeds {} bytes",
-                    url,
+                    redacted_url,
                     content_length,
                     SLACK_ATTACHMENT_IMAGE_MAX_BYTES
                 );
@@ -794,18 +844,18 @@ impl SlackChannel {
         let bytes = match resp.bytes().await {
             Ok(bytes) => bytes,
             Err(err) => {
-                tracing::warn!("Slack image body read failed for {url}: {err}");
+                tracing::warn!("Slack image body read failed for {}: {err}", redacted_url);
                 return None;
             }
         };
         if bytes.is_empty() {
-            tracing::warn!("Slack image body is empty for {url}");
+            tracing::warn!("Slack image body is empty for {}", redacted_url);
             return None;
         }
         if bytes.len() > SLACK_ATTACHMENT_IMAGE_MAX_BYTES {
             tracing::warn!(
                 "Slack image body too large for {}: {} bytes exceeds {} bytes",
-                url,
+                redacted_url,
                 bytes.len(),
                 SLACK_ATTACHMENT_IMAGE_MAX_BYTES
             );
@@ -815,11 +865,11 @@ impl SlackChannel {
         let Some(mime) =
             Self::detect_image_mime(content_type.as_deref(), file, bytes.as_ref(), url)
         else {
-            tracing::warn!("Slack image MIME detection failed for {url}");
+            tracing::warn!("Slack image MIME detection failed for {}", redacted_url);
             return None;
         };
         if !Self::is_supported_image_mime(&mime) {
-            tracing::warn!("Slack image MIME not supported for {url}: {mime}");
+            tracing::warn!("Slack image MIME not supported for {}: {mime}", redacted_url);
             return None;
         }
 
@@ -834,7 +884,7 @@ impl SlackChannel {
         if bytes.len() > SLACK_ATTACHMENT_IMAGE_INLINE_FALLBACK_MAX_BYTES {
             tracing::warn!(
                 "Slack image inline fallback skipped for {}: {} bytes exceeds {} bytes",
-                url,
+                redacted_url,
                 bytes.len(),
                 SLACK_ATTACHMENT_IMAGE_INLINE_FALLBACK_MAX_BYTES
             );
@@ -851,6 +901,7 @@ impl SlackChannel {
         bytes: &[u8],
         source_url: &str,
     ) -> Option<String> {
+        let redacted_source = Self::redact_raw_slack_url(source_url);
         if let Some(magic_mime) = Self::mime_from_magic(bytes) {
             return Some(magic_mime.to_string());
         }
@@ -861,7 +912,7 @@ impl SlackChannel {
         {
             tracing::warn!(
                 "Slack image MIME mismatch for {}: HTTP header claims {}, but bytes do not match a supported image signature",
-                source_url,
+                redacted_source,
                 header_mime
             );
         }
@@ -871,7 +922,7 @@ impl SlackChannel {
         {
             tracing::warn!(
                 "Slack image MIME mismatch for {}: file metadata claims {}, but bytes do not match a supported image signature",
-                source_url,
+                redacted_source,
                 file_mime
             );
         }
@@ -882,7 +933,7 @@ impl SlackChannel {
             if let Some(mime) = Self::mime_from_extension(&ext) {
                 tracing::warn!(
                     "Slack image MIME mismatch for {}: filename extension implies {}, but bytes do not match a supported image signature",
-                    source_url,
+                    redacted_source,
                     mime
                 );
             }
@@ -979,11 +1030,64 @@ impl SlackChannel {
             }
         };
 
-        if let Err(err) = tokio::fs::write(&output_path, bytes).await {
+        let Some(parent_dir) = output_path.parent() else {
             tracing::warn!(
-                "Slack image attachment write failed for {}: {err}",
+                "Slack image attachment write failed for {}: missing parent directory",
                 output_path.display()
             );
+            return None;
+        };
+
+        let file_tail = output_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment");
+        let temp_name = format!(
+            ".{file_tail}.{}.part",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let temp_path = parent_dir.join(temp_name);
+
+        let mut temp_file = match tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .await
+        {
+            Ok(file) => file,
+            Err(err) => {
+                tracing::warn!(
+                    "Slack image attachment temp open failed for {}: {err}",
+                    temp_path.display()
+                );
+                return None;
+            }
+        };
+
+        if let Err(err) = temp_file.write_all(bytes).await {
+            tracing::warn!(
+                "Slack image attachment temp write failed for {}: {err}",
+                temp_path.display()
+            );
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return None;
+        }
+        if let Err(err) = temp_file.sync_all().await {
+            tracing::warn!(
+                "Slack image attachment temp sync failed for {}: {err}",
+                temp_path.display()
+            );
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return None;
+        }
+        drop(temp_file);
+
+        if let Err(err) = tokio::fs::rename(&temp_path, &output_path).await {
+            tracing::warn!(
+                "Slack image attachment finalize failed for {}: {err}",
+                output_path.display()
+            );
+            let _ = tokio::fs::remove_file(&temp_path).await;
             return None;
         }
 
@@ -1018,27 +1122,7 @@ impl SlackChannel {
             );
         }
 
-        let output_path = resolved_save_dir.join(safe_name);
-        match tokio::fs::symlink_metadata(&output_path).await {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() {
-                    anyhow::bail!(
-                        "refusing to write Slack attachment through symlink: {}",
-                        output_path.display()
-                    );
-                }
-                if !meta.is_file() {
-                    anyhow::bail!(
-                        "Slack attachment output path is not a regular file: {}",
-                        output_path.display()
-                    );
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-
-        Ok(output_path)
+        Ok(resolved_save_dir.join(safe_name))
     }
 
     fn sanitize_attachment_filename(file_name: &str) -> Option<String> {
@@ -1238,6 +1322,7 @@ impl SlackChannel {
 
     async fn download_text_snippet(&self, file: &serde_json::Value) -> Option<String> {
         let url = Self::slack_file_download_url(file)?;
+        let redacted_url = Self::redact_raw_slack_url(url);
         let resp = self.fetch_slack_private_file(url).await?;
 
         let status = resp.status();
@@ -1247,7 +1332,10 @@ impl SlackChannel {
                 .await
                 .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
             let sanitized = crate::providers::sanitize_api_error(&body);
-            tracing::warn!("Slack snippet fetch failed for {url} ({status}): {sanitized}");
+            tracing::warn!(
+                "Slack snippet fetch failed for {} ({status}): {sanitized}",
+                redacted_url
+            );
             return None;
         }
 
@@ -1256,7 +1344,7 @@ impl SlackChannel {
             if content_length > SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES {
                 tracing::warn!(
                     "Slack snippet download skipped for {}: content-length {} exceeds {} bytes",
-                    url,
+                    redacted_url,
                     content_length,
                     SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES
                 );
@@ -1267,7 +1355,7 @@ impl SlackChannel {
         let bytes = match resp.bytes().await {
             Ok(bytes) => bytes,
             Err(err) => {
-                tracing::warn!("Slack snippet body read failed for {url}: {err}");
+                tracing::warn!("Slack snippet body read failed for {}: {err}", redacted_url);
                 return None;
             }
         };
@@ -1277,14 +1365,14 @@ impl SlackChannel {
         if bytes.len() > SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES {
             tracing::warn!(
                 "Slack snippet body too large for {}: {} bytes exceeds {} bytes",
-                url,
+                redacted_url,
                 bytes.len(),
                 SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES
             );
             return None;
         }
         if bytes.contains(&0) {
-            tracing::warn!("Slack snippet body appears binary for {url}");
+            tracing::warn!("Slack snippet body appears binary for {}", redacted_url);
             return None;
         }
 
@@ -1752,6 +1840,16 @@ impl SlackChannel {
         }
     }
 
+    fn evaluate_health(bot_ok: bool, socket_mode_enabled: bool, socket_mode_ok: bool) -> bool {
+        if !bot_ok {
+            return false;
+        }
+        if socket_mode_enabled {
+            return socket_mode_ok;
+        }
+        true
+    }
+
     async fn fetch_history_with_retry(
         &self,
         channel_id: &str,
@@ -2048,13 +2146,21 @@ impl Channel for SlackChannel {
     }
 
     async fn health_check(&self) -> bool {
-        self.http_client()
+        let bot_ok = self
+            .http_client()
             .get("https://slack.com/api/auth.test")
             .bearer_auth(&self.bot_token)
             .send()
             .await
             .map(|r| r.status().is_success())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        let socket_mode_enabled = self.configured_app_token().is_some();
+        let socket_mode_ok = if socket_mode_enabled {
+            self.open_socket_mode_url().await.is_ok()
+        } else {
+            true
+        };
+        Self::evaluate_health(bot_ok, socket_mode_enabled, socket_mode_ok)
     }
 }
 
@@ -2457,6 +2563,27 @@ mod tests {
         assert!(rejected_host.is_none());
     }
 
+    #[test]
+    fn redact_slack_url_hides_query_fragments() {
+        let url = reqwest::Url::parse(
+            "https://files.slack.com/files-pri/T1/F2/wow.png?token=secret#fragment",
+        )
+        .unwrap();
+        let redacted = SlackChannel::redact_slack_url(&url);
+        assert_eq!(redacted, "files.slack.com/.../wow.png");
+        assert!(!redacted.contains('?'));
+        assert!(!redacted.contains("token="));
+        assert!(!redacted.contains('#'));
+    }
+
+    #[test]
+    fn redact_redirect_location_keeps_only_relative_tail() {
+        let redacted =
+            SlackChannel::redact_redirect_location("/files-pri/T1/F2/wow.png?token=secret");
+        assert_eq!(redacted, "relative/.../wow.png");
+        assert!(!redacted.contains("token="));
+    }
+
     #[tokio::test]
     async fn resolve_workspace_attachment_output_path_stays_in_workspace() {
         let workspace = tempfile::tempdir().unwrap();
@@ -2468,6 +2595,44 @@ mod tests {
         let root = tokio::fs::canonicalize(workspace.path()).await.unwrap();
         assert!(output.starts_with(&root));
         assert!(output.to_string_lossy().contains("slack_files"));
+    }
+
+    #[tokio::test]
+    async fn persist_image_attachment_writes_bytes_without_part_leftovers() {
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![])
+            .with_workspace_dir(workspace.path().to_path_buf());
+        let file = serde_json::json!({"id":"F1","name":"wow.png"});
+        let png_bytes = vec![
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0x00, 0x01, 0x02, 0x03,
+        ];
+
+        let output = channel
+            .persist_image_attachment(&file, "wow.png", "image/png", &png_bytes)
+            .await
+            .expect("attachment path");
+        let stored = tokio::fs::read(&output).await.expect("stored bytes");
+        assert_eq!(stored, png_bytes);
+
+        let save_dir = output.parent().unwrap();
+        let mut entries = tokio::fs::read_dir(save_dir).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.ends_with(".part"),
+                "unexpected temp artifact left behind: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_health_enforces_socket_mode_probe_when_enabled() {
+        assert!(!SlackChannel::evaluate_health(false, false, true));
+        assert!(!SlackChannel::evaluate_health(false, true, true));
+        assert!(SlackChannel::evaluate_health(true, false, false));
+        assert!(SlackChannel::evaluate_health(true, false, true));
+        assert!(!SlackChannel::evaluate_health(true, true, false));
+        assert!(SlackChannel::evaluate_health(true, true, true));
     }
 
     #[test]
