@@ -67,6 +67,7 @@ mod heartbeat;
 mod hooks;
 mod identity;
 mod integrations;
+mod mcp_reload;
 mod memory;
 mod migration;
 mod multimodal;
