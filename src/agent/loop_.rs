@@ -1109,6 +1109,54 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
     calls
 }
 
+fn parse_glm_function_parameter_tags(body: &str) -> Option<ParsedToolCall> {
+    static FUNCTION_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)<function\s*=\s*([A-Za-z0-9_:\.-]+)\s*>(.*?)</function>").unwrap()
+    });
+    static PARAM_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)<parameter\s*=\s*([A-Za-z0-9_:\.-]+)\s*>(.*?)</parameter>").unwrap()
+    });
+
+    let captures = FUNCTION_RE.captures(body.trim())?;
+    let tool_raw = captures.get(1)?.as_str().trim();
+    if tool_raw.is_empty() {
+        return None;
+    }
+
+    let tool_name = map_tool_name_alias(tool_raw).to_string();
+    let inner = captures.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+    let mut arguments = serde_json::Map::new();
+
+    for param_cap in PARAM_RE.captures_iter(inner) {
+        let key = param_cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        let value = param_cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        arguments.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+
+    if arguments.is_empty() && !inner.is_empty() {
+        arguments.insert(
+            default_param_for_tool(&tool_name).to_string(),
+            serde_json::Value::String(inner.to_string()),
+        );
+    }
+
+    if arguments.is_empty() {
+        return None;
+    }
+
+    Some(ParsedToolCall {
+        name: tool_name,
+        arguments: serde_json::Value::Object(arguments),
+        tool_call_id: None,
+    })
+}
+
 /// Return the canonical default parameter name for a tool.
 ///
 /// When a model emits a shortened call like `shell>uname -a` (without an
@@ -1147,6 +1195,10 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
     let body = body.trim();
     if body.is_empty() {
         return None;
+    }
+
+    if let Some(call) = parse_glm_function_parameter_tags(body) {
+        return Some(call);
     }
 
     let function_style = body.find('(').and_then(|open| {
@@ -4516,6 +4568,26 @@ Tail"#;
         assert_eq!(
             calls[0].arguments.get("command").unwrap().as_str().unwrap(),
             "date"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_glm_function_parameter_equals_format() {
+        let response = r#"<tool_call>
+<function=file_read>
+<parameter=path>
+SOUL.md
+</parameter>
+</function>
+</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(
+            calls[0].arguments.get("path").unwrap().as_str().unwrap(),
+            "SOUL.md"
         );
     }
 

@@ -199,6 +199,17 @@ impl OllamaProvider {
             .to_string()
     }
 
+    fn thinking_text_for_tool_mode(model: &str, thinking: Option<&str>) -> Option<String> {
+        let thinking = thinking.map(str::trim).filter(|value| !value.is_empty())?;
+        let excerpt: String = thinking.chars().take(100).collect();
+        tracing::warn!(
+            "Ollama returned empty content with thinking for model '{}'; preserving raw thinking content for tool parsing. excerpt='{}'",
+            model,
+            excerpt
+        );
+        Some(thinking.to_string())
+    }
+
     fn build_chat_request(
         &self,
         messages: Vec<Message>,
@@ -655,18 +666,23 @@ impl Provider for OllamaProvider {
         // Plain text response.
         let content = response.message.content;
         let text = if let Some(content) = Self::normalize_response_text(content) {
-            content
+            Some(content)
+        } else if let Some(thinking_text) = Self::thinking_text_for_tool_mode(
+            &normalized_model,
+            response.message.thinking.as_deref(),
+        ) {
+            Some(thinking_text)
         } else {
-            Self::fallback_text_for_empty_content(
+            Some(Self::fallback_text_for_empty_content(
                 &normalized_model,
                 response.message.thinking.as_deref(),
-            )
+            ))
         };
         Ok(ChatResponse {
-            text: Some(text),
+            text,
             tool_calls: vec![],
             usage,
-            reasoning_content: None,
+            reasoning_content: response.message.thinking,
         })
     }
 
@@ -876,6 +892,18 @@ mod tests {
     fn fallback_text_for_empty_content_without_thinking_is_generic() {
         let text = OllamaProvider::fallback_text_for_empty_content("qwen3-coder", None);
         assert!(text.contains("couldn't get a complete response from Ollama"));
+    }
+
+    #[test]
+    fn thinking_text_for_tool_mode_preserves_raw_thinking() {
+        let text = OllamaProvider::thinking_text_for_tool_mode(
+            "qwen3.5:35b-a3b",
+            Some("<tool_call>{\"name\":\"file_read\",\"arguments\":{\"path\":\"SOUL.md\"}}</tool_call>"),
+        );
+        assert_eq!(
+            text.as_deref(),
+            Some("<tool_call>{\"name\":\"file_read\",\"arguments\":{\"path\":\"SOUL.md\"}}</tool_call>")
+        );
     }
 
     #[test]
