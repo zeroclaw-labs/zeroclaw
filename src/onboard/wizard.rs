@@ -121,7 +121,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     let project_ctx = setup_project_context()?;
 
     print_step(9, 9, "Workspace Files");
-    scaffold_workspace(&workspace_dir, &project_ctx).await?;
+    scaffold_workspace(&workspace_dir, &project_ctx, &memory_config.backend).await?;
 
     // ── Build config ──
     // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
@@ -630,7 +630,7 @@ async fn run_quick_setup_with_home(
             "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing."
                 .into(),
     };
-    scaffold_workspace(&workspace_dir, &default_ctx).await?;
+    scaffold_workspace(&workspace_dir, &default_ctx, &memory_backend_name).await?;
 
     println!(
         "  {} Workspace:  {}",
@@ -5406,7 +5406,7 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
 // ── Step 6: Scaffold workspace files ─────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> {
+async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext, memory_backend: &str) -> Result<()> {
     let agent = if ctx.agent_name.is_empty() {
         "ZeroClaw"
     } else {
@@ -5438,21 +5438,39 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          Update this file as you evolve. Your identity is yours to shape.\n"
     );
 
-    let agents = format!(
-        "# AGENTS.md — {agent} Personal Assistant\n\n\
-         ## Every Session (required)\n\n\
-         Before doing anything else:\n\n\
-         1. Read `SOUL.md` — this is who you are\n\
-         2. Read `USER.md` — this is who you're helping\n\
-         3. Use `memory_recall` for recent context (daily notes are on-demand)\n\
-         4. If in MAIN SESSION (direct chat): `MEMORY.md` is already injected\n\n\
-         Don't ask permission. Just do it.\n\n\
-         ## Memory System\n\n\
+    let memory_guidance = if memory_backend == "none" {
+        "## Memory System\n\n\
+         memory.backend = \"none\" — persistent memory is disabled.\n\
+         No daily notes or MEMORY.md will be created or injected.\n\
+         All context exists only within the current session.\n\n"
+            .to_string()
+    } else {
+        "## Memory System\n\n\
          You wake up fresh each session. These files ARE your continuity:\n\n\
          - **Daily notes:** `memory/YYYY-MM-DD.md` — raw logs (accessed via memory tools)\n\
          - **Long-term:** `MEMORY.md` — curated memories (auto-injected in main session)\n\n\
          Capture what matters. Decisions, context, things to remember.\n\
-         Skip secrets unless asked to keep them.\n\n\
+         Skip secrets unless asked to keep them.\n\n"
+            .to_string()
+    };
+
+    let session_steps = if memory_backend == "none" {
+        "1. Read `SOUL.md` — this is who you are\n\
+         2. Read `USER.md` — this is who you're helping\n\n"
+    } else {
+        "1. Read `SOUL.md` — this is who you are\n\
+         2. Read `USER.md` — this is who you're helping\n\
+         3. Use `memory_recall` for recent context (daily notes are on-demand)\n\
+         4. If in MAIN SESSION (direct chat): `MEMORY.md` is already injected\n\n"
+    };
+
+    let agents = format!(
+        "# AGENTS.md — {agent} Personal Assistant\n\n\
+         ## Every Session (required)\n\n\
+         Before doing anything else:\n\n\
+         {session_steps}\
+         Don't ask permission. Just do it.\n\n\
+         {memory_guidance}\
          ### Write It Down — No Mental Notes!\n\
          - Memory is limited — if you want to remember something, WRITE IT TO A FILE\n\
          - \"Mental notes\" don't survive session restarts. Files do.\n\
@@ -5621,7 +5639,7 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          ## Open Loops\n\
          (Track unfinished tasks and follow-ups here)\n";
 
-    let files: Vec<(&str, String)> = vec![
+    let mut files: Vec<(&str, String)> = vec![
         ("IDENTITY.md", identity),
         ("AGENTS.md", agents),
         ("HEARTBEAT.md", heartbeat),
@@ -5629,8 +5647,10 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
         ("USER.md", user_md),
         ("TOOLS.md", tools.to_string()),
         ("BOOTSTRAP.md", bootstrap),
-        ("MEMORY.md", memory.to_string()),
     ];
+    if memory_backend != "none" {
+        files.push(("MEMORY.md", memory.to_string()));
+    }
 
     // Create subdirectories
     let subdirs = ["sessions", "memory", "state", "cron", "skills"];
@@ -6221,7 +6241,7 @@ mod tests {
     async fn scaffold_creates_all_md_files() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite").await.unwrap();
 
         let expected = [
             "IDENTITY.md",
@@ -6242,7 +6262,7 @@ mod tests {
     async fn scaffold_creates_all_subdirectories() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite").await.unwrap();
 
         for dir in &["sessions", "memory", "state", "cron", "skills"] {
             assert!(tmp.path().join(dir).is_dir(), "missing subdirectory: {dir}");
@@ -6258,7 +6278,7 @@ mod tests {
             user_name: "Alice".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite").await.unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -6284,7 +6304,7 @@ mod tests {
             timezone: "US/Pacific".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite").await.unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -6310,7 +6330,7 @@ mod tests {
             agent_name: "Crabby".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite").await.unwrap();
 
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
             .await
@@ -6360,7 +6380,7 @@ mod tests {
             communication_style: "Be technical and detailed.".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite").await.unwrap();
 
         let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
@@ -6393,7 +6413,7 @@ mod tests {
     async fn scaffold_uses_defaults_for_empty_context() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default(); // all empty
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite").await.unwrap();
 
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
             .await
@@ -6440,7 +6460,7 @@ mod tests {
             .await
             .unwrap();
 
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite").await.unwrap();
 
         // SOUL.md should be untouched
         let soul = tokio::fs::read_to_string(&soul_path).await.unwrap();
@@ -6471,13 +6491,13 @@ mod tests {
             ..Default::default()
         };
 
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite").await.unwrap();
         let soul_v1 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
             .unwrap();
 
         // Run again — should not change anything
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite").await.unwrap();
         let soul_v2 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
             .unwrap();
@@ -6491,7 +6511,7 @@ mod tests {
     async fn scaffold_files_are_non_empty() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite").await.unwrap();
 
         for f in &[
             "IDENTITY.md",
@@ -6514,7 +6534,7 @@ mod tests {
     async fn agents_md_references_on_demand_memory() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite").await.unwrap();
 
         let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
             .await
@@ -6535,7 +6555,7 @@ mod tests {
     async fn memory_md_warns_about_token_cost() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite").await.unwrap();
 
         let memory = tokio::fs::read_to_string(tmp.path().join("MEMORY.md"))
             .await
@@ -6556,7 +6576,7 @@ mod tests {
     async fn tools_md_lists_all_builtin_tools() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite").await.unwrap();
 
         let tools = tokio::fs::read_to_string(tmp.path().join("TOOLS.md"))
             .await
@@ -6588,7 +6608,7 @@ mod tests {
     async fn soul_md_includes_emoji_awareness_guidance() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite").await.unwrap();
 
         let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
@@ -6614,7 +6634,7 @@ mod tests {
             timezone: "Europe/Madrid".into(),
             communication_style: "Be direct.".into(),
         };
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite").await.unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -6640,7 +6660,7 @@ mod tests {
                 "Be friendly, human, and conversational. Show warmth and empathy while staying efficient. Use natural contractions."
                     .into(),
         };
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite").await.unwrap();
 
         // Verify every file got personalized
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
@@ -6677,6 +6697,28 @@ mod tests {
             .await
             .unwrap();
         assert!(heartbeat.contains("Claw"));
+    }
+
+    // ── scaffold_workspace: none backend skips MEMORY.md ────────
+
+    #[tokio::test]
+    async fn scaffold_none_backend_disables_memory_guidance_and_skips_memory_md() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ProjectContext::default();
+        scaffold_workspace(tmp.path(), &ctx, "none").await.unwrap();
+
+        assert!(
+            !tmp.path().join("MEMORY.md").exists(),
+            "MEMORY.md should not be created for none backend"
+        );
+
+        let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
+            .await
+            .unwrap();
+        assert!(
+            agents.contains("memory.backend = \"none\""),
+            "AGENTS.md should note that memory backend is none"
+        );
     }
 
     // ── model helper coverage ───────────────────────────────────
