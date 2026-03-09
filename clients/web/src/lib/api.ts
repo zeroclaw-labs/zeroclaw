@@ -164,9 +164,10 @@ export class MoAClient {
   private getWsUrl(): string {
     const base = this.serverUrl.replace(/^http/, "ws");
     const params = new URLSearchParams();
-    if (this.token) params.set("token", this.token);
+    // Token sent via Sec-WebSocket-Protocol header, not query param (avoids log leakage)
     if (this.wsSessionId) params.set("session_id", this.wsSessionId);
-    return `${base}/ws/chat?${params.toString()}`;
+    const qs = params.toString();
+    return qs ? `${base}/ws/chat?${qs}` : `${base}/ws/chat`;
   }
 
   /** Connect to the /ws/chat WebSocket endpoint. */
@@ -191,7 +192,8 @@ export class MoAClient {
     }
 
     const url = this.getWsUrl();
-    this.ws = new WebSocket(url);
+    // Send token via Sec-WebSocket-Protocol subprotocol to avoid URL/log exposure
+    this.ws = new WebSocket(url, [`bearer.${this.token}`]);
 
     this.ws.onopen = () => {
       callbacks.onOpen?.();
@@ -391,10 +393,17 @@ export function renderMarkdown(text: string): string {
   // Ordered lists
   html = html.replace(/^\d+\.\s+(.+)$/gm, "<li>$1</li>");
 
-  // Links
+  // Links (sanitize href: escape quotes + block javascript: protocol)
   html = html.replace(
     /\[([^\]]+)\]\(([^)]+)\)/g,
-    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>',
+    (_match, label: string, url: string) => {
+      const safeUrl = url.replace(/"/g, "&quot;").replace(/'/g, "&#x27;");
+      // Block javascript:, data:, vbscript: protocols
+      if (/^\s*(javascript|data|vbscript)\s*:/i.test(url.replace(/&amp;/g, "&"))) {
+        return label;
+      }
+      return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    },
   );
 
   // Paragraphs: wrap non-tag lines

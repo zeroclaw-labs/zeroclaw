@@ -36,6 +36,8 @@ impl ResponseCache {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous  = NORMAL;
+             PRAGMA busy_timeout = 5000;
+             PRAGMA cache_size   = -2000;
              PRAGMA temp_store   = MEMORY;",
         )?;
 

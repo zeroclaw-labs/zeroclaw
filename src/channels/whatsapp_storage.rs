@@ -89,7 +89,8 @@ impl RusqliteStore {
         // Enable WAL mode for better concurrency
         to_store_err!(conn.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;",
+             PRAGMA synchronous = NORMAL;
+             PRAGMA busy_timeout = 5000;",
         ))?;
 
         let store = Self {

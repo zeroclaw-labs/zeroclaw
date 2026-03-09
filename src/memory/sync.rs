@@ -173,7 +173,10 @@ impl SyncEngine {
     fn init_db(db_path: &Path) -> anyhow::Result<()> {
         let conn = rusqlite::Connection::open(db_path)?;
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sync_journal (
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous  = NORMAL;
+             PRAGMA busy_timeout = 5000;
+             CREATE TABLE IF NOT EXISTS sync_journal (
                 id TEXT PRIMARY KEY,
                 device_id TEXT NOT NULL,
                 version_json TEXT NOT NULL,
@@ -184,7 +187,8 @@ impl SyncEngine {
                 key TEXT PRIMARY KEY,
                 value_json TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_journal_timestamp ON sync_journal(timestamp);",
+            CREATE INDEX IF NOT EXISTS idx_journal_timestamp ON sync_journal(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_journal_device ON sync_journal(device_id);",
         )?;
         Ok(())
     }
@@ -195,16 +199,21 @@ impl SyncEngine {
             return Ok(());
         }
         let conn = rusqlite::Connection::open(&self.db_path)?;
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;")?;
+
+        // Wrap in a single transaction for atomicity and performance
+        // (one fsync instead of N).
+        let tx = conn.unchecked_transaction()?;
 
         // Save version vector
         let version_json = serde_json::to_string(&self.version)?;
-        conn.execute(
+        tx.execute(
             "INSERT OR REPLACE INTO sync_version (key, value_json) VALUES ('current', ?1)",
             rusqlite::params![version_json],
         )?;
 
         // Upsert journal entries
-        let mut stmt = conn.prepare(
+        let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO sync_journal (id, device_id, version_json, operation_json, timestamp)
              VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
@@ -219,6 +228,8 @@ impl SyncEngine {
                 entry.timestamp as i64,
             ])?;
         }
+        drop(stmt);
+        tx.commit()?;
 
         Ok(())
     }
@@ -229,6 +240,7 @@ impl SyncEngine {
             return Ok(());
         }
         let conn = rusqlite::Connection::open(&self.db_path)?;
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;")?;
 
         // Load version vector
         let version_result: Result<String, _> = conn.query_row(
@@ -286,6 +298,12 @@ impl SyncEngine {
         } else {
             let id = DeviceId::generate();
             std::fs::write(&device_id_path, &id.0)?;
+            // Restrict key file to owner-only access (0o600).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&device_id_path, std::fs::Permissions::from_mode(0o600))?;
+            }
             id
         };
 
@@ -303,6 +321,12 @@ impl SyncEngine {
             let mut key = [0u8; 32];
             rand::fill(&mut key);
             std::fs::write(&key_path, key)?;
+            // Restrict key file to owner-only access (0o600).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+            }
             key
         };
 
@@ -626,6 +650,7 @@ impl SyncEngine {
             );
             // Delete pruned entries from SQLite too
             if let Ok(conn) = rusqlite::Connection::open(&self.db_path) {
+                let _ = conn.execute_batch("PRAGMA busy_timeout = 5000;");
                 let _ = conn.execute(
                     "DELETE FROM sync_journal WHERE timestamp < ?1",
                     rusqlite::params![cutoff as i64],

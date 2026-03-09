@@ -524,8 +524,14 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
         .with_context(|| format!("Failed to open cron DB: {}", db_path.display()))?;
 
     conn.execute_batch(
-        "PRAGMA foreign_keys = ON;
-         CREATE TABLE IF NOT EXISTS cron_jobs (
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA busy_timeout = 5000;
+         PRAGMA foreign_keys = ON;",
+    )?;
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS cron_jobs (
             id               TEXT PRIMARY KEY,
             expression       TEXT NOT NULL,
             command          TEXT NOT NULL,

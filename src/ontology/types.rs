@@ -90,12 +90,20 @@ impl std::fmt::Display for ActionStatus {
 }
 
 impl ActionStatus {
+    /// Parse a status string, logging a warning for unrecognized values.
+    ///
+    /// Falls back to `Pending` for unknown values (DB may contain legacy data),
+    /// but emits a warning so the issue is observable.
     pub fn from_str_lossy(s: &str) -> Self {
         match s {
+            "pending" => Self::Pending,
             "success" => Self::Success,
             "error" => Self::Error,
             "rolled_back" => Self::RolledBack,
-            _ => Self::Pending,
+            other => {
+                tracing::warn!(value = other, "unrecognized ActionStatus, defaulting to Pending");
+                Self::Pending
+            }
         }
     }
 }
@@ -120,11 +128,16 @@ impl std::fmt::Display for ActorKind {
 }
 
 impl ActorKind {
+    /// Parse an actor kind string, logging a warning for unrecognized values.
     pub fn from_str_lossy(s: &str) -> Self {
         match s {
             "user" => Self::User,
+            "agent" => Self::Agent,
             "system" => Self::System,
-            _ => Self::Agent,
+            other => {
+                tracing::warn!(value = other, "unrecognized ActorKind, defaulting to Agent");
+                Self::Agent
+            }
         }
     }
 }

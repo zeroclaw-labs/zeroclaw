@@ -993,6 +993,7 @@ fn read_openclaw_sqlite_entries(db_path: &Path) -> Result<Vec<SourceEntry>> {
 
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("Failed to open source db {}", db_path.display()))?;
+    conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
 
     let table_exists: Option<String> = conn
         .query_row(

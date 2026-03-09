@@ -326,6 +326,7 @@ impl PromptSection for OntologySection {
         let db_path = ctx.workspace_dir.join("memory").join("brain.db");
         if db_path.exists() {
             if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                let _ = conn.execute_batch("PRAGMA busy_timeout = 5000;");
                 // Derive owner_user_id from identity config (same logic as tools/mod.rs).
                 let owner_user_id = ctx
                     .identity_config

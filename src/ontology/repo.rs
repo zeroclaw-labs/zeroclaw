@@ -32,6 +32,7 @@ impl OntologyRepo {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous  = NORMAL;
+             PRAGMA busy_timeout = 5000;
              PRAGMA cache_size   = -2000;
              PRAGMA temp_store   = MEMORY;
              PRAGMA foreign_keys = ON;",
@@ -66,45 +67,37 @@ impl OntologyRepo {
     /// Resolve an object type name to its ID.
     pub fn object_type_id(&self, name: &str) -> anyhow::Result<i64> {
         let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT id FROM ontology_object_types WHERE name = ?1",
-            params![name],
-            |r| r.get(0),
-        )
-        .map_err(|e| anyhow::anyhow!("unknown object type '{}': {}", name, e))
+        let mut stmt = conn.prepare_cached("SELECT id FROM ontology_object_types WHERE name = ?1")?;
+        let id = stmt.query_row(params![name], |r| r.get(0))
+            .map_err(|e| anyhow::anyhow!("unknown object type '{}': {}", name, e))?;
+        Ok(id)
     }
 
     /// Resolve a link type name to its ID.
     pub fn link_type_id(&self, name: &str) -> anyhow::Result<i64> {
         let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT id FROM ontology_link_types WHERE name = ?1",
-            params![name],
-            |r| r.get(0),
-        )
-        .map_err(|e| anyhow::anyhow!("unknown link type '{}': {}", name, e))
+        let mut stmt = conn.prepare_cached("SELECT id FROM ontology_link_types WHERE name = ?1")?;
+        let id = stmt.query_row(params![name], |r| r.get(0))
+            .map_err(|e| anyhow::anyhow!("unknown link type '{}': {}", name, e))?;
+        Ok(id)
     }
 
     /// Resolve an action type name to its ID.
     pub fn action_type_id(&self, name: &str) -> anyhow::Result<i64> {
         let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT id FROM ontology_action_types WHERE name = ?1",
-            params![name],
-            |r| r.get(0),
-        )
-        .map_err(|e| anyhow::anyhow!("unknown action type '{}': {}", name, e))
+        let mut stmt = conn.prepare_cached("SELECT id FROM ontology_action_types WHERE name = ?1")?;
+        let id = stmt.query_row(params![name], |r| r.get(0))
+            .map_err(|e| anyhow::anyhow!("unknown action type '{}': {}", name, e))?;
+        Ok(id)
     }
 
     /// Resolve an action type ID to its name.
     pub fn action_type_name(&self, id: i64) -> anyhow::Result<String> {
         let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT name FROM ontology_action_types WHERE id = ?1",
-            params![id],
-            |r| r.get(0),
-        )
-        .map_err(|e| anyhow::anyhow!("unknown action type id {}: {}", id, e))
+        let mut stmt = conn.prepare_cached("SELECT name FROM ontology_action_types WHERE id = ?1")?;
+        let name = stmt.query_row(params![id], |r| r.get(0))
+            .map_err(|e| anyhow::anyhow!("unknown action type id {}: {}", id, e))?;
+        Ok(name)
     }
 
     // -----------------------------------------------------------------------
@@ -131,7 +124,10 @@ impl OntologyRepo {
         Ok(conn.last_insert_rowid())
     }
 
-    /// Get an object by ID.
+    /// Get an object by ID (internal use only — no owner filter).
+    ///
+    /// Callers operating on behalf of an external user should prefer
+    /// [`get_object_for_owner`] to enforce ownership isolation.
     pub fn get_object(&self, id: i64) -> anyhow::Result<Option<OntologyObject>> {
         let conn = self.conn.lock();
         conn.query_row(
@@ -154,7 +150,41 @@ impl OntologyRepo {
         .map_err(Into::into)
     }
 
-    /// Update an object's title and/or properties.
+    /// Get an object by ID, enforcing ownership isolation.
+    ///
+    /// Returns `None` if the object does not exist **or** belongs to a
+    /// different user — preventing cross-user data leakage.
+    pub fn get_object_for_owner(
+        &self,
+        id: i64,
+        owner_user_id: &str,
+    ) -> anyhow::Result<Option<OntologyObject>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT id, type_id, title, properties, owner_user_id, created_at, updated_at
+             FROM ontology_objects WHERE id = ?1 AND owner_user_id = ?2",
+            params![id, owner_user_id],
+            |r| {
+                Ok(OntologyObject {
+                    id: r.get(0)?,
+                    type_id: r.get(1)?,
+                    title: r.get(2)?,
+                    properties: parse_json_col(r.get::<_, String>(3)?),
+                    owner_user_id: r.get(4)?,
+                    created_at: r.get(5)?,
+                    updated_at: r.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Update an object's title and/or properties (internal, no owner check).
+    ///
+    /// Callers that operate on behalf of an external user **must** use
+    /// [`update_object_for_owner`] instead to prevent horizontal privilege
+    /// escalation.
     pub fn update_object(
         &self,
         id: i64,
@@ -178,6 +208,43 @@ impl OntologyRepo {
         Ok(())
     }
 
+    /// Update an object's title and/or properties **with owner verification**.
+    ///
+    /// Returns an error if the object does not exist or belongs to a different
+    /// user, preventing horizontal privilege escalation.
+    pub fn update_object_for_owner(
+        &self,
+        id: i64,
+        owner_user_id: &str,
+        title: Option<&str>,
+        properties: Option<&serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        let now = now_millis();
+        let conn = self.conn.lock();
+        let affected = if let Some(props) = properties {
+            let props_str = serde_json::to_string(props)?;
+            conn.execute(
+                "UPDATE ontology_objects SET title = COALESCE(?2, title), properties = ?3, updated_at = ?4
+                 WHERE id = ?1 AND owner_user_id = ?5",
+                params![id, title, props_str, now, owner_user_id],
+            )?
+        } else {
+            conn.execute(
+                "UPDATE ontology_objects SET title = COALESCE(?2, title), updated_at = ?3
+                 WHERE id = ?1 AND owner_user_id = ?4",
+                params![id, title, now, owner_user_id],
+            )?
+        };
+        if affected == 0 {
+            anyhow::bail!(
+                "object {} not found or not owned by user '{}'",
+                id,
+                owner_user_id,
+            );
+        }
+        Ok(())
+    }
+
     /// Search objects by type and FTS5 query, scoped to an owner.
     pub fn search_objects(
         &self,
@@ -189,78 +256,98 @@ impl OntologyRepo {
         let conn = self.conn.lock();
         let mut results = Vec::new();
 
+        // Resolve optional type filter to a type_id (using parameter binding, never format!).
+        let type_id: Option<i64> = if let Some(tn) = type_name {
+            Some(
+                conn.query_row(
+                    "SELECT id FROM ontology_object_types WHERE name = ?1",
+                    params![tn],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(|e| anyhow::anyhow!("unknown type '{}': {}", tn, e))?,
+            )
+        } else {
+            None
+        };
+
+        let row_mapper = |r: &rusqlite::Row| -> rusqlite::Result<OntologyObject> {
+            Ok(OntologyObject {
+                id: r.get(0)?,
+                type_id: r.get(1)?,
+                title: r.get(2)?,
+                properties: parse_json_col(r.get::<_, String>(3)?),
+                owner_user_id: r.get(4)?,
+                created_at: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        };
+
+        // Sanitize FTS5 query: quote each word to escape special chars
+        // (*, OR, AND, NOT, NEAR, etc.) that could cause syntax errors or
+        // unintended query semantics.
+        let sanitized_query: String = query
+            .split_whitespace()
+            .map(|w| {
+                let escaped = w.replace('"', "\"\"");
+                format!("\"{escaped}\"")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
         if query.is_empty() {
             // No FTS query — simple list by type.
-            let type_filter = if let Some(tn) = type_name {
-                let tid = conn
-                    .query_row(
-                        "SELECT id FROM ontology_object_types WHERE name = ?1",
-                        params![tn],
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .map_err(|e| anyhow::anyhow!("unknown type '{}': {}", tn, e))?;
-                format!("AND o.type_id = {tid}")
+            if let Some(tid) = type_id {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at
+                     FROM ontology_objects o
+                     WHERE o.owner_user_id = ?1 AND o.type_id = ?2
+                     ORDER BY o.updated_at DESC LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![owner_user_id, tid, limit as i64], row_mapper)?;
+                for row in rows {
+                    results.push(row?);
+                }
             } else {
-                String::new()
-            };
-            let sql = format!(
-                "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at
-                 FROM ontology_objects o
-                 WHERE o.owner_user_id = ?1 {type_filter}
-                 ORDER BY o.updated_at DESC LIMIT ?2"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![owner_user_id, limit as i64], |r| {
-                Ok(OntologyObject {
-                    id: r.get(0)?,
-                    type_id: r.get(1)?,
-                    title: r.get(2)?,
-                    properties: parse_json_col(r.get::<_, String>(3)?),
-                    owner_user_id: r.get(4)?,
-                    created_at: r.get(5)?,
-                    updated_at: r.get(6)?,
-                })
-            })?;
-            for row in rows {
-                results.push(row?);
+                let mut stmt = conn.prepare_cached(
+                    "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at
+                     FROM ontology_objects o
+                     WHERE o.owner_user_id = ?1
+                     ORDER BY o.updated_at DESC LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![owner_user_id, limit as i64], row_mapper)?;
+                for row in rows {
+                    results.push(row?);
+                }
             }
         } else {
-            // FTS5 search.
-            let type_filter = if let Some(tn) = type_name {
-                let tid = conn
-                    .query_row(
-                        "SELECT id FROM ontology_object_types WHERE name = ?1",
-                        params![tn],
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .map_err(|e| anyhow::anyhow!("unknown type '{}': {}", tn, e))?;
-                format!("AND o.type_id = {tid}")
+            // FTS5 search — always use parameter binding.
+            if let Some(tid) = type_id {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at
+                     FROM ontology_objects_fts f
+                     JOIN ontology_objects o ON o.id = f.rowid
+                     WHERE ontology_objects_fts MATCH ?1
+                       AND o.owner_user_id = ?2
+                       AND o.type_id = ?3
+                     ORDER BY rank LIMIT ?4",
+                )?;
+                let rows = stmt.query_map(params![sanitized_query, owner_user_id, tid, limit as i64], row_mapper)?;
+                for row in rows {
+                    results.push(row?);
+                }
             } else {
-                String::new()
-            };
-            let sql = format!(
-                "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at
-                 FROM ontology_objects_fts f
-                 JOIN ontology_objects o ON o.id = f.rowid
-                 WHERE ontology_objects_fts MATCH ?1
-                   AND o.owner_user_id = ?2
-                   {type_filter}
-                 ORDER BY rank LIMIT ?3"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![query, owner_user_id, limit as i64], |r| {
-                Ok(OntologyObject {
-                    id: r.get(0)?,
-                    type_id: r.get(1)?,
-                    title: r.get(2)?,
-                    properties: parse_json_col(r.get::<_, String>(3)?),
-                    owner_user_id: r.get(4)?,
-                    created_at: r.get(5)?,
-                    updated_at: r.get(6)?,
-                })
-            })?;
-            for row in rows {
-                results.push(row?);
+                let mut stmt = conn.prepare_cached(
+                    "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at
+                     FROM ontology_objects_fts f
+                     JOIN ontology_objects o ON o.id = f.rowid
+                     WHERE ontology_objects_fts MATCH ?1
+                       AND o.owner_user_id = ?2
+                     ORDER BY rank LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![sanitized_query, owner_user_id, limit as i64], row_mapper)?;
+                for row in rows {
+                    results.push(row?);
+                }
             }
         }
         Ok(results)
@@ -281,7 +368,11 @@ impl OntologyRepo {
     // -----------------------------------------------------------------------
 
     /// Create a link between two objects. Returns the link ID.
-    /// Uses INSERT OR IGNORE to avoid duplicate links.
+    ///
+    /// Uses INSERT OR IGNORE to avoid duplicate links.  When a duplicate is
+    /// ignored, returns the existing link's ID via a follow-up SELECT instead
+    /// of the misleading `last_insert_rowid()` (which would return the
+    /// *previous* insert's rowid, not this one).
     pub fn create_link(
         &self,
         link_type_name: &str,
@@ -293,23 +384,40 @@ impl OntologyRepo {
         let now = now_millis();
         let props_str = properties.map(|p| serde_json::to_string(p).unwrap_or_default());
         let conn = self.conn.lock();
-        conn.execute(
+        let affected = conn.execute(
             "INSERT OR IGNORE INTO ontology_links (link_type_id, from_object_id, to_object_id, properties, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![link_type_id, from_object_id, to_object_id, props_str, now],
         )?;
-        Ok(conn.last_insert_rowid())
+
+        if affected > 0 {
+            // Row was inserted — last_insert_rowid is valid.
+            Ok(conn.last_insert_rowid())
+        } else {
+            // Duplicate was ignored — look up the existing link.
+            conn.query_row(
+                "SELECT id FROM ontology_links WHERE link_type_id = ?1 AND from_object_id = ?2 AND to_object_id = ?3",
+                params![link_type_id, from_object_id, to_object_id],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
+        }
     }
 
-    /// Get all links originating from an object.
-    pub fn links_from(&self, object_id: i64) -> anyhow::Result<Vec<OntologyLink>> {
+    /// Get all links originating from an object, scoped to the object's owner.
+    ///
+    /// Joins through `ontology_objects` to ensure the caller can only see
+    /// links where the *from* object belongs to them.
+    pub fn links_from(&self, object_id: i64, owner_user_id: &str) -> anyhow::Result<Vec<OntologyLink>> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, link_type_id, from_object_id, to_object_id, properties, created_at
-             FROM ontology_links WHERE from_object_id = ?1
-             ORDER BY created_at DESC",
+        let mut stmt = conn.prepare_cached(
+            "SELECT l.id, l.link_type_id, l.from_object_id, l.to_object_id, l.properties, l.created_at
+             FROM ontology_links l
+             JOIN ontology_objects o ON o.id = l.from_object_id
+             WHERE l.from_object_id = ?1 AND o.owner_user_id = ?2
+             ORDER BY l.created_at DESC",
         )?;
-        let rows = stmt.query_map(params![object_id], |r| {
+        let rows = stmt.query_map(params![object_id, owner_user_id], |r| {
             Ok(OntologyLink {
                 id: r.get(0)?,
                 link_type_id: r.get(1)?,
@@ -324,15 +432,17 @@ impl OntologyRepo {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Get all links pointing to an object.
-    pub fn links_to(&self, object_id: i64) -> anyhow::Result<Vec<OntologyLink>> {
+    /// Get all links pointing to an object, scoped to the object's owner.
+    pub fn links_to(&self, object_id: i64, owner_user_id: &str) -> anyhow::Result<Vec<OntologyLink>> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, link_type_id, from_object_id, to_object_id, properties, created_at
-             FROM ontology_links WHERE to_object_id = ?1
-             ORDER BY created_at DESC",
+        let mut stmt = conn.prepare_cached(
+            "SELECT l.id, l.link_type_id, l.from_object_id, l.to_object_id, l.properties, l.created_at
+             FROM ontology_links l
+             JOIN ontology_objects o ON o.id = l.to_object_id
+             WHERE l.to_object_id = ?1 AND o.owner_user_id = ?2
+             ORDER BY l.created_at DESC",
         )?;
-        let rows = stmt.query_map(params![object_id], |r| {
+        let rows = stmt.query_map(params![object_id, owner_user_id], |r| {
             Ok(OntologyLink {
                 id: r.get(0)?,
                 link_type_id: r.get(1)?,
@@ -499,6 +609,9 @@ impl OntologyRepo {
     // -----------------------------------------------------------------------
 
     /// Find an object by type + title + owner, or create it if it doesn't exist.
+    ///
+    /// Uses INSERT ... ON CONFLICT to avoid the TOCTOU race condition that
+    /// existed in the old SELECT-then-INSERT pattern.
     pub fn ensure_object(
         &self,
         type_name: &str,
@@ -507,27 +620,27 @@ impl OntologyRepo {
         owner_user_id: &str,
     ) -> anyhow::Result<i64> {
         let type_id = self.object_type_id(type_name)?;
-        let conn = self.conn.lock();
-        let existing: Option<i64> = conn
-            .query_row(
-                "SELECT id FROM ontology_objects WHERE type_id = ?1 AND title = ?2 AND owner_user_id = ?3",
-                params![type_id, title, owner_user_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-
-        if let Some(id) = existing {
-            return Ok(id);
-        }
-
         let now = now_millis();
         let props_str = serde_json::to_string(default_properties)?;
+        let conn = self.conn.lock();
+
+        // Atomic upsert: the unique index on (type_id, title, owner_user_id)
+        // doesn't exist by default, so we fall back to a safe pattern:
+        // try INSERT, and if it conflicts on the implicit constraint, just
+        // SELECT the existing row.
         conn.execute(
-            "INSERT INTO ontology_objects (type_id, title, properties, owner_user_id, created_at, updated_at)
+            "INSERT OR IGNORE INTO ontology_objects (type_id, title, properties, owner_user_id, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![type_id, title, props_str, owner_user_id, now, now],
         )?;
-        Ok(conn.last_insert_rowid())
+
+        // Whether we just inserted or the row already existed, SELECT the ID.
+        let id: i64 = conn.query_row(
+            "SELECT id FROM ontology_objects WHERE type_id = ?1 AND title = ?2 AND owner_user_id = ?3",
+            params![type_id, title, owner_user_id],
+            |r| r.get(0),
+        )?;
+        Ok(id)
     }
 }
 
@@ -588,7 +701,7 @@ mod tests {
         repo.create_link("related_to", task_id, contact_id, None)
             .unwrap();
 
-        let links = repo.links_from(task_id).unwrap();
+        let links = repo.links_from(task_id, "u1").unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].to_object_id, contact_id);
     }
@@ -606,7 +719,7 @@ mod tests {
         repo.create_link("related_to", a, b, None).unwrap();
         repo.create_link("related_to", a, b, None).unwrap(); // should not error
 
-        let links = repo.links_from(a).unwrap();
+        let links = repo.links_from(a, "u1").unwrap();
         assert_eq!(links.len(), 1);
     }
 

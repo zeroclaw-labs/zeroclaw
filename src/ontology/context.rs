@@ -49,22 +49,31 @@ impl ContextBuilder {
                 .list_objects_by_type(&req.owner_user_id, "Project", 5)?;
 
         // Fetch recent actions and build summaries.
+        // Hard-cap at 50 regardless of caller input (schema documents max:50).
         let limit = req.limit_recent_actions.min(50);
         let raw_actions =
             self.repo
                 .recent_actions(&req.owner_user_id, req.channel.as_deref(), limit)?;
 
+        // Pre-build a cache of action_type_id → name to avoid N+1 lookups.
+        let mut type_name_cache = std::collections::HashMap::new();
+
         let recent_actions: Vec<ActionSummary> = raw_actions
             .into_iter()
             .map(|a| {
-                let action_type = self
-                    .repo
-                    .action_type_name(a.action_type_id)
-                    .unwrap_or_else(|_| format!("unknown_{}", a.action_type_id));
+                let action_type = type_name_cache
+                    .entry(a.action_type_id)
+                    .or_insert_with(|| {
+                        self.repo
+                            .action_type_name(a.action_type_id)
+                            .unwrap_or_else(|_| format!("unknown_{}", a.action_type_id))
+                    })
+                    .clone();
 
+                // Use owner-scoped lookup to prevent cross-user data leakage.
                 let primary_object_title = a.primary_object_id.and_then(|oid| {
                     self.repo
-                        .get_object(oid)
+                        .get_object_for_owner(oid, &req.owner_user_id)
                         .ok()
                         .flatten()
                         .and_then(|o| o.title)

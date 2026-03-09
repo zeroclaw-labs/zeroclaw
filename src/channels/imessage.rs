@@ -159,10 +159,12 @@ end tell"#
         // a new one on every 3-second poll cycle.
         let path = db_path.to_path_buf();
         let conn = tokio::task::spawn_blocking(move || -> anyhow::Result<Connection> {
-            Ok(Connection::open_with_flags(
+            let c = Connection::open_with_flags(
                 &path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?)
+            )?;
+            c.execute_batch("PRAGMA busy_timeout = 5000;")?;
+            Ok(c)
         })
         .await??;
 

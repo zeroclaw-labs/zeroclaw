@@ -259,6 +259,15 @@ pub async fn handle_pair_signup_submit(
 
 // ── HTML Templates ────────────────────────────────────────────────────
 
+/// Escape user-controlled strings for safe HTML interpolation (prevents XSS).
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 fn base_style() -> &'static str {
     r#"
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -297,9 +306,10 @@ fn base_style() -> &'static str {
 }
 
 fn render_login_page(token: &str, channel: &str, error: Option<&str>) -> String {
-    let channel_display = channel_display_name(channel);
+    let channel_display = html_escape(channel_display_name(channel));
+    let token_escaped = html_escape(token);
     let error_html = error
-        .map(|e| format!(r#"<div class="error">{e}</div>"#))
+        .map(|e| format!(r#"<div class="error">{}</div>"#, html_escape(e)))
         .unwrap_or_default();
 
     format!(
@@ -312,8 +322,8 @@ fn render_login_page(token: &str, channel: &str, error: Option<&str>) -> String 
 <div class="card">
   <div class="logo"><h1>MoA</h1><p>{channel_display} 연결</p></div>
   {error_html}
-  <form method="POST" action="/pair/auto/{token}">
-    <input type="hidden" name="token" value="{token}">
+  <form method="POST" action="/pair/auto/{token_escaped}">
+    <input type="hidden" name="token" value="{token_escaped}">
     <div class="form-group">
       <label>아이디 / Username</label>
       <input type="text" name="username" required autocomplete="username" placeholder="Enter username">
@@ -326,7 +336,7 @@ fn render_login_page(token: &str, channel: &str, error: Option<&str>) -> String 
   </form>
   <div class="link">
     계정이 없으신가요? / No account?<br>
-    <a href="/pair/signup?token={token}">회원가입 / Sign Up</a>
+    <a href="/pair/signup?token={token_escaped}">회원가입 / Sign Up</a>
   </div>
 </div>
 </body></html>"#,
@@ -335,7 +345,7 @@ fn render_login_page(token: &str, channel: &str, error: Option<&str>) -> String 
 }
 
 fn render_success(channel: &str) -> String {
-    let channel_display = channel_display_name(channel);
+    let channel_display = html_escape(channel_display_name(channel));
 
     format!(
         r#"<!DOCTYPE html>
@@ -361,8 +371,9 @@ fn render_success(channel: &str) -> String {
 }
 
 fn render_signup_page(token: &str, error: Option<&str>) -> String {
+    let token_escaped = html_escape(token);
     let error_html = error
-        .map(|e| format!(r#"<div class="error">{e}</div>"#))
+        .map(|e| format!(r#"<div class="error">{}</div>"#, html_escape(e)))
         .unwrap_or_default();
 
     format!(
@@ -376,7 +387,7 @@ fn render_signup_page(token: &str, error: Option<&str>) -> String {
   <div class="logo"><h1>MoA</h1><p>회원가입 / Sign Up</p></div>
   {error_html}
   <form method="POST" action="/pair/signup">
-    <input type="hidden" name="token" value="{token}">
+    <input type="hidden" name="token" value="{token_escaped}">
     <div class="form-group">
       <label>아이디 / Username</label>
       <input type="text" name="username" required autocomplete="username" placeholder="Choose a username">
@@ -393,7 +404,7 @@ fn render_signup_page(token: &str, error: Option<&str>) -> String {
   </form>
   <div class="link">
     이미 계정이 있으신가요? / Already have an account?<br>
-    <a href="/pair/auto/{token}">로그인 / Login</a>
+    <a href="/pair/auto/{token_escaped}">로그인 / Login</a>
   </div>
 </div>
 </body></html>"#,
@@ -402,7 +413,7 @@ fn render_signup_page(token: &str, error: Option<&str>) -> String {
 }
 
 fn render_error(message: &str) -> String {
-    let message_html = message.replace('\n', "<br>");
+    let message_html = html_escape(message).replace('\n', "<br>");
     format!(
         r#"<!DOCTYPE html>
 <html lang="ko"><head>

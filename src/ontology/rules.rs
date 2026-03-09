@@ -64,9 +64,9 @@ impl RuleEngine {
     ) -> anyhow::Result<()> {
         if let Some(contact_id) = req.primary_object_id {
             for related_id in &req.related_object_ids {
-                let _ = self
-                    .repo
-                    .create_link("related_to", *related_id, contact_id, None);
+                if let Err(e) = self.repo.create_link("related_to", *related_id, contact_id, None) {
+                    tracing::debug!(error = %e, "rule_send_message: create_link failed (non-fatal)");
+                }
             }
 
             // Ensure the contact is linked to the channel.
@@ -77,9 +77,9 @@ impl RuleEngine {
                     &json!({}),
                     &req.owner_user_id,
                 )?;
-                let _ = self
-                    .repo
-                    .create_link("communicates_via", contact_id, channel_id, None);
+                if let Err(e) = self.repo.create_link("communicates_via", contact_id, channel_id, None) {
+                    tracing::debug!(error = %e, "rule_send_message: communicates_via link failed (non-fatal)");
+                }
             }
         }
         Ok(())
@@ -99,7 +99,9 @@ impl RuleEngine {
         if let Some(task_id) = task_id {
             // Auto-link to context if present.
             if let Some(ctx_id) = req.context_id {
-                let _ = self.repo.create_link("related_to", task_id, ctx_id, None);
+                if let Err(e) = self.repo.create_link("related_to", task_id, ctx_id, None) {
+                    tracing::debug!(error = %e, "rule_create_task: context link failed (non-fatal)");
+                }
             }
 
             // Auto-link to channel if present.
@@ -110,9 +112,9 @@ impl RuleEngine {
                     &json!({}),
                     &req.owner_user_id,
                 )?;
-                let _ = self
-                    .repo
-                    .create_link("related_to", task_id, channel_id, None);
+                if let Err(e) = self.repo.create_link("related_to", task_id, channel_id, None) {
+                    tracing::debug!(error = %e, "rule_create_task: channel link failed (non-fatal)");
+                }
             }
         }
         Ok(())
@@ -150,9 +152,9 @@ impl RuleEngine {
 
             // Link the document to any related tasks/projects.
             for related_id in &req.related_object_ids {
-                let _ = self
-                    .repo
-                    .create_link("related_to", doc_id, *related_id, None);
+                if let Err(e) = self.repo.create_link("related_to", doc_id, *related_id, None) {
+                    tracing::debug!(error = %e, "rule_fetch_resource: link failed (non-fatal)");
+                }
             }
         }
         Ok(())
@@ -170,13 +172,13 @@ impl RuleEngine {
             .and_then(|v| v.as_i64())
         {
             if let Some(summary) = result.get("summary").and_then(|v| v.as_str()) {
-                // Update the document with a summary property.
-                if let Some(mut obj) = self.repo.get_object(doc_id)? {
+                // Use owner-scoped lookup to prevent cross-user data modification.
+                if let Some(mut obj) = self.repo.get_object_for_owner(doc_id, &req.owner_user_id)? {
                     if let Some(map) = obj.properties.as_object_mut() {
                         map.insert("summary".to_string(), json!(summary));
                     }
                     self.repo
-                        .update_object(doc_id, None, Some(&obj.properties))?;
+                        .update_object_for_owner(doc_id, &req.owner_user_id, None, Some(&obj.properties))?;
                 }
             }
         }
@@ -205,9 +207,9 @@ impl RuleEngine {
             &req.owner_user_id,
         )?;
 
-        let _ = self
-            .repo
-            .create_link("has_preference", user_id_obj, pref_id, None);
+        if let Err(e) = self.repo.create_link("has_preference", user_id_obj, pref_id, None) {
+            tracing::debug!(error = %e, "rule_save_preference: has_preference link failed (non-fatal)");
+        }
 
         Ok(())
     }
@@ -231,8 +233,8 @@ impl RuleEngine {
             None => return Ok(()),
         };
 
-        // Only apply to Contact objects.
-        let obj = match self.repo.get_object(contact_id)? {
+        // Only apply to Contact objects (owner-scoped lookup).
+        let obj = match self.repo.get_object_for_owner(contact_id, &req.owner_user_id)? {
             Some(o) => o,
             None => return Ok(()),
         };
@@ -261,7 +263,7 @@ impl RuleEngine {
                 map.insert("importance".to_string(), json!("high"));
             }
             self.repo
-                .update_object(contact_id, None, Some(&props))?;
+                .update_object_for_owner(contact_id, &req.owner_user_id, None, Some(&props))?;
             tracing::info!(
                 contact_id,
                 action_count,
@@ -323,9 +325,9 @@ impl RuleEngine {
 
         // Link all matching tasks to the project.
         for task in &matching_tasks {
-            let _ = self
-                .repo
-                .create_link("belongs_to", task.id, project_id, None);
+            if let Err(e) = self.repo.create_link("belongs_to", task.id, project_id, None) {
+                tracing::debug!(error = %e, task_id = task.id, "auto-group: belongs_to link failed (non-fatal)");
+            }
         }
 
         tracing::info!(
@@ -359,8 +361,8 @@ impl RuleEngine {
             &req.owner_user_id,
         )?;
 
-        // Update the frequency counter for this action type.
-        if let Some(mut obj) = self.repo.get_object(channel_id)? {
+        // Update the frequency counter for this action type (owner-scoped).
+        if let Some(mut obj) = self.repo.get_object_for_owner(channel_id, &req.owner_user_id)? {
             let freq = obj
                 .properties
                 .get("frequent_actions")
@@ -384,7 +386,7 @@ impl RuleEngine {
                 );
             }
             self.repo
-                .update_object(channel_id, None, Some(&obj.properties))?;
+                .update_object_for_owner(channel_id, &req.owner_user_id, None, Some(&obj.properties))?;
         }
 
         Ok(())
@@ -435,7 +437,7 @@ mod tests {
         assert!(!channels.is_empty());
         assert_eq!(channels[0].title.as_deref(), Some("kakao"));
 
-        let links = repo.links_from(contact_id).unwrap();
+        let links = repo.links_from(contact_id, "u1").unwrap();
         assert!(!links.is_empty());
     }
 

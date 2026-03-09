@@ -109,6 +109,7 @@ impl SqliteMemory {
         conn.execute_batch(&format!(
             "{journal_pragma}
              PRAGMA synchronous  = NORMAL;
+             PRAGMA busy_timeout = 5000;
              {mmap_pragma}
              PRAGMA cache_size   = -2000;
              PRAGMA temp_store   = MEMORY;"
@@ -171,7 +172,9 @@ impl SqliteMemory {
                 updated_at  TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
-            CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key);
+            -- Note: no explicit index on `key` — the UNIQUE constraint already
+            -- creates an implicit unique B-tree index, so a second one would
+            -- waste space and slow inserts.
 
             -- FTS5 full-text search (BM25 scoring)
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -270,7 +273,7 @@ impl SqliteMemory {
         let cached = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<f32>>> {
             let conn = conn.lock();
             let mut stmt =
-                conn.prepare("SELECT embedding FROM embedding_cache WHERE content_hash = ?1")?;
+                conn.prepare_cached("SELECT embedding FROM embedding_cache WHERE content_hash = ?1")?;
             let blob: Option<Vec<u8>> = stmt.query_row(params![hash_c], |row| row.get(0)).ok();
             if let Some(bytes) = blob {
                 conn.execute(
@@ -341,7 +344,7 @@ impl SqliteMemory {
                    ORDER BY score
                    LIMIT ?2";
 
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare_cached(sql)?;
         #[allow(clippy::cast_possible_wrap)]
         let limit_i64 = limit as i64;
 
@@ -691,7 +694,7 @@ impl Memory for SqliteMemory {
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
             let conn = conn.lock();
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT id, key, content, category, created_at, session_id FROM memories WHERE key = ?1",
             )?;
 
@@ -745,34 +748,42 @@ impl Memory for SqliteMemory {
 
             if let Some(ref cat) = category {
                 let cat_str = Self::category_to_str(cat);
-                let mut stmt = conn.prepare(
-                    "SELECT id, key, content, category, created_at, session_id FROM memories
-                     WHERE category = ?1 ORDER BY updated_at DESC LIMIT ?2",
-                )?;
-                let rows = stmt.query_map(params![cat_str, DEFAULT_LIST_LIMIT], row_mapper)?;
-                for row in rows {
-                    let entry = row?;
-                    if let Some(sid) = session_ref {
-                        if entry.session_id.as_deref() != Some(sid) {
-                            continue;
-                        }
+                if let Some(sid) = session_ref {
+                    let mut stmt = conn.prepare_cached(
+                        "SELECT id, key, content, category, created_at, session_id FROM memories
+                         WHERE category = ?1 AND session_id = ?2 ORDER BY updated_at DESC LIMIT ?3",
+                    )?;
+                    let rows = stmt.query_map(params![cat_str, sid, DEFAULT_LIST_LIMIT], row_mapper)?;
+                    for row in rows {
+                        results.push(row?);
                     }
-                    results.push(entry);
+                } else {
+                    let mut stmt = conn.prepare_cached(
+                        "SELECT id, key, content, category, created_at, session_id FROM memories
+                         WHERE category = ?1 ORDER BY updated_at DESC LIMIT ?2",
+                    )?;
+                    let rows = stmt.query_map(params![cat_str, DEFAULT_LIST_LIMIT], row_mapper)?;
+                    for row in rows {
+                        results.push(row?);
+                    }
+                }
+            } else if let Some(sid) = session_ref {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT id, key, content, category, created_at, session_id FROM memories
+                     WHERE session_id = ?1 ORDER BY updated_at DESC LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![sid, DEFAULT_LIST_LIMIT], row_mapper)?;
+                for row in rows {
+                    results.push(row?);
                 }
             } else {
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT id, key, content, category, created_at, session_id FROM memories
                      ORDER BY updated_at DESC LIMIT ?1",
                 )?;
                 let rows = stmt.query_map(params![DEFAULT_LIST_LIMIT], row_mapper)?;
                 for row in rows {
-                    let entry = row?;
-                    if let Some(sid) = session_ref {
-                        if entry.session_id.as_deref() != Some(sid) {
-                            continue;
-                        }
-                    }
-                    results.push(entry);
+                    results.push(row?);
                 }
             }
 
