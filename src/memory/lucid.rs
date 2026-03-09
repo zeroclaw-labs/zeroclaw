@@ -384,6 +384,35 @@ impl Memory for LucidMemory {
     }
 }
 
+#[async_trait]
+impl super::search::SearchableMemory for LucidMemory {
+    async fn search(
+        &self,
+        query: &str,
+        filter: &super::search::SearchFilter,
+        limit: usize,
+    ) -> anyhow::Result<Vec<super::search::SearchResult>> {
+        self.local.search(query, filter, limit).await
+    }
+
+    async fn semantic_search(
+        &self,
+        query: &str,
+        limit: usize,
+        min_score: f64,
+    ) -> anyhow::Result<Vec<super::search::SearchResult>> {
+        self.local.semantic_search(query, limit, min_score).await
+    }
+
+    async fn keyword_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<super::search::SearchResult>> {
+        self.local.keyword_search(query, limit).await
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

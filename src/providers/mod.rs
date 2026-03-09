@@ -18,8 +18,8 @@ pub use streaming::ProviderStreaming;
 pub use tool_calling::ProviderToolCalling;
 #[allow(unused_imports)]
 pub use traits::{
-    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ResponseUsage, ToolCall,
-    ToolResultMessage,
+    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, InferenceProvider, Provider,
+    ResponseUsage, ToolCall, ToolResultMessage,
 };
 
 use compatible::{AuthStyle, OpenAiCompatibleProvider};

@@ -2920,6 +2920,7 @@ pub struct ConsciousnessConfig {
     pub debate_rounds: usize,
     pub approval_threshold: f64,
     pub bus_capacity: usize,
+    pub sync_url: Option<String>,
 }
 
 impl Default for ConsciousnessConfig {
@@ -2929,6 +2930,7 @@ impl Default for ConsciousnessConfig {
             debate_rounds: 3,
             approval_threshold: 0.65,
             bus_capacity: 256,
+            sync_url: None,
         }
     }
 }

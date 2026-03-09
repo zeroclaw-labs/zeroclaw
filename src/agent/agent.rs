@@ -631,7 +631,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for MockProvider {
+    impl crate::providers::InferenceProvider for MockProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -641,7 +641,10 @@ mod tests {
         ) -> Result<String> {
             Ok("ok".into())
         }
+    }
 
+    #[async_trait]
+    impl Provider for MockProvider {
         async fn chat(
             &self,
             _request: ChatRequest<'_>,

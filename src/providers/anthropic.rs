@@ -1,6 +1,6 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    InferenceProvider, Provider, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -406,7 +406,7 @@ impl AnthropicProvider {
 }
 
 #[async_trait]
-impl Provider for AnthropicProvider {
+impl InferenceProvider for AnthropicProvider {
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -450,6 +450,21 @@ impl Provider for AnthropicProvider {
         Self::parse_text_response(chat_response)
     }
 
+    async fn warmup(&self) -> anyhow::Result<()> {
+        if let Some(credential) = self.credential.as_ref() {
+            let mut request = self
+                .http_client()
+                .post(format!("{}/v1/messages", self.base_url))
+                .header("anthropic-version", "2023-06-01");
+            request = self.apply_auth(request, credential);
+            let _ = request.send().await?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Provider for AnthropicProvider {
     async fn chat(
         &self,
         request: ProviderChatRequest<'_>,
@@ -464,7 +479,6 @@ impl Provider for AnthropicProvider {
 
         let (system_prompt, mut messages) = Self::convert_messages(request.messages);
 
-        // Auto-cache last message if conversation is long
         if Self::should_cache_conversation(request.messages) {
             Self::apply_cache_to_last_message(&mut messages);
         }
@@ -496,20 +510,6 @@ impl Provider for AnthropicProvider {
 
     fn supports_native_tools(&self) -> bool {
         true
-    }
-
-    async fn warmup(&self) -> anyhow::Result<()> {
-        if let Some(credential) = self.credential.as_ref() {
-            let mut request = self
-                .http_client()
-                .post(format!("{}/v1/messages", self.base_url))
-                .header("anthropic-version", "2023-06-01");
-            request = self.apply_auth(request, credential);
-            // Send a minimal request; the goal is TLS + HTTP/2 setup, not a valid response.
-            // Anthropic has no lightweight GET endpoint, so we accept any non-network error.
-            let _ = request.send().await?;
-        }
-        Ok(())
     }
 }
 

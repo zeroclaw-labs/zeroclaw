@@ -7,6 +7,8 @@ pub mod reflection;
 pub mod research;
 pub mod strategy;
 
+use crate::quantum::QuantumConsciousnessAgent;
+
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -61,5 +63,6 @@ pub fn build_all_agents(
         Box::new(metacognitive::MetacognitiveAgent::new(
             MetacognitivePolicy::default(),
         )),
+        Box::new(QuantumConsciousnessAgent::new()),
     ]
 }

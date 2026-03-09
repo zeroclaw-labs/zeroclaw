@@ -38,7 +38,7 @@ impl MockProvider {
 }
 
 #[async_trait]
-impl Provider for MockProvider {
+impl zeroclaw::providers::InferenceProvider for MockProvider {
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,
@@ -48,7 +48,10 @@ impl Provider for MockProvider {
     ) -> Result<String> {
         Ok("fallback".into())
     }
+}
 
+#[async_trait]
+impl Provider for MockProvider {
     async fn chat(
         &self,
         _request: ChatRequest<'_>,

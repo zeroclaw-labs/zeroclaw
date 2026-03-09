@@ -13,7 +13,7 @@
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    InferenceProvider, Provider, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -582,7 +582,7 @@ async fn write_file_secure(path: &Path, content: &str) {
 }
 
 #[async_trait]
-impl Provider for CopilotProvider {
+impl InferenceProvider for CopilotProvider {
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -624,6 +624,14 @@ impl Provider for CopilotProvider {
         Ok(response.text.unwrap_or_default())
     }
 
+    async fn warmup(&self) -> anyhow::Result<()> {
+        let _ = self.get_api_key().await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Provider for CopilotProvider {
     async fn chat(
         &self,
         request: ProviderChatRequest<'_>,
@@ -641,11 +649,6 @@ impl Provider for CopilotProvider {
 
     fn supports_native_tools(&self) -> bool {
         true
-    }
-
-    async fn warmup(&self) -> anyhow::Result<()> {
-        let _ = self.get_api_key().await?;
-        Ok(())
     }
 }
 

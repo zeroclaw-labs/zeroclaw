@@ -1,4 +1,4 @@
-use crate::providers::traits::Provider;
+use crate::providers::traits::{InferenceProvider, Provider};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -256,7 +256,7 @@ impl OllamaProvider {
 }
 
 #[async_trait]
-impl Provider for OllamaProvider {
+impl InferenceProvider for OllamaProvider {
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -284,7 +284,6 @@ impl Provider for OllamaProvider {
             .send_request(messages, &normalized_model, temperature, should_auth)
             .await?;
 
-        // If model returned tool calls, format them for loop_.rs's parse_tool_calls
         if !response.message.tool_calls.is_empty() {
             tracing::debug!(
                 "Ollama returned {} tool call(s), formatting for loop parser",
@@ -293,10 +292,8 @@ impl Provider for OllamaProvider {
             return Ok(self.format_tool_calls_for_loop(&response.message.tool_calls));
         }
 
-        // Plain text response
         let content = response.message.content;
 
-        // Handle edge case: model returned only "thinking" with no content or tool calls
         if content.is_empty() {
             if let Some(thinking) = &response.message.thinking {
                 tracing::warn!(
@@ -334,7 +331,6 @@ impl Provider for OllamaProvider {
             .send_request(api_messages, &normalized_model, temperature, should_auth)
             .await?;
 
-        // If model returned tool calls, format them for loop_.rs's parse_tool_calls
         if !response.message.tool_calls.is_empty() {
             tracing::debug!(
                 "Ollama returned {} tool call(s), formatting for loop parser",
@@ -343,18 +339,14 @@ impl Provider for OllamaProvider {
             return Ok(self.format_tool_calls_for_loop(&response.message.tool_calls));
         }
 
-        // Plain text response
         let content = response.message.content;
 
-        // Handle edge case: model returned only "thinking" with no content or tool calls
-        // This is a model quirk - it stopped after reasoning without producing output
         if content.is_empty() {
             if let Some(thinking) = &response.message.thinking {
                 tracing::warn!(
                     "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
                     if thinking.len() > 100 { &thinking[..100] } else { thinking }
                 );
-                // Return a message indicating the model's thought process but no action
                 return Ok(format!(
                     "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
                     if thinking.len() > 200 { &thinking[..200] } else { thinking }
@@ -365,11 +357,11 @@ impl Provider for OllamaProvider {
 
         Ok(content)
     }
+}
 
+#[async_trait]
+impl Provider for OllamaProvider {
     fn supports_native_tools(&self) -> bool {
-        // Return false since loop_.rs uses XML-style tool parsing via system prompt
-        // The model may return native tool_calls but we convert them to JSON format
-        // that parse_tool_calls() understands
         false
     }
 }

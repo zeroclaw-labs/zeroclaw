@@ -99,6 +99,15 @@ impl ConsciousnessAgent for ChairmanAgent {
             }
         }
 
+        let has_high_confidence_wisdom = state.wisdom_entries.iter().any(|w| w.confidence >= 0.7);
+        if has_high_confidence_wisdom {
+            for proposal in &mut proposals {
+                if proposal.priority == Priority::Normal {
+                    proposal.priority = Priority::High;
+                }
+            }
+        }
+
         proposals
     }
 

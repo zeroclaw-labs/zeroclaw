@@ -54,6 +54,9 @@ urlencoding = "2.1"
 # Optional Rust-native browser automation backend
 fantoccini = { version = "0.22.0", optional = true, default-features = false, features = ["rustls-tls"] }
 
+# Resource limits (Unix rlimit)
+libc = "0.2"
+
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
@@ -71,6 +74,9 @@ hex = "0.4"
 
 # CSPRNG for secure token generation
 rand = "0.9"
+
+# Complex number arithmetic for quantum-inspired computation
+num-complex = { version = "0.4", default-features = false, features = ["std", "serde"] }
 
 # Fast mutexes that don't poison on panic
 parking_lot = "0.12"

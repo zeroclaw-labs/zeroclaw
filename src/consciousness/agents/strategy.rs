@@ -1,4 +1,5 @@
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -16,6 +17,9 @@ pub struct StrategyAgent {
     free_energy: Arc<Mutex<FreeEnergyState>>,
     proposal_counter: u64,
     goals: Vec<String>,
+    priors: HashMap<String, f64>,
+    min_edge: f64,
+    ticks_since_prior_update: HashMap<String, u64>,
 }
 
 impl StrategyAgent {
@@ -30,7 +34,53 @@ impl StrategyAgent {
             free_energy,
             proposal_counter: 0,
             goals: Vec::new(),
+            priors: HashMap::new(),
+            min_edge: 0.05,
+            ticks_since_prior_update: HashMap::new(),
         }
+    }
+
+    pub fn with_min_edge(mut self, min_edge: f64) -> Self {
+        self.min_edge = min_edge;
+        self
+    }
+
+    fn domain_for_action(action: &str) -> String {
+        action.split(':').next().unwrap_or(action).to_string()
+    }
+
+    fn get_prior(&self, domain: &str) -> f64 {
+        *self.priors.get(domain).unwrap_or(&0.5)
+    }
+
+    fn update_posterior(&mut self, domain: &str, observation: f64) {
+        let prior = self.get_prior(domain);
+        let posterior = prior * 0.8 + observation * 0.2;
+        self.priors.insert(domain.to_string(), posterior);
+        self.ticks_since_prior_update.insert(domain.to_string(), 0);
+    }
+
+    fn decay_stale_priors(&mut self) {
+        for (domain, ticks) in &mut self.ticks_since_prior_update {
+            *ticks += 1;
+            if *ticks > 10 {
+                if let Some(prior) = self.priors.get_mut(domain) {
+                    *prior = *prior * 0.95 + 0.5 * 0.05;
+                }
+            }
+        }
+    }
+
+    fn compute_edge(&self, domain: &str, proposal_confidence: f64) -> f64 {
+        let posterior = self.get_prior(domain);
+        posterior - proposal_confidence
+    }
+
+    fn kelly_fraction(edge: f64, posterior: f64) -> f64 {
+        if posterior >= 1.0 || edge <= 0.0 {
+            return 0.0;
+        }
+        (edge / (1.0 - posterior)).clamp(0.0, 0.25)
     }
 
     fn next_id(&mut self) -> u64 {
@@ -69,7 +119,7 @@ impl ConsciousnessAgent for StrategyAgent {
         AgentKind::Strategy
     }
 
-    fn perceive(&mut self, _state: &ConsciousnessState, _signals: &[BusMessage]) -> Vec<Proposal> {
+    fn perceive(&mut self, state: &ConsciousnessState, _signals: &[BusMessage]) -> Vec<Proposal> {
         let mut proposals = Vec::new();
 
         let surprise = self.free_energy.lock().free_energy();
@@ -104,30 +154,64 @@ impl ConsciousnessAgent for StrategyAgent {
             });
         }
 
+        for entry in &state.wisdom_entries {
+            if entry.confidence >= 0.7 {
+                proposals.push(Proposal {
+                    id: self.next_id(),
+                    source: AgentKind::Strategy,
+                    action: format!("wisdom_guided:{}", entry.principle),
+                    reasoning: format!(
+                        "High-confidence wisdom ({:.2}) in domain '{}' guides action",
+                        entry.confidence, entry.domain
+                    ),
+                    confidence: entry.confidence,
+                    priority: Priority::Normal,
+                    contradicts: Vec::new(),
+                    timestamp: Utc::now(),
+                });
+            }
+        }
+
         proposals
     }
 
-    fn deliberate(&mut self, proposals: &[Proposal], _state: &ConsciousnessState) -> Vec<Verdict> {
+    fn deliberate(&mut self, proposals: &[Proposal], state: &ConsciousnessState) -> Vec<Verdict> {
+        self.decay_stale_priors();
+
         proposals
             .iter()
             .map(|p| {
                 let mut policy = self.policy.lock();
                 let decision = policy.evaluate(&p.action, "consciousness");
-                let kind = if decision.score >= 0.0 {
-                    VerdictKind::Approve
+
+                let domain = Self::domain_for_action(&p.action);
+                let raw_edge = self.compute_edge(&domain, p.confidence);
+                let friction = 1.0 - state.coherence;
+                let net_edge = raw_edge - friction * 0.1;
+
+                let (kind, confidence) = if decision.score < 0.0 {
+                    (VerdictKind::Reject, (decision.score.abs()).min(1.0))
+                } else if net_edge >= self.min_edge {
+                    let posterior = self.get_prior(&domain);
+                    let kelly = Self::kelly_fraction(net_edge, posterior);
+                    let base_conf = (decision.score.abs()).min(1.0);
+                    (VerdictKind::Approve, base_conf * (0.5 + kelly * 2.0).min(1.0))
                 } else {
-                    VerdictKind::Reject
+                    (
+                        VerdictKind::Reject,
+                        0.3,
+                    )
                 };
 
                 Verdict {
                     voter: AgentKind::Strategy,
                     proposal_id: p.id,
                     kind,
-                    confidence: (decision.score.abs()).min(1.0),
+                    confidence,
                     objection: if kind == VerdictKind::Reject {
                         Some(format!(
-                            "Policy evaluation negative: score={:.2}",
-                            decision.score
+                            "net_edge={net_edge:.3} below min_edge={:.3} (policy={:.2}, friction={friction:.2})",
+                            self.min_edge, decision.score
                         ))
                     } else {
                         None
@@ -171,6 +255,10 @@ impl ConsciousnessAgent for StrategyAgent {
 
     fn reflect(&mut self, outcomes: &[ActionOutcome], state: &ConsciousnessState) {
         for outcome in outcomes {
+            let domain = Self::domain_for_action(&outcome.action);
+            let observation = if outcome.success { outcome.impact } else { 0.1 };
+            self.update_posterior(&domain, observation);
+
             if outcome.success
                 && (outcome.action.contains("expand") || outcome.action.contains("optimize"))
             {
@@ -196,12 +284,113 @@ impl ConsciousnessAgent for StrategyAgent {
 mod tests {
     use super::*;
 
-    #[test]
-    fn strategy_agent_kind() {
+    fn make_agent() -> StrategyAgent {
         let cf = Arc::new(Mutex::new(CounterfactualEngine::new(10, 10)));
         let policy = Arc::new(Mutex::new(PolicyEngine::new(10)));
         let fe = Arc::new(Mutex::new(FreeEnergyState::new(100)));
-        let agent = StrategyAgent::new(cf, policy, fe);
+        StrategyAgent::new(cf, policy, fe)
+    }
+
+    #[test]
+    fn strategy_agent_kind() {
+        let agent = make_agent();
         assert_eq!(agent.kind(), AgentKind::Strategy);
+    }
+
+    #[test]
+    fn bayesian_edge_approval() {
+        let mut agent = make_agent().with_min_edge(0.05);
+
+        agent.priors.insert("research_query".to_string(), 0.8);
+
+        let proposal = Proposal {
+            id: 1,
+            source: AgentKind::Research,
+            action: "research_query:test".to_string(),
+            reasoning: "test".to_string(),
+            confidence: 0.5,
+            priority: Priority::Normal,
+            contradicts: Vec::new(),
+            timestamp: Utc::now(),
+        };
+
+        let state = ConsciousnessState {
+            coherence: 0.9,
+            ..Default::default()
+        };
+
+        let verdicts = agent.deliberate(&[proposal], &state);
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].kind, VerdictKind::Approve);
+    }
+
+    #[test]
+    fn low_edge_rejected() {
+        let mut agent = make_agent().with_min_edge(0.1);
+
+        agent.priors.insert("scan".to_string(), 0.5);
+
+        let proposal = Proposal {
+            id: 1,
+            source: AgentKind::Strategy,
+            action: "scan:world".to_string(),
+            reasoning: "test".to_string(),
+            confidence: 0.5,
+            priority: Priority::Normal,
+            contradicts: Vec::new(),
+            timestamp: Utc::now(),
+        };
+
+        let state = ConsciousnessState {
+            coherence: 0.9,
+            ..Default::default()
+        };
+
+        let verdicts = agent.deliberate(&[proposal], &state);
+        assert_eq!(verdicts[0].kind, VerdictKind::Reject);
+    }
+
+    #[test]
+    fn kelly_fraction_clamped() {
+        assert!(StrategyAgent::kelly_fraction(0.5, 0.3) <= 0.25);
+        assert!(StrategyAgent::kelly_fraction(-0.1, 0.5) == 0.0);
+        assert!(StrategyAgent::kelly_fraction(0.1, 1.0) == 0.0);
+    }
+
+    #[test]
+    fn prior_decay_toward_neutral() {
+        let mut agent = make_agent();
+        agent.priors.insert("test".to_string(), 0.9);
+        agent
+            .ticks_since_prior_update
+            .insert("test".to_string(), 15);
+        agent.decay_stale_priors();
+        let prior = agent.get_prior("test");
+        assert!(prior < 0.9, "prior should decay: {prior}");
+        assert!(prior > 0.5, "prior should not overshoot neutral: {prior}");
+    }
+
+    #[test]
+    fn reflect_updates_posteriors() {
+        let mut agent = make_agent();
+
+        let outcomes = vec![ActionOutcome {
+            agent: AgentKind::Strategy,
+            proposal_id: 1,
+            action: "pursue_goal:test".to_string(),
+            success: true,
+            impact: 0.8,
+            learnings: Vec::new(),
+            timestamp: Utc::now(),
+        }];
+
+        let state = ConsciousnessState::default();
+        agent.reflect(&outcomes, &state);
+
+        let posterior = agent.get_prior("pursue_goal");
+        assert!(
+            posterior > 0.5,
+            "posterior should increase after success: {posterior}"
+        );
     }
 }

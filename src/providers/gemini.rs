@@ -3,7 +3,7 @@
 //! - Gemini CLI OAuth tokens (reuse existing ~/.gemini/ authentication)
 //! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
-use crate::providers::traits::Provider;
+use crate::providers::traits::{InferenceProvider, Provider};
 use async_trait::async_trait;
 use directories::UserDirs;
 use reqwest::Client;
@@ -327,7 +327,7 @@ impl GeminiProvider {
 }
 
 #[async_trait]
-impl Provider for GeminiProvider {
+impl InferenceProvider for GeminiProvider {
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -345,7 +345,6 @@ impl Provider for GeminiProvider {
             )
         })?;
 
-        // Build request
         let system_instruction = system_prompt.map(|sys| Content {
             role: None,
             parts: vec![Part {
@@ -382,12 +381,10 @@ impl Provider for GeminiProvider {
 
         let result: GenerateContentResponse = response.json().await?;
 
-        // Check for API error in response body
         if let Some(err) = result.error {
             anyhow::bail!("Gemini API error: {}", err.message);
         }
 
-        // Extract text from response
         result
             .candidates
             .and_then(|c| c.into_iter().next())
@@ -417,6 +414,9 @@ impl Provider for GeminiProvider {
         Ok(())
     }
 }
+
+#[async_trait]
+impl Provider for GeminiProvider {}
 
 #[cfg(test)]
 mod tests {

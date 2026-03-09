@@ -2043,7 +2043,7 @@ mod tests {
     use super::*;
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
-    use crate::providers::{ChatMessage, Provider};
+    use crate::providers::{ChatMessage, InferenceProvider, Provider};
     use crate::tools::{Tool, ToolResult};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2150,7 +2150,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl Provider for SlowProvider {
+    impl crate::providers::InferenceProvider for SlowProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -2162,6 +2162,9 @@ mod tests {
             Ok(format!("echo: {message}"))
         }
     }
+
+    #[async_trait::async_trait]
+    impl Provider for SlowProvider {}
 
     struct ToolCallingProvider;
 
@@ -2180,7 +2183,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl Provider for ToolCallingProvider {
+    impl crate::providers::InferenceProvider for ToolCallingProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -2208,10 +2211,13 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl Provider for ToolCallingProvider {}
+
     struct ToolCallingAliasProvider;
 
     #[async_trait::async_trait]
-    impl Provider for ToolCallingAliasProvider {
+    impl crate::providers::InferenceProvider for ToolCallingAliasProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -2239,6 +2245,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl Provider for ToolCallingAliasProvider {}
+
     struct IterativeToolProvider {
         required_tool_iterations: usize,
     }
@@ -2253,7 +2262,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl Provider for IterativeToolProvider {
+    impl crate::providers::InferenceProvider for IterativeToolProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -2281,13 +2290,16 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl Provider for IterativeToolProvider {}
+
     #[derive(Default)]
     struct HistoryCaptureProvider {
         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
     }
 
     #[async_trait::async_trait]
-    impl Provider for HistoryCaptureProvider {
+    impl InferenceProvider for HistoryCaptureProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -2314,6 +2326,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl Provider for HistoryCaptureProvider {}
+
     struct MockPriceTool;
 
     #[derive(Default)]
@@ -2323,7 +2338,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl Provider for ModelCaptureProvider {
+    impl InferenceProvider for ModelCaptureProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -2348,6 +2363,9 @@ mod tests {
             Ok("ok".to_string())
         }
     }
+
+    #[async_trait::async_trait]
+    impl Provider for ModelCaptureProvider {}
 
     #[async_trait::async_trait]
     impl Tool for MockPriceTool {

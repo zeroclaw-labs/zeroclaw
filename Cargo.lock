@@ -4732,6 +4732,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-complex"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
+dependencies = [
+ "num-traits",
+ "serde",
+]
+
+[[package]]
 name = "num-conv"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8825,8 +8835,10 @@ dependencies = [
  "http-body-util",
  "landlock",
  "lettre",
+ "libc",
  "mail-parser",
  "matrix-sdk",
+ "num-complex",
  "nusb 0.2.1",
  "opentelemetry",
  "opentelemetry-otlp",

@@ -18,7 +18,7 @@ use zeroclaw::config::MemoryConfig;
 use zeroclaw::memory;
 use zeroclaw::memory::{Memory, MemoryCategory};
 use zeroclaw::observability::{NoopObserver, Observer};
-use zeroclaw::providers::{ChatRequest, ChatResponse, Provider, ToolCall};
+use zeroclaw::providers::{ChatRequest, ChatResponse, InferenceProvider, Provider, ToolCall};
 use zeroclaw::tools::{Tool, ToolResult};
 
 use anyhow::Result;
@@ -66,7 +66,7 @@ impl BenchProvider {
 }
 
 #[async_trait]
-impl Provider for BenchProvider {
+impl InferenceProvider for BenchProvider {
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,
@@ -76,7 +76,10 @@ impl Provider for BenchProvider {
     ) -> Result<String> {
         Ok("fallback".into())
     }
+}
 
+#[async_trait]
+impl Provider for BenchProvider {
     async fn chat(
         &self,
         _request: ChatRequest<'_>,

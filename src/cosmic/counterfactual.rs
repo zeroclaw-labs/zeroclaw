@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
+use num_complex::Complex64;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +126,49 @@ impl CounterfactualEngine {
 
     pub fn simulation_count(&self) -> usize {
         self.simulations.len()
+    }
+
+    pub fn path_integral_select(
+        &mut self,
+        scenarios: &[Scenario],
+        rng: &mut dyn rand::RngCore,
+    ) -> Option<SimulationResult> {
+        if scenarios.is_empty() {
+            return None;
+        }
+
+        let results: Vec<SimulationResult> = scenarios.iter().map(|s| self.simulate(s)).collect();
+
+        let hbar = 0.1;
+        let amplitudes: Vec<Complex64> = results
+            .iter()
+            .map(|r| {
+                let action = r.risk + (1.0 - r.predicted_outcome);
+                Complex64::from_polar(1.0, action / hbar)
+            })
+            .collect();
+
+        let total_norm_sq: f64 = amplitudes.iter().map(|a| a.norm_sqr()).sum();
+        if total_norm_sq < 1e-15 {
+            return results.into_iter().next();
+        }
+
+        let probabilities: Vec<f64> = amplitudes
+            .iter()
+            .map(|a| a.norm_sqr() / total_norm_sq)
+            .collect();
+
+        use rand::Rng;
+        let r: f64 = rng.random();
+        let mut cumulative = 0.0;
+        for (i, p) in probabilities.iter().enumerate() {
+            cumulative += p;
+            if r < cumulative {
+                return Some(results[i].clone());
+            }
+        }
+
+        results.into_iter().last()
     }
 
     pub fn clear_history(&mut self) {
@@ -254,6 +298,40 @@ mod tests {
         let result = engine.simulate(&scenario);
         assert!((result.predicted_outcome - 0.5).abs() < f64::EPSILON);
         assert_eq!(engine.simulation_count(), 1);
+    }
+
+    #[test]
+    fn path_integral_selects_scenario() {
+        let mut engine = CounterfactualEngine::new(10, 100);
+        engine.update_world_state("x", 0.8);
+        engine.update_world_state("y", 0.5);
+        let scenarios = vec![
+            make_scenario("good", vec![("x", 0.8), ("y", 0.5)]),
+            make_scenario("bad", vec![("x", 0.1), ("y", 0.9)]),
+            make_scenario("mid", vec![("x", 0.6), ("y", 0.4)]),
+        ];
+        let mut rng = rand::rng();
+        let result = engine.path_integral_select(&scenarios, &mut rng);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn path_integral_empty_scenarios() {
+        let mut engine = CounterfactualEngine::new(10, 100);
+        let mut rng = rand::rng();
+        let result = engine.path_integral_select(&[], &mut rng);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn path_integral_single_scenario() {
+        let mut engine = CounterfactualEngine::new(10, 100);
+        engine.update_world_state("x", 0.5);
+        let scenarios = vec![make_scenario("only", vec![("x", 0.5)])];
+        let mut rng = rand::rng();
+        let result = engine.path_integral_select(&scenarios, &mut rng);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().scenario_id, "only");
     }
 
     #[test]

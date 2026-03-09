@@ -1,4 +1,4 @@
-use super::traits::{ChatMessage, ChatRequest, ChatResponse};
+use super::traits::{ChatMessage, ChatRequest, ChatResponse, InferenceProvider};
 use super::Provider;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -91,7 +91,7 @@ impl RouterProvider {
 }
 
 #[async_trait]
-impl Provider for RouterProvider {
+impl InferenceProvider for RouterProvider {
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -126,6 +126,19 @@ impl Provider for RouterProvider {
             .await
     }
 
+    async fn warmup(&self) -> anyhow::Result<()> {
+        for (name, provider) in &self.providers {
+            tracing::info!(provider = name, "Warming up routed provider");
+            if let Err(e) = provider.warmup().await {
+                tracing::warn!(provider = name, "Warmup failed (non-fatal): {e}");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Provider for RouterProvider {
     async fn chat(
         &self,
         request: ChatRequest<'_>,
@@ -156,16 +169,6 @@ impl Provider for RouterProvider {
             .get(self.default_index)
             .map(|(_, p)| p.supports_native_tools())
             .unwrap_or(false)
-    }
-
-    async fn warmup(&self) -> anyhow::Result<()> {
-        for (name, provider) in &self.providers {
-            tracing::info!(provider = name, "Warming up routed provider");
-            if let Err(e) = provider.warmup().await {
-                tracing::warn!(provider = name, "Warmup failed (non-fatal): {e}");
-            }
-        }
-        Ok(())
     }
 }
 
@@ -200,7 +203,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for MockProvider {
+    impl InferenceProvider for MockProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -213,6 +216,9 @@ mod tests {
             Ok(self.response.to_string())
         }
     }
+
+    #[async_trait]
+    impl Provider for MockProvider {}
 
     fn make_router(
         providers: Vec<(&'static str, &'static str)>,
@@ -254,7 +260,7 @@ mod tests {
 
     // Arc<MockProvider> should also be a Provider
     #[async_trait]
-    impl Provider for Arc<MockProvider> {
+    impl InferenceProvider for Arc<MockProvider> {
         async fn chat_with_system(
             &self,
             system_prompt: Option<&str>,
@@ -267,6 +273,9 @@ mod tests {
                 .await
         }
     }
+
+    #[async_trait]
+    impl Provider for Arc<MockProvider> {}
 
     #[tokio::test]
     async fn routes_hint_to_correct_provider() {

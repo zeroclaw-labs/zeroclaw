@@ -1,4 +1,6 @@
-use super::traits::{ChatMessage, ChatResponse, StreamChunk, StreamOptions, StreamResult};
+use super::traits::{
+    ChatMessage, ChatResponse, InferenceProvider, StreamChunk, StreamOptions, StreamResult,
+};
 use super::Provider;
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
@@ -247,7 +249,7 @@ impl ReliableProvider {
 }
 
 #[async_trait]
-impl Provider for ReliableProvider {
+impl InferenceProvider for ReliableProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
         for (name, provider) in &self.providers {
             tracing::info!(provider = name, "Warming up provider connection pool");
@@ -467,7 +469,10 @@ impl Provider for ReliableProvider {
             failures.join("\n")
         )
     }
+}
 
+#[async_trait]
+impl Provider for ReliableProvider {
     fn supports_native_tools(&self) -> bool {
         self.providers
             .first()
@@ -663,7 +668,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for MockProvider {
+    impl InferenceProvider for MockProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -692,6 +697,9 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl Provider for MockProvider {}
+
     /// Mock that records which model was used for each call.
     struct ModelAwareMock {
         calls: Arc<AtomicUsize>,
@@ -701,7 +709,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for ModelAwareMock {
+    impl InferenceProvider for ModelAwareMock {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -717,6 +725,9 @@ mod tests {
             Ok(self.response.to_string())
         }
     }
+
+    #[async_trait]
+    impl Provider for ModelAwareMock {}
 
     // ── Existing tests (preserved) ──
 
@@ -1375,7 +1386,7 @@ mod tests {
     // ── Arc<ModelAwareMock> Provider impl for test ──
 
     #[async_trait]
-    impl Provider for Arc<ModelAwareMock> {
+    impl InferenceProvider for Arc<ModelAwareMock> {
         async fn chat_with_system(
             &self,
             system_prompt: Option<&str>,
@@ -1388,4 +1399,7 @@ mod tests {
                 .await
         }
     }
+
+    #[async_trait]
+    impl Provider for Arc<ModelAwareMock> {}
 }

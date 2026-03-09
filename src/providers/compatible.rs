@@ -4,7 +4,8 @@
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, StreamChunk, StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall,
+    InferenceProvider, Provider, StreamChunk, StreamError, StreamOptions, StreamResult,
+    ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
@@ -764,13 +765,7 @@ impl OpenAiCompatibleProvider {
 }
 
 #[async_trait]
-impl Provider for OpenAiCompatibleProvider {
-    fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
-        crate::providers::traits::ProviderCapabilities {
-            native_tool_calling: true,
-        }
-    }
-
+impl InferenceProvider for OpenAiCompatibleProvider {
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -950,6 +945,26 @@ impl Provider for OpenAiCompatibleProvider {
                 }
             })
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))
+    }
+
+    async fn warmup(&self) -> anyhow::Result<()> {
+        if let Some(credential) = self.credential.as_ref() {
+            let url = self.chat_completions_url();
+            let _ = self
+                .apply_auth_header(self.http_client().get(&url), credential)
+                .send()
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Provider for OpenAiCompatibleProvider {
+    fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+        crate::providers::traits::ProviderCapabilities {
+            native_tool_calling: true,
+        }
     }
 
     async fn chat_with_tools(
@@ -1234,20 +1249,6 @@ impl Provider for OpenAiCompatibleProvider {
             rx.recv().await.map(|chunk| (chunk, rx))
         })
         .boxed()
-    }
-
-    async fn warmup(&self) -> anyhow::Result<()> {
-        if let Some(credential) = self.credential.as_ref() {
-            // Hit the chat completions URL with a GET to establish the connection pool.
-            // The server will likely return 405 Method Not Allowed, which is fine -
-            // the goal is TLS handshake and HTTP/2 negotiation.
-            let url = self.chat_completions_url();
-            let _ = self
-                .apply_auth_header(self.http_client().get(&url), credential)
-                .send()
-                .await?;
-        }
-        Ok(())
     }
 }
 

@@ -66,6 +66,7 @@ pub mod observability;
 pub mod onboard;
 pub mod peripherals;
 pub mod providers;
+pub mod quantum;
 pub mod rag;
 pub mod runtime;
 pub mod security;

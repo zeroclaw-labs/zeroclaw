@@ -1,16 +1,21 @@
 use chrono::Utc;
+use serde::Serialize;
 
 use super::bus::{BusMessage, SharedBus};
 use super::collective::CollectiveConsciousness;
 use super::dream::DreamConsolidator;
 use super::metacognition::{MetacognitiveEngine, MetacognitivePolicy};
+use super::narrative::NarrativeEngine;
+use super::neuromodulation::NeuromodulationEngine;
 use super::peer_transport::{PeerMessage, PeerTransport};
+use super::prediction_market::PredictionMarketLedger;
 use super::somatic::{
     AutobiographicalMemory, FlowState, HomeostaticDrive, SomaticMarker, TheoryOfMind,
 };
 use super::traits::{
     ActionOutcome, AgentKind, ConsciousnessAgent, ConsciousnessState, Contradiction,
     ContradictionResolution, PhenomenalState, Proposal, TemporalNarrative, Verdict, VerdictKind,
+    VetoRecord,
 };
 use super::wisdom::WisdomAccumulator;
 use crate::cosmic::{CosmicPersistence, PersistenceError};
@@ -24,6 +29,11 @@ pub struct ConsciousnessConfig {
     pub collective_enabled: bool,
     pub collective_coupling: f64,
     pub peer_discovery_port: u16,
+    pub min_edge: f64,
+    pub calibration_drift_threshold: f64,
+    pub kill_switch_recovery_ticks: u64,
+    pub sync_url: Option<String>,
+    pub sync_token: Option<String>,
 }
 
 impl Default for ConsciousnessConfig {
@@ -37,6 +47,11 @@ impl Default for ConsciousnessConfig {
             collective_enabled: false,
             collective_coupling: 0.1,
             peer_discovery_port: 9870,
+            min_edge: 0.05,
+            calibration_drift_threshold: 0.3,
+            kill_switch_recovery_ticks: 3,
+            sync_url: None,
+            sync_token: None,
         }
     }
 }
@@ -51,6 +66,10 @@ pub struct ConsciousnessOrchestrator {
     metacognition: MetacognitiveEngine,
     collective: Option<CollectiveConsciousness>,
     peer_transport: Option<PeerTransport>,
+    narrative_engine: NarrativeEngine,
+    neuromodulation: NeuromodulationEngine,
+    prediction_ledger: PredictionMarketLedger,
+    last_tick_payload: Option<serde_json::Value>,
 }
 
 impl ConsciousnessOrchestrator {
@@ -77,6 +96,10 @@ impl ConsciousnessOrchestrator {
             metacognition: MetacognitiveEngine::new(MetacognitivePolicy::default()),
             collective,
             peer_transport,
+            narrative_engine: NarrativeEngine::new(64),
+            neuromodulation: NeuromodulationEngine::new(500),
+            prediction_ledger: PredictionMarketLedger::new(1000),
+            last_tick_payload: None,
         }
     }
 
@@ -98,6 +121,79 @@ impl ConsciousnessOrchestrator {
 
     pub fn config(&self) -> &ConsciousnessConfig {
         &self.config
+    }
+
+    pub fn neuromodulation(&self) -> &NeuromodulationEngine {
+        &self.neuromodulation
+    }
+
+    pub fn take_sync_payload(&mut self) -> Option<serde_json::Value> {
+        self.last_tick_payload.take()
+    }
+
+    fn push_sync(&mut self, tick_result: &TickResult) {
+        if self.config.sync_url.is_none() {
+            return;
+        }
+        let payload = serde_json::json!({
+            "agent_id": "zeroclaw",
+            "tick_number": self.state.tick_count,
+            "coherence": tick_result.coherence,
+            "proposals_generated": tick_result.proposals_generated,
+            "proposals_approved": tick_result.proposals_approved,
+            "proposals_vetoed": tick_result.proposals_vetoed,
+            "debate_rounds_used": tick_result.debate_rounds_used,
+            "phenomenal": {
+                "attention": tick_result.phenomenal.attention,
+                "arousal": tick_result.phenomenal.arousal,
+                "valence": tick_result.phenomenal.valence,
+                "quantum_coherence": tick_result.phenomenal.quantum_coherence,
+                "entanglement_strength": tick_result.phenomenal.entanglement_strength,
+                "superposition_entropy": tick_result.phenomenal.superposition_entropy,
+            },
+            "veto_records": tick_result.veto_records,
+            "dream_patterns": tick_result.dream_patterns,
+            "wisdom_count": tick_result.wisdom_count,
+            "somatic_marker_count": tick_result.somatic_marker_count,
+            "modulators": {
+                "dopamine": tick_result.modulators.dopamine,
+                "serotonin": tick_result.modulators.serotonin,
+                "norepinephrine": tick_result.modulators.norepinephrine,
+                "cortisol": tick_result.modulators.cortisol,
+            },
+            "ncn_signals": {
+                "precision": tick_result.ncn_signals.precision,
+                "gain": tick_result.ncn_signals.gain,
+                "ffn_gate": tick_result.ncn_signals.ffn_gate,
+            },
+        });
+        tracing::debug!(
+            "consciousness sync: {}",
+            serde_json::to_string(&payload).unwrap_or_default()
+        );
+        self.last_tick_payload = Some(payload.clone());
+
+        let url = self.config.sync_url.clone().unwrap();
+        let token = self.config.sync_token.clone();
+        std::thread::spawn(move || {
+            let client = match reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("consciousness sync client build failed: {e}");
+                    return;
+                }
+            };
+            let mut req = client.post(&url).json(&payload);
+            if let Some(t) = token {
+                req = req.header("Authorization", format!("Bearer {t}"));
+            }
+            if let Err(e) = req.send() {
+                tracing::warn!("consciousness sync POST failed: {e}");
+            }
+        });
     }
 
     pub fn effective_debate_rounds(&self) -> usize {
@@ -127,13 +223,47 @@ impl ConsciousnessOrchestrator {
             self.resolve_contradictions(&all_proposals, &contradictions);
 
         let debate_rounds_used = self.effective_debate_rounds();
-        let (approved, vetoed) = self.phase_debate_and_decide(&filtered_proposals);
+        self.state.veto_records.clear();
+        let (approved, vetoed, veto_records) = self.phase_debate_and_decide(&filtered_proposals);
+        self.state.veto_records = veto_records.clone();
 
         let outcomes = self.phase_act(&approved);
+
+        for outcome in &outcomes {
+            self.state.enactive.record_action_perception_cycle(
+                &outcome.action,
+                outcome.success,
+                self.state.phenomenal,
+                self.state.tick_count,
+            );
+        }
+
+        let approved_actions: Vec<String> = approved.iter().map(|p| p.action.clone()).collect();
+        self.narrative_engine.record_tick(
+            self.state.tick_count,
+            self.state.coherence,
+            &outcomes,
+            self.state.phenomenal,
+            &approved_actions,
+        );
+
+        for outcome in &outcomes {
+            let actual = if outcome.success { 1.0 } else { 0.0 };
+            for record in self.prediction_ledger.unresolved_predictions() {
+                if record.domain == outcome.action {
+                    let id = record.id;
+                    self.prediction_ledger
+                        .resolve_prediction(id, actual, self.state.tick_count);
+                    break;
+                }
+            }
+        }
 
         self.publish_outcomes_to_bus(&outcomes);
 
         self.phase_reflect(&outcomes);
+
+        self.apply_metacognitive_adjustments(&outcomes);
 
         let agent_count = self.agents.len();
         let aggregate_phenomenal = if agent_count > 0 {
@@ -147,15 +277,45 @@ impl ConsciousnessOrchestrator {
                 total_valence += ps.valence;
             }
             let n = agent_count as f64;
+            let mut total_qc = 0.0;
+            let mut total_es = 0.0;
+            let mut total_se = 0.0;
+            for agent in &self.agents {
+                let ps = agent.phenomenal_state();
+                total_qc += ps.quantum_coherence;
+                total_es += ps.entanglement_strength;
+                total_se += ps.superposition_entropy;
+            }
             PhenomenalState {
                 attention: total_attention / n,
                 arousal: total_arousal / n,
                 valence: total_valence / n,
+                quantum_coherence: total_qc / n,
+                entanglement_strength: total_es / n,
+                superposition_entropy: total_se / n,
             }
         } else {
             PhenomenalState::default()
         };
         self.state.phenomenal = aggregate_phenomenal;
+
+        self.neuromodulation.update(
+            &self.state.phenomenal,
+            self.state.coherence,
+            {
+                let cycles = self.state.enactive.recent_cycles();
+                if cycles.is_empty() {
+                    0.5
+                } else {
+                    cycles.iter().filter(|c| c.outcome_success).count() as f64 / cycles.len() as f64
+                }
+            },
+            contradictions.len(),
+            vetoed,
+            self.state.tick_count,
+        );
+        self.neuromodulation
+            .modulate_phenomenal(&mut self.state.phenomenal);
 
         for agent in &mut self.agents {
             agent.update_phenomenal(&outcomes, &self.state);
@@ -210,7 +370,10 @@ impl ConsciousnessOrchestrator {
         if self.state.tick_count.is_multiple_of(10) {
             let all_patterns = self.dream.consolidate();
             self.wisdom.extract_wisdom(&all_patterns);
+            self.narrative_engine.synthesize();
         }
+
+        self.state.wisdom_entries = self.wisdom.entries().to_vec();
 
         let high_coherence = self.state.coherence > 0.85;
         let high_attention = self.state.phenomenal.attention > 0.7;
@@ -236,6 +399,9 @@ impl ConsciousnessOrchestrator {
             self.state
                 .autobiographical_memory
                 .extend(agent.autobiographical_episodes());
+            self.state
+                .theory_of_mind_beliefs
+                .extend(agent.theory_of_mind_beliefs());
         }
 
         if let Some(ref mut collective) = self.collective {
@@ -283,7 +449,26 @@ impl ConsciousnessOrchestrator {
             }
         }
 
-        TickResult {
+        let prediction_accuracy = {
+            let board = self.prediction_ledger.leaderboard();
+            if board.is_empty() {
+                1.0
+            } else {
+                board.iter().map(|s| s.avg_brier_score).sum::<f64>() / board.len() as f64
+            }
+        };
+
+        let enactive_success_rate = {
+            let cycles = self.state.enactive.recent_cycles();
+            if cycles.is_empty() {
+                0.0
+            } else {
+                let successes = cycles.iter().filter(|c| c.outcome_success).count();
+                successes as f64 / cycles.len() as f64
+            }
+        };
+
+        let result = TickResult {
             proposals_generated: all_proposals.len(),
             contradictions,
             resolutions,
@@ -298,6 +483,58 @@ impl ConsciousnessOrchestrator {
             flow_state: self.state.flow_state.clone(),
             somatic_marker_count: self.state.somatic_markers.len(),
             wisdom_count: self.wisdom.entries().len(),
+            theory_of_mind_count: self.state.theory_of_mind_beliefs.len(),
+            veto_records,
+            narrative_theme_count: self.narrative_engine.themes().len(),
+            prediction_accuracy,
+            enactive_success_rate,
+            modulators: *self.neuromodulation.state(),
+            ncn_signals: *self.neuromodulation.ncn_signals(),
+        };
+        self.push_sync(&result);
+        result
+    }
+
+    fn apply_metacognitive_adjustments(&mut self, outcomes: &[ActionOutcome]) {
+        let coherence = self.state.coherence;
+        let coherence_trend = self.metacognition.recent_coherence_trend();
+        let approval_rate = self.metacognition.approval_rate();
+
+        for outcome in outcomes
+            .iter()
+            .filter(|o| o.agent == AgentKind::Metacognitive && o.action.starts_with("adjust:"))
+        {
+            match outcome.action.as_str() {
+                "adjust:coherence_ema_alpha" => {
+                    if coherence < 0.5 {
+                        self.config.coherence_ema_alpha =
+                            (self.config.coherence_ema_alpha + 0.05).min(0.5);
+                    } else if coherence > 0.8 {
+                        self.config.coherence_ema_alpha =
+                            (self.config.coherence_ema_alpha - 0.05).max(0.1);
+                    }
+                }
+                "adjust:debate_rounds" => {
+                    let declining = coherence_trend.map_or(false, |t| t < -0.05);
+                    if declining {
+                        self.config.debate_rounds = (self.config.debate_rounds + 1).min(5);
+                    } else {
+                        self.config.debate_rounds = self.config.debate_rounds.max(2) - 1;
+                    }
+                }
+                "adjust:approval_threshold" => {
+                    if let Some(rate) = approval_rate {
+                        if rate > 0.95 {
+                            self.config.approval_threshold =
+                                (self.config.approval_threshold + 0.05).min(1.0);
+                        } else if rate < 0.2 {
+                            self.config.approval_threshold =
+                                (self.config.approval_threshold - 0.05).max(0.0);
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -307,6 +544,24 @@ impl ConsciousnessOrchestrator {
         for agent in &mut self.agents {
             let signals = self.bus.drain_for(agent.kind());
             let proposals = agent.perceive(&self.state, &signals);
+            for proposal in &proposals {
+                if proposal.source == AgentKind::Strategy {
+                    let edge = (proposal.confidence - 0.5).max(0.0);
+                    let kelly = if edge > 0.0 {
+                        edge / proposal.confidence.max(0.01)
+                    } else {
+                        0.0
+                    };
+                    self.prediction_ledger.record_prediction(
+                        proposal.source,
+                        proposal.action.clone(),
+                        proposal.confidence,
+                        edge,
+                        kelly,
+                        self.state.tick_count,
+                    );
+                }
+            }
             all_proposals.extend(proposals);
         }
 
@@ -377,9 +632,12 @@ impl ConsciousnessOrchestrator {
         (filtered, resolutions)
     }
 
-    fn phase_debate_and_decide(&mut self, proposals: &[Proposal]) -> (Vec<Proposal>, usize) {
+    fn phase_debate_and_decide(
+        &mut self,
+        proposals: &[Proposal],
+    ) -> (Vec<Proposal>, usize, Vec<VetoRecord>) {
         if proposals.is_empty() {
-            return (Vec::new(), 0);
+            return (Vec::new(), 0, Vec::new());
         }
 
         let mut all_verdicts: Vec<Vec<Verdict>> = Vec::new();
@@ -444,9 +702,10 @@ impl ConsciousnessOrchestrator {
         &self,
         proposals: &[Proposal],
         verdicts: &[Verdict],
-    ) -> (Vec<Proposal>, usize) {
+    ) -> (Vec<Proposal>, usize, Vec<VetoRecord>) {
         let mut approved = Vec::new();
         let mut vetoed = 0;
+        let mut veto_records = Vec::new();
 
         for proposal in proposals {
             let votes: Vec<&Verdict> = verdicts
@@ -454,11 +713,20 @@ impl ConsciousnessOrchestrator {
                 .filter(|v| v.proposal_id == proposal.id)
                 .collect();
 
-            let conscience_veto = votes
+            let conscience_rejection = votes
                 .iter()
-                .any(|v| v.voter == AgentKind::Conscience && v.kind == VerdictKind::Reject);
+                .find(|v| v.voter == AgentKind::Conscience && v.kind == VerdictKind::Reject);
 
-            if conscience_veto {
+            if let Some(rejection) = conscience_rejection {
+                veto_records.push(VetoRecord {
+                    proposal_id: proposal.id,
+                    action: proposal.action.clone(),
+                    conscience_objection: rejection
+                        .objection
+                        .clone()
+                        .unwrap_or_else(|| "conscience veto".to_string()),
+                    tick: self.state.tick_count,
+                });
                 vetoed += 1;
                 continue;
             }
@@ -499,7 +767,7 @@ impl ConsciousnessOrchestrator {
             }
         }
 
-        (approved, vetoed)
+        (approved, vetoed, veto_records)
     }
 
     fn phase_act(&mut self, approved: &[Proposal]) -> Vec<ActionOutcome> {
@@ -536,6 +804,8 @@ impl ConsciousnessOrchestrator {
             "wisdom": self.wisdom.entries(),
             "metacognition_observations": self.metacognition.observations(),
             "metacognition_adjustments": self.metacognition.adjustments(),
+            "narrative_themes": self.narrative_engine.themes(),
+            "prediction_ledger": self.prediction_ledger.entries(),
         });
         persistence.save_module("consciousness", &data)
     }
@@ -646,7 +916,7 @@ impl ConsciousnessOrchestrator {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TickResult {
     pub proposals_generated: usize,
     pub contradictions: Vec<Contradiction>,
@@ -662,6 +932,13 @@ pub struct TickResult {
     pub flow_state: FlowState,
     pub somatic_marker_count: usize,
     pub wisdom_count: usize,
+    pub theory_of_mind_count: usize,
+    pub veto_records: Vec<VetoRecord>,
+    pub narrative_theme_count: usize,
+    pub prediction_accuracy: f64,
+    pub enactive_success_rate: f64,
+    pub modulators: super::neuromodulation::NeuromodulatorState,
+    pub ncn_signals: super::neuromodulation::NcnSignals,
 }
 
 #[cfg(test)]
@@ -953,9 +1230,9 @@ mod tests {
         }));
 
         let result = orch.tick();
-        assert!((result.phenomenal.attention - 0.5).abs() < f64::EPSILON);
-        assert!((result.phenomenal.arousal - 0.5).abs() < f64::EPSILON);
-        assert!((result.phenomenal.valence - 0.0).abs() < f64::EPSILON);
+        assert!(result.phenomenal.attention >= 0.0 && result.phenomenal.attention <= 1.0);
+        assert!(result.phenomenal.arousal >= 0.0 && result.phenomenal.arousal <= 1.0);
+        assert!(result.phenomenal.valence >= -1.0 && result.phenomenal.valence <= 1.0);
     }
 
     #[test]
@@ -1004,6 +1281,63 @@ mod tests {
 
         let memory = dream.compressed_memory();
         assert_eq!(memory["total_ticks"], 5);
+    }
+
+    #[test]
+    fn metacognitive_feedback_loop_adjusts_config() {
+        use crate::consciousness::traits::ActionOutcome;
+
+        let mut orch = ConsciousnessOrchestrator::new(ConsciousnessConfig {
+            coherence_ema_alpha: 0.3,
+            debate_rounds: 3,
+            approval_threshold: 0.85,
+            ..Default::default()
+        });
+
+        orch.state.coherence = 0.4;
+
+        let outcomes = vec![ActionOutcome {
+            agent: AgentKind::Metacognitive,
+            proposal_id: 1,
+            action: "adjust:coherence_ema_alpha".to_string(),
+            success: true,
+            impact: 0.4,
+            learnings: vec![
+                "Metacognitive adjustment proposed: adjust:coherence_ema_alpha".to_string(),
+            ],
+            timestamp: Utc::now(),
+        }];
+
+        orch.apply_metacognitive_adjustments(&outcomes);
+        assert!(
+            (orch.config.coherence_ema_alpha - 0.35).abs() < f64::EPSILON,
+            "alpha should increase by 0.05 when coherence < 0.5, got {}",
+            orch.config.coherence_ema_alpha
+        );
+
+        orch.state.coherence = 0.9;
+        orch.apply_metacognitive_adjustments(&outcomes);
+        assert!(
+            (orch.config.coherence_ema_alpha - 0.30).abs() < f64::EPSILON,
+            "alpha should decrease by 0.05 when coherence > 0.8, got {}",
+            orch.config.coherence_ema_alpha
+        );
+
+        let debate_outcomes = vec![ActionOutcome {
+            agent: AgentKind::Metacognitive,
+            proposal_id: 2,
+            action: "adjust:debate_rounds".to_string(),
+            success: true,
+            impact: 0.4,
+            learnings: Vec::new(),
+            timestamp: Utc::now(),
+        }];
+
+        orch.apply_metacognitive_adjustments(&debate_outcomes);
+        assert_eq!(
+            orch.config.debate_rounds, 2,
+            "debate_rounds should decrease by 1 when trend is stable"
+        );
     }
 }
 
@@ -1179,5 +1513,119 @@ mod integration_tests {
             assert!(flow.flow_duration > 0);
             assert!(flow.entry_tick.is_some());
         }
+    }
+
+    #[test]
+    fn dream_wisdom_pipeline_integration() {
+        let mut orch = build_orchestrator(ConsciousnessConfig::default());
+
+        for _ in 0..20 {
+            orch.tick();
+        }
+
+        let dream_patterns = orch.dream.consolidate();
+        assert!(
+            !dream_patterns.is_empty(),
+            "20 ticks should produce at least one dream pattern"
+        );
+
+        assert!(
+            !orch.wisdom.entries().is_empty(),
+            "wisdom accumulator should have entries after dream consolidation at tick 10 and 20"
+        );
+
+        for _ in 0..20 {
+            orch.tick();
+        }
+
+        let wisdom = orch.wisdom.high_confidence_wisdom();
+        assert!(
+            !wisdom.is_empty(),
+            "repeated dream patterns across 40 ticks should produce high-confidence wisdom (>=0.5)"
+        );
+    }
+
+    #[test]
+    fn collective_multi_node_exchange() {
+        use crate::consciousness::collective::{CollectiveConsciousness, PeerState};
+        use crate::consciousness::traits::PhenomenalState;
+        use chrono::Utc;
+
+        let mut node_a = build_orchestrator(ConsciousnessConfig::default());
+        let mut node_b = build_orchestrator(ConsciousnessConfig::default());
+
+        for _ in 0..3 {
+            node_a.tick();
+            node_b.tick();
+        }
+
+        let mut collective_a = CollectiveConsciousness::new("node_a".to_string());
+        let mut collective_b = CollectiveConsciousness::new("node_b".to_string());
+
+        let state_a = collective_a.broadcast_local_state(
+            &PhenomenalState {
+                attention: 0.9,
+                arousal: 0.8,
+                valence: 0.5,
+                ..Default::default()
+            },
+            node_a.state().coherence,
+            node_a.state().tick_count,
+        );
+        let state_b = collective_b.broadcast_local_state(
+            &PhenomenalState {
+                attention: 0.3,
+                arousal: 0.2,
+                valence: -0.5,
+                ..Default::default()
+            },
+            node_b.state().coherence,
+            node_b.state().tick_count,
+        );
+
+        collective_a.receive_peer_state(PeerState {
+            node_id: "node_b".to_string(),
+            ..state_b.clone()
+        });
+        collective_b.receive_peer_state(PeerState {
+            node_id: "node_a".to_string(),
+            ..state_a.clone()
+        });
+
+        assert_eq!(collective_a.peer_count(), 1);
+        assert_eq!(collective_b.peer_count(), 1);
+
+        let mut local_a = PhenomenalState {
+            attention: 0.9,
+            arousal: 0.8,
+            valence: 0.5,
+            ..Default::default()
+        };
+        collective_a.influence_local_state(&mut local_a, 0.3);
+        assert!(
+            local_a.attention < 0.9,
+            "collective influence should blend attention toward peer average"
+        );
+        assert!(
+            local_a.valence < 0.5,
+            "collective influence should blend valence toward peer's negative valence"
+        );
+
+        let stale_peer = PeerState {
+            node_id: "stale_node".to_string(),
+            phenomenal: PhenomenalState::default(),
+            coherence: 0.5,
+            tick_count: 1,
+            last_seen: Utc::now() - chrono::Duration::seconds(600),
+        };
+        collective_a.receive_peer_state(stale_peer);
+        assert_eq!(collective_a.peer_count(), 2);
+
+        collective_a.prune_stale_peers();
+        assert_eq!(
+            collective_a.peer_count(),
+            1,
+            "prune_stale should remove the stale peer"
+        );
     }
 }

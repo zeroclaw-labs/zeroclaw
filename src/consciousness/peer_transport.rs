@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::collective::PeerState;
 
 const MAX_DATAGRAM_SIZE: usize = 1400;
-const BROADCAST_ADDR: &str = "255.255.255.255";
+const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -33,10 +33,10 @@ impl PeerTransport {
                 if let Err(e) = s.set_nonblocking(true) {
                     tracing::warn!("failed to set udp socket non-blocking: {e}");
                     None
-                } else if let Err(e) = s.set_broadcast(true) {
-                    tracing::warn!("failed to enable udp broadcast: {e}");
-                    Some(s)
                 } else {
+                    if let Err(e) = s.join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED) {
+                        tracing::warn!("failed to join multicast group: {e}");
+                    }
                     Some(s)
                 }
             }
@@ -70,9 +70,7 @@ impl PeerTransport {
             tracing::warn!("discovery message exceeds max datagram size");
             return;
         }
-        let target: SocketAddr = format!("{BROADCAST_ADDR}:{}", self.discovery_port)
-            .parse()
-            .expect("valid broadcast addr");
+        let target: SocketAddr = (MULTICAST_ADDR, self.discovery_port).into();
         let _ = socket.send_to(&data, target);
     }
 
@@ -195,6 +193,7 @@ mod tests {
                         attention: 0.7,
                         arousal: 0.5,
                         valence: 0.1,
+                        ..Default::default()
                     },
                     coherence: 0.9,
                     tick_count: 42,
@@ -234,6 +233,12 @@ mod tests {
                 _ => panic!("mismatched message types"),
             }
         }
+    }
+
+    #[test]
+    fn multicast_address_is_admin_scoped() {
+        assert_eq!(MULTICAST_ADDR, Ipv4Addr::new(239, 255, 42, 1));
+        assert!(MULTICAST_ADDR.is_multicast());
     }
 
     #[test]

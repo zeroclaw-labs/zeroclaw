@@ -209,6 +209,7 @@ mod tests {
                 attention,
                 arousal: 0.5,
                 valence: 0.0,
+                ..Default::default()
             },
             coherence,
             tick_count: 1,
@@ -242,6 +243,7 @@ mod tests {
             attention: 0.5,
             arousal: 0.5,
             valence: 0.0,
+            ..Default::default()
         };
         collective.influence_local_state(&mut local, 0.2);
 
@@ -276,6 +278,7 @@ mod tests {
             attention: 0.7,
             arousal: 0.6,
             valence: 0.3,
+            ..Default::default()
         };
         let state = collective.broadcast_local_state(&phenomenal, 0.95, 100);
         assert_eq!(state.node_id, "node_42");

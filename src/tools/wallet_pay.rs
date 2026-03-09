@@ -2,16 +2,17 @@
 
 use super::traits::{Tool, ToolResult};
 use crate::config::TreasuryConfig;
+use crate::cost::CostTracker;
 use crate::wallet::storage::WalletStore;
 use crate::wallet::x402::{TreasuryLimits, X402Client};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
-/// Executes x402 payment protocol for a given URL, enforcing treasury limits.
 pub struct WalletPayTool {
     store: Arc<WalletStore>,
     treasury_config: TreasuryConfig,
+    cost_tracker: Option<Arc<CostTracker>>,
 }
 
 impl WalletPayTool {
@@ -19,19 +20,34 @@ impl WalletPayTool {
         Self {
             store,
             treasury_config,
+            cost_tracker: None,
         }
     }
 
+    pub fn with_cost_tracker(mut self, tracker: Arc<CostTracker>) -> Self {
+        self.cost_tracker = Some(tracker);
+        self
+    }
+
     fn treasury_limits(&self) -> TreasuryLimits {
+        let (daily_spent_cents, monthly_spent_cents) = self
+            .cost_tracker
+            .as_ref()
+            .and_then(|ct| ct.get_summary().ok())
+            .map(|s| {
+                let daily = (s.daily_cost_usd * 100.0).round() as u64;
+                let monthly = (s.monthly_cost_usd * 100.0).round() as u64;
+                (daily, monthly)
+            })
+            .unwrap_or((0, 0));
+
         TreasuryLimits {
             max_payment_cents: self.treasury_config.max_x402_payment_cents,
             allowed_domains: self.treasury_config.x402_allowed_domains.clone(),
             max_daily_spend_cents: self.treasury_config.max_daily_spend_cents,
             max_monthly_spend_cents: self.treasury_config.max_monthly_spend_cents,
-            // Spend tracking would be wired to CostTracker in production;
-            // for now, start at 0 per session.
-            daily_spent_cents: 0,
-            monthly_spent_cents: 0,
+            daily_spent_cents,
+            monthly_spent_cents,
         }
     }
 }

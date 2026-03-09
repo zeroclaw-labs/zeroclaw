@@ -236,30 +236,15 @@ pub enum ToolsPayload {
 }
 
 #[async_trait]
-pub trait Provider: Send + Sync {
-    /// Query provider capabilities.
-    ///
-    /// Default implementation returns minimal capabilities (no native tool calling).
-    /// Providers should override this to declare their actual capabilities.
-    fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities::default()
-    }
+pub trait InferenceProvider: Send + Sync {
+    async fn chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String>;
 
-    /// Convert tool specifications to provider-native format.
-    ///
-    /// Default implementation returns `PromptGuided` payload, which injects
-    /// tool documentation into the system prompt as text. Providers with
-    /// native tool calling support should override this to return their
-    /// specific format (Gemini, Anthropic, OpenAI).
-    fn convert_tools(&self, tools: &[ToolSpec]) -> ToolsPayload {
-        ToolsPayload::PromptGuided {
-            instructions: build_tool_instructions_text(tools),
-        }
-    }
-
-    /// Simple one-shot chat (single user message, no explicit system prompt).
-    ///
-    /// This is the preferred API for non-agentic direct interactions.
     async fn simple_chat(
         &self,
         message: &str,
@@ -270,19 +255,6 @@ pub trait Provider: Send + Sync {
             .await
     }
 
-    /// One-shot chat with optional system prompt.
-    ///
-    /// Kept for compatibility and advanced one-shot prompting.
-    async fn chat_with_system(
-        &self,
-        system_prompt: Option<&str>,
-        message: &str,
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String>;
-
-    /// Multi-turn conversation. Default implementation extracts the last user
-    /// message and delegates to `chat_with_system`.
     async fn chat_with_history(
         &self,
         messages: &[ChatMessage],
@@ -302,15 +274,29 @@ pub trait Provider: Send + Sync {
             .await
     }
 
-    /// Structured chat API for agent loop callers.
+    async fn warmup(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+pub trait Provider: InferenceProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
+
+    fn convert_tools(&self, tools: &[ToolSpec]) -> ToolsPayload {
+        ToolsPayload::PromptGuided {
+            instructions: build_tool_instructions_text(tools),
+        }
+    }
+
     async fn chat(
         &self,
         request: ChatRequest<'_>,
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
-        // If tools are provided but provider doesn't support native tools,
-        // inject tool instructions into system prompt as fallback.
         if let Some(tools) = request.tools {
             if !tools.is_empty() && !self.supports_native_tools() {
                 let tool_instructions = match self.convert_tools(tools) {
@@ -323,8 +309,6 @@ pub trait Provider: Send + Sync {
                 };
                 let mut modified_messages = request.messages.to_vec();
 
-                // Inject tool instructions into an existing system message.
-                // If none exists, prepend one to the conversation.
                 if let Some(system_message) =
                     modified_messages.iter_mut().find(|m| m.role == "system")
                 {
@@ -357,20 +341,10 @@ pub trait Provider: Send + Sync {
         })
     }
 
-    /// Whether provider supports native tool calls over API.
     fn supports_native_tools(&self) -> bool {
         self.capabilities().native_tool_calling
     }
 
-    /// Warm up the HTTP connection pool (TLS handshake, DNS, HTTP/2 setup).
-    /// Default implementation is a no-op; providers with HTTP clients should override.
-    async fn warmup(&self) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Chat with tool definitions for native function calling support.
-    /// The default implementation falls back to chat_with_history and returns
-    /// an empty tool_calls vector (prompt-based tool use only).
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -386,15 +360,10 @@ pub trait Provider: Send + Sync {
         })
     }
 
-    /// Whether provider supports streaming responses.
-    /// Default implementation returns false.
     fn supports_streaming(&self) -> bool {
         false
     }
 
-    /// Streaming chat with optional system prompt.
-    /// Returns an async stream of text chunks.
-    /// Default implementation falls back to non-streaming chat.
     fn stream_chat_with_system(
         &self,
         _system_prompt: Option<&str>,
@@ -403,12 +372,9 @@ pub trait Provider: Send + Sync {
         _temperature: f64,
         _options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        // Default: return an empty stream (not supported)
         stream::empty().boxed()
     }
 
-    /// Streaming chat with history.
-    /// Default implementation falls back to stream_chat_with_system with last user message.
     fn stream_chat_with_history(
         &self,
         _messages: &[ChatMessage],
@@ -416,12 +382,7 @@ pub trait Provider: Send + Sync {
         _temperature: f64,
         _options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        // For default implementation, we need to convert to owned strings
-        // This is a limitation of the default implementation
-        let provider_name = "unknown".to_string();
-
-        // Create a single empty chunk to indicate not supported
-        let chunk = StreamChunk::error(format!("{} does not support streaming", provider_name));
+        let chunk = StreamChunk::error("provider does not support streaming".to_string());
         stream::once(async move { Ok(chunk) }).boxed()
     }
 }
@@ -466,13 +427,7 @@ mod tests {
     struct CapabilityMockProvider;
 
     #[async_trait]
-    impl Provider for CapabilityMockProvider {
-        fn capabilities(&self) -> ProviderCapabilities {
-            ProviderCapabilities {
-                native_tool_calling: true,
-            }
-        }
-
+    impl InferenceProvider for CapabilityMockProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -481,6 +436,15 @@ mod tests {
             _temperature: f64,
         ) -> anyhow::Result<String> {
             Ok("ok".into())
+        }
+    }
+
+    #[async_trait]
+    impl Provider for CapabilityMockProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+            }
         }
     }
 
@@ -658,17 +622,12 @@ mod tests {
         assert!(instructions.contains("Available Tools"));
     }
 
-    // Mock provider for testing.
     struct MockProvider {
         supports_native: bool,
     }
 
     #[async_trait]
-    impl Provider for MockProvider {
-        fn supports_native_tools(&self) -> bool {
-            self.supports_native
-        }
-
+    impl InferenceProvider for MockProvider {
         async fn chat_with_system(
             &self,
             _system: Option<&str>,
@@ -677,6 +636,13 @@ mod tests {
             _temperature: f64,
         ) -> anyhow::Result<String> {
             Ok("response".to_string())
+        }
+    }
+
+    #[async_trait]
+    impl Provider for MockProvider {
+        fn supports_native_tools(&self) -> bool {
+            self.supports_native
         }
     }
 
@@ -743,17 +709,12 @@ mod tests {
         assert!(response.text.is_some());
     }
 
-    // Provider that echoes the system prompt for assertions.
     struct EchoSystemProvider {
         supports_native: bool,
     }
 
     #[async_trait]
-    impl Provider for EchoSystemProvider {
-        fn supports_native_tools(&self) -> bool {
-            self.supports_native
-        }
-
+    impl InferenceProvider for EchoSystemProvider {
         async fn chat_with_system(
             &self,
             system: Option<&str>,
@@ -765,8 +726,27 @@ mod tests {
         }
     }
 
-    // Provider with custom prompt-guided conversion.
+    #[async_trait]
+    impl Provider for EchoSystemProvider {
+        fn supports_native_tools(&self) -> bool {
+            self.supports_native
+        }
+    }
+
     struct CustomConvertProvider;
+
+    #[async_trait]
+    impl InferenceProvider for CustomConvertProvider {
+        async fn chat_with_system(
+            &self,
+            system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(system.unwrap_or_default().to_string())
+        }
+    }
 
     #[async_trait]
     impl Provider for CustomConvertProvider {
@@ -779,20 +759,22 @@ mod tests {
                 instructions: "CUSTOM_TOOL_INSTRUCTIONS".to_string(),
             }
         }
+    }
 
+    struct InvalidConvertProvider;
+
+    #[async_trait]
+    impl InferenceProvider for InvalidConvertProvider {
         async fn chat_with_system(
             &self,
-            system: Option<&str>,
+            _system: Option<&str>,
             _message: &str,
             _model: &str,
             _temperature: f64,
         ) -> anyhow::Result<String> {
-            Ok(system.unwrap_or_default().to_string())
+            Ok("should_not_reach".to_string())
         }
     }
-
-    // Provider returning an invalid payload for non-native mode.
-    struct InvalidConvertProvider;
 
     #[async_trait]
     impl Provider for InvalidConvertProvider {
@@ -804,16 +786,6 @@ mod tests {
             ToolsPayload::OpenAI {
                 tools: vec![serde_json::json!({"type": "function"})],
             }
-        }
-
-        async fn chat_with_system(
-            &self,
-            _system: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            Ok("should_not_reach".to_string())
         }
     }
 

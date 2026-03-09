@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use chrono::{DateTime, Utc};
+use num_complex::Complex64;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -134,6 +135,100 @@ impl GlobalWorkspace {
             .map(|e| e.subsystem)
             .collect();
         suppressed.extend(already_suppressed);
+
+        let coherence = self.coherence_score(&active);
+        let dominant = active.first().copied();
+
+        let result = BroadcastResult {
+            active_subsystems: active,
+            suppressed_subsystems: suppressed,
+            dominant,
+            coherence,
+            timestamp: Utc::now(),
+        };
+
+        self.broadcast_history.push_back(result.clone());
+        if self.broadcast_history.len() > self.history_capacity {
+            self.broadcast_history.pop_front();
+        }
+
+        result
+    }
+
+    pub fn compete_quantum(&mut self, rng: &mut dyn rand::RngCore) -> BroadcastResult {
+        let candidates: Vec<(SubsystemId, f64)> = self
+            .entries
+            .values()
+            .filter(|e| !e.suppressed)
+            .map(|e| (e.subsystem, e.activation * e.priority))
+            .collect();
+
+        if candidates.is_empty() {
+            return BroadcastResult {
+                active_subsystems: Vec::new(),
+                suppressed_subsystems: self.entries.keys().copied().collect(),
+                dominant: None,
+                coherence: 0.0,
+                timestamp: Utc::now(),
+            };
+        }
+
+        let total: f64 = candidates.iter().map(|(_, s)| s).sum();
+        let amplitudes: Vec<Complex64> = candidates
+            .iter()
+            .map(|(_, s)| {
+                let norm = if total > 1e-15 {
+                    s / total
+                } else {
+                    1.0 / candidates.len() as f64
+                };
+                Complex64::new(norm.sqrt(), 0.0)
+            })
+            .collect();
+
+        let state = crate::quantum::QuantumState::from_amplitudes(amplitudes);
+        let winner_idx = state.measure(rng);
+
+        let mut active = Vec::new();
+        let mut suppressed = Vec::new();
+
+        for (i, (id, _)) in candidates.iter().enumerate() {
+            if i == winner_idx {
+                active.push(*id);
+                if let Some(entry) = self.entries.get_mut(id) {
+                    entry.suppressed = false;
+                    entry.last_broadcast = Utc::now();
+                }
+            }
+        }
+
+        let mut additional_active = 0;
+        let mut ranked = candidates.clone();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (id, _) in &ranked {
+            if active.contains(id) {
+                continue;
+            }
+            let entry = self.entries.get(id).unwrap();
+            if additional_active < self.max_active.saturating_sub(1)
+                && entry.activation >= self.activation_threshold
+            {
+                active.push(*id);
+                additional_active += 1;
+            } else {
+                suppressed.push(*id);
+            }
+        }
+
+        for (id, entry) in &mut self.entries {
+            if active.contains(id) {
+                entry.suppressed = false;
+                entry.last_broadcast = Utc::now();
+            } else if !suppressed.contains(&entry.subsystem) {
+                suppressed.push(entry.subsystem);
+                entry.suppressed = true;
+            }
+        }
 
         let coherence = self.coherence_score(&active);
         let dominant = active.first().copied();
@@ -449,5 +544,56 @@ mod tests {
         assert!(snap.suppressed_subsystems.len() >= 5);
         assert!(snap.coherence > 0.0);
         assert!(snap.dominant.is_some());
+    }
+
+    #[test]
+    fn compete_quantum_selects_winner() {
+        let mut ws = test_workspace();
+        ws.activate(SubsystemId::Memory, 0.9);
+        ws.activate(SubsystemId::FreeEnergy, 0.8);
+        ws.activate(SubsystemId::Causality, 0.7);
+
+        let mut rng = rand::rng();
+        let result = ws.compete_quantum(&mut rng);
+        assert!(!result.active_subsystems.is_empty());
+        assert!(result.dominant.is_some());
+        assert!(result.coherence > 0.0);
+    }
+
+    #[test]
+    fn compete_quantum_empty_workspace() {
+        let mut ws = GlobalWorkspace::new(0.3, 5, 100);
+        let mut rng = rand::rng();
+        let result = ws.compete_quantum(&mut rng);
+        assert!(result.active_subsystems.is_empty());
+        assert!(result.dominant.is_none());
+    }
+
+    #[test]
+    fn compete_quantum_born_rule_statistics() {
+        let mut ws = GlobalWorkspace::new(0.1, 5, 100);
+        ws.register_subsystem(SubsystemId::Memory, 1.0);
+        ws.register_subsystem(SubsystemId::FreeEnergy, 1.0);
+        ws.activate(SubsystemId::Memory, 0.9);
+        ws.activate(SubsystemId::FreeEnergy, 0.1);
+
+        let mut rng = rand::rng();
+        let mut memory_wins = 0;
+        let trials = 500;
+        for _ in 0..trials {
+            ws.activate(SubsystemId::Memory, 0.9);
+            ws.activate(SubsystemId::FreeEnergy, 0.1);
+            ws.unsuppress(SubsystemId::Memory);
+            ws.unsuppress(SubsystemId::FreeEnergy);
+            let result = ws.compete_quantum(&mut rng);
+            if result.active_subsystems.first().copied() == Some(SubsystemId::Memory) {
+                memory_wins += 1;
+            }
+        }
+        let ratio = f64::from(memory_wins) / f64::from(trials);
+        assert!(
+            ratio > 0.6,
+            "Memory (0.9) should win more often than FreeEnergy (0.1), got {ratio}"
+        );
     }
 }

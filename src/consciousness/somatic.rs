@@ -24,10 +24,64 @@ impl HomeostaticDrive {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionPerceptionCycle {
+    pub action: String,
+    pub outcome_success: bool,
+    pub phenomenal: super::traits::PhenomenalState,
+    pub tick: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnactiveLoop {
-    pub perception: String,
-    pub action_tendency: String,
-    pub coupling_strength: f64,
+    cycles: Vec<ActionPerceptionCycle>,
+    capacity: usize,
+}
+
+impl EnactiveLoop {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            cycles: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    pub fn record_action_perception_cycle(
+        &mut self,
+        action: &str,
+        outcome_success: bool,
+        phenomenal: super::traits::PhenomenalState,
+        tick: u64,
+    ) {
+        if self.cycles.len() >= self.capacity {
+            self.cycles.remove(0);
+        }
+        self.cycles.push(ActionPerceptionCycle {
+            action: action.to_string(),
+            outcome_success,
+            phenomenal,
+            tick,
+        });
+    }
+
+    pub fn recent_cycles(&self) -> &[ActionPerceptionCycle] {
+        &self.cycles
+    }
+
+    pub fn action_success_rate(&self, action: &str) -> f64 {
+        let matching: Vec<&ActionPerceptionCycle> =
+            self.cycles.iter().filter(|c| c.action == action).collect();
+        if matching.is_empty() {
+            return 0.0;
+        }
+        let successes = matching.iter().filter(|c| c.outcome_success).count();
+        successes as f64 / matching.len() as f64
+    }
+}
+
+impl Default for EnactiveLoop {
+    fn default() -> Self {
+        Self::new(256)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

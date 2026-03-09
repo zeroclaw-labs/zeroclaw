@@ -1,6 +1,6 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    InferenceProvider, Provider, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -259,7 +259,7 @@ impl OpenAiProvider {
 }
 
 #[async_trait]
-impl Provider for OpenAiProvider {
+impl InferenceProvider for OpenAiProvider {
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -313,6 +313,21 @@ impl Provider for OpenAiProvider {
             .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))
     }
 
+    async fn warmup(&self) -> anyhow::Result<()> {
+        if let Some(credential) = self.credential.as_ref() {
+            self.http_client()
+                .get(format!("{}/models", self.base_url))
+                .header("Authorization", format!("Bearer {credential}"))
+                .send()
+                .await?
+                .error_for_status()?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Provider for OpenAiProvider {
     async fn chat(
         &self,
         request: ProviderChatRequest<'_>,
@@ -356,18 +371,6 @@ impl Provider for OpenAiProvider {
 
     fn supports_native_tools(&self) -> bool {
         true
-    }
-
-    async fn warmup(&self) -> anyhow::Result<()> {
-        if let Some(credential) = self.credential.as_ref() {
-            self.http_client()
-                .get(format!("{}/models", self.base_url))
-                .header("Authorization", format!("Bearer {credential}"))
-                .send()
-                .await?
-                .error_for_status()?;
-        }
-        Ok(())
     }
 }
 

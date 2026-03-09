@@ -1,6 +1,6 @@
 use crate::auth::jwt_verify::extract_account_id_with_fallback;
 use crate::auth::AuthService;
-use crate::providers::traits::Provider;
+use crate::providers::traits::{InferenceProvider, Provider};
 use crate::providers::ProviderRuntimeOptions;
 use async_trait::async_trait;
 use reqwest::Client;
@@ -336,7 +336,7 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<St
 }
 
 #[async_trait]
-impl Provider for OpenAiCodexProvider {
+impl InferenceProvider for OpenAiCodexProvider {
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -410,6 +410,9 @@ impl Provider for OpenAiCodexProvider {
         decode_responses_body(response).await
     }
 }
+
+#[async_trait]
+impl Provider for OpenAiCodexProvider {}
 
 #[cfg(test)]
 mod tests {

@@ -66,7 +66,7 @@ impl ScriptedProvider {
 }
 
 #[async_trait]
-impl Provider for ScriptedProvider {
+impl crate::providers::InferenceProvider for ScriptedProvider {
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,
@@ -76,7 +76,10 @@ impl Provider for ScriptedProvider {
     ) -> Result<String> {
         Ok("fallback".into())
     }
+}
 
+#[async_trait]
+impl Provider for ScriptedProvider {
     async fn chat(
         &self,
         request: ChatRequest<'_>,
@@ -104,7 +107,7 @@ impl Provider for ScriptedProvider {
 struct FailingProvider;
 
 #[async_trait]
-impl Provider for FailingProvider {
+impl crate::providers::InferenceProvider for FailingProvider {
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,
@@ -114,7 +117,10 @@ impl Provider for FailingProvider {
     ) -> Result<String> {
         anyhow::bail!("provider error")
     }
+}
 
+#[async_trait]
+impl Provider for FailingProvider {
     async fn chat(
         &self,
         _request: ChatRequest<'_>,

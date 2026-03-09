@@ -9,6 +9,7 @@ pub mod firejail;
 pub mod landlock;
 pub mod pairing;
 pub mod policy;
+pub mod resource_limits;
 pub mod secrets;
 pub mod traits;
 
@@ -19,6 +20,8 @@ pub use detect::create_sandbox;
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;
 pub use policy::{AutonomyLevel, SecurityPolicy};
+#[allow(unused_imports)]
+pub use resource_limits::ResourceLimits;
 pub use secrets::SecretStore;
 #[allow(unused_imports)]
 pub use traits::NoopSandbox;

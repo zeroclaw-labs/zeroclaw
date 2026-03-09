@@ -278,6 +278,10 @@ enum Commands {
 enum ConsciousnessCommands {
     /// Show consciousness state (coherence, tick count, agent status)
     Status,
+    /// Run one consciousness tick with default agents and print the result
+    Tick,
+    /// Print the consciousness config section
+    Config,
     /// Print current consciousness state (coherence, tick, phenomenal, flow, wisdom count)
     ConsciousnessStatus,
     /// Export full consciousness state to a JSON file
@@ -850,6 +854,57 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                Ok(())
+            }
+            ConsciousnessCommands::Tick => {
+                use consciousness::ConsciousnessOrchestrator;
+                let orch_config = consciousness::ConsciousnessConfig {
+                    debate_rounds: config.consciousness.debate_rounds,
+                    approval_threshold: config.consciousness.approval_threshold,
+                    bus_capacity: config.consciousness.bus_capacity,
+                    sync_url: config.consciousness.sync_url.clone(),
+                    ..consciousness::ConsciousnessConfig::default()
+                };
+                let mut orch = ConsciousnessOrchestrator::new(orch_config);
+                let result = orch.tick();
+                println!("Tick Result:");
+                println!("  Proposals generated: {}", result.proposals_generated);
+                println!("  Proposals approved:  {}", result.proposals_approved);
+                println!("  Proposals vetoed:    {}", result.proposals_vetoed);
+                println!("  Debate rounds used:  {}", result.debate_rounds_used);
+                println!("  Coherence:           {:.4}", result.coherence);
+                println!("  Phenomenal:");
+                println!("    Attention: {:.4}", result.phenomenal.attention);
+                println!("    Arousal:   {:.4}", result.phenomenal.arousal);
+                println!("    Valence:   {:.4}", result.phenomenal.valence);
+                println!("  Veto records:        {}", result.veto_records.len());
+                for vr in &result.veto_records {
+                    println!(
+                        "    [proposal {}] {} — {}",
+                        vr.proposal_id, vr.action, vr.conscience_objection
+                    );
+                }
+                Ok(())
+            }
+            ConsciousnessCommands::Config => {
+                println!("Consciousness Config:");
+                println!("  Enabled:            {}", config.consciousness.enabled);
+                println!(
+                    "  Debate rounds:      {}",
+                    config.consciousness.debate_rounds
+                );
+                println!(
+                    "  Approval threshold: {:.2}",
+                    config.consciousness.approval_threshold
+                );
+                println!(
+                    "  Bus capacity:       {}",
+                    config.consciousness.bus_capacity
+                );
+                println!(
+                    "  Sync URL:           {}",
+                    config.consciousness.sync_url.as_deref().unwrap_or("(none)")
+                );
                 Ok(())
             }
             ConsciousnessCommands::ConsciousnessStatus => {

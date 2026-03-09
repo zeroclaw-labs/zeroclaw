@@ -359,6 +359,7 @@ fn peer_message_state_serialization_roundtrip() {
             attention: 0.7,
             arousal: 0.5,
             valence: 0.1,
+            ..Default::default()
         },
         coherence: 0.85,
         tick_count: 42,
@@ -400,6 +401,7 @@ fn peer_message_size_under_datagram_limit() {
             attention: 1.0,
             arousal: 1.0,
             valence: -1.0,
+            ..Default::default()
         },
         coherence: 0.99,
         tick_count: u64::MAX,
@@ -576,7 +578,7 @@ fn full_orchestrator_tick_with_build_all_agents() {
         integration,
     );
 
-    assert_eq!(agents.len(), 8);
+    assert_eq!(agents.len(), 9);
 
     let mut orch = ConsciousnessOrchestrator::new(ConsciousnessConfig::default());
     for agent in agents {
@@ -587,4 +589,144 @@ fn full_orchestrator_tick_with_build_all_agents() {
     assert!(result.proposals_generated > 0);
     assert!(result.coherence >= 0.0 && result.coherence <= 1.0);
     assert_eq!(orch.state().tick_count, 1);
+}
+
+#[test]
+fn dream_to_wisdom_pipeline_end_to_end() {
+    let subsystems = build_subsystems();
+    let mut orch = build_orchestrator_with_all_agents(&subsystems);
+
+    let mut all_outcomes_count = 0;
+    let mut tick_10_dream_patterns = Vec::new();
+
+    for i in 1..=25 {
+        let result = orch.tick();
+        all_outcomes_count += result.outcomes.len();
+
+        if i == 10 {
+            tick_10_dream_patterns = result.dream_patterns.clone();
+        }
+
+        if i == 20 {
+            assert!(
+                !result.dream_patterns.is_empty() || !tick_10_dream_patterns.is_empty(),
+                "dream consolidation should produce patterns by tick 20; \
+                 outcomes so far: {all_outcomes_count}"
+            );
+
+            assert!(
+                result.wisdom_count > 0,
+                "wisdom entries should exist after tick 20 dream->wisdom pipeline; \
+                 dream_patterns at tick 10: {:?}, at tick 20: {:?}",
+                tick_10_dream_patterns,
+                result.dream_patterns
+            );
+        }
+    }
+
+    assert!(
+        all_outcomes_count > 0,
+        "agents must produce outcomes to feed dream fragments"
+    );
+
+    let final_result = orch.tick();
+    assert!(
+        final_result.wisdom_count > 0,
+        "wisdom should persist after pipeline completes"
+    );
+}
+
+#[test]
+fn collective_consciousness_multi_node() {
+    use zeroclaw::consciousness::collective::CollectiveConsciousness;
+
+    let mut collective = CollectiveConsciousness::new("node_alpha".to_string());
+
+    let local_phenomenal = PhenomenalState {
+        attention: 0.6,
+        arousal: 0.5,
+        valence: 0.2,
+        ..Default::default()
+    };
+    let snapshot = collective.broadcast_local_state(&local_phenomenal, 0.85, 10);
+    assert_eq!(snapshot.node_id, "node_alpha");
+    assert!((snapshot.coherence - 0.85).abs() < f64::EPSILON);
+
+    let remote_state = PeerState {
+        node_id: "node_beta".to_string(),
+        phenomenal: PhenomenalState {
+            attention: 0.9,
+            arousal: 0.7,
+            valence: -0.1,
+            ..Default::default()
+        },
+        coherence: 0.75,
+        tick_count: 8,
+        last_seen: Utc::now(),
+    };
+    collective.receive_peer_state(remote_state);
+    assert_eq!(collective.peer_count(), 1);
+    assert_eq!(collective.field().participant_count, 1);
+    assert!((collective.field().attention - 0.9).abs() < f64::EPSILON);
+
+    let mut local_state = PhenomenalState {
+        attention: 0.5,
+        arousal: 0.5,
+        valence: 0.0,
+        ..Default::default()
+    };
+    let before = local_state;
+    collective.influence_local_state(&mut local_state, 0.3);
+    assert!(
+        (local_state.attention - before.attention).abs() > f64::EPSILON,
+        "influence_local_state should modify attention"
+    );
+    assert!(
+        local_state.attention > before.attention,
+        "attention should move toward the peer field (0.9)"
+    );
+
+    let remote_state_2 = PeerState {
+        node_id: "node_gamma".to_string(),
+        phenomenal: PhenomenalState {
+            attention: 0.3,
+            arousal: 0.4,
+            valence: 0.5,
+            ..Default::default()
+        },
+        coherence: 0.6,
+        tick_count: 5,
+        last_seen: Utc::now() - chrono::Duration::seconds(600),
+    };
+    collective.receive_peer_state(remote_state_2);
+    assert_eq!(collective.peer_count(), 2);
+
+    collective.prune_stale_peers();
+    assert_eq!(
+        collective.peer_count(),
+        1,
+        "stale peer (node_gamma) should be pruned"
+    );
+    assert_eq!(collective.field().participant_count, 1);
+
+    let transport_a = PeerTransport::new("transport_alpha".to_string(), 0);
+    let transport_b = PeerTransport::new("transport_beta".to_string(), 0);
+
+    transport_a.broadcast_discovery();
+    transport_b.broadcast_discovery();
+    assert!(transport_a.known_peer_addrs().is_empty());
+    assert!(transport_b.known_peer_addrs().is_empty());
+
+    let subsystems = build_subsystems();
+    let config = ConsciousnessConfig {
+        collective_enabled: true,
+        peer_discovery_port: 0,
+        ..ConsciousnessConfig::default()
+    };
+    let mut orch = build_orchestrator_with_config(&subsystems, config);
+
+    for _ in 0..5 {
+        let result = orch.tick();
+        assert!(result.coherence >= 0.0 && result.coherence <= 1.0);
+    }
 }

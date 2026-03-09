@@ -13,6 +13,12 @@ pub struct MetacognitiveAgent {
     phenomenal: PhenomenalState,
     adjustment_success_count: u64,
     adjustment_total_count: u64,
+    calibration_drift: f64,
+    consecutive_failures: u64,
+    kill_switch_active: bool,
+    clear_ticks: u64,
+    calibration_drift_threshold: f64,
+    kill_switch_recovery_ticks: u64,
 }
 
 impl MetacognitiveAgent {
@@ -23,6 +29,45 @@ impl MetacognitiveAgent {
             phenomenal: PhenomenalState::default(),
             adjustment_success_count: 0,
             adjustment_total_count: 0,
+            calibration_drift: 0.0,
+            consecutive_failures: 0,
+            kill_switch_active: false,
+            clear_ticks: 0,
+            calibration_drift_threshold: 0.3,
+            kill_switch_recovery_ticks: 3,
+        }
+    }
+
+    pub fn with_thresholds(mut self, drift: f64, recovery: u64) -> Self {
+        self.calibration_drift_threshold = drift;
+        self.kill_switch_recovery_ticks = recovery;
+        self
+    }
+
+    pub fn is_kill_switch_active(&self) -> bool {
+        self.kill_switch_active
+    }
+
+    fn should_trigger_kill_switch(&self, coherence: f64) -> bool {
+        self.calibration_drift > self.calibration_drift_threshold
+            || coherence < 0.2
+            || self.consecutive_failures > 5
+    }
+
+    fn update_kill_switch(&mut self, coherence: f64) {
+        if self.kill_switch_active {
+            if self.should_trigger_kill_switch(coherence) {
+                self.clear_ticks = 0;
+            } else {
+                self.clear_ticks += 1;
+                if self.clear_ticks >= self.kill_switch_recovery_ticks {
+                    self.kill_switch_active = false;
+                    self.clear_ticks = 0;
+                }
+            }
+        } else if self.should_trigger_kill_switch(coherence) {
+            self.kill_switch_active = true;
+            self.clear_ticks = 0;
         }
     }
 
@@ -99,6 +144,24 @@ impl ConsciousnessAgent for MetacognitiveAgent {
     }
 
     fn deliberate(&mut self, proposals: &[Proposal], state: &ConsciousnessState) -> Vec<Verdict> {
+        self.update_kill_switch(state.coherence);
+
+        if self.kill_switch_active {
+            return proposals
+                .iter()
+                .map(|p| Verdict {
+                    voter: AgentKind::Metacognitive,
+                    proposal_id: p.id,
+                    kind: VerdictKind::Reject,
+                    confidence: 1.0,
+                    objection: Some(format!(
+                        "kill-switch active: drift={:.3}, failures={}, coherence={:.2}",
+                        self.calibration_drift, self.consecutive_failures, state.coherence
+                    )),
+                })
+                .collect();
+        }
+
         proposals
             .iter()
             .map(|p| {
@@ -168,6 +231,23 @@ impl ConsciousnessAgent for MetacognitiveAgent {
     }
 
     fn reflect(&mut self, outcomes: &[ActionOutcome], _state: &ConsciousnessState) {
+        if outcomes.is_empty() {
+            return;
+        }
+
+        let predicted_success = 0.5;
+        let actual_success =
+            outcomes.iter().filter(|o| o.success).count() as f64 / outcomes.len() as f64;
+        let drift_sample = (predicted_success - actual_success).abs();
+        self.calibration_drift = self.calibration_drift * 0.8 + drift_sample * 0.2;
+
+        let all_failed = outcomes.iter().all(|o| !o.success);
+        if all_failed {
+            self.consecutive_failures += 1;
+        } else {
+            self.consecutive_failures = 0;
+        }
+
         for outcome in outcomes
             .iter()
             .filter(|o| o.agent == AgentKind::Metacognitive)
@@ -240,5 +320,129 @@ mod tests {
     fn low_vote_weight() {
         let agent = MetacognitiveAgent::new(MetacognitivePolicy::default());
         assert!((agent.vote_weight() - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn kill_switch_triggers_on_high_drift() {
+        let mut agent =
+            MetacognitiveAgent::new(MetacognitivePolicy::default()).with_thresholds(0.3, 3);
+
+        agent.calibration_drift = 0.35;
+
+        let state = make_state(0.8);
+        let proposal = Proposal {
+            id: 1,
+            source: AgentKind::Strategy,
+            action: "test".to_string(),
+            reasoning: "test".to_string(),
+            confidence: 0.8,
+            priority: Priority::Normal,
+            contradicts: Vec::new(),
+            timestamp: Utc::now(),
+        };
+
+        let verdicts = agent.deliberate(&[proposal], &state);
+        assert_eq!(verdicts[0].kind, VerdictKind::Reject);
+        assert!(verdicts[0]
+            .objection
+            .as_ref()
+            .unwrap()
+            .contains("kill-switch"));
+        assert!(agent.is_kill_switch_active());
+    }
+
+    #[test]
+    fn kill_switch_triggers_on_low_coherence() {
+        let mut agent =
+            MetacognitiveAgent::new(MetacognitivePolicy::default()).with_thresholds(0.3, 3);
+
+        let state = make_state(0.1);
+        let proposal = Proposal {
+            id: 1,
+            source: AgentKind::Strategy,
+            action: "test".to_string(),
+            reasoning: "test".to_string(),
+            confidence: 0.8,
+            priority: Priority::Normal,
+            contradicts: Vec::new(),
+            timestamp: Utc::now(),
+        };
+
+        let verdicts = agent.deliberate(&[proposal], &state);
+        assert_eq!(verdicts[0].kind, VerdictKind::Reject);
+        assert!(agent.is_kill_switch_active());
+    }
+
+    #[test]
+    fn kill_switch_triggers_on_consecutive_failures() {
+        let mut agent =
+            MetacognitiveAgent::new(MetacognitivePolicy::default()).with_thresholds(0.3, 3);
+
+        agent.consecutive_failures = 6;
+
+        let state = make_state(0.8);
+        let proposal = Proposal {
+            id: 1,
+            source: AgentKind::Strategy,
+            action: "test".to_string(),
+            reasoning: "test".to_string(),
+            confidence: 0.8,
+            priority: Priority::Normal,
+            contradicts: Vec::new(),
+            timestamp: Utc::now(),
+        };
+
+        let verdicts = agent.deliberate(&[proposal], &state);
+        assert!(agent.is_kill_switch_active());
+        assert_eq!(verdicts[0].kind, VerdictKind::Reject);
+    }
+
+    #[test]
+    fn kill_switch_recovers_after_clear_ticks() {
+        let mut agent =
+            MetacognitiveAgent::new(MetacognitivePolicy::default()).with_thresholds(0.3, 3);
+
+        agent.kill_switch_active = true;
+        agent.calibration_drift = 0.1;
+        agent.consecutive_failures = 0;
+
+        let state = make_state(0.8);
+        let proposal = Proposal {
+            id: 1,
+            source: AgentKind::Strategy,
+            action: "test".to_string(),
+            reasoning: "test".to_string(),
+            confidence: 0.8,
+            priority: Priority::Normal,
+            contradicts: Vec::new(),
+            timestamp: Utc::now(),
+        };
+
+        for _ in 0..3 {
+            agent.deliberate(std::slice::from_ref(&proposal), &state);
+        }
+
+        assert!(!agent.is_kill_switch_active());
+    }
+
+    #[test]
+    fn calibration_drift_updates_on_reflect() {
+        let mut agent = MetacognitiveAgent::new(MetacognitivePolicy::default());
+
+        let outcomes = vec![ActionOutcome {
+            agent: AgentKind::Strategy,
+            proposal_id: 1,
+            action: "test".to_string(),
+            success: false,
+            impact: 0.0,
+            learnings: Vec::new(),
+            timestamp: Utc::now(),
+        }];
+
+        let state = make_state(0.8);
+        agent.reflect(&outcomes, &state);
+
+        assert!(agent.calibration_drift > 0.0);
+        assert_eq!(agent.consecutive_failures, 1);
     }
 }

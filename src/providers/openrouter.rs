@@ -1,6 +1,6 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    InferenceProvider, Provider, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -227,10 +227,8 @@ impl OpenRouterProvider {
 }
 
 #[async_trait]
-impl Provider for OpenRouterProvider {
+impl InferenceProvider for OpenRouterProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
-        // Hit a lightweight endpoint to establish TLS + HTTP/2 connection pool.
-        // This prevents the first real chat request from timing out on cold start.
         if let Some(credential) = self.credential.as_ref() {
             self.http_client()
                 .get("https://openrouter.ai/api/v1/auth/key")
@@ -348,7 +346,10 @@ impl Provider for OpenRouterProvider {
             .map(|c| c.message.content)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))
     }
+}
 
+#[async_trait]
+impl Provider for OpenRouterProvider {
     async fn chat(
         &self,
         request: ProviderChatRequest<'_>,
