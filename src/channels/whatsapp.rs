@@ -142,6 +142,7 @@ impl WhatsAppChannel {
                         channel: "whatsapp".to_string(),
                         timestamp,
                         thread_ts: None,
+                    is_voice: None,
                     });
                 }
             }
