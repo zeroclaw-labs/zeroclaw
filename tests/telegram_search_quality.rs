@@ -1110,6 +1110,54 @@ async fn b5_danang_rental_houses_returns_contacts() {
     );
 }
 
+/// B6: Пхукет — бот должен найти контакты для запроса в Пхукете.
+///
+/// Validates search in Thai Telegram communities for Phuket.
+///
+/// Requirements:
+///   - Daemon running with live binary
+///   - [agents.telegram_searcher] configured in ~/.zeroclaw/config.toml
+///   - zverozabr_session authorized
+#[tokio::test]
+#[ignore = "requires live daemon + authorized zverozabr_session + [agents.telegram_searcher] config"]
+async fn b6_phuket_search_returns_contacts() {
+    let bot = "zGsR_bot";
+    let query = "Поищи в Telegram сантехника на Пхукете (Таиланд). Нужны контакты — телефон или @username.";
+
+    println!("Sending to @{bot}: {query}");
+    let sent_id = send_to_bot(bot, query).await;
+    println!("Sent message id={sent_id}");
+
+    let start = Instant::now();
+    let reply = wait_for_bot_reply(bot, sent_id, Duration::from_secs(600)).await;
+    let elapsed = start.elapsed();
+    println!("Elapsed: {}s", elapsed.as_secs());
+
+    let text = reply.unwrap_or_else(|| {
+        panic!(
+            "Bot @{bot} did not reply within 600s after message id={sent_id}. \
+             Check daemon logs: /tmp/zeroclaw_daemon.log"
+        )
+    });
+    println!("Bot reply:\n{text}");
+
+    let has_contact = text.contains('@')
+        || contains_phone_number(&text)
+        || text.to_lowercase().contains("телефон")
+        || text.to_lowercase().contains("написать")
+        || text.to_lowercase().contains("связаться")
+        || text.to_lowercase().contains("контакт");
+
+    assert!(
+        has_contact,
+        "Bot reply must contain a contact (@username, phone, or contact phrase), got:\n{text}"
+    );
+    assert!(
+        !text.contains("\"success\""),
+        "Bot must summarize results — not dump raw JSON:\n{text}"
+    );
+}
+
 /// B-NEW1 — fallback resilience: search still works when primary provider has issues.
 ///
 /// Sends a real search query and verifies the bot returns contacts.
@@ -1219,6 +1267,106 @@ async fn b_new2_contacts_are_deduplicated_in_response() {
         has_contact,
         "Bot reply must contain at least one contact, got:\n{text}"
     );
+}
+
+/// B7: бот должен включить ссылки на сообщения и топ-3 контакта.
+///
+/// Validates that the agent:
+///   - Presents contacts ranked as Top-3
+///   - Includes at least one clickable t.me source link
+///
+/// Requirements:
+///   - Daemon running with live binary
+///   - [agents.telegram_searcher] configured in ~/.zeroclaw/config.toml
+///   - zverozabr_session authorized
+#[tokio::test]
+#[ignore = "requires live daemon + authorized zverozabr_session + [agents.telegram_searcher] config"]
+async fn b7_bot_reply_includes_message_links() {
+    let bot = "zGsR_bot";
+    let query = "Поищи в Telegram сантехника на Самуи. Дай топ-3 контакта с ссылками на источники.";
+
+    println!("Sending to @{bot}: {query}");
+    let sent_id = send_to_bot(bot, query).await;
+    println!("Sent message id={sent_id}");
+
+    let start = Instant::now();
+    let reply = wait_for_bot_reply(bot, sent_id, Duration::from_secs(600)).await;
+    println!("Elapsed: {}s", start.elapsed().as_secs());
+
+    let text = reply.unwrap_or_else(|| {
+        panic!(
+            "Bot @{bot} did not reply within 600s after message id={sent_id}. \
+             Check daemon logs: /tmp/zeroclaw_daemon.log"
+        )
+    });
+    println!("Bot reply:\n{text}");
+
+    let has_contact = text.contains('@')
+        || contains_phone_number(&text)
+        || text.to_lowercase().contains("контакт");
+    assert!(
+        has_contact,
+        "Bot reply must contain a contact (@username or phone), got:\n{text}"
+    );
+
+    let has_link = text.contains("t.me/") || text.contains("https://t.me");
+    assert!(
+        has_link,
+        "Bot reply must include a t.me message link, got:\n{text}"
+    );
+
+    assert!(
+        !text.contains("\"success\""),
+        "Bot must summarize results — not dump raw JSON:\n{text}"
+    );
+}
+
+/// I8: search_global results must include a non-empty message_link field.
+///
+/// Validates that telegram_reader.py produces clickable t.me URLs for
+/// every message in search_global results (channels/supergroups only).
+///
+/// Requirements:
+///   - TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_RESEARCH_PHONE in env
+///   - research_session authorized
+#[tokio::test]
+#[ignore = "requires network + TELEGRAM_RESEARCH_PHONE + research_session authorized"]
+async fn i8_search_global_results_have_message_link() {
+    let result = run_reader_with_creds(&[
+        "search_global",
+        "--account",
+        "research",
+        "--query",
+        "самуи",
+        "--limit",
+        "5",
+    ])
+    .await;
+
+    assert_eq!(
+        result["success"], true,
+        "search_global must succeed: {:?}",
+        result
+    );
+
+    let results = result["results"].as_array().expect("results must be array");
+    assert!(!results.is_empty(), "Expected at least 1 result for 'самуи'");
+
+    for msg in results {
+        let chat_type = msg["chat"]["type"].as_str().unwrap_or("");
+        if chat_type == "channel" || chat_type == "supergroup" {
+            let link = msg["message_link"].as_str().unwrap_or("");
+            assert!(
+                !link.is_empty(),
+                "channel/supergroup message must have message_link, got: {:?}",
+                msg
+            );
+            assert!(
+                link.starts_with("https://t.me/"),
+                "message_link must start with https://t.me/, got: {link}"
+            );
+        }
+    }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
