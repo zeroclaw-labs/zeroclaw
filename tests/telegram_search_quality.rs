@@ -1369,6 +1369,70 @@ async fn i8_search_global_results_have_message_link() {
     }
 }
 
+/// B8: Дананг — коммерческая недвижимость 100кв+ должна иметь даты и ссылки.
+///
+/// Validates that the agent reply includes:
+///   - at least one contact (@username or phone)
+///   - at least one t.me message link (source)
+///   - at least one date (message date of the source)
+///
+/// Requirements:
+///   - Daemon running with live binary
+///   - [agents.telegram_searcher] configured in ~/.zeroclaw/config.toml
+///   - zverozabr_session authorized
+#[tokio::test]
+#[ignore = "requires live daemon + authorized zverozabr_session + [agents.telegram_searcher] config"]
+async fn b8_danang_commercial_realestate_has_dates_and_links() {
+    let bot = "zGsR_bot";
+    let query = "Поищи коммерческую недвижимость 100кв плюс в Дананге. Топ-3 с датой объявления и ссылкой на источник.";
+
+    println!("Sending to @{bot}: {query}");
+    let sent_id = send_to_bot(bot, query).await;
+    println!("Sent message id={sent_id}");
+
+    let start = Instant::now();
+    let reply = wait_for_bot_reply(bot, sent_id, Duration::from_secs(600)).await;
+    println!("Elapsed: {}s", start.elapsed().as_secs());
+
+    let text = reply.unwrap_or_else(|| {
+        panic!(
+            "Bot @{bot} did not reply within 600s after message id={sent_id}. \
+             Check daemon logs: /tmp/zeroclaw_daemon.log"
+        )
+    });
+    println!("Bot reply:\n{text}");
+
+    let has_contact = text.contains('@')
+        || contains_phone_number(&text)
+        || text.to_lowercase().contains("контакт");
+    assert!(
+        has_contact,
+        "Bot reply must contain a contact (@username or phone), got:\n{text}"
+    );
+
+    let has_link = text.contains("t.me/") || text.contains("https://t.me");
+    assert!(
+        has_link,
+        "Bot reply must include a t.me message link, got:\n{text}"
+    );
+
+    // Date check: accept YYYY-MM-DD, DD.MM.YYYY, or month name in Russian
+    let has_date = text.contains("202") // year like 2025/2026
+        && (text.contains('.') || text.contains('-') // date separator
+            || ["январ", "феврал", "март", "апрел", "май", "июн",
+                "июл", "август", "сентябр", "октябр", "ноябр", "декабр"]
+                .iter().any(|m| text.to_lowercase().contains(m)));
+    assert!(
+        has_date,
+        "Bot reply must include a message date (e.g. 2026-03-01 or март 2026), got:\n{text}"
+    );
+
+    assert!(
+        !text.contains("\"success\""),
+        "Bot must summarize results — not dump raw JSON:\n{text}"
+    );
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Approximate ISO8601 date string from UNIX timestamp (no chrono dependency).
