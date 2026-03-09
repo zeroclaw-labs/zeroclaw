@@ -3069,6 +3069,11 @@ mod tests {
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -3134,6 +3139,11 @@ mod tests {
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -3182,6 +3192,11 @@ mod tests {
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let response = handle_metrics(State(state), test_public_connect_info(), HeaderMap::new())
@@ -3231,6 +3246,11 @@ mod tests {
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let unauthorized =
@@ -3722,6 +3742,11 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -3799,6 +3824,11 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let response = handle_webhook(
@@ -3857,6 +3887,11 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let response = handle_webhook(
@@ -3916,6 +3951,11 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let response = handle_webhook(
@@ -3984,6 +4024,11 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let response = handle_node_control(
@@ -4044,6 +4089,11 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let response = handle_node_control(
@@ -4109,6 +4159,11 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let headers = HeaderMap::new();
@@ -4200,6 +4255,11 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let response = handle_webhook(
@@ -4261,6 +4321,11 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4327,6 +4392,11 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4407,6 +4477,11 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let response = handle_github_webhook(
@@ -4466,6 +4541,11 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let body = r#"{
@@ -4536,6 +4616,11 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let body = r#"{
@@ -4611,6 +4696,11 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -4676,6 +4766,11 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4734,6 +4829,11 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let response = handle_qq_webhook(
@@ -4791,6 +4891,11 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            auth_store: None,
+            channel_pairing: None,
+            auth_allow_registration: false,
+            device_router: None,
+            email_verify_service: None,
         };
 
         let mut headers = HeaderMap::new();

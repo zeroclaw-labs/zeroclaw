@@ -103,6 +103,14 @@ pub struct ConferenceRoom {
     status: Arc<Mutex<RoomStatus>>,
 }
 
+impl std::fmt::Debug for ConferenceRoom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConferenceRoom")
+            .field("room_id", &self.config.room_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Internal state for a participant (includes session handle).
 struct ParticipantState {
     /// Public participant info.
@@ -549,7 +557,7 @@ mod tests {
             room_id: "test-room".into(),
             creator_user_id: "zeroclaw_user".into(),
             max_participants: 5,
-            default_target_lang: LanguageCode::English,
+            default_target_lang: LanguageCode::En,
             api_key: "test-key".into(),
         }
     }
@@ -563,8 +571,8 @@ mod tests {
             .join(
                 "p1".into(),
                 "Participant 1".into(),
-                LanguageCode::Korean,
-                LanguageCode::English,
+                LanguageCode::Ko,
+                LanguageCode::En,
             )
             .await
             .unwrap();
@@ -582,8 +590,8 @@ mod tests {
             .join(
                 "p1".into(),
                 "Participant 1".into(),
-                LanguageCode::Korean,
-                LanguageCode::English,
+                LanguageCode::Ko,
+                LanguageCode::En,
             )
             .await
             .unwrap();
@@ -592,8 +600,8 @@ mod tests {
             .join(
                 "p2".into(),
                 "Participant 2".into(),
-                LanguageCode::English,
-                LanguageCode::Korean,
+                LanguageCode::En,
+                LanguageCode::Ko,
             )
             .await
             .unwrap();
@@ -615,8 +623,8 @@ mod tests {
             .join(
                 "p1".into(),
                 "Participant 1".into(),
-                LanguageCode::Korean,
-                LanguageCode::English,
+                LanguageCode::Ko,
+                LanguageCode::En,
             )
             .await
             .unwrap();
@@ -625,8 +633,8 @@ mod tests {
             .join(
                 "p1".into(),
                 "Duplicate".into(),
-                LanguageCode::Korean,
-                LanguageCode::English,
+                LanguageCode::Ko,
+                LanguageCode::En,
             )
             .await;
 
@@ -641,16 +649,16 @@ mod tests {
         let room = ConferenceRoom::new(config);
 
         let _rx1 = room
-            .join("p1".into(), "P1".into(), LanguageCode::Korean, LanguageCode::English)
+            .join("p1".into(), "P1".into(), LanguageCode::Ko, LanguageCode::En)
             .await
             .unwrap();
         let _rx2 = room
-            .join("p2".into(), "P2".into(), LanguageCode::English, LanguageCode::Korean)
+            .join("p2".into(), "P2".into(), LanguageCode::En, LanguageCode::Ko)
             .await
             .unwrap();
 
         let result = room
-            .join("p3".into(), "P3".into(), LanguageCode::Japanese, LanguageCode::English)
+            .join("p3".into(), "P3".into(), LanguageCode::Ja, LanguageCode::En)
             .await;
 
         assert!(result.is_err());
@@ -662,12 +670,12 @@ mod tests {
         let room = ConferenceRoom::new(test_config());
 
         let mut rx1 = room
-            .join("p1".into(), "P1".into(), LanguageCode::Korean, LanguageCode::English)
+            .join("p1".into(), "P1".into(), LanguageCode::Ko, LanguageCode::En)
             .await
             .unwrap();
         // Skip the join event for p2
         let mut rx2 = room
-            .join("p2".into(), "P2".into(), LanguageCode::English, LanguageCode::Korean)
+            .join("p2".into(), "P2".into(), LanguageCode::En, LanguageCode::Ko)
             .await
             .unwrap();
 
@@ -724,7 +732,7 @@ mod tests {
         let room = ConferenceRoom::new(test_config());
 
         let _rx = room
-            .join("p1".into(), "P1".into(), LanguageCode::Korean, LanguageCode::English)
+            .join("p1".into(), "P1".into(), LanguageCode::Ko, LanguageCode::En)
             .await
             .unwrap();
 
@@ -742,7 +750,7 @@ mod tests {
         let room = ConferenceRoom::new(test_config());
 
         let _rx = room
-            .join("p1".into(), "P1".into(), LanguageCode::Korean, LanguageCode::English)
+            .join("p1".into(), "P1".into(), LanguageCode::Ko, LanguageCode::En)
             .await
             .unwrap();
 
