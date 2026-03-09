@@ -27,6 +27,8 @@ pub mod docker;
 // Prompt injection defense (contributed from RustyClaw, MIT licensed)
 pub mod domain_matcher;
 pub mod estop;
+pub mod iam_policy;
+pub mod nevis;
 #[cfg(target_os = "linux")]
 pub mod firejail;
 #[cfg(feature = "sandbox-landlock")]
@@ -55,6 +57,11 @@ pub use policy::{AutonomyLevel, SecurityPolicy};
 pub use secrets::SecretStore;
 #[allow(unused_imports)]
 pub use traits::{NoopSandbox, Sandbox};
+// Nevis IAM integration
+#[allow(unused_imports)]
+pub use iam_policy::{IamPolicy, PolicyDecision};
+#[allow(unused_imports)]
+pub use nevis::{NevisAuthProvider, NevisIdentity};
 // Prompt injection defense exports
 #[allow(unused_imports)]
 pub use leak_detector::{LeakDetector, LeakResult};

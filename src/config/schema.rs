@@ -3807,6 +3807,10 @@ pub struct SecurityConfig {
     /// Emergency-stop state machine configuration.
     #[serde(default)]
     pub estop: EstopConfig,
+
+    /// Nevis IAM integration for SSO/MFA authentication and role-based access.
+    #[serde(default)]
+    pub nevis: NevisConfig,
 }
 
 /// OTP validation strategy.
@@ -3916,6 +3920,120 @@ impl Default for EstopConfig {
             require_otp_to_resume: true,
         }
     }
+}
+
+
+/// Nevis IAM integration configuration.
+///
+/// When `enabled` is true, ZeroClaw validates incoming requests against a Nevis
+/// Security Suite instance and maps Nevis roles to tool/workspace permissions.
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NevisConfig {
+    /// Enable Nevis IAM integration. Defaults to false for backward compatibility.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Base URL of the Nevis instance (e.g. `https://nevis.example.com`).
+    #[serde(default)]
+    pub instance_url: String,
+
+    /// Nevis realm to authenticate against.
+    #[serde(default = "default_nevis_realm")]
+    pub realm: String,
+
+    /// OAuth2 client ID registered in Nevis.
+    #[serde(default)]
+    pub client_id: String,
+
+    /// OAuth2 client secret. Encrypted via SecretStore when stored on disk.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+
+    /// Token validation strategy: `"local"` (JWKS) or `"remote"` (introspection).
+    #[serde(default = "default_nevis_token_validation")]
+    pub token_validation: String,
+
+    /// JWKS endpoint URL for local token validation.
+    #[serde(default)]
+    pub jwks_url: Option<String>,
+
+    /// Nevis role to ZeroClaw permission mappings.
+    #[serde(default)]
+    pub role_mapping: Vec<NevisRoleMappingConfig>,
+
+    /// Require MFA verification for all Nevis-authenticated requests.
+    #[serde(default)]
+    pub require_mfa: bool,
+
+    /// Session timeout in seconds.
+    #[serde(default = "default_nevis_session_timeout_secs")]
+    pub session_timeout_secs: u64,
+}
+
+impl std::fmt::Debug for NevisConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NevisConfig")
+            .field("enabled", &self.enabled)
+            .field("instance_url", &self.instance_url)
+            .field("realm", &self.realm)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("token_validation", &self.token_validation)
+            .field("jwks_url", &self.jwks_url)
+            .field("role_mapping", &self.role_mapping)
+            .field("require_mfa", &self.require_mfa)
+            .field("session_timeout_secs", &self.session_timeout_secs)
+            .finish()
+    }
+}
+
+fn default_nevis_realm() -> String {
+    "master".into()
+}
+
+fn default_nevis_token_validation() -> String {
+    "local".into()
+}
+
+fn default_nevis_session_timeout_secs() -> u64 {
+    3600
+}
+
+impl Default for NevisConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            instance_url: String::new(),
+            realm: default_nevis_realm(),
+            client_id: String::new(),
+            client_secret: None,
+            token_validation: default_nevis_token_validation(),
+            jwks_url: None,
+            role_mapping: Vec::new(),
+            require_mfa: false,
+            session_timeout_secs: default_nevis_session_timeout_secs(),
+        }
+    }
+}
+
+/// Maps a Nevis role to ZeroClaw tool permissions and workspace access.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NevisRoleMappingConfig {
+    /// Nevis role name (case-insensitive).
+    pub nevis_role: String,
+
+    /// Tool names this role can access. Use `"all"` for unrestricted tool access.
+    #[serde(default)]
+    pub zeroclaw_permissions: Vec<String>,
+
+    /// Workspace names this role can access. Use `"all"` for unrestricted.
+    #[serde(default)]
+    pub workspace_access: Vec<String>,
 }
 
 /// Sandbox configuration for OS-level isolation
@@ -4936,6 +5054,13 @@ impl Config {
                 decrypt_secret(&store, token, "config.gateway.paired_tokens[]")?;
             }
 
+            // Decrypt Nevis IAM secret
+            decrypt_optional_secret(
+                &store,
+                &mut config.security.nevis.client_secret,
+                "config.security.nevis.client_secret",
+            )?;
+
             config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
@@ -5238,6 +5363,34 @@ impl Config {
         // MCP servers
         if self.mcp.enabled {
             validate_mcp_config(&self.mcp)?;
+        }
+
+        // Nevis IAM
+        if self.security.nevis.enabled {
+            let url = self.security.nevis.instance_url.trim();
+            if url.is_empty() {
+                anyhow::bail!(
+                    "security.nevis.instance_url must not be empty when Nevis IAM is enabled"
+                );
+            }
+            if !url.starts_with("https://") {
+                anyhow::bail!(
+                    "security.nevis.instance_url must start with 'https://', got '{}'",
+                    self.security.nevis.instance_url
+                );
+            }
+            let tv = self.security.nevis.token_validation.trim().to_ascii_lowercase();
+            if tv != "local" && tv != "remote" {
+                anyhow::bail!(
+                    "security.nevis.token_validation must be 'local' or 'remote', got '{}'",
+                    self.security.nevis.token_validation
+                );
+            }
+            if self.security.nevis.client_id.trim().is_empty() {
+                anyhow::bail!(
+                    "security.nevis.client_id must not be empty when Nevis IAM is enabled"
+                );
+            }
         }
 
         Ok(())
@@ -5862,6 +6015,13 @@ impl Config {
         for token in &mut config_to_save.gateway.paired_tokens {
             encrypt_secret(&store, token, "config.gateway.paired_tokens[]")?;
         }
+
+        // Encrypt Nevis IAM secret
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.security.nevis.client_secret,
+            "config.security.nevis.client_secret",
+        )?;
 
         let toml_str =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
