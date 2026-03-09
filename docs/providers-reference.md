@@ -61,7 +61,7 @@ credential is not reused for fallback providers.
 | `vllm` | — | Yes | `VLLM_API_KEY` (optional) |
 | `osaurus` | — | Yes | `OSAURUS_API_KEY` (optional; defaults to `"osaurus"`) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
-| `gigachat` |  `sber-gigachat` | No | `GIGACHAT_CREDENTIALS` |
+| `gigachat` |  | No | `GIGACHAT_CREDENTIALS` |
 
 ### Vercel AI Gateway Notes
 

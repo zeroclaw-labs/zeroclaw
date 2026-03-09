@@ -1505,7 +1505,7 @@ pub fn list_providers() -> Vec<ProviderInfo> {
         ProviderInfo {
             name: "gigachat",
             display_name: "GigaChat",
-            aliases: &["sber", "sber-gigachat"],
+            aliases: &[],
             local: false,
         },
         // ── OpenAI-compatible providers ──────────────────────
