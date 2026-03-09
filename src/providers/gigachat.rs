@@ -208,7 +208,7 @@ impl Provider for GigaChatProvider {
     /// Kept for compatibility and advanced one-shot prompting.
     async fn chat_with_system(
         &self,
-        system_prompt: Option<&str>, // TODO: support system prompts
+        system_prompt: Option<&str>,
         message: &str,
         model: &str,
         temperature: f64,
