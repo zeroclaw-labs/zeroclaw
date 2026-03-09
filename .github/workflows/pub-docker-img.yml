@@ -503,7 +503,7 @@ jobs:
 
             - name: Upload Trivy SARIF
               if: always() && steps.trivy-sarif.outputs.exists == 'true'
-              uses: github/codeql-action/upload-sarif@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
+              uses: github/codeql-action/upload-sarif@0d579ffd059c29b07949a3cce3983f0780820c98 # v4
               with:
                   sarif_file: artifacts/trivy-${{ steps.meta.outputs.release_tag }}.sarif
                   category: ghcr-trivy

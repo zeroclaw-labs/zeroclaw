@@ -90,7 +90,7 @@ jobs:
               run: bash ./scripts/ci/ensure_c_toolchain.sh
 
             - name: Initialize CodeQL
-              uses: github/codeql-action/init@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
+              uses: github/codeql-action/init@0d579ffd059c29b07949a3cce3983f0780820c98 # v4
               with:
                   languages: rust
                   config-file: ./.github/codeql/codeql-config.yml
@@ -121,7 +121,7 @@ jobs:
               run: cargo build --workspace --all-targets --locked
 
             - name: Perform CodeQL Analysis
-              uses: github/codeql-action/analyze@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
+              uses: github/codeql-action/analyze@0d579ffd059c29b07949a3cce3983f0780820c98 # v4
               with:
                   category: "/language:rust"
 
