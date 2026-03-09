@@ -208,29 +208,44 @@ impl Provider for GigaChatProvider {
     /// Kept for compatibility and advanced one-shot prompting.
     async fn chat_with_system(
         &self,
-        _system_prompt: Option<&str>, // TODO: support system prompts
+        system_prompt: Option<&str>, // TODO: support system prompts
         message: &str,
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        tracing::debug!(
-            "chat with system model: '{}', message: '{}', temperature: '{}'",
+        tracing::info!(
+            "chat with system model: '{}', message: '{}', temperature: '{}', syestem_prompt: '{}'",
             model,
             message,
-            temperature
+            temperature,
+            system_prompt.unwrap_or_default()
         );
 
         let access_token = self.fetch_auth_token().await?;
 
-        // TODO: better handling - get rid of hardcoded values
-        let request = ChatRequest {
-            model: model.to_string(),
-            messages: vec![Message {
+        let mut messages = vec![];
+        if system_prompt.is_some() {
+            messages.push(Message {
+                role: "system".to_string(),
+                content: Some(system_prompt.unwrap_or_else(|| "").to_string()),
+                functions_state_id: None,
+                attachments: None,
+            });
+        }
+
+        if message.len() > 0 {
+            messages.push(Message {
                 role: "user".to_string(),
                 content: Some(message.to_string()),
                 functions_state_id: None,
                 attachments: None,
-            }],
+            });
+        }
+
+        // TODO: better handling - get rid of hardcoded values
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages: messages,
             stream: false,
             temperature: temperature,
             top_p: 0.0,
