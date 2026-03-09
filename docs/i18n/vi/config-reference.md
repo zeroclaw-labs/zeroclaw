@@ -26,6 +26,34 @@ Lệnh xuất schema:
 | `default_model` | `anthropic/claude-sonnet-4-6` | Model định tuyến qua provider đã chọn |
 | `default_temperature` | `0.7` | Nhiệt độ model |
 
+## `[web_search]`
+
+| Khóa | Mặc định | Mục đích |
+|---|---|---|
+| `enabled` | `false` | Bật `web_search_tool` tích hợp |
+| `provider` | `duckduckgo` | Backend tìm kiếm: `duckduckgo`, `brave` hoặc `searxng` |
+| `brave_api_key` | chưa đặt | API key của Brave khi `provider = "brave"` |
+| `searxng_base_url` | chưa đặt | Base URL của SearXNG khi `provider = "searxng"` |
+| `max_results` | `5` | Số kết quả tối đa trả về cho mỗi truy vấn |
+| `timeout_secs` | `15` | Timeout HTTP cho yêu cầu tìm kiếm |
+
+Lưu ý:
+
+- `duckduckgo` miễn phí và không cần khóa, nhưng cách scrape HTML có thể hỏng khi markup phía nguồn thay đổi.
+- `brave` yêu cầu `brave_api_key`.
+- `searxng` dùng endpoint JSON chuẩn tại `<base_url>/search?...&format=json`.
+
+Ví dụ:
+
+```toml
+[web_search]
+enabled = true
+provider = "searxng"
+searxng_base_url = "https://searxng.example.com"
+max_results = 5
+timeout_secs = 15
+```
+
 ## `[observability]`
 
 | Khóa | Mặc định | Mục đích |
