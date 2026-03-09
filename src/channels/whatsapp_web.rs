@@ -332,11 +332,15 @@ impl Channel for WhatsAppWebChannel {
             // Channel to signal logout from the event handler back to the listen loop.
             let (logout_tx, mut logout_rx) = tokio::sync::broadcast::channel::<()>(1);
 
+            // Tracks whether Event::LoggedOut actually fired (vs task crash).
+            let session_revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
             // Build the bot
             let tx_clone = tx.clone();
             let allowed_numbers = self.allowed_numbers.clone();
             let logout_tx_clone = logout_tx.clone();
             let retry_count_clone = retry_count.clone();
+            let session_revoked_clone = session_revoked.clone();
 
             let mut builder = Bot::builder()
                 .with_backend(backend)
@@ -347,6 +351,7 @@ impl Channel for WhatsAppWebChannel {
                     let allowed_numbers = allowed_numbers.clone();
                     let logout_tx = logout_tx_clone.clone();
                     let retry_count = retry_count_clone.clone();
+                    let session_revoked = session_revoked_clone.clone();
                     async move {
                         match event {
                             Event::Message(msg, info) => {
@@ -423,6 +428,7 @@ impl Channel for WhatsAppWebChannel {
                                 retry_count.store(0, std::sync::atomic::Ordering::Relaxed);
                             }
                             Event::LoggedOut(_) => {
+                                session_revoked.store(true, std::sync::atomic::Ordering::Relaxed);
                                 tracing::warn!(
                                     "WhatsApp Web was logged out — will clear session and reconnect"
                                 );
@@ -532,23 +538,29 @@ impl Channel for WhatsAppWebChannel {
                     );
                 }
 
-                // Remove the session DB and its WAL/SHM sidecars so the next
-                // iteration triggers fresh QR pairing.
-                for path in [
-                    expanded_session_path.clone(),
-                    format!("{expanded_session_path}-wal"),
-                    format!("{expanded_session_path}-shm"),
-                ] {
-                    match tokio::fs::remove_file(&path).await {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => tracing::warn!(
-                            "WhatsApp Web: failed to remove session file {}: {e}",
-                            path
-                        ),
+                // Only purge session files when LoggedOut was explicitly observed.
+                // A transient task crash (Err from recv) should not wipe a valid session.
+                if session_revoked.load(std::sync::atomic::Ordering::Relaxed) {
+                    for path in [
+                        expanded_session_path.clone(),
+                        format!("{expanded_session_path}-wal"),
+                        format!("{expanded_session_path}-shm"),
+                    ] {
+                        match tokio::fs::remove_file(&path).await {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => tracing::warn!(
+                                "WhatsApp Web: failed to remove session file {}: {e}",
+                                path
+                            ),
+                        }
                     }
+                    tracing::info!("WhatsApp Web: session files removed, restarting for QR pairing");
+                } else {
+                    tracing::warn!(
+                        "WhatsApp Web: bot stopped without LoggedOut; reconnecting with existing session"
+                    );
                 }
-                tracing::info!("WhatsApp Web: session files removed, restarting for QR pairing");
 
                 let delay = std::cmp::min(
                     BASE_DELAY_SECS.saturating_mul(2u64.saturating_pow(attempts - 1)),
