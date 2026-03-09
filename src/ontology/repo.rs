@@ -131,13 +131,46 @@ impl OntologyRepo {
         Ok(conn.last_insert_rowid())
     }
 
-    /// Get an object by ID.
+    /// Get an object by ID (internal use only — no owner filter).
+    ///
+    /// Callers operating on behalf of an external user should prefer
+    /// [`get_object_for_owner`] to enforce ownership isolation.
     pub fn get_object(&self, id: i64) -> anyhow::Result<Option<OntologyObject>> {
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT id, type_id, title, properties, owner_user_id, created_at, updated_at
              FROM ontology_objects WHERE id = ?1",
             params![id],
+            |r| {
+                Ok(OntologyObject {
+                    id: r.get(0)?,
+                    type_id: r.get(1)?,
+                    title: r.get(2)?,
+                    properties: parse_json_col(r.get::<_, String>(3)?),
+                    owner_user_id: r.get(4)?,
+                    created_at: r.get(5)?,
+                    updated_at: r.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Get an object by ID, enforcing ownership isolation.
+    ///
+    /// Returns `None` if the object does not exist **or** belongs to a
+    /// different user — preventing cross-user data leakage.
+    pub fn get_object_for_owner(
+        &self,
+        id: i64,
+        owner_user_id: &str,
+    ) -> anyhow::Result<Option<OntologyObject>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT id, type_id, title, properties, owner_user_id, created_at, updated_at
+             FROM ontology_objects WHERE id = ?1 AND owner_user_id = ?2",
+            params![id, owner_user_id],
             |r| {
                 Ok(OntologyObject {
                     id: r.get(0)?,

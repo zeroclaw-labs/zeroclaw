@@ -67,7 +67,20 @@ impl ActionDispatcher {
         // 3. Update action log based on result.
         match &result {
             Ok(value) => {
-                self.repo.complete_action(action_id, value)?;
+                // Check if the tool explicitly reported failure via success field.
+                let tool_failed = value
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .map_or(false, |s| !s);
+                if tool_failed {
+                    let err_msg = value
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("tool reported failure");
+                    self.repo.fail_action(action_id, err_msg)?;
+                } else {
+                    self.repo.complete_action(action_id, value)?;
+                }
             }
             Err(e) => {
                 self.repo.fail_action(action_id, &e.to_string())?;
@@ -387,7 +400,7 @@ impl ActionDispatcher {
             .get("document_object_id")
             .and_then(|v| v.as_i64())
         {
-            if let Some(obj) = self.repo.get_object(doc_id)? {
+            if let Some(obj) = self.repo.get_object_for_owner(doc_id, &req.owner_user_id)? {
                 obj.properties
                     .get("content")
                     .or_else(|| obj.properties.get("raw_body"))
