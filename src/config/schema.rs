@@ -421,10 +421,29 @@ pub struct OpenClawNodeConfig {
     /// Maximum reconnect backoff in seconds (default: 30)
     #[serde(default = "default_openclaw_reconnect_backoff")]
     pub reconnect_max_backoff_secs: u64,
+
+    /// Accept self-signed / invalid TLS certificates. For dev environments only.
+    #[serde(default)]
+    pub accept_invalid_certs: bool,
 }
 
 fn default_openclaw_reconnect_backoff() -> u64 {
     30
+}
+
+impl Default for OpenClawNodeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gateway_url: None,
+            gateway_token: None,
+            node_id: None,
+            display_name: None,
+            device_key_path: None,
+            reconnect_max_backoff_secs: 30,
+            accept_invalid_certs: false,
+        }
+    }
 }
 
 /// Cluster configuration for multi-node multi-agent setups.

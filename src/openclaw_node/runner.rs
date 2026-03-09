@@ -24,7 +24,7 @@ impl OpenClawNodeRunner {
             .ok_or(anyhow!("openclaw_node not configured"))?;
 
         if !openclaw_config.enabled {
-            return Err(anyhow!("openclaw_node is disabled"));
+            return Err(anyhow!("openclaw_node is disabled in config (set enabled = true or use 'zeroclaw node-run')"));
         }
 
         let gateway_url = openclaw_config
@@ -45,17 +45,24 @@ impl OpenClawNodeRunner {
                 .and_then(|h| h.into_string().ok())
                 .unwrap_or_else(|| "zeroclaw-node".to_string()));
 
+        let home = dirs::home_dir().unwrap_or_default();
+        let default_key_path = home.join(".zeroclaw").join("openclaw-device-key.json");
         let device_key_path = openclaw_config
             .device_key_path
             .as_deref()
             .map(Path::new)
-            .unwrap_or_else(|| {
-                let home = dirs::home_dir().unwrap_or_default();
-                Box::leak(Box::new(home.join(".zeroclaw").join("openclaw-device-key")))
-            });
+            .unwrap_or(&default_key_path);
 
         // Load or create device identity
         let device_identity = DeviceIdentity::load_or_create(device_key_path)?;
+
+        eprintln!("openclaw node: device_id={}", device_identity.device_id());
+        eprintln!("openclaw node: node_id={node_id} display_name={display_name}");
+        eprintln!("openclaw node: gateway={gateway_url}");
+        eprintln!("openclaw node: identity_path={}", device_key_path.display());
+        if openclaw_config.gateway_token.is_none() {
+            eprintln!("openclaw node: WARNING — no gateway_token configured; connection will likely be rejected");
+        }
 
         // Create handler that delegates to agent
         let handler = Box::new(AgentDelegationHandler {
@@ -63,7 +70,7 @@ impl OpenClawNodeRunner {
             node_id: node_id.clone(),
         });
 
-        // Create and run client
+        // Create and run client (auto-reconnects)
         let mut client = OpenClawClient::new(
             gateway_url,
             node_id,
@@ -71,6 +78,11 @@ impl OpenClawNodeRunner {
             device_identity,
             openclaw_config.gateway_token.clone(),
         );
+
+        if openclaw_config.accept_invalid_certs {
+            eprintln!("openclaw node: WARNING — TLS certificate verification disabled (accept_invalid_certs=true)");
+            client = client.with_accept_invalid_certs();
+        }
 
         client.run(handler).await
     }

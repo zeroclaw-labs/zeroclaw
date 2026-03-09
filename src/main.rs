@@ -52,6 +52,7 @@ mod agent;
 mod approval;
 mod auth;
 mod channels;
+mod cluster;
 mod rag {
     pub use zeroclaw::rag::*;
 }
@@ -72,6 +73,7 @@ mod migration;
 mod multimodal;
 mod observability;
 mod onboard;
+mod openclaw_node;
 mod peripherals;
 mod providers;
 mod runtime;
@@ -243,6 +245,43 @@ Examples:
         /// Host to bind to; defaults to config gateway.host
         #[arg(long)]
         host: Option<String>,
+    },
+
+    /// Connect to an OpenClaw gateway as a persistent node (delegation mode)
+    #[command(long_about = "\
+Connect this ZeroClaw instance to an OpenClaw gateway as a persistent node.
+
+The node authenticates with a device identity keypair (auto-generated on first run,
+persisted at ~/.zeroclaw/openclaw-device-key). On first connection the gateway issues
+a pairing request — approve it in OpenClaw (Nodes → Pending) then re-run.
+
+Env vars override config: OPENCLAW_GATEWAY_URL, OPENCLAW_GATEWAY_TOKEN, OPENCLAW_INSECURE=1
+
+Examples:
+  zeroclaw node-run                                    # use config defaults
+  zeroclaw node-run --token <tok>                      # override token
+  zeroclaw node-run --gateway-url wss://host           # override URL
+  OPENCLAW_INSECURE=1 zeroclaw node-run                # allow self-signed cert")]
+    NodeRun {
+        /// Gateway WebSocket URL (overrides config/env)
+        #[arg(long)]
+        gateway_url: Option<String>,
+
+        /// Gateway auth token (overrides config/env)
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Node ID (overrides config)
+        #[arg(long)]
+        node_id: Option<String>,
+
+        /// Display name (overrides config)
+        #[arg(long)]
+        display_name: Option<String>,
+
+        /// Accept self-signed / invalid TLS certificates (dev only)
+        #[arg(long)]
+        insecure: bool,
     },
 
     /// Manage OS service lifecycle (launchd/systemd user service)
@@ -790,6 +829,37 @@ async fn main() -> Result<()> {
                 info!("🧠 Starting ZeroClaw Daemon on {host}:{port}");
             }
             daemon::run(config, host, port).await
+        }
+
+        Commands::NodeRun {
+            gateway_url,
+            token,
+            node_id,
+            display_name,
+            insecure,
+        } => {
+            use openclaw_node::runner::OpenClawNodeRunner;
+
+            // Env-var and CLI-arg overrides (priority: CLI arg > env var > config)
+            let token = token
+                .or_else(|| std::env::var("OPENCLAW_GATEWAY_TOKEN").ok());
+            let gateway_url = gateway_url
+                .or_else(|| std::env::var("OPENCLAW_GATEWAY_URL").ok());
+            let insecure = insecure
+                || std::env::var("OPENCLAW_INSECURE").map_or(false, |v| v == "1" || v.to_lowercase() == "true");
+
+            // Apply overrides onto the config
+            let mut run_config = config.clone();
+            let node_cfg = run_config.openclaw_node.get_or_insert_with(Default::default);
+            node_cfg.enabled = true; // running this command implies enabled
+            if let Some(u) = gateway_url { node_cfg.gateway_url = Some(u); }
+            if let Some(t) = token { node_cfg.gateway_token = Some(t); }
+            if let Some(id) = node_id { node_cfg.node_id = Some(id); }
+            if let Some(name) = display_name { node_cfg.display_name = Some(name); }
+            if insecure { node_cfg.accept_invalid_certs = true; }
+
+            info!("🔗 Starting ZeroClaw OpenClaw node...");
+            OpenClawNodeRunner::new(run_config).run().await
         }
 
         Commands::Status => {
