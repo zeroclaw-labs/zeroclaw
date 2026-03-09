@@ -293,6 +293,19 @@ pub fn merge_deltas_lww(
         let key = match &delta.operation {
             crate::memory::sync::DeltaOperation::Store { key, .. }
             | crate::memory::sync::DeltaOperation::Forget { key } => key.clone(),
+            // Ontology deltas use their delta ID as the dedup key.
+            crate::memory::sync::DeltaOperation::OntologyObjectUpsert { object_id, .. } => {
+                format!("onto_obj_{object_id}")
+            }
+            crate::memory::sync::DeltaOperation::OntologyLinkCreate {
+                from_object_id,
+                to_object_id,
+                link_type_name,
+                ..
+            } => format!("onto_link_{link_type_name}_{from_object_id}_{to_object_id}"),
+            crate::memory::sync::DeltaOperation::OntologyActionLog { .. } => {
+                delta.id.clone()
+            }
         };
 
         match winners.get(&key) {

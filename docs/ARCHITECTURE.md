@@ -473,6 +473,7 @@ src/
 ├── task_category.rs     # Category definitions + tool routing ← MoA addition
 ├── gatekeeper/          # Local SLM intent classification  ← MoA addition
 ├── billing/             # Credit-based billing system      ← MoA addition
+├── ontology/            # Structured relational memory — digital twin graph ← MoA addition
 ├── sync/                # E2E encrypted memory sync engine (patent impl)
 ├── peripherals/         # Hardware peripherals (STM32, RPi GPIO)
 ├── runtime/             # Runtime adapters
@@ -480,6 +481,15 @@ src/
 ├── telemetry/           # Telemetry collection
 ├── plugins/             # Plugin loader
 └── ...                  # (auth, hooks, rag, etc.)
+
+web/                     # Web dashboard UI (Vite + React + TypeScript)  ← MoA addition
+├── src/pages/           # AgentChat, Config, Cost, Cron, Dashboard, Devices, …
+├── src/components/      # Shared React components
+└── vite.config.ts
+
+site/                    # Main website / homepage (Vite + React + TypeScript) ← MoA addition
+├── src/pages/           # Landing, pricing, docs, web-chat entry
+└── vite.config.ts
 ```
 
 ### Platform Targets
@@ -511,9 +521,292 @@ The ZeroClaw runtime is invisible to end users.
 | `Peripheral` | `src/peripherals/traits.rs` | Hardware board abstraction |
 | `VoiceProvider` | `src/voice/pipeline.rs` | Voice API streaming |
 | `CodeReviewer` | `src/coding/traits.rs` | AI code review agent |
+| `OntologyRepo` | `src/ontology/repo.rs` | Structured relational memory CRUD |
 
 **Rule**: New capabilities are added by implementing traits + factory
 registration, NOT by cross-module rewrites.
+
+---
+
+## 6A. Structured Relational Memory — Digital Twin Graph Layer
+
+### Goal
+
+Elevate MoA's memory from a flat text store to a **structured knowledge
+graph** that models the user's real world as a digital twin. Objects
+(nouns), Links (relationships), and Actions (verbs) form a graph that the
+LLM agent queries and mutates through dedicated tools — enabling
+contextual reasoning, preference persistence, and automated graph
+maintenance.
+
+### Why This Matters
+
+MoA's existing episodic memory (SQLite FTS5 + vector embeddings) stores
+raw text chunks. It is powerful for recall, but it cannot answer
+structural questions like "which contacts belong to Project X?" or
+"what did I tell 김부장 last week?". The ontology layer sits **above**
+the existing memory and provides a typed, relational view of the user's
+world without replacing the episodic layer.
+
+### Layer Stack
+
+```
+┌──────────────────────────────────────────────────┐
+│  LLM Agent (brain)                               │
+│  ┌────────────────────────────────────────────┐  │
+│  │ Ontology Tools:                            │  │
+│  │  ontology_get_context                      │  │
+│  │  ontology_search_objects                   │  │
+│  │  ontology_execute_action                   │  │
+│  └────────────────┬───────────────────────────┘  │
+│                   │                              │
+│  ┌────────────────▼───────────────────────────┐  │
+│  │ Ontology Layer (src/ontology/)             │  │
+│  │  OntologyRepo   — CRUD on objects/links    │  │
+│  │  ActionDispatcher — route → ZeroClaw tools │  │
+│  │  RuleEngine     — post-action automation   │  │
+│  │  ContextBuilder — snapshot for LLM prompt  │  │
+│  └────────────────┬───────────────────────────┘  │
+│                   │                              │
+│  ┌────────────────▼───────────────────────────┐  │
+│  │ Existing Memory Layer                      │  │
+│  │  brain.db (SQLite + FTS5 + vec embeddings) │  │
+│  │  + ontology tables coexist in same DB      │  │
+│  └────────────────────────────────────────────┘  │
+│                   │                              │
+│  ┌────────────────▼───────────────────────────┐  │
+│  │ ZeroClaw Tool Layer (70+ tools)            │  │
+│  │  shell, http, kakao, browser, cron, ...    │  │
+│  └────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────┘
+```
+
+### Core Triple: Object / Link / Action
+
+| Concept | Table | Example |
+|---------|-------|---------|
+| **Object** (noun) | `ontology_objects` | User, Contact, Task, Document, Project, Preference |
+| **Link** (relationship) | `ontology_links` | User → owns → Task, Contact → belongs_to → Project |
+| **Action** (verb) | `ontology_actions` | SendMessage, CreateTask, FetchResource, SavePreference |
+
+Each concept has a **meta-type** table (`ontology_object_types`,
+`ontology_link_types`, `ontology_action_types`) that defines the schema,
+and an **instance** table that stores actual data. All tables coexist in
+`brain.db` alongside the existing memory tables — no separate database
+file is needed.
+
+### Module Structure (`src/ontology/`)
+
+| File | Component | Responsibility |
+|------|-----------|----------------|
+| `types.rs` | Data types | `ObjectType`, `LinkType`, `ActionType`, `OntologyObject`, `OntologyLink`, `OntologyAction`, `ActionStatus`, `ActorKind`, request/response types |
+| `schema.rs` | Schema init | `init_ontology_schema()` — 6 tables + FTS5 index; `seed_default_types()` — default object/link/action types |
+| `repo.rs` | Repository | `OntologyRepo` with `Arc<Mutex<Connection>>` — CRUD operations, FTS5 search, `ensure_object()` upsert, `list_objects_by_type()` |
+| `dispatcher.rs` | Action routing | `ActionDispatcher` — 4-step execute flow: log pending → route to tool → update result → run rules |
+| `rules.rs` | Rule engine | `RuleEngine` — type-specific rules (SendMessage, CreateTask, etc.) + cross-cutting rules (auto-tag clients, group tasks, channel profiling) |
+| `context.rs` | Context builder | `ContextBuilder` — builds `ContextSnapshot` (user, contacts, tasks, projects, recent actions) for LLM prompt injection |
+| `tools.rs` | LLM tools | `OntologyGetContextTool`, `OntologySearchObjectsTool`, `OntologyExecuteActionTool` — implement `Tool` trait |
+| `mod.rs` | Entry point | Module re-exports |
+
+### ActionDispatcher: 4-Step Execution Flow
+
+```
+1. Log action as "pending" in ontology_actions
+         │
+         ▼
+2. Route to handler:
+   ├── Internal ontology operation (CreateObject, CreateLink, SavePreference, …)
+   └── ZeroClaw tool execution (SendMessage→kakao_send, FetchResource→http_fetch, …)
+         │
+         ▼
+3. Update action log with result + status (success/error)
+         │
+         ▼
+4. Trigger RuleEngine.apply_post_action_rules()
+   ├── Type-specific rules (SendMessage → link Contact↔Task)
+   └── Cross-cutting rules (auto-tag important clients, group tasks into projects)
+```
+
+### RuleEngine Design
+
+Rules are **deterministic**, **additive** (create/strengthen links, never
+delete), and **non-fatal** (failures log warnings but don't roll back the
+action). Current rules:
+
+| Rule | Trigger | Effect |
+|------|---------|--------|
+| `rule_send_message` | `SendMessage` succeeds | Link the Contact to the related Task/Document |
+| `rule_create_task` | `CreateTask` succeeds | Auto-link Task to Project if project name present in params |
+| `rule_fetch_resource` | `FetchResource` succeeds | Upsert Document object for fetched URL |
+| `rule_summarize_document` | `SummarizeDocument` succeeds | Store summary in Document properties |
+| `rule_save_preference` | `SavePreference` succeeds | Upsert Preference object for user |
+| `rule_auto_tag_important_client` | Any action | Promote Contact to "important" if interaction count ≥ threshold |
+| `rule_auto_group_tasks_into_project` | Any action | Auto-create Project↔Task links based on keyword matching |
+| `rule_channel_profiling` | Any action | Record per-channel interaction frequency in User properties |
+
+### ContextBuilder: LLM Prompt Injection
+
+The `ContextBuilder` produces a `ContextSnapshot` — a compact JSON
+object injected into the LLM system prompt so the agent understands the
+user's current world state:
+
+```json
+{
+  "user": { "title": "Alice", "properties": { "preferred_language": "ko", … } },
+  "current_context": { "title": "Office - morning", … },
+  "recent_contacts": [ … ],
+  "recent_tasks": [ … ],
+  "recent_projects": [ … ],
+  "recent_actions": [ { "action_type": "SendMessage", "status": "success", … } ]
+}
+```
+
+This is triggered via `SystemPromptBuilder` in `src/agent/prompt.rs`,
+which loads the ontology section including auto-injected user preferences
+from `brain.db`.
+
+### Ontology Tools (LLM Interface)
+
+Three tools are registered in `src/tools/mod.rs` and exposed to the LLM:
+
+| Tool Name | Purpose |
+|-----------|---------|
+| `ontology_get_context` | Retrieve structured snapshot of user's world state |
+| `ontology_search_objects` | Search objects by type and FTS5 query |
+| `ontology_execute_action` | Execute a named action (routes internally to ZeroClaw tools or ontology operations) |
+
+### Multi-Device Sync Integration
+
+Ontology data participates in the existing E2E encrypted sync protocol.
+Three new `DeltaOperation` variants in `src/memory/sync.rs`:
+
+| Variant | Synced Data |
+|---------|------------|
+| `OntologyObjectUpsert` | Object create/update deltas |
+| `OntologyLinkCreate` | New link relationships |
+| `OntologyActionLog` | Action execution records |
+
+The patent's `SyncDelta.entityType` is extended with
+`"structured_object"`, `"structured_link"`, and `"action_log"`.
+Deduplication keys are generated in `src/sync/protocol.rs` for
+idempotent replay on receiving devices.
+
+### SQLite Schema (6 Tables + FTS5)
+
+```sql
+-- Meta-type tables
+ontology_object_types (id, name, description)
+ontology_link_types   (id, name, description, from_type_id, to_type_id)
+ontology_action_types (id, name, description, params_schema)
+
+-- Instance tables
+ontology_objects (id, type_id, title, properties, owner_user_id, created_at, updated_at)
+ontology_links   (id, link_type_id, from_object_id, to_object_id, properties, created_at)
+ontology_actions (id, action_type_id, actor_user_id, actor_kind, primary_object_id,
+                  related_object_ids, params, result, channel, context_id,
+                  status, error_message, created_at, updated_at)
+
+-- Full-text search on object titles + properties
+ontology_objects_fts (FTS5 virtual table)
+```
+
+All tables use `IF NOT EXISTS` and coexist safely with existing memory
+tables in `brain.db`.
+
+---
+
+## 6B. Web Chat & Homepage Integration Architecture
+
+### Overview
+
+MoA provides two web-based frontends in addition to the native Tauri app:
+
+1. **Web Dashboard** (`web/`) — A full-featured management UI for
+   agent chat, configuration, cost monitoring, cron jobs, device
+   management, and more.
+2. **Main Website / Homepage** (`site/`) — Public landing page with
+   product information, pricing, and a web-chat entry point for
+   authenticated users.
+
+Both are Vite + React + TypeScript applications served independently.
+They connect to the user's MoA gateway over WebSocket for real-time
+communication.
+
+### Web Dashboard (`web/`)
+
+```
+web/
+├── src/
+│   ├── pages/
+│   │   ├── AgentChat.tsx      # Primary chat interface
+│   │   ├── Config.tsx         # Agent configuration
+│   │   ├── Cost.tsx           # Usage & billing dashboard
+│   │   ├── Cron.tsx           # Scheduled tasks
+│   │   ├── Dashboard.tsx      # Overview / home
+│   │   ├── Devices.tsx        # Multi-device management & sync status
+│   │   └── ...
+│   ├── components/            # Shared React components
+│   └── App.tsx                # Route definitions
+├── vite.config.ts
+└── package.json
+```
+
+### Main Website (`site/`)
+
+```
+site/
+├── src/
+│   ├── pages/
+│   │   ├── Landing.tsx        # Homepage with product overview
+│   │   ├── Pricing.tsx        # Credit packages & API key model
+│   │   ├── WebChat.tsx        # Authenticated web-chat widget
+│   │   └── ...
+│   ├── components/
+│   └── App.tsx
+├── vite.config.ts
+└── package.json
+```
+
+### Gateway WebSocket Endpoints (`src/gateway/`)
+
+The ZeroClaw gateway (Axum HTTP/WebSocket server) exposes endpoints that
+both the Tauri app and web frontends connect to:
+
+| Endpoint | Module | Purpose |
+|----------|--------|---------|
+| `/ws/chat` | `src/gateway/ws.rs` | Real-time chat streaming (text messages, tool results) |
+| `/ws/voice` | `src/gateway/ws.rs` | Voice interpretation audio streaming |
+| `/api/*` | `src/gateway/api.rs` | REST API for config, memory, device management |
+| `/remote/*` | `src/gateway/remote.rs` | Remote access relay for cross-device channel routing |
+
+### Web Chat Data Flow
+
+```
+Browser (site/ or web/)
+    │
+    │  WebSocket connect to /ws/chat
+    │  (authenticated with device token)
+    ▼
+Gateway (src/gateway/ws.rs)
+    │
+    │  Route to Agent orchestration loop
+    ▼
+Agent (src/agent/loop_.rs)
+    │
+    ├── Recall from memory (SQLite + ontology context)
+    ├── Call LLM provider
+    ├── Execute tools as needed
+    └── Stream response tokens back via WebSocket
+    │
+    ▼
+Browser renders streaming response
+```
+
+Users on the homepage can chat with their MoA agent without installing
+the native app — the gateway handles WebSocket connections from any
+authenticated browser session. Memory, ontology state, and sync all work
+identically regardless of whether the client is the Tauri app or a web
+browser.
 
 ---
 
@@ -844,6 +1137,16 @@ Deliver, with error classification, recurring-error detection, rollback
 checkpoints, and multi-signal observation (exit code + stderr + server
 health + DOM snapshots).
 
+### Innovation 6: Structured Relational Memory (Digital Twin Graph)
+
+A typed Object/Link/Action graph layer that models the user's real world
+as a digital twin, sitting above the episodic memory (SQLite FTS5 + vec).
+The graph is maintained automatically by a deterministic rule engine that
+fires after every successful action — creating links, promoting objects,
+and profiling channels without explicit LLM orchestration. Combined with
+the E2E encrypted sync protocol, the structured graph synchronizes across
+all user devices as first-class delta operations.
+
 ---
 
 ## 12. Design Principles
@@ -869,7 +1172,7 @@ These are **mandatory constraints**, not guidelines:
 |------|-------|--------------|
 | **Low** | docs, chore, tests-only | Lightweight checks |
 | **Medium** | Most `src/**` behavior changes | Standard review |
-| **High** | `src/security/**`, `src/runtime/**`, `src/gateway/**`, `src/tools/**`, `.github/workflows/**`, `src/sync/**` | Full validation + boundary testing |
+| **High** | `src/security/**`, `src/runtime/**`, `src/gateway/**`, `src/tools/**`, `.github/workflows/**`, `src/sync/**`, `src/ontology/**` | Full validation + boundary testing |
 
 ---
 
@@ -923,6 +1226,17 @@ These are **mandatory constraints**, not guidelines:
 - [x] Coding review refactored to use ReviewPipeline (structured consensus)
 - [x] Tauri sidecar auto-retry UX (3 attempts, 30s timeout, transparent to user)
 
+### Recently Completed (2026-03-09)
+
+- [x] Structured relational memory (ontology digital twin graph) — `src/ontology/` (types, schema, repo, dispatcher, rules, context, tools)
+- [x] Ontology tool integration (3 tools registered in `src/tools/mod.rs`)
+- [x] System prompt ontology section + preference auto-injection (`src/agent/prompt.rs`)
+- [x] Ontology delta sync integration (3 new DeltaOperation variants in `src/memory/sync.rs`)
+- [x] Sync dedup keys for ontology deltas (`src/sync/protocol.rs`)
+- [x] Web dashboard (`web/` — Vite + React + TypeScript)
+- [x] Main website / homepage (`site/` — Vite + React + TypeScript)
+- [x] Patent dependent claims 14–18 for structured relational memory (`docs/ephemeral-relay-sync-patent.md`)
+
 ### Recently Completed (2026-03-03)
 
 - [x] Railway relay server deployment (5-minute TTL buffer) — `src/sync/relay.rs` SyncRelay + RelayClient, `deploy/railway/` config
@@ -962,8 +1276,10 @@ When reviewing a PR against this architecture:
 6. **Check platform independence**: Code must work on all 5 platforms
    (Windows, macOS, Linux, Android, iOS) — avoid platform-specific
    assumptions unless behind a `cfg` gate
-7. **Check memory sync contract**: Any change to `memory/` or `sync/` must
-   preserve the delta-based, E2E encrypted, server-non-storage invariants
+7. **Check memory sync contract**: Any change to `memory/`, `sync/`, or
+   `ontology/` must preserve the delta-based, E2E encrypted,
+   server-non-storage invariants. Ontology deltas sync via the same
+   protocol as episodic memory deltas
 8. **Check API key handling**: Never log API keys, never send them to the
    relay server, always handle both user-key and operator-key paths
 9. **Check unified app contract**: MoA and ZeroClaw must remain a single

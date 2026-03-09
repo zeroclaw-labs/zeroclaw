@@ -74,6 +74,14 @@ impl SyncedMemory {
                         tracing::warn!(key, "Failed to apply remote forget delta: {e}");
                     }
                 },
+                // Ontology deltas are applied by the ontology layer, not the
+                // memory layer. They are carried in the journal for cross-device
+                // transport but processed separately.
+                DeltaOperation::OntologyObjectUpsert { .. }
+                | DeltaOperation::OntologyLinkCreate { .. }
+                | DeltaOperation::OntologyActionLog { .. } => {
+                    tracing::debug!("Skipping ontology delta in memory apply (handled by ontology layer)");
+                }
             }
         }
 

@@ -83,6 +83,7 @@ mod memory;
 mod migration;
 mod multimodal;
 mod observability;
+mod ontology;
 mod onboard;
 mod peripherals;
 mod plugins;

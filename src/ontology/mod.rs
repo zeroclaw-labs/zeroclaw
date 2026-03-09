@@ -56,4 +56,5 @@ pub use context::ContextBuilder;
 pub use dispatcher::ActionDispatcher;
 pub use repo::OntologyRepo;
 pub use rules::RuleEngine;
+#[allow(unused_imports)]
 pub use types::*;

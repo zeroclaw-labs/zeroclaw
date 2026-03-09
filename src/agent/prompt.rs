@@ -35,6 +35,7 @@ impl SystemPromptBuilder {
             sections: vec![
                 Box::new(IdentitySection),
                 Box::new(ToolsSection),
+                Box::new(OntologySection),
                 Box::new(SafetySection),
                 Box::new(SchedulingSection),
                 Box::new(SkillsSection),
@@ -73,6 +74,7 @@ pub struct SkillsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct DateTimeSection;
+pub struct OntologySection;
 pub struct ChannelMediaSection;
 
 impl PromptSection for IdentitySection {
@@ -286,6 +288,96 @@ impl PromptSection for DateTimeSection {
             now.format("%Y-%m-%d %H:%M:%S"),
             now.format("%Z")
         ))
+    }
+}
+
+impl PromptSection for OntologySection {
+    fn name(&self) -> &str {
+        "ontology"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        let has_ontology = ctx.tools.iter().any(|t| t.name() == "ontology_get_context");
+        if !has_ontology {
+            return Ok(String::new());
+        }
+
+        // Load user preferences from ontology to inject into the prompt.
+        let mut out = String::from(
+            "## Ontology (Digital Twin)\n\n\
+             You operate on a Palantir-style ontology that models the user's real world \
+             as Objects (nouns), Links (relationships), and Actions (verbs).\n\n\
+             ### Available Object Types\n\
+             User, Contact, Device, Channel, Task, Project, Document, Meeting, Context, Preference\n\n\
+             ### Workflow\n\
+             1. **Understand context first**: Use `ontology_get_context` to see the user's \
+                current world state (recent contacts, tasks, projects, actions).\n\
+             2. **Search when needed**: Use `ontology_search_objects` to find specific objects.\n\
+             3. **Act through the ontology**: Use `ontology_execute_action` to perform actions \
+                (SendMessage, CreateTask, FetchResource, etc.). This automatically logs \
+                everything and updates the knowledge graph.\n\n\
+             ### Preference Awareness\n\
+             User preferences are stored as Preference objects in the ontology. When relevant, \
+             query preferences before making decisions. Preferences persist across model changes \
+             and sessions.\n",
+        );
+
+        // Attempt to load preferences from workspace ontology DB.
+        let db_path = ctx.workspace_dir.join("memory").join("brain.db");
+        if db_path.exists() {
+            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                // Derive owner_user_id from identity config (same logic as tools/mod.rs).
+                let owner_user_id = ctx
+                    .identity_config
+                    .and_then(|ic| ic.aieos_inline.as_deref())
+                    .and_then(|json_str| {
+                        serde_json::from_str::<serde_json::Value>(json_str)
+                            .ok()
+                            .and_then(|v| {
+                                v.pointer("/identity/names/first")
+                                    .or_else(|| v.pointer("/identity/name"))
+                                    .and_then(|n| n.as_str().map(|s| s.to_string()))
+                            })
+                    })
+                    .unwrap_or_else(|| "default_user".to_string());
+
+                let mut prefs_text = String::new();
+                let result: Result<Vec<(String, String)>, _> = (|| {
+                    let mut stmt = conn.prepare(
+                        "SELECT o.title, o.properties FROM ontology_objects o
+                         JOIN ontology_object_types t ON o.type_id = t.id
+                         WHERE t.name = 'Preference' AND o.owner_user_id = ?1
+                         ORDER BY o.updated_at DESC LIMIT 20"
+                    )?;
+                    let rows = stmt.query_map(rusqlite::params![owner_user_id], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                        ))
+                    })?;
+                    rows.collect::<Result<Vec<_>, _>>()
+                })();
+
+                if let Ok(prefs) = result {
+                    if !prefs.is_empty() {
+                        prefs_text.push_str("\n### Active Preferences\n");
+                        for (title, props) in &prefs {
+                            let value = serde_json::from_str::<serde_json::Value>(props)
+                                .ok()
+                                .and_then(|v| v.get("value").cloned())
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| props.clone());
+                            let _ = writeln!(prefs_text, "- **{}**: {}", title, value);
+                        }
+                    }
+                }
+                if !prefs_text.is_empty() {
+                    out.push_str(&prefs_text);
+                }
+            }
+        }
+
+        Ok(out)
     }
 }
 

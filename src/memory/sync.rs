@@ -94,6 +94,34 @@ pub enum DeltaOperation {
     },
     /// Memory entry deleted.
     Forget { key: String },
+
+    // ── Ontology sync operations ───────────────────────────────────
+
+    /// Ontology object created or updated.
+    OntologyObjectUpsert {
+        object_id: i64,
+        type_name: String,
+        title: Option<String>,
+        properties_json: String,
+        owner_user_id: String,
+    },
+    /// Ontology link created.
+    OntologyLinkCreate {
+        link_type_name: String,
+        from_object_id: i64,
+        to_object_id: i64,
+        properties_json: Option<String>,
+    },
+    /// Ontology action logged (read-only replication — actions are
+    /// never replayed, only the log entry is synced).
+    OntologyActionLog {
+        action_type_name: String,
+        actor_user_id: String,
+        params_json: String,
+        result_json: Option<String>,
+        channel: Option<String>,
+        status: String,
+    },
 }
 
 /// A single delta journal entry representing one memory change.
@@ -377,6 +405,102 @@ impl SyncEngine {
         // Persist to SQLite (best-effort)
         if let Err(e) = self.save() {
             tracing::warn!("Failed to persist sync journal: {e}");
+        }
+    }
+
+    /// Record an ontology object create/update in the delta journal.
+    pub fn record_ontology_object(
+        &mut self,
+        object_id: i64,
+        type_name: &str,
+        title: Option<&str>,
+        properties_json: &str,
+        owner_user_id: &str,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.version.increment(&self.device_id.0);
+        let entry = DeltaEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            device_id: self.device_id.0.clone(),
+            version: self.version.clone(),
+            operation: DeltaOperation::OntologyObjectUpsert {
+                object_id,
+                type_name: type_name.to_string(),
+                title: title.map(String::from),
+                properties_json: properties_json.to_string(),
+                owner_user_id: owner_user_id.to_string(),
+            },
+            timestamp: current_epoch_secs(),
+        };
+        self.journal.push(entry);
+        if let Err(e) = self.save() {
+            tracing::warn!("Failed to persist ontology object sync: {e}");
+        }
+    }
+
+    /// Record an ontology link creation in the delta journal.
+    pub fn record_ontology_link(
+        &mut self,
+        link_type_name: &str,
+        from_object_id: i64,
+        to_object_id: i64,
+        properties_json: Option<&str>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.version.increment(&self.device_id.0);
+        let entry = DeltaEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            device_id: self.device_id.0.clone(),
+            version: self.version.clone(),
+            operation: DeltaOperation::OntologyLinkCreate {
+                link_type_name: link_type_name.to_string(),
+                from_object_id,
+                to_object_id,
+                properties_json: properties_json.map(String::from),
+            },
+            timestamp: current_epoch_secs(),
+        };
+        self.journal.push(entry);
+        if let Err(e) = self.save() {
+            tracing::warn!("Failed to persist ontology link sync: {e}");
+        }
+    }
+
+    /// Record an ontology action log entry in the delta journal.
+    pub fn record_ontology_action(
+        &mut self,
+        action_type_name: &str,
+        actor_user_id: &str,
+        params_json: &str,
+        result_json: Option<&str>,
+        channel: Option<&str>,
+        status: &str,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.version.increment(&self.device_id.0);
+        let entry = DeltaEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            device_id: self.device_id.0.clone(),
+            version: self.version.clone(),
+            operation: DeltaOperation::OntologyActionLog {
+                action_type_name: action_type_name.to_string(),
+                actor_user_id: actor_user_id.to_string(),
+                params_json: params_json.to_string(),
+                result_json: result_json.map(String::from),
+                channel: channel.map(String::from),
+                status: status.to_string(),
+            },
+            timestamp: current_epoch_secs(),
+        };
+        self.journal.push(entry);
+        if let Err(e) = self.save() {
+            tracing::warn!("Failed to persist ontology action sync: {e}");
         }
     }
 

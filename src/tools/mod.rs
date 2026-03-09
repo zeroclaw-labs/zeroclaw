@@ -678,6 +678,64 @@ pub fn all_tools_with_runtime(
         }
     }
 
+    // ── Ontology tools ──────────────────────────────────────────────
+    // Expose the Palantir-style ontology layer to the LLM as three
+    // high-level tools: get_context, search_objects, execute_action.
+    {
+        use crate::ontology::{
+            ContextBuilder, ActionDispatcher, OntologyRepo, RuleEngine,
+            tools::{
+                OntologyGetContextTool, OntologySearchObjectsTool,
+                OntologyExecuteActionTool,
+            },
+        };
+
+        // Derive a stable owner_user_id. If AIEOS JSON is present, try to
+        // extract a name from it; otherwise fall back to "default_user".
+        let owner_user_id = root_config
+            .identity
+            .aieos_inline
+            .as_deref()
+            .and_then(|json_str| {
+                serde_json::from_str::<serde_json::Value>(json_str)
+                    .ok()
+                    .and_then(|v| {
+                        v.pointer("/identity/names/first")
+                            .or_else(|| v.pointer("/identity/name"))
+                            .and_then(|n| n.as_str().map(|s| s.to_string()))
+                    })
+            })
+            .unwrap_or_else(|| "default_user".to_string());
+
+        if let Ok(onto_repo) = OntologyRepo::open(&workspace_dir) {
+            let onto_repo = Arc::new(onto_repo);
+            let rule_engine = Arc::new(RuleEngine::new(Arc::clone(&onto_repo)));
+            let ctx_builder = Arc::new(ContextBuilder::new(Arc::clone(&onto_repo)));
+
+            // Give the dispatcher access to the current tool set for routing.
+            let dispatcher = Arc::new(ActionDispatcher::new(
+                Arc::clone(&onto_repo),
+                rule_engine,
+                tool_arcs.clone(),
+            ));
+
+            tool_arcs.push(Arc::new(OntologyGetContextTool::new(
+                ctx_builder,
+                owner_user_id.clone(),
+            )));
+            tool_arcs.push(Arc::new(OntologySearchObjectsTool::new(
+                Arc::clone(&onto_repo),
+                owner_user_id.clone(),
+            )));
+            tool_arcs.push(Arc::new(OntologyExecuteActionTool::new(
+                dispatcher,
+                owner_user_id,
+            )));
+        } else {
+            tracing::warn!("ontology: failed to open repo; ontology tools disabled");
+        }
+    }
+
     // Attach background execution wrappers to the finalized registry.
     // This ensures `bg_run` / `bg_status` are available anywhere the
     // runtime tool graph is used.
