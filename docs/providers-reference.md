@@ -61,6 +61,7 @@ credential is not reused for fallback providers.
 | `vllm` | — | Yes | `VLLM_API_KEY` (optional) |
 | `osaurus` | — | Yes | `OSAURUS_API_KEY` (optional; defaults to `"osaurus"`) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
+| `gigachat` |  `sber-gigachat` | No | `GIGACHAT_CREDENTIALS` |
 
 ### Vercel AI Gateway Notes
 
@@ -172,6 +173,18 @@ Recommended starter model IDs (verified against NVIDIA API catalog on February 1
 - `deepseek-ai/deepseek-v3.2`
 - `nvidia/llama-3.3-nemotron-super-49b-v1.5`
 - `nvidia/llama-3.1-nemotron-ultra-253b-v1`
+
+### GigaChat Notes
+
+- Canonical provider ID: `gigachat`
+- Aliases: `sber-gigachat`
+- Model discovery: `zeroclaw models refresh --provider gigachat`
+
+Recommended starter model IDs:
+
+- `GigaChat-2`
+- `GigaChat-2-Pro`
+- `GigaChat-2-Max`
 
 ## Custom Endpoints
 

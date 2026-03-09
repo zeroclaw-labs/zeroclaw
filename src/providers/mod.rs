@@ -21,6 +21,7 @@ pub mod bedrock;
 pub mod compatible;
 pub mod copilot;
 pub mod gemini;
+pub mod gigachat;
 pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
@@ -848,6 +849,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "vllm" => vec!["VLLM_API_KEY"],
         "osaurus" => vec!["OSAURUS_API_KEY"],
         "telnyx" => vec!["TELNYX_API_KEY"],
+        "gigachat" => vec!["GIGACHAT_CREDENTIALS"],
         _ => vec![],
     };
 
@@ -968,6 +970,7 @@ fn create_provider_with_url_and_options(
             )?))
         }
         // ── Primary providers (custom implementations) ───────
+        "gigachat" => Ok(Box::new(gigachat::GigaChatProvider::new(api_url, api_key))),
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
         "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
@@ -1497,6 +1500,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "gemini",
             display_name: "Google Gemini",
             aliases: &["google", "google-gemini"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "gigachat",
+            display_name: "GigaChat",
+            aliases: &["gigachat", "sber-gigachat"],
             local: false,
         },
         // ── OpenAI-compatible providers ──────────────────────
@@ -2630,6 +2639,7 @@ mod tests {
             "nvidia",
             "astrai",
             "ovhcloud",
+            "gigachat",
         ];
         for name in providers {
             assert!(

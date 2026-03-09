@@ -1160,7 +1160,7 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "glm"
             | "zai"
             | "qwen"
-            | "nvidia"
+            | "nvidia" // | "gigachat"
     )
 }
 
@@ -1512,6 +1512,7 @@ async fn fetch_live_models_for_provider(
         "openrouter" => fetch_openrouter_models(api_key.as_deref()).await?,
         "anthropic" => fetch_anthropic_models(api_key.as_deref()).await?,
         "gemini" => fetch_gemini_models(api_key.as_deref()).await?,
+        // "gigachat" => fetch_gigachat_models(api_key.as_deref())?,
         "ollama" => {
             if ollama_remote {
                 // Remote Ollama endpoints can serve cloud-routed models.
