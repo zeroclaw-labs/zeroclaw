@@ -7,7 +7,6 @@ use crate::providers::Provider;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -209,7 +208,7 @@ impl Provider for GigaChatProvider {
     /// Kept for compatibility and advanced one-shot prompting.
     async fn chat_with_system(
         &self,
-        system_prompt: Option<&str>,
+        _system_prompt: Option<&str>, // TODO: support system prompts
         message: &str,
         model: &str,
         temperature: f64,
