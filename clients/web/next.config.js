@@ -6,6 +6,8 @@ const nextConfig = {
     NEXT_PUBLIC_R2_BASE_URL:
       process.env.NEXT_PUBLIC_R2_BASE_URL ||
       "https://downloads.moa-agent.com",
+    NEXT_PUBLIC_KAKAO_REST_API_KEY:
+      process.env.NEXT_PUBLIC_KAKAO_REST_API_KEY || "",
   },
   async headers() {
     return [
