@@ -16,6 +16,7 @@
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 pub mod browser;
+pub mod browser_delegate;
 pub mod browser_open;
 pub mod cli_discovery;
 pub mod composio;
@@ -63,6 +64,8 @@ pub mod web_fetch;
 pub mod web_search_tool;
 
 pub use browser::{BrowserTool, ComputerUseConfig};
+#[allow(unused_imports)]
+pub use browser_delegate::{BrowserDelegateConfig, BrowserDelegateTool};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
@@ -305,6 +308,14 @@ pub fn all_tools_with_runtime(
                 max_coordinate_x: browser_config.computer_use.max_coordinate_x,
                 max_coordinate_y: browser_config.computer_use.max_coordinate_y,
             },
+        )));
+    }
+
+    // Browser delegation tool (conditionally registered)
+    if root_config.browser_delegate.enabled {
+        tool_arcs.push(Arc::new(BrowserDelegateTool::new(
+            security.clone(),
+            root_config.browser_delegate.clone(),
         )));
     }
 
