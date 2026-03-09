@@ -1773,8 +1773,13 @@ pub async fn run_models_refresh(
     })
     .join();
 
+    // Convert thread panic to anyhow::Error and route through existing error branch
+    // for consistent fallback behavior
+    let fetch_result: Result<Vec<String>, anyhow::Error> =
+        fetch_result.unwrap_or_else(|_| Err(anyhow::anyhow!("model refresh thread panicked")));
+
     match fetch_result {
-        Ok(Ok(models)) if !models.is_empty() => {
+        Ok(models) if !models.is_empty() => {
             cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models).await?;
             println!(
                 "Refreshed '{}' model cache with {} models.",
@@ -1784,7 +1789,7 @@ pub async fn run_models_refresh(
             print_model_preview(&models);
             Ok(())
         }
-        Ok(Ok(_)) => {
+        Ok(_) => {
             if let Some(stale_cache) =
                 load_any_cached_models_for_provider(&config.workspace_dir, &provider_name).await?
             {
@@ -1798,7 +1803,7 @@ pub async fn run_models_refresh(
 
             anyhow::bail!("Provider '{}' returned an empty model list", provider_name)
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             if let Some(stale_cache) =
                 load_any_cached_models_for_provider(&config.workspace_dir, &provider_name).await?
             {
@@ -1813,9 +1818,6 @@ pub async fn run_models_refresh(
 
             Err(error)
                 .with_context(|| format!("failed to refresh models for provider '{provider_name}'"))
-        }
-        Err(_) => {
-            anyhow::bail!("Model refresh thread panicked for provider '{provider_name}'")
         }
     }
 }
@@ -2722,8 +2724,13 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 })
                 .join();
 
+                // Convert thread panic to anyhow::Error and route through existing error branch
+                // for consistent fallback behavior
+                let fetch_result: Result<Vec<String>, anyhow::Error> = fetch_result
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("live fetch thread panicked")));
+
                 match fetch_result {
-                    Ok(Ok(live_model_ids)) if !live_model_ids.is_empty() => {
+                    Ok(live_model_ids) if !live_model_ids.is_empty() => {
                         cache_live_models_for_provider(
                             workspace_dir,
                             provider_name,
@@ -2748,10 +2755,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
                         live_options = Some(build_model_options(shown_models, "live"));
                     }
-                    Ok(Ok(_)) => {
+                    Ok(_) => {
                         print_bullet("Provider returned no models; using curated list.");
                     }
-                    Ok(Err(error)) => {
+                    Err(error) => {
                         print_bullet(&format!(
                             "Live fetch failed ({}); using cached/curated list.",
                             style(error.to_string()).yellow()
@@ -2777,9 +2784,6 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                                 ));
                             }
                         }
-                    }
-                    Err(_) => {
-                        print_bullet("Live fetch thread panicked; using cached/curated list.");
                     }
                 }
             }
