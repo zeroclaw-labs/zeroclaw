@@ -255,6 +255,9 @@ pub struct Config {
     /// Dynamic node discovery configuration (`[nodes]`).
     #[serde(default)]
     pub nodes: NodesConfig,
+    /// Multi-machine node system configuration (`[node_system]`).
+    #[serde(default)]
+    pub node_system: NodeSystemConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -1198,6 +1201,83 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
+}
+
+/// Multi-machine node system configuration (`[node_system]` section).
+///
+/// Controls registration, heartbeat, and cross-node invocation for
+/// clustered ZeroClaw deployments.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NodeSystemConfig {
+    /// Enable the multi-machine node subsystem.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Identifier for this node in the cluster.
+    #[serde(default)]
+    pub node_id: String,
+
+    /// Address this node advertises to peers (e.g. `"192.168.1.10:42617"`).
+    #[serde(default)]
+    pub advertise_address: String,
+
+    /// Seconds between heartbeat pings to registered peers.
+    #[serde(default = "default_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+
+    /// Seconds before a silent node is marked offline.
+    #[serde(default = "default_stale_timeout_secs")]
+    pub stale_timeout_secs: u64,
+
+    /// Maximum number of nodes allowed in the registry.
+    #[serde(default = "default_max_nodes")]
+    pub max_nodes: usize,
+
+    /// Allowlist of node IDs that may register. Empty = accept all.
+    /// Use `"*"` to explicitly allow any node.
+    #[serde(default)]
+    pub allowed_node_ids: Vec<String>,
+
+    /// Require authentication (HMAC or token) for inter-node traffic.
+    #[serde(default = "default_true")]
+    pub require_auth: bool,
+
+    /// Shared HMAC secret for signing inter-node requests.
+    #[serde(default)]
+    pub shared_secret: String,
+
+    /// Optional bearer token for the `X-Node-Control-Token` header.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+impl Default for NodeSystemConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            node_id: String::new(),
+            advertise_address: String::new(),
+            heartbeat_interval_secs: default_heartbeat_interval_secs(),
+            stale_timeout_secs: default_stale_timeout_secs(),
+            max_nodes: default_max_nodes(),
+            allowed_node_ids: Vec::new(),
+            require_auth: true,
+            shared_secret: String::new(),
+            auth_token: None,
+        }
+    }
+}
+
+fn default_heartbeat_interval_secs() -> u64 {
+    30
+}
+
+fn default_stale_timeout_secs() -> u64 {
+    120
+}
+
+fn default_max_nodes() -> usize {
+    32
 }
 
 fn default_gateway_port() -> u16 {
@@ -4204,6 +4284,7 @@ impl Default for Config {
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            node_system: NodeSystemConfig::default(),
         }
     }
 }
@@ -5234,11 +5315,6 @@ impl Config {
 
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
-
-        // MCP servers
-        if self.mcp.enabled {
-            validate_mcp_config(&self.mcp)?;
-        }
 
         Ok(())
     }
@@ -6310,6 +6386,7 @@ default_temperature = 0.7
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            node_system: NodeSystemConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -6601,6 +6678,7 @@ tool_dispatcher = "xml"
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            node_system: NodeSystemConfig::default(),
         };
 
         config.save().await.unwrap();
