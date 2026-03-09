@@ -2,7 +2,7 @@
 
 Tài liệu này liệt kê các provider ID, alias và biến môi trường chứa thông tin xác thực.
 
-Cập nhật lần cuối: **2026-03-10**.
+Cập nhật lần cuối: **2026-03-12**.
 
 ## Cách liệt kê các Provider
 
@@ -54,6 +54,7 @@ Với chuỗi provider dự phòng (`reliability.fallback_providers`), mỗi pro
 | `copilot` | `github-copilot` | Không | (dùng config/`API_KEY` fallback với GitHub token) |
 | `lmstudio` | `lm-studio` | Có | (tùy chọn; mặc định là cục bộ) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | Không | `NVIDIA_API_KEY` |
+| `avian` | — | Không | `AVIAN_API_KEY` |
 
 ### Ghi chú về Gemini
 
