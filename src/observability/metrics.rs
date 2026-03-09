@@ -272,4 +272,36 @@ mod tests {
             assert!(reg.get(name).is_some(), "metric {name} should exist");
         }
     }
+
+    #[test]
+    fn runtime_metric_increments_wired_correctly() {
+        // Verify that the metrics used by runtime call sites
+        // (gateway requests, tool calls, tool errors, provider requests)
+        // are all registered and increment as expected.
+        let reg = test_registry();
+
+        // Simulate gateway request increment
+        reg.increment("requests_total");
+        assert_eq!(reg.get("requests_total"), Some(1));
+
+        // Simulate tool call + error increments
+        reg.increment("tool_calls_total");
+        reg.increment("tool_calls_total");
+        reg.increment("tool_errors_total");
+        assert_eq!(reg.get("tool_calls_total"), Some(2));
+        assert_eq!(reg.get("tool_errors_total"), Some(1));
+
+        // Simulate provider request increment
+        reg.increment("provider_requests_total");
+        reg.increment("provider_requests_total");
+        reg.increment("provider_requests_total");
+        assert_eq!(reg.get("provider_requests_total"), Some(3));
+
+        // Verify all appear in Prometheus export
+        let output = reg.export_prometheus();
+        assert!(output.contains("test_requests_total 1"));
+        assert!(output.contains("test_tool_calls_total 2"));
+        assert!(output.contains("test_tool_errors_total 1"));
+        assert!(output.contains("test_provider_requests_total 3"));
+    }
 }
