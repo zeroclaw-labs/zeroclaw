@@ -326,15 +326,30 @@ impl PromptSection for OntologySection {
         let db_path = ctx.workspace_dir.join("memory").join("brain.db");
         if db_path.exists() {
             if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                // Derive owner_user_id from identity config (same logic as tools/mod.rs).
+                let owner_user_id = ctx
+                    .identity_config
+                    .and_then(|ic| ic.aieos_inline.as_deref())
+                    .and_then(|json_str| {
+                        serde_json::from_str::<serde_json::Value>(json_str)
+                            .ok()
+                            .and_then(|v| {
+                                v.pointer("/identity/names/first")
+                                    .or_else(|| v.pointer("/identity/name"))
+                                    .and_then(|n| n.as_str().map(|s| s.to_string()))
+                            })
+                    })
+                    .unwrap_or_else(|| "default_user".to_string());
+
                 let mut prefs_text = String::new();
                 let result: Result<Vec<(String, String)>, _> = (|| {
                     let mut stmt = conn.prepare(
                         "SELECT o.title, o.properties FROM ontology_objects o
                          JOIN ontology_object_types t ON o.type_id = t.id
-                         WHERE t.name = 'Preference'
+                         WHERE t.name = 'Preference' AND o.owner_user_id = ?1
                          ORDER BY o.updated_at DESC LIMIT 20"
                     )?;
-                    let rows = stmt.query_map([], |r| {
+                    let rows = stmt.query_map(rusqlite::params![owner_user_id], |r| {
                         Ok((
                             r.get::<_, String>(0)?,
                             r.get::<_, String>(1)?,

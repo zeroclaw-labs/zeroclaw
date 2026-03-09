@@ -690,12 +690,22 @@ pub fn all_tools_with_runtime(
             },
         };
 
+        // Derive a stable owner_user_id. If AIEOS JSON is present, try to
+        // extract a name from it; otherwise fall back to "default_user".
         let owner_user_id = root_config
             .identity
             .aieos_inline
             .as_deref()
-            .unwrap_or("default_user")
-            .to_string();
+            .and_then(|json_str| {
+                serde_json::from_str::<serde_json::Value>(json_str)
+                    .ok()
+                    .and_then(|v| {
+                        v.pointer("/identity/names/first")
+                            .or_else(|| v.pointer("/identity/name"))
+                            .and_then(|n| n.as_str().map(|s| s.to_string()))
+                    })
+            })
+            .unwrap_or_else(|| "default_user".to_string());
 
         if let Ok(onto_repo) = OntologyRepo::open(&workspace_dir) {
             let onto_repo = Arc::new(onto_repo);
