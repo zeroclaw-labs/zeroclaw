@@ -259,4 +259,35 @@ mod tests {
         // Critical still admitted.
         assert!(ctrl.admit(Priority::Critical).is_ok());
     }
+
+    /// Integration-style test: simulate a wired admit/complete cycle to verify
+    /// the controller tracks in-flight work correctly and sheds load at threshold.
+    #[test]
+    fn admit_complete_cycle_tracks_depth_and_sheds() {
+        let ctrl = make_controller(10);
+
+        // Admit 8 Normal requests (below 85% threshold).
+        for _ in 0..8 {
+            assert!(ctrl.admit(Priority::Normal).is_ok());
+        }
+        assert_eq!(ctrl.depth(), 8);
+
+        // At depth 8/10 = 80%, Normal (threshold 85%) should still be admitted.
+        assert!(ctrl.admit(Priority::Normal).is_ok());
+        assert_eq!(ctrl.depth(), 9);
+
+        // At depth 9/10 = 90%, Normal (threshold 85%) should be shed.
+        assert!(ctrl.admit(Priority::Normal).is_err());
+        assert_eq!(ctrl.depth(), 9); // depth unchanged on shed
+
+        // Complete 3 items, bringing depth to 6.
+        ctrl.complete();
+        ctrl.complete();
+        ctrl.complete();
+        assert_eq!(ctrl.depth(), 6);
+
+        // At depth 6/10 = 60%, Normal should be admitted again.
+        assert!(ctrl.admit(Priority::Normal).is_ok());
+        assert_eq!(ctrl.depth(), 7);
+    }
 }

@@ -3131,6 +3131,42 @@ pub async fn run(
         &provider_runtime_options,
     )?;
 
+    // ── Circuit breaker (wrap provider when enabled) ────────────────────
+    let provider: Box<dyn Provider> = if config.resilience.circuit_breaker_enabled {
+        let cb_config = providers::circuit_breaker::CircuitBreakerConfig {
+            failure_threshold: config.resilience.circuit_breaker_failure_threshold,
+            recovery_timeout: std::time::Duration::from_secs(
+                config.resilience.circuit_breaker_recovery_timeout_secs,
+            ),
+            half_open_max_requests: config.resilience.circuit_breaker_half_open_max_requests,
+        };
+        tracing::info!("Circuit breaker enabled for provider calls");
+        Box::new(providers::circuit_breaker::CircuitBreakerProvider::new(
+            provider, cb_config,
+        ))
+    } else {
+        provider
+    };
+
+    // ── Backpressure controller (when enabled) ──────────────────────────
+    let backpressure: Option<Arc<crate::agent::backpressure::BackpressureController>> =
+        if config.resilience.backpressure_enabled {
+            tracing::info!(
+                max_queue_depth = config.resilience.backpressure_max_queue_depth,
+                "Backpressure controller enabled"
+            );
+            Some(Arc::new(
+                crate::agent::backpressure::BackpressureController::new(
+                    crate::agent::backpressure::BackpressureConfig {
+                        max_queue_depth: config.resilience.backpressure_max_queue_depth,
+                        ..Default::default()
+                    },
+                ),
+            ))
+        } else {
+            None
+        };
+
     observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.to_string(),
         model: model_name.to_string(),
@@ -3456,6 +3492,16 @@ pub async fn run(
                 _ => {}
             }
 
+            // ── Backpressure admission check ──
+            if let Some(ref bp) = backpressure {
+                if let Err(shed) =
+                    bp.admit(crate::agent::backpressure::Priority::Normal)
+                {
+                    eprintln!("\nBackpressure: {shed}\n");
+                    continue;
+                }
+            }
+
             // Auto-save conversation turns (skip short/trivial messages)
             if config.memory.auto_save && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
                 let user_key = autosave_memory_key("user_msg");
@@ -3512,6 +3558,9 @@ pub async fn run(
             {
                 Ok(resp) => resp,
                 Err(e) => {
+                    if let Some(ref bp) = backpressure {
+                        bp.complete();
+                    }
                     eprintln!("\nError: {e}\n");
                     continue;
                 }
@@ -3526,6 +3575,11 @@ pub async fn run(
                 eprintln!("\nError sending CLI response: {e}\n");
             }
             observer.record_event(&ObserverEvent::TurnComplete);
+
+            // ── Backpressure completion signal ──
+            if let Some(ref bp) = backpressure {
+                bp.complete();
+            }
 
             // Auto-compaction before hard trimming to preserve long-context signal.
             if let Ok(compacted) = auto_compact_history(
@@ -3674,6 +3728,31 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &model_name,
         &provider_runtime_options,
     )?;
+
+    // ── Circuit breaker (wrap provider when enabled) ────────────────────
+    let provider: Box<dyn Provider> = if config.resilience.circuit_breaker_enabled {
+        let cb_config = providers::circuit_breaker::CircuitBreakerConfig {
+            failure_threshold: config.resilience.circuit_breaker_failure_threshold,
+            recovery_timeout: std::time::Duration::from_secs(
+                config.resilience.circuit_breaker_recovery_timeout_secs,
+            ),
+            half_open_max_requests: config.resilience.circuit_breaker_half_open_max_requests,
+        };
+        Box::new(providers::circuit_breaker::CircuitBreakerProvider::new(
+            provider, cb_config,
+        ))
+    } else {
+        provider
+    };
+
+    // ── Backpressure check (single-message path) ────────────────────────
+    if config.resilience.backpressure_enabled {
+        // For single-message processing, a static controller would be needed
+        // for cross-request coordination. Here we validate config is enabled
+        // but actual admission control happens in the long-running `run` loop
+        // and `Agent::turn`. Log for observability.
+        tracing::debug!("Backpressure enabled (single-message path — no queue tracking)");
+    }
 
     let hardware_rag: Option<crate::rag::HardwareRag> = config
         .peripherals

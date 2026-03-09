@@ -224,6 +224,131 @@ impl CircuitBreaker {
     }
 }
 
+// ── Provider wrapper ────────────────────────────────────────────────────
+// Wraps any `Box<dyn Provider>` with circuit breaker protection on the
+// two primary call paths: `chat_with_system` and `chat`.
+
+use super::traits::{
+    ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions, StreamResult,
+    ToolsPayload,
+};
+use crate::tools::ToolSpec;
+use super::Provider;
+use async_trait::async_trait;
+use futures_util::stream;
+use std::sync::Arc;
+
+/// A [`Provider`] decorator that guards calls with a [`CircuitBreaker`].
+///
+/// When the circuit is open, calls are rejected immediately with a
+/// descriptive error instead of hitting the downstream provider.
+pub struct CircuitBreakerProvider {
+    inner: Box<dyn Provider>,
+    breaker: Arc<CircuitBreaker>,
+}
+
+impl CircuitBreakerProvider {
+    /// Wrap `inner` with a circuit breaker built from `config`.
+    pub fn new(inner: Box<dyn Provider>, config: CircuitBreakerConfig) -> Self {
+        Self {
+            inner,
+            breaker: Arc::new(CircuitBreaker::new(config)),
+        }
+    }
+
+    /// Returns the current circuit state (useful for observability/tests).
+    pub fn state(&self) -> CircuitState {
+        self.breaker.state()
+    }
+}
+
+#[async_trait]
+impl Provider for CircuitBreakerProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn convert_tools(&self, tools: &[ToolSpec]) -> ToolsPayload {
+        self.inner.convert_tools(tools)
+    }
+
+    async fn chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        let sp = system_prompt.map(String::from);
+        let msg = message.to_string();
+        let mdl = model.to_string();
+        let inner = &self.inner;
+        self.breaker
+            .call(|| async {
+                inner
+                    .chat_with_system(sp.as_deref(), &msg, &mdl, temperature)
+                    .await
+            })
+            .await
+    }
+
+    async fn chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let messages = request.messages.to_vec();
+        let tools: Option<Vec<ToolSpec>> = request.tools.map(|t| t.to_vec());
+        let mdl = model.to_string();
+        let inner = &self.inner;
+        self.breaker
+            .call(|| async {
+                let req = ChatRequest {
+                    messages: &messages,
+                    tools: tools.as_deref(),
+                };
+                inner.chat(req, &mdl, temperature).await
+            })
+            .await
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        self.inner.supports_native_tools()
+    }
+
+    fn supports_vision(&self) -> bool {
+        self.inner.supports_vision()
+    }
+
+    async fn warmup(&self) -> anyhow::Result<()> {
+        self.inner.warmup().await
+    }
+
+    fn supports_streaming(&self) -> bool {
+        self.inner.supports_streaming()
+    }
+
+    fn stream_chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+        _options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        // Circuit breaker does not wrap streaming calls (they have their own
+        // error handling). Delegate directly.
+        self.inner.stream_chat_with_system(
+            _system_prompt,
+            _message,
+            _model,
+            _temperature,
+            _options,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +457,117 @@ mod tests {
             .call(|| async { Err::<i32, _>(anyhow::anyhow!("fail again")) })
             .await;
         assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    // ── CircuitBreakerProvider integration tests ────────────────────────
+
+    use super::super::traits::{ChatRequest, ChatResponse};
+    use super::super::Provider;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Deterministic mock provider that fails the first N calls then succeeds.
+    struct FailNProvider {
+        fail_count: AtomicUsize,
+        fail_limit: usize,
+    }
+
+    impl FailNProvider {
+        fn new(fail_limit: usize) -> Self {
+            Self {
+                fail_count: AtomicUsize::new(0),
+                fail_limit,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for FailNProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let n = self.fail_count.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_limit {
+                anyhow::bail!("provider error #{}", n + 1);
+            }
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let n = self.fail_count.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_limit {
+                anyhow::bail!("provider error #{}", n + 1);
+            }
+            Ok(ChatResponse {
+                text: Some("ok".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_provider_opens_after_failures() {
+        let provider = Box::new(FailNProvider::new(100)); // always fails
+        let cb_provider = CircuitBreakerProvider::new(
+            provider,
+            CircuitBreakerConfig {
+                failure_threshold: 3,
+                recovery_timeout: Duration::from_secs(60),
+                half_open_max_requests: 1,
+            },
+        );
+
+        // First 3 calls fail normally (circuit still closed).
+        for i in 1..=3 {
+            let err = cb_provider
+                .chat_with_system(None, "test", "model", 0.7)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("provider error #{i}")),
+                "expected provider error, got: {err}"
+            );
+        }
+
+        // Circuit should now be open — next call rejected immediately.
+        assert_eq!(cb_provider.state(), CircuitState::Open);
+        let err = cb_provider
+            .chat_with_system(None, "test", "model", 0.7)
+            .await
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<CircuitOpen>().is_some(),
+            "expected CircuitOpen error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_provider_passes_through_on_success() {
+        let provider = Box::new(FailNProvider::new(0)); // always succeeds
+        let cb_provider = CircuitBreakerProvider::new(
+            provider,
+            CircuitBreakerConfig {
+                failure_threshold: 3,
+                recovery_timeout: Duration::from_secs(60),
+                half_open_max_requests: 1,
+            },
+        );
+
+        let result = cb_provider
+            .chat_with_system(None, "test", "model", 0.7)
+            .await;
+        assert_eq!(result.unwrap(), "ok");
+        assert_eq!(cb_provider.state(), CircuitState::Closed);
     }
 }
