@@ -11,6 +11,7 @@ use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
     default_memory_backend_key, memory_backend_profile, selectable_memory_backends,
 };
+use crate::providers::gigachat::GigaChatProvider;
 use crate::providers::{
     canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias,
     is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_zai_alias,
@@ -1160,7 +1161,8 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "glm"
             | "zai"
             | "qwen"
-            | "nvidia" // | "gigachat"
+            | "nvidia"
+            | "gigachat"
     )
 }
 
@@ -1383,6 +1385,18 @@ async fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
     Ok(parse_gemini_model_ids(&payload))
 }
 
+async fn fetch_gigachat_models(api_key: Option<&str>) -> Result<Vec<String>> {
+    let Some(api_key) = api_key else {
+        bail!("GigaChat model fetch requires API key");
+    };
+
+    let models = GigaChatProvider::new(None, Some(api_key))
+        .fetch_models()
+        .await?;
+
+    Ok(models)
+}
+
 async fn fetch_ollama_models() -> Result<Vec<String>> {
     let client = build_model_fetch_client()?;
     let payload: Value = client
@@ -1512,7 +1526,7 @@ async fn fetch_live_models_for_provider(
         "openrouter" => fetch_openrouter_models(api_key.as_deref()).await?,
         "anthropic" => fetch_anthropic_models(api_key.as_deref()).await?,
         "gemini" => fetch_gemini_models(api_key.as_deref()).await?,
-        // "gigachat" => fetch_gigachat_models(api_key.as_deref())?,
+        "gigachat" => fetch_gigachat_models(api_key.as_deref()).await?,
         "ollama" => {
             if ollama_remote {
                 // Remote Ollama endpoints can serve cloud-routed models.

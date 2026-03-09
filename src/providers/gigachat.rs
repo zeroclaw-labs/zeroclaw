@@ -7,6 +7,7 @@ use crate::providers::Provider;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +73,21 @@ struct MessageResponse {
                                         // function_call_id: Option<FunctionCall>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ModelsResponse {
+    data: Vec<Model>,
+    object: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Model {
+    id: String,
+    object: String,
+    owned_by: String,
+    #[serde(rename = "type")]
+    model_type: String, // TODO: explicit enum [chat, aicheck, embedder]
+}
+
 const OAUTH_API_ENDPOINT: &str = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth";
 const CHAT_COMPLETIONS_ENDPOINT: &str =
     "https://gigachat.devices.sberbank.ru/api/v1/chat/completions";
@@ -102,29 +118,33 @@ impl GigaChatProvider {
         Ok(builder?)
     }
 
-    // pub fn fetch_models(&self) -> anyhow::Result<Vec<String>> {
-    //     let access_token = self.fetch_auth_token().await?;
-    //
-    //     let response = self
-    //         .client
-    //         .get("https://gigachat.devices.sberbank.ru/api/v1/models")
-    //         .header(
-    //             "Authorization",
-    //             format!("Bearer {}", access_token.access_token),
-    //         )
-    //         .send()
-    //         .await
-    //         .or_else(|error| {
-    //             tracing::error!("Response error: {:?}", error);
-    //             Err(error)
-    //         })?;
-    //
-    //     let models = response.text().await?;
-    //
-    //     tracing::debug!("GigaChat models: {:?}", models);
-    //
-    //     Ok(vec![])
-    // }
+    pub async fn fetch_models(&self) -> anyhow::Result<Vec<String>> {
+        let access_token = self.fetch_auth_token().await?;
+
+        let response = self
+            .client
+            .get("https://gigachat.devices.sberbank.ru/api/v1/models")
+            .header(
+                "Authorization",
+                format!("Bearer {}", access_token.access_token),
+            )
+            .send()
+            .await
+            .or_else(|error| {
+                tracing::error!("Response error: {:?}", error);
+                Err(error)
+            })?;
+
+        let models = response.json::<ModelsResponse>().await?;
+
+        let result = models
+            .data
+            .iter()
+            .map(|model| format!("{} [{}]", model.id, model.model_type))
+            .collect();
+
+        Ok(result)
+    }
 
     pub async fn fetch_auth_token(&self) -> anyhow::Result<AccessToken> {
         let req_id = Uuid::new_v4();
@@ -203,6 +223,7 @@ impl Provider for GigaChatProvider {
 
         let access_token = self.fetch_auth_token().await?;
 
+        // TODO: better handling - get rid of hardcoded values
         let request = ChatRequest {
             model: model.to_string(),
             messages: vec![Message {
