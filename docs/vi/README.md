@@ -20,8 +20,8 @@
 | Vận hành hàng ngày (runbook) | [operations-runbook.md](operations-runbook.md) |
 | Khắc phục sự cố cài đặt/chạy/kênh | [troubleshooting.md](troubleshooting.md) |
 | Cấu hình Matrix phòng mã hóa (E2EE) | [matrix-e2ee-guide.md](matrix-e2ee-guide.md) |
-| Xem theo danh mục | [SUMMARY.md](SUMMARY.md) |
-| Xem bản chụp PR/Issue | [../project-triage-snapshot-2026-02-18.md](../project-triage-snapshot-2026-02-18.md) |
+| Xem theo danh mục | [SUMMARY.md](../i18n/vi/SUMMARY.md) |
+| Xem bản chụp PR/Issue | [../maintainers/project-triage-snapshot-2026-02-18.md](../maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## Tìm nhanh
 
@@ -32,7 +32,7 @@
 - Tìm hiểu bảo mật và lộ trình → [security/README.md](security/README.md)
 - Làm việc với bo mạch / thiết bị ngoại vi → [hardware/README.md](hardware/README.md)
 - Đóng góp / review / quy trình CI → [contributing/README.md](contributing/README.md)
-- Xem toàn bộ bản đồ tài liệu → [SUMMARY.md](SUMMARY.md)
+- Xem toàn bộ bản đồ tài liệu → [SUMMARY.md](../i18n/vi/SUMMARY.md)
 
 ## Theo danh mục
 
@@ -81,8 +81,8 @@
 
 ## Quản lý tài liệu
 
-- Mục lục thống nhất (TOC): [SUMMARY.md](SUMMARY.md)
-- Danh mục và phân loại tài liệu: [../docs-inventory.md](../docs-inventory.md)
+- Mục lục thống nhất (TOC): [SUMMARY.md](../i18n/vi/SUMMARY.md)
+- Danh mục và phân loại tài liệu: [../maintainers/docs-inventory.md](../maintainers/docs-inventory.md)
 
 ## Ngôn ngữ khác
 

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="zeroclaw.png" alt="ZeroClaw" width="200" />
+  <img src="docs/assets/zeroclaw.png" alt="ZeroClaw" width="200" />
 </p>
 
 <h1 align="center">ZeroClaw 🦀</h1>
@@ -25,12 +25,43 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 </p>
 
 <p align="center">
-  🌐 <strong>Languages:</strong> <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.ru.md">Русский</a> · <a href="README.fr.md">Français</a> · <a href="README.vi.md">Tiếng Việt</a>
+  🌐 <strong>Languages:</strong>
+  <a href="README.md">🇺🇸 English</a> ·
+  <a href="README.zh-CN.md">🇨🇳 简体中文</a> ·
+  <a href="README.ja.md">🇯🇵 日本語</a> ·
+  <a href="README.ko.md">🇰🇷 한국어</a> ·
+  <a href="README.vi.md">🇻🇳 Tiếng Việt</a> ·
+  <a href="README.tl.md">🇵🇭 Tagalog</a> ·
+  <a href="README.es.md">🇪🇸 Español</a> ·
+  <a href="README.pt.md">🇧🇷 Português</a> ·
+  <a href="README.it.md">🇮🇹 Italiano</a> ·
+  <a href="README.de.md">🇩🇪 Deutsch</a> ·
+  <a href="README.fr.md">🇫🇷 Français</a> ·
+  <a href="README.ar.md">🇸🇦 العربية</a> ·
+  <a href="README.hi.md">🇮🇳 हिन्दी</a> ·
+  <a href="README.ru.md">🇷🇺 Русский</a> ·
+  <a href="README.bn.md">🇧🇩 বাংলা</a> ·
+  <a href="README.he.md">🇮🇱 עברית</a> ·
+  <a href="README.pl.md">🇵🇱 Polski</a> ·
+  <a href="README.cs.md">🇨🇿 Čeština</a> ·
+  <a href="README.nl.md">🇳🇱 Nederlands</a> ·
+  <a href="README.tr.md">🇹🇷 Türkçe</a> ·
+  <a href="README.uk.md">🇺🇦 Українська</a> ·
+  <a href="README.id.md">🇮🇩 Bahasa Indonesia</a> ·
+  <a href="README.th.md">🇹🇭 ไทย</a> ·
+  <a href="README.ur.md">🇵🇰 اردو</a> ·
+  <a href="README.ro.md">🇷🇴 Română</a> ·
+  <a href="README.sv.md">🇸🇪 Svenska</a> ·
+  <a href="README.el.md">🇬🇷 Ελληνικά</a> ·
+  <a href="README.hu.md">🇭🇺 Magyar</a> ·
+  <a href="README.fi.md">🇫🇮 Suomi</a> ·
+  <a href="README.da.md">🇩🇰 Dansk</a> ·
+  <a href="README.nb.md">🇳🇴 Norsk</a>
 </p>
 
 <p align="center">
   <a href="#quick-start">Getting Started</a> |
-  <a href="bootstrap.sh">One-Click Setup</a> |
+  <a href="install.sh">One-Click Setup</a> |
   <a href="docs/README.md">Docs Hub</a> |
   <a href="docs/SUMMARY.md">Docs TOC</a>
 </p>
@@ -38,8 +69,8 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 <p align="center">
   <strong>Quick Routes:</strong>
   <a href="docs/reference/README.md">Reference</a> ·
-  <a href="docs/operations/README.md">Operations</a> ·
-  <a href="docs/troubleshooting.md">Troubleshoot</a> ·
+  <a href="docs/ops/README.md">Operations</a> ·
+  <a href="docs/ops/troubleshooting.md">Troubleshoot</a> ·
   <a href="docs/security/README.md">Security</a> ·
   <a href="docs/hardware/README.md">Hardware</a> ·
   <a href="docs/contributing/README.md">Contribute</a>
@@ -95,7 +126,7 @@ Local machine quick benchmark (macOS arm64, Feb 2026) normalized for 0.8GHz edge
 > Notes: ZeroClaw results are measured on release builds using `/usr/bin/time -l`. OpenClaw requires Node.js runtime (typically ~390MB additional memory overhead), while NanoBot requires Python runtime. PicoClaw and ZeroClaw are static binaries. The RAM figures above are runtime memory; build-time compilation requirements are higher.
 
 <p align="center">
-  <img src="zero-claw.jpeg" alt="ZeroClaw vs OpenClaw Comparison" width="800" />
+  <img src="docs/assets/zeroclaw-comparison.jpeg" alt="ZeroClaw vs OpenClaw Comparison" width="800" />
 </p>
 
 ### Reproducible local measurement
@@ -180,7 +211,7 @@ Example sample (macOS arm64, measured on February 18, 2026):
 Or skip the steps above and install everything (system deps, Rust, ZeroClaw) in a single command:
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/install.sh | bash
+curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/install.sh | bash
 ```
 
 #### Compilation resource requirements
@@ -195,13 +226,13 @@ Building from source needs more resources than running the resulting binary:
 If your host is below the minimum, use pre-built binaries:
 
 ```bash
-./bootstrap.sh --prefer-prebuilt
+./install.sh --prefer-prebuilt
 ```
 
 To require binary-only install with no source fallback:
 
 ```bash
-./bootstrap.sh --prebuilt-only
+./install.sh --prebuilt-only
 ```
 
 #### Optional
@@ -226,37 +257,37 @@ brew install zeroclaw
 # Recommended: clone then run local bootstrap script
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
-./bootstrap.sh
+./install.sh
 
 # Optional: bootstrap dependencies + Rust on fresh machines
-./bootstrap.sh --install-system-deps --install-rust
+./install.sh --install-system-deps --install-rust
 
 # Optional: pre-built binary first (recommended on low-RAM/low-disk hosts)
-./bootstrap.sh --prefer-prebuilt
+./install.sh --prefer-prebuilt
 
 # Optional: binary-only install (no source build fallback)
-./bootstrap.sh --prebuilt-only
+./install.sh --prebuilt-only
 
 # Optional: run onboarding in the same flow
-./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
+./install.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
 
 # Optional: run bootstrap + onboarding fully in Docker-compatible mode
-./bootstrap.sh --docker
+./install.sh --docker
 
 # Optional: force Podman as container CLI
-ZEROCLAW_CONTAINER_CLI=podman ./bootstrap.sh --docker
+ZEROCLAW_CONTAINER_CLI=podman ./install.sh --docker
 
 # Optional: in --docker mode, skip local image build and use local tag or pull fallback image
-./bootstrap.sh --docker --skip-build
+./install.sh --docker --skip-build
 ```
 
 Remote one-liner (review first in security-sensitive environments):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/install.sh | bash
 ```
 
-Details: [`docs/one-click-bootstrap.md`](docs/one-click-bootstrap.md) (toolchain mode may request `sudo` for system packages).
+Details: [`docs/setup-guides/one-click-bootstrap.md`](docs/setup-guides/one-click-bootstrap.md) (toolchain mode may request `sudo` for system packages).
 
 ### Pre-built binaries
 
@@ -398,7 +429,7 @@ zeroclaw agent --provider anthropic -m "hello"
 Every subsystem is a **trait** — swap implementations with a config change, zero code changes.
 
 <p align="center">
-  <img src="docs/architecture.svg" alt="ZeroClaw Architecture" width="900" />
+  <img src="docs/assets/architecture.svg" alt="ZeroClaw Architecture" width="900" />
 </p>
 
 | Subsystem         | Trait            | Ships with                                                                                                                                                                 | Extend                                                                                       |
@@ -497,7 +528,7 @@ Inbound sender policy is now consistent:
 
 This keeps accidental exposure low by default.
 
-Full channel configuration reference: [docs/channels-reference.md](docs/channels-reference.md).
+Full channel configuration reference: [docs/reference/api/channels-reference.md](docs/reference/api/channels-reference.md).
 
 Recommended low-friction setup (secure + fast):
 
@@ -816,7 +847,7 @@ default_model = "qwen3-30b-a3b-8bit"
 
 ### Custom Provider Endpoints
 
-For detailed configuration of custom OpenAI-compatible and Anthropic-compatible endpoints, see [docs/custom-providers.md](docs/custom-providers.md).
+For detailed configuration of custom OpenAI-compatible and Anthropic-compatible endpoints, see [docs/contributing/custom-providers.md](docs/contributing/custom-providers.md).
 
 ## Python Companion Package (`zeroclaw-tools`)
 
@@ -980,7 +1011,7 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 | `hardware`                                    | USB discover/introspect/info commands                                                |
 | `peripheral`                                  | Manage and flash hardware peripherals                                                |
 
-For a task-oriented command guide, see [`docs/commands-reference.md`](docs/commands-reference.md).
+For a task-oriented command guide, see [`docs/reference/cli/commands-reference.md`](docs/reference/cli/commands-reference.md).
 
 ### Service Management
 
@@ -1004,7 +1035,7 @@ sudo rc-update add zeroclaw default
 sudo rc-service zeroclaw start
 ```
 
-For full OpenRC setup instructions, see [docs/network-deployment.md](docs/network-deployment.md#7-openrc-alpine-linux-service).
+For full OpenRC setup instructions, see [docs/ops/network-deployment.md](docs/ops/network-deployment.md#7-openrc-alpine-linux-service).
 
 ### Open-Skills Opt-In
 
@@ -1061,31 +1092,31 @@ Start from the docs hub for a task-oriented map:
 
 - Documentation hub: [`docs/README.md`](docs/README.md)
 - Unified docs TOC: [`docs/SUMMARY.md`](docs/SUMMARY.md)
-- Commands reference: [`docs/commands-reference.md`](docs/commands-reference.md)
-- Config reference: [`docs/config-reference.md`](docs/config-reference.md)
-- Providers reference: [`docs/providers-reference.md`](docs/providers-reference.md)
-- Channels reference: [`docs/channels-reference.md`](docs/channels-reference.md)
-- Operations runbook: [`docs/operations-runbook.md`](docs/operations-runbook.md)
-- Troubleshooting: [`docs/troubleshooting.md`](docs/troubleshooting.md)
-- Docs inventory/classification: [`docs/docs-inventory.md`](docs/docs-inventory.md)
-- PR/Issue triage snapshot (as of February 18, 2026): [`docs/project-triage-snapshot-2026-02-18.md`](docs/project-triage-snapshot-2026-02-18.md)
+- Commands reference: [`docs/reference/cli/commands-reference.md`](docs/reference/cli/commands-reference.md)
+- Config reference: [`docs/reference/api/config-reference.md`](docs/reference/api/config-reference.md)
+- Providers reference: [`docs/reference/api/providers-reference.md`](docs/reference/api/providers-reference.md)
+- Channels reference: [`docs/reference/api/channels-reference.md`](docs/reference/api/channels-reference.md)
+- Operations runbook: [`docs/ops/operations-runbook.md`](docs/ops/operations-runbook.md)
+- Troubleshooting: [`docs/ops/troubleshooting.md`](docs/ops/troubleshooting.md)
+- Docs inventory/classification: [`docs/maintainers/docs-inventory.md`](docs/maintainers/docs-inventory.md)
+- PR/Issue triage snapshot (as of February 18, 2026): [`docs/maintainers/project-triage-snapshot-2026-02-18.md`](docs/maintainers/project-triage-snapshot-2026-02-18.md)
 
 Core collaboration references:
 
 - Documentation hub: [docs/README.md](docs/README.md)
-- Documentation template: [docs/doc-template.md](docs/doc-template.md)
+- Documentation template: [docs/contributing/doc-template.md](docs/contributing/doc-template.md)
 - Documentation change checklist: [docs/README.md#4-documentation-change-checklist](docs/README.md#4-documentation-change-checklist)
-- Channel configuration reference: [docs/channels-reference.md](docs/channels-reference.md)
-- Matrix encrypted-room operations: [docs/matrix-e2ee-guide.md](docs/matrix-e2ee-guide.md)
+- Channel configuration reference: [docs/reference/api/channels-reference.md](docs/reference/api/channels-reference.md)
+- Matrix encrypted-room operations: [docs/security/matrix-e2ee-guide.md](docs/security/matrix-e2ee-guide.md)
 - Contribution guide: [CONTRIBUTING.md](CONTRIBUTING.md)
-- PR workflow policy: [docs/pr-workflow.md](docs/pr-workflow.md)
-- Reviewer playbook (triage + deep review): [docs/reviewer-playbook.md](docs/reviewer-playbook.md)
+- PR workflow policy: [docs/contributing/pr-workflow.md](docs/contributing/pr-workflow.md)
+- Reviewer playbook (triage + deep review): [docs/contributing/reviewer-playbook.md](docs/contributing/reviewer-playbook.md)
 - Security disclosure policy: [SECURITY.md](SECURITY.md)
 
 For deployment and runtime operations:
 
-- Network deployment guide: [docs/network-deployment.md](docs/network-deployment.md)
-- Proxy agent playbook: [docs/proxy-agent-playbook.md](docs/proxy-agent-playbook.md)
+- Network deployment guide: [docs/ops/network-deployment.md](docs/ops/network-deployment.md)
+- Proxy agent playbook: [docs/ops/proxy-agent-playbook.md](docs/ops/proxy-agent-playbook.md)
 
 ## Support ZeroClaw
 
@@ -1110,7 +1141,7 @@ We're building in the open because the best ideas come from everywhere. If you'r
 
 > https://github.com/zeroclaw-labs/zeroclaw
 
-Any other repository, organization, domain, or package claiming to be "ZeroClaw" or implying affiliation with ZeroClaw Labs is **unauthorized and not affiliated with this project**. Known unauthorized forks will be listed in [TRADEMARK.md](TRADEMARK.md).
+Any other repository, organization, domain, or package claiming to be "ZeroClaw" or implying affiliation with ZeroClaw Labs is **unauthorized and not affiliated with this project**. Known unauthorized forks will be listed in [TRADEMARK.md](docs/maintainers/trademark.md).
 
 If you encounter impersonation or trademark misuse, please [open an issue](https://github.com/zeroclaw-labs/zeroclaw/issues).
 
@@ -1125,11 +1156,11 @@ ZeroClaw is dual-licensed for maximum openness and contributor protection:
 | [MIT](LICENSE-MIT) | Open-source, research, academic, personal use |
 | [Apache 2.0](LICENSE-APACHE) | Patent protection, institutional, commercial deployment |
 
-You may choose either license. **Contributors automatically grant rights under both** — see [CLA.md](CLA.md) for the full contributor agreement.
+You may choose either license. **Contributors automatically grant rights under both** — see [CLA.md](docs/contributing/cla.md) for the full contributor agreement.
 
 ### Trademark
 
-The **ZeroClaw** name and logo are trademarks of ZeroClaw Labs. This license does not grant permission to use them to imply endorsement or affiliation. See [TRADEMARK.md](TRADEMARK.md) for permitted and prohibited uses.
+The **ZeroClaw** name and logo are trademarks of ZeroClaw Labs. This license does not grant permission to use them to imply endorsement or affiliation. See [TRADEMARK.md](docs/maintainers/trademark.md) for permitted and prohibited uses.
 
 ### Contributor Protections
 
@@ -1142,9 +1173,9 @@ The **ZeroClaw** name and logo are trademarks of ZeroClaw Labs. This license doe
 
 New to ZeroClaw? Look for issues labeled [`good first issue`](https://github.com/zeroclaw-labs/zeroclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) — see our [Contributing Guide](CONTRIBUTING.md#first-time-contributors) for how to get started.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md). Implement a trait, submit a PR:
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](docs/contributing/cla.md). Implement a trait, submit a PR:
 
-- CI workflow guide: [docs/ci-map.md](docs/ci-map.md)
+- CI workflow guide: [docs/contributing/ci-map.md](docs/contributing/ci-map.md)
 - New `Provider` → `src/providers/`
 - New `Channel` → `src/channels/`
 - New `Observer` → `src/observability/`

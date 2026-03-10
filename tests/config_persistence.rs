@@ -119,10 +119,12 @@ fn memory_config_default_vector_keyword_weights_sum_to_one() {
 
 #[test]
 fn config_toml_roundtrip_preserves_provider() {
-    let mut config = Config::default();
-    config.default_provider = Some("deepseek".into());
-    config.default_model = Some("deepseek-chat".into());
-    config.default_temperature = 0.5;
+    let config = Config {
+        default_provider: Some("deepseek".into()),
+        default_model: Some("deepseek-chat".into()),
+        default_temperature: 0.5,
+        ..Default::default()
+    };
 
     let toml_str = toml::to_string(&config).expect("config should serialize to TOML");
     let parsed: Config = toml::from_str(&toml_str).expect("TOML should deserialize back");
@@ -173,9 +175,11 @@ fn config_file_write_read_roundtrip() {
     let tmp = tempfile::TempDir::new().expect("tempdir creation should succeed");
     let config_path = tmp.path().join("config.toml");
 
-    let mut config = Config::default();
-    config.default_provider = Some("mistral".into());
-    config.default_model = Some("mistral-large".into());
+    let mut config = Config {
+        default_provider: Some("mistral".into()),
+        default_model: Some("mistral-large".into()),
+        ..Default::default()
+    };
     config.agent.max_tool_iterations = 15;
 
     let toml_str = toml::to_string(&config).expect("config should serialize");
