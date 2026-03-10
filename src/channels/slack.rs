@@ -869,7 +869,10 @@ impl SlackChannel {
             return None;
         };
         if !Self::is_supported_image_mime(&mime) {
-            tracing::warn!("Slack image MIME not supported for {}: {mime}", redacted_url);
+            tracing::warn!(
+                "Slack image MIME not supported for {}: {mime}",
+                redacted_url
+            );
             return None;
         }
 
