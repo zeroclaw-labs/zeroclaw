@@ -187,9 +187,9 @@ Examples:
         #[arg(long)]
         model: Option<String>,
 
-        /// Temperature (0.0 - 2.0)
-        #[arg(short, long, default_value = "0.7", value_parser = parse_temperature)]
-        temperature: f64,
+        /// Temperature (0.0 - 2.0, defaults to config default_temperature)
+        #[arg(short, long, value_parser = parse_temperature)]
+        temperature: Option<f64>,
 
         /// Attach a peripheral (board:path, e.g. nucleo-f401re:/dev/ttyACM0)
         #[arg(long)]
@@ -779,7 +779,7 @@ async fn main() -> Result<()> {
             message,
             provider,
             model,
-            temperature,
+            temperature.unwrap_or(config.default_temperature),
             peripheral,
             true,
         )
