@@ -64,4 +64,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Workspace escape prevention
 - Forbidden system path protection (`/etc`, `/root`, `~/.ssh`)
 
-[0.1.0]: https://github.com/theonlyhennygod/zeroclaw/releases/tag/v0.1.0
+[0.1.0]: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/v0.1.0
