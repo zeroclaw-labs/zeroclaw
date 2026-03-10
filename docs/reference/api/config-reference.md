@@ -568,7 +568,7 @@ Notes:
 
 - Webhook endpoint is `POST /nextcloud-talk`.
 - `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides `webhook_secret` when set.
-- See [nextcloud-talk-setup.md](nextcloud-talk-setup.md) for setup and troubleshooting.
+- See [nextcloud-talk-setup.md](../../setup-guides/nextcloud-talk-setup.md) for setup and troubleshooting.
 
 ## `[hardware]`
 
@@ -587,7 +587,7 @@ Notes:
 
 - Use `transport = "serial"` with `serial_port` for USB-serial connections.
 - Use `transport = "probe"` with `probe_target` for debug-probe flashing (e.g. ST-Link).
-- See [hardware-peripherals-design.md](hardware-peripherals-design.md) for protocol details.
+- See [hardware-peripherals-design.md](../../hardware/hardware-peripherals-design.md) for protocol details.
 
 ## `[peripherals]`
 
@@ -627,7 +627,7 @@ transport = "native"
 Notes:
 
 - Place `.md`/`.txt` datasheet files named by board (e.g. `nucleo-f401re.md`, `rpi-gpio.md`) in `datasheet_dir` for RAG retrieval.
-- See [hardware-peripherals-design.md](hardware-peripherals-design.md) for board protocol and firmware notes.
+- See [hardware-peripherals-design.md](../../hardware/hardware-peripherals-design.md) for board protocol and firmware notes.
 
 ## Security-Relevant Defaults
 
@@ -650,5 +650,5 @@ zeroclaw service restart
 
 - [channels-reference.md](channels-reference.md)
 - [providers-reference.md](providers-reference.md)
-- [operations-runbook.md](operations-runbook.md)
-- [troubleshooting.md](troubleshooting.md)
+- [operations-runbook.md](../../ops/operations-runbook.md)
+- [troubleshooting.md](../../ops/troubleshooting.md)

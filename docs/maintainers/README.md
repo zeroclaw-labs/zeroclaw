@@ -4,7 +4,7 @@ Time-bound project status snapshots for planning documentation and operations wo
 
 ## Current Snapshot
 
-- [../project-triage-snapshot-2026-02-18.md](../project-triage-snapshot-2026-02-18.md)
+- [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md)
 
 ## Scope
 
@@ -14,4 +14,4 @@ Project snapshots are time-bound assessments of open PRs, issues, and documentat
 - Prioritize docs maintenance alongside code changes
 - Track evolving PR/issue pressure over time
 
-For stable documentation classification (not time-bound), use [docs-inventory.md](../docs-inventory.md).
+For stable documentation classification (not time-bound), use [docs-inventory.md](docs-inventory.md).

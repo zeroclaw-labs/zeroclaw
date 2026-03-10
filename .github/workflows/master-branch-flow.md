@@ -4,9 +4,9 @@ This document explains what runs when code is proposed to `master` and released.
 
 Use this with:
 
-- [`docs/ci-map.md`](../../docs/ci-map.md)
-- [`docs/pr-workflow.md`](../../docs/pr-workflow.md)
-- [`docs/release-process.md`](../../docs/release-process.md)
+- [`docs/ci-map.md`](../../docs/contributing/ci-map.md)
+- [`docs/pr-workflow.md`](../../docs/contributing/pr-workflow.md)
+- [`docs/release-process.md`](../../docs/contributing/release-process.md)
 
 ## Branching Model
 

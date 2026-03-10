@@ -2,7 +2,7 @@
 
 This document explains what each GitHub workflow does, when it runs, and whether it should block merges.
 
-For event-by-event delivery behavior across PR, merge, push, and release, see [`.github/workflows/master-branch-flow.md`](../.github/workflows/master-branch-flow.md).
+For event-by-event delivery behavior across PR, merge, push, and release, see [`.github/workflows/master-branch-flow.md`](../../.github/workflows/master-branch-flow.md).
 
 ## Merge-Blocking vs Optional
 
@@ -102,14 +102,14 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 ## Maintenance Rules
 
 - Keep merge-blocking checks deterministic and reproducible (`--locked` where applicable).
-- Follow `docs/release-process.md` for verify-before-publish release cadence and tag discipline.
+- Follow [`docs/contributing/release-process.md`](./release-process.md) for verify-before-publish release cadence and tag discipline.
 - Keep merge-blocking rust quality policy aligned across `.github/workflows/ci-run.yml`, `dev/ci.sh`, and `.githooks/pre-push` (`./scripts/ci/rust_quality_gate.sh` + `./scripts/ci/rust_strict_delta_gate.sh`).
 - Use `./scripts/ci/rust_strict_delta_gate.sh` (or `./dev/ci.sh lint-delta`) as the incremental strict merge gate for changed Rust lines.
 - Run full strict lint audits regularly via `./scripts/ci/rust_quality_gate.sh --strict` (for example through `./dev/ci.sh lint-strict`) and track cleanup in focused PRs.
 - Keep docs markdown gating incremental via `./scripts/ci/docs_quality_gate.sh` (block changed-line issues, report baseline issues separately).
 - Keep docs link gating incremental via `./scripts/ci/collect_changed_links.py` + lychee (check only links added on changed lines).
 - Prefer explicit workflow permissions (least privilege).
-- Keep Actions source policy restricted to approved allowlist patterns (see `docs/actions-source-policy.md`).
+- Keep Actions source policy restricted to approved allowlist patterns (see [`docs/contributing/actions-source-policy.md`](./actions-source-policy.md)).
 - Use path filters for expensive workflows when practical.
 - Keep docs quality checks low-noise (incremental markdown + incremental added-link checks).
 - Keep dependency update volume controlled (grouping + PR limits).

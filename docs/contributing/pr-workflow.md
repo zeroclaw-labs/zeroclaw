@@ -11,7 +11,7 @@ This document defines how ZeroClaw handles high PR volume while maintaining:
 
 Related references:
 
-- [`docs/README.md`](./README.md) for documentation taxonomy and navigation.
+- [`docs/README.md`](../README.md) for documentation taxonomy and navigation.
 - [`docs/ci-map.md`](./ci-map.md) for per-workflow ownership, triggers, and triage flow.
 - [`docs/reviewer-playbook.md`](./reviewer-playbook.md) for day-to-day reviewer execution.
 
@@ -352,7 +352,7 @@ This keeps context loss low and avoids repeated deep dives.
 
 ## 15. Related Docs
 
-- [README.md](./README.md) — documentation taxonomy and navigation.
+- [README.md](../README.md) — documentation taxonomy and navigation.
 - [ci-map.md](./ci-map.md) — CI workflow ownership and triage map.
 - [reviewer-playbook.md](./reviewer-playbook.md) — reviewer execution model.
 - [actions-source-policy.md](./actions-source-policy.md) — action source allowlist policy.

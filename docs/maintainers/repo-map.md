@@ -56,7 +56,7 @@ zeroclaw/
 ├── Dockerfile            # Container build
 ├── docker-compose.yml    # Service composition
 ├── flake.nix             # Nix dev environment
-└── bootstrap.sh          # One-command setup script
+└── install.sh            # One-command setup script
 ```
 
 ---

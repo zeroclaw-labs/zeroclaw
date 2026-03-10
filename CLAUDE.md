@@ -335,7 +335,7 @@ Additional expectations by change type:
 - **Docs/template-only**:
     - run markdown lint and link-integrity checks
     - if touching README/docs-hub/SUMMARY/collection indexes, verify EN/ZH/JA/RU navigation parity
-    - if touching bootstrap docs/scripts, run `bash -n bootstrap.sh scripts/bootstrap.sh scripts/install.sh`
+    - if touching bootstrap docs/scripts, run `bash -n install.sh`
 - **Workflow changes**: validate YAML syntax; run workflow lint/sanity checks when available.
 - **Security/runtime/gateway/tools**: include at least one boundary/failure-mode validation.
 

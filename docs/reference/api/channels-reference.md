@@ -3,15 +3,15 @@
 This document is the canonical reference for channel configuration in ZeroClaw.
 
 For encrypted Matrix rooms, also read the dedicated runbook:
-- [Matrix E2EE Guide](./matrix-e2ee-guide.md)
+- [Matrix E2EE Guide](../../security/matrix-e2ee-guide.md)
 
 ## Quick Paths
 
 - Need a full config reference by channel: jump to [Per-Channel Config Examples](#4-per-channel-config-examples).
 - Need a no-response diagnosis flow: jump to [Troubleshooting Checklist](#6-troubleshooting-checklist).
-- Need Matrix encrypted-room help: use [Matrix E2EE Guide](./matrix-e2ee-guide.md).
-- Need Nextcloud Talk bot setup: use [Nextcloud Talk Setup](./nextcloud-talk-setup.md).
-- Need deployment/network assumptions (polling vs webhook): use [Network Deployment](./network-deployment.md).
+- Need Matrix encrypted-room help: use [Matrix E2EE Guide](../../security/matrix-e2ee-guide.md).
+- Need Nextcloud Talk bot setup: use [Nextcloud Talk Setup](../../setup-guides/nextcloud-talk-setup.md).
+- Need deployment/network assumptions (polling vs webhook): use [Network Deployment](../../ops/network-deployment.md).
 
 ## FAQ: Matrix setup passes but no reply
 
@@ -211,7 +211,7 @@ room_id = "!room:matrix.example.com"       # or room alias (#ops:matrix.example.
 allowed_users = ["*"]
 ```
 
-See [Matrix E2EE Guide](./matrix-e2ee-guide.md) for encrypted-room troubleshooting.
+See [Matrix E2EE Guide](../../security/matrix-e2ee-guide.md) for encrypted-room troubleshooting.
 
 ### 4.6 Signal
 
@@ -403,7 +403,7 @@ Notes:
 - Signature verification uses `X-Nextcloud-Talk-Random` and `X-Nextcloud-Talk-Signature`.
 - If `webhook_secret` is set, invalid signatures are rejected with `401`.
 - `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides config secret.
-- See [nextcloud-talk-setup.md](./nextcloud-talk-setup.md) for a full runbook.
+- See [nextcloud-talk-setup.md](../../setup-guides/nextcloud-talk-setup.md) for a full runbook.
 
 ### 4.16 Linq
 
@@ -462,7 +462,7 @@ If a channel appears connected but does not respond:
 5. Restart `zeroclaw daemon` after config changes.
 
 For Matrix encrypted rooms specifically, use:
-- [Matrix E2EE Guide](./matrix-e2ee-guide.md)
+- [Matrix E2EE Guide](../../security/matrix-e2ee-guide.md)
 
 ---
 

@@ -1,7 +1,7 @@
 # Reviewer Playbook
 
 This playbook is the operational companion to [`docs/pr-workflow.md`](./pr-workflow.md).
-For broader documentation navigation, use [`docs/README.md`](./README.md).
+For broader documentation navigation, use [`docs/README.md`](../README.md).
 
 ## 0. Summary
 
@@ -177,7 +177,7 @@ If handing off review to another maintainer/agent, include:
 
 ## 8. Related Docs
 
-- [README.md](./README.md) — documentation taxonomy and navigation.
+- [README.md](../README.md) — documentation taxonomy and navigation.
 - [pr-workflow.md](./pr-workflow.md) — governance workflow and merge contract.
 - [ci-map.md](./ci-map.md) — CI ownership and triage map.
 - [actions-source-policy.md](./actions-source-policy.md) — action source allowlist policy.

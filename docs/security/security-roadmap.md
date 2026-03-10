@@ -3,7 +3,7 @@
 > ⚠️ **Status: Proposal / Roadmap**
 >
 > This document describes proposed approaches and may include hypothetical commands or config.
-> For current runtime behavior, see [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), and [troubleshooting.md](troubleshooting.md).
+> For current runtime behavior, see [config-reference.md](../reference/api/config-reference.md), [operations-runbook.md](../ops/operations-runbook.md), and [troubleshooting.md](../ops/troubleshooting.md).
 
 ## Current State: Strong Foundation
 

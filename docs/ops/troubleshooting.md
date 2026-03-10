@@ -15,7 +15,7 @@ Symptom:
 Fix:
 
 ```bash
-./bootstrap.sh --install-rust
+./install.sh --install-rust
 ```
 
 Or install from <https://rustup.rs/>.
@@ -29,7 +29,7 @@ Symptom:
 Fix:
 
 ```bash
-./bootstrap.sh --install-system-deps
+./install.sh --install-system-deps
 ```
 
 ### Build fails on low-RAM / low-disk hosts
@@ -48,13 +48,13 @@ Why this happens:
 Preferred path for constrained machines:
 
 ```bash
-./bootstrap.sh --prefer-prebuilt
+./install.sh --prefer-prebuilt
 ```
 
 Binary-only mode (no source fallback):
 
 ```bash
-./bootstrap.sh --prebuilt-only
+./install.sh --prebuilt-only
 ```
 
 If you must compile from source on constrained hosts:
@@ -215,16 +215,11 @@ Linux logs:
 journalctl --user -u zeroclaw.service -f
 ```
 
-## Legacy Installer Compatibility
-
-Both still work:
+## Installer URL
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/bootstrap.sh | bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/install.sh | bash
 ```
-
-`install.sh` is a compatibility entry and forwards/falls back to bootstrap behavior.
 
 ## Still Stuck?
 
@@ -242,6 +237,6 @@ Also include OS, install method, and sanitized config snippets (no secrets).
 ## Related Docs
 
 - [operations-runbook.md](operations-runbook.md)
-- [one-click-bootstrap.md](one-click-bootstrap.md)
-- [channels-reference.md](channels-reference.md)
+- [one-click-bootstrap.md](../setup-guides/one-click-bootstrap.md)
+- [channels-reference.md](../reference/api/channels-reference.md)
 - [network-deployment.md](network-deployment.md)

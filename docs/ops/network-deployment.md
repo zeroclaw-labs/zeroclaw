@@ -299,7 +299,7 @@ sudo zeroclaw service uninstall
 
 ## 8. References
 
-- [channels-reference.md](./channels-reference.md) — Channel configuration overview
-- [matrix-e2ee-guide.md](./matrix-e2ee-guide.md) — Matrix setup and encrypted-room troubleshooting
-- [hardware-peripherals-design.md](./hardware-peripherals-design.md) — Peripherals design
-- [adding-boards-and-tools.md](./adding-boards-and-tools.md) — Hardware setup and adding boards
+- [channels-reference.md](../reference/api/channels-reference.md) — Channel configuration overview
+- [matrix-e2ee-guide.md](../security/matrix-e2ee-guide.md) — Matrix setup and encrypted-room troubleshooting
+- [hardware-peripherals-design.md](../hardware/hardware-peripherals-design.md) — Peripherals design
+- [adding-boards-and-tools.md](../contributing/adding-boards-and-tools.md) — Hardware setup and adding boards

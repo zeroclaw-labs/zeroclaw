@@ -298,6 +298,6 @@ If all tests pass:
 
 ## 📞 Support
 
-- Issues: https://github.com/theonlyhennygod/zeroclaw/issues
-- Docs: `docs/contributing/testing-telegram.md`
+- Issues: https://github.com/zeroclaw-labs/zeroclaw/issues
+- Docs: [testing-telegram.md](../../tests/telegram/testing-telegram.md)
 - Help: `zeroclaw --help`

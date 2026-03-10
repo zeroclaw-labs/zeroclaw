@@ -138,5 +138,5 @@ curl -s "https://api.z.ai/api/coding/paas/v4/models" \
 ## Related Documentation
 
 - [ZeroClaw README](../README.md)
-- [Custom Provider Endpoints](./custom-providers.md)
-- [Contributing Guide](../CONTRIBUTING.md)
+- [Custom Provider Endpoints](../contributing/custom-providers.md)
+- [Contributing Guide](../../CONTRIBUTING.md)

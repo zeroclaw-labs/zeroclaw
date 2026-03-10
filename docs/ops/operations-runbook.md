@@ -13,7 +13,7 @@ Use this document for day-2 operations:
 - safe rollout and rollback
 - incident triage and recovery
 
-For first-time installation, start from [one-click-bootstrap.md](one-click-bootstrap.md).
+For first-time installation, start from [one-click-bootstrap.md](../setup-guides/one-click-bootstrap.md).
 
 ## Runtime Modes
 
@@ -122,7 +122,7 @@ If a rollout regresses behavior:
 
 ## Related Docs
 
-- [one-click-bootstrap.md](one-click-bootstrap.md)
-- [troubleshooting.md](troubleshooting.md)
-- [config-reference.md](config-reference.md)
-- [commands-reference.md](commands-reference.md)
+- [one-click-bootstrap.md](../setup-guides/one-click-bootstrap.md)
+- [troubleshooting.md](./troubleshooting.md)
+- [config-reference.md](../reference/api/config-reference.md)
+- [commands-reference.md](../reference/cli/commands-reference.md)

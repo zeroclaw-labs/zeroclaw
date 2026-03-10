@@ -90,7 +90,7 @@ Place PDFs in the datasheet directory. They are extracted and chunked for RAG.
 2. **Add to config** — `zeroclaw peripheral add my-board /dev/ttyUSB0`
 3. **Implement a peripheral** (optional) — For custom protocols, implement the `Peripheral` trait in `src/peripherals/` and register in `create_peripheral_tools`.
 
-See `docs/hardware-peripherals-design.md` for the full design.
+See [`docs/hardware/hardware-peripherals-design.md`](../hardware/hardware-peripherals-design.md) for the full design.
 
 ## Adding a Custom Tool
 

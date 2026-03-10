@@ -4,11 +4,11 @@ For operators running ZeroClaw in persistent or production-like environments.
 
 ## Core Operations
 
-- Day-2 runbook: [../operations-runbook.md](../operations-runbook.md)
-- Release runbook: [../release-process.md](../release-process.md)
-- Troubleshooting matrix: [../troubleshooting.md](../troubleshooting.md)
-- Safe network/gateway deployment: [../network-deployment.md](../network-deployment.md)
-- Mattermost setup (channel-specific): [../mattermost-setup.md](../mattermost-setup.md)
+- Day-2 runbook: [./operations-runbook.md](./operations-runbook.md)
+- Release runbook: [../contributing/release-process.md](../contributing/release-process.md)
+- Troubleshooting matrix: [./troubleshooting.md](./troubleshooting.md)
+- Safe network/gateway deployment: [./network-deployment.md](./network-deployment.md)
+- Mattermost setup (channel-specific): [../setup-guides/mattermost-setup.md](../setup-guides/mattermost-setup.md)
 
 ## Common Flow
 
@@ -20,5 +20,5 @@ For operators running ZeroClaw in persistent or production-like environments.
 
 ## Related
 
-- Config reference: [../config-reference.md](../config-reference.md)
+- Config reference: [../reference/api/config-reference.md](../reference/api/config-reference.md)
 - Security collection: [../security/README.md](../security/README.md)

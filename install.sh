@@ -1,4 +1,50 @@
-#!/usr/bin/env bash
+#!/usr/bin/env sh
+# ZeroClaw installer
+# POSIX preamble: ensure bash is available, then re-exec under bash.
+set -eu
+
+_have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+_run_privileged() {
+  if [ "$(id -u)" -eq 0 ]; then "$@"
+  elif _have_cmd sudo; then sudo "$@"
+  else echo "error: sudo is required to install missing dependencies." >&2; exit 1; fi
+}
+
+_is_container_runtime() {
+  [ -f /.dockerenv ] || [ -f /run/.containerenv ] && return 0
+  [ -r /proc/1/cgroup ] && grep -Eq '(docker|containerd|kubepods|podman|lxc)' /proc/1/cgroup && return 0
+  return 1
+}
+
+_ensure_bash() {
+  _have_cmd bash && return 0
+  echo "==> bash not found; attempting to install it"
+  if _have_cmd apk; then _run_privileged apk add --no-cache bash
+  elif _have_cmd apt-get; then _run_privileged apt-get update -qq && _run_privileged apt-get install -y bash
+  elif _have_cmd dnf; then _run_privileged dnf install -y bash
+  elif _have_cmd pacman; then
+    if _is_container_runtime; then
+      _PACMAN_CFG="$(mktemp /tmp/zeroclaw-pacman.XXXXXX.conf)"
+      cp /etc/pacman.conf "$_PACMAN_CFG"
+      grep -Eq '^[[:space:]]*DisableSandboxSyscalls([[:space:]]|$)' "$_PACMAN_CFG" || printf '\nDisableSandboxSyscalls\n' >> "$_PACMAN_CFG"
+      _run_privileged pacman --config "$_PACMAN_CFG" -Sy --noconfirm
+      _run_privileged pacman --config "$_PACMAN_CFG" -S --noconfirm --needed bash
+      rm -f "$_PACMAN_CFG"
+    else
+      _run_privileged pacman -Sy --noconfirm
+      _run_privileged pacman -S --noconfirm --needed bash
+    fi
+  else echo "error: unsupported package manager; install bash manually and retry." >&2; exit 1; fi
+}
+
+# If not already running under bash, ensure bash exists and re-exec.
+if [ -z "${BASH_VERSION:-}" ]; then
+  _ensure_bash
+  exec bash "$0" "$@"
+fi
+
+# --- From here on, we are running under bash ---
 set -euo pipefail
 
 info() {
@@ -15,11 +61,10 @@ error() {
 
 usage() {
   cat <<'USAGE'
-ZeroClaw installer bootstrap engine
+ZeroClaw installer
 
 Usage:
-  ./zeroclaw_install.sh [options]
-  ./bootstrap.sh [options]         # compatibility entrypoint
+  ./install.sh [options]
 
 Modes:
   Default mode installs/builds ZeroClaw only (requires existing Rust toolchain).
@@ -29,7 +74,7 @@ Modes:
 Options:
   --guided                   Run interactive guided installer
   --no-guided                Disable guided installer
-  --docker                   Run bootstrap in Docker-compatible mode and launch onboarding inside the container
+  --docker                   Run install in Docker-compatible mode and launch onboarding inside the container
   --install-system-deps      Install build dependencies (Linux/macOS)
   --install-rust             Install Rust via rustup if missing
   --prefer-prebuilt          Try latest release binary first; fallback to source build on miss
@@ -46,19 +91,17 @@ Options:
   -h, --help                 Show help
 
 Examples:
-  ./zeroclaw_install.sh
-  ./zeroclaw_install.sh --guided
-  ./zeroclaw_install.sh --install-system-deps --install-rust
-  ./zeroclaw_install.sh --prefer-prebuilt
-  ./zeroclaw_install.sh --prebuilt-only
-  ./zeroclaw_install.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
-  ./zeroclaw_install.sh --interactive-onboard
-
-  # Compatibility entrypoint:
-  ./bootstrap.sh --docker
+  ./install.sh
+  ./install.sh --guided
+  ./install.sh --install-system-deps --install-rust
+  ./install.sh --prefer-prebuilt
+  ./install.sh --prebuilt-only
+  ./install.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
+  ./install.sh --interactive-onboard
+  ./install.sh --docker
 
   # Remote one-liner
-  curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/scripts/bootstrap.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/install.sh | bash
 
 Environment:
   ZEROCLAW_CONTAINER_CLI     Container CLI command (default: docker; auto-fallback: podman)
@@ -690,9 +733,9 @@ run_docker_bootstrap() {
 Use either:
   --api-key "sk-..."
 or:
-  ZEROCLAW_API_KEY="sk-..." ./zeroclaw_install.sh --docker
+  ZEROCLAW_API_KEY="sk-..." ./install.sh --docker
 or run interactive:
-  ./zeroclaw_install.sh --docker --interactive-onboard
+  ./install.sh --docker --interactive-onboard
 MSG
       exit 1
     fi
@@ -720,7 +763,7 @@ MSG
 
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd || pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd || pwd)"
+ROOT_DIR="$SCRIPT_DIR"
 REPO_URL="https://github.com/zeroclaw-labs/zeroclaw.git"
 ORIGINAL_ARG_COUNT=$#
 GUIDED_MODE="auto"
@@ -889,9 +932,9 @@ cleanup() {
 trap cleanup EXIT
 
 # Support three launch modes:
-# 1) ./bootstrap.sh from repo root
-# 2) scripts/bootstrap.sh from repo
-# 3) curl | bash (no local repo => temporary clone)
+# Support two launch modes:
+# 1) ./install.sh from repo root
+# 2) curl | bash (no local repo => temporary clone)
 if [[ ! -f "$WORK_DIR/Cargo.toml" ]]; then
   if [[ -f "$(pwd)/Cargo.toml" ]]; then
     WORK_DIR="$(pwd)"
@@ -912,7 +955,7 @@ if [[ ! -f "$WORK_DIR/Cargo.toml" ]]; then
   fi
 fi
 
-info "ZeroClaw bootstrap"
+info "ZeroClaw installer"
 echo "    workspace: $WORK_DIR"
 
 cd "$WORK_DIR"
@@ -945,8 +988,8 @@ DONE
   cat <<'DONE'
 
 Next steps:
-  ./zeroclaw_install.sh --docker --interactive-onboard
-  ./zeroclaw_install.sh --docker --api-key "sk-..." --provider openrouter
+  ./install.sh --docker --interactive-onboard
+  ./install.sh --docker --api-key "sk-..." --provider openrouter
 DONE
   exit 0
 fi
@@ -979,7 +1022,7 @@ if [[ "$PREBUILT_INSTALLED" == false && ( "$SKIP_BUILD" == false || "$SKIP_INSTA
   cat <<'MSG' >&2
 Install Rust first: https://rustup.rs/
 or re-run with:
-  ./zeroclaw_install.sh --install-rust
+  ./install.sh --install-rust
 MSG
   exit 1
 fi
@@ -1024,9 +1067,9 @@ if [[ "$RUN_ONBOARD" == true ]]; then
 Use either:
   --api-key "sk-..."
 or:
-  ZEROCLAW_API_KEY="sk-..." ./zeroclaw_install.sh --onboard
+  ZEROCLAW_API_KEY="sk-..." ./install.sh --onboard
 or run interactive:
-  ./zeroclaw_install.sh --interactive-onboard
+  ./install.sh --interactive-onboard
 MSG
       exit 1
     fi

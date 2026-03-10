@@ -25,8 +25,8 @@
 </p>
 
 <p align="center">
-  <a href="bootstrap.sh">Установка в 1 клик</a> |
-  <a href="docs/getting-started/README.md">Быстрый старт</a> |
+  <a href="install.sh">Установка в 1 клик</a> |
+  <a href="docs/setup-guides/README.md">Быстрый старт</a> |
   <a href="docs/README.ru.md">Хаб документации</a> |
   <a href="docs/SUMMARY.md">TOC docs</a>
 </p>
@@ -34,8 +34,8 @@
 <p align="center">
   <strong>Быстрые маршруты:</strong>
   <a href="docs/reference/README.md">Справочники</a> ·
-  <a href="docs/operations/README.md">Операции</a> ·
-  <a href="docs/troubleshooting.md">Диагностика</a> ·
+  <a href="docs/ops/README.md">Операции</a> ·
+  <a href="docs/ops/troubleshooting.md">Диагностика</a> ·
   <a href="docs/security/README.md">Безопасность</a> ·
   <a href="docs/hardware/README.md">Аппаратная часть</a> ·
   <a href="docs/contributing/README.md">Вклад и CI</a>
@@ -113,12 +113,12 @@ ls -lh target/release/zeroclaw
 ```bash
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
-./bootstrap.sh
+./install.sh
 ```
 
-Для полной инициализации окружения: `./bootstrap.sh --install-system-deps --install-rust` (для системных пакетов может потребоваться `sudo`).
+Для полной инициализации окружения: `./install.sh --install-system-deps --install-rust` (для системных пакетов может потребоваться `sudo`).
 
-Подробности: [`docs/one-click-bootstrap.md`](docs/one-click-bootstrap.md).
+Подробности: [`docs/setup-guides/one-click-bootstrap.md`](docs/setup-guides/one-click-bootstrap.md).
 
 ## Быстрый старт
 
@@ -195,7 +195,7 @@ zeroclaw agent --provider anthropic -m "hello"
 Каждая подсистема — это **Trait**: меняйте реализации через конфигурацию, без изменения кода.
 
 <p align="center">
-  <img src="docs/architecture.svg" alt="Архитектура ZeroClaw" width="900" />
+  <img src="docs/assets/architecture.svg" alt="Архитектура ZeroClaw" width="900" />
 </p>
 
 | Подсистема | Trait | Встроенные реализации | Расширение |
@@ -279,20 +279,20 @@ allow_public_bind = false
 - Хаб документации (English): [`docs/README.md`](docs/README.md)
 - Единый TOC docs: [`docs/SUMMARY.md`](docs/SUMMARY.md)
 - Хаб документации (Русский): [`docs/README.ru.md`](docs/README.ru.md)
-- Справочник команд: [`docs/commands-reference.md`](docs/commands-reference.md)
-- Справочник конфигурации: [`docs/config-reference.md`](docs/config-reference.md)
-- Справочник providers: [`docs/providers-reference.md`](docs/providers-reference.md)
-- Справочник channels: [`docs/channels-reference.md`](docs/channels-reference.md)
-- Операционный runbook: [`docs/operations-runbook.md`](docs/operations-runbook.md)
-- Устранение неполадок: [`docs/troubleshooting.md`](docs/troubleshooting.md)
-- Инвентарь и классификация docs: [`docs/docs-inventory.md`](docs/docs-inventory.md)
-- Снимок triage проекта: [`docs/project-triage-snapshot-2026-02-18.md`](docs/project-triage-snapshot-2026-02-18.md)
+- Справочник команд: [`docs/reference/cli/commands-reference.md`](docs/reference/cli/commands-reference.md)
+- Справочник конфигурации: [`docs/reference/api/config-reference.md`](docs/reference/api/config-reference.md)
+- Справочник providers: [`docs/reference/api/providers-reference.md`](docs/reference/api/providers-reference.md)
+- Справочник channels: [`docs/reference/api/channels-reference.md`](docs/reference/api/channels-reference.md)
+- Операционный runbook: [`docs/ops/operations-runbook.md`](docs/ops/operations-runbook.md)
+- Устранение неполадок: [`docs/ops/troubleshooting.md`](docs/ops/troubleshooting.md)
+- Инвентарь и классификация docs: [`docs/maintainers/docs-inventory.md`](docs/maintainers/docs-inventory.md)
+- Снимок triage проекта: [`docs/maintainers/project-triage-snapshot-2026-02-18.md`](docs/maintainers/project-triage-snapshot-2026-02-18.md)
 
 ## Вклад и лицензия
 
 - Contribution guide: [`CONTRIBUTING.md`](CONTRIBUTING.md)
-- PR workflow: [`docs/pr-workflow.md`](docs/pr-workflow.md)
-- Reviewer playbook: [`docs/reviewer-playbook.md`](docs/reviewer-playbook.md)
+- PR workflow: [`docs/contributing/pr-workflow.md`](docs/contributing/pr-workflow.md)
+- Reviewer playbook: [`docs/contributing/reviewer-playbook.md`](docs/contributing/reviewer-playbook.md)
 - License: MIT or Apache 2.0 ([`LICENSE-MIT`](LICENSE-MIT), [`LICENSE-APACHE`](LICENSE-APACHE), [`NOTICE`](NOTICE))
 
 ---

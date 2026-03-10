@@ -34,7 +34,7 @@ From your local repository checkout:
 
 ```bash
 git pull --ff-only
-./bootstrap.sh --prefer-prebuilt
+./install.sh --prefer-prebuilt
 zeroclaw --version
 ```
 
@@ -107,6 +107,6 @@ pkill -f zeroclaw
 
 ## Related docs
 
-- [One-Click Bootstrap](../one-click-bootstrap.md)
-- [Commands Reference](../commands-reference.md)
-- [Troubleshooting](../troubleshooting.md)
+- [One-Click Bootstrap](one-click-bootstrap.md)
+- [Commands Reference](../reference/cli/commands-reference.md)
+- [Troubleshooting](../ops/troubleshooting.md)

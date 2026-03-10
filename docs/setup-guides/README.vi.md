@@ -5,8 +5,8 @@ Dành cho cài đặt lần đầu và làm quen nhanh.
 ## Lộ trình bắt đầu
 
 1. Tổng quan và khởi động nhanh: [../../README.vi.md](../../README.vi.md)
-2. Cài đặt một lệnh và chế độ bootstrap kép: [../one-click-bootstrap.md](../one-click-bootstrap.md)
-3. Tìm lệnh theo tác vụ: [../commands-reference.md](../commands-reference.md)
+2. Cài đặt một lệnh và chế độ bootstrap kép: [one-click-bootstrap.md](one-click-bootstrap.md)
+3. Tìm lệnh theo tác vụ: [../reference/cli/commands-reference.md](../reference/cli/commands-reference.md)
 
 ## Chọn hướng đi
 
@@ -25,5 +25,5 @@ Dành cho cài đặt lần đầu và làm quen nhanh.
 
 ## Tiếp theo
 
-- Vận hành runtime: [../operations/README.md](../operations/README.md)
+- Vận hành runtime: [../ops/README.md](../ops/README.md)
 - Tra cứu tham khảo: [../reference/README.md](../reference/README.md)

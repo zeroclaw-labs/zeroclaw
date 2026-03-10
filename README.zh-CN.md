@@ -25,8 +25,8 @@
 </p>
 
 <p align="center">
-  <a href="bootstrap.sh">一键部署</a> |
-  <a href="docs/getting-started/README.md">安装入门</a> |
+  <a href="install.sh">一键部署</a> |
+  <a href="docs/setup-guides/README.md">安装入门</a> |
   <a href="docs/README.zh-CN.md">文档总览</a> |
   <a href="docs/SUMMARY.md">文档目录</a>
 </p>
@@ -34,8 +34,8 @@
 <p align="center">
   <strong>场景分流：</strong>
   <a href="docs/reference/README.md">参考手册</a> ·
-  <a href="docs/operations/README.md">运维部署</a> ·
-  <a href="docs/troubleshooting.md">故障排查</a> ·
+  <a href="docs/ops/README.md">运维部署</a> ·
+  <a href="docs/ops/troubleshooting.md">故障排查</a> ·
   <a href="docs/security/README.md">安全专题</a> ·
   <a href="docs/hardware/README.md">硬件外设</a> ·
   <a href="docs/contributing/README.md">贡献与 CI</a>
@@ -113,12 +113,12 @@ ls -lh target/release/zeroclaw
 ```bash
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
-./bootstrap.sh
+./install.sh
 ```
 
-可选环境初始化：`./bootstrap.sh --install-system-deps --install-rust`（可能需要 `sudo`）。
+可选环境初始化：`./install.sh --install-system-deps --install-rust`（可能需要 `sudo`）。
 
-详细说明见：[`docs/one-click-bootstrap.md`](docs/one-click-bootstrap.md)。
+详细说明见：[`docs/setup-guides/one-click-bootstrap.md`](docs/setup-guides/one-click-bootstrap.md)。
 
 ## 快速开始
 
@@ -200,7 +200,7 @@ zeroclaw agent --provider anthropic -m "hello"
 每个子系统都是一个 **Trait** — 通过配置切换即可更换实现，无需修改代码。
 
 <p align="center">
-  <img src="docs/architecture.svg" alt="ZeroClaw 架构图" width="900" />
+  <img src="docs/assets/architecture.svg" alt="ZeroClaw 架构图" width="900" />
 </p>
 
 | 子系统 | Trait | 内置实现 | 扩展方式 |
@@ -284,20 +284,20 @@ allow_public_bind = false
 - 文档总览（英文）：[`docs/README.md`](docs/README.md)
 - 统一目录（TOC）：[`docs/SUMMARY.md`](docs/SUMMARY.md)
 - 文档总览（简体中文）：[`docs/README.zh-CN.md`](docs/README.zh-CN.md)
-- 命令参考：[`docs/commands-reference.md`](docs/commands-reference.md)
-- 配置参考：[`docs/config-reference.md`](docs/config-reference.md)
-- Provider 参考：[`docs/providers-reference.md`](docs/providers-reference.md)
-- Channel 参考：[`docs/channels-reference.md`](docs/channels-reference.md)
-- 运维手册：[`docs/operations-runbook.md`](docs/operations-runbook.md)
-- 故障排查：[`docs/troubleshooting.md`](docs/troubleshooting.md)
-- 文档清单与分类：[`docs/docs-inventory.md`](docs/docs-inventory.md)
-- 项目 triage 快照（2026-02-18）：[`docs/project-triage-snapshot-2026-02-18.md`](docs/project-triage-snapshot-2026-02-18.md)
+- 命令参考：[`docs/reference/cli/commands-reference.md`](docs/reference/cli/commands-reference.md)
+- 配置参考：[`docs/reference/api/config-reference.md`](docs/reference/api/config-reference.md)
+- Provider 参考：[`docs/reference/api/providers-reference.md`](docs/reference/api/providers-reference.md)
+- Channel 参考：[`docs/reference/api/channels-reference.md`](docs/reference/api/channels-reference.md)
+- 运维手册：[`docs/ops/operations-runbook.md`](docs/ops/operations-runbook.md)
+- 故障排查：[`docs/ops/troubleshooting.md`](docs/ops/troubleshooting.md)
+- 文档清单与分类：[`docs/maintainers/docs-inventory.md`](docs/maintainers/docs-inventory.md)
+- 项目 triage 快照（2026-02-18）：[`docs/maintainers/project-triage-snapshot-2026-02-18.md`](docs/maintainers/project-triage-snapshot-2026-02-18.md)
 
 ## 贡献与许可证
 
 - 贡献指南：[`CONTRIBUTING.md`](CONTRIBUTING.md)
-- PR 工作流：[`docs/pr-workflow.md`](docs/pr-workflow.md)
-- Reviewer 指南：[`docs/reviewer-playbook.md`](docs/reviewer-playbook.md)
+- PR 工作流：[`docs/contributing/pr-workflow.md`](docs/contributing/pr-workflow.md)
+- Reviewer 指南：[`docs/contributing/reviewer-playbook.md`](docs/contributing/reviewer-playbook.md)
 - 许可证：MIT 或 Apache 2.0（见 [`LICENSE-MIT`](LICENSE-MIT)、[`LICENSE-APACHE`](LICENSE-APACHE) 与 [`NOTICE`](NOTICE)）
 
 ---

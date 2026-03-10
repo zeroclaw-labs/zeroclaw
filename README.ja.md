@@ -25,8 +25,8 @@
 </p>
 
 <p align="center">
-  <a href="bootstrap.sh">ワンクリック導入</a> |
-  <a href="docs/getting-started/README.md">導入ガイド</a> |
+  <a href="install.sh">ワンクリック導入</a> |
+  <a href="docs/setup-guides/README.md">導入ガイド</a> |
   <a href="docs/README.ja.md">ドキュメントハブ</a> |
   <a href="docs/SUMMARY.md">Docs TOC</a>
 </p>
@@ -34,8 +34,8 @@
 <p align="center">
   <strong>クイック分流：</strong>
   <a href="docs/reference/README.md">参照</a> ·
-  <a href="docs/operations/README.md">運用</a> ·
-  <a href="docs/troubleshooting.md">障害対応</a> ·
+  <a href="docs/ops/README.md">運用</a> ·
+  <a href="docs/ops/troubleshooting.md">障害対応</a> ·
   <a href="docs/security/README.md">セキュリティ</a> ·
   <a href="docs/hardware/README.md">ハードウェア</a> ·
   <a href="docs/contributing/README.md">貢献・CI</a>
@@ -113,12 +113,12 @@ README のサンプル値（macOS arm64, 2026-02-18）:
 ```bash
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
-./bootstrap.sh
+./install.sh
 ```
 
-環境ごと初期化する場合: `./bootstrap.sh --install-system-deps --install-rust`（システムパッケージで `sudo` が必要な場合があります）。
+環境ごと初期化する場合: `./install.sh --install-system-deps --install-rust`（システムパッケージで `sudo` が必要な場合があります）。
 
-詳細は [`docs/one-click-bootstrap.md`](docs/one-click-bootstrap.md) を参照してください。
+詳細は [`docs/setup-guides/one-click-bootstrap.md`](docs/setup-guides/one-click-bootstrap.md) を参照してください。
 
 ## クイックスタート
 
@@ -195,7 +195,7 @@ zeroclaw agent --provider anthropic -m "hello"
 すべてのサブシステムは **Trait** — 設定変更だけで実装を差し替え可能、コード変更不要。
 
 <p align="center">
-  <img src="docs/architecture.svg" alt="ZeroClaw アーキテクチャ" width="900" />
+  <img src="docs/assets/architecture.svg" alt="ZeroClaw アーキテクチャ" width="900" />
 </p>
 
 | サブシステム | Trait | 内蔵実装 | 拡張方法 |
@@ -279,20 +279,20 @@ allow_public_bind = false
 - ドキュメントハブ（英語）: [`docs/README.md`](docs/README.md)
 - 統合 TOC: [`docs/SUMMARY.md`](docs/SUMMARY.md)
 - ドキュメントハブ（日本語）: [`docs/README.ja.md`](docs/README.ja.md)
-- コマンドリファレンス: [`docs/commands-reference.md`](docs/commands-reference.md)
-- 設定リファレンス: [`docs/config-reference.md`](docs/config-reference.md)
-- Provider リファレンス: [`docs/providers-reference.md`](docs/providers-reference.md)
-- Channel リファレンス: [`docs/channels-reference.md`](docs/channels-reference.md)
-- 運用ガイド（Runbook）: [`docs/operations-runbook.md`](docs/operations-runbook.md)
-- トラブルシューティング: [`docs/troubleshooting.md`](docs/troubleshooting.md)
-- ドキュメント一覧 / 分類: [`docs/docs-inventory.md`](docs/docs-inventory.md)
-- プロジェクト triage スナップショット: [`docs/project-triage-snapshot-2026-02-18.md`](docs/project-triage-snapshot-2026-02-18.md)
+- コマンドリファレンス: [`docs/reference/cli/commands-reference.md`](docs/reference/cli/commands-reference.md)
+- 設定リファレンス: [`docs/reference/api/config-reference.md`](docs/reference/api/config-reference.md)
+- Provider リファレンス: [`docs/reference/api/providers-reference.md`](docs/reference/api/providers-reference.md)
+- Channel リファレンス: [`docs/reference/api/channels-reference.md`](docs/reference/api/channels-reference.md)
+- 運用ガイド（Runbook）: [`docs/ops/operations-runbook.md`](docs/ops/operations-runbook.md)
+- トラブルシューティング: [`docs/ops/troubleshooting.md`](docs/ops/troubleshooting.md)
+- ドキュメント一覧 / 分類: [`docs/maintainers/docs-inventory.md`](docs/maintainers/docs-inventory.md)
+- プロジェクト triage スナップショット: [`docs/maintainers/project-triage-snapshot-2026-02-18.md`](docs/maintainers/project-triage-snapshot-2026-02-18.md)
 
 ## コントリビュート / ライセンス
 
 - Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md)
-- PR Workflow: [`docs/pr-workflow.md`](docs/pr-workflow.md)
-- Reviewer Playbook: [`docs/reviewer-playbook.md`](docs/reviewer-playbook.md)
+- PR Workflow: [`docs/contributing/pr-workflow.md`](docs/contributing/pr-workflow.md)
+- Reviewer Playbook: [`docs/contributing/reviewer-playbook.md`](docs/contributing/reviewer-playbook.md)
 - License: MIT or Apache 2.0（[`LICENSE-MIT`](LICENSE-MIT), [`LICENSE-APACHE`](LICENSE-APACHE), [`NOTICE`](NOTICE)）
 
 ---
