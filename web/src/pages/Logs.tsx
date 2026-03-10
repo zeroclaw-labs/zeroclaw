@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import type { SSEEvent } from '@/types/api';
 import { SSEClient } from '@/lib/sse';
+import { t } from '@/lib/i18n';
 
 function formatTimestamp(ts?: string): string {
   if (!ts) return new Date().toLocaleTimeString();
@@ -138,7 +139,7 @@ export default function Logs() {
       <div className="flex items-center justify-between px-6 py-3 border-b border-gray-800 bg-gray-900">
         <div className="flex items-center gap-3">
           <Activity className="h-5 w-5 text-blue-400" />
-          <h2 className="text-base font-semibold text-white">Live Logs</h2>
+          <h2 className="text-base font-semibold text-white">{t('logs.title')}</h2>
           <div className="flex items-center gap-2 ml-2">
             <span
               className={`inline-block h-2 w-2 rounded-full ${
@@ -146,11 +147,11 @@ export default function Logs() {
               }`}
             />
             <span className="text-xs text-gray-500">
-              {connected ? 'Connected' : 'Disconnected'}
+              {connected ? t('agent.connected') : t('agent.disconnected')}
             </span>
           </div>
           <span className="text-xs text-gray-500 ml-2">
-            {filteredEntries.length} events
+            {filteredEntries.length} {t('logs.events')}
           </span>
         </div>
 
@@ -166,11 +167,11 @@ export default function Logs() {
           >
             {paused ? (
               <>
-                <Play className="h-3.5 w-3.5" /> Resume
+                <Play className="h-3.5 w-3.5" /> {t('logs.resume')}
               </>
             ) : (
               <>
-                <Pause className="h-3.5 w-3.5" /> Pause
+                <Pause className="h-3.5 w-3.5" /> {t('logs.pause')}
               </>
             )}
           </button>
@@ -182,7 +183,7 @@ export default function Logs() {
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors"
             >
               <ArrowDown className="h-3.5 w-3.5" />
-              Jump to bottom
+              {t('logs.jump_to_bottom')}
             </button>
           )}
         </div>
@@ -192,7 +193,7 @@ export default function Logs() {
       {allTypes.length > 0 && (
         <div className="flex items-center gap-2 px-6 py-2 border-b border-gray-800 bg-gray-900/80 overflow-x-auto">
           <Filter className="h-4 w-4 text-gray-500 flex-shrink-0" />
-          <span className="text-xs text-gray-500 flex-shrink-0">Filter:</span>
+          <span className="text-xs text-gray-500 flex-shrink-0">{t('logs.filter_label')}</span>
           {allTypes.map((type) => (
             <label
               key={type}
@@ -212,7 +213,7 @@ export default function Logs() {
               onClick={() => setTypeFilters(new Set())}
               className="text-xs text-blue-400 hover:text-blue-300 flex-shrink-0 ml-1"
             >
-              Clear
+              {t('logs.clear')}
             </button>
           )}
         </div>
@@ -229,8 +230,8 @@ export default function Logs() {
             <Activity className="h-10 w-10 text-gray-600 mb-3" />
             <p className="text-sm">
               {paused
-                ? 'Log streaming is paused.'
-                : 'Waiting for events...'}
+                ? t('logs.paused_stream')
+                : t('logs.waiting_for_events')}
             </p>
           </div>
         ) : (

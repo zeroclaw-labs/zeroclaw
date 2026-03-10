@@ -72,6 +72,21 @@ function unwrapField<T>(value: T | Record<string, T>, key: string): T {
   return value as T;
 }
 
+function normalizeMemoryCategory(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (value && typeof value === 'object') {
+    const custom = (value as { custom?: unknown }).custom;
+    if (typeof custom === 'string' && custom.trim().length > 0) {
+      return custom;
+    }
+  }
+
+  return 'unknown';
+}
+
 // ---------------------------------------------------------------------------
 // Pairing
 // ---------------------------------------------------------------------------
@@ -208,7 +223,11 @@ export function getMemory(
   if (category) params.set('category', category);
   const qs = params.toString();
   return apiFetch<MemoryEntry[] | { entries: MemoryEntry[] }>(`/api/memory${qs ? `?${qs}` : ''}`).then(
-    (data) => unwrapField(data, 'entries'),
+    (data) =>
+      unwrapField(data, 'entries').map((entry) => ({
+        ...entry,
+        category: normalizeMemoryCategory((entry as { category: unknown }).category),
+      })),
   );
 }
 

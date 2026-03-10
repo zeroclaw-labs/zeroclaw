@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import type { CostSummary } from '@/types/api';
 import { getCost } from '@/lib/api';
+import { t } from '@/lib/i18n';
 
 function formatUSD(value: number): string {
   return `$${value.toFixed(4)}`;
@@ -28,7 +29,7 @@ export default function Cost() {
     return (
       <div className="p-6">
         <div className="rounded-lg bg-red-900/30 border border-red-700 p-4 text-red-300">
-          Failed to load cost data: {error}
+          {t('cost.load_failed')}: {error}
         </div>
       </div>
     );
@@ -53,7 +54,7 @@ export default function Cost() {
             <div className="p-2 bg-blue-600/20 rounded-lg">
               <DollarSign className="h-5 w-5 text-blue-400" />
             </div>
-            <span className="text-sm text-gray-400">Session Cost</span>
+            <span className="text-sm text-gray-400">{t('cost.session')}</span>
           </div>
           <p className="text-2xl font-bold text-white">
             {formatUSD(cost.session_cost_usd)}
@@ -65,7 +66,7 @@ export default function Cost() {
             <div className="p-2 bg-green-600/20 rounded-lg">
               <TrendingUp className="h-5 w-5 text-green-400" />
             </div>
-            <span className="text-sm text-gray-400">Daily Cost</span>
+            <span className="text-sm text-gray-400">{t('cost.daily')}</span>
           </div>
           <p className="text-2xl font-bold text-white">
             {formatUSD(cost.daily_cost_usd)}
@@ -77,7 +78,7 @@ export default function Cost() {
             <div className="p-2 bg-purple-600/20 rounded-lg">
               <Layers className="h-5 w-5 text-purple-400" />
             </div>
-            <span className="text-sm text-gray-400">Monthly Cost</span>
+            <span className="text-sm text-gray-400">{t('cost.monthly')}</span>
           </div>
           <p className="text-2xl font-bold text-white">
             {formatUSD(cost.monthly_cost_usd)}
@@ -89,7 +90,7 @@ export default function Cost() {
             <div className="p-2 bg-orange-600/20 rounded-lg">
               <Hash className="h-5 w-5 text-orange-400" />
             </div>
-            <span className="text-sm text-gray-400">Total Requests</span>
+            <span className="text-sm text-gray-400">{t('cost.total_requests')}</span>
           </div>
           <p className="text-2xl font-bold text-white">
             {cost.request_count.toLocaleString()}
@@ -100,17 +101,17 @@ export default function Cost() {
       {/* Token Statistics */}
       <div className="bg-gray-900 rounded-xl border border-gray-800 p-5">
         <h3 className="text-base font-semibold text-white mb-4">
-          Token Statistics
+          {t('cost.token_statistics')}
         </h3>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div className="bg-gray-800/50 rounded-lg p-4">
-            <p className="text-sm text-gray-400">Total Tokens</p>
+            <p className="text-sm text-gray-400">{t('cost.total_tokens')}</p>
             <p className="text-xl font-bold text-white mt-1">
               {cost.total_tokens.toLocaleString()}
             </p>
           </div>
           <div className="bg-gray-800/50 rounded-lg p-4">
-            <p className="text-sm text-gray-400">Avg Tokens / Request</p>
+            <p className="text-sm text-gray-400">{t('cost.avg_tokens_per_request')}</p>
             <p className="text-xl font-bold text-white mt-1">
               {cost.request_count > 0
                 ? Math.round(cost.total_tokens / cost.request_count).toLocaleString()
@@ -118,7 +119,7 @@ export default function Cost() {
             </p>
           </div>
           <div className="bg-gray-800/50 rounded-lg p-4">
-            <p className="text-sm text-gray-400">Cost per 1K Tokens</p>
+            <p className="text-sm text-gray-400">{t('cost.cost_per_1k_tokens')}</p>
             <p className="text-xl font-bold text-white mt-1">
               {cost.total_tokens > 0
                 ? formatUSD((cost.monthly_cost_usd / cost.total_tokens) * 1000)
@@ -132,12 +133,12 @@ export default function Cost() {
       <div className="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
         <div className="px-5 py-4 border-b border-gray-800">
           <h3 className="text-base font-semibold text-white">
-            Model Breakdown
+            {t('cost.model_breakdown')}
           </h3>
         </div>
         {models.length === 0 ? (
           <div className="p-8 text-center text-gray-500">
-            No model data available.
+            {t('cost.no_model_data')}
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -145,19 +146,19 @@ export default function Cost() {
               <thead>
                 <tr className="border-b border-gray-800">
                   <th className="text-left px-5 py-3 text-gray-400 font-medium">
-                    Model
+                    {t('cost.model')}
                   </th>
                   <th className="text-right px-5 py-3 text-gray-400 font-medium">
-                    Cost
+                    {t('cost.usd')}
                   </th>
                   <th className="text-right px-5 py-3 text-gray-400 font-medium">
-                    Tokens
+                    {t('cost.tokens')}
                   </th>
                   <th className="text-right px-5 py-3 text-gray-400 font-medium">
-                    Requests
+                    {t('cost.requests')}
                   </th>
                   <th className="text-left px-5 py-3 text-gray-400 font-medium">
-                    Share
+                    {t('cost.share')}
                   </th>
                 </tr>
               </thead>

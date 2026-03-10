@@ -689,6 +689,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/ws/chat", get(ws::handle_ws_chat))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
+        // ── Root redirect to dashboard ──
+        .route("/", get(|| async {
+            axum::response::Redirect::permanent("/_app/")
+        }))
         // ── Config PUT with larger body limit ──
         .merge(config_put_router)
         .with_state(state)

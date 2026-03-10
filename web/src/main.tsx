@@ -6,8 +6,8 @@ import './index.css';
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    {/* Vite base '/_app/' scopes static asset URLs only; app routes stay rooted at '/' for SPA fallback. */}
-    <BrowserRouter basename="/">
+    {/* Match React Router paths to Vite's public base so in-app links resolve under /_app/. */}
+    <BrowserRouter basename="/_app">
       <App />
     </BrowserRouter>
   </React.StrictMode>
