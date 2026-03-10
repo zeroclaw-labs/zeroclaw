@@ -87,8 +87,8 @@ use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
-    ChannelCommands, CronCommands, HardwareCommands, IntegrationCommands, MigrateCommands,
-    PeripheralCommands, ServiceCommands, SkillCommands,
+    ChannelCommands, CronCommands, GatewayCommands, HardwareCommands, IntegrationCommands,
+    MigrateCommands, PeripheralCommands, ServiceCommands, SkillCommands,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -196,27 +196,20 @@ Examples:
         peripheral: Vec<String>,
     },
 
-    /// Start the gateway server (webhooks, websockets)
+    /// Start/manage the gateway server (webhooks, websockets)
     #[command(long_about = "\
-Start the gateway server (webhooks, websockets).
+Manage the gateway server (webhooks, websockets).
 
-Runs the HTTP/WebSocket gateway that accepts incoming webhook events \
-and WebSocket connections. Bind address defaults to the values in \
-your config file (gateway.host / gateway.port).
+Start, restart, or inspect the HTTP/WebSocket gateway that accepts \
+incoming webhook events and WebSocket connections.
 
 Examples:
-  zeroclaw gateway                  # use config defaults
-  zeroclaw gateway -p 8080          # listen on port 8080
-  zeroclaw gateway --host 0.0.0.0   # bind to all interfaces
-  zeroclaw gateway -p 0             # random available port")]
+  zeroclaw gateway start              # start gateway
+  zeroclaw gateway restart            # restart gateway
+  zeroclaw gateway get-paircode       # show pairing code")]
     Gateway {
-        /// Port to listen on (use 0 for random available port); defaults to config gateway.port
-        #[arg(short, long)]
-        port: Option<u16>,
-
-        /// Host to bind to; defaults to config gateway.host
-        #[arg(long)]
-        host: Option<String>,
+        #[command(subcommand)]
+        gateway_command: Option<zeroclaw::GatewayCommands>,
     },
 
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
@@ -786,15 +779,44 @@ async fn main() -> Result<()> {
         .await
         .map(|_| ()),
 
-        Commands::Gateway { port, host } => {
-            let port = port.unwrap_or(config.gateway.port);
-            let host = host.unwrap_or_else(|| config.gateway.host.clone());
-            if port == 0 {
-                info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
-            } else {
-                info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
+        Commands::Gateway { gateway_command } => {
+            match gateway_command {
+                Some(zeroclaw::GatewayCommands::Restart { port, host }) => {
+                    let port = port.unwrap_or(config.gateway.port);
+                    let host = host.unwrap_or_else(|| config.gateway.host.clone());
+                    info!("🔄 Restarting ZeroClaw Gateway on {host}:{port}");
+                    // TODO: Implement actual restart logic (stop existing, start new)
+                    // For now, just start the gateway
+                    gateway::run_gateway(&host, port, config).await
+                }
+                Some(zeroclaw::GatewayCommands::GetPaircode) => {
+                    // Show pairing code from config
+                    if config.gateway.require_pairing {
+                        println!("🔐 Gateway pairing is enabled.");
+                        if config.gateway.paired_tokens.is_empty() {
+                            println!("   No pairing code generated yet.");
+                            println!("   Start the gateway first to generate a pairing code.");
+                        } else {
+                            println!("   Paired tokens: {} configured", config.gateway.paired_tokens.len());
+                            println!("   To get a new pairing code, restart the gateway.");
+                        }
+                    } else {
+                        println!("⚠️  Gateway pairing is disabled.");
+                        println!("   All requests will be accepted without authentication.");
+                    }
+                    Ok(())
+                }
+                Some(zeroclaw::GatewayCommands::Start { port, host }) | None => {
+                    let port = port.unwrap_or(config.gateway.port);
+                    let host = host.unwrap_or_else(|| config.gateway.host.clone());
+                    if port == 0 {
+                        info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
+                    } else {
+                        info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
+                    }
+                    gateway::run_gateway(&host, port, config).await
+                }
             }
-            gateway::run_gateway(&host, port, config).await
         }
 
         Commands::Daemon { port, host } => {
