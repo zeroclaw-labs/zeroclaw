@@ -1533,11 +1533,8 @@ struct AdminResponse {
 }
 
 /// POST /admin/shutdown — graceful shutdown from CLI
-async fn handle_admin_shutdown(State(state): State<AppState>) -> impl IntoResponse {
+async fn handle_admin_shutdown(State(_state): State<AppState>) -> impl IntoResponse {
     tracing::info!("🔌 Admin shutdown request received — initiating graceful shutdown");
-
-    // Signal shutdown to the system
-    crate::health::mark_component_stopping("gateway");
 
     // The server will shut down when this response is sent
     // In a real implementation, we might use a shutdown channel

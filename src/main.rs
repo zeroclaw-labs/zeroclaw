@@ -818,18 +818,24 @@ async fn main() -> Result<()> {
                             println!("    POST /pair with header X-Pairing-Code: {code}");
                         }
                         Ok(None) => {
-                            if !config.gateway.require_pairing {
-                                println!("⚠️  Gateway pairing is disabled in config.");
-                                println!("   All requests will be accepted without authentication.");
-                                println!("   To enable pairing, set [gateway] require_pairing = true");
-                            } else {
+                            if config.gateway.require_pairing {
                                 println!("🔐 Gateway pairing is enabled, but no active pairing code available.");
                                 println!("   The gateway may already be paired, or the code has been used.");
                                 println!("   Restart the gateway to generate a new pairing code.");
+                            } else {
+                                println!("⚠️  Gateway pairing is disabled in config.");
+                                println!(
+                                    "   All requests will be accepted without authentication."
+                                );
+                                println!(
+                                    "   To enable pairing, set [gateway] require_pairing = true"
+                                );
                             }
                         }
                         Err(e) => {
-                            println!("❌ Failed to fetch pairing code from gateway at {host}:{port}");
+                            println!(
+                                "❌ Failed to fetch pairing code from gateway at {host}:{port}"
+                            );
                             println!("   Error: {e}");
                             println!();
                             println!("   Is the gateway running? Start it with:");
@@ -1302,9 +1308,17 @@ async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
     let url = format!("http://{host}:{port}/admin/shutdown");
     let client = reqwest::Client::new();
 
-    match client.post(&url).timeout(std::time::Duration::from_secs(5)).send().await {
+    match client
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
         Ok(response) if response.status().is_success() => Ok(()),
-        Ok(response) => Err(anyhow::anyhow!("Gateway responded with status: {}", response.status())),
+        Ok(response) => Err(anyhow::anyhow!(
+            "Gateway responded with status: {}",
+            response.status()
+        )),
         Err(e) => Err(anyhow::anyhow!("Failed to connect to gateway: {e}")),
     }
 }
@@ -1322,7 +1336,10 @@ async fn fetch_paircode(host: &str, port: u16) -> Result<Option<String>> {
         .map_err(|e| anyhow::anyhow!("Failed to connect to gateway: {e}"))?;
 
     if !response.status().is_success() {
-        return Err(anyhow::anyhow!("Gateway responded with status: {}", response.status()));
+        return Err(anyhow::anyhow!(
+            "Gateway responded with status: {}",
+            response.status()
+        ));
     }
 
     let json: serde_json::Value = response
@@ -1334,7 +1351,10 @@ async fn fetch_paircode(host: &str, port: u16) -> Result<Option<String>> {
         return Ok(None);
     }
 
-    Ok(json.get("pairing_code").and_then(|v| v.as_str()).map(String::from))
+    Ok(json
+        .get("pairing_code")
+        .and_then(|v| v.as_str())
+        .map(String::from))
 }
 
 // ─── Generic Pending OAuth Login ────────────────────────────────────────────

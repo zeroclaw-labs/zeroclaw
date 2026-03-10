@@ -301,7 +301,7 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
         let y = *b.get(i).unwrap_or(&0);
         byte_diff |= x ^ y;
     }
-    (len_diff == 0) & (byte_diff == 0)
+    (len_diff == 0) && (byte_diff == 0)
 }
 
 /// Check if a host string represents a non-localhost bind address.
