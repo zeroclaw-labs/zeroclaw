@@ -3062,8 +3062,11 @@ pub struct MatrixConfig {
     /// Matrix homeserver URL (e.g. `"https://matrix.org"`).
     pub homeserver: String,
     /// Matrix access token for the bot account.
-    pub access_token: String,
+    /// Optional when `password` is set (bot will login and obtain a token automatically).
+    #[serde(default)]
+    pub access_token: Option<String>,
     /// Optional Matrix user ID (e.g. `"@bot:matrix.org"`).
+    /// Required when using password-based login without access_token.
     #[serde(default)]
     pub user_id: Option<String>,
     /// Optional Matrix device ID.
@@ -3073,6 +3076,11 @@ pub struct MatrixConfig {
     pub room_id: String,
     /// Allowed Matrix user IDs. Empty = deny all.
     pub allowed_users: Vec<String>,
+    /// Optional Matrix account password. When set, the bot will:
+    /// - Login automatically if no access_token is configured (simplest setup).
+    /// - Bootstrap cross-signing so the device is marked as "verified by its owner".
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -5803,16 +5811,17 @@ tool_dispatcher = "xml"
     async fn matrix_config_serde() {
         let mc = MatrixConfig {
             homeserver: "https://matrix.org".into(),
-            access_token: "syt_token_abc".into(),
+            access_token: Some("syt_token_abc".to_string()),
             user_id: Some("@bot:matrix.org".into()),
             device_id: Some("DEVICE123".into()),
             room_id: "!room123:matrix.org".into(),
             allowed_users: vec!["@user:matrix.org".into()],
+            password: None,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.homeserver, "https://matrix.org");
-        assert_eq!(parsed.access_token, "syt_token_abc");
+        assert_eq!(parsed.access_token.as_deref(), Some("syt_token_abc"));
         assert_eq!(parsed.user_id.as_deref(), Some("@bot:matrix.org"));
         assert_eq!(parsed.device_id.as_deref(), Some("DEVICE123"));
         assert_eq!(parsed.room_id, "!room123:matrix.org");
@@ -5823,11 +5832,12 @@ tool_dispatcher = "xml"
     async fn matrix_config_toml_roundtrip() {
         let mc = MatrixConfig {
             homeserver: "https://synapse.local:8448".into(),
-            access_token: "tok".into(),
+            access_token: Some("tok".to_string()),
             user_id: None,
             device_id: None,
             room_id: "!abc:synapse.local".into(),
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
+            password: None,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -5912,11 +5922,12 @@ allowed_users = ["@ops:matrix.org"]
             }),
             matrix: Some(MatrixConfig {
                 homeserver: "https://m.org".into(),
-                access_token: "tok".into(),
+                access_token: Some("tok".to_string()),
                 user_id: None,
                 device_id: None,
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
+                password: None,
             }),
             signal: None,
             whatsapp: None,

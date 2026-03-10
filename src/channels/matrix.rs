@@ -7,6 +7,7 @@ use matrix_sdk::{
     encryption::verification::{SasState, VerificationRequestState},
     media::{MediaFormat, MediaRequestParameters},
     ruma::{
+        api::client::uiaa,
         events::room::{
             message::{
                 AudioMessageEventContent, FileMessageEventContent, ImageMessageEventContent,
@@ -19,7 +20,7 @@ use matrix_sdk::{
     Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
 };
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, OnceCell, RwLock};
@@ -27,12 +28,24 @@ use tokio::sync::{mpsc, Mutex, OnceCell, RwLock};
 /// Maximum media download size (50 MB).
 const MATRIX_MAX_MEDIA_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
 
+/// Filename for persisted session credentials (access_token + device_id).
+const MATRIX_SESSION_FILE: &str = "session.json";
+
+/// Persisted Matrix session credentials, saved after login_username().
+/// Allows subsequent runs to restore_session() without re-reading the password.
+#[derive(Serialize, Deserialize)]
+struct SavedSession {
+    access_token: String,
+    device_id: String,
+    user_id: String,
+}
+
 /// Matrix channel for Matrix Client-Server API.
 /// Uses matrix-sdk for reliable sync and encrypted-room decryption.
 #[derive(Clone)]
 pub struct MatrixChannel {
     homeserver: String,
-    access_token: String,
+    access_token: Option<String>,
     room_id: String,
     allowed_users: Vec<String>,
     session_owner_hint: Option<String>,
@@ -43,6 +56,7 @@ pub struct MatrixChannel {
     http_client: Client,
     transcription: Option<crate::config::TranscriptionConfig>,
     voice_transcriptions: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    password: Option<String>,
 }
 
 impl std::fmt::Debug for MatrixChannel {
@@ -243,7 +257,7 @@ impl MatrixChannel {
 
     pub fn new(
         homeserver: String,
-        access_token: String,
+        access_token: Option<String>,
         room_id: String,
         allowed_users: Vec<String>,
     ) -> Self {
@@ -252,7 +266,7 @@ impl MatrixChannel {
 
     pub fn new_with_session_hint(
         homeserver: String,
-        access_token: String,
+        access_token: Option<String>,
         room_id: String,
         allowed_users: Vec<String>,
         owner_hint: Option<String>,
@@ -271,7 +285,7 @@ impl MatrixChannel {
 
     pub fn new_with_session_hint_and_zeroclaw_dir(
         homeserver: String,
-        access_token: String,
+        access_token: Option<String>,
         room_id: String,
         allowed_users: Vec<String>,
         owner_hint: Option<String>,
@@ -279,7 +293,9 @@ impl MatrixChannel {
         zeroclaw_dir: Option<PathBuf>,
     ) -> Self {
         let homeserver = homeserver.trim_end_matches('/').to_string();
-        let access_token = access_token.trim().to_string();
+        let access_token = access_token
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
         let room_id = room_id.trim().to_string();
         let allowed_users = allowed_users
             .into_iter()
@@ -300,7 +316,13 @@ impl MatrixChannel {
             http_client: Client::new(),
             transcription: None,
             voice_transcriptions: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            password: None,
         }
+    }
+
+    pub fn with_password(mut self, password: Option<String>) -> Self {
+        self.password = password;
+        self
     }
 
     pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
@@ -331,14 +353,52 @@ impl MatrixChannel {
         encoded
     }
 
-    fn auth_header_value(&self) -> String {
-        format!("Bearer {}", self.access_token)
+    /// Returns the Bearer token for HTTP API calls.
+    /// Reads from config access_token first, falls back to persisted session.json.
+    async fn auth_header_value(&self) -> anyhow::Result<String> {
+        if let Some(ref token) = self.access_token {
+            return Ok(format!("Bearer {token}"));
+        }
+        if let Some(saved) = self.load_saved_session().await {
+            return Ok(format!("Bearer {}", saved.access_token));
+        }
+        anyhow::bail!(
+            "Matrix access_token is not available; configure access_token or password and restart"
+        )
     }
 
     fn matrix_store_dir(&self) -> Option<PathBuf> {
         self.zeroclaw_dir
             .as_ref()
             .map(|dir| dir.join("state").join("matrix"))
+    }
+
+    fn session_file_path(&self) -> Option<PathBuf> {
+        self.matrix_store_dir().map(|d| d.join(MATRIX_SESSION_FILE))
+    }
+
+    async fn load_saved_session(&self) -> Option<SavedSession> {
+        let path = self.session_file_path()?;
+        let data = tokio::fs::read_to_string(&path).await.ok()?;
+        serde_json::from_str(&data).ok()
+    }
+
+    async fn save_session(&self, session: &SavedSession) -> anyhow::Result<()> {
+        let path = self.session_file_path().ok_or_else(|| {
+            anyhow::anyhow!("Matrix store directory not configured; cannot persist session")
+        })?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let data = serde_json::to_string_pretty(session)?;
+        tokio::fs::write(&path, data).await?;
+        // Restrict permissions to owner-only on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
+        }
+        Ok(())
     }
 
     fn media_save_dir(&self) -> Option<PathBuf> {
@@ -413,7 +473,7 @@ impl MatrixChannel {
         let resp = self
             .http_client
             .get(&url)
-            .header("Authorization", self.auth_header_value())
+            .header("Authorization", self.auth_header_value().await?)
             .send()
             .await?;
 
@@ -433,69 +493,7 @@ impl MatrixChannel {
         let client = self
             .sdk_client
             .get_or_try_init(|| async {
-                let identity = self.get_my_identity().await;
-                let whoami = match identity {
-                    Ok(whoami) => Some(whoami),
-                    Err(error) => {
-                        if self.session_owner_hint.is_some() && self.session_device_id_hint.is_some()
-                        {
-                            tracing::warn!(
-                                "Matrix whoami failed; falling back to configured session hints for E2EE session restore: {error}"
-                            );
-                            None
-                        } else {
-                            return Err(error);
-                        }
-                    }
-                };
-
-                let resolved_user_id = if let Some(whoami) = whoami.as_ref() {
-                    if let Some(hinted) = self.session_owner_hint.as_ref() {
-                        if hinted != &whoami.user_id {
-                            tracing::warn!(
-                                "Matrix configured user_id '{}' does not match whoami '{}'; using whoami.",
-                                crate::security::redact(hinted),
-                                crate::security::redact(&whoami.user_id)
-                            );
-                        }
-                    }
-                    whoami.user_id.clone()
-                } else {
-                    self.session_owner_hint.clone().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Matrix session restore requires user_id when whoami is unavailable"
-                        )
-                    })?
-                };
-
-                let resolved_device_id = match (whoami.as_ref(), self.session_device_id_hint.as_ref()) {
-                    (Some(whoami), Some(hinted)) => {
-                        if let Some(whoami_device_id) = whoami.device_id.as_ref() {
-                            if whoami_device_id != hinted {
-                                tracing::warn!(
-                                    "Matrix configured device_id '{}' does not match whoami '{}'; using whoami.",
-                                    crate::security::redact(hinted),
-                                    crate::security::redact(whoami_device_id)
-                                );
-                            }
-                            whoami_device_id.clone()
-                        } else {
-                            hinted.clone()
-                        }
-                    }
-                    (Some(whoami), None) => whoami.device_id.clone().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Matrix whoami response did not include device_id. Set channels.matrix.device_id to enable E2EE session restore."
-                        )
-                    })?,
-                    (None, Some(hinted)) => hinted.clone(),
-                    (None, None) => {
-                        return Err(anyhow::anyhow!(
-                            "Matrix E2EE session restore requires device_id when whoami is unavailable"
-                        ));
-                    }
-                };
-
+                // ── Build SDK client with E2EE + persistent store ──
                 let encryption_settings = matrix_sdk::encryption::EncryptionSettings {
                     auto_enable_cross_signing: true,
                     auto_enable_backups: true,
@@ -519,30 +517,188 @@ impl MatrixChannel {
 
                 let client = client_builder.build().await?;
 
-                let user_id: OwnedUserId = resolved_user_id.parse()?;
-                let session = MatrixSession {
-                    meta: SessionMeta {
-                        user_id,
-                        device_id: resolved_device_id.into(),
-                    },
-                    tokens: SessionTokens {
-                        access_token: self.access_token.clone(),
-                        refresh_token: None,
-                    },
-                };
+                // ── Auth: session.json → access_token → password → error ──
+                let saved = self.load_saved_session().await;
+                let resolved_user_id: String;
 
-                client.restore_session(session).await?;
-
-                // Bootstrap cross-signing if not already set up, so other
-                // devices/users can verify this bot and share room keys.
-                if let Err(error) = client
-                    .encryption()
-                    .bootstrap_cross_signing_if_needed(None)
-                    .await
-                {
-                    tracing::warn!(
-                        "Matrix cross-signing bootstrap failed (verification may be unavailable): {error}"
+                if let Some(ref saved) = saved {
+                    // Path 1: Restore from persisted session.json (previous login).
+                    let user_id: OwnedUserId = saved.user_id.parse()?;
+                    let session = MatrixSession {
+                        meta: SessionMeta {
+                            user_id,
+                            device_id: saved.device_id.clone().into(),
+                        },
+                        tokens: SessionTokens {
+                            access_token: saved.access_token.clone(),
+                            refresh_token: None,
+                        },
+                    };
+                    client.restore_session(session).await?;
+                    resolved_user_id = saved.user_id.clone();
+                    tracing::info!(
+                        "Matrix: restored session from session.json (device_id={})",
+                        crate::security::redact(&saved.device_id)
                     );
+                } else if self.access_token.is_some() {
+                    // Path 2: Restore from config access_token + device_id (legacy flow).
+                    let identity = self.get_my_identity().await;
+                    let whoami = match identity {
+                        Ok(whoami) => Some(whoami),
+                        Err(error) => {
+                            if self.session_owner_hint.is_some()
+                                && self.session_device_id_hint.is_some()
+                            {
+                                tracing::warn!(
+                                    "Matrix whoami failed; falling back to configured session hints: {error}"
+                                );
+                                None
+                            } else {
+                                return Err(error);
+                            }
+                        }
+                    };
+
+                    let user_id_str = if let Some(whoami) = whoami.as_ref() {
+                        whoami.user_id.clone()
+                    } else {
+                        self.session_owner_hint.clone().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Matrix session restore requires user_id when whoami is unavailable"
+                            )
+                        })?
+                    };
+
+                    let device_id_str = match (
+                        whoami.as_ref().and_then(|w| w.device_id.clone()),
+                        self.session_device_id_hint.as_ref(),
+                    ) {
+                        (Some(whoami_did), _) => whoami_did,
+                        (None, Some(hinted)) => hinted.clone(),
+                        (None, None) => {
+                            return Err(anyhow::anyhow!(
+                                "Matrix E2EE requires device_id. Set channels.matrix.device_id or use password-based login."
+                            ));
+                        }
+                    };
+
+                    let user_id: OwnedUserId = user_id_str.parse()?;
+                    let session = MatrixSession {
+                        meta: SessionMeta {
+                            user_id,
+                            device_id: device_id_str.clone().into(),
+                        },
+                        tokens: SessionTokens {
+                            access_token: self.access_token.clone().unwrap_or_default(),
+                            refresh_token: None,
+                        },
+                    };
+                    client.restore_session(session).await?;
+                    resolved_user_id = user_id_str.clone();
+
+                    // Persist session.json so future runs use Path 1.
+                    if let Err(e) = self
+                        .save_session(&SavedSession {
+                            access_token: self.access_token.clone().unwrap_or_default(),
+                            device_id: device_id_str,
+                            user_id: user_id_str,
+                        })
+                        .await
+                    {
+                        tracing::warn!("Matrix: failed to persist session.json: {e}");
+                    }
+                } else if let Some(ref pw) = self.password {
+                    // Path 3: Login with password (simplest setup, no access_token needed).
+                    let user_id_str = self.session_owner_hint.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Matrix password-based login requires user_id in config"
+                        )
+                    })?;
+
+                    let response = client
+                        .matrix_auth()
+                        .login_username(user_id_str, pw)
+                        .initial_device_display_name("ZeroClaw")
+                        .send()
+                        .await?;
+
+                    resolved_user_id = response.user_id.to_string();
+                    tracing::info!(
+                        "Matrix: logged in with password (device_id={})",
+                        response.device_id
+                    );
+
+                    // Persist session.json so future runs use Path 1 (no password needed).
+                    if let Err(e) = self
+                        .save_session(&SavedSession {
+                            access_token: response.access_token,
+                            device_id: response.device_id.to_string(),
+                            user_id: resolved_user_id.clone(),
+                        })
+                        .await
+                    {
+                        tracing::warn!("Matrix: failed to persist session.json: {e}");
+                    }
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "Matrix channel requires either access_token or password in config"
+                    ));
+                }
+
+                // ── E2EE initialization ──
+                client
+                    .encryption()
+                    .wait_for_e2ee_initialization_tasks()
+                    .await;
+
+                // ── Cross-signing bootstrap with password (UIA) ──
+                // Always attempt bootstrap_cross_signing (not _if_needed) so keys
+                // are actually uploaded to the server. The _if_needed variant checks
+                // the local store, which may have stale keys from auto_enable that
+                // were never uploaded (server required UIA).
+                if let Some(ref pw) = self.password {
+                    match client
+                        .encryption()
+                        .bootstrap_cross_signing(None)
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::info!("Matrix: cross-signing bootstrap successful (no UIA needed)");
+                        }
+                        Err(e) => {
+                            if let Some(response) = e.as_uiaa_response() {
+                                let mut password_auth = uiaa::Password::new(
+                                    uiaa::UserIdentifier::UserIdOrLocalpart(
+                                        resolved_user_id.clone(),
+                                    ),
+                                    pw.clone(),
+                                );
+                                password_auth.session = response.session.clone();
+                                match client
+                                    .encryption()
+                                    .bootstrap_cross_signing(Some(uiaa::AuthData::Password(
+                                        password_auth,
+                                    )))
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        tracing::info!(
+                                            "Matrix: cross-signing bootstrap successful (with password)"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Matrix: cross-signing bootstrap with password failed: {e}"
+                                        );
+                                    }
+                                }
+                            } else {
+                                tracing::warn!(
+                                    "Matrix: cross-signing bootstrap failed (non-UIA): {e}"
+                                );
+                            }
+                        }
+                    }
                 }
 
                 Ok::<MatrixSdkClient, anyhow::Error>(client)
@@ -569,7 +725,7 @@ impl MatrixChannel {
             let resp = self
                 .http_client
                 .get(&url)
-                .header("Authorization", self.auth_header_value())
+                .header("Authorization", self.auth_header_value().await?)
                 .send()
                 .await?;
 
@@ -597,7 +753,7 @@ impl MatrixChannel {
         let resp = self
             .http_client
             .get(&url)
-            .header("Authorization", self.auth_header_value())
+            .header("Authorization", self.auth_header_value().await?)
             .send()
             .await?;
 
@@ -619,7 +775,7 @@ impl MatrixChannel {
         let resp = self
             .http_client
             .get(&url)
-            .header("Authorization", self.auth_header_value())
+            .header("Authorization", self.auth_header_value().await?)
             .send()
             .await?;
 
@@ -696,8 +852,11 @@ impl MatrixChannel {
     }
 }
 
-/// Handle an incoming SAS verification request: accept, start SAS, log emojis,
-/// and auto-confirm once the other side confirms (operator verifies on their client).
+/// Handle an incoming SAS verification request: accept the request, wait for
+/// the other side to start SAS, accept it, log emojis, and auto-confirm.
+///
+/// Flow: receive request → accept → wait for other side to start SAS →
+/// accept SAS → keys exchanged (emojis shown) → confirm → done.
 async fn handle_verification_request(
     client: MatrixSdkClient,
     sender: OwnedUserId,
@@ -717,39 +876,79 @@ async fn handle_verification_request(
         sender
     );
 
+    // Force a fresh device key query from the server for the sender.
+    // The crypto store may have stale keys from a previous session, causing
+    // MAC verification to fail even though emojis match. This ensures the
+    // SAS captures the sender's current Ed25519/Curve25519 device keys.
+    match client.encryption().request_user_identity(&sender).await {
+        Ok(_) => {
+            tracing::debug!("Matrix verification: refreshed device keys for {}", sender);
+        }
+        Err(error) => {
+            tracing::warn!(
+                "Matrix verification: failed to refresh device keys for {}: {error}",
+                sender
+            );
+        }
+    }
+
     if let Err(error) = request.accept().await {
         tracing::warn!("Matrix verification accept failed: {error}");
         return;
     }
 
-    // Wait for the request to transition to Ready, then start SAS.
+    // Wait for the request to reach Ready, then wait for the other side to
+    // start the SAS flow (Transitioned state). The bot is the responder —
+    // it should NOT call start_sas(), as the initiating client (Element)
+    // will send m.key.verification.start.
     let mut changes = request.changes();
-    loop {
+    let sas = loop {
         match request.state() {
-            VerificationRequestState::Ready { .. } => break,
-            VerificationRequestState::Done | VerificationRequestState::Cancelled(_) => return,
+            VerificationRequestState::Transitioned { verification } => {
+                if let Some(sas) = verification.sas() {
+                    break sas;
+                }
+                tracing::warn!("Matrix verification transitioned but not to SAS");
+                return;
+            }
+            VerificationRequestState::Done | VerificationRequestState::Cancelled(_) => {
+                tracing::warn!("Matrix verification request ended before SAS started");
+                return;
+            }
             _ => {}
         }
         if changes.next().await.is_none() {
             return;
         }
-    }
-
-    let Some(sas) = (match request.start_sas().await {
-        Ok(sas) => sas,
-        Err(error) => {
-            tracing::warn!("Matrix SAS verification start failed: {error}");
-            return;
-        }
-    }) else {
-        tracing::warn!("Matrix SAS verification could not be started (not in ready state)");
-        return;
     };
 
-    tracing::info!("Matrix SAS verification started with {}", sender);
+    // Log the other device's keys for diagnostics — if these don't match
+    // what the other side actually has, MAC verification will fail.
+    let other_dev = sas.other_device();
+    tracing::info!(
+        "Matrix SAS verification initiated by {} (device {}), accepting SAS...",
+        sender,
+        other_dev.device_id()
+    );
+    tracing::debug!(
+        "Matrix SAS: other device ed25519={:?} curve25519={:?}",
+        other_dev.ed25519_key().map(|k| k.to_base64()),
+        other_dev.curve25519_key().map(|k| k.to_base64()),
+    );
 
+    // Subscribe to SAS state changes BEFORE calling accept, so we don't
+    // miss any state transitions that fire immediately after accept.
     let mut sas_changes = sas.changes();
+
+    // Accept the SAS — sends m.key.verification.accept back to the initiator.
+    if let Err(error) = sas.accept().await {
+        tracing::warn!("Matrix SAS accept failed: {error}");
+        return;
+    }
+
+    // Listen for SAS state changes: KeysExchanged → confirm → Done.
     while let Some(state) = sas_changes.next().await {
+        tracing::debug!("Matrix SAS state change: {:?}", state);
         match state {
             SasState::KeysExchanged { emojis, decimals } => {
                 if let Some(emojis) = emojis {
@@ -774,9 +973,13 @@ async fn handle_verification_request(
                     );
                 }
 
-                // Auto-confirm: the operator verifies emojis on their Element client.
-                // Once Element confirms, the SAS protocol completes. We confirm on
-                // the bot side since the operator already compared visually.
+                // Brief delay before auto-confirming: let the sync loop
+                // fully process the key exchange on both sides before
+                // sending our MAC. Without this, Element may receive the
+                // MAC before it has finished processing the key material.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+                tracing::info!("Matrix SAS: confirming emojis match on bot side...");
                 if let Err(error) = sas.confirm().await {
                     tracing::warn!("Matrix SAS verification confirm failed: {error}");
                     return;
@@ -907,6 +1110,10 @@ impl Channel for MatrixChannel {
     }
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        // Initialize SDK client first — this may login with password and
+        // persist session.json, which is needed for subsequent HTTP calls.
+        let client = self.matrix_client().await?;
+
         let target_room_id = self.target_room_id().await?;
         self.ensure_room_supported(&target_room_id).await?;
 
@@ -924,9 +1131,59 @@ impl Channel for MatrixChannel {
                 }
             }
         };
-        let client = self.matrix_client().await?;
 
         self.log_e2ee_diagnostics(&client).await;
+
+        // Force a fresh device key query for allowed users BEFORE the initial
+        // sync. The SDK captures device data from the local store when it first
+        // processes a verification request event. If the store has stale keys
+        // (e.g. from a previous session), SAS MAC verification will fail even
+        // though emojis match. Querying keys now ensures the store is up-to-date
+        // before any verification events are processed during sync.
+        for user_str in &self.allowed_users {
+            if let Ok(user_id) = <&matrix_sdk::ruma::UserId>::try_from(user_str.as_str()) {
+                match client.encryption().request_user_identity(user_id).await {
+                    Ok(_) => {
+                        tracing::debug!("Matrix: refreshed device keys for {user_str}");
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            "Matrix: could not refresh device keys for {user_str}: {error}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Register the verification handler BEFORE the initial sync so that
+        // verification requests arriving during the first sync are handled.
+        let verification_client = client.clone();
+        let allowed_users_for_verification = self.allowed_users.clone();
+        client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, _room: Room| {
+            let ver_client = verification_client.clone();
+            let allowed_users = allowed_users_for_verification.clone();
+
+            async move {
+                if !matches!(&event.content.msgtype, MessageType::VerificationRequest(_)) {
+                    return;
+                }
+
+                let sender = event.sender.to_string();
+                if !MatrixChannel::is_sender_allowed(&allowed_users, &sender) {
+                    tracing::warn!(
+                        "Matrix verification request from non-allowed user {sender}, ignoring"
+                    );
+                    return;
+                }
+
+                let flow_id = event.event_id.to_string();
+                let sender_id = event.sender.clone();
+
+                tokio::spawn(async move {
+                    handle_verification_request(ver_client, sender_id, flow_id).await;
+                });
+            }
+        });
 
         let _ = client.sync_once(SyncSettings::new()).await;
 
@@ -1114,36 +1371,6 @@ impl Channel for MatrixChannel {
             }
         });
 
-        // Verification handler: accept incoming SAS verification requests
-        // and auto-confirm after logging emojis for operator review.
-        let verification_client = client.clone();
-        let allowed_users_for_verification = self.allowed_users.clone();
-        client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, _room: Room| {
-            let ver_client = verification_client.clone();
-            let allowed_users = allowed_users_for_verification.clone();
-
-            async move {
-                if !matches!(&event.content.msgtype, MessageType::VerificationRequest(_)) {
-                    return;
-                }
-
-                let sender = event.sender.to_string();
-                if !MatrixChannel::is_sender_allowed(&allowed_users, &sender) {
-                    tracing::warn!(
-                        "Matrix verification request from non-allowed user {sender}, ignoring"
-                    );
-                    return;
-                }
-
-                let flow_id = event.event_id.to_string();
-                let sender_id = event.sender.clone();
-
-                tokio::spawn(async move {
-                    handle_verification_request(ver_client, sender_id, flow_id).await;
-                });
-            }
-        });
-
         let sync_settings = SyncSettings::new().timeout(std::time::Duration::from_secs(30));
         client
             .sync_with_result_callback(sync_settings, |sync_result| {
@@ -1167,6 +1394,10 @@ impl Channel for MatrixChannel {
     }
 
     async fn health_check(&self) -> bool {
+        if self.matrix_client().await.is_err() {
+            return false;
+        }
+
         let Ok(room_id) = self.target_room_id().await else {
             return false;
         };
@@ -1186,7 +1417,7 @@ mod tests {
     fn make_channel() -> MatrixChannel {
         MatrixChannel::new(
             "https://matrix.org".to_string(),
-            "syt_test_token".to_string(),
+            Some("syt_test_token".to_string()),
             "!room:matrix.org".to_string(),
             vec!["@user:matrix.org".to_string()],
         )
@@ -1195,7 +1426,7 @@ mod tests {
     fn make_channel_with_zeroclaw_dir() -> MatrixChannel {
         MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
             "https://matrix.org".to_string(),
-            "syt_test_token".to_string(),
+            Some("syt_test_token".to_string()),
             "!room:matrix.org".to_string(),
             vec!["@user:matrix.org".to_string()],
             None,
@@ -1208,7 +1439,7 @@ mod tests {
     fn creates_with_correct_fields() {
         let ch = make_channel();
         assert_eq!(ch.homeserver, "https://matrix.org");
-        assert_eq!(ch.access_token, "syt_test_token");
+        assert_eq!(ch.access_token.as_deref(), Some("syt_test_token"));
         assert_eq!(ch.room_id, "!room:matrix.org");
         assert_eq!(ch.allowed_users.len(), 1);
     }
@@ -1217,7 +1448,7 @@ mod tests {
     fn strips_trailing_slash() {
         let ch = MatrixChannel::new(
             "https://matrix.org/".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec![],
         );
@@ -1228,7 +1459,7 @@ mod tests {
     fn no_trailing_slash_unchanged() {
         let ch = MatrixChannel::new(
             "https://matrix.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec![],
         );
@@ -1239,7 +1470,7 @@ mod tests {
     fn multiple_trailing_slashes_strip_all() {
         let ch = MatrixChannel::new(
             "https://matrix.org//".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec![],
         );
@@ -1250,18 +1481,18 @@ mod tests {
     fn trims_access_token() {
         let ch = MatrixChannel::new(
             "https://matrix.org".to_string(),
-            "  syt_test_token  ".to_string(),
+            Some("  syt_test_token  ".to_string()),
             "!r:m".to_string(),
             vec![],
         );
-        assert_eq!(ch.access_token, "syt_test_token");
+        assert_eq!(ch.access_token.as_deref(), Some("syt_test_token"));
     }
 
     #[test]
     fn session_hints_are_normalized() {
         let ch = MatrixChannel::new_with_session_hint(
             "https://matrix.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec![],
             Some("  @bot:matrix.org ".to_string()),
@@ -1276,7 +1507,7 @@ mod tests {
     fn empty_session_hints_are_ignored() {
         let ch = MatrixChannel::new_with_session_hint(
             "https://matrix.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec![],
             Some("   ".to_string()),
@@ -1291,7 +1522,7 @@ mod tests {
     fn matrix_store_dir_is_derived_from_zeroclaw_dir() {
         let ch = MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
             "https://matrix.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec![],
             None,
@@ -1309,7 +1540,7 @@ mod tests {
     fn matrix_store_dir_absent_without_zeroclaw_dir() {
         let ch = MatrixChannel::new_with_session_hint(
             "https://matrix.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec![],
             None,
@@ -1405,7 +1636,7 @@ mod tests {
     fn trims_room_id_and_allowed_users() {
         let ch = MatrixChannel::new(
             "https://matrix.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "  !room:matrix.org  ".to_string(),
             vec![
                 "  @user:matrix.org  ".to_string(),
@@ -1424,7 +1655,7 @@ mod tests {
     fn wildcard_allows_anyone() {
         let ch = MatrixChannel::new(
             "https://m.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec!["*".to_string()],
         );
@@ -1449,7 +1680,7 @@ mod tests {
     fn user_case_insensitive() {
         let ch = MatrixChannel::new(
             "https://m.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec!["@User:Matrix.org".to_string()],
         );
@@ -1461,7 +1692,7 @@ mod tests {
     fn empty_allowlist_denies_all() {
         let ch = MatrixChannel::new(
             "https://m.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec![],
         );
@@ -1584,7 +1815,7 @@ mod tests {
     async fn invalid_room_reference_fails_fast() {
         let ch = MatrixChannel::new(
             "https://matrix.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "room_without_prefix".to_string(),
             vec![],
         );
@@ -1599,7 +1830,7 @@ mod tests {
     async fn target_room_id_keeps_canonical_room_id_without_lookup() {
         let ch = MatrixChannel::new(
             "https://matrix.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!canonical:matrix.org".to_string(),
             vec![],
         );
@@ -1612,7 +1843,7 @@ mod tests {
     async fn target_room_id_uses_cached_alias_resolution() {
         let ch = MatrixChannel::new(
             "https://matrix.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "#ops:matrix.org".to_string(),
             vec![],
         );
