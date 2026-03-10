@@ -285,6 +285,7 @@ fn is_token_hash(value: &str) -> bool {
 ///
 /// Does not short-circuit on length mismatch — always iterates over the
 /// longer input to avoid leaking length information via timing.
+#[allow(clippy::needless_bitwise_bool)]
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
@@ -301,7 +302,9 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
         let y = *b.get(i).unwrap_or(&0);
         byte_diff |= x ^ y;
     }
-    (len_diff == 0) && (byte_diff == 0)
+    // Intentional use of bitwise & (not &&) to ensure constant-time execution
+    // and prevent timing side-channel attacks. Both comparisons must execute.
+    (len_diff == 0) & (byte_diff == 0)
 }
 
 /// Check if a host string represents a non-localhost bind address.
