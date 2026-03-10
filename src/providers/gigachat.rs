@@ -4,6 +4,7 @@
 use crate::providers::Provider;
 use anyhow::Result;
 use async_trait::async_trait;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -11,6 +12,12 @@ use uuid::Uuid;
 pub struct AccessToken {
     access_token: String,
     expires_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HttpError {
+    status: u16,
+    message: String,
 }
 
 // https://developers.sber.ru/docs/ru/gigachat/api/reference/rest/post-chat
@@ -112,8 +119,11 @@ impl GigaChatProvider {
         Ok(builder?)
     }
 
+    // https://developers.sber.ru/docs/ru/gigachat/api/reference/rest/get-models
     pub async fn fetch_models(&self) -> anyhow::Result<Vec<String>> {
-        let access_token = self.fetch_auth_token().await?;
+        let access_token = self.fetch_auth_token().await.or_else(|error| {
+            return Err(error);
+        })?;
 
         let response = self
             .client
@@ -125,9 +135,25 @@ impl GigaChatProvider {
             .send()
             .await
             .or_else(|error| {
-                tracing::error!("Response error: {:?}", error);
-                Err(error)
+                return Err(error);
             })?;
+
+        if !response.status().is_success() {
+            if response.status() == StatusCode::UNAUTHORIZED {
+                // For 401 explicit error returned
+                // https://developers.sber.ru/docs/ru/gigachat/api/reference/rest/get-models#responsesr
+                let error = response.json::<HttpError>().await?;
+
+                return Err(anyhow::anyhow!(
+                    "GigaChat API error: {} {}",
+                    error.status,
+                    error.message
+                ));
+            }
+
+            // Just a rest of unhandled errors
+            return Err(anyhow::anyhow!("GigaChat API error: {}", response.status()));
+        }
 
         let models = response.json::<ModelsResponse>().await?;
 
@@ -140,6 +166,7 @@ impl GigaChatProvider {
         Ok(result)
     }
 
+    // https://developers.sber.ru/docs/ru/gigachat/api/reference/rest/post-token
     pub async fn fetch_auth_token(&self) -> anyhow::Result<AccessToken> {
         let req_id = Uuid::new_v4();
 
@@ -154,9 +181,28 @@ impl GigaChatProvider {
             .send()
             .await
             .or_else(|error| {
-                tracing::error!("Response error: {:?}", error);
-                Err(error)
+                return Err(error);
             })?;
+
+        if !response.status().is_success() {
+            if response.status() == StatusCode::UNAUTHORIZED {
+                // For 401 explicit error returned
+                // https://developers.sber.ru/docs/ru/gigachat/api/reference/rest/post-token#responses
+                let error = response.json::<HttpError>().await?;
+
+                return Err(anyhow::anyhow!(
+                    "GigaChat fetch token error: {} {}",
+                    error.status,
+                    error.message
+                ));
+            }
+
+            // Just a rest of unhandled errors
+            return Err(anyhow::anyhow!(
+                "GigaChat fetch token error: {}",
+                response.status()
+            ));
+        }
 
         let token = response.json().await?;
 
@@ -185,10 +231,35 @@ impl GigaChatProvider {
             )
             .send()
             .await
-            .or_else(|error| {
-                tracing::error!("Response error: {:?}", error);
-                Err(error)
-            })?;
+            .or_else(|error| return Err(error))?;
+
+        // Codes we can explicitly handle:
+        // https://developers.sber.ru/docs/ru/gigachat/api/reference/rest/post-chat#responses
+        const DATA_CODES: [StatusCode; 5] = [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::NOT_FOUND,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ];
+
+        if !response.status().is_success() {
+            if DATA_CODES.contains(&response.status()) {
+                let error = response.json::<HttpError>().await?;
+
+                return Err(anyhow::anyhow!(
+                    "GigaChat completion error: {} {}",
+                    error.status,
+                    error.message
+                ));
+            }
+
+            // Just a rest of unhandled errors
+            return Err(anyhow::anyhow!(
+                "GigaChat completion error: {}",
+                response.status()
+            ));
+        }
 
         let chat_response = response.json().await?;
 
@@ -216,7 +287,9 @@ impl Provider for GigaChatProvider {
         //     system_prompt.unwrap_or_default()
         // );
 
-        let access_token = self.fetch_auth_token().await?;
+        let access_token = self.fetch_auth_token().await.or_else(|error| {
+            return Err(error);
+        })?;
 
         let mut messages = vec![];
         if system_prompt.is_some() {
@@ -253,9 +326,14 @@ impl Provider for GigaChatProvider {
             update_interval: 0,
         };
 
-        let chat_response = self.fetch_chat_completions(&request, &access_token).await?;
+        let chat_response = self
+            .fetch_chat_completions(&request, &access_token)
+            .await
+            .or_else(|error| {
+                return Err(error);
+            })?;
 
-        tracing::debug!("Chat Response: {:?}", chat_response);
+        // tracing::debug!("Chat Response: {:?}", chat_response);
 
         // join the response messages to single string
         let result = chat_response
