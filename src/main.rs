@@ -140,6 +140,10 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
+        /// Reinitialize from scratch (backup and reset all configuration)
+        #[arg(long)]
+        reinit: bool,
+
         /// Reconfigure channels only (fast repair flow)
         #[arg(long)]
         channels_only: bool,
@@ -690,6 +694,7 @@ async fn main() -> Result<()> {
     if let Commands::Onboard {
         interactive,
         force,
+        reinit,
         channels_only,
         api_key,
         provider,
@@ -699,6 +704,7 @@ async fn main() -> Result<()> {
     {
         let interactive = *interactive;
         let force = *force;
+        let reinit = *reinit;
         let channels_only = *channels_only;
         let api_key = api_key.clone();
         let provider = provider.clone();
@@ -708,6 +714,12 @@ async fn main() -> Result<()> {
         if interactive && channels_only {
             bail!("Use either --interactive or --channels-only, not both");
         }
+        if reinit && channels_only {
+            bail!("Use either --reinit or --channels-only, not both");
+        }
+        if reinit && !interactive {
+            bail!("--reinit requires --interactive mode");
+        }
         if channels_only
             && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
         {
@@ -716,6 +728,33 @@ async fn main() -> Result<()> {
         if channels_only && force {
             bail!("--channels-only does not accept --force");
         }
+
+        // Handle --reinit: backup and reset configuration
+        if reinit {
+            use std::path::PathBuf;
+            let zeroclaw_dir = dirs::home_dir()
+                .map(|h| h.join(".zeroclaw"))
+                .unwrap_or_else(|| PathBuf::from(".zeroclaw"));
+
+            if zeroclaw_dir.exists() {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let backup_dir = format!("{}.backup.{}", zeroclaw_dir.display(), timestamp);
+
+                println!("⚠️  Reinitializing ZeroClaw configuration...");
+                println!("   Backing up existing config to: {}", backup_dir);
+
+                // Rename existing directory as backup
+                tokio::fs::rename(&zeroclaw_dir, &backup_dir).await
+                    .with_context(|| format!("Failed to backup existing config to {}", backup_dir))?;
+
+                println!("   Backup created successfully.");
+                println!("   Starting fresh initialization...\n");
+            }
+        }
+
         let config = if channels_only {
             onboard::run_channels_repair_wizard().await
         } else if interactive {
