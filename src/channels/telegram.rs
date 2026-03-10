@@ -2288,7 +2288,35 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             writeln!(final_out, "<pre><code>{}</code></pre>", code_buf.trim_end()).unwrap();
         }
 
-        final_out.trim_end_matches('\n').to_string()
+        // Third pass: group consecutive "&gt; " lines into <blockquote> blocks.
+        // The first pass escapes bare '>' to "&gt;", so markdown blockquote lines
+        // `> text` arrive here as `&gt; text`. Group them and wrap in <blockquote>.
+        let mut bq_out = String::with_capacity(final_out.len());
+        let mut quote_buf: Vec<&str> = Vec::new();
+        for line in final_out.trim_end_matches('\n').split('\n') {
+            if let Some(content) =
+                line.strip_prefix("&gt; ")
+                    .or_else(|| if line == "&gt;" { Some("") } else { None })
+            {
+                quote_buf.push(content);
+            } else {
+                if !quote_buf.is_empty() {
+                    bq_out.push_str("<blockquote>");
+                    bq_out.push_str(&quote_buf.join("\n"));
+                    bq_out.push_str("</blockquote>\n");
+                    quote_buf.clear();
+                }
+                bq_out.push_str(line);
+                bq_out.push('\n');
+            }
+        }
+        if !quote_buf.is_empty() {
+            bq_out.push_str("<blockquote>");
+            bq_out.push_str(&quote_buf.join("\n"));
+            bq_out.push_str("</blockquote>\n");
+        }
+
+        bq_out.trim_end_matches('\n').to_string()
     }
 
     fn escape_html(s: &str) -> String {
@@ -2304,8 +2332,18 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Returns `None` if the `<` should be escaped.
     fn try_html_passthrough_len(text: &str, pos: usize) -> Option<usize> {
         const SAFE_OPEN: &[&str] = &[
-            "<b>", "<i>", "<u>", "<s>", "<code>", "<pre>", "<strong>", "<em>", "<strike>", "<del>",
+            "<b>",
+            "<i>",
+            "<u>",
+            "<s>",
+            "<code>",
+            "<pre>",
+            "<strong>",
+            "<em>",
+            "<strike>",
+            "<del>",
             "<ins>",
+            "<blockquote>",
         ];
         const SAFE_CLOSE: &[&str] = &[
             "</b>",
@@ -2320,6 +2358,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             "</del>",
             "</ins>",
             "</a>",
+            "</blockquote>",
         ];
         let tail = &text[pos..];
         for tag in SAFE_OPEN.iter().chain(SAFE_CLOSE.iter()) {
@@ -4039,6 +4078,31 @@ mod tests {
             rendered,
             "say &quot;hi&quot; &amp; &lt;tag&gt; &#39;ok&#39;"
         );
+    }
+
+    #[test]
+    fn markdown_to_telegram_html_blockquote_single_line() {
+        let out = TelegramChannel::markdown_to_telegram_html("> quoted text");
+        assert_eq!(out, "<blockquote>quoted text</blockquote>");
+    }
+
+    #[test]
+    fn markdown_to_telegram_html_blockquote_multiline() {
+        let out = TelegramChannel::markdown_to_telegram_html("> line one\n> line two");
+        assert_eq!(out, "<blockquote>line one\nline two</blockquote>");
+    }
+
+    #[test]
+    fn markdown_to_telegram_html_blockquote_with_inline_bold() {
+        let out = TelegramChannel::markdown_to_telegram_html("> **bold** text");
+        assert_eq!(out, "<blockquote><b>bold</b> text</blockquote>");
+    }
+
+    #[test]
+    fn markdown_to_telegram_html_blockquote_passthrough_html_tag() {
+        // LLM may output <blockquote> directly — should pass through unchanged
+        let out = TelegramChannel::markdown_to_telegram_html("<blockquote>direct</blockquote>");
+        assert_eq!(out, "<blockquote>direct</blockquote>");
     }
 
     #[test]
