@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Send, Bot, User, AlertCircle } from 'lucide-react';
+import { Send, Bot, User, AlertCircle, Copy, Check } from 'lucide-react';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
 
@@ -16,11 +16,13 @@ export default function AgentChat() {
   const [typing, setTyping] = useState(false);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocketClient | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const pendingContentRef = useRef('');
+  const copyToastTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     const ws = new WebSocketClient();
@@ -116,6 +118,46 @@ export default function AgentChat() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, typing]);
 
+  useEffect(() => {
+    return () => {
+      if (copyToastTimerRef.current !== null) {
+        window.clearTimeout(copyToastTimerRef.current);
+      }
+    };
+  }, []);
+
+  const fallbackCopy = (text: string) => {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand('copy');
+    document.body.removeChild(textarea);
+  };
+
+  const handleCopyMessage = async (msg: ChatMessage) => {
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(msg.content);
+      } else {
+        fallbackCopy(msg.content);
+      }
+
+      setCopiedMessageId(msg.id);
+      if (copyToastTimerRef.current !== null) {
+        window.clearTimeout(copyToastTimerRef.current);
+      }
+      copyToastTimerRef.current = window.setTimeout(() => {
+        setCopiedMessageId(null);
+      }, 1500);
+    } catch {
+      setError('Failed to copy message to clipboard.');
+    }
+  };
+
   const handleSend = () => {
     const trimmed = input.trim();
     if (!trimmed || !wsRef.current?.connected) return;
@@ -190,12 +232,29 @@ export default function AgentChat() {
               )}
             </div>
             <div
-              className={`max-w-[75%] rounded-xl px-4 py-3 ${
+              className={`group relative max-w-[75%] rounded-xl px-4 py-3 ${
                 msg.role === 'user'
                   ? 'bg-blue-600 text-white'
                   : 'bg-gray-800 text-gray-100 border border-gray-700'
               }`}
             >
+              <button
+                type="button"
+                onClick={() => handleCopyMessage(msg)}
+                aria-label={`Copy ${msg.role} message`}
+                title={copiedMessageId === msg.id ? 'Copied' : 'Copy message'}
+                className={`absolute top-2 right-2 rounded-md border p-1 transition-opacity ${
+                  copiedMessageId === msg.id
+                    ? 'opacity-100 border-green-400/50 bg-green-500/20 text-green-200'
+                    : 'opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:pointer-events-auto border-black/20 bg-black/20 text-white/80 hover:text-white'
+                }`}
+              >
+                {copiedMessageId === msg.id ? (
+                  <Check className="h-3.5 w-3.5" />
+                ) : (
+                  <Copy className="h-3.5 w-3.5" />
+                )}
+              </button>
               <p className="text-sm whitespace-pre-wrap break-words">{msg.content}</p>
               <p
                 className={`text-xs mt-1 ${
