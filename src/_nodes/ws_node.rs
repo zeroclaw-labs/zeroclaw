@@ -23,7 +23,12 @@ use axum::{
 };
 use serde_json::Value;
 use std::net::SocketAddr;
+use tokio::time::{self, Duration, MissedTickBehavior};
 use uuid::Uuid;
+
+/// Interval for gateway → node tick events (milliseconds).
+/// Matches OpenClaw's TICK_INTERVAL_MS so shared clients can reuse watchdog logic.
+const NODE_TICK_INTERVAL_MS: u64 = 30_000;
 
 fn sanitize_ws_headers(headers: &HeaderMap) -> Value {
     let mut out = serde_json::Map::new();
@@ -289,6 +294,11 @@ async fn handle_node_socket(
         break (node_id, rx);
     };
 
+    // Periodic keepalive: send `event: "tick"` frames to the node so
+    // node-side watchdogs can detect stalled connections.
+    let mut tick_interval = time::interval(Duration::from_millis(NODE_TICK_INTERVAL_MS));
+    tick_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             // Incoming from node: node.invoke.result (req frame)
@@ -429,6 +439,23 @@ async fn handle_node_socket(
 
                 if socket.send(Message::Text(wire.to_string().into())).await.is_err() {
                     tracing::warn!(node_id = %node_id, "failed to send gateway frame to node");
+                    break;
+                }
+            }
+
+            // Periodic tick: gateway-initiated heartbeat for node clients.
+            _ = tick_interval.tick() => {
+                let payload = serde_json::json!({
+                    "ts": chrono::Utc::now().timestamp_millis(),
+                });
+                let tick = serde_json::json!({
+                    "type": "event",
+                    "event": "tick",
+                    "payload": payload,
+                });
+
+                if socket.send(Message::Text(tick.to_string().into())).await.is_err() {
+                    tracing::warn!(node_id = %node_id, "failed to send tick event to node");
                     break;
                 }
             }
