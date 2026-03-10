@@ -431,6 +431,48 @@ Notes:
 allowed_contacts = ["*"]
 ```
 
+### 4.18 MQTT
+
+MQTT is a lightweight publish/subscribe protocol ideal for IoT devices, sensors, and low-bandwidth environments.
+
+```toml
+[channels_config.mqtt]
+broker_url = "mqtt://broker.example.com:1883"
+client_id = "zeroclaw_agent"
+topics = ["commands/zeroclaw/#", "sensors/+/alert"]
+qos = 1
+# Optional authentication
+# username = "zeroclaw_user"
+# password = "secret"
+use_tls = false
+keep_alive_secs = 30
+# Response topic template (supports {{sender}} placeholder)
+response_topic = "responses/{{sender}}"
+# Allowed senders (empty = deny all, "*" = allow all)
+allowed_senders = ["*"]
+```
+
+For TLS-enabled brokers (mqtts://):
+
+```toml
+[channels_config.mqtt]
+broker_url = "mqtts://broker.example.com:8883"
+client_id = "zeroclaw_agent"
+topics = ["commands/#"]
+qos = 1
+use_tls = true
+allowed_senders = ["device_001", "sensor_gateway"]
+```
+
+**Notes:**
+- `broker_url` must start with `mqtt://` or `mqtts://`
+- `mqtts://` URLs require `use_tls = true`
+- `topics` supports MQTT wildcards: `+` (single level) and `#` (multi-level)
+- `qos` must be 0 (at most once), 1 (at least once), or 2 (exactly once)
+- Sender identity is extracted from the last non-wildcard topic segment
+- `response_topic` can use `{{sender}}` placeholder for dynamic routing
+- `allowed_senders` uses the extracted sender identity for access control
+
 ---
 
 ## 5. Validation Workflow
