@@ -1,26 +1,35 @@
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use matrix_sdk::{
     authentication::matrix::MatrixSession,
     config::SyncSettings,
+    encryption::verification::{SasState, VerificationRequestState},
+    media::{MediaFormat, MediaRequestParameters},
     ruma::{
         events::reaction::ReactionEventContent,
         events::relation::{Annotation, InReplyTo, Thread},
-        events::room::message::{
-            MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+        events::room::{
+            message::{
+                AudioMessageEventContent, FileMessageEventContent, ImageMessageEventContent,
+                MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+            },
+            MediaSource,
         },
-        events::room::MediaSource,
-        OwnedEventId, OwnedRoomId, OwnedUserId,
+        OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId,
     },
     Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
 };
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, OnceCell, RwLock};
+
+/// Maximum media download size (50 MB).
+const MATRIX_MAX_MEDIA_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
 
 /// Matrix channel for Matrix Client-Server API.
 /// Uses matrix-sdk for reliable sync and encrypted-room decryption.
@@ -38,6 +47,8 @@ pub struct MatrixChannel {
     http_client: Client,
     reaction_events: Arc<RwLock<HashMap<String, String>>>,
     voice_mode: Arc<AtomicBool>,
+    transcription: Option<crate::config::TranscriptionConfig>,
+    voice_transcriptions: Arc<Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for MatrixChannel {
@@ -106,6 +117,129 @@ struct RoomAliasResponse {
     room_id: String,
 }
 
+// --- Outgoing attachment marker types (follows Telegram/Discord pattern) ---
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatrixOutgoingAttachmentKind {
+    Image,
+    File,
+    Audio,
+    Voice,
+}
+
+impl MatrixOutgoingAttachmentKind {
+    fn from_marker(marker: &str) -> Option<Self> {
+        match marker.trim().to_ascii_uppercase().as_str() {
+            "IMAGE" | "PHOTO" => Some(Self::Image),
+            "DOCUMENT" | "FILE" => Some(Self::File),
+            "AUDIO" => Some(Self::Audio),
+            "VOICE" => Some(Self::Voice),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MatrixOutgoingAttachment {
+    kind: MatrixOutgoingAttachmentKind,
+    target: String,
+}
+
+fn parse_matrix_attachment_markers(message: &str) -> (String, Vec<MatrixOutgoingAttachment>) {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut attachments = Vec::new();
+    let mut cursor = 0usize;
+
+    while cursor < message.len() {
+        let Some(open_rel) = message[cursor..].find('[') else {
+            cleaned.push_str(&message[cursor..]);
+            break;
+        };
+
+        let open = cursor + open_rel;
+        cleaned.push_str(&message[cursor..open]);
+
+        let Some(close_rel) = message[open..].find(']') else {
+            cleaned.push_str(&message[open..]);
+            break;
+        };
+
+        let close = open + close_rel;
+        let marker = &message[open + 1..close];
+
+        let parsed = marker.split_once(':').and_then(|(kind, target)| {
+            let kind = MatrixOutgoingAttachmentKind::from_marker(kind)?;
+            let target = target.trim();
+            if target.is_empty() {
+                return None;
+            }
+            Some(MatrixOutgoingAttachment {
+                kind,
+                target: target.to_string(),
+            })
+        });
+
+        if let Some(attachment) = parsed {
+            attachments.push(attachment);
+        } else {
+            cleaned.push_str(&message[open..=close]);
+        }
+
+        cursor = close + 1;
+    }
+
+    (cleaned.trim().to_string(), attachments)
+}
+
+fn is_image_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Download media from a Matrix media source via the SDK client, save to disk.
+async fn download_and_save_matrix_media(
+    client: &MatrixSdkClient,
+    source: &MediaSource,
+    filename: &str,
+    save_dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    let request = MediaRequestParameters {
+        source: source.clone(),
+        format: MediaFormat::File,
+    };
+
+    let data = client.media().get_media_content(&request, false).await?;
+
+    if data.len() > MATRIX_MAX_MEDIA_DOWNLOAD_BYTES {
+        anyhow::bail!(
+            "Matrix media exceeds size limit ({} bytes > {} bytes)",
+            data.len(),
+            MATRIX_MAX_MEDIA_DOWNLOAD_BYTES,
+        );
+    }
+
+    tokio::fs::create_dir_all(save_dir).await?;
+
+    // Sanitize filename: UUID prefix prevents collisions and path traversal.
+    let safe_name = Path::new(filename)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("attachment.bin");
+    let local_name = format!("{}_{}", uuid::Uuid::new_v4(), safe_name);
+    let local_path = save_dir.join(&local_name);
+
+    tokio::fs::write(&local_path, &data).await?;
+
+    Ok(local_path)
+}
+
 impl MatrixChannel {
     fn normalize_optional_field(value: Option<String>) -> Option<String> {
         value
@@ -172,7 +306,16 @@ impl MatrixChannel {
             http_client: Client::new(),
             reaction_events: Arc::new(RwLock::new(HashMap::new())),
             voice_mode: Arc::new(AtomicBool::new(false)),
+            transcription: None,
+            voice_transcriptions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        if config.enabled {
+            self.transcription = Some(config);
+        }
+        self
     }
 
     fn encode_path_segment(value: &str) -> String {
@@ -206,6 +349,12 @@ impl MatrixChannel {
             .map(|dir| dir.join("state").join("matrix"))
     }
 
+    fn media_save_dir(&self) -> Option<PathBuf> {
+        self.zeroclaw_dir
+            .as_ref()
+            .map(|dir| dir.join("matrix_files"))
+    }
+
     fn is_user_allowed(&self, sender: &str) -> bool {
         Self::is_sender_allowed(&self.allowed_users, sender)
     }
@@ -219,7 +368,10 @@ impl MatrixChannel {
     }
 
     fn is_supported_message_type(msgtype: &str) -> bool {
-        matches!(msgtype, "m.text" | "m.notice")
+        matches!(
+            msgtype,
+            "m.text" | "m.notice" | "m.image" | "m.file" | "m.audio"
+        )
     }
 
     fn has_non_empty_body(body: &str) -> bool {
@@ -352,7 +504,16 @@ impl MatrixChannel {
                     }
                 };
 
-                let mut client_builder = MatrixSdkClient::builder().homeserver_url(&self.homeserver);
+                let encryption_settings = matrix_sdk::encryption::EncryptionSettings {
+                    auto_enable_cross_signing: true,
+                    auto_enable_backups: true,
+                    backup_download_strategy:
+                        matrix_sdk::encryption::BackupDownloadStrategy::AfterDecryptionFailure,
+                };
+
+                let mut client_builder = MatrixSdkClient::builder()
+                    .homeserver_url(&self.homeserver)
+                    .with_encryption_settings(encryption_settings);
 
                 if let Some(store_dir) = self.matrix_store_dir() {
                     tokio::fs::create_dir_all(&store_dir).await.map_err(|error| {
@@ -379,6 +540,18 @@ impl MatrixChannel {
                 };
 
                 client.restore_session(session).await?;
+
+                // Bootstrap cross-signing if not already set up, so other
+                // devices/users can verify this bot and share room keys.
+                if let Err(error) = client
+                    .encryption()
+                    .bootstrap_cross_signing_if_needed(None)
+                    .await
+                {
+                    tracing::warn!(
+                        "Matrix cross-signing bootstrap failed (verification may be unavailable): {error}"
+                    );
+                }
 
                 Ok::<MatrixSdkClient, anyhow::Error>(client)
             })
@@ -531,6 +704,113 @@ impl MatrixChannel {
     }
 }
 
+/// Handle an incoming SAS verification request: accept, start SAS, log emojis,
+/// and auto-confirm once the other side confirms (operator verifies on their client).
+async fn handle_verification_request(
+    client: MatrixSdkClient,
+    sender: OwnedUserId,
+    flow_id: String,
+) {
+    let Some(request) = client
+        .encryption()
+        .get_verification_request(&sender, &flow_id)
+        .await
+    else {
+        tracing::warn!("Matrix verification request not found for flow {flow_id}");
+        return;
+    };
+
+    tracing::info!(
+        "Matrix verification request received from {}, accepting...",
+        sender
+    );
+
+    if let Err(error) = request.accept().await {
+        tracing::warn!("Matrix verification accept failed: {error}");
+        return;
+    }
+
+    // Wait for the request to transition to Ready, then start SAS.
+    let mut changes = request.changes();
+    loop {
+        match request.state() {
+            VerificationRequestState::Ready { .. } => break,
+            VerificationRequestState::Done | VerificationRequestState::Cancelled(_) => return,
+            _ => {}
+        }
+        if changes.next().await.is_none() {
+            return;
+        }
+    }
+
+    let Some(sas) = (match request.start_sas().await {
+        Ok(sas) => sas,
+        Err(error) => {
+            tracing::warn!("Matrix SAS verification start failed: {error}");
+            return;
+        }
+    }) else {
+        tracing::warn!("Matrix SAS verification could not be started (not in ready state)");
+        return;
+    };
+
+    tracing::info!("Matrix SAS verification started with {}", sender);
+
+    let mut sas_changes = sas.changes();
+    while let Some(state) = sas_changes.next().await {
+        match state {
+            SasState::KeysExchanged { emojis, decimals } => {
+                if let Some(emojis) = emojis {
+                    let emoji_display: Vec<String> = emojis
+                        .emojis
+                        .iter()
+                        .map(|e| format!("{} ({})", e.symbol, e.description))
+                        .collect();
+                    tracing::info!(
+                        "Matrix SAS verification emojis with {} — confirm these match in your client:\n  {}",
+                        sender,
+                        emoji_display.join("  ")
+                    );
+                } else {
+                    let (d1, d2, d3) = decimals;
+                    tracing::info!(
+                        "Matrix SAS verification decimals with {}: {} {} {}",
+                        sender,
+                        d1,
+                        d2,
+                        d3
+                    );
+                }
+
+                // Auto-confirm: the operator verifies emojis on their Element client.
+                // Once Element confirms, the SAS protocol completes. We confirm on
+                // the bot side since the operator already compared visually.
+                if let Err(error) = sas.confirm().await {
+                    tracing::warn!("Matrix SAS verification confirm failed: {error}");
+                    return;
+                }
+            }
+            SasState::Done { .. } => {
+                tracing::info!(
+                    "Matrix SAS verification with {} completed successfully. Device {} is now verified.",
+                    sender,
+                    sas.other_device().device_id()
+                );
+                return;
+            }
+            SasState::Cancelled(info) => {
+                tracing::warn!(
+                    "Matrix SAS verification with {} cancelled: {}",
+                    sender,
+                    info.reason()
+                );
+                return;
+            }
+            _ => {}
+        }
+    }
+}
+
 #[async_trait]
 impl Channel for MatrixChannel {
     fn name(&self) -> &str {
@@ -538,6 +818,9 @@ impl Channel for MatrixChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        let raw_content = super::strip_tool_call_tags(&message.content);
+        let (cleaned_content, parsed_attachments) = parse_matrix_attachment_markers(&raw_content);
+
         let client = self.matrix_client().await?;
         let target_room_id = if message.recipient.contains("||") {
             message
@@ -565,93 +848,87 @@ impl Channel for MatrixChannel {
             anyhow::bail!("Matrix room '{}' is not in joined state", target_room_id);
         }
 
-        let mut content = RoomMessageEventContent::text_markdown(&message.content);
+        // Send each attachment as a separate media message.
+        for attachment in &parsed_attachments {
+            let target = attachment.target.trim();
+            let path = Path::new(target);
 
-        if let Some(ref thread_ts) = message.thread_ts {
-            if let Ok(thread_root) = thread_ts.parse::<OwnedEventId>() {
-                content.relates_to = Some(Relation::Thread(Thread::plain(
-                    thread_root.clone(),
-                    thread_root,
-                )));
+            if !path.exists() || !path.is_file() {
+                tracing::warn!(
+                    "Matrix outgoing attachment not found or not a file: {}",
+                    target
+                );
+                continue;
             }
+
+            let bytes = match tokio::fs::read(path).await {
+                Ok(b) => b,
+                Err(error) => {
+                    tracing::warn!(
+                        "Matrix failed to read outgoing attachment '{}': {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+
+            let mime = mime_guess::from_path(path)
+                .first()
+                .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM);
+
+            let upload_result = client.media().upload(&mime, bytes, None).await;
+
+            let mxc_uri: OwnedMxcUri = match upload_result {
+                Ok(response) => response.content_uri,
+                Err(error) => {
+                    tracing::warn!(
+                        "Matrix media upload failed for '{}': {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("attachment.bin")
+                .to_string();
+
+            let msg_type = match attachment.kind {
+                MatrixOutgoingAttachmentKind::Image => {
+                    MessageType::Image(ImageMessageEventContent::plain(filename, mxc_uri))
+                }
+                MatrixOutgoingAttachmentKind::Audio | MatrixOutgoingAttachmentKind::Voice => {
+                    MessageType::Audio(AudioMessageEventContent::plain(filename, mxc_uri))
+                }
+                MatrixOutgoingAttachmentKind::File => {
+                    MessageType::File(FileMessageEventContent::plain(filename, mxc_uri))
+                }
+            };
+
+            room.send(RoomMessageEventContent::new(msg_type)).await?;
         }
 
-        room.send(content).await?;
-
-        // Voice reply: generate TTS audio and send as m.audio when voice_mode is active
-        if self.voice_mode.load(Ordering::Relaxed) {
-            self.voice_mode.store(false, Ordering::Relaxed);
-            tracing::info!("Voice mode active, generating TTS reply");
-            let voice_work = std::path::PathBuf::from("/tmp/zeroclaw-voice");
-            let _ = tokio::fs::create_dir_all(&voice_work).await;
-            let mp3_path = voice_work.join("reply.mp3");
-
-            let tts_text = message
-                .content
-                .replace("**", "")
-                .replace("*", "")
-                .replace("`", "")
-                .replace("# ", "");
-
-            let tts_ok = tokio::process::Command::new("edge-tts")
-                .arg("--text")
-                .arg(&tts_text)
-                .arg("--write-media")
-                .arg(&mp3_path)
-                .output()
-                .await
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-
-            if tts_ok && mp3_path.exists() {
-                if let Ok(audio_data) = tokio::fs::read(&mp3_path).await {
-                    let upload_url = format!(
-                        "{}/_matrix/media/v3/upload?filename=voice-reply.mp3",
-                        self.homeserver
-                    );
-                    if let Ok(resp) = self
-                        .http_client
-                        .post(&upload_url)
-                        .header("Authorization", self.auth_header_value())
-                        .header("Content-Type", "audio/mpeg")
-                        .body(audio_data)
-                        .send()
-                        .await
-                    {
-                        if resp.status().is_success() {
-                            if let Ok(body) = resp.json::<serde_json::Value>().await {
-                                if let Some(content_uri) = body["content_uri"].as_str() {
-                                    let encoded_room = Self::encode_path_segment(&target_room_id);
-                                    let txn_id = format!(
-                                        "voice_{}",
-                                        std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_millis()
-                                    );
-                                    let audio_msg = serde_json::json!({
-                                        "msgtype": "m.audio",
-                                        "body": "Voice reply",
-                                        "url": content_uri,
-                                        "info": { "mimetype": "audio/mpeg" }
-                                    });
-                                    let send_url = format!(
-                                        "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
-                                        self.homeserver, encoded_room, txn_id
-                                    );
-                                    let _ = self
-                                        .http_client
-                                        .put(&send_url)
-                                        .header("Authorization", self.auth_header_value())
-                                        .json(&audio_msg)
-                                        .send()
-                                        .await;
-                                }
-                            }
-                        }
-                    }
+        // Send remaining text (if any) after attachments, with threading support.
+        let send_text = |text: &str| {
+            let mut content = RoomMessageEventContent::text_markdown(text);
+            if let Some(ref thread_ts) = message.thread_ts {
+                if let Ok(thread_root) = thread_ts.parse::<OwnedEventId>() {
+                    content.relates_to = Some(Relation::Thread(Thread::plain(
+                        thread_root.clone(),
+                        thread_root,
+                    )));
                 }
             }
+            content
+        };
+
+        if !cleaned_content.is_empty() {
+            room.send(send_text(&cleaned_content)).await?;
+        } else if parsed_attachments.is_empty() {
+            // No markers were found — send original content as text.
+            room.send(send_text(&raw_content)).await?;
         }
 
         Ok(())
@@ -700,6 +977,9 @@ impl Channel for MatrixChannel {
         let homeserver_for_handler = self.homeserver.clone();
         let access_token_for_handler = self.access_token.clone();
         let voice_mode_for_handler = Arc::clone(&self.voice_mode);
+        let media_save_dir_for_handler = self.media_save_dir();
+        let transcription_for_handler = self.transcription.clone();
+        let voice_cache_for_handler = Arc::clone(&self.voice_transcriptions);
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
@@ -710,6 +990,9 @@ impl Channel for MatrixChannel {
             let homeserver = homeserver_for_handler.clone();
             let access_token = access_token_for_handler.clone();
             let voice_mode = Arc::clone(&voice_mode_for_handler);
+            let media_save_dir = media_save_dir_for_handler.clone();
+            let transcription_config = transcription_for_handler.clone();
+            let voice_cache = Arc::clone(&voice_cache_for_handler);
 
             async move {
                 if false
@@ -727,122 +1010,117 @@ impl Channel for MatrixChannel {
                     return;
                 }
 
-                // Helper: extract mxc:// download URL and filename for media types
-                let media_info = |source: &MediaSource, name: &str| -> Option<(String, String)> {
-                    match source {
-                        MediaSource::Plain(mxc) => {
-                            let rest = mxc.as_str().strip_prefix("mxc://")?;
-                            let url =
-                                format!("{}/_matrix/client/v1/media/download/{}", homeserver, rest);
-                            Some((url, name.to_string()))
-                        }
-                        _ => None,
-                    }
-                };
-
-                let (body, media_download) = match &event.content.msgtype {
-                    MessageType::Text(content) => (content.body.clone(), None),
-                    MessageType::Notice(content) => (content.body.clone(), None),
+                let body = match &event.content.msgtype {
+                    MessageType::Text(content) => content.body.clone(),
+                    MessageType::Notice(content) => content.body.clone(),
                     MessageType::Image(content) => {
-                        let dl = media_info(&content.source, &content.body);
-                        (format!("[image: {}]", content.body), dl)
+                        let Some(ref save_dir) = media_save_dir else {
+                            tracing::warn!("Matrix image received but no zeroclaw_dir configured for media storage");
+                            return;
+                        };
+                        let filename = content.filename().to_string();
+                        let source = content.source.clone();
+                        let sdk_client = room.client();
+                        match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir).await {
+                            Ok(local_path) => {
+                                if is_image_extension(&local_path) {
+                                    format!("[IMAGE:{}]", local_path.display())
+                                } else {
+                                    format!("[Document: {}] {}", filename, local_path.display())
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!("Matrix image download failed: {error}");
+                                return;
+                            }
+                        }
                     }
                     MessageType::File(content) => {
-                        let dl = media_info(&content.source, &content.body);
-                        (format!("[file: {}]", content.body), dl)
+                        let Some(ref save_dir) = media_save_dir else {
+                            tracing::warn!("Matrix file received but no zeroclaw_dir configured for media storage");
+                            return;
+                        };
+                        let filename = content.filename().to_string();
+                        let source = content.source.clone();
+                        let sdk_client = room.client();
+                        match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir).await {
+                            Ok(local_path) => {
+                                format!("[Document: {}] {}", filename, local_path.display())
+                            }
+                            Err(error) => {
+                                tracing::warn!("Matrix file download failed: {error}");
+                                return;
+                            }
+                        }
                     }
                     MessageType::Audio(content) => {
-                        let dl = media_info(&content.source, &content.body);
-                        (format!("[audio: {}]", content.body), dl)
-                    }
-                    MessageType::Video(content) => {
-                        let dl = media_info(&content.source, &content.body);
-                        (format!("[video: {}]", content.body), dl)
-                    }
-                    _ => return,
-                };
+                        let filename = content.filename().to_string();
+                        let source = content.source.clone();
+                        let sdk_client = room.client();
 
-                // Download media to workspace if present
-                let body = if let Some((url, filename)) = media_download {
-                    let workspace = std::path::PathBuf::from(
-                        std::env::var("ZEROCLAW_WORKSPACE")
-                            .unwrap_or_else(|_| "/tmp/zeroclaw-uploads".to_string()),
-                    );
-                    let _ = tokio::fs::create_dir_all(&workspace).await;
-                    let dest = workspace.join(&filename);
-                    let client = reqwest::Client::new();
-                    match client
-                        .get(&url)
-                        .header("Authorization", format!("Bearer {}", access_token))
-                        .send()
-                        .await
-                    {
-                        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                            Ok(bytes) => match tokio::fs::write(&dest, &bytes).await {
-                                Ok(_) => format!("{} — saved to {}", body, dest.display()),
-                                Err(_) => format!("{} — failed to write to disk", body),
-                            },
-                            Err(_) => format!("{} — download failed", body),
-                        },
-                        _ => format!("{} — download failed (auth error?)", body),
-                    }
-                } else {
-                    body
-                };
-
-                // Voice transcription: if this was an audio message, transcribe it
-                let body = if body.starts_with("[audio:") {
-                    if let Some(path_start) = body.find("saved to ") {
-                        let audio_path = body[path_start + 9..].to_string();
-                        let wav_path = format!("{}.16k.wav", audio_path);
-                        let convert_ok = tokio::process::Command::new("ffmpeg")
-                            .args([
-                                "-y",
-                                "-i",
-                                &audio_path,
-                                "-ar",
-                                "16000",
-                                "-ac",
-                                "1",
-                                "-f",
-                                "wav",
-                                &wav_path,
-                            ])
-                            .stderr(std::process::Stdio::null())
-                            .output()
-                            .await
-                            .map(|o| o.status.success())
-                            .unwrap_or(false);
-                        if convert_ok {
-                            let transcription = tokio::process::Command::new("whisper-cpp")
-                                .args([
-                                    "-m",
-                                    "/tmp/ggml-base.en.bin",
-                                    "-f",
-                                    &wav_path,
-                                    "--no-timestamps",
-                                    "-nt",
-                                ])
-                                .output()
-                                .await
-                                .ok()
-                                .filter(|o| o.status.success())
-                                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                                .filter(|s| !s.is_empty());
-                            if let Some(text) = transcription {
-                                voice_mode.store(true, Ordering::Relaxed);
-                                format!("[Voice message]: {}", text)
-                            } else {
-                                body
+                        // Try transcription first if enabled.
+                        if let Some(ref config) = transcription_config {
+                            let request = MediaRequestParameters {
+                                source: source.clone(),
+                                format: MediaFormat::File,
+                            };
+                            match sdk_client.media().get_media_content(&request, false).await {
+                                Ok(audio_data) => {
+                                    match super::transcription::transcribe_audio(audio_data, &filename, config).await {
+                                        Ok(text) => {
+                                            let event_id = event.event_id.to_string();
+                                            let mut cache = voice_cache.lock().await;
+                                            if cache.len() >= 100 {
+                                                cache.clear();
+                                            }
+                                            cache.insert(event_id, text.clone());
+                                            voice_mode.store(true, Ordering::Relaxed);
+                                            format!("[Voice] {text}")
+                                        }
+                                        Err(error) => {
+                                            tracing::debug!("Matrix audio transcription failed, falling back to file save: {error}");
+                                            let Some(ref save_dir) = media_save_dir else {
+                                                tracing::warn!("Matrix audio received but no zeroclaw_dir configured for media storage");
+                                                return;
+                                            };
+                                            match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir).await {
+                                                Ok(local_path) => {
+                                                    format!("[Document: {}] {}", filename, local_path.display())
+                                                }
+                                                Err(dl_error) => {
+                                                    tracing::warn!("Matrix audio download failed: {dl_error}");
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!("Matrix audio media fetch failed: {error}");
+                                    return;
+                                }
                             }
                         } else {
-                            body
+                            // No transcription — save as document.
+                            let Some(ref save_dir) = media_save_dir else {
+                                tracing::warn!("Matrix audio received but no zeroclaw_dir configured for media storage");
+                                return;
+                            };
+                            match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir).await {
+                                Ok(local_path) => {
+                                    format!("[Document: {}] {}", filename, local_path.display())
+                                }
+                                Err(error) => {
+                                    tracing::warn!("Matrix audio download failed: {error}");
+                                    return;
+                                }
+                            }
                         }
-                    } else {
-                        body
                     }
-                } else {
-                    body
+                    MessageType::Video(content) => {
+                        format!("[video: {}]", content.body)
+                    }
+                    _ => return,
                 };
 
                 if !MatrixChannel::has_non_empty_body(&body) {
@@ -876,6 +1154,36 @@ impl Channel for MatrixChannel {
                 };
 
                 let _ = tx.send(msg).await;
+            }
+        });
+
+        // Verification handler: accept incoming SAS verification requests
+        // and auto-confirm after logging emojis for operator review.
+        let verification_client = client.clone();
+        let allowed_users_for_verification = self.allowed_users.clone();
+        client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, _room: Room| {
+            let ver_client = verification_client.clone();
+            let allowed_users = allowed_users_for_verification.clone();
+
+            async move {
+                if !matches!(&event.content.msgtype, MessageType::VerificationRequest(_)) {
+                    return;
+                }
+
+                let sender = event.sender.to_string();
+                if !MatrixChannel::is_sender_allowed(&allowed_users, &sender) {
+                    tracing::warn!(
+                        "Matrix verification request from non-allowed user {sender}, ignoring"
+                    );
+                    return;
+                }
+
+                let flow_id = event.event_id.to_string();
+                let sender_id = event.sender.clone();
+
+                tokio::spawn(async move {
+                    handle_verification_request(ver_client, sender_id, flow_id).await;
+                });
             }
         });
 
@@ -1100,6 +1408,18 @@ mod tests {
         )
     }
 
+    fn make_channel_with_zeroclaw_dir() -> MatrixChannel {
+        MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
+            "https://matrix.org".to_string(),
+            "syt_test_token".to_string(),
+            "!room:matrix.org".to_string(),
+            vec!["@user:matrix.org".to_string()],
+            None,
+            None,
+            Some(PathBuf::from("/tmp/zeroclaw")),
+        )
+    }
+
     #[test]
     fn creates_with_correct_fields() {
         let ch = make_channel();
@@ -1231,8 +1551,11 @@ mod tests {
     fn supported_message_type_detection() {
         assert!(MatrixChannel::is_supported_message_type("m.text"));
         assert!(MatrixChannel::is_supported_message_type("m.notice"));
-        assert!(!MatrixChannel::is_supported_message_type("m.image"));
-        assert!(!MatrixChannel::is_supported_message_type("m.file"));
+        assert!(MatrixChannel::is_supported_message_type("m.image"));
+        assert!(MatrixChannel::is_supported_message_type("m.file"));
+        assert!(MatrixChannel::is_supported_message_type("m.audio"));
+        assert!(!MatrixChannel::is_supported_message_type("m.video"));
+        assert!(!MatrixChannel::is_supported_message_type("m.location"));
     }
 
     #[test]
@@ -1520,5 +1843,124 @@ mod tests {
         let json = r#"{"next_batch":"s0"}"#;
         let resp: SyncResponse = serde_json::from_str(json).unwrap();
         assert!(resp.rooms.join.is_empty());
+    }
+
+    // --- Media support tests ---
+
+    #[test]
+    fn parse_matrix_attachment_markers_multiple() {
+        let input = "Here is an image\n[IMAGE:/tmp/photo.png]\nAnd a file [FILE:/tmp/doc.pdf]";
+        let (cleaned, attachments) = parse_matrix_attachment_markers(input);
+        assert_eq!(cleaned, "Here is an image\n\nAnd a file");
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].kind, MatrixOutgoingAttachmentKind::Image);
+        assert_eq!(attachments[0].target, "/tmp/photo.png");
+        assert_eq!(attachments[1].kind, MatrixOutgoingAttachmentKind::File);
+        assert_eq!(attachments[1].target, "/tmp/doc.pdf");
+    }
+
+    #[test]
+    fn parse_matrix_attachment_markers_invalid_kept_as_text() {
+        let input = "Hello [NOT_A_MARKER:foo] world";
+        let (cleaned, attachments) = parse_matrix_attachment_markers(input);
+        assert_eq!(cleaned, "Hello [NOT_A_MARKER:foo] world");
+        assert!(attachments.is_empty());
+    }
+
+    #[test]
+    fn parse_matrix_attachment_markers_empty_target() {
+        let input = "[IMAGE:] some text";
+        let (cleaned, attachments) = parse_matrix_attachment_markers(input);
+        assert_eq!(cleaned, "[IMAGE:] some text");
+        assert!(attachments.is_empty());
+    }
+
+    #[test]
+    fn parse_matrix_attachment_markers_no_markers() {
+        let input = "Just plain text";
+        let (cleaned, attachments) = parse_matrix_attachment_markers(input);
+        assert_eq!(cleaned, "Just plain text");
+        assert!(attachments.is_empty());
+    }
+
+    #[test]
+    fn outgoing_attachment_kind_from_marker_all_variants() {
+        assert_eq!(
+            MatrixOutgoingAttachmentKind::from_marker("IMAGE"),
+            Some(MatrixOutgoingAttachmentKind::Image)
+        );
+        assert_eq!(
+            MatrixOutgoingAttachmentKind::from_marker("photo"),
+            Some(MatrixOutgoingAttachmentKind::Image)
+        );
+        assert_eq!(
+            MatrixOutgoingAttachmentKind::from_marker("DOCUMENT"),
+            Some(MatrixOutgoingAttachmentKind::File)
+        );
+        assert_eq!(
+            MatrixOutgoingAttachmentKind::from_marker("file"),
+            Some(MatrixOutgoingAttachmentKind::File)
+        );
+        assert_eq!(
+            MatrixOutgoingAttachmentKind::from_marker("Audio"),
+            Some(MatrixOutgoingAttachmentKind::Audio)
+        );
+        assert_eq!(
+            MatrixOutgoingAttachmentKind::from_marker("VOICE"),
+            Some(MatrixOutgoingAttachmentKind::Voice)
+        );
+        assert_eq!(MatrixOutgoingAttachmentKind::from_marker("unknown"), None);
+    }
+
+    #[test]
+    fn is_image_extension_known() {
+        assert!(is_image_extension(Path::new("photo.png")));
+        assert!(is_image_extension(Path::new("photo.JPG")));
+        assert!(is_image_extension(Path::new("photo.jpeg")));
+        assert!(is_image_extension(Path::new("photo.gif")));
+        assert!(is_image_extension(Path::new("photo.webp")));
+        assert!(is_image_extension(Path::new("photo.bmp")));
+    }
+
+    #[test]
+    fn is_image_extension_unknown() {
+        assert!(!is_image_extension(Path::new("file.pdf")));
+        assert!(!is_image_extension(Path::new("audio.ogg")));
+        assert!(!is_image_extension(Path::new("noext")));
+    }
+
+    #[test]
+    fn media_save_dir_derived_from_zeroclaw_dir() {
+        let ch = make_channel_with_zeroclaw_dir();
+        assert_eq!(
+            ch.media_save_dir(),
+            Some(PathBuf::from("/tmp/zeroclaw/matrix_files"))
+        );
+    }
+
+    #[test]
+    fn media_save_dir_absent_without_zeroclaw_dir() {
+        let ch = make_channel();
+        assert!(ch.media_save_dir().is_none());
+    }
+
+    #[test]
+    fn with_transcription_enabled() {
+        let config = crate::config::TranscriptionConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let ch = make_channel().with_transcription(config);
+        assert!(ch.transcription.is_some());
+    }
+
+    #[test]
+    fn with_transcription_disabled() {
+        let config = crate::config::TranscriptionConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let ch = make_channel().with_transcription(config);
+        assert!(ch.transcription.is_none());
     }
 }
