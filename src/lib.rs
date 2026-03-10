@@ -118,16 +118,24 @@ Examples:
         #[arg(long)]
         host: Option<String>,
     },
-    /// Show the current pairing code without restarting
+    /// Show or generate the pairing code without restarting
     #[command(long_about = "\
-Show the current gateway pairing code.
+Show or generate the gateway pairing code.
 
 Displays the pairing code for connecting new clients without \
 restarting the gateway. Requires the gateway to be running.
 
+With --new, generates a fresh pairing code even if the gateway \
+was previously paired (useful for adding additional clients).
+
 Examples:
-  zeroclaw gateway get-paircode       # show current pairing code")]
-    GetPaircode,
+  zeroclaw gateway get-paircode       # show current pairing code
+  zeroclaw gateway get-paircode --new # generate a new pairing code")]
+    GetPaircode {
+        /// Generate a new pairing code (even if already paired)
+        #[arg(long)]
+        new: bool,
+    },
 }
 
 /// Service management subcommands

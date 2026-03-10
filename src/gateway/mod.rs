@@ -657,6 +657,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/paircode", get(handle_admin_paircode))
+        .route("/admin/paircode/new", post(handle_admin_paircode_new))
         // ── Existing routes ──
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
@@ -1578,6 +1579,31 @@ async fn handle_admin_paircode(State(state): State<AppState>) -> impl IntoRespon
     };
 
     (StatusCode::OK, Json(body))
+}
+
+/// POST /admin/paircode/new — generate a new pairing code
+async fn handle_admin_paircode_new(State(state): State<AppState>) -> impl IntoResponse {
+    match state.pairing.generate_new_pairing_code() {
+        Some(code) => {
+            tracing::info!("🔐 New pairing code generated via admin endpoint");
+            let body = serde_json::json!({
+                "success": true,
+                "pairing_required": state.pairing.require_pairing(),
+                "pairing_code": code,
+                "message": "New pairing code generated — use this one-time code to pair"
+            });
+            (StatusCode::OK, Json(body))
+        }
+        None => {
+            let body = serde_json::json!({
+                "success": false,
+                "pairing_required": false,
+                "pairing_code": null,
+                "message": "Pairing is disabled for this gateway"
+            });
+            (StatusCode::BAD_REQUEST, Json(body))
+        }
+    }
 }
 
 #[cfg(test)]

@@ -801,12 +801,13 @@ async fn main() -> Result<()> {
                     log_gateway_start(&host, port);
                     gateway::run_gateway(&host, port, config).await
                 }
-                Some(zeroclaw::GatewayCommands::GetPaircode) => {
+                Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
                     let port = config.gateway.port;
                     let host = &config.gateway.host;
 
                     // Fetch live pairing code from running gateway
-                    match fetch_paircode(host, port).await {
+                    // If --new is specified, generate a fresh pairing code
+                    match fetch_paircode(host, port, new).await {
                         Ok(Some(code)) => {
                             println!("🔐 Gateway pairing is enabled.");
                             println!();
@@ -1324,16 +1325,29 @@ async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
 }
 
 /// Fetch the current pairing code from a running gateway.
-async fn fetch_paircode(host: &str, port: u16) -> Result<Option<String>> {
-    let url = format!("http://{host}:{port}/admin/paircode");
+/// If `new` is true, generates a fresh pairing code via POST request.
+async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<String>> {
     let client = reqwest::Client::new();
 
-    let response = client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to gateway: {e}"))?;
+    let response = if new {
+        // Generate a new pairing code via POST
+        let url = format!("http://{host}:{port}/admin/paircode/new");
+        client
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+    } else {
+        // Get existing pairing code via GET
+        let url = format!("http://{host}:{port}/admin/paircode");
+        client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+    };
+
+    let response = response.map_err(|e| anyhow::anyhow!("Failed to connect to gateway: {e}"))?;
 
     if !response.status().is_success() {
         return Err(anyhow::anyhow!(
