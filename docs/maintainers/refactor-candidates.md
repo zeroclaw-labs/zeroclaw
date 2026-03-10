@@ -133,3 +133,53 @@ Changes deferred from the project-cleanup pass. Each entry includes rationale an
 - Create `docs/i18n/{zh-CN,ja,ru,fr}/` directories with their README + SUMMARY
 - Root `README.*.md` files stay (GitHub convention)
 - Update `docs/i18n/vi/` internal structure to mirror the new English docs layout after the English restructure lands
+
+### TODO: Fuzz testing — upgrade stubs to real coverage
+
+**Current state:** 5 fuzz targets exist in `fuzz/fuzz_targets/`, but only `fuzz_command_validation` tests real ZeroClaw code. The other 4 (`fuzz_config_parse`, `fuzz_tool_params`, `fuzz_webhook_payload`, `fuzz_provider_response`) just fuzz `serde_json::from_str::<Value>` or `toml::from_str::<Value>` — they test third-party crate internals, not ZeroClaw logic.
+
+**Wire existing stubs to real code paths:**
+
+- `fuzz_config_parse`: deserialize into `Config`, not `toml::Value`
+- `fuzz_tool_params`: pass through actual `Tool::execute` input validation
+- `fuzz_webhook_payload`: run through webhook signature verification + body parsing
+- `fuzz_provider_response`: parse into actual provider response types (Anthropic, OpenAI, etc.)
+
+**Add missing targets for security surfaces:**
+
+- Shell command parser (quote-aware parsing, beyond just `validate_command_execution`)
+- Credential scrubbing (`scrub_credentials` — already had a UTF-8 boundary panic in #3024)
+- Pairing code generation/validation
+- Domain matcher
+- Prompt guard scoring
+- Leak detector regex
+
+**Infrastructure improvements:**
+
+- Add seed corpora (`fuzz/corpus/<target>/`) with known-good and edge-case inputs; commit to repo
+- Consider `Arbitrary` derive for structured fuzzing instead of raw `&[u8]`
+- Set up scheduled CI fuzzing (nightly/weekly) — OSS-Fuzz is free for open-source projects
+- Use `cargo fuzz coverage <target>` to generate lcov reports from corpus runs and track which code paths the fuzzer actually reaches
+- Track crash artifacts (`fuzz/artifacts/<target>/`) as issues
+
+### TODO: Automated release announcements — Twitter/X integration
+
+**Current state:** Releases are published on GitHub only. No automated cross-posting to social channels.
+
+**Plan:**
+
+- Add `.github/workflows/release-tweet.yml` triggered on `release: [published]`
+- Use `nearform-actions/github-action-notify-twitter` (OAuth 1.0a, v1.1 API) or direct X API v2 `curl` with OAuth signing
+- Tweet template: release tag, one-line summary, link to GitHub release
+- Skip prereleases (`if: "!github.event.release.prerelease"`)
+
+**Required secrets (Settings > Secrets > Actions):**
+
+- `TWITTER_API_KEY`, `TWITTER_API_KEY_SECRET`
+- `TWITTER_ACCESS_TOKEN`, `TWITTER_ACCESS_TOKEN_SECRET`
+
+**Considerations:**
+
+- Review against `docs/contributing/actions-source-policy.md` — pin third-party action to commit SHA or vendor
+- X free tier: 1,500 tweets/month (sufficient for releases)
+- Truncate release body to 280 chars if including highlights in tweet
