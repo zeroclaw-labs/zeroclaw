@@ -2,20 +2,21 @@ use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use matrix_sdk::{
+    attachment::{AttachmentConfig, AttachmentInfo, BaseAudioInfo},
     authentication::matrix::MatrixSession,
     config::SyncSettings,
     encryption::verification::{SasState, VerificationRequestState},
     media::{MediaFormat, MediaRequestParameters},
     ruma::{
         api::client::uiaa,
-        events::room::{
-            message::{
-                AudioMessageEventContent, FileMessageEventContent, ImageMessageEventContent,
-                MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+        events::{
+            reaction::OriginalSyncReactionEvent,
+            room::{
+                message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+                MediaSource,
             },
-            MediaSource,
         },
-        OwnedMxcUri, OwnedRoomId, OwnedUserId,
+        OwnedRoomId, OwnedUserId,
     },
     Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
 };
@@ -1034,7 +1035,8 @@ impl Channel for MatrixChannel {
             anyhow::bail!("Matrix room '{}' is not in joined state", target_room_id);
         }
 
-        // Send each attachment as a separate media message.
+        // Send each attachment via room.send_attachment() which auto-encrypts
+        // media for E2EE rooms (unlike client.media().upload() which uploads plain).
         for attachment in &parsed_attachments {
             let target = attachment.target.trim();
             let path = Path::new(target);
@@ -1062,38 +1064,37 @@ impl Channel for MatrixChannel {
                 .first()
                 .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM);
 
-            let upload_result = client.media().upload(&mime, bytes, None).await;
-
-            let mxc_uri: OwnedMxcUri = match upload_result {
-                Ok(response) => response.content_uri,
-                Err(error) => {
-                    tracing::warn!(
-                        "Matrix media upload failed for '{}': {error}",
-                        path.display()
-                    );
-                    continue;
-                }
-            };
-
             let filename = path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("attachment.bin")
                 .to_string();
 
-            let msg_type = match attachment.kind {
-                MatrixOutgoingAttachmentKind::Image => {
-                    MessageType::Image(ImageMessageEventContent::plain(filename, mxc_uri))
+            let config = match attachment.kind {
+                MatrixOutgoingAttachmentKind::Voice => {
+                    AttachmentConfig::new().info(AttachmentInfo::Voice(BaseAudioInfo {
+                        duration: None,
+                        size: None,
+                        waveform: None,
+                    }))
                 }
-                MatrixOutgoingAttachmentKind::Audio | MatrixOutgoingAttachmentKind::Voice => {
-                    MessageType::Audio(AudioMessageEventContent::plain(filename, mxc_uri))
+                MatrixOutgoingAttachmentKind::Audio => {
+                    AttachmentConfig::new().info(AttachmentInfo::Audio(BaseAudioInfo {
+                        duration: None,
+                        size: None,
+                        waveform: None,
+                    }))
                 }
-                MatrixOutgoingAttachmentKind::File => {
-                    MessageType::File(FileMessageEventContent::plain(filename, mxc_uri))
-                }
+                _ => AttachmentConfig::new(),
             };
 
-            room.send(RoomMessageEventContent::new(msg_type)).await?;
+            match room.send_attachment(&filename, &mime, bytes, config).await {
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!("Matrix media send failed for '{}': {error}", path.display());
+                    continue;
+                }
+            }
         }
 
         // Send remaining text (if any) after attachments.
@@ -1353,6 +1354,62 @@ impl Channel for MatrixChannel {
                         return;
                     }
                 }
+
+                let msg = ChannelMessage {
+                    id: event_id,
+                    sender: sender.clone(),
+                    reply_target: sender,
+                    content: body,
+                    channel: "matrix".to_string(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    thread_ts: None,
+                };
+
+                let _ = tx.send(msg).await;
+            }
+        });
+
+        // Reaction event handler — delivers emoji reactions to the agent.
+        let tx_reaction = tx.clone();
+        let target_room_for_reaction = target_room.clone();
+        let my_user_id_for_reaction = my_user_id.clone();
+        let allowed_users_for_reaction = self.allowed_users.clone();
+        let dedupe_for_reaction = Arc::clone(&recent_event_cache);
+
+        client.add_event_handler(move |event: OriginalSyncReactionEvent, room: Room| {
+            let tx = tx_reaction.clone();
+            let target_room = target_room_for_reaction.clone();
+            let my_user_id = my_user_id_for_reaction.clone();
+            let allowed_users = allowed_users_for_reaction.clone();
+            let dedupe = Arc::clone(&dedupe_for_reaction);
+
+            async move {
+                if room.room_id().as_str() != target_room.as_str() {
+                    return;
+                }
+                if event.sender == my_user_id {
+                    return;
+                }
+                let sender = event.sender.to_string();
+                if !MatrixChannel::is_sender_allowed(&allowed_users, &sender) {
+                    return;
+                }
+
+                let event_id = event.event_id.to_string();
+                {
+                    let mut guard = dedupe.lock().await;
+                    let (recent_order, recent_lookup) = &mut *guard;
+                    if MatrixChannel::cache_event_id(&event_id, recent_order, recent_lookup) {
+                        return;
+                    }
+                }
+
+                let emoji = &event.content.relates_to.key;
+                let target_event = event.content.relates_to.event_id.to_string();
+                let body = format!("[Reaction: {emoji}] on message {target_event}");
 
                 let msg = ChannelMessage {
                     id: event_id,
