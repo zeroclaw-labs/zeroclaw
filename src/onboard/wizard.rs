@@ -6772,6 +6772,10 @@ mod tests {
             default_model_for_provider("astrai"),
             "anthropic/claude-sonnet-4.6"
         );
+        assert_eq!(
+            default_model_for_provider("avian"),
+            "deepseek/deepseek-v3.2"
+        );
     }
 
     #[test]
@@ -6910,6 +6914,19 @@ mod tests {
     }
 
     #[test]
+    fn curated_models_for_avian_include_expected_catalog() {
+        let ids: Vec<String> = curated_models_for_provider("avian")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"deepseek/deepseek-v3.2".to_string()));
+        assert!(ids.contains(&"moonshotai/kimi-k2.5".to_string()));
+        assert!(ids.contains(&"z-ai/glm-5".to_string()));
+        assert!(ids.contains(&"minimax/minimax-m2.5".to_string()));
+    }
+
+    #[test]
     fn supports_live_model_fetch_for_supported_and_unsupported_providers() {
         assert!(supports_live_model_fetch("openai"));
         assert!(supports_live_model_fetch("anthropic"));
@@ -6926,6 +6943,7 @@ mod tests {
         assert!(supports_live_model_fetch("sglang"));
         assert!(supports_live_model_fetch("vllm"));
         assert!(supports_live_model_fetch("astrai"));
+        assert!(supports_live_model_fetch("avian"));
         assert!(supports_live_model_fetch("venice"));
         assert!(supports_live_model_fetch("glm-cn"));
         assert!(supports_live_model_fetch("qwen-intl"));
@@ -7046,6 +7064,10 @@ mod tests {
         assert_eq!(
             models_endpoint_for_provider("vllm"),
             Some("http://localhost:8000/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("avian"),
+            Some("https://api.avian.io/v1/models")
         );
         assert_eq!(models_endpoint_for_provider("perplexity"), None);
         assert_eq!(models_endpoint_for_provider("unknown-provider"), None);
@@ -7333,6 +7355,7 @@ mod tests {
         assert_eq!(provider_env_var("build.nvidia.com"), "NVIDIA_API_KEY"); // alias
         assert_eq!(provider_env_var("astrai"), "ASTRAI_API_KEY");
         assert_eq!(provider_env_var("opencode-go"), "OPENCODE_GO_API_KEY");
+        assert_eq!(provider_env_var("avian"), "AVIAN_API_KEY");
     }
 
     #[test]
