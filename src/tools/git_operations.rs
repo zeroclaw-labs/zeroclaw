@@ -359,14 +359,16 @@ impl GitOperationsTool {
         let sanitized = self.sanitize_git_args(branch)?;
 
         if sanitized.is_empty() || sanitized.len() > 1 {
-            anyhow::bail!("Invalid branch specification");
+            anyhow::bail!(
+                "Invalid branch specification: expected a single branch name without spaces"
+            );
         }
 
         let branch_name = &sanitized[0];
 
         // Block dangerous branch names
         if branch_name.contains('@') || branch_name.contains('^') || branch_name.contains('~') {
-            anyhow::bail!("Branch name contains invalid characters");
+            anyhow::bail!("Branch name contains invalid characters (@, ^, ~ are not allowed)");
         }
 
         let output = self.run_git_command(&["checkout", branch_name]).await;
