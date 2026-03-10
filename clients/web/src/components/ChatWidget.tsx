@@ -3,12 +3,12 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
   getClient,
-  MoAClient,
+  ZeroClawClient,
   renderMarkdown,
   type ChatMessage,
 } from "@/lib/api";
 
-const STORAGE_KEY_MODEL = "moa_selected_model";
+const STORAGE_KEY_MODEL = "zeroclaw_selected_model";
 const DEFAULT_MODEL = "google/gemini-3.1-pro-preview";
 
 const LLM_MODELS = [
@@ -47,7 +47,7 @@ export default function ChatWidget({
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const clientRef = useRef<MoAClient | null>(null);
+  const clientRef = useRef<ZeroClawClient | null>(null);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -55,7 +55,7 @@ export default function ChatWidget({
     clientRef.current = client;
     setServerUrl(client.getServerUrl());
     setIsConnected(client.isConnected());
-    setMessages(MoAClient.loadMessages());
+    setMessages(ZeroClawClient.loadMessages());
     // Restore saved model selection
     const savedModel = localStorage.getItem(STORAGE_KEY_MODEL);
     if (savedModel && LLM_MODELS.some((m) => m.id === savedModel)) {
@@ -117,7 +117,7 @@ export default function ChatWidget({
   }, []);
 
   const handleClearHistory = useCallback(() => {
-    MoAClient.clearMessages();
+    ZeroClawClient.clearMessages();
     setMessages([]);
   }, []);
 
@@ -133,24 +133,24 @@ export default function ChatWidget({
     const trimmed = input.trim();
     if (!trimmed || isLoading || !clientRef.current) return;
 
-    const userMsg = MoAClient.createMessage("user", trimmed);
+    const userMsg = ZeroClawClient.createMessage("user", trimmed);
     const updatedMessages = [...messages, userMsg];
     setMessages(updatedMessages);
-    MoAClient.saveMessages(updatedMessages);
+    ZeroClawClient.saveMessages(updatedMessages);
     setInput("");
     setIsLoading(true);
     setError(null);
 
     try {
       const response = await clientRef.current.chat(trimmed, selectedModel);
-      const assistantMsg = MoAClient.createMessage(
+      const assistantMsg = ZeroClawClient.createMessage(
         "assistant",
         response.response,
         response.model,
       );
       const finalMessages = [...updatedMessages, assistantMsg];
       setMessages(finalMessages);
-      MoAClient.saveMessages(finalMessages);
+      ZeroClawClient.saveMessages(finalMessages);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : "Failed to send message";
       setError(errMsg);
@@ -418,10 +418,10 @@ export default function ChatWidget({
       <div className="flex items-center justify-between border-b border-dark-800/50 px-4 py-3">
         <div className="flex items-center gap-3">
           <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary-500/10 border border-primary-500/20">
-            <span className="text-sm font-bold text-primary-400">M</span>
+            <span className="text-sm font-bold text-primary-400">Z</span>
           </div>
           <div>
-            <h2 className="text-sm font-semibold text-dark-100">MoA Chat</h2>
+            <h2 className="text-sm font-semibold text-dark-100">ZeroClaw Chat</h2>
             <div className="flex items-center gap-1.5">
               <div
                 className={`h-1.5 w-1.5 rounded-full ${

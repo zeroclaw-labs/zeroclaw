@@ -52,7 +52,7 @@ const keyAdvantages = [
     title: "\uCE74\uCE74\uC624\uD1A1 \uC5F0\uB3D9",
     titleEn: "KakaoTalk Integration",
     description:
-      "\uD734\uB300\uD3F0\uC5D0 MoA \uC571 \uC124\uCE58 \uC5C6\uC774\uB3C4 \uCE74\uD1A1 \uBA54\uC2DC\uC9C0\uB9CC\uC73C\uB85C AI\uC640 \uBB34\uC81C\uD55C \uB300\uD654 \uBC0F \uC9C0\uC2DC \uAC00\uB2A5. Telegram, Discord, Slack, WhatsApp, Signal \uB4F1 18\uAC1C \uC774\uC0C1 \uCC44\uB110 \uC9C0\uC6D0.",
+      "\uD734\uB300\uD3F0\uC5D0 \uC571 \uC124\uCE58 \uC5C6\uC774\uB3C4 \uCE74\uD1A1 \uBA54\uC2DC\uC9C0\uB9CC\uC73C\uB85C AI\uC640 \uBB34\uC81C\uD55C \uB300\uD654 \uBC0F \uC9C0\uC2DC \uAC00\uB2A5. Telegram, Discord, Slack, WhatsApp, Signal \uB4F1 18\uAC1C \uC774\uC0C1 \uCC44\uB110 \uC9C0\uC6D0.",
     descriptionEn:
       "Chat with AI via KakaoTalk without installing anything. Also supports Telegram, Discord, Slack, WhatsApp, Signal, and 18+ channels.",
   },
@@ -246,7 +246,7 @@ export default function HomePage() {
             <h1 className="text-3xl font-extrabold tracking-tight sm:text-5xl lg:text-6xl animate-fade-in-up">
               <span className="text-dark-200">{"\uD074\uB85C\uB4DC\uBD07(OpenClaw)\uC758 \uD55C\uACC4\uB97C \uB118\uC5B4,"}</span>
               <br />
-              <span className="text-gradient text-4xl sm:text-6xl lg:text-7xl">MoA</span>
+              <span className="text-gradient text-4xl sm:text-6xl lg:text-7xl">ZeroClaw</span>
               <span className="text-dark-50 text-4xl sm:text-6xl lg:text-7xl">{"\uAC00 \uC654\uC2B5\uB2C8\uB2E4"}</span>
             </h1>
 
@@ -255,7 +255,7 @@ export default function HomePage() {
               {"\uC804 \uC138\uACC4 15\uB9CC\uBA85\uC774 \uC5F4\uAD11\uD55C \uD074\uB85C\uB4DC\uBD07! \uC124\uCE58\uAC00 \uC5B4\uB835\uACE0 \uBCF4\uC548\uC774 \uCDE8\uC57D\uD574\uC11C \uD3EC\uAE30\uD558\uC168\uB098\uC694?"}
               <br />
               <span className="text-primary-400 font-semibold">
-                {"MoA\uB294 \uBCF4\uC548, \uC124\uCE58, \uC131\uB2A5, \uD65C\uC6A9\uC131 \uBAA8\uB4E0 \uBA74\uC5D0\uC11C \uC644\uC804\uD788 \uB2E4\uB985\uB2C8\uB2E4."}
+                {"ZeroClaw\uB294 \uBCF4\uC548, \uC124\uCE58, \uC131\uB2A5, \uD65C\uC6A9\uC131 \uBAA8\uB4E0 \uBA74\uC5D0\uC11C \uC644\uC804\uD788 \uB2E4\uB985\uB2C8\uB2E4."}
               </span>
             </p>
 
@@ -301,11 +301,11 @@ export default function HomePage() {
         <div className="relative mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
           <div className="text-center mb-16">
             <h2 className="text-3xl font-bold text-dark-50 sm:text-4xl">
-              {"MoA\uB9CC\uC758 6\uB300 \uD575\uC2EC \uAC15\uC810"}
-              <span className="text-dark-500 ml-3 text-xl font-normal">Why MoA?</span>
+              {"ZeroClaw\uB9CC\uC758 6\uB300 \uD575\uC2EC \uAC15\uC810"}
+              <span className="text-dark-500 ml-3 text-xl font-normal">Why ZeroClaw?</span>
             </h2>
             <p className="mt-4 text-dark-400 max-w-2xl mx-auto">
-              {"\uD074\uB85C\uB4DC\uBD07\uC744 \uD3EC\uAE30\uD588\uB358 \uC774\uC720\uB4E4, MoA\uAC00 \uBAA8\uB450 \uD574\uACB0\uD588\uC2B5\uB2C8\uB2E4."}
+              {"\uD074\uB85C\uB4DC\uBD07\uC744 \uD3EC\uAE30\uD588\uB358 \uC774\uC720\uB4E4, ZeroClaw\uAC00 \uBAA8\uB450 \uD574\uACB0\uD588\uC2B5\uB2C8\uB2E4."}
             </p>
           </div>
 
@@ -329,12 +329,12 @@ export default function HomePage() {
         </div>
       </section>
 
-      {/* Comparison Table - MoA vs OpenClaw */}
+      {/* Comparison Table - ZeroClaw vs OpenClaw */}
       <section className="py-20 sm:py-28" id="comparison">
         <div className="mx-auto max-w-4xl px-4 sm:px-6 lg:px-8">
           <div className="text-center mb-12">
             <h2 className="text-3xl font-bold text-dark-50 sm:text-4xl">
-              {"MoA vs \uD074\uB85C\uB4DC\uBD07"}
+              {"ZeroClaw vs \uD074\uB85C\uB4DC\uBD07"}
               <span className="text-dark-500 ml-3 text-xl font-normal">Comparison</span>
             </h2>
             <p className="mt-4 text-dark-400">
@@ -352,7 +352,7 @@ export default function HomePage() {
                 <span className="text-xs font-semibold text-dark-500">{"\uD074\uB85C\uB4DC\uBD07"} (OpenClaw)</span>
               </div>
               <div className="px-4 py-3 sm:px-6 text-center">
-                <span className="text-xs font-bold text-primary-400">MoA</span>
+                <span className="text-xs font-bold text-primary-400">ZeroClaw</span>
               </div>
             </div>
 
@@ -421,7 +421,7 @@ export default function HomePage() {
             <div>
               <h2 className="text-3xl font-bold text-dark-50 sm:text-4xl">ZeroClaw Runtime</h2>
               <p className="mt-4 text-dark-400 leading-relaxed">
-                {"\uACE0\uC131\uB2A5 Rust \uB7F0\uD0C0\uC784 \uC704\uC5D0 \uAD6C\uCD95\uB41C MoA\uB294 \uBE60\uB978 \uC18D\uB3C4, \uB0AE\uC740 \uBA54\uBAA8\uB9AC, \uADF8\uB9AC\uACE0 \uAD70\uC0AC \uAE09 \uBCF4\uC548\uC744 \uB3D9\uC2DC\uC5D0 \uC81C\uACF5\uD569\uB2C8\uB2E4."}
+                {"\uACE0\uC131\uB2A5 Rust \uB7F0\uD0C0\uC784 \uC704\uC5D0 \uAD6C\uCD95\uB41C ZeroClaw\uB294 \uBE60\uB978 \uC18D\uB3C4, \uB0AE\uC740 \uBA54\uBAA8\uB9AC, \uADF8\uB9AC\uACE0 \uAD70\uC0AC \uAE09 \uBCF4\uC548\uC744 \uB3D9\uC2DC\uC5D0 \uC81C\uACF5\uD569\uB2C8\uB2E4."}
               </p>
               <p className="mt-2 text-sm text-dark-500">
                 Built on Rust: speed, minimal memory, and military-grade security in one binary.
@@ -636,7 +636,7 @@ export default function HomePage() {
                 {"\uC9C0\uAE08 \uBC14\uB85C \uC2DC\uC791\uD558\uC138\uC694"}
               </h2>
               <p className="mt-4 text-dark-300 max-w-lg mx-auto text-lg">
-                {"\uBCC4\uB3C4\uC758 \uC124\uCE58 \uC5C6\uC774 \uC6F9 \uBE0C\uB77C\uC6B0\uC800\uC5D0\uC11C \uBC14\uB85C MoA\uB97C \uCCB4\uD5D8\uD574\uBCF4\uC138\uC694."}
+                {"\uBCC4\uB3C4\uC758 \uC124\uCE58 \uC5C6\uC774 \uC6F9 \uBE0C\uB77C\uC6B0\uC800\uC5D0\uC11C \uBC14\uB85C ZeroClaw\uB97C \uCCB4\uD5D8\uD574\uBCF4\uC138\uC694."}
               </p>
               <p className="mt-2 text-dark-400 max-w-md mx-auto text-sm">
                 {"\uB610\uB294 \uCE74\uCE74\uC624\uD1A1\uC73C\uB85C \uBC14\uB85C \uB300\uD654\uB97C \uC2DC\uC791\uD558\uC138\uC694. \uC571 \uC124\uCE58\uAC00 \uD544\uC694 \uC5C6\uC2B5\uB2C8\uB2E4."}

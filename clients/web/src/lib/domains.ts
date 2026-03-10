@@ -1,4 +1,4 @@
-// Domain configuration for MoA Agent Selection System
+// Domain configuration for ZeroClaw Agent Selection System
 // Each domain has sub-agents, recommended LLMs, and tools (APIs)
 
 export interface LLMModel {

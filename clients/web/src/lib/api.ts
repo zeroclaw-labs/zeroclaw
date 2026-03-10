@@ -28,7 +28,7 @@ function generateId(): string {
   return Date.now().toString(36) + Math.random().toString(36).substring(2, 8);
 }
 
-export class MoAClient {
+export class ZeroClawClient {
   private serverUrl: string;
   private token: string | null;
 
@@ -329,14 +329,14 @@ export class MoAClient {
 }
 
 // Singleton for client-side use
-let clientInstance: MoAClient | null = null;
+let clientInstance: ZeroClawClient | null = null;
 
-export function getClient(): MoAClient {
+export function getClient(): ZeroClawClient {
   if (typeof window === "undefined") {
-    return new MoAClient();
+    return new ZeroClawClient();
   }
   if (!clientInstance) {
-    clientInstance = new MoAClient();
+    clientInstance = new ZeroClawClient();
   }
   return clientInstance;
 }

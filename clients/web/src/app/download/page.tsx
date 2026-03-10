@@ -72,13 +72,13 @@ const downloads: DownloadItem[] = [
       "Download the .msi installer",
       "Double-click the downloaded file",
       "Follow the installation wizard",
-      "Launch MoA from Start Menu",
+      "Launch ZeroClaw from Start Menu",
     ],
     instructionsKo: [
       ".msi \uC124\uCE58 \uD30C\uC77C \uB2E4\uC6B4\uB85C\uB4DC",
       "\uB2E4\uC6B4\uB85C\uB4DC\uB41C \uD30C\uC77C \uB354\uBE14 \uD074\uB9AD",
       "\uC124\uCE58 \uB9C8\uBC95\uC0AC \uC548\uB0B4 \uB530\uB77C \uC124\uCE58",
-      "\uC2DC\uC791 \uBA54\uB274\uC5D0\uC11C MoA \uC2E4\uD589",
+      "\uC2DC\uC791 \uBA54\uB274\uC5D0\uC11C ZeroClaw \uC2E4\uD589",
     ],
   },
   {
@@ -119,15 +119,15 @@ const downloads: DownloadItem[] = [
     instructions: [
       "Download the .dmg file",
       "Open the .dmg file",
-      "Drag MoA to Applications folder",
-      "Open MoA from Applications or Launchpad",
+      "Drag ZeroClaw to Applications folder",
+      "Open ZeroClaw from Applications or Launchpad",
       "If blocked: System Settings > Privacy & Security > Allow",
     ],
     instructionsKo: [
       ".dmg \uD30C\uC77C \uB2E4\uC6B4\uB85C\uB4DC",
       ".dmg \uD30C\uC77C \uC5F4\uAE30",
-      "MoA\uB97C \uC751\uC6A9 \uD504\uB85C\uADF8\uB7A8 \uD3F4\uB354\uB85C \uB4DC\uB798\uADF8",
-      "\uC751\uC6A9 \uD504\uB85C\uADF8\uB7A8 \uB610\uB294 Launchpad\uC5D0\uC11C MoA \uC2E4\uD589",
+      "ZeroClaw\uB97C \uC751\uC6A9 \uD504\uB85C\uADF8\uB7A8 \uD3F4\uB354\uB85C \uB4DC\uB798\uADF8",
+      "\uC751\uC6A9 \uD504\uB85C\uADF8\uB7A8 \uB610\uB294 Launchpad\uC5D0\uC11C ZeroClaw \uC2E4\uD589",
       "\uCC28\uB2E8 \uC2DC: \uC2DC\uC2A4\uD15C \uC124\uC815 > \uAC1C\uC778\uC815\uBCF4 \uBCF4\uD638 > \uD5C8\uC6A9",
     ],
   },
@@ -214,13 +214,13 @@ const downloads: DownloadItem[] = [
       "Download the .apk file",
       "Enable 'Install from Unknown Sources' in Settings",
       "Open the .apk file to install",
-      "Launch MoA from app drawer",
+      "Launch ZeroClaw from app drawer",
     ],
     instructionsKo: [
       ".apk \uD30C\uC77C \uB2E4\uC6B4\uB85C\uB4DC",
       "\uC124\uC815\uC5D0\uC11C '\uCD9C\uCC98\uB97C \uC54C \uC218 \uC5C6\uB294 \uC571 \uC124\uCE58' \uD5C8\uC6A9",
       ".apk \uD30C\uC77C\uC744 \uC5F4\uC5B4 \uC124\uCE58",
-      "\uC571 \uC11C\uB78D\uC5D0\uC11C MoA \uC2E4\uD589",
+      "\uC571 \uC11C\uB78D\uC5D0\uC11C ZeroClaw \uC2E4\uD589",
     ],
   },
   {
@@ -254,15 +254,15 @@ const downloads: DownloadItem[] = [
     ],
     instructions: [
       "Open App Store on your device",
-      "Search for 'MoA - Master of AI'",
+      "Search for 'ZeroClaw'",
       "Tap 'Get' to download and install",
-      "Open MoA from home screen",
+      "Open ZeroClaw from home screen",
     ],
     instructionsKo: [
       "\uAE30\uAE30\uC5D0\uC11C App Store \uC5F4\uAE30",
-      "'MoA - Master of AI' \uAC80\uC0C9",
+      "'ZeroClaw' \uAC80\uC0C9",
       "'\uBC1B\uAE30' \uD0ED\uD558\uC5EC \uB2E4\uC6B4\uB85C\uB4DC \uBC0F \uC124\uCE58",
-      "\uD648 \uD654\uBA74\uC5D0\uC11C MoA \uC2E4\uD589",
+      "\uD648 \uD654\uBA74\uC5D0\uC11C ZeroClaw \uC2E4\uD589",
     ],
   },
 ];
@@ -296,10 +296,10 @@ export default function DownloadPage() {
               </span>
             </h1>
             <p className="mt-4 text-dark-400 max-w-xl mx-auto">
-              {"\uBAA8\uB4E0 \uD50C\uB7AB\uD3FC\uC5D0\uC11C MoA\uB97C \uC0AC\uC6A9\uD558\uC138\uC694. \uC6F9 \uBE0C\uB77C\uC6B0\uC800\uC5D0\uC11C\uB3C4 \uBC14\uB85C \uC0AC\uC6A9 \uAC00\uB2A5\uD569\uB2C8\uB2E4."}
+              {"\uBAA8\uB4E0 \uD50C\uB7AB\uD3FC\uC5D0\uC11C ZeroClaw\uB97C \uC0AC\uC6A9\uD558\uC138\uC694. \uC6F9 \uBE0C\uB77C\uC6B0\uC800\uC5D0\uC11C\uB3C4 \uBC14\uB85C \uC0AC\uC6A9 \uAC00\uB2A5\uD569\uB2C8\uB2E4."}
             </p>
             <p className="mt-1 text-sm text-dark-500">
-              Use MoA on every platform. Also available directly in your browser.
+              Use ZeroClaw on every platform. Also available directly in your browser.
             </p>
 
             {currentPlatform !== "unknown" && (
@@ -491,7 +491,7 @@ export default function DownloadPage() {
                 </span>
               </h3>
               <p className="mt-2 text-sm text-dark-400">
-                {"\uC6F9 \uBE0C\uB77C\uC6B0\uC800\uC5D0\uC11C \uBC14\uB85C MoA\uB97C \uC0AC\uC6A9\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4."}
+                {"\uC6F9 \uBE0C\uB77C\uC6B0\uC800\uC5D0\uC11C \uBC14\uB85C ZeroClaw\uB97C \uC0AC\uC6A9\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4."}
               </p>
               <a href="/chat" className="btn-accent mt-4 inline-flex px-6 py-2.5">
                 {"\uC6F9\uC5D0\uC11C \uCC44\uD305 \uC2DC\uC791"} Start Web Chat
