@@ -494,6 +494,12 @@ impl GeminiProvider {
             .or_else(|| Self::load_non_empty_env("GEMINI_API_KEY").map(GeminiAuth::EnvGeminiKey))
             .or_else(|| Self::load_non_empty_env("GOOGLE_API_KEY").map(GeminiAuth::EnvGoogleKey));
 
+        tracing::debug!(
+            has_api_key = resolved_auth.is_some(),
+            profile_override = ?profile_override,
+            "Gemini auth: API key resolution"
+        );
+
         // If no API key, we'll use managed OAuth (checked at runtime)
         // or fall back to CLI OAuth
         let (auth, use_managed) = if resolved_auth.is_some() {
@@ -521,6 +527,12 @@ impl GeminiProvider {
                 .is_some()
             });
 
+            tracing::debug!(
+                has_managed,
+                profile_override = ?profile_override,
+                "Gemini auth: managed OAuth check"
+            );
+
             if has_managed {
                 (Some(GeminiAuth::ManagedOAuth), true)
             } else {
@@ -530,6 +542,21 @@ impl GeminiProvider {
                 (cli_auth, false)
             }
         };
+
+        let auth_type_label = match &auth {
+            Some(GeminiAuth::ExplicitKey(_)) => "explicit_key",
+            Some(GeminiAuth::EnvGeminiKey(_)) => "env_gemini_key",
+            Some(GeminiAuth::EnvGoogleKey(_)) => "env_google_key",
+            Some(GeminiAuth::OAuthToken(_)) => "cli_oauth",
+            Some(GeminiAuth::ManagedOAuth) => "managed_oauth",
+            None => "none",
+        };
+        tracing::info!(
+            auth_type = auth_type_label,
+            profile_override = ?profile_override,
+            has_auth_service = use_managed,
+            "Gemini provider initialized"
+        );
 
         Self {
             auth,
@@ -1067,6 +1094,18 @@ impl GeminiProvider {
         };
 
         let url = Self::build_generate_content_url(model, auth);
+
+        tracing::debug!(
+            auth_type = match auth {
+                GeminiAuth::ManagedOAuth => "managed_oauth",
+                GeminiAuth::OAuthToken(_) => "cli_oauth",
+                _ if auth.is_api_key() => "api_key",
+                _ => "unknown",
+            },
+            url_prefix = if url.contains("cloudcode-pa") { "cloudcode-pa" } else { "public" },
+            model,
+            "Gemini request: auth type and endpoint"
+        );
 
         let mut response = self
             .build_generate_content_request(

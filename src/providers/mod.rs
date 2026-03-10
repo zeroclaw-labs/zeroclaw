@@ -1002,6 +1002,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "vllm" => vec!["VLLM_API_KEY"],
         "osaurus" => vec!["OSAURUS_API_KEY"],
         "telnyx" => vec!["TELNYX_API_KEY"],
+        "gemini" | "google" | "google-gemini" => vec!["GEMINI_API_KEY", "GOOGLE_API_KEY"],
         _ => vec![],
     };
 
