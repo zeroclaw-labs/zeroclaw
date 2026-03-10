@@ -210,20 +210,20 @@ To keep docs useful under high PR volume, we use these rules:
 - **Side-effect visibility**: document blast radius, failure modes, and rollback before merge.
 - **Automation assists, humans decide**: bots triage and label, but merge accountability stays human.
 - **Index-first discoverability**: `docs/README.md` is the first entry point for operational documentation.
-- **Template-first authoring**: start new operational docs from `docs/doc-template.md`.
+- **Template-first authoring**: start new operational docs from `docs/contributing/doc-template.md`.
 
 ### Documentation System Map
 
 | Doc | Primary purpose | When to update |
 |---|---|---|
 | `docs/README.md` | canonical docs index and taxonomy | add/remove docs or change documentation ownership/navigation |
-| `docs/doc-template.md` | standard skeleton for new operational documentation | when required sections or documentation quality bar changes |
+| `docs/contributing/doc-template.md` | standard skeleton for new operational documentation | when required sections or documentation quality bar changes |
 | `CONTRIBUTING.md` | contributor contract and readiness baseline | contributor expectations or policy changes |
-| `docs/pr-workflow.md` | governance logic and merge contract | workflow/risk/merge gate changes |
-| `docs/reviewer-playbook.md` | reviewer operating checklist | review depth or triage behavior changes |
-| `docs/ci-map.md` | CI ownership and triage entry points | workflow trigger/job ownership changes |
-| `docs/network-deployment.md` | runtime deployment and network operating guide | gateway/channel/tunnel/network runtime behavior changes |
-| `docs/proxy-agent-playbook.md` | agent-operable proxy runbook and rollback recipes | proxy scope/selector/tooling behavior changes |
+| `docs/contributing/pr-workflow.md` | governance logic and merge contract | workflow/risk/merge gate changes |
+| `docs/contributing/reviewer-playbook.md` | reviewer operating checklist | review depth or triage behavior changes |
+| `docs/contributing/ci-map.md` | CI ownership and triage entry points | workflow trigger/job ownership changes |
+| `docs/ops/network-deployment.md` | runtime deployment and network operating guide | gateway/channel/tunnel/network runtime behavior changes |
+| `docs/ops/proxy-agent-playbook.md` | agent-operable proxy runbook and rollback recipes | proxy scope/selector/tooling behavior changes |
 
 ## PR Definition of Ready (DoR)
 
@@ -237,7 +237,7 @@ Before requesting review, ensure all of the following are true:
 - Tests/fixtures/examples use neutral project-scoped wording (no identity-specific or first-person phrasing).
 - If identity-like wording is required, use ZeroClaw-centric labels only (for example: `ZeroClawAgent`, `ZeroClawOperator`, `zeroclaw_user`).
 - If docs were changed, update `docs/README.md` navigation and reciprocal links with related docs.
-- If a new operational doc was added, start from `docs/doc-template.md` and keep risk/rollback/troubleshooting sections where applicable.
+- If a new operational doc was added, start from `docs/contributing/doc-template.md` and keep risk/rollback/troubleshooting sections where applicable.
 - Linked issue (or rationale for no issue) is included.
 
 ## PR Definition of Done (DoD)
@@ -265,9 +265,9 @@ When PR traffic is high (especially with AI-assisted contributions), these rules
 - **Identity normalization**: when identity traits are unavoidable, use ZeroClaw/project-native roles instead of personal or real-world identities.
 - **Supersede hygiene**: if your PR replaces an older open PR, add `Supersedes #...` and request maintainers close the outdated one.
 
-Full maintainer workflow: [`docs/pr-workflow.md`](docs/pr-workflow.md).
-CI workflow ownership and triage map: [`docs/ci-map.md`](docs/ci-map.md).
-Reviewer operating checklist: [`docs/reviewer-playbook.md`](docs/reviewer-playbook.md).
+Full maintainer workflow: [`docs/contributing/pr-workflow.md`](docs/contributing/pr-workflow.md).
+CI workflow ownership and triage map: [`docs/contributing/ci-map.md`](docs/contributing/ci-map.md).
+Reviewer operating checklist: [`docs/contributing/reviewer-playbook.md`](docs/contributing/reviewer-playbook.md).
 
 ## Agent Collaboration Guidance
 
