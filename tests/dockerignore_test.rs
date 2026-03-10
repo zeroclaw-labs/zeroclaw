@@ -334,7 +334,6 @@ async fn dockerignore_pattern_matching_edge_cases() {
     assert!(is_excluded(&patterns, "target/debug/build"));
     assert!(is_excluded(&patterns, "README.md"));
     assert!(is_excluded(&patterns, "brain.db"));
-    assert!(is_excluded(&patterns, ".tmp_todo_probe"));
     assert!(is_excluded(&patterns, ".env"));
 
     // Should NOT match

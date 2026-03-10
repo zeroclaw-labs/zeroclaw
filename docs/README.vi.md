@@ -13,7 +13,7 @@ Hub bản địa hóa: [简体中文](README.zh-CN.md) · [日本語](README.ja.
 | Tôi muốn…                                         | Xem tài liệu                                                                  |
 | -------------------------------------------------- | ------------------------------------------------------------------------------ |
 | Cài đặt và chạy nhanh                              | [README.vi.md (Khởi động nhanh)](../README.vi.md) / [../README.md](../README.md) |
-| Cài đặt bằng một lệnh                              | [one-click-bootstrap.md](one-click-bootstrap.md)                               |
+| Cài đặt bằng một lệnh                              | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                   |
 | Tìm lệnh theo tác vụ                               | [commands-reference.md](i18n/vi/commands-reference.md)                         |
 | Kiểm tra giá trị mặc định và khóa cấu hình         | [config-reference.md](i18n/vi/config-reference.md)                             |
 | Kết nối provider / endpoint tùy chỉnh               | [custom-providers.md](i18n/vi/custom-providers.md)                             |
@@ -23,7 +23,7 @@ Hub bản địa hóa: [简体中文](README.zh-CN.md) · [日本語](README.ja.
 | Khắc phục sự cố cài đặt/chạy/kênh                   | [troubleshooting.md](i18n/vi/troubleshooting.md)                               |
 | Cấu hình Matrix phòng mã hóa (E2EE)                | [matrix-e2ee-guide.md](i18n/vi/matrix-e2ee-guide.md)                           |
 | Xem theo danh mục                                   | [SUMMARY.md](i18n/vi/SUMMARY.md)                                              |
-| Xem bản chụp PR/Issue                               | [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md) |
+| Xem bản chụp PR/Issue                               | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## Tìm nhanh (10 giây)
 
@@ -84,8 +84,8 @@ Hub bản địa hóa: [简体中文](README.zh-CN.md) · [日本語](README.ja.
 ## Quản lý tài liệu
 
 - Mục lục thống nhất (TOC): [SUMMARY.md](i18n/vi/SUMMARY.md)
-- Bản đồ cấu trúc docs (ngôn ngữ/phần/chức năng): [structure/README.md](structure/README.md)
-- Danh mục và phân loại tài liệu: [docs-inventory.md](docs-inventory.md)
+- Bản đồ cấu trúc docs (ngôn ngữ/phần/chức năng): [structure/README.md](maintainers/structure-README.md)
+- Danh mục và phân loại tài liệu: [docs-inventory.md](maintainers/docs-inventory.md)
 
 ## Ngôn ngữ khác
 

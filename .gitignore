@@ -1,5 +1,6 @@
 /target
 firmware/*/target
+web/dist/
 *.db
 *.db-journal
 .DS_Store
@@ -29,3 +30,7 @@ venv/
 *.pem
 credentials.json
 .worktrees/
+.zeroclaw/*
+
+# Coverage artifacts
+lcov.info
