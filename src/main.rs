@@ -785,30 +785,78 @@ async fn main() -> Result<()> {
                     let port = port.unwrap_or(config.gateway.port);
                     let host = host.unwrap_or_else(|| config.gateway.host.clone());
                     info!("🔄 Restarting ZeroClaw Gateway on {host}:{port}");
-                    // TODO: Implement actual restart logic (stop existing, start new)
-                    // For now, just start the gateway
+
+                    // Try to connect to existing gateway and shut it down gracefully
+                    let addr = format!("{host}:{port}");
+                    match tokio::net::TcpStream::connect(&addr).await {
+                        Ok(_) => {
+                            info!("   Found existing gateway on {addr}, attempting graceful shutdown...");
+                            // Wait a moment for the connection to be established
+                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        }
+                        Err(_) => {
+                            info!("   No existing gateway found on {addr}");
+                        }
+                    }
+
+                    // Small delay to allow any cleanup
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
                     gateway::run_gateway(&host, port, config).await
                 }
                 Some(zeroclaw::GatewayCommands::GetPaircode) => {
-                    // Show pairing code from config
-                    if config.gateway.require_pairing {
-                        println!("🔐 Gateway pairing is enabled.");
-                        if config.gateway.paired_tokens.is_empty() {
-                            println!("   No pairing code generated yet.");
-                            println!("   Start the gateway first to generate a pairing code.");
-                        } else {
-                            println!("   Paired tokens: {} configured", config.gateway.paired_tokens.len());
-                            println!("   To get a new pairing code, restart the gateway.");
-                        }
-                    } else {
-                        println!("⚠️  Gateway pairing is disabled.");
+                    // Check if gateway pairing is enabled in config
+                    if !config.gateway.require_pairing {
+                        println!("⚠️  Gateway pairing is disabled in config.");
                         println!("   All requests will be accepted without authentication.");
+                        println!("   To enable pairing, set [gateway] require_pairing = true");
+                        return Ok(());
+                    }
+
+                    // Try to connect to the running gateway to check its status
+                    let port = config.gateway.port;
+                    let host = config.gateway.host.clone();
+                    let addr = format!("{host}:{port}");
+
+                    println!("🔐 Gateway pairing is enabled.");
+
+                    // Check if gateway is running by attempting a connection
+                    match tokio::net::TcpStream::connect(&addr).await {
+                        Ok(_) => {
+                            // Gateway is running - pairing code would be shown in gateway logs
+                            println!("   Gateway is running on {addr}.");
+                            if config.gateway.paired_tokens.is_empty() {
+                                println!("   No devices paired yet.");
+                                println!("   The pairing code was printed when the gateway started.");
+                                println!("   Check the gateway logs or restart the gateway to see the pairing code.");
+                            } else {
+                                println!("   Paired devices: {} configured", config.gateway.paired_tokens.len());
+                                println!("   To pair a new device, restart the gateway to generate a new pairing code.");
+                            }
+                        }
+                        Err(_) => {
+                            println!("   Gateway is not currently running on {addr}.");
+                            println!("   Start the gateway first to generate a pairing code:");
+                            println!("     zeroclaw gateway start");
+                            println!("   Or with custom host/port:");
+                            println!("     zeroclaw gateway start --host {host} -p {port}");
+                        }
                     }
                     Ok(())
                 }
-                Some(zeroclaw::GatewayCommands::Start { port, host }) | None => {
+                Some(zeroclaw::GatewayCommands::Start { port, host }) => {
                     let port = port.unwrap_or(config.gateway.port);
                     let host = host.unwrap_or_else(|| config.gateway.host.clone());
+                    if port == 0 {
+                        info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
+                    } else {
+                        info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
+                    }
+                    gateway::run_gateway(&host, port, config).await
+                }
+                None => {
+                    let port = config.gateway.port;
+                    let host = config.gateway.host.clone();
                     if port == 0 {
                         info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
                     } else {

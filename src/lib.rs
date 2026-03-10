@@ -86,7 +86,7 @@ your config file (gateway.host / gateway.port).
 Examples:
   zeroclaw gateway start              # use config defaults
   zeroclaw gateway start -p 8080      # listen on port 8080
-  zeroclaw gateway start --host 0.0.0.0   # bind to all interfaces
+  zeroclaw gateway start --host 0.0.0.0   # requires [gateway].allow_public_bind=true or a tunnel
   zeroclaw gateway start -p 0         # random available port")]
     Start {
         /// Port to listen on (use 0 for random available port); defaults to config gateway.port
