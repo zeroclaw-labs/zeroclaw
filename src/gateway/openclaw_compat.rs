@@ -721,7 +721,7 @@ pub async fn handle_v1_chat_completions_with_tools(
             .header(header::CACHE_CONTROL, "no-cache")
             .header(header::CONNECTION, "keep-alive")
             .body(Body::from(output))
-            .unwrap()
+            .expect("static SSE headers are valid")
             .into_response()
     } else {
         // ── Non-streaming JSON ──
@@ -744,7 +744,7 @@ pub async fn handle_v1_chat_completions_with_tools(
                 total_tokens: prompt_tokens + completion_tokens,
             },
         };
-        Json(serde_json::to_value(response).unwrap()).into_response()
+        Json(response).into_response()
     }
 }
 

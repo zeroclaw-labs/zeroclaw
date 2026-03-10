@@ -309,11 +309,7 @@ async fn handle_non_streaming(
                 },
             };
 
-            (
-                StatusCode::OK,
-                Json(serde_json::to_value(response).unwrap()),
-            )
-                .into_response()
+            (StatusCode::OK, Json(response)).into_response()
         }
         Err(e) => {
             let duration = started_at.elapsed();
@@ -406,7 +402,7 @@ fn handle_streaming(
             .header(header::CACHE_CONTROL, "no-cache")
             .header(header::CONNECTION, "keep-alive")
             .body(Body::from_stream(stream))
-            .unwrap()
+            .expect("static SSE headers are valid")
             .into_response();
     }
 
@@ -462,7 +458,7 @@ fn handle_streaming(
             .header(header::CACHE_CONTROL, "no-cache")
             .header(header::CONNECTION, "keep-alive")
             .body(Body::from_stream(stream))
-            .unwrap()
+            .expect("static SSE headers are valid")
             .into_response();
     }
 
@@ -544,7 +540,7 @@ fn handle_streaming(
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(sse_stream))
-        .unwrap()
+        .expect("static SSE headers are valid")
         .into_response()
 }
 
@@ -582,10 +578,7 @@ pub async fn handle_v1_models(
         }],
     };
 
-    (
-        StatusCode::OK,
-        Json(serde_json::to_value(response).unwrap()),
-    )
+    (StatusCode::OK, Json(serde_json::to_value(&response).expect("ModelsResponse is Serialize")))
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
