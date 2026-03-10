@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { Send, Bot, User, AlertCircle } from 'lucide-react';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
@@ -19,8 +19,19 @@ export default function AgentChat() {
 
   const wsRef = useRef<WebSocketClient | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const pendingContentRef = useRef('');
+  const COMPOSER_MAX_HEIGHT = 160;
+
+  const resizeComposer = useCallback(() => {
+    const el = inputRef.current;
+    if (!el) return;
+
+    el.style.height = '0px';
+    const nextHeight = Math.min(Math.max(el.scrollHeight, 48), COMPOSER_MAX_HEIGHT);
+    el.style.height = `${nextHeight}px`;
+    el.style.overflowY = el.scrollHeight > COMPOSER_MAX_HEIGHT ? 'auto' : 'hidden';
+  }, []);
 
   useEffect(() => {
     const ws = new WebSocketClient();
@@ -115,6 +126,15 @@ export default function AgentChat() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, typing]);
+
+  useEffect(() => {
+    resizeComposer();
+  }, [input, resizeComposer]);
+
+  useEffect(() => {
+    window.addEventListener('resize', resizeComposer);
+    return () => window.removeEventListener('resize', resizeComposer);
+  }, [resizeComposer]);
 
   const handleSend = () => {
     const trimmed = input.trim();
@@ -229,17 +249,17 @@ export default function AgentChat() {
 
       {/* Input area */}
       <div className="border-t border-gray-800 bg-gray-900 p-4">
-        <div className="flex items-center gap-3 max-w-4xl mx-auto">
+        <div className="flex items-end gap-3 max-w-4xl mx-auto">
           <div className="flex-1 relative">
-            <input
+            <textarea
               ref={inputRef}
-              type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
+              rows={1}
               placeholder={connected ? 'Type a message...' : 'Connecting...'}
               disabled={!connected}
-              className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
+              className="w-full min-h-12 max-h-40 resize-none bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
             />
           </div>
           <button
