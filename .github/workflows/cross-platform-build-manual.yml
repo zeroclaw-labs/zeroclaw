@@ -11,8 +11,28 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  web:
+    name: Build Web Dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build web dashboard
+        run: cd web && npm ci && npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+          retention-days: 1
+
   build:
     name: Build ${{ matrix.target }}
+    needs: [web]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
@@ -36,6 +56,11 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         if: runner.os != 'Windows'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
 
       - name: Install cross compiler
         if: matrix.cross_compiler
