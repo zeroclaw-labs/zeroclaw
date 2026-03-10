@@ -11,6 +11,7 @@ use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use crate::tools::SharedToolRegistry;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
@@ -32,7 +33,7 @@ pub struct SubAgentSpawnTool {
     fallback_credential: Option<String>,
     provider_runtime_options: providers::ProviderRuntimeOptions,
     registry: Arc<SubAgentRegistry>,
-    parent_tools: Arc<Vec<Arc<dyn Tool>>>,
+    parent_tools: SharedToolRegistry,
     multimodal_config: crate::config::MultimodalConfig,
 }
 
@@ -44,7 +45,7 @@ impl SubAgentSpawnTool {
         security: Arc<SecurityPolicy>,
         provider_runtime_options: providers::ProviderRuntimeOptions,
         registry: Arc<SubAgentRegistry>,
-        parent_tools: Arc<Vec<Arc<dyn Tool>>>,
+        parent_tools: SharedToolRegistry,
         multimodal_config: crate::config::MultimodalConfig,
     ) -> Self {
         Self {
@@ -395,7 +396,7 @@ async fn run_agentic_background(
     agent_config: &DelegateAgentConfig,
     provider: &dyn Provider,
     full_prompt: &str,
-    parent_tools: &[Arc<dyn Tool>],
+    parent_tools: &SharedToolRegistry,
     multimodal_config: &crate::config::MultimodalConfig,
 ) -> anyhow::Result<ToolResult> {
     if agent_config.allowed_tools.is_empty() {
@@ -414,6 +415,11 @@ async fn run_agentic_background(
         .map(|name| name.trim())
         .filter(|name| !name.is_empty())
         .collect::<std::collections::HashSet<_>>();
+
+    let parent_tools = parent_tools
+        .lock()
+        .map(|tools| tools.clone())
+        .unwrap_or_default();
 
     let sub_tools: Vec<Box<dyn Tool>> = parent_tools
         .iter()
@@ -540,7 +546,7 @@ mod tests {
             security,
             providers::ProviderRuntimeOptions::default(),
             Arc::new(SubAgentRegistry::new()),
-            Arc::new(Vec::new()),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
             crate::config::MultimodalConfig::default(),
         )
     }
@@ -705,7 +711,7 @@ mod tests {
             test_security(),
             providers::ProviderRuntimeOptions::default(),
             registry,
-            Arc::new(Vec::new()),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
             crate::config::MultimodalConfig::default(),
         );
 

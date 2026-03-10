@@ -1,3 +1,5 @@
+#![cfg(feature = "quota-tools-live")]
+
 //! Live E2E tests for quota tools with real auth profiles.
 //!
 //! These tests require real auth-profiles.json at ~/.zeroclaw/auth-profiles.json

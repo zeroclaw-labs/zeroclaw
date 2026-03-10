@@ -1,5 +1,7 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
+use crate::config::schema::ModelPricing;
 use crate::config::Config;
+use crate::cost::{CostTracker, TokenUsage as CostTokenUsage};
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
@@ -15,7 +17,7 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use regex::{Regex, RegexSet};
 use rustyline::error::ReadlineError;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
@@ -192,6 +194,84 @@ pub(crate) struct NonCliApprovalContext {
 
 tokio::task_local! {
     static TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT: Option<NonCliApprovalContext>;
+}
+
+#[derive(Clone)]
+pub(crate) struct ToolLoopCostTrackingContext {
+    tracker: Arc<CostTracker>,
+    prices: Arc<HashMap<String, ModelPricing>>,
+}
+
+impl ToolLoopCostTrackingContext {
+    pub(crate) fn new(
+        tracker: Arc<CostTracker>,
+        prices: Arc<HashMap<String, ModelPricing>>,
+    ) -> Self {
+        Self { tracker, prices }
+    }
+}
+
+tokio::task_local! {
+    static TOOL_LOOP_COST_TRACKING_CONTEXT: Option<ToolLoopCostTrackingContext>;
+}
+
+fn lookup_model_pricing<'a>(
+    prices: &'a HashMap<String, ModelPricing>,
+    provider_name: &str,
+    model: &str,
+) -> Option<&'a ModelPricing> {
+    prices
+        .get(model)
+        .or_else(|| prices.get(&format!("{provider_name}/{model}")))
+        .or_else(|| {
+            model
+                .rsplit_once('/')
+                .and_then(|(_, suffix)| prices.get(suffix))
+        })
+}
+
+fn record_tool_loop_cost_usage(
+    provider_name: &str,
+    model: &str,
+    usage: &crate::providers::traits::TokenUsage,
+) -> Option<(u64, f64)> {
+    let input_tokens = usage.input_tokens.unwrap_or(0);
+    let output_tokens = usage.output_tokens.unwrap_or(0);
+    let total_tokens = input_tokens.saturating_add(output_tokens);
+    if total_tokens == 0 {
+        return None;
+    }
+
+    let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()?;
+    let pricing = lookup_model_pricing(&ctx.prices, provider_name, model);
+    let cost_usage = CostTokenUsage::new(
+        model,
+        input_tokens,
+        output_tokens,
+        pricing.map_or(0.0, |entry| entry.input),
+        pricing.map_or(0.0, |entry| entry.output),
+    );
+
+    if pricing.is_none() {
+        tracing::debug!(
+            provider = provider_name,
+            model,
+            "Cost tracking recorded token usage with zero pricing because no model price was configured"
+        );
+    }
+
+    if let Err(error) = ctx.tracker.record_usage(cost_usage.clone()) {
+        tracing::warn!(
+            provider = provider_name,
+            model,
+            "Failed to record cost tracking usage: {error}"
+        );
+    }
+
+    Some((cost_usage.total_tokens, cost_usage.cost_usd))
 }
 
 /// Extract a short hint from tool call arguments for progress display.
@@ -475,6 +555,31 @@ fn build_tool_unavailable_retry_prompt(tool_specs: &[crate::tools::ToolSpec]) ->
     )
 }
 
+fn display_text_for_turn(
+    response_text: &str,
+    parsed_text: &str,
+    tool_call_count: usize,
+    native_tool_call_count: usize,
+) -> String {
+    if tool_call_count == 0 {
+        return if parsed_text.is_empty() {
+            response_text.to_string()
+        } else {
+            parsed_text.to_string()
+        };
+    }
+
+    if !parsed_text.is_empty() {
+        return parsed_text.to_string();
+    }
+
+    if native_tool_call_count > 0 {
+        return response_text.to_string();
+    }
+
+    String::new()
+}
+
 #[derive(Debug)]
 pub(crate) struct ToolLoopCancelled;
 
@@ -734,6 +839,7 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
     approval: Option<&ApprovalManager>,
     channel_name: &str,
     non_cli_approval_context: Option<NonCliApprovalContext>,
+    cost_tracking_context: Option<ToolLoopCostTrackingContext>,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
@@ -750,23 +856,26 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
             non_cli_approval_context,
             TOOL_LOOP_REPLY_TARGET.scope(
                 reply_target,
-                run_tool_call_loop(
-                    provider,
-                    history,
-                    tools_registry,
-                    observer,
-                    provider_name,
-                    model,
-                    temperature,
-                    silent,
-                    approval,
-                    channel_name,
-                    multimodal_config,
-                    max_tool_iterations,
-                    cancellation_token,
-                    on_delta,
-                    hooks,
-                    excluded_tools,
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    cost_tracking_context,
+                    run_tool_call_loop(
+                        provider,
+                        history,
+                        tools_registry,
+                        observer,
+                        provider_name,
+                        model,
+                        temperature,
+                        silent,
+                        approval,
+                        channel_name,
+                        multimodal_config,
+                        max_tool_iterations,
+                        cancellation_token,
+                        on_delta,
+                        hooks,
+                        excluded_tools,
+                    ),
                 ),
             ),
         )
@@ -1019,6 +1128,11 @@ pub(crate) async fn run_tool_call_loop(
                     output_tokens: resp_output_tokens,
                 });
 
+                let _ = resp
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| record_tool_loop_cost_usage(provider_name, model, usage));
+
                 let response_text = resp.text_or_empty().to_string();
                 // First try native structured tool calls (OpenAI-format).
                 // Fall back to text-based parsing (XML tags, markdown blocks,
@@ -1135,11 +1249,12 @@ pub(crate) async fn run_tool_call_loop(
             }
         };
 
-        let display_text = if parsed_text.is_empty() {
-            response_text.clone()
-        } else {
-            parsed_text
-        };
+        let display_text = display_text_for_turn(
+            &response_text,
+            &parsed_text,
+            tool_calls.len(),
+            native_tool_calls.len(),
+        );
 
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -1845,7 +1960,7 @@ pub async fn run(
     } else {
         (None, None)
     };
-    let mut tools_registry = tools::all_tools_with_runtime(
+    let (mut tool_arcs, shared_tool_registry) = tools::all_tools_with_runtime_arcs(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -1861,12 +1976,16 @@ pub async fn run(
         &config,
     );
 
-    let peripheral_tools: Vec<Box<dyn Tool>> =
+    let peripheral_tools: Vec<Arc<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     if !peripheral_tools.is_empty() {
         tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
-        tools_registry.extend(peripheral_tools);
+        tool_arcs.extend(peripheral_tools);
+        if let Some(shared_registry) = shared_tool_registry.as_ref() {
+            tools::sync_shared_tool_registry(shared_registry, &tool_arcs);
+        }
     }
+    let tools_registry = tools::boxed_registry_from_arcs(tool_arcs);
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
@@ -2333,7 +2452,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         (None, None)
     };
-    let mut tools_registry = tools::all_tools_with_runtime(
+    let (mut tool_arcs, shared_tool_registry) = tools::all_tools_with_runtime_arcs(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -2348,9 +2467,13 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.api_key.as_deref(),
         &config,
     );
-    let peripheral_tools: Vec<Box<dyn Tool>> =
+    let peripheral_tools: Vec<Arc<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
-    tools_registry.extend(peripheral_tools);
+    tool_arcs.extend(peripheral_tools);
+    if let Some(shared_registry) = shared_tool_registry.as_ref() {
+        tools::sync_shared_tool_registry(shared_registry, &tool_arcs);
+    }
+    let tools_registry = tools::boxed_registry_from_arcs(tool_arcs);
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config
@@ -2508,10 +2631,11 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tempfile::TempDir;
 
     #[test]
     fn test_scrub_credentials() {
@@ -2584,6 +2708,37 @@ mod tests {
         assert!(args.get("delivery").is_none());
     }
 
+    #[test]
+    fn display_text_for_turn_hides_prompt_guided_tool_payloads() {
+        let display = display_text_for_turn(
+            "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}</tool_call>",
+            "",
+            1,
+            0,
+        );
+
+        assert!(display.is_empty());
+    }
+
+    #[test]
+    fn display_text_for_turn_preserves_prompt_guided_preface_text() {
+        let display = display_text_for_turn(
+            "Let me check.\n<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}</tool_call>",
+            "Let me check.",
+            1,
+            0,
+        );
+
+        assert_eq!(display, "Let me check.");
+    }
+
+    #[test]
+    fn display_text_for_turn_preserves_native_tool_preface_text() {
+        let display = display_text_for_turn("Let me check.", "", 1, 1);
+
+        assert_eq!(display, "Let me check.");
+    }
+
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::router::{Route, RouterProvider};
@@ -2591,8 +2746,6 @@ mod tests {
     use crate::providers::ChatResponse;
     use crate::runtime::NativeRuntime;
     use crate::security::{AutonomyLevel, SecurityPolicy, ShellRedirectPolicy};
-    use tempfile::TempDir;
-
     struct NonVisionProvider {
         calls: Arc<AtomicUsize>,
     }
@@ -3472,6 +3625,7 @@ mod tests {
                 reply_target: "chat-approval".to_string(),
                 prompt_tx,
             }),
+            None,
             &crate::config::MultimodalConfig::default(),
             4,
             None,
@@ -3488,6 +3642,86 @@ mod tests {
             max_active.load(Ordering::SeqCst),
             1,
             "shell tool should execute after non-cli approval is resolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_records_cost_usage_when_tracking_context_is_scoped() {
+        let provider = ScriptedProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(crate::providers::traits::TokenUsage {
+                    input_tokens: Some(1_200),
+                    output_tokens: Some(300),
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let workspace = TempDir::new().expect("temp workspace should be created");
+        let mut cost_config = crate::config::CostConfig {
+            enabled: true,
+            ..crate::config::CostConfig::default()
+        };
+        cost_config.prices = HashMap::from([(
+            "mock-provider/mock-model".to_string(),
+            ModelPricing {
+                input: 2.0,
+                output: 4.0,
+            },
+        )]);
+        let tracker = Arc::new(
+            CostTracker::new(cost_config.clone(), workspace.path())
+                .expect("cost tracker should initialize"),
+        );
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("hello"),
+        ];
+
+        let result = run_tool_call_loop_with_non_cli_approval_context(
+            &provider,
+            &mut history,
+            &[],
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            None,
+            Some(ToolLoopCostTrackingContext::new(
+                Arc::clone(&tracker),
+                Arc::new(cost_config.prices.clone()),
+            )),
+            &crate::config::MultimodalConfig::default(),
+            2,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("tool loop should succeed");
+
+        assert_eq!(result, "done");
+
+        let summary = tracker
+            .get_summary()
+            .expect("cost summary should be readable");
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.total_tokens, 1_500);
+        assert!(summary.session_cost_usd > 0.0);
+        assert_eq!(
+            summary
+                .by_model
+                .get("mock-model")
+                .expect("model stats should exist")
+                .total_tokens,
+            1_500
         );
     }
 

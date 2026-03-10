@@ -5858,6 +5858,16 @@ impl Config {
                 &mut config.browser.computer_use.api_key,
                 "config.browser.computer_use.api_key",
             )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.web_fetch.api_key,
+                "config.web_fetch.api_key",
+            )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.web_search.api_key,
+                "config.web_search.api_key",
+            )?;
 
             decrypt_optional_secret(
                 &store,
@@ -5888,6 +5898,20 @@ impl Config {
 
             for agent in config.agents.values_mut() {
                 decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
+            }
+            for route in &mut config.model_routes {
+                decrypt_optional_secret(
+                    &store,
+                    &mut route.api_key,
+                    "config.model_routes.*.api_key",
+                )?;
+            }
+            for route in &mut config.embedding_routes {
+                decrypt_optional_secret(
+                    &store,
+                    &mut route.api_key,
+                    "config.embedding_routes.*.api_key",
+                )?;
             }
 
             decrypt_channel_secrets(&store, &mut config.channels_config)?;
@@ -6727,6 +6751,16 @@ impl Config {
             &mut config_to_save.browser.computer_use.api_key,
             "config.browser.computer_use.api_key",
         )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.web_fetch.api_key,
+            "config.web_fetch.api_key",
+        )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.web_search.api_key,
+            "config.web_search.api_key",
+        )?;
 
         encrypt_optional_secret(
             &store,
@@ -6757,6 +6791,16 @@ impl Config {
 
         for agent in config_to_save.agents.values_mut() {
             encrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
+        }
+        for route in &mut config_to_save.model_routes {
+            encrypt_optional_secret(&store, &mut route.api_key, "config.model_routes.*.api_key")?;
+        }
+        for route in &mut config_to_save.embedding_routes {
+            encrypt_optional_secret(
+                &store,
+                &mut route.api_key,
+                "config.embedding_routes.*.api_key",
+            )?;
         }
 
         encrypt_channel_secrets(&store, &mut config_to_save.channels_config)?;
@@ -7747,6 +7791,8 @@ tool_dispatcher = "xml"
         config.proxy.https_proxy = Some("https://user:pass@proxy.internal:8443".into());
         config.proxy.all_proxy = Some("socks5://user:pass@proxy.internal:1080".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
+        config.web_fetch.api_key = Some("web-fetch-credential".into());
+        config.web_search.api_key = Some("web-search-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
         config.reliability.api_keys = vec!["backup-credential".into()];
@@ -7754,6 +7800,20 @@ tool_dispatcher = "xml"
             "custom:https://api-a.example.com/v1".into(),
             "fallback-a-credential".into(),
         );
+        config.model_routes = vec![ModelRouteConfig {
+            hint: "reasoning".into(),
+            provider: "openrouter".into(),
+            model: "anthropic/claude-sonnet-4".into(),
+            max_tokens: None,
+            api_key: Some("route-credential".into()),
+        }];
+        config.embedding_routes = vec![EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "openai".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: Some(1536),
+            api_key: Some("embedding-credential".into()),
+        }];
         config.gateway.paired_tokens = vec!["zc_0123456789abcdef".into()];
         config.channels_config.telegram = Some(TelegramConfig {
             bot_token: "telegram-credential".into(),
@@ -7835,6 +7895,22 @@ tool_dispatcher = "xml"
             store.decrypt(browser_encrypted).unwrap(),
             "browser-credential"
         );
+        let web_fetch_encrypted = stored.web_fetch.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            web_fetch_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(web_fetch_encrypted).unwrap(),
+            "web-fetch-credential"
+        );
+        let web_search_api_encrypted = stored.web_search.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            web_search_api_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(web_search_api_encrypted).unwrap(),
+            "web-search-credential"
+        );
 
         let web_search_encrypted = stored.web_search.brave_api_key.as_deref().unwrap();
         assert!(crate::security::SecretStore::is_encrypted(
@@ -7869,6 +7945,15 @@ tool_dispatcher = "xml"
         assert_eq!(
             store.decrypt(fallback_key).unwrap(),
             "fallback-a-credential"
+        );
+        let routed_key = stored.model_routes[0].api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(routed_key));
+        assert_eq!(store.decrypt(routed_key).unwrap(), "route-credential");
+        let embedding_key = stored.embedding_routes[0].api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(embedding_key));
+        assert_eq!(
+            store.decrypt(embedding_key).unwrap(),
+            "embedding-credential"
         );
 
         let paired_token = &stored.gateway.paired_tokens[0];

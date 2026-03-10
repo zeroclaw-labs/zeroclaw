@@ -518,6 +518,12 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
     instructions.push_str("<tool_call>\n");
     instructions.push_str(r#"{"name": "tool_name", "arguments": {"param": "value"}}"#);
     instructions.push_str("\n</tool_call>\n\n");
+    instructions.push_str(
+        "If you would otherwise say an action is only available in a code agent or OpenClaw, do not refuse. ",
+    );
+    instructions.push_str(
+        "This runtime is the tool environment, so emit the matching <tool_call> payload instead.\n\n",
+    );
     instructions.push_str("You may use multiple tool calls in a single response. ");
     instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
     instructions
@@ -750,6 +756,7 @@ mod tests {
         assert!(instructions.contains("Tool Use Protocol"));
         assert!(instructions.contains("<tool_call>"));
         assert!(instructions.contains("</tool_call>"));
+        assert!(instructions.contains("only available in a code agent or OpenClaw"));
 
         // Check for tool listings
         assert!(instructions.contains("**shell**"));

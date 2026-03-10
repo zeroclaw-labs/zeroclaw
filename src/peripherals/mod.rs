@@ -31,6 +31,7 @@ use crate::peripherals::traits::Peripheral;
 use crate::tools::HardwareMemoryMapTool;
 use crate::tools::Tool;
 use anyhow::Result;
+use std::sync::Arc;
 
 /// List configured boards from config (no connection yet).
 pub fn list_configured_boards(config: &PeripheralsConfig) -> Vec<&PeripheralBoardConfig> {
@@ -137,20 +138,20 @@ pub async fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> 
 /// Create and connect peripherals from config, returning their tools.
 /// Returns empty vec if peripherals disabled or hardware feature off.
 #[cfg(feature = "hardware")]
-pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<Box<dyn Tool>>> {
+pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<Arc<dyn Tool>>> {
     if !config.enabled || config.boards.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     let mut serial_transports: Vec<(String, std::sync::Arc<serial::SerialTransport>)> = Vec::new();
 
     for board in &config.boards {
         // Arduino Uno Q: Bridge transport (socket to local Bridge app)
         if board.transport == "bridge" && (board.board == "arduino-uno-q" || board.board == "uno-q")
         {
-            tools.push(Box::new(uno_q_bridge::UnoQGpioReadTool));
-            tools.push(Box::new(uno_q_bridge::UnoQGpioWriteTool));
+            tools.push(Arc::new(uno_q_bridge::UnoQGpioReadTool));
+            tools.push(Arc::new(uno_q_bridge::UnoQGpioWriteTool));
             tracing::info!(board = %board.board, "Uno Q Bridge GPIO tools added");
             continue;
         }
@@ -162,7 +163,12 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
         {
             match rpi::RpiGpioPeripheral::connect_from_config(board).await {
                 Ok(peripheral) => {
-                    tools.extend(peripheral.tools());
+                    tools.extend(
+                        peripheral
+                            .tools()
+                            .into_iter()
+                            .map(|tool| Arc::<dyn Tool>::from(tool)),
+                    );
                     tracing::info!(board = %board.board, "RPi GPIO peripheral connected");
                 }
                 Err(e) => {
@@ -188,10 +194,10 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
                     tracing::warn!("Peripheral {} connect warning (continuing)", p.name());
                 }
                 serial_transports.push((board.board.clone(), p.transport()));
-                tools.extend(p.tools());
+                tools.extend(p.tools().into_iter().map(Arc::<dyn Tool>::from));
                 if board.board == "arduino-uno" {
                     if let Some(ref path) = board.path {
-                        tools.push(Box::new(arduino_upload::ArduinoUploadTool::new(
+                        tools.push(Arc::new(arduino_upload::ArduinoUploadTool::new(
                             path.clone(),
                         )));
                         tracing::info!("Arduino upload tool added (port: {})", path);
@@ -208,18 +214,18 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
     // Phase B: Add hardware tools when any boards configured
     if !tools.is_empty() {
         let board_names: Vec<String> = config.boards.iter().map(|b| b.board.clone()).collect();
-        tools.push(Box::new(HardwareMemoryMapTool::new(board_names.clone())));
-        tools.push(Box::new(crate::tools::HardwareBoardInfoTool::new(
+        tools.push(Arc::new(HardwareMemoryMapTool::new(board_names.clone())));
+        tools.push(Arc::new(crate::tools::HardwareBoardInfoTool::new(
             board_names.clone(),
         )));
-        tools.push(Box::new(crate::tools::HardwareMemoryReadTool::new(
+        tools.push(Arc::new(crate::tools::HardwareMemoryReadTool::new(
             board_names,
         )));
     }
 
     // Phase C: Add hardware_capabilities tool when any serial boards
     if !serial_transports.is_empty() {
-        tools.push(Box::new(capabilities_tool::HardwareCapabilitiesTool::new(
+        tools.push(Arc::new(capabilities_tool::HardwareCapabilitiesTool::new(
             serial_transports,
         )));
     }
@@ -229,7 +235,7 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
 
 #[cfg(not(feature = "hardware"))]
 #[allow(clippy::unused_async)]
-pub async fn create_peripheral_tools(_config: &PeripheralsConfig) -> Result<Vec<Box<dyn Tool>>> {
+pub async fn create_peripheral_tools(_config: &PeripheralsConfig) -> Result<Vec<Arc<dyn Tool>>> {
     Ok(Vec::new())
 }
 

@@ -1096,6 +1096,12 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     for agent in masked.agents.values_mut() {
         mask_optional_secret(&mut agent.api_key);
     }
+    for route in &mut masked.model_routes {
+        mask_optional_secret(&mut route.api_key);
+    }
+    for route in &mut masked.embedding_routes {
+        mask_optional_secret(&mut route.api_key);
+    }
 
     if let Some(telegram) = masked.channels_config.telegram.as_mut() {
         mask_required_secret(&mut telegram.bot_token);
@@ -1213,6 +1219,20 @@ fn restore_masked_sensitive_fields(
         if let Some(current_agent) = current.agents.get(name) {
             restore_optional_secret(&mut agent.api_key, &current_agent.api_key);
         }
+    }
+    for (incoming_route, current_route) in incoming
+        .model_routes
+        .iter_mut()
+        .zip(current.model_routes.iter())
+    {
+        restore_optional_secret(&mut incoming_route.api_key, &current_route.api_key);
+    }
+    for (incoming_route, current_route) in incoming
+        .embedding_routes
+        .iter_mut()
+        .zip(current.embedding_routes.iter())
+    {
+        restore_optional_secret(&mut incoming_route.api_key, &current_route.api_key);
     }
 
     if let (Some(incoming_ch), Some(current_ch)) = (
@@ -1393,11 +1413,27 @@ mod tests {
         current.workspace_dir = std::path::PathBuf::from("/tmp/current/workspace");
         current.api_key = Some("real-key".to_string());
         current.reliability.api_keys = vec!["r1".to_string(), "r2".to_string()];
+        current.model_routes = vec![crate::config::ModelRouteConfig {
+            hint: "reasoning".to_string(),
+            provider: "openrouter".to_string(),
+            model: "anthropic/claude-sonnet-4".to_string(),
+            max_tokens: None,
+            api_key: Some("route-key".to_string()),
+        }];
+        current.embedding_routes = vec![crate::config::EmbeddingRouteConfig {
+            hint: "semantic".to_string(),
+            provider: "openai".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            dimensions: None,
+            api_key: Some("embedding-key".to_string()),
+        }];
 
         let mut incoming = mask_sensitive_fields(&current);
         incoming.default_model = Some("gpt-4.1-mini".to_string());
         // Simulate UI changing only one key and keeping the first masked.
         incoming.reliability.api_keys = vec![MASKED_SECRET.to_string(), "r2-new".to_string()];
+        incoming.model_routes[0].api_key = Some(MASKED_SECRET.to_string());
+        incoming.embedding_routes[0].api_key = Some(MASKED_SECRET.to_string());
 
         let hydrated = hydrate_config_for_save(incoming, &current);
 
@@ -1408,6 +1444,14 @@ mod tests {
         assert_eq!(
             hydrated.reliability.api_keys,
             vec!["r1".to_string(), "r2-new".to_string()]
+        );
+        assert_eq!(
+            hydrated.model_routes[0].api_key.as_deref(),
+            Some("route-key")
+        );
+        assert_eq!(
+            hydrated.embedding_routes[0].api_key.as_deref(),
+            Some("embedding-key")
         );
     }
 
@@ -1514,6 +1558,36 @@ mod tests {
         assert_eq!(masked_feishu.encrypt_key.as_deref(), Some(MASKED_SECRET));
         assert_eq!(
             masked_feishu.verification_token.as_deref(),
+            Some(MASKED_SECRET)
+        );
+    }
+
+    #[test]
+    fn mask_sensitive_fields_masks_route_api_keys() {
+        let mut cfg = crate::config::Config::default();
+        cfg.model_routes = vec![crate::config::ModelRouteConfig {
+            hint: "reasoning".to_string(),
+            provider: "openrouter".to_string(),
+            model: "anthropic/claude-sonnet-4".to_string(),
+            max_tokens: None,
+            api_key: Some("route-real-key".to_string()),
+        }];
+        cfg.embedding_routes = vec![crate::config::EmbeddingRouteConfig {
+            hint: "semantic".to_string(),
+            provider: "openai".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            dimensions: None,
+            api_key: Some("embedding-real-key".to_string()),
+        }];
+
+        let masked = mask_sensitive_fields(&cfg);
+
+        assert_eq!(
+            masked.model_routes[0].api_key.as_deref(),
+            Some(MASKED_SECRET)
+        );
+        assert_eq!(
+            masked.embedding_routes[0].api_key.as_deref(),
             Some(MASKED_SECRET)
         );
     }

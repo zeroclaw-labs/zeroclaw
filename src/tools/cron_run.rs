@@ -211,10 +211,13 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.level = AutonomyLevel::ReadOnly;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let mut writable_config = config.clone();
+        writable_config.autonomy.level = AutonomyLevel::Full;
+        let writable_cfg = Arc::new(writable_config);
+        let job = cron::add_job(&writable_cfg, "*/5 * * * *", "echo run-now").unwrap();
+        config.autonomy.level = AutonomyLevel::ReadOnly;
         let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo run-now").unwrap();
         let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
 
         let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
@@ -234,7 +237,8 @@ mod tests {
         config.autonomy.allowed_commands = vec!["touch".into()];
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "touch cron-run-approval").unwrap();
+        let job =
+            cron::add_job_approved(&cfg, "*/5 * * * *", "touch cron-run-approval", true).unwrap();
         let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
 
         let denied = tool.execute(json!({ "job_id": job.id })).await.unwrap();
