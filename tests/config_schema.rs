@@ -99,11 +99,13 @@ fn gateway_config_idempotency_defaults() {
 
 #[test]
 fn gateway_config_toml_roundtrip() {
-    let mut gw = GatewayConfig::default();
-    gw.port = 8080;
-    gw.host = "0.0.0.0".into();
-    gw.require_pairing = false;
-    gw.pair_rate_limit_per_minute = 5;
+    let gw = GatewayConfig {
+        port: 8080,
+        host: "0.0.0.0".into(),
+        require_pairing: false,
+        pair_rate_limit_per_minute: 5,
+        ..Default::default()
+    };
 
     let toml_str = toml::to_string(&gw).expect("gateway config should serialize");
     let parsed: GatewayConfig = toml::from_str(&toml_str).expect("should deserialize back");
