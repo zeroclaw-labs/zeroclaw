@@ -31,3 +31,6 @@ venv/
 credentials.json
 .worktrees/
 .zeroclaw/*
+
+# Coverage artifacts
+lcov.info
