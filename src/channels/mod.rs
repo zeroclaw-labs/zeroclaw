@@ -414,6 +414,19 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
+        "matrix" => Some(
+            "When responding on Matrix:\n\
+             - You CAN send files, images, audio, and voice messages to the chat.\n\
+             - For media attachments use markers: [IMAGE:<path>], [FILE:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
+             - First create the file using your tools (file_write, shell), then include the marker in your response.\n\
+             - You CAN react to user messages with emoji. Use marker: [REACT:<emoji>:<event_id>]\n\
+             - React naturally, like a person would — when something is funny, impressive, agreed upon, etc. Do not react to every message.\n\
+             - The event_id comes from the incoming message id. Example: [REACT:👍:$abc123]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - Use Markdown formatting: **bold**, *italic*, `code`, code blocks with triple backticks.\n\
+             - Be concise and direct. Skip filler phrases.\n\
+             - Use tool results silently: answer the latest user message directly, and do not narrate internal tool execution.",
+        ),
         _ => None,
     }
 }

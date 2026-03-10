@@ -351,7 +351,54 @@ async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result
 
     validate_mime(source, &mime)?;
 
-    Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
+    // Resize large images to fit within model context budget (max 1024px longest side, JPEG).
+    let final_bytes = compress_image_if_needed(&bytes, &mime);
+    let final_mime = if final_bytes.len() < bytes.len() {
+        "image/jpeg"
+    } else {
+        &mime
+    };
+
+    Ok(format!(
+        "data:{final_mime};base64,{}",
+        STANDARD.encode(&final_bytes)
+    ))
+}
+
+/// Resize image to max 1024px on longest side and re-encode as JPEG if it reduces size.
+/// Falls back to original bytes on any decode/encode failure (e.g. unsupported format).
+fn compress_image_if_needed(bytes: &[u8], _mime: &str) -> Vec<u8> {
+    const MAX_DIM: u32 = 1024;
+
+    let img = match image::load_from_memory(bytes) {
+        Ok(img) => img,
+        Err(_) => return bytes.to_vec(),
+    };
+
+    let (w, h) = (img.width(), img.height());
+    let resized = if w > MAX_DIM || h > MAX_DIM {
+        img.thumbnail(MAX_DIM, MAX_DIM)
+    } else {
+        img
+    };
+
+    let mut buf = Vec::new();
+    if resized
+        .write_to(
+            &mut std::io::Cursor::new(&mut buf),
+            image::ImageFormat::Jpeg,
+        )
+        .is_err()
+    {
+        return bytes.to_vec();
+    }
+
+    // Only use compressed version if it actually reduced size.
+    if buf.len() < bytes.len() {
+        buf
+    } else {
+        bytes.to_vec()
+    }
 }
 
 fn validate_size(source: &str, size_bytes: usize, max_bytes: usize) -> anyhow::Result<()> {

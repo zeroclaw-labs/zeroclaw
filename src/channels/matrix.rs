@@ -10,13 +10,14 @@ use matrix_sdk::{
     ruma::{
         api::client::uiaa,
         events::{
-            reaction::OriginalSyncReactionEvent,
+            reaction::{OriginalSyncReactionEvent, ReactionEventContent},
+            relation::Annotation,
             room::{
                 message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
                 MediaSource,
             },
         },
-        OwnedRoomId, OwnedUserId,
+        OwnedEventId, OwnedRoomId, OwnedUserId,
     },
     Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
 };
@@ -124,6 +125,48 @@ struct WhoAmIResponse {
 #[derive(Debug, Deserialize)]
 struct RoomAliasResponse {
     room_id: String,
+}
+
+// --- Outgoing reaction marker: [REACT:emoji:$event_id] ---
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MatrixOutgoingReaction {
+    emoji: String,
+    event_id: String,
+}
+
+/// Parse `[REACT:emoji:$event_id]` markers from response text.
+/// Returns cleaned text (markers removed) and list of reactions.
+fn parse_matrix_reaction_markers(message: &str) -> (String, Vec<MatrixOutgoingReaction>) {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut reactions = Vec::new();
+    let mut rest = message;
+
+    while let Some(start) = rest.find("[REACT:") {
+        cleaned.push_str(&rest[..start]);
+        let after_prefix = &rest[start + 7..];
+        if let Some(end) = after_prefix.find(']') {
+            let inner = &after_prefix[..end];
+            // Split into emoji and event_id: "👍:$event_id"
+            if let Some(colon) = inner.find(':') {
+                let emoji = inner[..colon].trim();
+                let event_id = inner[colon + 1..].trim();
+                if !emoji.is_empty() && !event_id.is_empty() {
+                    reactions.push(MatrixOutgoingReaction {
+                        emoji: emoji.to_string(),
+                        event_id: event_id.to_string(),
+                    });
+                }
+            }
+            rest = &after_prefix[end + 1..];
+        } else {
+            cleaned.push_str(&rest[start..start + 7]);
+            rest = after_prefix;
+        }
+    }
+    cleaned.push_str(rest);
+
+    (cleaned.trim().to_string(), reactions)
 }
 
 // --- Outgoing attachment marker types (follows Telegram/Discord pattern) ---
@@ -1015,7 +1058,9 @@ impl Channel for MatrixChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let raw_content = super::strip_tool_call_tags(&message.content);
-        let (cleaned_content, parsed_attachments) = parse_matrix_attachment_markers(&raw_content);
+        let (after_reactions, reaction_markers) = parse_matrix_reaction_markers(&raw_content);
+        let (cleaned_content, parsed_attachments) =
+            parse_matrix_attachment_markers(&after_reactions);
 
         let client = self.matrix_client().await?;
         let target_room_id = self.target_room_id().await?;
@@ -1033,6 +1078,20 @@ impl Channel for MatrixChannel {
 
         if room.state() != RoomState::Joined {
             anyhow::bail!("Matrix room '{}' is not in joined state", target_room_id);
+        }
+
+        // Stop typing indicator before sending the response.
+        let _ = room.typing_notice(false).await;
+
+        // Send reaction markers — the LLM decided to react to a message.
+        for reaction in &reaction_markers {
+            if let Ok(eid) = reaction.event_id.parse::<OwnedEventId>() {
+                let content =
+                    ReactionEventContent::new(Annotation::new(eid, reaction.emoji.clone()));
+                if let Err(error) = room.send(content).await {
+                    tracing::warn!("Matrix reaction send failed: {error}");
+                }
+            }
         }
 
         // Send each attachment via room.send_attachment() which auto-encrypts
@@ -1354,6 +1413,20 @@ impl Channel for MatrixChannel {
                         return;
                     }
                 }
+
+                // Mark message as read + start typing indicator.
+                if let Ok(eid) = event_id.parse::<OwnedEventId>() {
+                    use matrix_sdk::ruma::api::client::receipt::create_receipt;
+                    use matrix_sdk::ruma::events::receipt::ReceiptThread;
+                    let _ = room
+                        .send_single_receipt(
+                            create_receipt::v3::ReceiptType::Read,
+                            ReceiptThread::Unthreaded,
+                            eid,
+                        )
+                        .await;
+                }
+                let _ = room.typing_notice(true).await;
 
                 let msg = ChannelMessage {
                     id: event_id,
