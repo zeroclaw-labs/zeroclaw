@@ -480,7 +480,7 @@ impl PaymentManager {
             return Ok(None);
         };
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT transaction_id, user_id, package_id, amount_krw, credits, status, provider_tid, created_at, updated_at
              FROM payments WHERE transaction_id = ?1",
         )?;
@@ -567,7 +567,7 @@ impl PaymentManager {
             return Ok(Vec::new());
         };
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT transaction_id, user_id, package_id, amount_krw, credits, status, provider_tid, created_at, updated_at
              FROM payments WHERE user_id = ?1
              ORDER BY created_at DESC LIMIT ?2",

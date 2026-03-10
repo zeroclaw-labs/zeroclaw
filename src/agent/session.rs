@@ -357,7 +357,7 @@ impl SessionManager for SqliteSessionManager {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
             let mut stmt =
-                conn.prepare("SELECT history_json FROM agent_sessions WHERE session_id = ?1")?;
+                conn.prepare_cached("SELECT history_json FROM agent_sessions WHERE session_id = ?1")?;
             let mut rows = stmt.query(params![session_id])?;
             if let Some(row) = rows.next()? {
                 let json: String = row.get(0)?;

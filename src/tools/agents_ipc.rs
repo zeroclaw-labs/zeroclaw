@@ -187,7 +187,7 @@ impl Tool for AgentsListTool {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let cutoff = now_epoch() - self.ipc_db.staleness_secs as i64;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT agent_id, role, status, last_seen FROM agents WHERE last_seen >= ?1",
         )?;
 
@@ -348,7 +348,7 @@ impl Tool for AgentsInboxTool {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let agent_id = &self.ipc_db.agent_id;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, from_agent, payload, created_at FROM messages WHERE (to_agent = ?1 OR to_agent = '*') AND read = 0 ORDER BY created_at ASC",
         )?;
 

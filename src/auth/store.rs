@@ -340,7 +340,7 @@ impl AuthStore {
     /// List all devices for a user.
     pub fn list_devices(&self, user_id: &str) -> Result<Vec<Device>> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT device_id, user_id, device_name, last_seen
              FROM devices WHERE user_id = ?1 ORDER BY last_seen DESC",
         )?;
@@ -441,7 +441,7 @@ impl AuthStore {
         let now = epoch_secs() as i64;
         let cutoff = now - online_threshold_secs as i64;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT device_id, user_id, device_name, platform, last_seen, pairing_code_hash
              FROM devices WHERE user_id = ?1 ORDER BY last_seen DESC",
         )?;

@@ -382,7 +382,7 @@ impl TelemetryStore {
             |row| row.get(0),
         )?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT country, COUNT(*) as cnt FROM telemetry_events
              WHERE country != '' GROUP BY country ORDER BY cnt DESC LIMIT 10",
         )?;
@@ -391,7 +391,7 @@ impl TelemetryStore {
             .filter_map(|r| r.ok())
             .collect();
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT action, COUNT(*) as cnt FROM telemetry_events
              GROUP BY action ORDER BY cnt DESC LIMIT 10",
         )?;
@@ -401,7 +401,7 @@ impl TelemetryStore {
             .collect();
 
         // Recent alerts (last 20)
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, user_id, country, ip_address, channel, action, target_url,
                     details, tool_name, alert_level, alert_reason, timestamp
              FROM telemetry_events WHERE alert_level != 'none'

@@ -84,7 +84,7 @@ impl ResponseCache {
         let now = Local::now();
         let cutoff = (now - Duration::minutes(self.ttl_minutes)).to_rfc3339();
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT response FROM response_cache
              WHERE prompt_hash = ?1 AND created_at > ?2",
         )?;

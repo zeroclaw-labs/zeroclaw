@@ -94,7 +94,8 @@ impl ChannelPairingStore {
                 user_id TEXT NOT NULL DEFAULT '',
                 paired_at INTEGER NOT NULL,
                 PRIMARY KEY (channel, platform_uid)
-            );",
+            );
+            CREATE INDEX IF NOT EXISTS idx_pairing_tokens_expires ON pairing_tokens(expires_at);",
         )
         .expect("Failed to initialize pairing tables");
 

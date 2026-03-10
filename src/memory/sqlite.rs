@@ -172,6 +172,7 @@ impl SqliteMemory {
                 updated_at  TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
+            CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at DESC);
             -- Note: no explicit index on `key` — the UNIQUE constraint already
             -- creates an implicit unique B-tree index, so a second one would
             -- waste space and slow inserts.
@@ -435,7 +436,7 @@ impl SqliteMemory {
         let entries: Vec<(String, String)> = tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
             let mut stmt =
-                conn.prepare("SELECT id, content FROM memories WHERE embedding IS NULL")?;
+                conn.prepare_cached("SELECT id, content FROM memories WHERE embedding IS NULL")?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;

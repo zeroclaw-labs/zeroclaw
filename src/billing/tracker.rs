@@ -233,7 +233,7 @@ impl CostTracker {
         )?;
 
         // Per-provider breakdown
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT provider, COALESCE(SUM(cost_usd), 0.0), COALESCE(SUM(input_tokens), 0),
                     COALESCE(SUM(output_tokens), 0), COUNT(*)
              FROM cost_ledger WHERE timestamp >= ?1 AND timestamp <= ?2

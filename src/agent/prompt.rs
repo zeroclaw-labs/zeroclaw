@@ -344,7 +344,7 @@ impl PromptSection for OntologySection {
 
                 let mut prefs_text = String::new();
                 let result: Result<Vec<(String, String)>, _> = (|| {
-                    let mut stmt = conn.prepare(
+                    let mut stmt = conn.prepare_cached(
                         "SELECT o.title, o.properties FROM ontology_objects o
                          JOIN ontology_object_types t ON o.type_id = t.id
                          WHERE t.name = 'Preference' AND o.owner_user_id = ?1
