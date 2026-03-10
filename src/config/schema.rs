@@ -7670,7 +7670,10 @@ challenge_delivery = "dm"
 
         assert!(parsed.security.otp.enabled);
         assert_eq!(parsed.security.otp.method, OtpMethod::Totp);
-        assert_eq!(parsed.security.otp.challenge_delivery.as_deref(), Some("dm"));
+        assert_eq!(
+            parsed.security.otp.challenge_delivery.as_deref(),
+            Some("dm")
+        );
     }
 
     #[test]
@@ -7691,7 +7694,10 @@ challenge_delivery = "dm"
 
         assert!(parsed.security.otp.enabled);
         assert_eq!(parsed.security.otp.method, OtpMethod::Totp);
-        assert_eq!(parsed.security.otp.challenge_delivery.as_deref(), Some("dm"));
+        assert_eq!(
+            parsed.security.otp.challenge_delivery.as_deref(),
+            Some("dm")
+        );
     }
 
     #[test]
