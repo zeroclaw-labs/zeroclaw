@@ -269,7 +269,7 @@ cd zeroclaw
 ./install.sh --prebuilt-only
 
 # Optional: run onboarding in the same flow
-./install.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
+./install.sh --onboard --api-key "sk-..." --provider openrouter --model "openrouter/auto"
 
 # Optional: run bootstrap + onboarding fully in Docker-compatible mode
 ./install.sh --docker
@@ -317,8 +317,8 @@ cargo install --path . --force --locked
 # Ensure ~/.cargo/bin is in your PATH
 export PATH="$HOME/.cargo/bin:$PATH"
 
-# Quick setup (no prompts, optional model specification)
-zeroclaw onboard --api-key sk-... --provider openrouter [--model "openrouter/auto"]
+# Quick setup (no prompts)
+zeroclaw onboard --api-key sk-... --provider openrouter --model "openrouter/auto"
 
 # Or interactive wizard
 zeroclaw onboard --interactive

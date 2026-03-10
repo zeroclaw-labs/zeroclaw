@@ -96,7 +96,7 @@ Examples:
   ./install.sh --install-system-deps --install-rust
   ./install.sh --prefer-prebuilt
   ./install.sh --prebuilt-only
-  ./install.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
+  ./install.sh --onboard --api-key "sk-..." --provider openrouter --model "openrouter/auto"
   ./install.sh --interactive-onboard
   ./install.sh --docker
 

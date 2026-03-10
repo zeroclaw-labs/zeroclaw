@@ -13,7 +13,7 @@ For first-time setup and quick orientation.
 
 | Scenario | Command |
 |----------|---------|
-| I have an API key, want fastest setup | `zeroclaw onboard --api-key sk-... --provider openrouter` |
+| I have an API key, want fastest setup | `zeroclaw onboard --api-key sk-... --provider openrouter --model "openrouter/auto"` |
 | I want guided prompts | `zeroclaw onboard --interactive` |
 | Config exists, just fix channels | `zeroclaw onboard --channels-only` |
 | Config exists, I intentionally want full overwrite | `zeroclaw onboard --force` |
@@ -21,7 +21,7 @@ For first-time setup and quick orientation.
 
 ## Onboarding and Validation
 
-- Quick onboarding: `zeroclaw onboard --api-key "sk-..." --provider openrouter`
+- Quick onboarding: `zeroclaw onboard --api-key "sk-..." --provider openrouter --model "openrouter/auto"`
 - Interactive onboarding: `zeroclaw onboard --interactive`
 - Existing config protection: reruns require explicit confirmation (or `--force` in non-interactive flows)
 - Ollama cloud models (`:cloud`) require a remote `api_url` and API key (for example `api_url = "https://ollama.com"`).

@@ -101,13 +101,13 @@ it pulls `ghcr.io/zeroclaw-labs/zeroclaw:latest` and tags it locally before runn
 ### Quick onboarding (non-interactive)
 
 ```bash
-./install.sh --onboard --api-key "sk-..." --provider openrouter
+./install.sh --onboard --api-key "sk-..." --provider openrouter --model "openrouter/auto"
 ```
 
 Or with environment variables:
 
 ```bash
-ZEROCLAW_API_KEY="sk-..." ZEROCLAW_PROVIDER="openrouter" ./install.sh --onboard
+ZEROCLAW_API_KEY="sk-..." ZEROCLAW_PROVIDER="openrouter" ZEROCLAW_MODEL="openrouter/auto" ./install.sh --onboard
 ```
 
 ### Interactive onboarding
