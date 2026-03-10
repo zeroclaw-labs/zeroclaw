@@ -1,0 +1,426 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: acp-client
+  namespace: ai-agents
+data:
+  acp-client.py: |
+    #!/usr/bin/env python3
+    """Async ACP-over-HTTP client for delegating tasks to Goose.
+
+    IMPORTANT: Goose typically takes 1-10+ minutes to respond. Use the async
+    send/poll workflow below — do NOT use send-sync unless you have a very
+    long timeout.
+
+    Typical workflow:
+      1. acp-client send "Your task here"
+         → Returns immediately: PENDING acp_session_id=<id> session_id=<id>
+      2. acp-client poll <acp-session-id>
+         → RUNNING (shows elapsed time and partial output)
+         → Repeat every 30-60s until status changes
+      3. acp-client poll <acp-session-id>
+         → COMPLETE (prints full response)
+         or
+         acp-client result <acp-session-id>
+         → Prints just the response text
+
+    Commands:
+      acp-client send "Your message here"
+          Non-blocking. Sends prompt to Goose and returns immediately.
+          A background process collects the response asynchronously.
+          Output: PENDING acp_session_id=<id> session_id=<id>
+
+      acp-client poll <acp-session-id>
+          Check status: RUNNING (with partial output), COMPLETE, or ERROR.
+          Safe to call repeatedly — each call completes in <1s.
+
+      acp-client result <acp-session-id>
+          Print the full response text (waits up to 10s if still running).
+
+      acp-client send-sync "Your message here"
+          Blocking version: waits for full response. WARNING: takes 1-10+
+          minutes. Only use with a long timeout or for interactive testing.
+
+      acp-client health
+          Check if Goose ACP server is reachable.
+
+      acp-client delete <acp-session-id>
+          Tear down an ACP session.
+
+      acp-client cleanup
+          Remove completed session files older than 1 hour.
+
+    Environment:
+      ACP_BASE_URL  — default: http://goose-acp.ai-agents.svc.cluster.local:8080
+      ACP_CWD       — working directory for new sessions (default: /tmp)
+
+    Session files are stored in /tmp/acp-sessions/<acp-session-id>/
+    """
+
+    import json
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+    import urllib.request
+    import urllib.error
+
+    BASE_URL = os.environ.get("ACP_BASE_URL", "http://goose-acp.ai-agents.svc.cluster.local:8080")
+    ACP_ENDPOINT = f"{BASE_URL}/acp"
+    DEFAULT_CWD = os.environ.get("ACP_CWD", "/tmp")
+    SESSION_DIR = "/tmp/acp-sessions"
+
+    INIT_PARAMS = {
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": {"name": "acp-client", "version": "0.3.0"},
+    }
+
+    # --- JSON-RPC / HTTP helpers ---
+
+    def _jsonrpc(method, id, params=None):
+        msg = {"jsonrpc": "2.0", "method": method, "id": id}
+        if params is not None:
+            msg["params"] = params
+        return json.dumps(msg).encode()
+
+    def _post(data, acp_session_id=None, timeout=300):
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if acp_session_id:
+            headers["Acp-Session-Id"] = acp_session_id
+        req = urllib.request.Request(ACP_ENDPOINT, data=data, headers=headers, method="POST")
+        return urllib.request.urlopen(req, timeout=timeout)
+
+    def _read_sse_events(response):
+        """Read SSE stream line-by-line using readline() to avoid buffering stalls."""
+        while True:
+            raw_line = response.readline()
+            if not raw_line:
+                break
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if line.startswith("data:"):
+                data = line[5:].strip()
+                if data:
+                    try:
+                        yield json.loads(data)
+                    except json.JSONDecodeError:
+                        pass
+
+    def _wait_for_result(response):
+        """Read SSE events until a JSON-RPC result is received, then close."""
+        for msg in _read_sse_events(response):
+            if "result" in msg:
+                response.close()
+                return msg["result"]
+        response.close()
+        return None
+
+    def _extract_text(msg):
+        """Extract human-readable text from an ACP notification or result."""
+        if "result" in msg:
+            return None
+        params = msg.get("params", {})
+        update = params.get("update", params)
+        content = update.get("content", {})
+        if isinstance(content, dict) and content.get("text"):
+            return content["text"]
+        chunk = update.get("chunk", "")
+        if chunk:
+            return chunk
+        if update.get("type") == "ToolCall" or "tool_name" in update:
+            name = update.get("tool_name", update.get("name", "unknown"))
+            status = update.get("status", "")
+            return f"[tool: {name} — {status}]"
+        if "tool_call_id" in update:
+            status = update.get("status", "")
+            result_text = update.get("result", "")
+            if result_text:
+                r = str(result_text)[:200]
+                return f"[tool result ({status}): {r}]"
+            return f"[tool {status}]"
+        return None
+
+    # --- Session file helpers ---
+
+    def _session_dir(acp_session_id):
+        return os.path.join(SESSION_DIR, acp_session_id)
+
+    def _write_status(acp_session_id, status, extra=None):
+        d = _session_dir(acp_session_id)
+        os.makedirs(d, exist_ok=True)
+        data = {"status": status, "updated": time.time()}
+        if extra:
+            data.update(extra)
+        with open(os.path.join(d, "status.json"), "w") as f:
+            json.dump(data, f)
+
+    def _read_status(acp_session_id):
+        path = os.path.join(_session_dir(acp_session_id), "status.json")
+        if not os.path.exists(path):
+            return None
+        with open(path) as f:
+            return json.load(f)
+
+    def _append_response(acp_session_id, text):
+        d = _session_dir(acp_session_id)
+        with open(os.path.join(d, "response.txt"), "a") as f:
+            f.write(text)
+
+    def _read_response(acp_session_id):
+        path = os.path.join(_session_dir(acp_session_id), "response.txt")
+        if not os.path.exists(path):
+            return ""
+        with open(path) as f:
+            return f.read()
+
+    # --- ACP session setup (shared by send and send-sync) ---
+
+    def _init_and_create_session():
+        """Initialize ACP connection and create a goose session.
+        Returns (acp_session_id, session_id) or raises."""
+        resp = _post(_jsonrpc("initialize", 1, INIT_PARAMS), timeout=30)
+        acp_session_id = resp.headers.get("Acp-Session-Id", "")
+        _wait_for_result(resp)
+        if not acp_session_id:
+            raise RuntimeError("Failed to initialize ACP connection")
+
+        resp2 = _post(_jsonrpc("session/new", 2, {"cwd": DEFAULT_CWD, "mcpServers": []}),
+                       acp_session_id, timeout=30)
+        result = _wait_for_result(resp2)
+        session_id = (result.get("sessionId", result.get("session_id", "")) if result else "")
+        if not session_id:
+            raise RuntimeError("Failed to create session")
+
+        return acp_session_id, session_id
+
+    # --- Commands ---
+
+    def cmd_health():
+        req = urllib.request.Request(f"{BASE_URL}/health")
+        resp = urllib.request.urlopen(req, timeout=5)
+        print(resp.read().decode())
+
+    def cmd_send(text):
+        """Non-blocking: init, create session, send prompt, return immediately."""
+        try:
+            acp_session_id, session_id = _init_and_create_session()
+        except Exception as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        # Write initial status
+        _write_status(acp_session_id, "running", {
+            "session_id": session_id,
+            "prompt": text,
+            "started": time.time(),
+        })
+
+        # Spawn background collector: runs _collect as a detached subprocess
+        subprocess.Popen(
+            [sys.executable, __file__, "_collect", acp_session_id, session_id, text],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+        # Return immediately with session info
+        print(f"PENDING acp_session_id={acp_session_id} session_id={session_id}")
+
+    def cmd_collect(acp_session_id, session_id, text):
+        """Internal: called as a background process to read the SSE stream."""
+        # Ignore SIGHUP so we survive parent death
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+        try:
+            params = {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]}
+            resp = _post(_jsonrpc("session/prompt", 3, params), acp_session_id, timeout=900)
+
+            for msg in _read_sse_events(resp):
+                if "result" in msg:
+                    break
+                text_chunk = _extract_text(msg)
+                if text_chunk:
+                    _append_response(acp_session_id, text_chunk)
+                    # Touch status to show we're alive
+                    _write_status(acp_session_id, "running", {
+                        "session_id": session_id,
+                        "last_chunk": time.time(),
+                    })
+            resp.close()
+
+            _write_status(acp_session_id, "complete", {
+                "session_id": session_id,
+                "finished": time.time(),
+            })
+        except Exception as e:
+            _write_status(acp_session_id, "error", {
+                "session_id": session_id,
+                "error": str(e),
+            })
+
+    def cmd_poll(acp_session_id):
+        """Check status of a background request."""
+        status = _read_status(acp_session_id)
+        if status is None:
+            print(f"ERROR: no session found for {acp_session_id}", file=sys.stderr)
+            sys.exit(1)
+
+        s = status["status"]
+        response_text = _read_response(acp_session_id)
+
+        if s == "running":
+            elapsed = time.time() - status.get("started", status.get("updated", 0))
+            last_chunk = status.get("last_chunk")
+            if last_chunk:
+                chunk_ago = int(time.time() - last_chunk)
+                print(f"RUNNING ({int(elapsed)}s elapsed, last activity {chunk_ago}s ago)")
+            else:
+                print(f"RUNNING ({int(elapsed)}s elapsed, waiting for first response)")
+            if response_text:
+                # Show last 500 chars of partial response
+                partial = response_text[-500:] if len(response_text) > 500 else response_text
+                print(f"---partial---\n{partial}")
+        elif s == "complete":
+            print("COMPLETE")
+            if response_text:
+                print(response_text)
+            else:
+                print("(empty response)")
+        elif s == "error":
+            print(f"ERROR: {status.get('error', 'unknown error')}")
+        else:
+            print(f"UNKNOWN status: {s}")
+
+    def cmd_result(acp_session_id):
+        """Get the final response. Waits up to 10s if still running."""
+        for _ in range(10):
+            status = _read_status(acp_session_id)
+            if status is None:
+                print(f"ERROR: no session found for {acp_session_id}", file=sys.stderr)
+                sys.exit(1)
+            if status["status"] != "running":
+                break
+            time.sleep(1)
+
+        response_text = _read_response(acp_session_id)
+        if status["status"] == "complete":
+            print(response_text if response_text else "(empty response)")
+        elif status["status"] == "running":
+            print(f"STILL_RUNNING")
+            if response_text:
+                partial = response_text[-500:] if len(response_text) > 500 else response_text
+                print(f"---partial---\n{partial}")
+        else:
+            print(f"ERROR: {status.get('error', 'unknown error')}", file=sys.stderr)
+            sys.exit(1)
+
+    def cmd_send_sync(text):
+        """Blocking: init → new session → prompt → stream full response."""
+        try:
+            acp_session_id, session_id = _init_and_create_session()
+        except Exception as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"[session: {session_id} | acp: {acp_session_id}]", file=sys.stderr)
+
+        params = {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]}
+        resp = _post(_jsonrpc("session/prompt", 3, params), acp_session_id)
+        for msg in _read_sse_events(resp):
+            if "result" in msg:
+                break
+            text_chunk = _extract_text(msg)
+            if text_chunk:
+                sys.stdout.write(text_chunk)
+                sys.stdout.flush()
+        resp.close()
+        print()
+
+    def cmd_delete(acp_session_id):
+        """Delete an ACP session."""
+        headers = {"Acp-Session-Id": acp_session_id}
+        req = urllib.request.Request(ACP_ENDPOINT, headers=headers, method="DELETE")
+        resp = urllib.request.urlopen(req, timeout=10)
+        print(f"Deleted: HTTP {resp.status}")
+
+    def cmd_cleanup():
+        """Remove session directories older than 1 hour."""
+        if not os.path.isdir(SESSION_DIR):
+            print("No sessions to clean up.")
+            return
+        now = time.time()
+        count = 0
+        for name in os.listdir(SESSION_DIR):
+            d = os.path.join(SESSION_DIR, name)
+            if not os.path.isdir(d):
+                continue
+            status_file = os.path.join(d, "status.json")
+            if os.path.exists(status_file):
+                mtime = os.path.getmtime(status_file)
+                if now - mtime > 3600:
+                    for f in os.listdir(d):
+                        os.remove(os.path.join(d, f))
+                    os.rmdir(d)
+                    count += 1
+        print(f"Cleaned up {count} session(s).")
+
+    def main():
+        if len(sys.argv) < 2:
+            print(__doc__)
+            sys.exit(1)
+
+        cmd = sys.argv[1]
+
+        if cmd in ("help", "--help", "-h"):
+            print(__doc__)
+            sys.exit(0)
+        elif cmd == "health":
+            cmd_health()
+        elif cmd == "send":
+            if len(sys.argv) < 3:
+                print("Usage: acp-client send \"message\"", file=sys.stderr)
+                sys.exit(1)
+            cmd_send(" ".join(sys.argv[2:]))
+        elif cmd == "send-sync":
+            if len(sys.argv) < 3:
+                print("Usage: acp-client send-sync \"message\"", file=sys.stderr)
+                sys.exit(1)
+            cmd_send_sync(" ".join(sys.argv[2:]))
+        elif cmd == "poll":
+            if len(sys.argv) < 3:
+                print("Usage: acp-client poll <acp-session-id>", file=sys.stderr)
+                sys.exit(1)
+            cmd_poll(sys.argv[2])
+        elif cmd == "result":
+            if len(sys.argv) < 3:
+                print("Usage: acp-client result <acp-session-id>", file=sys.stderr)
+                sys.exit(1)
+            cmd_result(sys.argv[2])
+        elif cmd == "_collect":
+            if len(sys.argv) < 5:
+                sys.exit(1)
+            cmd_collect(sys.argv[2], sys.argv[3], " ".join(sys.argv[4:]))
+        elif cmd == "delete":
+            if len(sys.argv) < 3:
+                print("Usage: acp-client delete <acp-session-id>", file=sys.stderr)
+                sys.exit(1)
+            cmd_delete(sys.argv[2])
+        elif cmd == "cleanup":
+            cmd_cleanup()
+        # Keep old 'ask' as alias for send-sync (backwards compat)
+        elif cmd == "ask":
+            if len(sys.argv) < 3:
+                print("Usage: acp-client ask \"message\"", file=sys.stderr)
+                sys.exit(1)
+            cmd_send_sync(" ".join(sys.argv[2:]))
+        else:
+            print(f"Unknown command: {cmd}", file=sys.stderr)
+            print(__doc__)
+            sys.exit(1)
+
+    if __name__ == "__main__":
+        main()

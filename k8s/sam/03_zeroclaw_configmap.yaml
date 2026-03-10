@@ -54,8 +54,8 @@ data:
 
       [agent]
       max_tool_iterations = 999
-      loop_detection_no_progress_threshold = 5
-      loop_detection_failure_streak = 5
+      loop_detection_no_progress_threshold = 15
+      loop_detection_failure_streak = 10
 
       [heartbeat]
       enabled = true

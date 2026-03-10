@@ -61,6 +61,28 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+    # ACP-over-HTTP to goose-subagent (legacy WebSocket)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ai-agents
+          podSelector:
+            matchLabels:
+              app: goose-subagent
+      ports:
+        - protocol: TCP
+          port: 8080
+    # ACP-over-HTTP to goose-acp (standardized ACP protocol)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ai-agents
+          podSelector:
+            matchLabels:
+              app: goose-acp
+      ports:
+        - protocol: TCP
+          port: 8080
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0

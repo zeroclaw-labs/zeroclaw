@@ -143,6 +143,10 @@ spec:
           volumeMounts:
             - name: zeroclaw-data
               mountPath: /data
+            - name: acp-client
+              mountPath: /usr/local/bin/acp-client
+              subPath: acp-client.py
+              readOnly: true
         - name: serena
           image: citizendaniel/zeroclaw-sam:v1.3.7
           imagePullPolicy: IfNotPresent
@@ -217,6 +221,10 @@ spec:
         - name: zeroclaw-identity
           configMap:
             name: zeroclaw-identity
+        - name: acp-client
+          configMap:
+            name: acp-client
+            defaultMode: 0755
   volumeClaimTemplates:
     - metadata:
         name: zeroclaw-data
