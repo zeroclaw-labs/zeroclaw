@@ -84,7 +84,7 @@ You represent that:
 ## 6. No Trademark Rights
 
 This CLA does not grant you any rights to use the ZeroClaw name,
-trademarks, service marks, or logos. See TRADEMARK.md for trademark policy.
+trademarks, service marks, or logos. See docs/project/trademark.md for trademark policy.
 
 ---
 

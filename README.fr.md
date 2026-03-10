@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="zeroclaw.png" alt="ZeroClaw" width="200" />
+  <img src="docs/assets/zeroclaw.png" alt="ZeroClaw" width="200" />
 </p>
 
 <h1 align="center">ZeroClaw 🦀</h1>
@@ -95,7 +95,7 @@ Benchmark rapide sur machine locale (macOS arm64, fév. 2026) normalisé pour ma
 > Notes : Les résultats ZeroClaw sont mesurés sur des builds de production utilisant `/usr/bin/time -l`. OpenClaw nécessite le runtime Node.js (typiquement ~390 Mo de surcharge mémoire supplémentaire), tandis que NanoBot nécessite le runtime Python. PicoClaw et ZeroClaw sont des binaires statiques. Les chiffres RAM ci-dessus sont la mémoire runtime ; les exigences de compilation build-time sont plus élevées.
 
 <p align="center">
-  <img src="zero-claw.jpeg" alt="Comparaison ZeroClaw vs OpenClaw" width="800" />
+  <img src="docs/assets/zeroclaw-comparison.jpeg" alt="Comparaison ZeroClaw vs OpenClaw" width="800" />
 </p>
 
 ### Mesure locale reproductible
@@ -826,7 +826,7 @@ Nous construisons en open source parce que les meilleures idées viennent de par
 
 > <https://github.com/zeroclaw-labs/zeroclaw>
 
-Tout autre dépôt, organisation, domaine ou package prétendant être "ZeroClaw" ou impliquant une affiliation avec ZeroClaw Labs est **non autorisé et non affilié à ce projet**. Les forks non autorisés connus seront listés dans [TRADEMARK.md](TRADEMARK.md).
+Tout autre dépôt, organisation, domaine ou package prétendant être "ZeroClaw" ou impliquant une affiliation avec ZeroClaw Labs est **non autorisé et non affilié à ce projet**. Les forks non autorisés connus seront listés dans [TRADEMARK.md](docs/project/trademark.md).
 
 Si vous rencontrez une usurpation d'identité ou une utilisation abusive de marque, veuillez [ouvrir une issue](https://github.com/zeroclaw-labs/zeroclaw/issues).
 
@@ -841,11 +841,11 @@ ZeroClaw est sous double licence pour une ouverture maximale et la protection de
 | [MIT](LICENSE-MIT)               | Open-source, recherche, académique, usage personnel          |
 | [Apache 2.0](LICENSE-APACHE) | Protection de brevet, institutionnel, déploiement commercial |
 
-Vous pouvez choisir l'une ou l'autre licence. **Les contributeurs accordent automatiquement des droits sous les deux** — voir [CLA.md](CLA.md) pour l'accord de contributeur complet.
+Vous pouvez choisir l'une ou l'autre licence. **Les contributeurs accordent automatiquement des droits sous les deux** — voir [CLA.md](docs/contributing/cla.md) pour l'accord de contributeur complet.
 
 ### Marque
 
-Le nom **ZeroClaw** et le logo sont des marques déposées de ZeroClaw Labs. Cette licence n'accorde pas la permission de les utiliser pour impliquer une approbation ou une affiliation. Voir [TRADEMARK.md](TRADEMARK.md) pour les utilisations permises et interdites.
+Le nom **ZeroClaw** et le logo sont des marques déposées de ZeroClaw Labs. Cette licence n'accorde pas la permission de les utiliser pour impliquer une approbation ou une affiliation. Voir [TRADEMARK.md](docs/project/trademark.md) pour les utilisations permises et interdites.
 
 ### Protections des Contributeurs
 
@@ -856,7 +856,7 @@ Le nom **ZeroClaw** et le logo sont des marques déposées de ZeroClaw Labs. Cet
 
 ## Contribuer
 
-Voir [CONTRIBUTING.md](CONTRIBUTING.md) et [CLA.md](CLA.md). Implémentez un trait, soumettez une PR :
+Voir [CONTRIBUTING.md](CONTRIBUTING.md) et [CLA.md](docs/contributing/cla.md). Implémentez un trait, soumettez une PR :
 
 - Guide de workflow CI : [docs/ci-map.md](docs/ci-map.md)
 - Nouveau `Provider` → `src/providers/`
