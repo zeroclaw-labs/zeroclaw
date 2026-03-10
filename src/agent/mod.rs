@@ -12,4 +12,4 @@ mod tests;
 #[allow(unused_imports)]
 pub use agent::{Agent, AgentBuilder};
 #[allow(unused_imports)]
-pub use loop_::{process_message, run};
+pub use loop_::{process_message, process_message_with_stream, run};

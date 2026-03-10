@@ -44,12 +44,13 @@ Last refreshed: **February 18, 2026**.
 
 ### 3) Operations & Deployment
 
-- [ops/README.md](ops/README.md)
-- [operations-runbook.md](ops/operations-runbook.md)
-- [release-process.md](contributing/release-process.md)
-- [troubleshooting.md](ops/troubleshooting.md)
-- [network-deployment.md](ops/network-deployment.md)
-- [mattermost-setup.md](setup-guides/mattermost-setup.md)
+- [operations/README.md](operations/README.md)
+- [operations-runbook.md](operations-runbook.md)
+- [release-process.md](release-process.md)
+- [troubleshooting.md](troubleshooting.md)
+- [network-deployment.md](network-deployment.md)
+- [node-control-websocket-design.md](node-control-websocket-design.md) — Gateway WebSocket for nodes + nodes tool (proposal)
+- [mattermost-setup.md](mattermost-setup.md)
 
 ### 4) Security Design & Proposals
 

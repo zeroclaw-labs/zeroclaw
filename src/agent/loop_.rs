@@ -1860,7 +1860,7 @@ pub(crate) fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
-/// When `silent` is true, suppresses stdout (for channel use).
+/// When `silent` is true, suppresses stdout (for channel or non-CLI use).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn agent_turn(
     provider: &dyn Provider,
@@ -1873,6 +1873,8 @@ pub(crate) async fn agent_turn(
     silent: bool,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    excluded_tools: &[String],
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -1888,9 +1890,9 @@ pub(crate) async fn agent_turn(
         multimodal_config,
         max_tool_iterations,
         None,
+        on_delta,
         None,
-        None,
-        &[],
+        excluded_tools,
     )
     .await
 }
@@ -1904,6 +1906,7 @@ async fn execute_one_tool(
 ) -> Result<ToolExecutionOutcome> {
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
+        arguments: call_arguments.to_string(),
     });
     let start = Instant::now();
 
@@ -2158,7 +2161,7 @@ pub(crate) async fn run_tool_call_loop(
 
         // Unified path via Provider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
-        let request_tools = if use_native_tools {
+        let request_tools = if !tool_specs.is_empty() {
             Some(tool_specs.as_slice())
         } else {
             None
@@ -2953,6 +2956,17 @@ pub async fn run(
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
     }
+
+    // For non-CLI callers (daemon / cron / gateway-style runs), apply the
+    // non_cli_excluded_tools allowlist so these tools are neither advertised
+    // in the system prompt nor callable at runtime.
+    if !interactive {
+        let excluded = &config.autonomy.non_cli_excluded_tools;
+        if !excluded.is_empty() {
+            tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+        }
+    }
+
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -2982,6 +2996,14 @@ pub async fn run(
         None
     };
     let channel_name = if interactive { "cli" } else { "daemon" };
+
+    // Determine which tools to exclude during the tool loop. CLI runs ignore
+    // non_cli_excluded_tools; daemon/cron runs honor the configured list.
+    let excluded_tools: Vec<String> = if interactive {
+        Vec::new()
+    } else {
+        config.autonomy.non_cli_excluded_tools.clone()
+    };
 
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
@@ -3034,7 +3056,7 @@ pub async fn run(
             None,
             None,
             None,
-            &[],
+            &excluded_tools,
         )
         .await?;
         final_output = response.clone();
@@ -3156,7 +3178,7 @@ pub async fn run(
                 None,
                 None,
                 None,
-                &[],
+                &excluded_tools,
             )
             .await
             {
@@ -3210,7 +3232,24 @@ pub async fn run(
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
-pub async fn process_message(config: Config, message: &str) -> Result<String> {
+/// `extra_tools` can be used by callers (for example, the HTTP gateway) to inject
+/// additional tools such as the `nodes` tool backed by a shared registry.
+pub async fn process_message(
+    config: Config,
+    message: &str,
+    extra_tools: Option<Vec<Box<dyn Tool>>>,
+) -> Result<String> {
+    process_message_with_stream(config, message, extra_tools, None).await
+}
+
+/// 与 `process_message` 相同，但允许将 agent 的终局回答通过 `on_delta` 渠道
+/// 流式输出（复用工具循环中的 streaming sender 机制）。
+pub async fn process_message_with_stream(
+    config: Config,
+    message: &str,
+    extra_tools: Option<Vec<Box<dyn Tool>>>,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+) -> Result<String> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -3252,6 +3291,10 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
+
+    if let Some(mut extra) = extra_tools {
+        tools_registry.append(&mut extra);
+    }
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config
@@ -3338,6 +3381,12 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
             "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
         ));
     }
+
+    // Apply non-CLI tool exclusions so `/response` 和通道场景不会暴露这些工具
+    let excluded = &config.autonomy.non_cli_excluded_tools;
+    if !excluded.is_empty() {
+        tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+    }
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -3388,6 +3437,8 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         true,
         &config.multimodal,
         config.agent.max_tool_iterations,
+        &config.autonomy.non_cli_excluded_tools,
+        on_delta,
     )
     .await
 }

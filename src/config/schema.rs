@@ -790,6 +790,35 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
+
+    /// Enable node control (WebSocket nodes + nodes tool)
+    #[serde(default)]
+    pub node_control: NodeControlConfig,
+}
+
+/// Node control configuration (`[gateway.node_control]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NodeControlConfig {
+    /// Enable node control (WebSocket nodes + nodes tool)
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allowed node IDs for node control
+    #[serde(default)]
+    pub allowed_node_ids: Vec<String>,
+    /// Optional shared secret for node-control HTTP/WebSocket APIs.
+    /// When set, inbound requests must include `X-Node-Control-Token`.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+impl Default for NodeControlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_node_ids: Vec::new(),
+            auth_token: None,
+        }
+    }
 }
 
 fn default_gateway_port() -> u16 {
@@ -838,6 +867,7 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+            node_control: NodeControlConfig::default(),
         }
     }
 }
@@ -5984,6 +6014,7 @@ channel_id = "C123"
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
+            node_control: NodeControlConfig::default(),
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
