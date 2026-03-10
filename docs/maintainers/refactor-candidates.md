@@ -102,6 +102,16 @@ The `python/` subtree has minimal type hints, no docstrings on key functions, an
 
 Only sets `edition = "2021"`. For a project this size, configuring `max_width`, `imports_granularity`, `group_imports` would enforce consistency as contributor count grows.
 
+### Resolved: CI/CD security hardening (P1/P2)
+
+~~Third-party actions pinned to mutable tags; release workflows granted overly broad write permissions; no composite gate job for branch protection; security tools compiled from source on every PR.~~
+
+**Fixed in** `cicd-best-practices` **branch:**
+- All third-party actions SHA-pinned (P1)
+- Release workflow permissions scoped per-job (P1)
+- Composite `Gate` job added to PR checks (P2)
+- Security tools installed via pre-built binaries (P2)
+
 ## Priority Recommendations
 
 1. **Replace unwraps/panics in non-test code** with proper error propagation — highest stability impact.
