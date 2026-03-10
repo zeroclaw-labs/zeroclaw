@@ -201,6 +201,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arbitrary"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
+dependencies = [
+ "derive_arbitrary",
+]
+
+[[package]]
 name = "archery"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -392,6 +401,15 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "web-sys",
+]
+
+[[package]]
+name = "atoi_simd"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a49e05797ca52e312a0c658938b7d00693ef037799ef7187678f212d7684cf"
+dependencies = [
+ "debug_unsafe",
 ]
 
 [[package]]
@@ -736,6 +754,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6bd91ee7b2422bcb158d90ef4d14f75ef67f340943fc4149891dcce8f8b972a3"
 
 [[package]]
+name = "calamine"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da56b262e8a827c6b12c3dde4ea4622e0ff542bd2e9ea5855e4cb523481d77b7"
+dependencies = [
+ "atoi_simd",
+ "byteorder",
+ "codepage",
+ "encoding_rs",
+ "fast-float2",
+ "log",
+ "quick-xml",
+ "serde",
+ "zip",
+]
+
+[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -953,6 +988,15 @@ checksum = "b4ef0193218d365c251b5b9297f9911a908a8ddd2ebd3a36cc5d0ef0f63aee9e"
 dependencies = [
  "heapless",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "codepage"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48f68d061bc2828ae826206326e61251aca94c1e4a5305cf52d9138639c918b4"
+dependencies = [
+ "encoding_rs",
 ]
 
 [[package]]
@@ -1360,6 +1404,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "debug_unsafe"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7eed2c4702fa172d1ce21078faa7c5203e69f5394d48cc436d25928394a867a2"
+
+[[package]]
 name = "decancer"
 version = "3.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1436,6 +1486,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "derive_arbitrary"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.116",
 ]
 
 [[package]]
@@ -1875,6 +1936,12 @@ dependencies = [
  "url",
  "webdriver",
 ]
+
+[[package]]
+name = "fast-float2"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8eb564c5c7423d25c886fb561d1e4ee69f72354d16918afa32c08811f6b6a55"
 
 [[package]]
 name = "fastrand"
@@ -4773,6 +4840,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 dependencies = [
  "image",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.38.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
+dependencies = [
+ "encoding_rs",
+ "memchr",
 ]
 
 [[package]]
@@ -8021,6 +8098,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "calamine",
  "chacha20poly1305",
  "chrono",
  "chrono-tz",
@@ -8239,6 +8317,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "zip"
+version = "4.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caa8cd6af31c3b31c6631b8f483848b91589021b28fffe50adada48d4f4d2ed1"
+dependencies = [
+ "arbitrary",
+ "crc32fast",
+ "flate2",
+ "indexmap",
+ "memchr",
+ "zopfli",
+]
+
+[[package]]
 name = "zlib-rs"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8249,6 +8341,18 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[package]]
+name = "zopfli"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f05cd8797d63865425ff89b5c4a48804f35ba0ce8d125800027ad6017d2b5249"
+dependencies = [
+ "bumpalo",
+ "crc32fast",
+ "log",
+ "simd-adler32",
+]
 
 [[package]]
 name = "zune-core"

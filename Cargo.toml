@@ -107,6 +107,7 @@ cron = "0.15"
 # Interactive CLI prompts
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 console = "0.16"
+calamine = "0.31"
 
 # Hardware discovery (device path globbing)
 glob = "0.3"

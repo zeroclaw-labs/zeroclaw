@@ -1,0 +1,120 @@
+# ZeroClaw development compose (source-mounted) with OpenAI Codex + Discord channel.
+#
+# Usage:
+#   1) Copy .env.codex-discord.example -> .env and fill DISCORD_BOT_TOKEN
+#   2) Run `make dev`
+#
+# Notes:
+# - Source is bind-mounted so code changes are immediately available in-container.
+# - Config is generated from environment on each container start.
+# - OpenAI Codex uses subscription OAuth profiles (no OPENAI_API_KEY required).
+
+services:
+  zeroclaw-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    container_name: zeroclaw-dev-codex-discord
+    restart: unless-stopped
+    working_dir: /app
+
+    environment:
+      HOME: /app
+      PATH: /usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      ZEROCLAW_CONFIG_DIR: /app/.zeroclaw
+      ZEROCLAW_WORKSPACE: /app/playground
+      ZEROCLAW_ALLOW_PUBLIC_BIND: "true"
+      ZEROCLAW_GATEWAY_PORT: "42617"
+      RUST_LOG: ${RUST_LOG:-info}
+      ZEROCLAW_CARGO_FEATURES: ${ZEROCLAW_CARGO_FEATURES:-rag-pdf}
+      ZEROCLAW_RUNTIME_TRACE_MODE: ${ZEROCLAW_RUNTIME_TRACE_MODE:-rolling}
+      ZEROCLAW_RUNTIME_TRACE_PATH: ${ZEROCLAW_RUNTIME_TRACE_PATH:-state/runtime-trace.jsonl}
+      ZEROCLAW_RUNTIME_TRACE_MAX_ENTRIES: ${ZEROCLAW_RUNTIME_TRACE_MAX_ENTRIES:-2000}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:?set DISCORD_BOT_TOKEN in .env}
+      DISCORD_MENTION_ONLY: ${DISCORD_MENTION_ONLY:-false}
+      DISCORD_LISTEN_TO_BOTS: ${DISCORD_LISTEN_TO_BOTS:-false}
+      CARGO_TARGET_DIR: /app/target
+
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -euo pipefail
+
+        mkdir -p /app/.zeroclaw /app/playground
+        cat > /usr/local/bin/zeroclaw <<'EOF'
+        #!/usr/bin/env bash
+        set -euo pipefail
+        if [ -n "${ZEROCLAW_CARGO_FEATURES:-}" ]; then
+          exec cargo run --features "${ZEROCLAW_CARGO_FEATURES}" -- "$@"
+        fi
+        exec cargo run -- "$@"
+        EOF
+        chmod +x /usr/local/bin/zeroclaw
+
+        discord_mention_only="$$(printf '%s' "${DISCORD_MENTION_ONLY:-false}" | tr '[:upper:]' '[:lower:]')"
+        case "$${discord_mention_only}" in
+          true|false) ;;
+          *) discord_mention_only="false" ;;
+        esac
+
+        discord_listen_to_bots="$$(printf '%s' "${DISCORD_LISTEN_TO_BOTS:-false}" | tr '[:upper:]' '[:lower:]')"
+        case "$${discord_listen_to_bots}" in
+          true|false) ;;
+          *) discord_listen_to_bots="false" ;;
+        esac
+
+        runtime_trace_mode="$$(printf '%s' "${ZEROCLAW_RUNTIME_TRACE_MODE:-rolling}" | tr '[:upper:]' '[:lower:]')"
+        case "$${runtime_trace_mode}" in
+          none|rolling|full) ;;
+          *) runtime_trace_mode="rolling" ;;
+        esac
+
+        runtime_trace_path="${ZEROCLAW_RUNTIME_TRACE_PATH:-state/runtime-trace.jsonl}"
+        runtime_trace_max_entries="${ZEROCLAW_RUNTIME_TRACE_MAX_ENTRIES:-2000}"
+        case "$${runtime_trace_max_entries}" in
+          ''|*[!0-9]*) runtime_trace_max_entries="2000" ;;
+        esac
+
+        printf '%s\n' \
+          'default_provider = "openai-codex"' \
+          'default_model = "gpt-5.3-codex"' \
+          'default_temperature = 0.2' \
+          '' \
+          '[observability]' \
+          'backend = "none"' \
+          "runtime_trace_mode = \"$${runtime_trace_mode}\"" \
+          "runtime_trace_path = \"$${runtime_trace_path}\"" \
+          "runtime_trace_max_entries = $${runtime_trace_max_entries}" \
+          '' \
+          '[gateway]' \
+          'port = 42617' \
+          'host = "[::]"' \
+          'allow_public_bind = true' \
+          '' \
+          '[channels_config]' \
+          'cli = false' \
+          '' \
+          '[channels_config.discord]' \
+          "bot_token = \"${DISCORD_BOT_TOKEN}\"" \
+          'allowed_users = ["*"]' \
+          "listen_to_bots = $${discord_listen_to_bots}" \
+          "mention_only = $${discord_mention_only}" \
+          > /app/.zeroclaw/config.toml
+
+        exec zeroclaw daemon
+
+    volumes:
+      - ./:/app
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - cargo-target:/app/target
+
+    ports:
+      - "42617:42617"
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  cargo-target:

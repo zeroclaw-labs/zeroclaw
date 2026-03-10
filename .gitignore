@@ -29,3 +29,9 @@ venv/
 *.pem
 credentials.json
 .worktrees/
+
+
+
+.bash_history
+.zeroclaw/
+playground/

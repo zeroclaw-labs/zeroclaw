@@ -1,5 +1,7 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use calamine::Reader;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
@@ -58,14 +60,38 @@ impl DiscordChannel {
 /// Process Discord message attachments and return a string to append to the
 /// agent message context.
 ///
-/// Only `text/*` MIME types are fetched and inlined. All other types are
-/// silently skipped. Fetch errors are logged as warnings.
+/// Supported ingestion:
+/// - `text/*`, `application/json`, `text/csv` -> inlined text
+/// - `image/*` (png/jpg/jpeg/webp/gif/bmp) -> `[IMAGE:data:...]` marker
+/// - `application/pdf` -> extracted text (when built with `rag-pdf`), otherwise saved path
+/// - `.xlsx` -> extracted table preview text, with saved path fallback
+///
+/// Attachments that cannot be inlined are still saved to workspace and referenced
+/// so the model can use tools like `file_read`.
 async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
 ) -> String {
+    const MAX_ATTACHMENTS: usize = 12;
+    const MAX_INLINE_TEXT_CHARS: usize = 16_000;
+    const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
     let mut parts: Vec<String> = Vec::new();
-    for att in attachments {
+    if !attachments.is_empty() {
+        tracing::info!(
+            count = attachments.len(),
+            "discord: processing incoming attachments"
+        );
+    }
+    for (index, att) in attachments.iter().enumerate() {
+        if index >= MAX_ATTACHMENTS {
+            tracing::warn!(
+                max = MAX_ATTACHMENTS,
+                "discord: attachment list truncated for safety"
+            );
+            break;
+        }
+
         let ct = att
             .get("content_type")
             .and_then(|v| v.as_str())
@@ -74,33 +100,299 @@ async fn process_attachments(
             .get("filename")
             .and_then(|v| v.as_str())
             .unwrap_or("file");
+        let size = att.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
         let Some(url) = att.get("url").and_then(|v| v.as_str()) else {
             tracing::warn!(name, "discord: attachment has no url, skipping");
             continue;
         };
-        if ct.starts_with("text/") {
-            match client.get(url).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    if let Ok(text) = resp.text().await {
-                        parts.push(format!("[{name}]\n{text}"));
-                    }
-                }
-                Ok(resp) => {
-                    tracing::warn!(name, status = %resp.status(), "discord attachment fetch failed");
-                }
-                Err(e) => {
-                    tracing::warn!(name, error = %e, "discord attachment fetch error");
-                }
-            }
-        } else {
-            tracing::debug!(
+        let content_type = normalize_attachment_content_type(ct, name);
+
+        let bytes = match fetch_attachment_bytes(client, url, name).await {
+            Some(bytes) => bytes,
+            None => continue,
+        };
+
+        if let Some(saved_path) = save_attachment_to_workspace(name, &bytes).await {
+            tracing::info!(
                 name,
-                content_type = ct,
-                "discord: skipping unsupported attachment type"
+                content_type = content_type,
+                bytes = bytes.len(),
+                path = saved_path,
+                "discord: attachment saved to workspace"
             );
         }
+
+        if is_inline_text_type(&content_type) {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            parts.push(format!(
+                "[{name}]\n{}",
+                truncate_chars(&text, MAX_INLINE_TEXT_CHARS)
+            ));
+            continue;
+        }
+
+        if is_supported_image_type(&content_type) {
+            if bytes.len() > MAX_IMAGE_BYTES {
+                tracing::warn!(
+                    name,
+                    bytes = bytes.len(),
+                    max = MAX_IMAGE_BYTES,
+                    "discord: image attachment exceeds multimodal size limit; skipped"
+                );
+                continue;
+            }
+
+            let data_uri = format!("data:{content_type};base64,{}", STANDARD.encode(&bytes));
+            parts.push(format!("[Image: {name}]\n[IMAGE:{data_uri}]"));
+            continue;
+        }
+
+        if content_type == "application/pdf" {
+            if let Some(text) = extract_pdf_text(&bytes) {
+                parts.push(format!(
+                    "[{name}]\n{}",
+                    truncate_chars(&text, MAX_INLINE_TEXT_CHARS)
+                ));
+            } else {
+                let notice = format!(
+                    "[{name}] PDF received but text extraction is unavailable in this build. \
+Use file tools on the saved attachment in workspace."
+                );
+                parts.push(notice);
+            }
+            continue;
+        }
+
+        if is_xlsx_type(&content_type, name) {
+            if let Some(text) = extract_xlsx_preview(&bytes) {
+                parts.push(format!(
+                    "[{name}]\n{}",
+                    truncate_chars(&text, MAX_INLINE_TEXT_CHARS)
+                ));
+            } else {
+                parts.push(format!(
+                    "[{name}] XLSX received but preview extraction failed. \
+Use file tools on the saved attachment in workspace."
+                ));
+            }
+            continue;
+        }
+
+        tracing::warn!(
+            name,
+            content_type = content_type,
+            bytes = size,
+            "discord: unsupported attachment type; saved for tool-based handling"
+        );
+        parts.push(format!(
+            "[{name}] attachment type '{content_type}' saved to workspace for tool-based handling."
+        ));
     }
     parts.join("\n---\n")
+}
+
+fn normalize_attachment_content_type(content_type: &str, filename: &str) -> String {
+    let normalized = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !normalized.is_empty() {
+        return normalized;
+    }
+
+    match filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "txt" | "md" | "log" | "xml" | "yaml" | "yml" | "toml" => "text/plain".to_string(),
+        "csv" => "text/csv".to_string(),
+        "json" => "application/json".to_string(),
+        "pdf" => "application/pdf".to_string(),
+        "xlsx" => {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string()
+        }
+        "png" => "image/png".to_string(),
+        "jpg" | "jpeg" => "image/jpeg".to_string(),
+        "webp" => "image/webp".to_string(),
+        "gif" => "image/gif".to_string(),
+        "bmp" => "image/bmp".to_string(),
+        _ => "application/octet-stream".to_string(),
+    }
+}
+
+fn is_inline_text_type(content_type: &str) -> bool {
+    content_type.starts_with("text/")
+        || matches!(
+            content_type,
+            "application/json" | "application/ld+json" | "application/x-ndjson"
+        )
+}
+
+fn is_supported_image_type(content_type: &str) -> bool {
+    matches!(
+        content_type,
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif" | "image/bmp"
+    )
+}
+
+fn is_xlsx_type(content_type: &str, filename: &str) -> bool {
+    content_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        || filename.to_ascii_lowercase().ends_with(".xlsx")
+}
+
+fn truncate_chars(input: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (i, ch) in input.chars().enumerate() {
+        if i >= max_chars {
+            out.push_str("\n[...truncated...]");
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+async fn fetch_attachment_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    name: &str,
+) -> Option<Vec<u8>> {
+    let response = match client.get(url).send().await {
+        Ok(resp) => resp,
+        Err(error) => {
+            tracing::warn!(name, error = %error, "discord attachment fetch error");
+            return None;
+        }
+    };
+
+    if !response.status().is_success() {
+        tracing::warn!(
+            name,
+            status = %response.status(),
+            "discord attachment fetch failed"
+        );
+        return None;
+    }
+
+    match response.bytes().await {
+        Ok(bytes) => Some(bytes.to_vec()),
+        Err(error) => {
+            tracing::warn!(
+                name,
+                error = %error,
+                "discord attachment byte read failed"
+            );
+            None
+        }
+    }
+}
+
+async fn save_attachment_to_workspace(filename: &str, bytes: &[u8]) -> Option<String> {
+    let workspace = std::env::var("ZEROCLAW_WORKSPACE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| ".".to_string());
+
+    let incoming_dir = Path::new(&workspace).join("incoming").join("discord");
+    if tokio::fs::create_dir_all(&incoming_dir).await.is_err() {
+        return None;
+    }
+
+    let safe_name = sanitize_filename(filename);
+    let target_name = format!("{}_{}", Uuid::new_v4(), safe_name);
+    let full_path = incoming_dir.join(&target_name);
+    if tokio::fs::write(&full_path, bytes).await.is_err() {
+        return None;
+    }
+
+    Some(format!("incoming/discord/{target_name}"))
+}
+
+fn sanitize_filename(filename: &str) -> String {
+    let mut out = String::with_capacity(filename.len().max(8));
+    for ch in filename.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "attachment.bin".to_string()
+    } else {
+        out
+    }
+}
+
+#[cfg(feature = "rag-pdf")]
+fn extract_pdf_text(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 5 || &bytes[..5] != b"%PDF-" {
+        return None;
+    }
+    let text = pdf_extract::extract_text_from_mem(bytes).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
+#[cfg(not(feature = "rag-pdf"))]
+fn extract_pdf_text(_bytes: &[u8]) -> Option<String> {
+    None
+}
+
+fn extract_xlsx_preview(bytes: &[u8]) -> Option<String> {
+    use std::io::Write;
+
+    let temp_path = std::env::temp_dir().join(format!("zeroclaw_discord_{}.xlsx", Uuid::new_v4()));
+    let mut file = std::fs::File::create(&temp_path).ok()?;
+    if file.write_all(bytes).is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+        return None;
+    }
+
+    let mut workbook = match calamine::open_workbook_auto(&temp_path) {
+        Ok(wb) => wb,
+        Err(_) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return None;
+        }
+    };
+
+    let sheet_names = workbook.sheet_names().to_vec();
+    let mut lines = Vec::new();
+    for (sheet_idx, sheet_name) in sheet_names.iter().take(3).enumerate() {
+        if let Some(Ok(range)) = workbook.worksheet_range_at(sheet_idx) {
+            lines.push(format!("[Sheet: {sheet_name}]"));
+            for row in range.rows().take(120) {
+                let cells: Vec<String> = row
+                    .iter()
+                    .take(20)
+                    .map(|cell| cell.to_string())
+                    .collect();
+                if cells.iter().all(|cell| cell.trim().is_empty()) {
+                    continue;
+                }
+                lines.push(cells.join(", "));
+            }
+            lines.push(String::new());
+        }
+    }
+
+    let _ = std::fs::remove_file(&temp_path);
+
+    let content = lines.join("\n");
+    if content.trim().is_empty() {
+        None
+    } else {
+        Some(content)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,6 +545,97 @@ async fn send_discord_message_json(
             .await
             .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
         anyhow::bail!("Discord send message failed ({status}): {err}");
+    }
+
+    Ok(())
+}
+
+async fn create_discord_message_json(
+    client: &reqwest::Client,
+    bot_token: &str,
+    recipient: &str,
+    content: &str,
+) -> anyhow::Result<String> {
+    let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
+    let body = json!({ "content": content });
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bot {bot_token}"))
+        .json(&body)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+        anyhow::bail!("Discord create message failed ({status}): {err}");
+    }
+
+    let payload: serde_json::Value = resp.json().await?;
+    let message_id = payload.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if message_id.is_empty() {
+        anyhow::bail!("Discord create message returned empty message id");
+    }
+
+    Ok(message_id.to_string())
+}
+
+async fn edit_discord_message_json(
+    client: &reqwest::Client,
+    bot_token: &str,
+    recipient: &str,
+    message_id: &str,
+    content: &str,
+) -> anyhow::Result<()> {
+    let raw_message_id = message_id.strip_prefix("discord_").unwrap_or(message_id);
+    let url = format!("https://discord.com/api/v10/channels/{recipient}/messages/{raw_message_id}");
+    let body = json!({ "content": content });
+
+    let resp = client
+        .patch(&url)
+        .header("Authorization", format!("Bot {bot_token}"))
+        .json(&body)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+        anyhow::bail!("Discord edit message failed ({status}): {err}");
+    }
+
+    Ok(())
+}
+
+async fn delete_discord_message(
+    client: &reqwest::Client,
+    bot_token: &str,
+    recipient: &str,
+    message_id: &str,
+) -> anyhow::Result<()> {
+    let raw_message_id = message_id.strip_prefix("discord_").unwrap_or(message_id);
+    let url = format!("https://discord.com/api/v10/channels/{recipient}/messages/{raw_message_id}");
+
+    let resp = client
+        .delete(&url)
+        .header("Authorization", format!("Bot {bot_token}"))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+        anyhow::bail!("Discord delete message failed ({status}): {err}");
     }
 
     Ok(())
@@ -824,6 +1207,82 @@ impl Channel for DiscordChannel {
             handle.abort();
         }
         Ok(())
+    }
+
+    fn supports_draft_updates(&self) -> bool {
+        true
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        let content = if message.content.trim().is_empty() {
+            "⏳ Thinking..."
+        } else {
+            message.content.trim()
+        };
+        let content = truncate_chars(content, DISCORD_MAX_MESSAGE_LENGTH);
+        let message_id = create_discord_message_json(
+            &self.http_client(),
+            &self.bot_token,
+            &message.recipient,
+            &content,
+        )
+        .await?;
+        Ok(Some(message_id))
+    }
+
+    async fn update_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let content = if text.trim().is_empty() {
+            "⏳ Thinking..."
+        } else {
+            text.trim()
+        };
+        let content = truncate_chars(content, DISCORD_MAX_MESSAGE_LENGTH);
+        edit_discord_message_json(
+            &self.http_client(),
+            &self.bot_token,
+            recipient,
+            message_id,
+            &content,
+        )
+        .await
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let normalized = text.trim();
+        let chunks = if normalized.is_empty() {
+            vec!["(empty response)".to_string()]
+        } else {
+            split_message_for_discord(normalized)
+        };
+
+        edit_discord_message_json(
+            &self.http_client(),
+            &self.bot_token,
+            recipient,
+            message_id,
+            &chunks[0],
+        )
+        .await?;
+
+        for extra in chunks.iter().skip(1) {
+            send_discord_message_json(&self.http_client(), &self.bot_token, recipient, extra).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        delete_discord_message(&self.http_client(), &self.bot_token, recipient, message_id).await
     }
 
     async fn add_reaction(
