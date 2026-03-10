@@ -606,10 +606,9 @@ impl SlackChannel {
         let host = url.host_str().unwrap_or("unknown-host");
         let tail = url
             .path_segments()
-            .and_then(|segments| {
+            .and_then(|mut segments| {
                 segments
-                    .filter(|segment| !segment.is_empty())
-                    .next_back()
+                    .rfind(|segment| !segment.is_empty())
                     .map(str::to_string)
             })
             .unwrap_or_else(|| "root".to_string());
@@ -2367,7 +2366,9 @@ mod tests {
                 "U123".to_string(),
                 CachedSlackDisplayName {
                     display_name: "Expired Name".to_string(),
-                    expires_at: Instant::now() - Duration::from_secs(1),
+                    expires_at: Instant::now()
+                        .checked_sub(Duration::from_secs(1))
+                        .expect("instant should allow subtracting one second in tests"),
                 },
             );
         }
@@ -2406,7 +2407,7 @@ mod tests {
     #[test]
     fn compose_incoming_content_allows_attachment_only_messages() {
         let composed = SlackChannel::compose_incoming_content(
-            "".to_string(),
+            String::new(),
             vec!["[IMAGE:data:image/png;base64,aaaa]".to_string()],
         );
         assert_eq!(
