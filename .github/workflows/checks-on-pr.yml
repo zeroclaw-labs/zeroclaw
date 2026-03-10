@@ -112,13 +112,11 @@ jobs:
           toolchain: 1.92.0
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
-      - uses: taiki-e/install-action@a37010ded18ff788be4440302bd6830b1ae50d8b # v2
-        with:
-          tool: cargo-audit
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
 
-      - uses: taiki-e/install-action@a37010ded18ff788be4440302bd6830b1ae50d8b # v2
-        with:
-          tool: cargo-deny
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
 
       - name: Audit dependencies
         run: cargo audit
