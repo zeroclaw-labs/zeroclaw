@@ -404,6 +404,7 @@ impl DelegateTool {
                 temperature,
                 true,
                 None,
+                None,
                 "delegate",
                 &self.multimodal_config,
                 agent_config.max_iterations,

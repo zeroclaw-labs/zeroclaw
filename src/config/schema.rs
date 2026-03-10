@@ -2722,6 +2722,10 @@ fn default_draft_update_interval_ms() -> u64 {
     1000
 }
 
+fn default_telegram_approval_timeout_secs() -> u64 {
+    300
+}
+
 /// Telegram bot channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TelegramConfig {
@@ -2743,6 +2747,10 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// Seconds to wait for inline button approval before auto-denying.
+    /// Applies to tools listed in `autonomy.always_ask`.
+    #[serde(default = "default_telegram_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -5101,6 +5109,7 @@ default_temperature = 0.7
                     draft_update_interval_ms: default_draft_update_interval_ms(),
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    approval_timeout_secs: 300,
                 }),
                 discord: None,
                 slack: None,
@@ -5472,6 +5481,7 @@ tool_dispatcher = "xml"
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
             mention_only: false,
+            approval_timeout_secs: 300,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();

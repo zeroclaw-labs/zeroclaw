@@ -404,6 +404,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            approval_timeout_secs: 300,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -536,6 +537,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            approval_timeout_secs: 300,
         });
 
         let target = heartbeat_delivery_target(&config).unwrap();

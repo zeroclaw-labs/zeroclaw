@@ -68,6 +68,7 @@ pub use whatsapp::WhatsAppChannel;
 pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
+use crate::approval::ApprovalManager;
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -224,6 +225,8 @@ struct ChannelRuntimeContext {
     multimodal: crate::config::MultimodalConfig,
     hooks: Option<Arc<crate::hooks::HookRunner>>,
     non_cli_excluded_tools: Arc<Vec<String>>,
+    telegram_approval_broker: Option<Arc<telegram::TelegramApprovalBroker>>,
+    approval_manager: Option<Arc<ApprovalManager>>,
 }
 
 #[derive(Clone)]
@@ -1725,6 +1728,27 @@ async fn process_channel_message(
         Cancelled,
     }
 
+    // Build Telegram approval handle if this message comes from Telegram
+    let tg_approval = if msg.channel == "telegram" {
+        ctx.telegram_approval_broker.as_ref().and_then(|broker| {
+            // reply_target may be "chat_id" or "chat_id:thread_id"
+            let chat_id_str = msg
+                .reply_target
+                .split(':')
+                .next()
+                .unwrap_or(&msg.reply_target);
+            chat_id_str
+                .parse::<i64>()
+                .ok()
+                .map(|chat_id| telegram::TelegramApprovalRequest {
+                    broker: Arc::clone(broker),
+                    chat_id,
+                })
+        })
+    } else {
+        None
+    };
+
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
     let llm_result = tokio::select! {
@@ -1740,7 +1764,11 @@ async fn process_channel_message(
                 route.model.as_str(),
                 runtime_defaults.temperature,
                 true,
-                None,
+                // Only activate ApprovalManager when we have a channel-specific
+                // approval mechanism available (currently Telegram only).
+                // Other channels fall through to None → auto-approve as before.
+                if tg_approval.is_some() { ctx.approval_manager.as_deref() } else { None },
+                tg_approval.as_ref(),
                 msg.channel.as_str(),
                 &ctx.multimodal,
                 ctx.max_tool_iterations,
@@ -2681,22 +2709,27 @@ struct ConfiguredChannel {
 fn collect_configured_channels(
     config: &Config,
     matrix_skip_context: &str,
-) -> Vec<ConfiguredChannel> {
+) -> (
+    Vec<ConfiguredChannel>,
+    Option<Arc<telegram::TelegramApprovalBroker>>,
+) {
     let mut channels = Vec::new();
+    let mut tg_approval_broker = None;
 
     if let Some(ref tg) = config.channels_config.telegram {
+        let tg_channel = TelegramChannel::new(
+            tg.bot_token.clone(),
+            tg.allowed_users.clone(),
+            tg.mention_only,
+        )
+        .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+        .with_approval_timeout(tg.approval_timeout_secs)
+        .with_transcription(config.transcription.clone())
+        .with_workspace_dir(config.workspace_dir.clone());
+        tg_approval_broker = Some(Arc::clone(tg_channel.approval_broker()));
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
-            channel: Arc::new(
-                TelegramChannel::new(
-                    tg.bot_token.clone(),
-                    tg.allowed_users.clone(),
-                    tg.mention_only,
-                )
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                .with_transcription(config.transcription.clone())
-                .with_workspace_dir(config.workspace_dir.clone()),
-            ),
+            channel: Arc::new(tg_channel),
         });
     }
 
@@ -2961,12 +2994,12 @@ fn collect_configured_channels(
         });
     }
 
-    channels
+    (channels, tg_approval_broker)
 }
 
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
-    let mut channels = collect_configured_channels(&config, "health check");
+    let (mut channels, _) = collect_configured_channels(&config, "health check");
 
     if let Some(ref ns) = config.channels_config.nostr {
         channels.push(ConfiguredChannel {
@@ -3202,11 +3235,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     // Collect active channels from a shared builder to keep startup and doctor parity.
-    let mut channels: Vec<Arc<dyn Channel>> =
-        collect_configured_channels(&config, "runtime startup")
-            .into_iter()
-            .map(|configured| configured.channel)
-            .collect();
+    let (configured_channels, tg_approval_broker) =
+        collect_configured_channels(&config, "runtime startup");
+    let mut channels: Vec<Arc<dyn Channel>> = configured_channels
+        .into_iter()
+        .map(|configured| configured.channel)
+        .collect();
 
     if let Some(ref ns) = config.channels_config.nostr {
         channels.push(Arc::new(
@@ -3321,6 +3355,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
             None
         },
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
+        telegram_approval_broker: tg_approval_broker,
+        approval_manager: Some(Arc::new(ApprovalManager::from_config(&config.autonomy))),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3534,6 +3570,8 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -3583,6 +3621,8 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -3635,6 +3675,8 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4108,6 +4150,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
         });
@@ -4167,6 +4211,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
         });
@@ -4242,6 +4288,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         });
 
         process_channel_message(
@@ -4301,6 +4349,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         });
 
         process_channel_message(
@@ -4369,6 +4419,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         });
 
         process_channel_message(
@@ -4458,6 +4510,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         });
 
         process_channel_message(
@@ -4529,6 +4583,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         });
 
         process_channel_message(
@@ -4615,6 +4671,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         });
 
         process_channel_message(
@@ -4686,6 +4744,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         });
 
         process_channel_message(
@@ -4746,6 +4806,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         });
 
         process_channel_message(
@@ -4917,6 +4979,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -4997,6 +5061,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5089,6 +5155,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5163,6 +5231,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         });
 
         process_channel_message(
@@ -5222,6 +5292,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         });
 
         process_channel_message(
@@ -5738,6 +5810,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         });
 
         process_channel_message(
@@ -5823,6 +5897,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         });
 
         process_channel_message(
@@ -5908,6 +5984,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         });
 
         process_channel_message(
@@ -6225,7 +6303,7 @@ This is an example JSON object for profile settings."#;
             mention_only: Some(false),
         });
 
-        let channels = collect_configured_channels(&config, "test");
+        let (channels, _) = collect_configured_channels(&config, "test");
 
         assert!(channels
             .iter()
@@ -6457,6 +6535,8 @@ This is an example JSON object for profile settings."#;
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -6523,6 +6603,8 @@ This is an example JSON object for profile settings."#;
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            telegram_approval_broker: None,
+            approval_manager: None,
         });
 
         process_channel_message(
