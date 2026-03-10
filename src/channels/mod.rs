@@ -415,17 +415,28 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
         "matrix" => Some(
-            "When responding on Matrix:\n\
-             - You CAN send files, images, audio, and voice messages to the chat.\n\
-             - For media attachments use markers: [IMAGE:<path>], [FILE:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
-             - First create the file using your tools (file_write, shell), then include the marker in your response.\n\
-             - You CAN react to user messages with emoji. Use marker: [REACT:<emoji>:<event_id>]\n\
-             - React naturally, like a person would — when something is funny, impressive, agreed upon, etc. Do not react to every message.\n\
-             - The event_id comes from the incoming message id. Example: [REACT:👍:$abc123]\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n\
-             - Use Markdown formatting: **bold**, *italic*, `code`, code blocks with triple backticks.\n\
+            "When responding on Matrix:\n\n\
+             ## Media\n\
+             - You CAN send files, images, audio, and voice messages.\n\
+             - Markers: [IMAGE:<path>], [FILE:<path>], [AUDIO:<path>], [VOICE:<path>]\n\
+             - Create the file first with your tools, then include the marker.\n\n\
+             ## Reactions\n\
+             - You CAN react to messages with emoji: [REACT:<emoji>:<event_id>]\n\
+             - React naturally and sparingly — only when genuinely appropriate.\n\
+             - Do NOT react to every message. Do NOT copy the user's reaction back.\n\
+             - When you receive [Reaction: emoji on your message: \"text\"] — this is feedback on YOUR response. Understand the emoji meaning (👍=good, 👎=bad, ❤️=love, 😂=funny, ❌=wrong/redo).\n\
+             - When you receive [Reaction: emoji on their message: \"text\"] — user reacted to their own message as an addition/emphasis.\n\
+             - Do NOT send a text reply just to acknowledge a reaction unless it requires action (like ❌ or 👎).\n\n\
+             ## Location\n\
+             - You CAN send locations: [LOCATION:geo:lat,lon:Description]\n\
+             - When you receive [Location: geo:lat,lon] — user shared their location.\n\n\
+             ## Replies\n\
+             - When you receive [Reply to $event_id] prefix — user is replying to a specific earlier message, consider that context.\n\n\
+             ## Formatting\n\
+             - Keep markers outside normal text, never in code fences.\n\
+             - Use Markdown: **bold**, *italic*, `code`, code blocks.\n\
              - Be concise and direct. Skip filler phrases.\n\
-             - Use tool results silently: answer the latest user message directly, and do not narrate internal tool execution.",
+             - Use tool results silently: answer directly, do not narrate internal execution.",
         ),
         _ => None,
     }

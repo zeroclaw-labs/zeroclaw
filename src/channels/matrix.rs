@@ -13,7 +13,10 @@ use matrix_sdk::{
             reaction::{OriginalSyncReactionEvent, ReactionEventContent},
             relation::Annotation,
             room::{
-                message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+                message::{
+                    LocationMessageEventContent, MessageType, OriginalSyncRoomMessageEvent,
+                    RoomMessageEventContent,
+                },
                 MediaSource,
             },
         },
@@ -167,6 +170,55 @@ fn parse_matrix_reaction_markers(message: &str) -> (String, Vec<MatrixOutgoingRe
     cleaned.push_str(rest);
 
     (cleaned.trim().to_string(), reactions)
+}
+
+// --- Outgoing location marker: [LOCATION:geo:lat,lon:description] ---
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MatrixOutgoingLocation {
+    geo_uri: String,
+    description: String,
+}
+
+/// Parse `[LOCATION:geo_uri:description]` markers from response text.
+fn parse_matrix_location_markers(message: &str) -> (String, Vec<MatrixOutgoingLocation>) {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut locations = Vec::new();
+    let mut rest = message;
+
+    while let Some(start) = rest.find("[LOCATION:") {
+        cleaned.push_str(&rest[..start]);
+        let after_prefix = &rest[start + 10..];
+        if let Some(end) = after_prefix.find(']') {
+            let inner = &after_prefix[..end];
+            // Split: "geo:lat,lon:Description text"
+            // geo_uri is "geo:..." up to second ':', description is the rest
+            if let Some(geo_end) = inner.find(',').and_then(|comma_pos| {
+                // Find the ':' after the comma (end of geo_uri)
+                inner[comma_pos..].find(':').map(|p| comma_pos + p)
+            }) {
+                let geo_uri = inner[..geo_end].trim().to_string();
+                let description = inner[geo_end + 1..].trim().to_string();
+                if !geo_uri.is_empty() {
+                    locations.push(MatrixOutgoingLocation {
+                        geo_uri,
+                        description: if description.is_empty() {
+                            "Shared location".to_string()
+                        } else {
+                            description
+                        },
+                    });
+                }
+            }
+            rest = &after_prefix[end + 1..];
+        } else {
+            cleaned.push_str(&rest[start..start + 10]);
+            rest = after_prefix;
+        }
+    }
+    cleaned.push_str(rest);
+
+    (cleaned.trim().to_string(), locations)
 }
 
 // --- Outgoing attachment marker types (follows Telegram/Discord pattern) ---
@@ -448,7 +500,7 @@ impl MatrixChannel {
     fn media_save_dir(&self) -> Option<PathBuf> {
         self.zeroclaw_dir
             .as_ref()
-            .map(|dir| dir.join("matrix_files"))
+            .map(|dir| dir.join("workspace").join("matrix_files"))
     }
 
     fn is_user_allowed(&self, sender: &str) -> bool {
@@ -1059,8 +1111,9 @@ impl Channel for MatrixChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let raw_content = super::strip_tool_call_tags(&message.content);
         let (after_reactions, reaction_markers) = parse_matrix_reaction_markers(&raw_content);
+        let (after_locations, location_markers) = parse_matrix_location_markers(&after_reactions);
         let (cleaned_content, parsed_attachments) =
-            parse_matrix_attachment_markers(&after_reactions);
+            parse_matrix_attachment_markers(&after_locations);
 
         let client = self.matrix_client().await?;
         let target_room_id = self.target_room_id().await?;
@@ -1091,6 +1144,19 @@ impl Channel for MatrixChannel {
                 if let Err(error) = room.send(content).await {
                     tracing::warn!("Matrix reaction send failed: {error}");
                 }
+            }
+        }
+
+        // Send location markers.
+        for location in &location_markers {
+            let content = RoomMessageEventContent::new(MessageType::Location(
+                LocationMessageEventContent::new(
+                    location.description.clone(),
+                    location.geo_uri.clone(),
+                ),
+            ));
+            if let Err(error) = room.send(content).await {
+                tracing::warn!("Matrix location send failed: {error}");
             }
         }
 
@@ -1156,11 +1222,14 @@ impl Channel for MatrixChannel {
             }
         }
 
-        // Send remaining text (if any) after attachments.
+        // Send remaining text (if any) after attachments/reactions.
         if !cleaned_content.is_empty() {
             room.send(RoomMessageEventContent::text_markdown(&cleaned_content))
                 .await?;
-        } else if parsed_attachments.is_empty() {
+        } else if parsed_attachments.is_empty()
+            && reaction_markers.is_empty()
+            && location_markers.is_empty()
+        {
             // No markers were found — send original content as text.
             room.send(RoomMessageEventContent::text_markdown(&raw_content))
                 .await?;
@@ -1398,7 +1467,17 @@ impl Channel for MatrixChannel {
                             }
                         }
                     }
+                    MessageType::Location(content) => {
+                        format!("[Location: {}] {}", content.geo_uri, content.body)
+                    }
                     _ => return,
+                };
+
+                // Prepend reply context if this message is a reply to another.
+                let body = if let Some(matrix_sdk::ruma::events::room::message::Relation::Reply { in_reply_to }) = &event.content.relates_to {
+                    format!("[Reply to {}] {}", in_reply_to.event_id, body)
+                } else {
+                    body
                 };
 
                 if !MatrixChannel::has_non_empty_body(&body) {
@@ -1481,8 +1560,46 @@ impl Channel for MatrixChannel {
                 }
 
                 let emoji = &event.content.relates_to.key;
-                let target_event = event.content.relates_to.event_id.to_string();
-                let body = format!("[Reaction: {emoji}] on message {target_event}");
+                let target_event_id = &event.content.relates_to.event_id;
+
+                // Fetch the original message to provide context.
+                let (original_author, original_text) = match room.event(target_event_id, None).await
+                {
+                    Ok(timeline_event) => {
+                        let raw = timeline_event.raw();
+                        match raw.deserialize() {
+                            Ok(any_event) => {
+                                let author = any_event.sender().to_string();
+                                // Extract body from the raw JSON content.
+                                let text = serde_json::to_value(raw)
+                                    .ok()
+                                    .and_then(|v| {
+                                        v.get("content")?
+                                            .get("body")?
+                                            .as_str()
+                                            .map(|s| s.to_string())
+                                    })
+                                    .unwrap_or_default();
+                                (author, text)
+                            }
+                            Err(_) => (String::new(), String::new()),
+                        }
+                    }
+                    Err(_) => (String::new(), String::new()),
+                };
+
+                let is_own_message = original_author == my_user_id.as_str();
+                let author_label = if is_own_message {
+                    "your message"
+                } else {
+                    "their message"
+                };
+                let preview = if original_text.len() > 100 {
+                    format!("{}…", &original_text[..100])
+                } else {
+                    original_text.clone()
+                };
+                let body = format!("[Reaction: {emoji} on {author_label}: \"{preview}\"]");
 
                 let msg = ChannelMessage {
                     id: event_id,
@@ -2079,7 +2196,7 @@ mod tests {
         let ch = make_channel_with_zeroclaw_dir();
         assert_eq!(
             ch.media_save_dir(),
-            Some(PathBuf::from("/tmp/zeroclaw/matrix_files"))
+            Some(PathBuf::from("/tmp/zeroclaw/workspace/matrix_files"))
         );
     }
 
