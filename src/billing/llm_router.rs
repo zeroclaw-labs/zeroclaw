@@ -32,6 +32,7 @@ pub struct AdminKeys {
     pub anthropic: Option<String>,
     pub openai: Option<String>,
     pub gemini: Option<String>,
+    pub perplexity: Option<String>,
 }
 
 impl AdminKeys {
@@ -41,6 +42,7 @@ impl AdminKeys {
             anthropic: std::env::var("ADMIN_ANTHROPIC_API_KEY").ok(),
             openai: std::env::var("ADMIN_OPENAI_API_KEY").ok(),
             gemini: std::env::var("ADMIN_GEMINI_API_KEY").ok(),
+            perplexity: std::env::var("ADMIN_PERPLEXITY_API_KEY").ok(),
         }
     }
 
@@ -50,6 +52,7 @@ impl AdminKeys {
             "anthropic" | "claude" => self.anthropic.as_deref(),
             "openai" | "gpt" => self.openai.as_deref(),
             "gemini" | "google" => self.gemini.as_deref(),
+            "perplexity" => self.perplexity.as_deref(),
             _ => None,
         }
     }
@@ -171,6 +174,7 @@ mod tests {
             anthropic: Some("admin-anthropic-key".to_string()),
             openai: Some("admin-openai-key".to_string()),
             gemini: None,
+            perplexity: None,
         }
     }
 

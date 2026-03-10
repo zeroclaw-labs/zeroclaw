@@ -557,6 +557,10 @@ impl WebSearchTool {
         Ok(lines.join("\n"))
     }
 
+    /// Perplexity Sonar API — uses the Chat Completions endpoint with
+    /// an online model that performs real-time web search and returns
+    /// cited answers.  The old `/search` endpoint does not exist;
+    /// Perplexity exposes only `/chat/completions`.
     async fn search_perplexity(&self, query: &str) -> anyhow::Result<String> {
         let api_key = self.get_next_perplexity_api_key().ok_or_else(|| {
             anyhow::anyhow!(
@@ -570,35 +574,31 @@ impl WebSearchTool {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or("https://api.perplexity.ai");
-        let endpoint = format!("{}/search", api_url.trim_end_matches('/'));
+        let endpoint = format!("{}/chat/completions", api_url.trim_end_matches('/'));
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
             .user_agent(self.user_agent.as_str())
             .build()?;
 
         let mut body = json!({
-            "query": query,
-            "max_results": self.max_results,
+            "model": "sonar",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful search assistant. Answer the query concisely with cited sources."
+                },
+                {
+                    "role": "user",
+                    "content": query
+                }
+            ],
+            "web_search": true
         });
         if let Some(tokens) = self.max_tokens {
             body["max_tokens"] = json!(tokens);
         }
-        if let Some(tokens_per_page) = self.max_tokens_per_page {
-            body["max_tokens_per_page"] = json!(tokens_per_page);
-        }
         if !self.domain_filter.is_empty() {
             body["search_domain_filter"] = json!(self.domain_filter);
-        }
-        if !self.language_filter.is_empty() {
-            body["search_language_filter"] = json!(self.language_filter);
-        }
-        if let Some(country) = self
-            .country
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            body["country"] = json!(country);
         }
         if let Some(recency) = self
             .recency_filter
@@ -615,6 +615,7 @@ impl WebSearchTool {
                 reqwest::header::AUTHORIZATION,
                 format!("Bearer {}", api_key),
             )
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
             .json(&body)
             .send()
             .await
@@ -632,39 +633,32 @@ impl WebSearchTool {
         let parsed: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("Invalid Perplexity response JSON: {e}"))?;
 
-        let results = parsed
-            .get("results")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| anyhow::anyhow!("Perplexity response missing results array"))?;
+        // Extract the assistant's answer from chat completions response.
+        let answer = parsed
+            .pointer("/choices/0/message/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
 
-        if results.is_empty() {
+        if answer.is_empty() {
             return Ok(format!("No results found for: {}", query));
         }
 
-        let mut lines = vec![format!("Search results for: {} (via Perplexity)", query)];
-        for (i, result) in results.iter().take(self.max_results).enumerate() {
-            let title = result
-                .get("title")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("No title");
-            let url = result
-                .get("url")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let snippet = result
-                .get("snippet")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .trim();
+        // Extract citations if available.
+        let mut out = format!("Search results for: {} (via Perplexity Sonar)\n\n{}", query, answer);
 
-            lines.push(format!("{}. {}", i + 1, title));
-            lines.push(format!("   {}", url));
-            if !snippet.is_empty() {
-                lines.push(format!("   {}", snippet));
+        if let Some(citations) = parsed.get("citations").and_then(serde_json::Value::as_array) {
+            if !citations.is_empty() {
+                out.push_str("\n\nSources:");
+                for (i, cite) in citations.iter().enumerate() {
+                    if let Some(url) = cite.as_str() {
+                        out.push_str(&format!("\n[{}] {}", i + 1, url));
+                    }
+                }
             }
         }
 
-        Ok(lines.join("\n"))
+        Ok(out)
     }
 
     async fn search_exa(&self, query: &str) -> anyhow::Result<String> {

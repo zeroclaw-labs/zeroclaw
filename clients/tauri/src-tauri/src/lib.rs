@@ -760,6 +760,119 @@ fn is_zeroclaw_configured() -> bool {
         .unwrap_or(false)
 }
 
+// ── WebView Browsing & Crawling ──────────────────────────────────
+
+/// Fetch a URL via the backend HTTP client, extract readable text,
+/// and return it.  This is used when the user asks MoA to "look at
+/// a web page" or "summarize this URL" — the frontend sends the URL
+/// and receives clean text suitable for LLM summarization.
+///
+/// The extraction uses a lightweight HTML-to-text conversion so the
+/// user never needs to know about DOM selectors.
+#[tauri::command]
+async fn browse_and_extract(
+    url: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let server_url = state.server_url.lock().map_err(|e| e.to_string())?.clone();
+    let token = state.token.lock().map_err(|e| e.to_string())?.clone();
+
+    // Delegate to the ZeroClaw gateway's web_fetch tool via the webhook.
+    // This reuses the existing WebFetchTool (firecrawl/nanohtml2text)
+    // and respects allowed_domains / blocked_domains config.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut req = client
+        .post(format!("{server_url}/webhook"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "message": format!("Use the web_fetch tool to fetch and extract the text content from this URL: {url}"),
+            "tool_hint": "web_fetch"
+        }));
+
+    if let Some(ref t) = token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+
+    let res = req.send().await.map_err(|e| format!("Browse failed: {e}"))?;
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("Browse failed: {text}"));
+    }
+
+    let data: serde_json::Value = res.json().await.map_err(|e| format!("Invalid response: {e}"))?;
+    Ok(data)
+}
+
+/// Perform a web search via the ZeroClaw gateway.
+/// Supports standard search (DuckDuckGo/Brave/etc.) and
+/// AI-powered search (Perplexity Sonar) when the user requests
+/// comprehensive answers.
+///
+/// Parameters:
+/// - `query`: The search query
+/// - `use_perplexity`: If true, use Perplexity Sonar AI search
+/// - `perplexity_api_key`: Optional user-provided Perplexity API key.
+///   If absent and use_perplexity is true, the operator key is used
+///   (with 2x credit deduction).
+#[tauri::command]
+async fn web_search(
+    query: String,
+    use_perplexity: Option<bool>,
+    perplexity_api_key: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let server_url = state.server_url.lock().map_err(|e| e.to_string())?.clone();
+    let token = state.token.lock().map_err(|e| e.to_string())?.clone();
+
+    let provider = if use_perplexity.unwrap_or(false) {
+        "perplexity"
+    } else {
+        "duckduckgo"
+    };
+
+    let mut message = format!(
+        "Use the web_search_tool with provider '{}' to search for: {}",
+        provider, query
+    );
+
+    // If user provided their own Perplexity API key, include it as context
+    if let Some(ref key) = perplexity_api_key {
+        if !key.is_empty() {
+            message.push_str(&format!("\n[User Perplexity API Key: {}]", key));
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut req = client
+        .post(format!("{server_url}/webhook"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "message": message,
+            "tool_hint": "web_search_tool"
+        }));
+
+    if let Some(ref t) = token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+
+    let res = req.send().await.map_err(|e| format!("Search failed: {e}"))?;
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("Search failed: {text}"));
+    }
+
+    let data: serde_json::Value = res.json().await.map_err(|e| format!("Invalid response: {e}"))?;
+    Ok(data)
+}
+
 // ── Entry Point ──────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -818,6 +931,8 @@ pub fn run() {
             is_gateway_running,
             write_zeroclaw_config,
             is_zeroclaw_configured,
+            browse_and_extract,
+            web_search,
         ])
         .setup(|app| {
             // Override data_dir with Tauri's actual app data path

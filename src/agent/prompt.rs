@@ -180,54 +180,17 @@ impl PromptSection for SchedulingSection {
         let has_browser = ctx.tools.iter().any(|t| t.name() == "browser");
 
         let mut out = String::from(
-            "## Periodic Monitoring & Scheduling\n\n\
-             When the user requests periodic, recurring, or scheduled monitoring \
-             (e.g. \"check this website every day\", \"notify me when X changes\", \
-             \"monitor Y every hour\"), use the `cron_add` tool to create a scheduled agent job.\n\n\
-             ### How to create a monitoring job\n\n\
-             Use `cron_add` with `job_type: \"agent\"` and a descriptive `prompt` that tells \
-             the scheduled agent exactly what to check and how to report results.\n\n\
-             Required parameters:\n\
-             - `schedule`: `{\"kind\":\"cron\",\"expr\":\"0 9 * * *\"}` (cron), \
-             `{\"kind\":\"every\",\"every_ms\":3600000}` (interval), or \
-             `{\"kind\":\"at\",\"at\":\"2025-01-01T09:00:00Z\"}` (one-shot)\n\
-             - `job_type`: `\"agent\"`\n\
-             - `prompt`: Clear instructions for the agent job\n\n\
-             Optional parameters:\n\
-             - `name`: Human-readable job name\n\
-             - `delivery`: To send results to a channel, use:\n\
-             ```json\n\
-             {\"mode\":\"announce\",\"channel\":\"telegram\",\"to\":\"<chat_id>\"}\n\
-             ```\n\
-             Supported delivery channels: telegram, discord, slack, kakao, matrix, signal, \
-             whatsapp, email, lark, dingtalk, qq, irc\n\
-             - `session_target`: `\"isolated\"` (default, separate context) or `\"main\"`\n\
-             - `model`: Override model for the job\n",
+            "## Scheduling\n\n\
+             For periodic/recurring tasks, use `cron_add` with `job_type: \"agent\"`.\n\
+             Schedule formats: `{\"kind\":\"cron\",\"expr\":\"0 9 * * *\"}`, \
+             `{\"kind\":\"every\",\"every_ms\":3600000}`, `{\"kind\":\"at\",\"at\":\"...\"}`\n\
+             Optional: `name`, `delivery` (`{\"mode\":\"announce\",\"channel\":\"telegram\",\"to\":\"...\"}`), \
+             `session_target`, `model`.\n",
         );
 
         if has_browser {
-            out.push_str(
-                "\n### Browser access\n\n\
-                 Scheduled agent jobs have full access to the `browser` tool for web scraping \
-                 and monitoring. Include browser instructions in the job prompt when the task \
-                 requires visiting websites.\n",
-            );
+            out.push_str("Agent jobs can use `browser` for web scraping.\n");
         }
-
-        out.push_str(
-            "\n### Example\n\n\
-             User: \"Check the Supreme Court website daily for new case rulings and notify me on Telegram.\"\n\n\
-             Response: Use `cron_add` with:\n\
-             ```json\n\
-             {\n\
-               \"name\": \"court_ruling_monitor\",\n\
-               \"schedule\": {\"kind\": \"cron\", \"expr\": \"0 9 * * *\"},\n\
-               \"job_type\": \"agent\",\n\
-               \"prompt\": \"Use the browser tool to visit the Supreme Court website. Check for new case rulings published today. Summarize any new rulings found.\",\n\
-               \"delivery\": {\"mode\": \"announce\", \"channel\": \"telegram\", \"to\": \"<chat_id>\"}\n\
-             }\n\
-             ```\n",
-        );
 
         Ok(out)
     }
@@ -304,22 +267,12 @@ impl PromptSection for OntologySection {
 
         // Load user preferences from ontology to inject into the prompt.
         let mut out = String::from(
-            "## Ontology (Digital Twin)\n\n\
-             You operate on a Palantir-style ontology that models the user's real world \
-             as Objects (nouns), Links (relationships), and Actions (verbs).\n\n\
-             ### Available Object Types\n\
-             User, Contact, Device, Channel, Task, Project, Document, Meeting, Context, Preference\n\n\
-             ### Workflow\n\
-             1. **Understand context first**: Use `ontology_get_context` to see the user's \
-                current world state (recent contacts, tasks, projects, actions).\n\
-             2. **Search when needed**: Use `ontology_search_objects` to find specific objects.\n\
-             3. **Act through the ontology**: Use `ontology_execute_action` to perform actions \
-                (SendMessage, CreateTask, FetchResource, etc.). This automatically logs \
-                everything and updates the knowledge graph.\n\n\
-             ### Preference Awareness\n\
-             User preferences are stored as Preference objects in the ontology. When relevant, \
-             query preferences before making decisions. Preferences persist across model changes \
-             and sessions.\n",
+            "## Ontology\n\n\
+             A structured knowledge graph models the user's world as Objects, Links, and Actions.\n\
+             Types: User, Contact, Device, Channel, Task, Project, Document, Meeting, Context, Preference\n\n\
+             Tools: `ontology_get_context` (world state), `ontology_search_objects` (find), \
+             `ontology_execute_action` (act — auto-logs + updates graph).\n\
+             Preferences persist across sessions; check before decisions.\n",
         );
 
         // Attempt to load preferences from workspace ontology DB.
