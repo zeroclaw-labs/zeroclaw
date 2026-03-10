@@ -316,12 +316,46 @@ fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool>
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
 
+fn normalize_tool_argument_scalars(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(normalize_tool_argument_scalars)
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => {
+            let type_value = map.get("type").and_then(serde_json::Value::as_str);
+            let scalar_typed_wrapper = map.len() <= 2
+                && map.contains_key("value")
+                && type_value.is_some_and(|kind| {
+                    matches!(kind, "string" | "number" | "integer" | "boolean")
+                });
+
+            if scalar_typed_wrapper {
+                if let Some(inner) = map.get("value") {
+                    return normalize_tool_argument_scalars(inner.clone());
+                }
+            }
+
+            let mut normalized = serde_json::Map::new();
+            for (key, item) in map {
+                normalized.insert(key, normalize_tool_argument_scalars(item));
+            }
+            serde_json::Value::Object(normalized)
+        }
+        other => other,
+    }
+}
+
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
     match raw {
-        Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(s)
-            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
-        Some(value) => value.clone(),
-        None => serde_json::Value::Object(serde_json::Map::new()),
+        Some(serde_json::Value::String(s)) => normalize_tool_argument_scalars(
+            serde_json::from_str::<serde_json::Value>(s)
+                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+        ),
+        Some(value) => normalize_tool_argument_scalars(value.clone()),
+        None => normalize_tool_argument_scalars(serde_json::Value::Object(serde_json::Map::new())),
     }
 }
 
@@ -4984,6 +5018,41 @@ Done."#;
         assert_eq!(
             result.arguments.get("command").and_then(|v| v.as_str()),
             Some("date")
+        );
+    }
+
+    #[test]
+    fn parse_tool_call_value_normalizes_typed_scalar_argument_wrappers() {
+        let value = serde_json::json!({
+            "function": {
+                "name": "shell",
+                "arguments": {
+                    "command": {
+                        "type": "string",
+                        "value": "date +%s"
+                    }
+                }
+            }
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "shell");
+        assert_eq!(
+            result.arguments.get("command").and_then(|v| v.as_str()),
+            Some("date +%s")
+        );
+    }
+
+    #[test]
+    fn parse_tool_call_value_normalizes_string_encoded_typed_wrappers() {
+        let value = serde_json::json!({
+            "name": "shell",
+            "arguments": "{\"command\":{\"type\":\"string\",\"value\":\"date +%s\"}}"
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "shell");
+        assert_eq!(
+            result.arguments.get("command").and_then(|v| v.as_str()),
+            Some("date +%s")
         );
     }
 
