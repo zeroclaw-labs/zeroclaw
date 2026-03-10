@@ -1,6 +1,6 @@
-const STORAGE_KEY_TOKEN = "moa_token";
-const STORAGE_KEY_SERVER = "moa_server_url";
-const STORAGE_KEY_MESSAGES = "moa_chat_messages";
+const STORAGE_KEY_TOKEN = "zeroclaw_token";
+const STORAGE_KEY_SERVER = "zeroclaw_server_url";
+const STORAGE_KEY_MESSAGES = "zeroclaw_chat_messages";
 
 export interface PairResponse {
   paired: boolean;

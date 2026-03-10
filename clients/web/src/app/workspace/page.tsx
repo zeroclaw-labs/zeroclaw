@@ -13,7 +13,7 @@ import {
   getChannelById,
 } from "@/lib/domains";
 
-const STORAGE_KEY_WORKSPACE = "moa_workspace_state";
+const STORAGE_KEY_WORKSPACE = "zeroclaw_workspace_state";
 
 interface WorkspaceState {
   selectedDomain: string | null;

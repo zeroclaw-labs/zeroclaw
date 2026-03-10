@@ -16,7 +16,6 @@ export const metadata: Metadata = {
   keywords: [
     "ZeroClaw",
     "AI agent",
-    "ZeroClaw",
     "\uCE74\uCE74\uC624\uD1A1 AI",
     "AI \uC5D0\uC774\uC804\uD2B8",
     "\uC790\uC728 AI",
