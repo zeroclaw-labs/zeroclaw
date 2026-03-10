@@ -872,7 +872,7 @@ mod tests {
     #[test]
     fn response_message_effective_content_falls_back_to_reasoning() {
         let msg = ResponseMessage {
-            content: Some("".to_string()),
+            content: Some(String::new()),
             reasoning_content: Some("reasoning content".to_string()),
         };
         assert_eq!(msg.effective_content(), "reasoning content");
