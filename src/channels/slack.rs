@@ -47,6 +47,7 @@ const SLACK_ATTACHMENT_FILENAME_MAX_CHARS: usize = 128;
 const SLACK_ATTACHMENT_SAVE_SUBDIR: &str = "slack_files";
 const SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE: usize = 8;
 const SLACK_ATTACHMENT_RENDER_CONCURRENCY: usize = 3;
+const SLACK_MEDIA_REDIRECT_MAX_HOPS: usize = 5;
 const SLACK_ALLOWED_MEDIA_HOST_SUFFIXES: &[&str] =
     &["slack.com", "slack-edge.com", "slack-files.com"];
 const SLACK_SUPPORTED_IMAGE_MIME_TYPES: &[&str] = &[
@@ -711,72 +712,73 @@ impl SlackChannel {
         Some(target)
     }
 
-    fn slack_media_http_client_no_redirect(&self) -> reqwest::Client {
+    fn slack_media_http_client_no_redirect(&self) -> anyhow::Result<reqwest::Client> {
         let builder = crate::config::apply_runtime_proxy_to_builder(
             reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
             "channel.slack",
         );
-        builder.build().unwrap_or_else(|err| {
-            tracing::warn!(
-                "Failed to build Slack media no-redirect HTTP client, using default client: {err}"
-            );
-            reqwest::Client::new()
-        })
+        builder
+            .build()
+            .context("failed to build Slack media no-redirect HTTP client")
     }
 
     async fn fetch_slack_private_file(&self, raw_url: &str) -> Option<reqwest::Response> {
         let parsed = Self::validate_slack_private_file_url(raw_url)?;
         let redacted_parsed = Self::redact_slack_url(&parsed);
-        let client = self.slack_media_http_client_no_redirect();
-        let initial = match client
-            .get(parsed.clone())
-            .bearer_auth(&self.bot_token)
-            .send()
-            .await
-        {
-            Ok(response) => response,
+        let client = match self.slack_media_http_client_no_redirect() {
+            Ok(client) => client,
             Err(err) => {
                 tracing::warn!("Slack file fetch failed for {}: {}", redacted_parsed, err);
                 return None;
             }
         };
+        let mut current_url = parsed;
 
-        if !initial.status().is_redirection() {
-            return Some(initial);
-        }
+        for redirect_hop in 0..=SLACK_MEDIA_REDIRECT_MAX_HOPS {
+            let redacted_current = Self::redact_slack_url(&current_url);
+            let response = match client
+                .get(current_url.clone())
+                .bearer_auth(&self.bot_token)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    tracing::warn!("Slack file fetch failed for {}: {}", redacted_current, err);
+                    return None;
+                }
+            };
 
-        let Some(location) = initial.headers().get(reqwest::header::LOCATION) else {
-            return Some(initial);
-        };
-        let Ok(location) = location.to_str() else {
-            tracing::warn!(
-                "Slack file redirect location header is not valid UTF-8 for {}",
-                redacted_parsed
-            );
-            return Some(initial);
-        };
-        let Some(redirect_url) = Self::resolve_https_redirect_target(&parsed, location) else {
-            return Some(initial);
-        };
-        let redacted_redirect = Self::redact_slack_url(&redirect_url);
-
-        match self
-            .http_client()
-            .get(redirect_url.clone())
-            .bearer_auth(&self.bot_token)
-            .send()
-            .await
-        {
-            Ok(response) => Some(response),
-            Err(err) => {
-                tracing::warn!(
-                    "Slack redirected file fetch failed for {}: {}",
-                    redacted_redirect,
-                    err
-                );
-                None
+            if !response.status().is_redirection() {
+                return Some(response);
             }
+
+            if redirect_hop == SLACK_MEDIA_REDIRECT_MAX_HOPS {
+                tracing::warn!(
+                    "Slack file redirect limit exceeded for {} after {} hops",
+                    redacted_current,
+                    SLACK_MEDIA_REDIRECT_MAX_HOPS
+                );
+                return Some(response);
+            }
+
+            let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+                return Some(response);
+            };
+            let Ok(location) = location.to_str() else {
+                tracing::warn!(
+                    "Slack file redirect location header is not valid UTF-8 for {}",
+                    redacted_current
+                );
+                return Some(response);
+            };
+            let Some(next_url) = Self::resolve_https_redirect_target(&current_url, location) else {
+                return Some(response);
+            };
+            current_url = next_url;
         }
+
+        None
     }
 
     async fn fetch_image_marker(&self, file: &serde_json::Value) -> Option<String> {
@@ -1852,6 +1854,18 @@ impl SlackChannel {
         true
     }
 
+    fn slack_api_call_succeeded(status: reqwest::StatusCode, body: &str) -> bool {
+        if !status.is_success() {
+            return false;
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+        parsed
+            .get("ok")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+    }
+
     async fn fetch_history_with_retry(
         &self,
         channel_id: &str,
@@ -2148,14 +2162,20 @@ impl Channel for SlackChannel {
     }
 
     async fn health_check(&self) -> bool {
-        let bot_ok = self
+        let bot_ok = match self
             .http_client()
             .get("https://slack.com/api/auth.test")
             .bearer_auth(&self.bot_token)
             .send()
             .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
+        {
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                Self::slack_api_call_succeeded(status, &body)
+            }
+            Err(_) => false,
+        };
         let socket_mode_enabled = self.configured_app_token().is_some();
         let socket_mode_ok = if socket_mode_enabled {
             self.open_socket_mode_url().await.is_ok()
@@ -2637,6 +2657,22 @@ mod tests {
         assert!(SlackChannel::evaluate_health(true, false, true));
         assert!(!SlackChannel::evaluate_health(true, true, false));
         assert!(SlackChannel::evaluate_health(true, true, true));
+    }
+
+    #[test]
+    fn slack_api_call_succeeded_requires_ok_true_in_body() {
+        assert!(!SlackChannel::slack_api_call_succeeded(
+            reqwest::StatusCode::OK,
+            r#"{"ok":false,"error":"invalid_auth"}"#
+        ));
+    }
+
+    #[test]
+    fn slack_api_call_succeeded_accepts_ok_true() {
+        assert!(SlackChannel::slack_api_call_succeeded(
+            reqwest::StatusCode::OK,
+            r#"{"ok":true}"#
+        ));
     }
 
     #[test]
