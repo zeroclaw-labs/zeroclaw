@@ -26,6 +26,37 @@ Schema export command:
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
 
+## `[web_search]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable the built-in `web_search_tool` |
+| `provider` | `duckduckgo` | Search backend: `duckduckgo`, `brave`, or `searxng` |
+| `brave_api_key` | unset | Brave API key when `provider = "brave"` |
+| `searxng_base_url` | unset | SearXNG base URL when `provider = "searxng"` |
+| `max_results` | `5` | Maximum results returned per query |
+| `timeout_secs` | `15` | HTTP timeout for search requests |
+
+Notes:
+
+- `duckduckgo` is free and needs no key, but HTML scraping can be brittle when upstream markup changes.
+- `brave` requires `brave_api_key`.
+- `searxng` expects a standard JSON endpoint at `<base_url>/search?...&format=json`.
+- Runtime overrides for `searxng_base_url` are `ZEROCLAW_SEARXNG_BASE_URL` first, then `SEARXNG_BASE_URL`; if neither is set, ZeroClaw uses `web_search.searxng_base_url` from `config.toml`.
+- `searxng_base_url` is a new config key; existing `duckduckgo` and `brave` setups keep working unchanged.
+- Roll back by unsetting `searxng_base_url` and switching `provider` back to `duckduckgo` or `brave`.
+
+Example:
+
+```toml
+[web_search]
+enabled = true
+provider = "searxng"
+searxng_base_url = "https://searxng.example.com"
+max_results = 5
+timeout_secs = 15
+```
+
 ## `[observability]`
 
 | Key | Default | Purpose |

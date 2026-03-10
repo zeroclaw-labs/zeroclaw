@@ -1101,12 +1101,15 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
+    /// Search provider: "duckduckgo" (free), "brave" (requires API key), or "searxng"
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
     /// Brave Search API key (required if provider is "brave")
     #[serde(default)]
     pub brave_api_key: Option<String>,
+    /// SearXNG base URL (required if provider is "searxng")
+    #[serde(default)]
+    pub searxng_base_url: Option<String>,
     /// Maximum results per search (1-10)
     #[serde(default = "default_web_search_max_results")]
     pub max_results: usize,
@@ -1133,6 +1136,7 @@ impl Default for WebSearchConfig {
             enabled: false,
             provider: default_web_search_provider(),
             brave_api_key: None,
+            searxng_base_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
         }
@@ -4232,6 +4236,50 @@ impl Config {
             anyhow::bail!("gateway.host must not be empty");
         }
 
+        match self
+            .web_search
+            .provider
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "duckduckgo" | "ddg" => {}
+            "brave" => {
+                if self
+                    .web_search
+                    .brave_api_key
+                    .as_deref()
+                    .map(str::trim)
+                    .is_none_or(|value| value.is_empty())
+                {
+                    anyhow::bail!(
+                        "web_search.brave_api_key is required when web_search.provider = \"brave\""
+                    );
+                }
+            }
+            "searxng" => {
+                let base_url = self
+                    .web_search
+                    .searxng_base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .context(
+                        "web_search.searxng_base_url is required when web_search.provider = \"searxng\""
+                    )?;
+                let parsed = reqwest::Url::parse(base_url)
+                    .context("web_search.searxng_base_url must be a valid URL")?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    anyhow::bail!("web_search.searxng_base_url must use http/https");
+                }
+            }
+            other => {
+                anyhow::bail!(
+                    "web_search.provider must be one of: duckduckgo, brave, searxng (got {other})"
+                );
+            }
+        }
+
         // Autonomy
         if self.autonomy.max_actions_per_hour == 0 {
             anyhow::bail!("autonomy.max_actions_per_hour must be greater than 0");
@@ -4559,6 +4607,16 @@ impl Config {
             let api_key = api_key.trim();
             if !api_key.is_empty() {
                 self.web_search.brave_api_key = Some(api_key.to_string());
+            }
+        }
+
+        // SearXNG base URL: ZEROCLAW_SEARXNG_BASE_URL or SEARXNG_BASE_URL
+        if let Ok(base_url) = std::env::var("ZEROCLAW_SEARXNG_BASE_URL")
+            .or_else(|_| std::env::var("SEARXNG_BASE_URL"))
+        {
+            let base_url = base_url.trim();
+            if !base_url.is_empty() {
+                self.web_search.searxng_base_url = Some(base_url.to_string());
             }
         }
 
@@ -7069,6 +7127,7 @@ default_model = "legacy-model"
         std::env::set_var("WEB_SEARCH_MAX_RESULTS", "7");
         std::env::set_var("WEB_SEARCH_TIMEOUT_SECS", "20");
         std::env::set_var("BRAVE_API_KEY", "brave-test-key");
+        std::env::set_var("SEARXNG_BASE_URL", "https://search.example.com");
 
         config.apply_env_overrides();
 
@@ -7080,12 +7139,17 @@ default_model = "legacy-model"
             config.web_search.brave_api_key.as_deref(),
             Some("brave-test-key")
         );
+        assert_eq!(
+            config.web_search.searxng_base_url.as_deref(),
+            Some("https://search.example.com")
+        );
 
         std::env::remove_var("WEB_SEARCH_ENABLED");
         std::env::remove_var("WEB_SEARCH_PROVIDER");
         std::env::remove_var("WEB_SEARCH_MAX_RESULTS");
         std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS");
         std::env::remove_var("BRAVE_API_KEY");
+        std::env::remove_var("SEARXNG_BASE_URL");
     }
 
     #[test]
@@ -7105,6 +7169,44 @@ default_model = "legacy-model"
 
         std::env::remove_var("WEB_SEARCH_MAX_RESULTS");
         std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS");
+    }
+
+    #[tokio::test]
+    async fn validate_web_search_rejects_unknown_provider() {
+        let mut config = Config::default();
+        config.web_search.provider = "custom-search".into();
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("web_search.provider must be one of"));
+    }
+
+    #[tokio::test]
+    async fn validate_web_search_requires_brave_api_key() {
+        let mut config = Config::default();
+        config.web_search.provider = "brave".into();
+        config.web_search.brave_api_key = None;
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("web_search.brave_api_key is required"));
+    }
+
+    #[tokio::test]
+    async fn validate_web_search_requires_valid_searxng_url() {
+        let mut config = Config::default();
+        config.web_search.provider = "searxng".into();
+        config.web_search.searxng_base_url = Some("not a url".into());
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("web_search.searxng_base_url must be a valid URL"));
+    }
+
+    #[tokio::test]
+    async fn validate_web_search_accepts_valid_searxng_url() {
+        let mut config = Config::default();
+        config.web_search.provider = "searxng".into();
+        config.web_search.searxng_base_url = Some("https://search.example.com".into());
+
+        config.validate().unwrap();
     }
 
     #[test]

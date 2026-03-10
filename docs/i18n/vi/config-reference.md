@@ -2,7 +2,7 @@
 
 Các mục cấu hình thường dùng và giá trị mặc định.
 
-Xác minh lần cuối: **2026-02-19**.
+Xác minh lần cuối: **2026-03-09**.
 
 Thứ tự tìm config khi khởi động:
 
@@ -25,6 +25,37 @@ Lệnh xuất schema:
 | `default_provider` | `openrouter` | ID hoặc bí danh provider |
 | `default_model` | `anthropic/claude-sonnet-4-6` | Model định tuyến qua provider đã chọn |
 | `default_temperature` | `0.7` | Nhiệt độ model |
+
+## `[web_search]`
+
+| Khóa | Mặc định | Mục đích |
+|---|---|---|
+| `enabled` | `false` | Bật `web_search_tool` tích hợp |
+| `provider` | `duckduckgo` | Backend tìm kiếm: `duckduckgo`, `brave` hoặc `searxng` |
+| `brave_api_key` | chưa đặt | API key của Brave khi `provider = "brave"` |
+| `searxng_base_url` | chưa đặt | Base URL của SearXNG khi `provider = "searxng"` |
+| `max_results` | `5` | Số kết quả tối đa trả về cho mỗi truy vấn |
+| `timeout_secs` | `15` | Timeout HTTP cho yêu cầu tìm kiếm |
+
+Lưu ý:
+
+- `duckduckgo` miễn phí và không cần khóa, nhưng cách scrape HTML có thể hỏng khi markup phía nguồn thay đổi.
+- `brave` yêu cầu `brave_api_key`.
+- `searxng` dùng endpoint JSON chuẩn tại `<base_url>/search?...&format=json`.
+- Biến môi trường runtime cho `searxng_base_url` là `ZEROCLAW_SEARXNG_BASE_URL` ưu tiên trước, rồi đến `SEARXNG_BASE_URL`; nếu cả hai không có, ZeroClaw dùng `web_search.searxng_base_url` trong `config.toml`.
+- `searxng_base_url` là khóa cấu hình mới; các cấu hình `duckduckgo` và `brave` hiện có vẫn hoạt động như cũ.
+- Có thể rollback bằng cách bỏ `searxng_base_url` và chuyển `provider` về `duckduckgo` hoặc `brave`.
+
+Ví dụ:
+
+```toml
+[web_search]
+enabled = true
+provider = "searxng"
+searxng_base_url = "https://searxng.example.com"
+max_results = 5
+timeout_secs = 15
+```
 
 ## `[observability]`
 
