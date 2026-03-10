@@ -502,10 +502,10 @@ export class MoAClient {
     if (isTauri()) {
       const info = await getPlatformInfo();
       if (info) {
-        return `MoA ${info.os} ${info.is_mobile ? "Mobile" : "Desktop"}`;
+        return `ZeroClaw ${info.os} ${info.is_mobile ? "Mobile" : "Desktop"}`;
       }
     }
-    return `MoA ${navigator.platform || "Web"}`;
+    return `ZeroClaw ${navigator.platform || "Web"}`;
   }
 }
 

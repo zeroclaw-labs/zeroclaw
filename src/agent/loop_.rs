@@ -282,7 +282,9 @@ const AUTO_CRON_DELIVERY_CHANNELS: &[&str] = &[
 
 const NON_CLI_APPROVAL_WAIT_TIMEOUT_SECS: u64 = 300;
 const NON_CLI_APPROVAL_POLL_INTERVAL_MS: u64 = 250;
-const MISSING_TOOL_CALL_RETRY_PROMPT: &str = "Internal correction: your last reply indicated you were about to take an action, but no valid tool call was emitted. If a tool is needed, emit it now using the required <tool_call>...</tool_call> format. If no tool is needed, provide the complete final answer now and do not defer action.";
+const MISSING_TOOL_CALL_RETRY_PROMPT_GUIDED: &str = "Internal correction: your last reply indicated you were about to take an action, but no valid tool call was emitted. If a tool is needed, emit it now using the required <tool_call>...</tool_call> format. If no tool is needed, provide the complete final answer now and do not defer action.";
+
+const MISSING_TOOL_CALL_RETRY_PROMPT_NATIVE: &str = "Internal correction: your last reply indicated you were about to take an action, but no tool call was emitted. If a tool is needed, invoke it now using the function calling interface. If no tool is needed, provide the complete final answer now and do not defer action.";
 
 #[derive(Debug, Clone)]
 pub(crate) struct NonCliApprovalPrompt {
@@ -1663,7 +1665,11 @@ pub(crate) async fn run_tool_call_loop(
                     || looks_like_deferred_action_without_tool_call(&display_text));
             if missing_tool_call_followthrough {
                 missing_tool_call_retry_used = true;
-                missing_tool_call_retry_prompt = Some(MISSING_TOOL_CALL_RETRY_PROMPT.to_string());
+                missing_tool_call_retry_prompt = Some(if use_native_tools {
+                    MISSING_TOOL_CALL_RETRY_PROMPT_NATIVE
+                } else {
+                    MISSING_TOOL_CALL_RETRY_PROMPT_GUIDED
+                }.to_string());
                 let retry_reason = if parse_issue_detected {
                     "parse_issue_detected"
                 } else {

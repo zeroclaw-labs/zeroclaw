@@ -518,7 +518,7 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
             <div className="settings-section-title">About</div>
             <div className="settings-card">
               <p style={{ fontSize: 13, color: "var(--color-text-secondary)", marginBottom: 4 }}>
-                <strong>MoA - Master of AI</strong>
+                <strong>ZeroClaw</strong>
               </p>
               <p style={{ fontSize: 12, color: "var(--color-text-muted)" }}>
                 Powered by ZeroClaw Agent Runtime

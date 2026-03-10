@@ -243,6 +243,10 @@ pub async fn run_wizard_with_migration(
         telemetry: Default::default(),
         voice: Default::default(),
         coding: Default::default(),
+        stripe_secret_key: None,
+        stripe_webhook_secret: None,
+        toss_secret_key: None,
+        callback_base_url: None,
     };
 
     println!(
@@ -765,6 +769,10 @@ async fn run_quick_setup_with_home(
         telemetry: Default::default(),
         voice: Default::default(),
         coding: Default::default(),
+        stripe_secret_key: None,
+        stripe_webhook_secret: None,
+        toss_secret_key: None,
+        callback_base_url: None,
     };
     if no_totp {
         config.security.otp.enabled = false;

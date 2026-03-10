@@ -1,9 +1,11 @@
-import { useLocation } from 'react-router-dom';
-import { LogOut, Menu } from 'lucide-react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { useState, useEffect } from 'react';
+import { LogOut, Menu, Coins } from 'lucide-react';
 import { t } from '@/lib/i18n';
 import type { Locale } from '@/lib/i18n';
 import { useLocaleContext } from '@/App';
 import { useAuth } from '@/hooks/useAuth';
+import { getCreditBalance } from '@/lib/api';
 
 const routeTitles: Record<string, string> = {
   '/': 'nav.dashboard',
@@ -13,6 +15,7 @@ const routeTitles: Record<string, string> = {
   '/integrations': 'nav.integrations',
   '/memory': 'nav.memory',
   '/config': 'nav.config',
+  '/credits': 'nav.credits',
   '/cost': 'nav.cost',
   '/logs': 'nav.logs',
   '/doctor': 'nav.doctor',
@@ -26,8 +29,28 @@ interface HeaderProps {
 
 export default function Header({ onToggleSidebar }: HeaderProps) {
   const location = useLocation();
+  const navigate = useNavigate();
   const { logout } = useAuth();
   const { locale, setAppLocale } = useLocaleContext();
+  const [creditBalance, setCreditBalance] = useState<number | null>(null);
+
+  useEffect(() => {
+    getCreditBalance()
+      .then((data) => {
+        if (data.enabled) setCreditBalance(data.balance);
+      })
+      .catch(() => { /* billing not available */ });
+
+    // Refresh balance every 30 seconds
+    const interval = setInterval(() => {
+      getCreditBalance()
+        .then((data) => {
+          if (data.enabled) setCreditBalance(data.balance);
+        })
+        .catch(() => {});
+    }, 30_000);
+    return () => clearInterval(interval);
+  }, []);
 
   const titleKey = routeTitles[location.pathname] ?? 'nav.dashboard';
   const pageTitle = t(titleKey);
@@ -53,6 +76,17 @@ export default function Header({ onToggleSidebar }: HeaderProps) {
       </div>
 
       <div className="flex items-center gap-2 md:gap-4">
+        {creditBalance !== null && (
+          <button
+            type="button"
+            onClick={() => navigate('/credits')}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium bg-blue-900/40 border border-blue-700/50 text-blue-200 hover:bg-blue-800/50 transition-colors"
+          >
+            <Coins className="h-4 w-4" />
+            <span>{creditBalance.toLocaleString()}</span>
+          </button>
+        )}
+
         <button
           type="button"
           onClick={toggleLanguage}

@@ -10,6 +10,10 @@ import type {
   CostSummary,
   CliTool,
   HealthSnapshot,
+  CreditBalance,
+  CreditPackagesResponse,
+  CheckoutResponse,
+  CreditHistory,
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
 
@@ -281,5 +285,40 @@ export function getCost(): Promise<CostSummary> {
 export function getCliTools(): Promise<CliTool[]> {
   return apiFetch<CliTool[] | { cli_tools: CliTool[] }>('/api/cli-tools').then((data) =>
     unwrapField(data, 'cli_tools'),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Credits / Billing
+// ---------------------------------------------------------------------------
+
+export function getCreditBalance(): Promise<CreditBalance> {
+  return apiFetch<CreditBalance>('/api/credits/balance');
+}
+
+export function getCreditPackages(): Promise<CreditPackagesResponse> {
+  return apiFetch<CreditPackagesResponse>('/api/credits/packages/usd');
+}
+
+export function createCheckout(
+  packageId: string,
+  provider: 'stripe' | 'toss',
+  userId: string,
+  saveMethod?: boolean,
+): Promise<CheckoutResponse> {
+  return apiFetch<CheckoutResponse>('/api/checkout/create', {
+    method: 'POST',
+    body: JSON.stringify({
+      package_id: packageId,
+      provider,
+      user_id: userId,
+      save_method: saveMethod ?? false,
+    }),
+  });
+}
+
+export function getCreditHistory(): Promise<CreditHistory[]> {
+  return apiFetch<{ payments: CreditHistory[]; enabled: boolean }>('/api/credits/history').then(
+    (data) => data.payments,
   );
 }

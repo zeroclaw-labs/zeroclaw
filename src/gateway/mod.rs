@@ -1062,6 +1062,27 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             get(api::handle_api_payment_cancel),
         )
         .route("/api/payment/fail", get(api::handle_api_payment_fail))
+        // ── Checkout (Stripe + TossPayments) ──
+        .route(
+            "/api/credits/packages/usd",
+            get(api::handle_api_credits_packages_usd),
+        )
+        .route(
+            "/api/checkout/create",
+            post(api::handle_api_checkout_create),
+        )
+        .route(
+            "/api/checkout/success",
+            get(api::handle_api_checkout_success),
+        )
+        .route(
+            "/api/checkout/cancel",
+            get(api::handle_api_checkout_cancel),
+        )
+        .route(
+            "/api/checkout/webhook/stripe",
+            post(api::handle_api_checkout_webhook_stripe),
+        )
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
         .route("/api/node-control", post(handle_node_control))

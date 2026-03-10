@@ -56,7 +56,7 @@ function App() {
   useEffect(() => {
     if (!gatewayReady) return;
 
-    const setupComplete = localStorage.getItem("moa_setup_complete");
+    const setupComplete = localStorage.getItem("zeroclaw_setup_complete");
     if (!setupComplete) {
       setPage("setup");
       return;
@@ -314,7 +314,7 @@ function App() {
     if (devices.length <= 1) {
       // 0 or 1 device → auto-connect
       if (devices.length === 0) {
-        apiClient.registerDevice("MoA Device").catch(() => {});
+        apiClient.registerDevice("ZeroClaw Device").catch(() => {});
       }
       proceedToChat();
     } else {

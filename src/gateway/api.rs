@@ -879,6 +879,337 @@ pub async fn handle_api_credits_usage(
     .into_response()
 }
 
+// ── Checkout (Stripe + TossPayments) ─────────────────────────────
+
+/// Query params for checkout callbacks.
+#[derive(Debug, Deserialize)]
+pub struct CheckoutCallbackParams {
+    pub tx: Option<String>,
+    pub provider: Option<String>,
+    #[serde(rename = "paymentKey")]
+    pub payment_key: Option<String>,
+    #[serde(rename = "orderId")]
+    pub order_id: Option<String>,
+    pub amount: Option<u32>,
+}
+
+/// GET /api/credits/packages/usd — available USD credit packages (Stripe + Toss)
+pub async fn handle_api_credits_packages_usd(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let packages: Vec<serde_json::Value> = crate::billing::checkout::USD_PACKAGES
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id,
+                "name": p.name,
+                "price_usd": format!("${}", p.price_cents / 100),
+                "price_cents": p.price_cents,
+                "price_krw": p.price_krw,
+                "credits": p.credits,
+            })
+        })
+        .collect();
+
+    let providers = {
+        let config = state.config.lock();
+        let has_stripe = config.stripe_secret_key.is_some();
+        let has_toss = config.toss_secret_key.is_some();
+        serde_json::json!({
+            "stripe": has_stripe,
+            "toss": has_toss,
+        })
+    };
+
+    Json(serde_json::json!({
+        "packages": packages,
+        "providers": providers,
+    }))
+    .into_response()
+}
+
+/// POST /api/checkout/create — create a checkout session (Stripe or Toss)
+pub async fn handle_api_checkout_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::billing::checkout::CheckoutRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let package = match crate::billing::checkout::find_usd_package(&body.package_id) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid package_id"})),
+            )
+                .into_response();
+        }
+    };
+
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let callback_base_url = {
+        let config = state.config.lock();
+        config
+            .callback_base_url
+            .clone()
+            .unwrap_or_else(|| "https://localhost:3541".to_string())
+    };
+
+    match body.provider {
+        crate::billing::checkout::CheckoutProvider::Stripe => {
+            let secret_key = {
+                let config = state.config.lock();
+                config.stripe_secret_key.clone()
+            };
+            let Some(key) = secret_key else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "Stripe not configured"})),
+                )
+                    .into_response();
+            };
+
+            match crate::billing::checkout::create_stripe_session(
+                &key,
+                package,
+                &transaction_id,
+                &body.user_id,
+                &callback_base_url,
+                body.save_method,
+            )
+            .await
+            {
+                Ok(resp) => Json(serde_json::json!({
+                    "checkout_url": resp.checkout_url,
+                    "transaction_id": resp.transaction_id,
+                    "provider": "stripe",
+                }))
+                .into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Stripe session failed: {e}")})),
+                )
+                    .into_response(),
+            }
+        }
+        crate::billing::checkout::CheckoutProvider::Toss => {
+            let secret_key = {
+                let config = state.config.lock();
+                config.toss_secret_key.clone()
+            };
+            let Some(key) = secret_key else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "TossPayments not configured"})),
+                )
+                    .into_response();
+            };
+
+            match crate::billing::checkout::create_toss_session(
+                &key,
+                package,
+                &transaction_id,
+                &body.user_id,
+                &callback_base_url,
+            )
+            .await
+            {
+                Ok(resp) => Json(serde_json::json!({
+                    "checkout_url": resp.checkout_url,
+                    "transaction_id": resp.transaction_id,
+                    "provider": "toss",
+                }))
+                .into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Toss session failed: {e}")})),
+                )
+                    .into_response(),
+            }
+        }
+    }
+}
+
+/// GET /api/checkout/success — checkout success callback (both Stripe and Toss)
+pub async fn handle_api_checkout_success(
+    State(state): State<AppState>,
+    Query(params): Query<CheckoutCallbackParams>,
+) -> impl IntoResponse {
+    let tx_id = params.tx.unwrap_or_default();
+    if tx_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing tx parameter"})),
+        )
+            .into_response();
+    }
+
+    let provider = params.provider.unwrap_or_default();
+
+    // For TossPayments, confirm the payment first
+    if provider == "toss" {
+        let payment_key = params.payment_key.unwrap_or_default();
+        let amount = params.amount.unwrap_or(0);
+
+        if payment_key.is_empty() || amount == 0 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing paymentKey or amount for Toss confirmation"})),
+            )
+                .into_response();
+        }
+
+        let secret_key = {
+            let config = state.config.lock();
+            config.toss_secret_key.clone()
+        };
+
+        if let Some(key) = secret_key {
+            if let Err(e) =
+                crate::billing::checkout::confirm_toss_payment(&key, &payment_key, &tx_id, amount)
+                    .await
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Toss confirmation failed: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Grant credits via PaymentManager
+    let Some(ref pm) = state.payment_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Payment system not configured"})),
+        )
+            .into_response();
+    };
+
+    let pm_guard = pm.lock();
+    match pm_guard.complete_payment(&tx_id) {
+        Ok(record) => {
+            tracing::info!(
+                transaction_id = %tx_id,
+                provider = %provider,
+                credits = record.credits,
+                "Checkout completed — credits granted"
+            );
+            Json(serde_json::json!({
+                "status": "completed",
+                "transaction_id": tx_id,
+                "credits": record.credits,
+                "provider": provider,
+                "message": "Credits added to your account",
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Credit grant failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/checkout/cancel — checkout cancellation callback
+pub async fn handle_api_checkout_cancel(
+    State(_state): State<AppState>,
+    Query(params): Query<CheckoutCallbackParams>,
+) -> impl IntoResponse {
+    let tx_id = params.tx.unwrap_or_default();
+    tracing::info!(transaction_id = %tx_id, "Checkout cancelled by user");
+    Json(serde_json::json!({
+        "status": "cancelled",
+        "transaction_id": tx_id,
+        "message": "Payment cancelled",
+    }))
+    .into_response()
+}
+
+/// POST /api/checkout/webhook/stripe — Stripe webhook endpoint
+pub async fn handle_api_checkout_webhook_stripe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let sig_header = match headers.get("stripe-signature").and_then(|v| v.to_str().ok()) {
+        Some(sig) => sig.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing Stripe-Signature header"})),
+            )
+                .into_response();
+        }
+    };
+
+    let webhook_secret = {
+        let config = state.config.lock();
+        config.stripe_webhook_secret.clone()
+    };
+
+    let Some(secret) = webhook_secret else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Stripe webhook secret not configured"})),
+        )
+            .into_response();
+    };
+
+    let event = match crate::billing::checkout::verify_stripe_signature(&body, &sig_header, &secret)
+    {
+        Ok(ev) => ev,
+        Err(e) => {
+            tracing::warn!("Invalid Stripe webhook signature: {e}");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid signature"})),
+            )
+                .into_response();
+        }
+    };
+
+    let event_type = event
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    match event_type {
+        "checkout.session.completed" | "payment_intent.succeeded" => {
+            let tx_id = event
+                .pointer("/data/object/metadata/transaction_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if !tx_id.is_empty() {
+                if let Some(ref pm) = state.payment_manager {
+                    let pm_guard = pm.lock();
+                    if let Err(e) = pm_guard.complete_payment(tx_id) {
+                        tracing::warn!(transaction_id = %tx_id, "Stripe webhook: credit grant failed: {e}");
+                    } else {
+                        tracing::info!(transaction_id = %tx_id, "Stripe webhook: credits granted");
+                    }
+                }
+            }
+        }
+        _ => {
+            tracing::debug!(event_type, "Stripe webhook: unhandled event type");
+        }
+    }
+
+    Json(serde_json::json!({"received": true})).into_response()
+}
+
 /// GET /api/cli-tools — discovered CLI tools
 pub async fn handle_api_cli_tools(
     State(state): State<AppState>,

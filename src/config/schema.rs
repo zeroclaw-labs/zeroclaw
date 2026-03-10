@@ -414,6 +414,22 @@ pub struct Config {
     /// Multi-model coding review pipeline settings.
     #[serde(default)]
     pub coding: CodingConfig,
+
+    /// Stripe secret key for international credit card payments.
+    #[serde(default)]
+    pub stripe_secret_key: Option<String>,
+
+    /// Stripe webhook signing secret for verifying webhook events.
+    #[serde(default)]
+    pub stripe_webhook_secret: Option<String>,
+
+    /// TossPayments secret key for Korean payment methods.
+    #[serde(default)]
+    pub toss_secret_key: Option<String>,
+
+    /// Callback base URL for payment redirects (e.g. "https://your-domain.com").
+    #[serde(default)]
+    pub callback_base_url: Option<String>,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -6333,6 +6349,10 @@ impl Default for Config {
             sync: SyncConfig::default(),
             voice: VoiceConfig::default(),
             coding: CodingConfig::default(),
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            toss_secret_key: None,
+            callback_base_url: None,
         }
     }
 }
@@ -10154,6 +10174,10 @@ ws_url = "ws://127.0.0.1:3002"
             mcp: McpConfig::default(),
             model_support_vision: None,
             wasm: WasmConfig::default(),
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            toss_secret_key: None,
+            callback_base_url: None,
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -10535,6 +10559,10 @@ tool_dispatcher = "xml"
             mcp: McpConfig::default(),
             model_support_vision: None,
             wasm: WasmConfig::default(),
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            toss_secret_key: None,
+            callback_base_url: None,
         };
 
         config.save().await.unwrap();

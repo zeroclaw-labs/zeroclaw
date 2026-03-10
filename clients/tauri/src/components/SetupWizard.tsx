@@ -9,14 +9,14 @@ import { isTauri, isGatewayRunning, writeZeroClawConfig } from "../lib/tauri-bri
 // They extend the main i18n system.
 const wizardText: Record<Locale, Record<string, string>> = {
   en: {
-    title: "Welcome to MoA",
+    title: "Welcome to ZeroClaw",
     subtitle: "Let's set up your AI assistant",
     step_language: "Language",
     step_provider: "AI Provider",
     step_apikey: "API Key",
     step_complete: "Ready!",
     language_label: "Choose your language",
-    language_hint: "Select the language for the MoA interface",
+    language_hint: "Select the language for the ZeroClaw interface",
     provider_label: "Choose your AI provider",
     provider_hint: "You can change this later in Settings",
     apikey_label: "Enter your API key",
@@ -31,7 +31,7 @@ const wizardText: Record<Locale, Record<string, string>> = {
     gateway_ready: "AI engine is running",
     gateway_not_ready: "AI engine is starting...",
     setup_complete_title: "You're all set!",
-    setup_complete_desc: "MoA is ready to assist you. You can always change these settings later in the Settings page.",
+    setup_complete_desc: "ZeroClaw is ready to assist you. You can always change these settings later in the Settings page.",
     setup_complete_settings_hint: "Channel configuration, voice settings, and memory sync can be set up in Settings.",
     provider_openrouter: "OpenRouter (Recommended)",
     provider_openrouter_desc: "Access 200+ models with one key",
@@ -45,14 +45,14 @@ const wizardText: Record<Locale, Record<string, string>> = {
     provider_ollama_desc: "Free, runs on your machine",
   },
   ko: {
-    title: "MoA에 오신 것을 환영합니다",
+    title: "ZeroClaw에 오신 것을 환영합니다",
     subtitle: "AI 어시스턴트를 설정해 봅시다",
     step_language: "언어",
     step_provider: "AI 제공자",
     step_apikey: "API 키",
     step_complete: "완료!",
     language_label: "언어를 선택하세요",
-    language_hint: "MoA 인터페이스의 언어를 선택하세요",
+    language_hint: "ZeroClaw 인터페이스의 언어를 선택하세요",
     provider_label: "AI 제공자를 선택하세요",
     provider_hint: "나중에 설정에서 변경할 수 있습니다",
     apikey_label: "API 키를 입력하세요",
@@ -67,7 +67,7 @@ const wizardText: Record<Locale, Record<string, string>> = {
     gateway_ready: "AI 엔진 실행 중",
     gateway_not_ready: "AI 엔진 시작 중...",
     setup_complete_title: "모든 준비가 완료되었습니다!",
-    setup_complete_desc: "MoA가 도와드릴 준비가 되었습니다. 설정 페이지에서 언제든 변경할 수 있습니다.",
+    setup_complete_desc: "ZeroClaw가 도와드릴 준비가 되었습니다. 설정 페이지에서 언제든 변경할 수 있습니다.",
     setup_complete_settings_hint: "채널 설정, 음성 설정, 메모리 동기화는 설정 페이지에서 구성할 수 있습니다.",
     provider_openrouter: "OpenRouter (추천)",
     provider_openrouter_desc: "하나의 키로 200개 이상의 모델 사용",
@@ -158,11 +158,11 @@ export function SetupWizard({ locale, onLocaleChange, onComplete }: SetupWizardP
     } else if (step === "provider") {
       if (selectedProvider === "ollama") {
         // Ollama doesn't need an API key — write config and skip to complete
-        localStorage.setItem("moa_setup_provider", selectedProvider);
+        localStorage.setItem("zeroclaw_setup_provider", selectedProvider);
         if (isTauri()) {
           await writeZeroClawConfig(selectedProvider).catch(() => {});
         }
-        localStorage.setItem("moa_setup_complete", "true");
+        localStorage.setItem("zeroclaw_setup_complete", "true");
         setStep("complete");
         checkGateway();
         return;
@@ -172,7 +172,7 @@ export function SetupWizard({ locale, onLocaleChange, onComplete }: SetupWizardP
       setSaving(true);
       try {
         // Save provider preference to localStorage (for frontend reference)
-        localStorage.setItem("moa_setup_provider", selectedProvider);
+        localStorage.setItem("zeroclaw_setup_provider", selectedProvider);
 
         // Write directly to ZeroClaw's config.toml via Tauri bridge.
         // This ensures the gateway starts with the correct provider/key
@@ -187,14 +187,14 @@ export function SetupWizard({ locale, onLocaleChange, onComplete }: SetupWizardP
 
         // Save API key to localStorage as backup
         if (apiKey.trim()) {
-          const storageKey = `moa_api_key_${selectedProvider}`;
+          const storageKey = `zeroclaw_api_key_${selectedProvider}`;
           localStorage.setItem(storageKey, apiKey.trim());
 
           // Also try syncing to running gateway (best-effort)
           await apiClient.saveApiKeyToAgent(selectedProvider, apiKey.trim()).catch(() => {});
         }
 
-        localStorage.setItem("moa_setup_complete", "true");
+        localStorage.setItem("zeroclaw_setup_complete", "true");
       } catch {
         // Non-critical, continue anyway
       }
@@ -205,12 +205,12 @@ export function SetupWizard({ locale, onLocaleChange, onComplete }: SetupWizardP
   }, [step, selectedLocale, selectedProvider, apiKey, checkGateway, onLocaleChange]);
 
   const handleSkipApiKey = useCallback(async () => {
-    localStorage.setItem("moa_setup_provider", selectedProvider);
+    localStorage.setItem("zeroclaw_setup_provider", selectedProvider);
     // Write provider to config.toml even without API key
     if (isTauri()) {
       await writeZeroClawConfig(selectedProvider).catch(() => {});
     }
-    localStorage.setItem("moa_setup_complete", "true");
+    localStorage.setItem("zeroclaw_setup_complete", "true");
     setStep("complete");
     checkGateway();
   }, [selectedProvider, checkGateway]);
@@ -222,7 +222,7 @@ export function SetupWizard({ locale, onLocaleChange, onComplete }: SetupWizardP
   }, [step]);
 
   const handleFinish = useCallback(() => {
-    localStorage.setItem("moa_setup_complete", "true");
+    localStorage.setItem("zeroclaw_setup_complete", "true");
     onComplete();
   }, [onComplete]);
 
@@ -234,7 +234,7 @@ export function SetupWizard({ locale, onLocaleChange, onComplete }: SetupWizardP
           <div className="setup-wizard-logo">
             <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
               <rect width="48" height="48" rx="12" fill="url(#logo-gradient)" />
-              <text x="24" y="32" textAnchor="middle" fill="white" fontSize="22" fontWeight="700">M</text>
+              <text x="24" y="32" textAnchor="middle" fill="white" fontSize="22" fontWeight="700">Z</text>
               <defs>
                 <linearGradient id="logo-gradient" x1="0" y1="0" x2="48" y2="48">
                   <stop stopColor="#6366f1" />

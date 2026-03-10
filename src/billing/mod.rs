@@ -9,10 +9,16 @@
 //! - Configurable spending limits (daily/monthly) with alerts
 //! - Usage summary export for billing reconciliation
 
+pub mod checkout;
 pub mod llm_router;
 pub mod payment;
 pub mod tracker;
 
+#[allow(unused_imports)]
+pub use checkout::{
+    AutoRechargeSettings, CheckoutProvider, CheckoutRequest, CheckoutResponse,
+    UsdCreditPackage, USD_PACKAGES,
+};
 #[allow(unused_imports)]
 pub use llm_router::{AdminKeys, KeySource, ResolvedKey};
 #[allow(unused_imports)]

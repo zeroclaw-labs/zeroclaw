@@ -761,7 +761,7 @@ export function Interpreter({
                 <summary>iPhone / iPad</summary>
                 <ol>
                   <li>{locale === "ko" ? "설정 앱을 엽니다" : "Open Settings"}</li>
-                  <li>{locale === "ko" ? "MoA (또는 브라우저 앱)를 찾습니다" : "Find MoA (or your browser app)"}</li>
+                  <li>{locale === "ko" ? "ZeroClaw (또는 브라우저 앱)를 찾습니다" : "Find ZeroClaw (or your browser app)"}</li>
                   <li>{locale === "ko" ? "마이크를 켭니다" : "Turn on Microphone"}</li>
                   <li>{locale === "ko" ? "앱을 다시 열어주세요" : "Reopen the app"}</li>
                 </ol>
@@ -771,7 +771,7 @@ export function Interpreter({
               <details className="mic-permission-platform">
                 <summary>Android</summary>
                 <ol>
-                  <li>{locale === "ko" ? "설정 → 앱 → MoA" : "Settings → Apps → MoA"}</li>
+                  <li>{locale === "ko" ? "설정 → 앱 → ZeroClaw" : "Settings → Apps → ZeroClaw"}</li>
                   <li>{locale === "ko" ? "권한 → 마이크 → 허용" : "Permissions → Microphone → Allow"}</li>
                   <li>{locale === "ko" ? "앱을 다시 열어주세요" : "Reopen the app"}</li>
                 </ol>
@@ -782,11 +782,11 @@ export function Interpreter({
                 <summary>macOS / Windows</summary>
                 <ol>
                   <li>{locale === "ko"
-                    ? "macOS: 시스템 설정 → 개인정보 보호 → 마이크 → MoA 허용"
-                    : "macOS: System Settings → Privacy → Microphone → Allow MoA"}</li>
+                    ? "macOS: 시스템 설정 → 개인정보 보호 → 마이크 → ZeroClaw 허용"
+                    : "macOS: System Settings → Privacy → Microphone → Allow ZeroClaw"}</li>
                   <li>{locale === "ko"
-                    ? "Windows: 설정 → 개인정보 → 마이크 → MoA 허용"
-                    : "Windows: Settings → Privacy → Microphone → Allow MoA"}</li>
+                    ? "Windows: 설정 → 개인정보 → 마이크 → ZeroClaw 허용"
+                    : "Windows: Settings → Privacy → Microphone → Allow ZeroClaw"}</li>
                 </ol>
               </details>
             </div>
