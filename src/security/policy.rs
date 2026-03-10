@@ -546,6 +546,11 @@ fn attached_short_option_value(token: &str) -> Option<&str> {
     if body.starts_with('-') || body.len() < 2 {
         return None;
     }
+    // Short option flags must be ASCII letters; non-ASCII tokens are not shell flags.
+    let first = body.chars().next()?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
     let value = body[1..].trim_start_matches('=').trim();
     if value.is_empty() {
         None

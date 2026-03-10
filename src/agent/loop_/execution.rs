@@ -23,8 +23,9 @@ async fn execute_one_tool(
     });
     let args_preview = {
         let s = call_arguments.to_string();
-        if s.len() > 400 {
-            format!("{}…", &s[..400])
+        if s.chars().count() > 400 {
+            let truncated: String = s.chars().take(400).collect();
+            format!("{}…", truncated)
         } else {
             s
         }
