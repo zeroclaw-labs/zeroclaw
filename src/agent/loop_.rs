@@ -316,13 +316,70 @@ fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool>
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
 
+fn normalize_tool_argument_scalars(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(normalize_tool_argument_scalars)
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => {
+            let type_value = map.get("type").and_then(serde_json::Value::as_str);
+            let scalar_typed_wrapper = map.len() <= 2
+                && map.contains_key("value")
+                && type_value.is_some_and(|kind| {
+                    matches!(kind, "string" | "number" | "integer" | "boolean")
+                });
+
+            if scalar_typed_wrapper {
+                if let Some(inner) = map.get("value") {
+                    return normalize_tool_argument_scalars(inner.clone());
+                }
+            }
+
+            let mut normalized = serde_json::Map::new();
+            for (key, item) in map {
+                normalized.insert(key, normalize_tool_argument_scalars(item));
+            }
+            serde_json::Value::Object(normalized)
+        }
+        other => other,
+    }
+}
+
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
     match raw {
-        Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(s)
-            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
-        Some(value) => value.clone(),
-        None => serde_json::Value::Object(serde_json::Map::new()),
+        Some(serde_json::Value::String(s)) => normalize_tool_argument_scalars(
+            serde_json::from_str::<serde_json::Value>(s)
+                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+        ),
+        Some(value) => normalize_tool_argument_scalars(value.clone()),
+        None => normalize_tool_argument_scalars(serde_json::Value::Object(serde_json::Map::new())),
     }
+}
+
+fn normalize_shell_command_aliases(name: &str, arguments: serde_json::Value) -> serde_json::Value {
+    let shell_like = matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "shell" | "bash" | "sh" | "exec" | "command" | "cmd"
+    );
+    if !shell_like {
+        return arguments;
+    }
+
+    let mut map = match arguments {
+        serde_json::Value::Object(map) => map,
+        other => return other,
+    };
+
+    if !map.contains_key("command") {
+        if let Some(cmd_value) = map.get("cmd").cloned() {
+            map.insert("command".to_string(), cmd_value);
+        }
+    }
+
+    serde_json::Value::Object(map)
 }
 
 fn parse_tool_call_id(
@@ -379,10 +436,13 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
             .trim()
             .to_string();
         if !name.is_empty() {
-            let arguments = parse_arguments_value(
+            let arguments = normalize_shell_command_aliases(
+                &name,
+                parse_arguments_value(
                 function
                     .get("arguments")
                     .or_else(|| function.get("parameters")),
+                ),
             );
             return Some(ParsedToolCall {
                 name,
@@ -404,8 +464,10 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
         return None;
     }
 
-    let arguments =
-        parse_arguments_value(value.get("arguments").or_else(|| value.get("parameters")));
+    let arguments = normalize_shell_command_aliases(
+        &name,
+        parse_arguments_value(value.get("arguments").or_else(|| value.get("parameters"))),
+    );
     Some(ParsedToolCall {
         name,
         arguments,
@@ -442,6 +504,28 @@ fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedTool
     }
 
     calls
+}
+
+fn infer_shell_call_from_argument_only_json(value: &serde_json::Value) -> Option<ParsedToolCall> {
+    let obj = value.as_object()?;
+    if obj.contains_key("name")
+        || obj.contains_key("function")
+        || obj.contains_key("tool_calls")
+        || obj.contains_key("tool_call_id")
+        || obj.contains_key("call_id")
+    {
+        return None;
+    }
+
+    if obj.contains_key("command") || obj.contains_key("cmd") {
+        let wrapped = serde_json::json!({
+            "name": "shell",
+            "arguments": value
+        });
+        return parse_tool_call_value(&wrapped);
+    }
+
+    None
 }
 
 fn is_xml_meta_tag(tag: &str) -> bool {
@@ -661,6 +745,119 @@ fn parse_minimax_invoke_calls(response: &str) -> Option<(String, Vec<ParsedToolC
         .to_string();
 
     Some((text, calls))
+}
+
+/// Parse attribute-style opening tool tags like:
+/// `<tool_call name="shell">{"cmd":"echo hi"}`
+/// where the closing tag may be missing.
+fn parse_named_opening_tool_calls(response: &str) -> Option<(String, Vec<ParsedToolCall>)> {
+    static NAMED_OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?is)<(tool_call|toolcall|tool-call|invoke|minimax:tool_call|minimax:toolcall)\b[^>]*\bname\s*=\s*(?:"([^"]+)"|'([^']+)')[^>]*>"#,
+        )
+        .unwrap()
+    });
+
+    let mut calls = Vec::new();
+    let mut text_parts = Vec::new();
+    let mut cursor = 0usize;
+
+    for cap in NAMED_OPEN_RE.captures_iter(response) {
+        let Some(full_match) = cap.get(0) else {
+            continue;
+        };
+
+        if full_match.start() < cursor {
+            continue;
+        }
+
+        let before = response[cursor..full_match.start()].trim();
+        if !before.is_empty() {
+            text_parts.push(before.to_string());
+        }
+
+        let open_tag = cap.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
+        let tool_name = cap
+            .get(2)
+            .or_else(|| cap.get(3))
+            .map(|m| m.as_str().trim())
+            .filter(|name| !name.is_empty())
+            .map(map_tool_name_alias)
+            .unwrap_or_default();
+
+        let after_open = &response[full_match.end()..];
+        let matching_close = match open_tag {
+            "tool_call" => Some("</tool_call>"),
+            "toolcall" => Some("</toolcall>"),
+            "tool-call" => Some("</tool-call>"),
+            "invoke" => Some("</invoke>"),
+            "minimax:tool_call" => Some("</minimax:tool_call>"),
+            "minimax:toolcall" => Some("</minimax:toolcall>"),
+            _ => None,
+        };
+
+        let (inner, consumed) = if let Some(close_tag) = matching_close {
+            if let Some(close_idx) = after_open.find(close_tag) {
+                (&after_open[..close_idx], close_idx + close_tag.len())
+            } else if let Some((cross_idx, cross_tag)) =
+                find_first_tag(after_open, &TOOL_CALL_CLOSE_TAGS)
+            {
+                (&after_open[..cross_idx], cross_idx + cross_tag.len())
+            } else {
+                (after_open, after_open.len())
+            }
+        } else {
+            (after_open, after_open.len())
+        };
+
+        if !tool_name.is_empty() {
+            let mut parsed = false;
+            for value in extract_json_values(inner) {
+                let parsed_calls = parse_tool_calls_from_json_value(&value);
+                if !parsed_calls.is_empty() {
+                    calls.extend(parsed_calls);
+                    parsed = true;
+                    continue;
+                }
+
+                let arguments = if value.is_object() {
+                    value
+                } else {
+                    serde_json::json!({ "value": value })
+                };
+                let wrapped = serde_json::json!({
+                    "name": tool_name,
+                    "arguments": arguments
+                });
+                if let Some(call) = parse_tool_call_value(&wrapped) {
+                    calls.push(call);
+                    parsed = true;
+                }
+            }
+
+            if !parsed {
+                if let Some(glm_call) = parse_glm_shortened_body(inner) {
+                    calls.push(glm_call);
+                }
+            }
+        }
+
+        cursor = full_match.end() + consumed;
+        if cursor >= response.len() {
+            break;
+        }
+    }
+
+    if calls.is_empty() {
+        return None;
+    }
+
+    let after = response[cursor..].trim();
+    if !after.is_empty() {
+        text_parts.push(after.to_string());
+    }
+
+    Some((text_parts.join("\n"), calls))
 }
 
 const TOOL_CALL_OPEN_TAGS: [&str; 6] = [
@@ -950,6 +1147,103 @@ fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     calls
 }
 
+/// Parse self-closing attribute-style tool calls like:
+/// `<tool_call tool="open_file" file="SOUL.md"/>`
+fn parse_self_closing_tool_call_attrs(response: &str) -> Vec<ParsedToolCall> {
+    static SELF_CLOSING_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(?is)<tool[_-]?call\b([^>]*)/\s*>"#).unwrap());
+    static ATTR_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')"#).unwrap()
+    });
+
+    let mut calls = Vec::new();
+
+    for cap in SELF_CLOSING_RE.captures_iter(response) {
+        let attrs = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let mut map = serde_json::Map::new();
+        for attr in ATTR_RE.captures_iter(attrs) {
+            let key = attr.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+            let value = attr
+                .get(2)
+                .or_else(|| attr.get(3))
+                .map(|m| m.as_str())
+                .unwrap_or("")
+                .trim();
+            if !key.is_empty() && !value.is_empty() {
+                map.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+            }
+        }
+
+        let raw_name = map
+            .get("name")
+            .or_else(|| map.get("tool"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if raw_name.is_empty() {
+            continue;
+        }
+
+        if raw_name.eq_ignore_ascii_case("open_file") || raw_name.eq_ignore_ascii_case("file_open")
+        {
+            let path = map
+                .get("file")
+                .or_else(|| map.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if !path.is_empty() {
+                calls.push(ParsedToolCall {
+                    name: "shell".to_string(),
+                    arguments: serde_json::json!({ "command": format!("open -a TextEdit {}", path) }),
+                    tool_call_id: None,
+                });
+            }
+            continue;
+        }
+
+        let normalized_name = map_tool_name_alias(&raw_name).to_string();
+        let mut args = serde_json::Map::new();
+        for (k, v) in map {
+            if k != "name" && k != "tool" {
+                args.insert(k, v);
+            }
+        }
+        let wrapped = serde_json::json!({
+            "name": normalized_name,
+            "arguments": serde_json::Value::Object(args),
+        });
+        if let Some(call) = parse_tool_call_value(&wrapped) {
+            calls.push(call);
+        }
+    }
+
+    calls
+}
+
+/// Parse raw fenced single-line shell commands:
+/// ```text
+/// open -a TextEdit SOUL.md
+/// ```
+fn parse_plain_fenced_shell_command(response: &str) -> Option<ParsedToolCall> {
+    static PLAIN_FENCE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(?s)^\s*```\s*\n(.*?)\n```\s*$"#).unwrap());
+    let cap = PLAIN_FENCE_RE.captures(response.trim())?;
+    let body = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+    if body.is_empty() || body.contains('\n') {
+        return None;
+    }
+    if !body.starts_with("open ") {
+        return None;
+    }
+    Some(ParsedToolCall {
+        name: "shell".to_string(),
+        arguments: serde_json::json!({ "command": body }),
+        tool_call_id: None,
+    })
+}
+
 /// Parse FunctionCall-style tool calls from response text.
 /// This handles formats like:
 /// ```text
@@ -1000,6 +1294,133 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     }
 
     calls
+}
+
+fn parse_intent_style_tool_call(response: &str) -> Option<ParsedToolCall> {
+    static TOOL_WITH_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?is)\buse (?:the )?(file_open|file_read|file_write)\b(?:\s+(?:tool|function))?.{0,220}?(?:path(?:\s+parameter)?(?:\s+set\s+to)?|called)\s*[`"']?([A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,8})"#,
+        )
+        .unwrap()
+    });
+    static OPEN_COMMAND_FILE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?is)(?:`open`|open command).{0,220}\b([A-Za-z0-9_./-]+\.(?:md|txt|json|toml|yaml|yml))\b"#,
+        )
+        .unwrap()
+    });
+    static FILE_MENTION_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?i)\b([A-Za-z0-9_./-]+\.(?:md|txt|json|toml|yaml|yml))\b"#).unwrap()
+    });
+    static OPEN_TOOL_WITH_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?is)\buse (?:the )?open tool\b.{0,220}?\bpath\b.{0,260}?([A-Za-z0-9_./-]+\.(?:md|txt|json|toml|yaml|yml))"#,
+        )
+        .unwrap()
+    });
+
+    let trimmed = response.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(caps) = TOOL_WITH_PATH_RE.captures(trimmed) {
+        let tool_name = caps.get(1)?.as_str().trim();
+        let path = caps.get(2)?.as_str().trim();
+        return Some(ParsedToolCall {
+            name: map_tool_name_alias(tool_name).to_string(),
+            arguments: serde_json::json!({ "path": path }),
+            tool_call_id: None,
+        });
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(caps) = OPEN_TOOL_WITH_PATH_RE.captures(trimmed) {
+        let path = caps.get(1)?.as_str().trim();
+        let command = if lower.contains("finder") {
+            format!("open -R {}", path)
+        } else {
+            format!("open {}", path)
+        };
+        return Some(ParsedToolCall {
+            name: "shell".to_string(),
+            arguments: serde_json::json!({ "command": command }),
+            tool_call_id: None,
+        });
+    }
+
+    if OPEN_COMMAND_FILE_RE.is_match(trimmed)
+        || lower.contains("open command")
+        || lower.contains("`open` command")
+    {
+        let path = FILE_MENTION_RE
+            .captures(trimmed)
+            .and_then(|caps| caps.get(1))
+            .map(|m| m.as_str().trim().to_string())?;
+        return Some(ParsedToolCall {
+            name: "shell".to_string(),
+            arguments: serde_json::json!({ "command": format!("open {}", path) }),
+            tool_call_id: None,
+        });
+    }
+
+    None
+}
+
+fn parse_explicit_user_tool_call(user_message: &str) -> Option<ParsedToolCall> {
+    static OPEN_IN_TARGET_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?is)\bopen\s+([A-Za-z0-9_./-]+\.(?:md|txt|json|toml|yaml|yml))\s+in\s+(finder|the\s+finder|default\s+editor|the\s+default\s+editor|textedit|the\s+textedit)\b"#,
+        )
+        .unwrap()
+    });
+    static RUN_SHELL_COMMAND_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?is)^\s*(?:run\s+(?:the\s+)?shell\s+command|run\s+command|execute\s+command)\s*[:\-]\s*(.+?)\s*$"#,
+        )
+        .unwrap()
+    });
+
+    if let Some(captures) = RUN_SHELL_COMMAND_RE.captures(user_message) {
+        let command = captures
+            .get(1)
+            .map(|m| m.as_str().trim())
+            .unwrap_or_default();
+        if !command.is_empty() {
+            return Some(ParsedToolCall {
+                name: "shell".to_string(),
+                arguments: serde_json::json!({ "command": command }),
+                tool_call_id: None,
+            });
+        }
+    }
+
+    let captures = OPEN_IN_TARGET_RE.captures(user_message)?;
+    let path = captures.get(1)?.as_str().trim();
+    let target = captures.get(2)?.as_str().trim().to_ascii_lowercase();
+
+    let command = if target.contains("finder") {
+        format!("open -R {}", path)
+    } else if target.contains("textedit") {
+        format!("open -a TextEdit {}", path)
+    } else {
+        format!("open {}", path)
+    };
+
+    Some(ParsedToolCall {
+        name: "shell".to_string(),
+        arguments: serde_json::json!({ "command": command }),
+        tool_call_id: None,
+    })
+}
+
+fn infer_tool_call_from_latest_user_message(history: &[ChatMessage]) -> Option<ParsedToolCall> {
+    let user_message = history
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.as_str())?;
+    parse_explicit_user_tool_call(user_message)
 }
 
 /// Parse GLM-style tool calls from response text.
@@ -1389,6 +1810,12 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
+    if let Some((named_text, named_calls)) = parse_named_opening_tool_calls(response) {
+        if !named_calls.is_empty() {
+            return (named_text, named_calls);
+        }
+    }
+
     // Fall back to XML-style tool-call tag parsing.
     while let Some((start, open_tag)) = find_first_tag(remaining, &TOOL_CALL_OPEN_TAGS) {
         // Everything before the tag is text
@@ -1413,6 +1840,10 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 if !parsed_calls.is_empty() {
                     parsed_any = true;
                     calls.extend(parsed_calls);
+                } else if let Some(inferred_call) = infer_shell_call_from_argument_only_json(&value)
+                {
+                    parsed_any = true;
+                    calls.push(inferred_call);
                 }
             }
 
@@ -1455,6 +1886,11 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                     if !parsed_calls.is_empty() {
                         parsed_any = true;
                         calls.extend(parsed_calls);
+                    } else if let Some(inferred_call) =
+                        infer_shell_call_from_argument_only_json(&value)
+                    {
+                        parsed_any = true;
+                        calls.push(inferred_call);
                     }
                 }
 
@@ -1495,6 +1931,12 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                         calls.extend(parsed_calls);
                         remaining = strip_leading_close_tags(&after_open[json_end..]);
                         continue;
+                    } else if let Some(inferred_call) =
+                        infer_shell_call_from_argument_only_json(&value)
+                    {
+                        calls.push(inferred_call);
+                        remaining = strip_leading_close_tags(&after_open[json_end..]);
+                        continue;
                     }
                 }
             }
@@ -1503,6 +1945,11 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 let parsed_calls = parse_tool_calls_from_json_value(&value);
                 if !parsed_calls.is_empty() {
                     calls.extend(parsed_calls);
+                    remaining = strip_leading_close_tags(&after_open[consumed_end..]);
+                    continue;
+                } else if let Some(inferred_call) = infer_shell_call_from_argument_only_json(&value)
+                {
+                    calls.push(inferred_call);
                     remaining = strip_leading_close_tags(&after_open[consumed_end..]);
                     continue;
                 }
@@ -1676,6 +2123,16 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
+    // Self-closing tool-call attributes:
+    // <tool_call tool="open_file" file="SOUL.md"/>
+    if calls.is_empty() {
+        let attr_calls = parse_self_closing_tool_call_attrs(remaining);
+        if !attr_calls.is_empty() {
+            calls.extend(attr_calls);
+            remaining = "";
+        }
+    }
+
     // <FunctionCall>
     // file_read
     // <code>path>/Users/...</code>
@@ -1724,6 +2181,26 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             if !cleaned_text.trim().is_empty() {
                 text_parts.push(cleaned_text.trim().to_string());
             }
+            remaining = "";
+        }
+    }
+
+    // Intent-style fallback for local reasoning models that narrate tool intent
+    // without emitting structured syntax (no tags/JSON/tool_call blocks).
+    if calls.is_empty() {
+        if let Some(intent_call) = parse_intent_style_tool_call(remaining) {
+            calls.push(intent_call);
+            remaining = "";
+        }
+    }
+
+    // Raw fenced single-line shell commands, e.g.:
+    // ```
+    // open -a TextEdit SOUL.md
+    // ```
+    if calls.is_empty() {
+        if let Some(shell_call) = parse_plain_fenced_shell_command(remaining) {
+            calls.push(shell_call);
             remaining = "";
         }
     }
@@ -1781,13 +2258,91 @@ fn detect_tool_call_parse_issue(response: &str, parsed_calls: &[ParsedToolCall])
 fn parse_structured_tool_calls(tool_calls: &[ToolCall]) -> Vec<ParsedToolCall> {
     tool_calls
         .iter()
-        .map(|call| ParsedToolCall {
-            name: call.name.clone(),
-            arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
-                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
-            tool_call_id: Some(call.id.clone()),
+        .map(|call| {
+            let mut name = map_tool_name_alias(call.name.trim()).to_string();
+            let raw_arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+
+            // Some providers return shell-shaped arguments under generic/meta names.
+            // If we have command/cmd but no actionable name, recover as shell.
+            if (name.is_empty()
+                || matches!(
+                    name.as_str(),
+                    "tool_call" | "toolcall" | "tool-call" | "function_call" | "function"
+                ))
+                && raw_arguments
+                    .as_object()
+                    .is_some_and(|obj| obj.contains_key("command") || obj.contains_key("cmd"))
+            {
+                name = "shell".to_string();
+            }
+
+            let arguments = normalize_shell_command_aliases(&name, raw_arguments);
+
+            ParsedToolCall {
+                name,
+                arguments,
+                tool_call_id: Some(call.id.clone()),
+            }
         })
         .collect()
+}
+
+fn is_nonempty_string_arg(arguments: &serde_json::Value, key: &str) -> bool {
+    arguments
+        .get(key)
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn is_actionable_parsed_tool_call(call: &ParsedToolCall) -> bool {
+    let normalized = map_tool_name_alias(call.name.trim());
+    if normalized.is_empty()
+        || matches!(
+            normalized,
+            "tool_call" | "toolcall" | "tool-call" | "function_call" | "function"
+        )
+    {
+        return false;
+    }
+
+    match normalized {
+        "shell" => is_nonempty_string_arg(&call.arguments, "command"),
+        "file_read" | "file_write" | "file_open" => is_nonempty_string_arg(&call.arguments, "path"),
+        "http_request" => is_nonempty_string_arg(&call.arguments, "url"),
+        "file_list"
+        | "memory_recall"
+        | "memory_store"
+        | "memory_forget"
+        | "message_send"
+        | "browser_open"
+        | "schedule"
+        | "composio"
+        | "cron_create"
+        | "cron_list"
+        | "cron_get"
+        | "cron_update"
+        | "cron_run"
+        | "cron_runs"
+        | "web_search"
+        | "web_fetch"
+        | "screenshot"
+        | "image_info"
+        | "delegate"
+        | "model_routing_config"
+        | "gpio_read"
+        | "gpio_write"
+        | "arduino_upload"
+        | "hardware_memory_map"
+        | "hardware_board_info"
+        | "hardware_memory_read"
+        | "hardware_capabilities" => true,
+        _ => false,
+    }
+}
+
+fn has_actionable_parsed_tool_call(calls: &[ParsedToolCall]) -> bool {
+    calls.iter().any(is_actionable_parsed_tool_call)
 }
 
 /// Build assistant history entry in JSON format for native tool-call APIs.
@@ -2140,6 +2695,38 @@ pub(crate) async fn run_tool_call_loop(
         max_tool_iterations
     };
 
+    // Deterministic fast-path for explicit user command intents. This avoids
+    // model-side refusals for clearly executable local actions like:
+    // "open soul.md in textedit" / "run shell command: ..."
+    if let Some(inferred_call) = infer_tool_call_from_latest_user_message(history) {
+        let inferred_name = map_tool_name_alias(inferred_call.name.trim()).to_string();
+        let is_excluded = excluded_tools.iter().any(|tool| tool == &inferred_name);
+        let needs_approval = approval.is_some_and(|mgr| mgr.needs_approval(&inferred_name));
+        if !is_excluded && !needs_approval {
+            let outcome = execute_one_tool(
+                &inferred_name,
+                inferred_call.arguments.clone(),
+                tools_registry,
+                observer,
+                cancellation_token.as_ref(),
+            )
+            .await?;
+
+            let reply = if outcome.success {
+                if outcome.output.trim().is_empty() {
+                    "Done.".to_string()
+                } else {
+                    outcome.output
+                }
+            } else if let Some(reason) = outcome.error_reason {
+                format!("Command failed: {reason}")
+            } else {
+                "Command failed.".to_string()
+            };
+            return Ok(reply);
+        }
+    }
+
     let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
         .iter()
         .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
@@ -2234,7 +2821,7 @@ pub(crate) async fn run_tool_call_loop(
             chat_future.await
         };
 
-        let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
+        let (response_text, parsed_text, mut tool_calls, assistant_history_content, native_tool_calls) =
             match chat_result {
                 Ok(resp) => {
                     let (resp_input_tokens, resp_output_tokens) = resp
@@ -2261,12 +2848,14 @@ pub(crate) async fn run_tool_call_loop(
                     let mut calls = parse_structured_tool_calls(&resp.tool_calls);
                     let mut parsed_text = String::new();
 
-                    if calls.is_empty() {
+                    if calls.is_empty() || !has_actionable_parsed_tool_call(&calls) {
                         let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
                         if !fallback_text.is_empty() {
                             parsed_text = fallback_text;
                         }
-                        calls = fallback_calls;
+                        if !fallback_calls.is_empty() {
+                            calls = fallback_calls;
+                        }
                     }
 
                     if let Some(parse_issue) = detect_tool_call_parse_issue(&response_text, &calls)
@@ -2366,6 +2955,36 @@ pub(crate) async fn run_tool_call_loop(
                     return Err(e);
                 }
             };
+
+        if tool_calls.is_empty() {
+            if let Some(inferred_call) = infer_tool_call_from_latest_user_message(history) {
+                tracing::info!(
+                    tool = %inferred_call.name,
+                    "Recovered missing tool call from explicit user command"
+                );
+                runtime_trace::record_event(
+                    "tool_call_recovery",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(true),
+                    None,
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "reason": "missing_tool_calls_in_model_response",
+                        "inferred_tool": inferred_call.name,
+                        "arguments": scrub_credentials(&inferred_call.arguments.to_string()),
+                    }),
+                );
+                tool_calls.push(inferred_call);
+            }
+        } else {
+            tracing::info!(
+                tool_calls = tool_calls.len(),
+                "Using model-parsed tool call(s)"
+            );
+        }
 
         let display_text = if parsed_text.is_empty() {
             response_text.clone()
@@ -4592,6 +5211,137 @@ SOUL.md
     }
 
     #[test]
+    fn parse_tool_calls_handles_intent_style_file_tool_path() {
+        let response = "The user wants to open SOUL.md in the default editor. I need to use the file_open function with the path parameter set to \"SOUL.md\".";
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_open");
+        assert_eq!(
+            calls[0].arguments.get("path").unwrap().as_str().unwrap(),
+            "SOUL.md"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_intent_style_open_command_with_file_mention() {
+        let response = "The user wants to open SOUL.md in the default editor. I should use the `open` command with the file path.";
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "open SOUL.md"
+        );
+        assert!(text.is_empty() || text.contains("default editor"));
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_qwen_finder_intent_narration() {
+        let response = "The user wants me to open the file 'soul.md' in Finder on their Mac system. I should use the appropriate command or tool for this. On macOS, opening a file in Finder can be done with the `open` command or using the `finder` command.\n\nLet me use the `open` command which is the standard way to open files in macOS.";
+        let (_text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "open soul.md"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_qwen_open_tool_with_path_narration() {
+        let response = "The user wants to open SOUL.md in Finder. I need to use the open tool with the file path. The working directory is /Users/nigecoleman/.local/share/zeroclaw/workspace, so the full path would be /Users/nigecoleman/.local/share/zeroclaw/workspace/SOUL.md";
+        let (_text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "open -R /Users/nigecoleman/.local/share/zeroclaw/workspace/SOUL.md"
+        );
+    }
+
+    #[test]
+    fn has_actionable_parsed_tool_call_rejects_meta_names() {
+        let calls = vec![ParsedToolCall {
+            name: "tool_call".to_string(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        }];
+        assert!(!has_actionable_parsed_tool_call(&calls));
+    }
+
+    #[test]
+    fn has_actionable_parsed_tool_call_accepts_shell() {
+        let calls = vec![ParsedToolCall {
+            name: "shell".to_string(),
+            arguments: serde_json::json!({"command": "date"}),
+            tool_call_id: None,
+        }];
+        assert!(has_actionable_parsed_tool_call(&calls));
+    }
+
+    #[test]
+    fn has_actionable_parsed_tool_call_rejects_shell_without_command() {
+        let calls = vec![ParsedToolCall {
+            name: "shell".to_string(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        }];
+        assert!(!has_actionable_parsed_tool_call(&calls));
+    }
+
+    #[test]
+    fn has_actionable_parsed_tool_call_rejects_unknown_tool_name() {
+        let calls = vec![ParsedToolCall {
+            name: "open".to_string(),
+            arguments: serde_json::json!({"path":"SOUL.md"}),
+            tool_call_id: None,
+        }];
+        assert!(!has_actionable_parsed_tool_call(&calls));
+    }
+
+    #[test]
+    fn parse_explicit_user_tool_call_open_in_finder() {
+        let call = parse_explicit_user_tool_call("open soul.md in finder").unwrap();
+        assert_eq!(call.name, "shell");
+        assert_eq!(
+            call.arguments.get("command").unwrap().as_str().unwrap(),
+            "open -R soul.md"
+        );
+    }
+
+    #[test]
+    fn parse_explicit_user_tool_call_open_in_default_editor() {
+        let call = parse_explicit_user_tool_call("open SOUL.md in the default editor").unwrap();
+        assert_eq!(call.name, "shell");
+        assert_eq!(
+            call.arguments.get("command").unwrap().as_str().unwrap(),
+            "open SOUL.md"
+        );
+    }
+
+    #[test]
+    fn parse_explicit_user_tool_call_open_in_textedit() {
+        let call = parse_explicit_user_tool_call("open soul.md in textedit").unwrap();
+        assert_eq!(call.name, "shell");
+        assert_eq!(
+            call.arguments.get("command").unwrap().as_str().unwrap(),
+            "open -a TextEdit soul.md"
+        );
+    }
+
+    #[test]
+    fn parse_explicit_user_tool_call_run_shell_command_prefix() {
+        let call =
+            parse_explicit_user_tool_call("run shell command: echo zc_toolcheck").unwrap();
+        assert_eq!(call.name, "shell");
+        assert_eq!(
+            call.arguments.get("command").unwrap().as_str().unwrap(),
+            "echo zc_toolcheck"
+        );
+    }
+
+    #[test]
     fn parse_tool_calls_handles_perl_style_tool_call_blocks() {
         let response = r#"TOOL_CALL
 {tool => "shell", args => { --command "uname -a" }}}
@@ -5060,6 +5810,57 @@ Done."#;
     }
 
     #[test]
+    fn parse_tool_call_value_normalizes_typed_scalar_argument_wrappers() {
+        let value = serde_json::json!({
+            "function": {
+                "name": "shell",
+                "arguments": {
+                    "command": {
+                        "type": "string",
+                        "value": "date +%s"
+                    }
+                }
+            }
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "shell");
+        assert_eq!(
+            result.arguments.get("command").and_then(|v| v.as_str()),
+            Some("date +%s")
+        );
+    }
+
+    #[test]
+    fn parse_tool_call_value_normalizes_string_encoded_typed_wrappers() {
+        let value = serde_json::json!({
+            "name": "shell",
+            "arguments": "{\"command\":{\"type\":\"string\",\"value\":\"date +%s\"}}"
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "shell");
+        assert_eq!(
+            result.arguments.get("command").and_then(|v| v.as_str()),
+            Some("date +%s")
+        );
+    }
+
+    #[test]
+    fn parse_tool_call_value_accepts_shell_cmd_alias() {
+        let value = serde_json::json!({
+            "name": "shell",
+            "arguments": {
+                "cmd": "open -a TextEdit soul.md"
+            }
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "shell");
+        assert_eq!(
+            result.arguments.get("command").and_then(|v| v.as_str()),
+            Some("open -a TextEdit soul.md")
+        );
+    }
+
+    #[test]
     fn parse_tool_call_value_preserves_tool_call_id_aliases() {
         let value = serde_json::json!({
             "call_id": "legacy_1",
@@ -5518,6 +6319,61 @@ Let me check the result."#;
     }
 
     #[test]
+    fn parse_tool_calls_unclosed_named_tool_call_with_cmd_alias() {
+        // <tool_call name="shell">{"cmd":"open -a TextEdit SOUL.md"}
+        let input = r#"<tool_call name="shell">
+{"cmd":"open -a TextEdit SOUL.md"}"#;
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "open -a TextEdit SOUL.md");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_infers_shell_from_bare_cmd_object() {
+        // <tool_call>{"cmd":"open -a TextEdit SOUL.md"}</tool_call>
+        let input = r#"<tool_call>
+{"cmd":"open -a TextEdit SOUL.md"}
+</tool_call>"#;
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "open -a TextEdit SOUL.md");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_self_closing_open_file_attrs() {
+        let input = r#"<tool_call tool="open_file" file="SOUL.md"/>"#;
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "open -a TextEdit SOUL.md");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_plain_fenced_open_command() {
+        let input = "```\nopen -a TextEdit SOUL.md\n```";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "open -a TextEdit SOUL.md");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_unclosed_bare_cmd_no_close_tag() {
+        let input = "<tool_call>\n{\"cmd\":\"open -a TextEdit SOUL.md\"}";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "open -a TextEdit SOUL.md");
+        assert!(text.is_empty());
+    }
+
+    #[test]
     fn parse_tool_calls_text_before_cross_alias() {
         // Text before and after cross-alias tool call
         let input = "Let me check that.\n<tool_call>shell>uname -a</invoke>\nDone.";
@@ -5667,5 +6523,31 @@ Let me check the result."#;
         let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert!(parsed.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn parse_structured_tool_calls_normalizes_shell_cmd_alias() {
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "shell".into(),
+            arguments: r#"{"cmd":"open -a TextEdit SOUL.md"}"#.into(),
+        }];
+        let parsed = parse_structured_tool_calls(&calls);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "shell");
+        assert_eq!(parsed[0].arguments["command"], "open -a TextEdit SOUL.md");
+    }
+
+    #[test]
+    fn parse_structured_tool_calls_recovers_shell_from_meta_name() {
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "tool_call".into(),
+            arguments: r#"{"cmd":"open -a TextEdit SOUL.md"}"#.into(),
+        }];
+        let parsed = parse_structured_tool_calls(&calls);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "shell");
+        assert_eq!(parsed[0].arguments["command"], "open -a TextEdit SOUL.md");
     }
 }

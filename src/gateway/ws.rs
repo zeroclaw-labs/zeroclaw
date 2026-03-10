@@ -20,6 +20,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::sync::Arc;
 
 #[derive(Deserialize)]
 pub struct WsQuery {
@@ -99,7 +100,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             continue;
         }
 
-        // Process message with the LLM provider
+        // Process message with the full agent tool-call loop (same as CLI/channels),
+        // so WebSocket chat actually executes tools instead of returning raw tags.
         let provider_label = state
             .config
             .lock()
@@ -114,44 +116,81 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             "model": state.model,
         }));
 
-        // Simple single-turn chat (no streaming for now — use provider.chat_with_system)
-        let system_prompt = {
-            let config_guard = state.config.lock();
-            crate::channels::build_system_prompt(
-                &config_guard.workspace_dir,
-                &state.model,
-                &[],
-                &[],
-                Some(&config_guard.identity),
-                None,
-            )
-        };
-
-        let messages = vec![
+        let config_snapshot = state.config.lock().clone();
+        let system_prompt = crate::channels::build_system_prompt(
+            &config_snapshot.workspace_dir,
+            &state.model,
+            &[],
+            &[],
+            Some(&config_snapshot.identity),
+            None,
+        );
+        let mut history = vec![
             crate::providers::ChatMessage::system(system_prompt),
             crate::providers::ChatMessage::user(&content),
         ];
 
-        let multimodal_config = state.config.lock().multimodal.clone();
-        let prepared =
-            match crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config)
-                .await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    let err = serde_json::json!({
-                        "type": "error",
-                        "message": format!("Multimodal prep failed: {e}")
-                    });
-                    let _ = sender.send(Message::Text(err.to_string().into())).await;
-                    continue;
-                }
-            };
+        let runtime_adapter = match crate::runtime::create_runtime(&config_snapshot.runtime) {
+            Ok(runtime) => Arc::from(runtime),
+            Err(e) => {
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": format!("Runtime initialization failed: {e}"),
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                continue;
+            }
+        };
 
-        match state
-            .provider
-            .chat_with_history(&prepared.messages, &state.model, state.temperature)
-            .await
+        let security = Arc::new(crate::security::SecurityPolicy::from_config(
+            &config_snapshot.autonomy,
+            &config_snapshot.workspace_dir,
+        ));
+
+        let (composio_key, composio_entity_id) = if config_snapshot.composio.enabled {
+            (
+                config_snapshot.composio.api_key.as_deref(),
+                Some(config_snapshot.composio.entity_id.as_str()),
+            )
+        } else {
+            (None, None)
+        };
+
+        let tools_registry = crate::tools::all_tools_with_runtime(
+            Arc::new(config_snapshot.clone()),
+            &security,
+            runtime_adapter,
+            Arc::clone(&state.mem),
+            composio_key,
+            composio_entity_id,
+            &config_snapshot.browser,
+            &config_snapshot.http_request,
+            &config_snapshot.web_fetch,
+            &config_snapshot.workspace_dir,
+            &config_snapshot.agents,
+            config_snapshot.api_key.as_deref(),
+            &config_snapshot,
+        );
+
+        match crate::agent::loop_::run_tool_call_loop(
+            state.provider.as_ref(),
+            &mut history,
+            &tools_registry,
+            state.observer.as_ref(),
+            provider_label.as_str(),
+            &state.model,
+            state.temperature,
+            true,
+            None,
+            "webchat",
+            &config_snapshot.multimodal,
+            config_snapshot.agent.max_tool_iterations,
+            None,
+            None,
+            None,
+            &config_snapshot.autonomy.non_cli_excluded_tools,
+        )
+        .await
         {
             Ok(response) => {
                 // Send the full response as a done message
