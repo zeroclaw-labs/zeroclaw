@@ -775,6 +775,11 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
     anyhow::anyhow!("{provider} API error ({status}): {sanitized}")
 }
 
+/// Ensure JSON provider calls always send an explicit Content-Type header.
+pub(crate) fn with_json_content_type(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    req.header(reqwest::header::CONTENT_TYPE, "application/json")
+}
+
 /// Resolve API key for a provider from config and environment variables.
 ///
 /// Resolution order:
@@ -2774,6 +2779,19 @@ mod tests {
         let input = "simple upstream timeout";
         let result = sanitize_api_error(input);
         assert_eq!(result, input);
+    }
+
+    #[test]
+    fn with_json_content_type_sets_header() {
+        let request = with_json_content_type(reqwest::Client::new().post("http://example.com"))
+            .body("{}")
+            .build()
+            .expect("request should build");
+        let content_type = request
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .expect("content type must be set");
+        assert_eq!(content_type, "application/json");
     }
 
     #[test]

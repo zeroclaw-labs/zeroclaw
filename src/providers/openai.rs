@@ -328,13 +328,14 @@ impl Provider for OpenAiProvider {
             temperature,
         };
 
-        let response = self
-            .http_client()
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {credential}"))
-            .json(&request)
-            .send()
-            .await?;
+        let response = super::with_json_content_type(
+            self.http_client()
+                .post(format!("{}/chat/completions", self.base_url)),
+        )
+        .header("Authorization", format!("Bearer {credential}"))
+        .json(&request)
+        .send()
+        .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
@@ -369,13 +370,14 @@ impl Provider for OpenAiProvider {
             tools,
         };
 
-        let response = self
-            .http_client()
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {credential}"))
-            .json(&native_request)
-            .send()
-            .await?;
+        let response = super::with_json_content_type(
+            self.http_client()
+                .post(format!("{}/chat/completions", self.base_url)),
+        )
+        .header("Authorization", format!("Bearer {credential}"))
+        .json(&native_request)
+        .send()
+        .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
@@ -432,13 +434,14 @@ impl Provider for OpenAiProvider {
             tools: native_tools,
         };
 
-        let response = self
-            .http_client()
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {credential}"))
-            .json(&native_request)
-            .send()
-            .await?;
+        let response = super::with_json_content_type(
+            self.http_client()
+                .post(format!("{}/chat/completions", self.base_url)),
+        )
+        .header("Authorization", format!("Bearer {credential}"))
+        .json(&native_request)
+        .send()
+        .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
@@ -476,6 +479,8 @@ impl Provider for OpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn creates_with_key() {
@@ -598,6 +603,28 @@ mod tests {
         let provider = OpenAiProvider::new(None);
         let result = provider.warmup().await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn chat_with_system_sends_explicit_json_content_type_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("content-type", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "ok" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/v1", server.uri());
+        let provider = OpenAiProvider::with_base_url(Some(&base_url), Some("test-key"));
+        let text = provider
+            .chat_with_system(None, "hello", "gpt-4o-mini", 0.2)
+            .await
+            .expect("openai chat should succeed");
+
+        assert_eq!(text, "ok");
     }
 
     // ----------------------------------------------------------

@@ -186,6 +186,7 @@ impl Provider for GlmProvider {
             .http_client()
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
             .json(&request)
             .send()
             .await?;
@@ -233,6 +234,7 @@ impl Provider for GlmProvider {
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
             .json(&request)
             .send()
             .await?;

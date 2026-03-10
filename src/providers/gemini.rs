@@ -820,6 +820,7 @@ impl GeminiProvider {
         let response = client
             .post(LOAD_CODE_ASSIST_ENDPOINT)
             .bearer_auth(token)
+            .header("Content-Type", "application/json")
             .json(&serde_json::json!({
                 "cloudaicompanionProject": project_seed_for_request,
                 "metadata": {
@@ -880,7 +881,7 @@ impl GeminiProvider {
         project: Option<&str>,
         oauth_token: Option<&str>,
     ) -> reqwest::RequestBuilder {
-        let req = self.http_client().post(url).json(request);
+        let req = super::with_json_content_type(self.http_client().post(url)).json(request);
         match auth {
             GeminiAuth::OAuthToken(_) | GeminiAuth::ManagedOAuth => {
                 let token = oauth_token.unwrap_or_default();
@@ -902,6 +903,7 @@ impl GeminiProvider {
                 };
                 self.http_client()
                     .post(url)
+                    .header("Content-Type", "application/json")
                     .json(&internal_request)
                     .bearer_auth(token)
             }

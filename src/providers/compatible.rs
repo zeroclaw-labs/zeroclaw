@@ -848,7 +848,10 @@ impl OpenAiCompatibleProvider {
         let url = self.responses_url();
 
         let response = self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
+            .apply_auth_header(
+                super::with_json_content_type(self.http_client().post(&url)).json(&request),
+                credential,
+            )
             .send()
             .await?;
 
@@ -1161,7 +1164,10 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let response = match self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
+            .apply_auth_header(
+                super::with_json_content_type(self.http_client().post(&url)).json(&request),
+                credential,
+            )
             .send()
             .await
         {
@@ -1271,7 +1277,10 @@ impl Provider for OpenAiCompatibleProvider {
 
         let url = self.chat_completions_url();
         let response = match self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
+            .apply_auth_header(
+                super::with_json_content_type(self.http_client().post(&url)).json(&request),
+                credential,
+            )
             .send()
             .await
         {
@@ -1389,7 +1398,10 @@ impl Provider for OpenAiCompatibleProvider {
 
         let url = self.chat_completions_url();
         let response = match self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
+            .apply_auth_header(
+                super::with_json_content_type(self.http_client().post(&url)).json(&request),
+                credential,
+            )
             .send()
             .await
         {
@@ -1486,7 +1498,7 @@ impl Provider for OpenAiCompatibleProvider {
         let url = self.chat_completions_url();
         let response = match self
             .apply_auth_header(
-                self.http_client().post(&url).json(&native_request),
+                super::with_json_content_type(self.http_client().post(&url)).json(&native_request),
                 credential,
             )
             .send()
@@ -1634,7 +1646,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         tokio::spawn(async move {
             // Build request with auth
-            let mut req_builder = client.post(&url).json(&request);
+            let mut req_builder = super::with_json_content_type(client.post(&url)).json(&request);
 
             // Apply auth header
             req_builder = match &auth_header {
@@ -1704,6 +1716,8 @@ impl Provider for OpenAiCompatibleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
         OpenAiCompatibleProvider::new(name, url, key, AuthStyle::Bearer)
@@ -1744,6 +1758,27 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Venice API key not set"));
+    }
+
+    #[tokio::test]
+    async fn chat_with_system_sends_explicit_json_content_type_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("content-type", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "ok from compatible" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = make_provider("custom", &server.uri(), Some("test-key"));
+        let text = provider
+            .chat_with_system(None, "hello", "gpt-4o-mini", 0.2)
+            .await
+            .expect("compatible chat should succeed");
+
+        assert_eq!(text, "ok from compatible");
     }
 
     #[test]

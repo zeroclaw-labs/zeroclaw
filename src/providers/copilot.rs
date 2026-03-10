@@ -337,6 +337,7 @@ impl CopilotProvider {
             .http_client()
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
             .json(&request);
 
         for (header, value) in &Self::COPILOT_HEADERS {
@@ -455,6 +456,7 @@ impl CopilotProvider {
             .http_client()
             .post(GITHUB_DEVICE_CODE_URL)
             .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
             .json(&serde_json::json!({
                 "client_id": GITHUB_CLIENT_ID,
                 "scope": "read:user"
@@ -484,6 +486,7 @@ impl CopilotProvider {
                 .http_client()
                 .post(GITHUB_ACCESS_TOKEN_URL)
                 .header("Accept", "application/json")
+                .header("Content-Type", "application/json")
                 .json(&serde_json::json!({
                     "client_id": GITHUB_CLIENT_ID,
                     "device_code": response.device_code,

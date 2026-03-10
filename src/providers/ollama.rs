@@ -367,7 +367,8 @@ impl OllamaProvider {
             request.tools.as_ref().map_or(0, |t| t.len()),
         );
 
-        let mut request_builder = self.http_client().post(&url).json(&request);
+        let mut request_builder =
+            super::with_json_content_type(self.http_client().post(&url)).json(&request);
 
         if should_auth {
             if let Some(key) = self.api_key.as_ref() {
