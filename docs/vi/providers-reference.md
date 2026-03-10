@@ -36,6 +36,7 @@ Với chuỗi provider dự phòng (`reliability.fallback_providers`), mỗi pro
 | `kimi-code` | `kimi_coding`, `kimi_for_coding` | Không | `KIMI_CODE_API_KEY`, `MOONSHOT_API_KEY` |
 | `synthetic` | — | Không | `SYNTHETIC_API_KEY` |
 | `opencode` | `opencode-zen` | Không | `OPENCODE_API_KEY` |
+| `opencode` | — | Không | `OPENCODE_GO_API_KEY` |
 | `zai` | `z.ai` | Không | `ZAI_API_KEY` |
 | `glm` | `zhipu` | Không | `GLM_API_KEY` |
 | `minimax` | `minimax-intl`, `minimax-io`, `minimax-global`, `minimax-cn`, `minimaxi`, `minimax-oauth`, `minimax-oauth-cn`, `minimax-portal`, `minimax-portal-cn` | Không | `MINIMAX_OAUTH_TOKEN`, `MINIMAX_API_KEY` |
