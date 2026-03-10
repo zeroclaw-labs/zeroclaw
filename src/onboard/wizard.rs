@@ -5665,6 +5665,10 @@ fn print_summary(config: &Config) {
             );
         } else {
             let env_var = provider_env_var(provider);
+            let model = config.default_model.as_deref().unwrap_or("");
+            let is_custom_model = !model.is_empty()
+                && model != default_model_for_provider(provider);
+
             println!(
                 "    {} Set your API key:",
                 style(format!("{step}.")).cyan().bold()
@@ -5673,6 +5677,22 @@ fn print_summary(config: &Config) {
                 "       {}",
                 style(format!("export {env_var}=\"sk-...\"")).yellow()
             );
+
+            // Show onboard command with model if custom model was selected
+            if is_custom_model {
+                println!();
+                println!(
+                    "    {} Or re-run with your custom model:",
+                    style(format!("{step}.")).cyan().bold()
+                );
+                println!(
+                    "       {}",
+                    style(format!(
+                        "zeroclaw onboard --api-key \"sk-...\" --provider {provider} --model {model}"
+                    ))
+                    .yellow()
+                );
+            }
         }
         println!();
         step += 1;
