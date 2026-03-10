@@ -269,7 +269,7 @@ impl Agent {
             None
         };
 
-        let tools = tools::all_tools_with_runtime(
+        let mut tools = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             runtime,
@@ -284,6 +284,45 @@ impl Agent {
             config.api_key.as_deref(),
             config,
         );
+
+        // Wire MCP tools into the registry — non-fatal.
+        if config.mcp.enabled && !config.mcp.servers.is_empty() {
+            tracing::info!(
+                "Initializing MCP client — {} server(s) configured",
+                config.mcp.servers.len()
+            );
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    match handle
+                        .block_on(crate::tools::McpRegistry::connect_all(&config.mcp.servers))
+                    {
+                        Ok(registry) => {
+                            let registry = std::sync::Arc::new(registry);
+                            let names = registry.tool_names();
+                            let mut registered = 0usize;
+                            for name in names {
+                                if let Some(def) = handle.block_on(registry.get_tool_def(&name)) {
+                                    let wrapper = crate::tools::McpToolWrapper::new(
+                                        name,
+                                        def,
+                                        std::sync::Arc::clone(&registry),
+                                    );
+                                    tools.push(Box::new(wrapper));
+                                    registered += 1;
+                                }
+                            }
+                            tracing::info!(
+                                "MCP: {} tool(s) registered from {} server(s)",
+                                registered,
+                                registry.server_count()
+                            );
+                        }
+                        Err(e) => tracing::error!("MCP registry failed to initialize: {e:#}"),
+                    }
+                }
+                Err(_) => tracing::warn!("No tokio runtime available for MCP initialization"),
+            }
+        }
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
 

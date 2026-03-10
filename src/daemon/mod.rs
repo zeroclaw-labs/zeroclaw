@@ -25,6 +25,24 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
+    // Start SIGHUP handler for MCP hot-reload
+    if config.mcp.enabled {
+        let mcp_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::mcp_reload::McpManager::new(&config)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to create MCP manager: {e}");
+                    // Return a default-like manager by creating without connecting
+                    // This is safe since McpManager::new never actually connects
+                    panic!("McpManager::new should not fail: {e}");
+                }),
+        ));
+        let config_path = config.config_path.clone();
+        let handler = crate::mcp_reload::SignalHandler::new(mcp_manager, config_path);
+        let _signal_thread = handler.start();
+        tracing::info!("SIGHUP handler registered for MCP hot-reload");
+    }
+
     {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();

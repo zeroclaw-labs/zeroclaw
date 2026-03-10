@@ -217,6 +217,10 @@ pub struct Config {
     /// Voice transcription configuration (Whisper API via Groq).
     #[serde(default)]
     pub transcription: TranscriptionConfig,
+
+    /// External MCP server connections (`[mcp]`).
+    #[serde(default, alias = "mcpServers")]
+    pub mcp: McpConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -522,6 +526,60 @@ impl Default for MultimodalConfig {
             allow_remote_fetch: false,
         }
     }
+}
+
+// ── MCP ─────────────────────────────────────────────────────────
+
+/// Transport type for MCP server connections.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    /// Spawn a local process and communicate over stdin/stdout.
+    #[default]
+    Stdio,
+    /// Connect via HTTP POST.
+    Http,
+    /// Connect via HTTP + Server-Sent Events.
+    Sse,
+}
+
+/// Configuration for a single external MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct McpServerConfig {
+    /// Display name used as a tool prefix (`<server>__<tool>`).
+    pub name: String,
+    /// Transport type (default: stdio).
+    #[serde(default)]
+    pub transport: McpTransport,
+    /// URL for HTTP/SSE transports.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Executable to spawn for stdio transport.
+    #[serde(default)]
+    pub command: String,
+    /// Command arguments for stdio transport.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Optional environment variables for stdio transport.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Optional HTTP headers for HTTP/SSE transports.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Optional per-call timeout in seconds (hard capped in validation).
+    #[serde(default)]
+    pub tool_timeout_secs: Option<u64>,
+}
+
+/// External MCP client configuration (`[mcp]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct McpConfig {
+    /// Enable MCP tool loading.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Configured MCP servers.
+    #[serde(default, alias = "mcpServers")]
+    pub servers: Vec<McpServerConfig>,
 }
 
 // ── Identity (AIEOS / OpenClaw format) ──────────────────────────
@@ -3629,6 +3687,7 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
 }
@@ -4003,6 +4062,65 @@ fn read_codex_openai_api_key() -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+const MCP_MAX_TOOL_TIMEOUT_SECS: u64 = 600;
+
+fn validate_mcp_config(config: &McpConfig) -> Result<()> {
+    let mut seen_names = std::collections::HashSet::new();
+    for (i, server) in config.servers.iter().enumerate() {
+        let name = server.name.trim();
+        if name.is_empty() {
+            anyhow::bail!("mcp.servers[{i}].name must not be empty");
+        }
+        if !seen_names.insert(name.to_ascii_lowercase()) {
+            anyhow::bail!("mcp.servers contains duplicate name: {name}");
+        }
+
+        if let Some(timeout) = server.tool_timeout_secs {
+            if timeout == 0 {
+                anyhow::bail!("mcp.servers[{i}].tool_timeout_secs must be greater than 0");
+            }
+            if timeout > MCP_MAX_TOOL_TIMEOUT_SECS {
+                anyhow::bail!(
+                    "mcp.servers[{i}].tool_timeout_secs exceeds max {MCP_MAX_TOOL_TIMEOUT_SECS}"
+                );
+            }
+        }
+
+        match server.transport {
+            McpTransport::Stdio => {
+                if server.command.trim().is_empty() {
+                    anyhow::bail!(
+                        "mcp.servers[{i}] with transport=stdio requires non-empty command"
+                    );
+                }
+            }
+            McpTransport::Http | McpTransport::Sse => {
+                let url = server
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "mcp.servers[{i}] with transport={} requires url",
+                            match server.transport {
+                                McpTransport::Http => "http",
+                                McpTransport::Sse => "sse",
+                                McpTransport::Stdio => "stdio",
+                            }
+                        )
+                    })?;
+                let parsed = reqwest::Url::parse(url)
+                    .with_context(|| format!("mcp.servers[{i}].url is not a valid URL"))?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    anyhow::bail!("mcp.servers[{i}].url must use http/https");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Config {
@@ -4676,6 +4794,14 @@ impl Config {
         }
 
         set_runtime_proxy_config(self.proxy.clone());
+
+        // MCP
+        if self.mcp.enabled {
+            if let Err(error) = validate_mcp_config(&self.mcp) {
+                tracing::warn!("Invalid MCP configuration ignored: {error}");
+                self.mcp.enabled = false;
+            }
+        }
     }
 
     pub async fn save(&self) -> Result<()> {
@@ -5161,6 +5287,7 @@ default_temperature = 0.7
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            mcp: McpConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -5343,6 +5470,7 @@ tool_dispatcher = "xml"
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            mcp: McpConfig::default(),
         };
 
         config.save().await.unwrap();
