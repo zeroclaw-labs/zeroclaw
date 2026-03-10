@@ -782,86 +782,71 @@ async fn main() -> Result<()> {
         Commands::Gateway { gateway_command } => {
             match gateway_command {
                 Some(zeroclaw::GatewayCommands::Restart { port, host }) => {
-                    let port = port.unwrap_or(config.gateway.port);
-                    let host = host.unwrap_or_else(|| config.gateway.host.clone());
-                    info!("🔄 Restarting ZeroClaw Gateway on {host}:{port}");
-
-                    // Try to connect to existing gateway and shut it down gracefully
+                    let (port, host) = resolve_gateway_addr(&config, port, host);
                     let addr = format!("{host}:{port}");
-                    match tokio::net::TcpStream::connect(&addr).await {
-                        Ok(_) => {
-                            info!("   Found existing gateway on {addr}, attempting graceful shutdown...");
-                            // Wait a moment for the connection to be established
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    info!("🔄 Restarting ZeroClaw Gateway on {addr}");
+
+                    // Try to gracefully shutdown existing gateway via admin endpoint
+                    match shutdown_gateway(&host, port).await {
+                        Ok(()) => {
+                            info!("   ✓ Existing gateway on {addr} shut down gracefully");
+                            // Small delay to allow port to be released
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                         }
-                        Err(_) => {
-                            info!("   No existing gateway found on {addr}");
+                        Err(e) => {
+                            info!("   No existing gateway to shut down: {e}");
                         }
                     }
 
-                    // Small delay to allow any cleanup
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
+                    log_gateway_start(&host, port);
                     gateway::run_gateway(&host, port, config).await
                 }
                 Some(zeroclaw::GatewayCommands::GetPaircode) => {
-                    // Check if gateway pairing is enabled in config
-                    if !config.gateway.require_pairing {
-                        println!("⚠️  Gateway pairing is disabled in config.");
-                        println!("   All requests will be accepted without authentication.");
-                        println!("   To enable pairing, set [gateway] require_pairing = true");
-                        return Ok(());
-                    }
-
-                    // Try to connect to the running gateway to check its status
                     let port = config.gateway.port;
-                    let host = config.gateway.host.clone();
-                    let addr = format!("{host}:{port}");
+                    let host = &config.gateway.host;
 
-                    println!("🔐 Gateway pairing is enabled.");
-
-                    // Check if gateway is running by attempting a connection
-                    match tokio::net::TcpStream::connect(&addr).await {
-                        Ok(_) => {
-                            // Gateway is running - pairing code would be shown in gateway logs
-                            println!("   Gateway is running on {addr}.");
-                            if config.gateway.paired_tokens.is_empty() {
-                                println!("   No devices paired yet.");
-                                println!("   The pairing code was printed when the gateway started.");
-                                println!("   Check the gateway logs or restart the gateway to see the pairing code.");
+                    // Fetch live pairing code from running gateway
+                    match fetch_paircode(host, port).await {
+                        Ok(Some(code)) => {
+                            println!("🔐 Gateway pairing is enabled.");
+                            println!();
+                            println!("  ┌──────────────┐");
+                            println!("  │  {code}  │");
+                            println!("  └──────────────┘");
+                            println!();
+                            println!("  Use this one-time code to pair a new device:");
+                            println!("    POST /pair with header X-Pairing-Code: {code}");
+                        }
+                        Ok(None) => {
+                            if !config.gateway.require_pairing {
+                                println!("⚠️  Gateway pairing is disabled in config.");
+                                println!("   All requests will be accepted without authentication.");
+                                println!("   To enable pairing, set [gateway] require_pairing = true");
                             } else {
-                                println!("   Paired devices: {} configured", config.gateway.paired_tokens.len());
-                                println!("   To pair a new device, restart the gateway to generate a new pairing code.");
+                                println!("🔐 Gateway pairing is enabled, but no active pairing code available.");
+                                println!("   The gateway may already be paired, or the code has been used.");
+                                println!("   Restart the gateway to generate a new pairing code.");
                             }
                         }
-                        Err(_) => {
-                            println!("   Gateway is not currently running on {addr}.");
-                            println!("   Start the gateway first to generate a pairing code:");
+                        Err(e) => {
+                            println!("❌ Failed to fetch pairing code from gateway at {host}:{port}");
+                            println!("   Error: {e}");
+                            println!();
+                            println!("   Is the gateway running? Start it with:");
                             println!("     zeroclaw gateway start");
-                            println!("   Or with custom host/port:");
-                            println!("     zeroclaw gateway start --host {host} -p {port}");
                         }
                     }
                     Ok(())
                 }
                 Some(zeroclaw::GatewayCommands::Start { port, host }) => {
-                    let port = port.unwrap_or(config.gateway.port);
-                    let host = host.unwrap_or_else(|| config.gateway.host.clone());
-                    if port == 0 {
-                        info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
-                    } else {
-                        info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
-                    }
+                    let (port, host) = resolve_gateway_addr(&config, port, host);
+                    log_gateway_start(&host, port);
                     gateway::run_gateway(&host, port, config).await
                 }
                 None => {
                     let port = config.gateway.port;
                     let host = config.gateway.host.clone();
-                    if port == 0 {
-                        info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
-                    } else {
-                        info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
-                    }
+                    log_gateway_start(&host, port);
                     gateway::run_gateway(&host, port, config).await
                 }
             }
@@ -1292,6 +1277,64 @@ fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> R
 
     writer.flush()?;
     Ok(())
+}
+
+// ─── Gateway helper functions ───────────────────────────────────────────────
+
+/// Resolve gateway host and port from CLI args or config.
+fn resolve_gateway_addr(config: &Config, port: Option<u16>, host: Option<String>) -> (u16, String) {
+    let port = port.unwrap_or(config.gateway.port);
+    let host = host.unwrap_or_else(|| config.gateway.host.clone());
+    (port, host)
+}
+
+/// Log gateway startup message.
+fn log_gateway_start(host: &str, port: u16) {
+    if port == 0 {
+        info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
+    } else {
+        info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
+    }
+}
+
+/// Gracefully shutdown a running gateway via the admin endpoint.
+async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
+    let url = format!("http://{host}:{port}/admin/shutdown");
+    let client = reqwest::Client::new();
+
+    match client.post(&url).timeout(std::time::Duration::from_secs(5)).send().await {
+        Ok(response) if response.status().is_success() => Ok(()),
+        Ok(response) => Err(anyhow::anyhow!("Gateway responded with status: {}", response.status())),
+        Err(e) => Err(anyhow::anyhow!("Failed to connect to gateway: {e}")),
+    }
+}
+
+/// Fetch the current pairing code from a running gateway.
+async fn fetch_paircode(host: &str, port: u16) -> Result<Option<String>> {
+    let url = format!("http://{host}:{port}/admin/paircode");
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to gateway: {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!("Gateway responded with status: {}", response.status()));
+    }
+
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to parse response: {e}"))?;
+
+    if json.get("success").and_then(|v| v.as_bool()) != Some(true) {
+        return Ok(None);
+    }
+
+    Ok(json.get("pairing_code").and_then(|v| v.as_str()).map(String::from))
 }
 
 // ─── Generic Pending OAuth Login ────────────────────────────────────────────

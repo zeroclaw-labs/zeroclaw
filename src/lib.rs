@@ -94,6 +94,7 @@ Examples:
         port: Option<u16>,
 
         /// Host to bind to; defaults to config gateway.host
+        /// Note: Binding to 0.0.0.0 requires `gateway.allow_public_bind = true` in config
         #[arg(long)]
         host: Option<String>,
     },
