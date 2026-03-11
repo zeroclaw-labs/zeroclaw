@@ -131,7 +131,13 @@ impl HookHandler for WebhookAuditHook {
     }
 
     async fn before_tool_call(&self, name: String, args: Value) -> HookResult<(String, Value)> {
-        // Placeholder — will be implemented in the next commit.
+        if self.config.include_args && matches_any_pattern(&self.config.tool_patterns, &name) {
+            tracing::debug!(hook = "webhook-audit", tool = %name, "capturing args for audit");
+            self.pending_args
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(name.clone(), args.clone());
+        }
         HookResult::Continue((name, args))
     }
 
@@ -199,6 +205,51 @@ mod tests {
     fn empty_patterns_matches_nothing() {
         let patterns: Vec<String> = vec![];
         assert!(!matches_any_pattern(&patterns, "anything"));
+    }
+
+    // ── before_tool_call tests ────────────────────────────────────
+
+    fn make_hook(patterns: Vec<&str>, include_args: bool) -> WebhookAuditHook {
+        WebhookAuditHook::new(WebhookAuditConfig {
+            enabled: true,
+            url: "http://localhost:9999/audit".to_string(),
+            tool_patterns: patterns.into_iter().map(String::from).collect(),
+            include_args,
+            max_args_bytes: 4096,
+        })
+    }
+
+    #[tokio::test]
+    async fn before_tool_call_captures_args_when_enabled() {
+        let hook = make_hook(vec!["Bash", "mcp__*"], true);
+        let args = serde_json::json!({"command": "ls"});
+        let result = hook.before_tool_call("Bash".into(), args.clone()).await;
+        assert!(!result.is_cancel());
+
+        let pending = hook.pending_args.lock().unwrap();
+        assert_eq!(pending.get("Bash"), Some(&args));
+    }
+
+    #[tokio::test]
+    async fn before_tool_call_skips_non_matching_tools() {
+        let hook = make_hook(vec!["Bash"], true);
+        let args = serde_json::json!({"path": "/tmp"});
+        let result = hook.before_tool_call("Write".into(), args).await;
+        assert!(!result.is_cancel());
+
+        let pending = hook.pending_args.lock().unwrap();
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn before_tool_call_skips_when_include_args_false() {
+        let hook = make_hook(vec!["Bash"], false);
+        let args = serde_json::json!({"command": "ls"});
+        let result = hook.before_tool_call("Bash".into(), args).await;
+        assert!(!result.is_cancel());
+
+        let pending = hook.pending_args.lock().unwrap();
+        assert!(pending.is_empty());
     }
 
     // ── Truncation tests ─────────────────────────────────────────
