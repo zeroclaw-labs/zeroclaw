@@ -4082,6 +4082,156 @@ fn decrypt_secret(
     Ok(())
 }
 
+fn decrypt_channel_secrets(
+    store: &crate::security::SecretStore,
+    channels: &mut ChannelsConfig,
+) -> Result<()> {
+    if let Some(ref mut telegram) = channels.telegram {
+        decrypt_secret(store, &mut telegram.bot_token, "config.channels_config.telegram.bot_token")?;
+    }
+    if let Some(ref mut discord) = channels.discord {
+        decrypt_secret(store, &mut discord.bot_token, "config.channels_config.discord.bot_token")?;
+    }
+    if let Some(ref mut slack) = channels.slack {
+        decrypt_secret(store, &mut slack.bot_token, "config.channels_config.slack.bot_token")?;
+        decrypt_optional_secret(
+            store,
+            &mut slack.app_token,
+            "config.channels_config.slack.app_token",
+        )?;
+    }
+    if let Some(ref mut mattermost) = channels.mattermost {
+        decrypt_secret(
+            store,
+            &mut mattermost.bot_token,
+            "config.channels_config.mattermost.bot_token",
+        )?;
+    }
+    if let Some(ref mut webhook) = channels.webhook {
+        decrypt_optional_secret(store, &mut webhook.secret, "config.channels_config.webhook.secret")?;
+    }
+    if let Some(ref mut matrix) = channels.matrix {
+        decrypt_secret(
+            store,
+            &mut matrix.access_token,
+            "config.channels_config.matrix.access_token",
+        )?;
+    }
+    if let Some(ref mut whatsapp) = channels.whatsapp {
+        decrypt_optional_secret(
+            store,
+            &mut whatsapp.access_token,
+            "config.channels_config.whatsapp.access_token",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut whatsapp.app_secret,
+            "config.channels_config.whatsapp.app_secret",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut whatsapp.verify_token,
+            "config.channels_config.whatsapp.verify_token",
+        )?;
+    }
+    if let Some(ref mut linq) = channels.linq {
+        decrypt_secret(store, &mut linq.api_token, "config.channels_config.linq.api_token")?;
+        decrypt_optional_secret(
+            store,
+            &mut linq.signing_secret,
+            "config.channels_config.linq.signing_secret",
+        )?;
+    }
+    if let Some(ref mut nextcloud) = channels.nextcloud_talk {
+        decrypt_secret(
+            store,
+            &mut nextcloud.app_token,
+            "config.channels_config.nextcloud_talk.app_token",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut nextcloud.webhook_secret,
+            "config.channels_config.nextcloud_talk.webhook_secret",
+        )?;
+    }
+    if let Some(ref mut wati) = channels.wati {
+        decrypt_secret(store, &mut wati.api_token, "config.channels_config.wati.api_token")?;
+    }
+    if let Some(ref mut irc) = channels.irc {
+        decrypt_optional_secret(
+            store,
+            &mut irc.server_password,
+            "config.channels_config.irc.server_password",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut irc.nickserv_password,
+            "config.channels_config.irc.nickserv_password",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut irc.sasl_password,
+            "config.channels_config.irc.sasl_password",
+        )?;
+    }
+    if let Some(ref mut lark) = channels.lark {
+        decrypt_secret(store, &mut lark.app_secret, "config.channels_config.lark.app_secret")?;
+        decrypt_optional_secret(
+            store,
+            &mut lark.encrypt_key,
+            "config.channels_config.lark.encrypt_key",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut lark.verification_token,
+            "config.channels_config.lark.verification_token",
+        )?;
+    }
+    if let Some(ref mut feishu) = channels.feishu {
+        decrypt_secret(
+            store,
+            &mut feishu.app_secret,
+            "config.channels_config.feishu.app_secret",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut feishu.encrypt_key,
+            "config.channels_config.feishu.encrypt_key",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut feishu.verification_token,
+            "config.channels_config.feishu.verification_token",
+        )?;
+    }
+    if let Some(ref mut dingtalk) = channels.dingtalk {
+        decrypt_secret(
+            store,
+            &mut dingtalk.client_secret,
+            "config.channels_config.dingtalk.client_secret",
+        )?;
+    }
+    if let Some(ref mut qq) = channels.qq {
+        decrypt_secret(store, &mut qq.app_secret, "config.channels_config.qq.app_secret")?;
+    }
+    if let Some(ref mut clawdtalk) = channels.clawdtalk {
+        decrypt_secret(
+            store,
+            &mut clawdtalk.api_key,
+            "config.channels_config.clawdtalk.api_key",
+        )?;
+        decrypt_optional_secret(
+            store,
+            &mut clawdtalk.webhook_secret,
+            "config.channels_config.clawdtalk.webhook_secret",
+        )?;
+    }
+    if let Some(ref mut email) = channels.email {
+        decrypt_secret(store, &mut email.password, "config.channels_config.email.password")?;
+    }
+    Ok(())
+}
+
 fn encrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
@@ -4283,6 +4433,7 @@ impl Config {
                     "config.channels_config.nostr.private_key",
                 )?;
             }
+            decrypt_channel_secrets(&store, &mut config.channels_config)?;
 
             config.apply_env_overrides();
             config.validate()?;
@@ -7093,6 +7244,110 @@ default_model = "legacy-model"
         assert_eq!(config.config_path, env_workspace_dir.join("config.toml"));
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[tokio::test]
+    async fn load_or_init_decrypts_channel_secrets() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_home.join(".zeroclaw");
+        let config_path = config_dir.join("config.toml");
+        fs::create_dir_all(&config_dir).await.unwrap();
+
+        let store = crate::security::SecretStore::new(&config_dir, true);
+        let telegram_token = store.encrypt("telegram-token").unwrap();
+        let slack_bot_token = store.encrypt("slack-token").unwrap();
+        let slack_app_token = store.encrypt("slack-app-token").unwrap();
+        let webhook_secret = store.encrypt("webhook-secret").unwrap();
+        let matrix_token = store.encrypt("matrix-token").unwrap();
+        let lark_secret = store.encrypt("lark-secret").unwrap();
+        let lark_encrypt_key = store.encrypt("lark-encrypt").unwrap();
+        let lark_verification_token = store.encrypt("lark-verify").unwrap();
+
+        fs::write(
+            &config_path,
+            format!(
+                r#"[secrets]
+encrypt = true
+
+[channels_config.telegram]
+bot_token = "{telegram_token}"
+allowed_users = ["*"]
+stream_mode = "edit"
+draft_update_interval_ms = 500
+interrupt_on_new_message = false
+mention_only = false
+
+[channels_config.slack]
+bot_token = "{slack_bot_token}"
+app_token = "{slack_app_token}"
+channel_id = "C123"
+allowed_users = ["U123"]
+
+[channels_config.webhook]
+port = 42600
+secret = "{webhook_secret}"
+
+[channels_config.matrix]
+homeserver = "https://matrix.example.com"
+access_token = "{matrix_token}"
+user_id = "@bot:example.com"
+device_id = "DEVICE"
+room_id = "!room:example.com"
+allowed_users = ["@user:example.com"]
+
+[channels_config.lark]
+app_id = "cli_aabbcc"
+app_secret = "{lark_secret}"
+encrypt_key = "{lark_encrypt_key}"
+verification_token = "{lark_verification_token}"
+allowed_users = ["*"]
+mention_only = false
+use_feishu = false
+receive_mode = "websocket"
+"#
+            ),
+        )
+        .await
+        .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+
+        let config = Config::load_or_init().await.unwrap();
+
+        assert_eq!(
+            config.channels_config.telegram.as_ref().unwrap().bot_token,
+            "telegram-token"
+        );
+        let slack = config.channels_config.slack.as_ref().unwrap();
+        assert_eq!(slack.bot_token, "slack-token");
+        assert_eq!(slack.app_token.as_deref(), Some("slack-app-token"));
+        assert_eq!(
+            config
+                .channels_config
+                .webhook
+                .as_ref()
+                .and_then(|cfg| cfg.secret.as_deref()),
+            Some("webhook-secret")
+        );
+        assert_eq!(
+            config.channels_config.matrix.as_ref().unwrap().access_token,
+            "matrix-token"
+        );
+        let lark = config.channels_config.lark.as_ref().unwrap();
+        assert_eq!(lark.app_secret, "lark-secret");
+        assert_eq!(lark.encrypt_key.as_deref(), Some("lark-encrypt"));
+        assert_eq!(lark.verification_token.as_deref(), Some("lark-verify"));
+
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
         } else {
