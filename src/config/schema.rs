@@ -1234,7 +1234,7 @@ pub struct WebFetchConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Allowed domains for web fetch (exact or subdomain match; `["*"]` = all public hosts)
-    #[serde(default)]
+    #[serde(default = "default_web_fetch_allowed_domains")]
     pub allowed_domains: Vec<String>,
     /// Blocked domains (exact or subdomain match; always takes priority over allowed_domains)
     #[serde(default)]
@@ -1253,6 +1253,10 @@ fn default_web_fetch_max_response_size() -> usize {
 
 fn default_web_fetch_timeout_secs() -> u64 {
     30
+}
+
+fn default_web_fetch_allowed_domains() -> Vec<String> {
+    vec!["*".into()]
 }
 
 impl Default for WebFetchConfig {
