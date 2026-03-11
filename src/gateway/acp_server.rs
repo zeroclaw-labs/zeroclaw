@@ -459,18 +459,25 @@ async fn handle_session_prompt(
     // Create a channel for streaming SSE events
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
 
-    // Spawn the agent loop in a background task
+    // Spawn the agent loop in a background task.
+    // Inner spawn lets the outer task await the JoinHandle — if the inner task
+    // panics, JoinHandle returns Err(JoinError) instead of silently swallowing it.
+    let tx_panic = tx.clone();
     tokio::spawn(async move {
-        let result = run_acp_agent_loop(
-            config,
-            &prompt_text,
-            existing_history,
-            tx.clone(),
-        )
+        tracing::info!("ACP agent task spawned, calling run_acp_agent_loop");
+        let inner_tx = tx.clone();
+        let join_result = tokio::spawn(async move {
+            run_acp_agent_loop(config, &prompt_text, existing_history, inner_tx).await
+        })
         .await;
 
-        match result {
-            Ok((response_text, updated_history)) => {
+        match join_result {
+            Ok(Ok((response_text, updated_history))) => {
+                tracing::info!(
+                    response_len = response_text.len(),
+                    history_len = updated_history.len(),
+                    "ACP agent loop completed successfully"
+                );
                 // Persist updated history back to the session store
                 if let Some(mut session) = store_clone.get(&transport_id) {
                     session.history = updated_history;
@@ -486,10 +493,31 @@ async fn handle_session_prompt(
                 );
                 let _ = tx.send(sse_line(&result_msg)).await;
             }
-            Err(e) => {
-                tracing::error!(error = %e, "ACP agent loop failed");
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "ACP agent loop returned error");
                 let err = jsonrpc_error(&request_id, -32000, &format!("Agent error: {e}"));
                 let _ = tx.send(sse_line(&err)).await;
+            }
+            Err(join_err) => {
+                let panic_msg = if join_err.is_panic() {
+                    let payload = join_err.into_panic();
+                    if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else if let Some(s) = payload.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else {
+                        "unknown panic payload".to_string()
+                    }
+                } else {
+                    format!("task cancelled: {join_err}")
+                };
+                tracing::error!(panic = %panic_msg, "ACP agent loop PANICKED");
+                let err = jsonrpc_error(
+                    &request_id,
+                    -32000,
+                    &format!("Agent panic: {panic_msg}"),
+                );
+                let _ = tx_panic.send(sse_line(&err)).await;
             }
         }
     });
@@ -530,7 +558,27 @@ async fn run_acp_agent_loop(
     );
     let _ = tx.send(sse_line(&notif)).await;
 
-    crate::agent::process_message_with_history(config, message, existing_history).await
+    tracing::info!(
+        message_len = message.len(),
+        history_len = existing_history.len(),
+        provider = config.default_provider.as_deref().unwrap_or("(none)"),
+        model = config.default_model.as_deref().unwrap_or("(none)"),
+        "run_acp_agent_loop: calling process_message_with_history"
+    );
+    let result =
+        crate::agent::process_message_with_history(config, message, existing_history).await;
+    match &result {
+        Ok((text, hist)) => tracing::info!(
+            response_len = text.len(),
+            history_len = hist.len(),
+            "run_acp_agent_loop: process_message_with_history returned Ok"
+        ),
+        Err(e) => tracing::error!(
+            error = %e,
+            "run_acp_agent_loop: process_message_with_history returned Err"
+        ),
+    }
+    result
 }
 
 // ── Tests ────────────────────────────────────────────────────────

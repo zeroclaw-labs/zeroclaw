@@ -240,8 +240,44 @@ The k8s agent zeroclaw has the full tool registry. For the k8s use case, the imp
 | 2. Transport Sessions | 🟩 | `AcpSessionStore` with TTL, create/get/update/remove |
 | 3. Prompt Execution | 🟩 | `process_message_with_history` + SSE streaming |
 | 4. Auth & Rate Limiting | 🟩 | Pairing auth + rate limiting reused from gateway |
-| 5. acp-client Integration | 🟥 | Needs live test against deployed instance |
-| 6. Testing | 🟨 | 10 unit tests pass; integration tests pending |
-| 7. Deployment | 🟥 | K8s manifests + identity files drafted |
+| 5. acp-client Integration | 🟨 | acp-client defaults updated, needs live test |
+| 6. Testing | 🟩 | 18 unit tests pass (store, handlers, lifecycle, isolation) |
+| 7. Deployment | 🟨 | Manifests created, Docker build in progress, Vault secret pending |
 
-**Overall: ~65%**
+**Overall: ~85%**
+
+## Manual Steps Required
+
+Before deploying, the user must:
+
+1. **Create Vault secret** at `kvv2/zeroclaw/zeroclaw-k8s-agent` with keys:
+   - `api_key` — LiteLLM proxy API key (same as Sam's)
+   - `gateway-paired-tokens` — pre-shared token for ACP auth (generate new)
+   - `git-token` — Gitea access token for cloning scrapyard-applications
+
+2. **Push Docker image** `citizendaniel/zeroclaw:feat-proactive-messaging` to registry
+
+3. **Apply manifests** in order:
+   ```bash
+   kubectl apply -f 04_zeroclaw_k8s_agent/00_vso_vault.yaml
+   kubectl apply -f 04_zeroclaw_k8s_agent/01_configmap.yaml
+   kubectl apply -f 04_zeroclaw_k8s_agent/02_identity_configmap.yaml
+   kubectl apply -f 04_zeroclaw_k8s_agent/03_sandbox.yaml
+   kubectl apply -f 04_zeroclaw_k8s_agent/04_service.yaml
+   kubectl apply -f 04_zeroclaw_k8s_agent/05_networkpolicy.yaml
+   kubectl apply -f 04_zeroclaw_k8s_agent/06_cilium_kube_api_policy.yaml
+   ```
+
+4. **Update Sam's acp-client** — apply updated ConfigMap:
+   ```bash
+   kubectl apply -f 03_goose_acp/04_acp_client_configmap.yaml
+   ```
+
+5. **Update Sam's identity** — apply updated TOOLS.md:
+   ```bash
+   kubectl apply -f ../32_zeroclaw/05_zeroclaw_identity_configmap.yaml
+   ```
+
+6. **Pair Sam with the new agent** — Sam needs to obtain a Bearer token from the k8s agent gateway via the pairing flow, then configure it as `ACP_AUTH_TOKEN` env var or pass in acp-client calls.
+
+7. **Retire Goose** (optional) — once verified, scale down goose-acp Sandbox

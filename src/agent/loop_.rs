@@ -3728,21 +3728,37 @@ pub async fn process_message_with_history(
     } else {
         None
     };
+    tracing::info!(
+        provider = provider_name,
+        model = %model_name,
+        history_len = history.len(),
+        tools_count = tools_registry.len(),
+        max_iterations = config.agent.max_tool_iterations,
+        "process_message_with_history: setup complete, calling agent_turn"
+    );
+    let ld_config = LoopDetectionConfig {
+        no_progress_threshold: config.agent.loop_detection_no_progress_threshold,
+        ping_pong_cycles: config.agent.loop_detection_ping_pong_cycles,
+        failure_streak_threshold: config.agent.loop_detection_failure_streak,
+    };
     let result = scope_cost_enforcement_context(
         cost_enforcement_context,
         SAFETY_HEARTBEAT_CONFIG.scope(
             hb_cfg,
-            agent_turn(
-                provider.as_ref(),
-                &mut history,
-                &tools_registry,
-                observer.as_ref(),
-                provider_name,
-                &model_name,
-                config.default_temperature,
-                true,
-                &config.multimodal,
-                config.agent.max_tool_iterations,
+            LOOP_DETECTION_CONFIG.scope(
+                ld_config,
+                agent_turn(
+                    provider.as_ref(),
+                    &mut history,
+                    &tools_registry,
+                    observer.as_ref(),
+                    provider_name,
+                    &model_name,
+                    config.default_temperature,
+                    true,
+                    &config.multimodal,
+                    config.agent.max_tool_iterations,
+                ),
             ),
         ),
     )
