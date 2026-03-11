@@ -1934,13 +1934,13 @@ mod tests {
             .unwrap();
 
         // In-memory tokens should remain as plaintext 64-char hex hashes.
-        {
+        let plaintext = {
             let in_memory = shared_config.lock();
             assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
-            let plaintext = &in_memory.gateway.paired_tokens[0];
-            assert_eq!(plaintext.len(), 64);
-            assert!(plaintext.chars().all(|c: char| c.is_ascii_hexdigit()));
-        }
+            in_memory.gateway.paired_tokens[0].clone()
+        };
+        assert_eq!(plaintext.len(), 64);
+        assert!(plaintext.chars().all(|c: char| c.is_ascii_hexdigit()));
 
         // On disk, the token should be encrypted (secrets.encrypt defaults to true).
         let saved = tokio::fs::read_to_string(config_path).await.unwrap();
