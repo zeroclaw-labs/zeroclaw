@@ -43,6 +43,23 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Find the largest character boundary less than or equal to `index`.
+///
+/// `index` is a byte offset (not a character index). If it falls in the middle
+/// of a multi-byte UTF-8 character, this function returns the starting byte
+/// offset of that character. If `index` is exactly on a character boundary,
+/// it returns `index`. If `index >= s.len()`, it returns `s.len()`.
+pub fn floor_utf8_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Utility enum for handling optional values.
 pub enum MaybeSet<T> {
     Set(T),
@@ -141,5 +158,20 @@ mod tests {
     fn test_truncate_zero_max_chars() {
         // Edge case: max_chars = 0
         assert_eq!(truncate_with_ellipsis("hello", 0), "...");
+    }
+
+    #[test]
+    fn test_floor_utf8_char_boundary() {
+        let s = "aé你好🦀"; // 1 (a), 2 (é), 3 (你), 3 (好), 4 (🦀)
+                            // bytes: [0], [1,2], [3,4,5], [6,7,8], [9,10,11,12]
+        assert_eq!(floor_utf8_char_boundary(s, 0), 0);
+        assert_eq!(floor_utf8_char_boundary(s, 1), 1);
+        assert_eq!(floor_utf8_char_boundary(s, 2), 1); // inside é
+        assert_eq!(floor_utf8_char_boundary(s, 3), 3); // boundary after é
+        assert_eq!(floor_utf8_char_boundary(s, 4), 3); // inside 你
+        assert_eq!(floor_utf8_char_boundary(s, 6), 6); // boundary after 你
+        assert_eq!(floor_utf8_char_boundary(s, 10), 9); // inside 🦀
+        assert_eq!(floor_utf8_char_boundary(s, 13), 13); // end
+        assert_eq!(floor_utf8_char_boundary(s, 100), 13); // past end
     }
 }

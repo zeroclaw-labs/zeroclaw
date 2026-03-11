@@ -27,6 +27,7 @@ pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'st
 
 #[cfg(test)]
 mod tests {
+    use super::schema::NotionConfig;
     use super::*;
 
     #[test]
@@ -85,10 +86,31 @@ mod tests {
             allowed_users: vec!["*".into()],
         };
 
+        let notion = NotionConfig {
+            enabled: true,
+            api_key: Some("token".into()),
+            database_id: None,
+            data_source_id: None,
+            poll_interval_secs: 5,
+            status_property: "Status".into(),
+            input_property: "Input".into(),
+            result_property: "Result".into(),
+            pending_value: "Pending".into(),
+            running_value: "Running".into(),
+            done_value: "Done".into(),
+            error_value: "Error".into(),
+            status_type: "select".into(),
+            recover_stale: true,
+            allow_read: true,
+            allow_insert: true,
+            allow_update: true,
+        };
+
         assert_eq!(telegram.allowed_users.len(), 1);
         assert_eq!(discord.guild_id.as_deref(), Some("123"));
         assert_eq!(lark.app_id, "app-id");
         assert_eq!(feishu.app_id, "app-id");
         assert_eq!(nextcloud_talk.base_url, "https://cloud.example.com");
+        assert!(notion.enabled);
     }
 }
