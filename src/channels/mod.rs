@@ -2695,7 +2695,9 @@ fn collect_configured_channels(
                     tg.allowed_users.clone(),
                     tg.mention_only,
                 )
+                .with_api_base(tg.api_base.clone())
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                .with_ack_reaction(tg.ack_reaction)
                 .with_transcription(config.transcription.clone())
                 .with_workspace_dir(config.workspace_dir.clone()),
             ),

@@ -4,7 +4,9 @@ pub mod traits;
 #[allow(unused_imports)]
 pub use schema::{
     apply_runtime_proxy_to_builder, build_runtime_proxy_client,
-    build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
+    build_runtime_proxy_client_with_timeouts, default_telegram_api_base, runtime_proxy_config,
+    set_runtime_proxy_config,
+    init_live_config, live_config, set_live_config, try_load_config,
     AgentConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
     BuiltinHooksConfig, ChannelsConfig, ClassificationRule, ComposioConfig, Config, CostConfig,
     CronConfig, DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig, EmbeddingRouteConfig,
@@ -45,6 +47,8 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            api_base: "https://api.telegram.org".into(),
+            ack_reaction: true,
         };
 
         let discord = DiscordConfig {

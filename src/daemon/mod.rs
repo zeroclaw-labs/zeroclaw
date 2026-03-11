@@ -3,10 +3,12 @@ use anyhow::Result;
 use chrono::Utc;
 use std::future::Future;
 use std::path::PathBuf;
+use std::time::SystemTime;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
+const CONFIG_POLL_SECONDS: u64 = 5;
 
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
@@ -16,6 +18,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         .max(initial_backoff);
 
     crate::health::mark_component_ok("daemon");
+
+    // Seed the global live config store so consumers can hot-read.
+    crate::config::init_live_config(&config);
 
     if config.heartbeat.enabled {
         let _ =
@@ -87,9 +92,14 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         tracing::info!("Cron disabled; scheduler supervisor not started");
     }
 
+    // Config file watcher — polls config.toml for changes and hot-reloads
+    // when the file is modified.  Broken / unparseable files are silently
+    // skipped so the daemon keeps running with the last good config.
+    handles.push(spawn_config_watcher(config.config_path.clone()));
+
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
-    println!("   Components: gateway, channels, heartbeat, scheduler");
+    println!("   Components: gateway, channels, heartbeat, scheduler, config-watcher");
     println!("   Ctrl+C to stop");
 
     tokio::signal::ctrl_c().await?;
@@ -318,6 +328,66 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
     Ok(())
 }
 
+/// Spawn a background task that polls `config.toml` for modifications and
+/// hot-reloads the global live config when the file changes.
+///
+/// If the file is missing, corrupt, or fails validation the watcher logs a
+/// warning and keeps the previous good config — it never crashes the daemon.
+fn spawn_config_watcher(config_path: PathBuf) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last_stamp: Option<(SystemTime, u64)> = None;
+        let mut initialized = false;
+        let mut interval = tokio::time::interval(Duration::from_secs(CONFIG_POLL_SECONDS));
+
+        loop {
+            interval.tick().await;
+
+            // Read file metadata to detect changes cheaply.
+            let metadata = match tokio::fs::metadata(&config_path).await {
+                Ok(m) => m,
+                Err(_) => continue, // file temporarily missing — skip
+            };
+            let modified = match metadata.modified() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let stamp = (modified, metadata.len());
+
+            if last_stamp == Some(stamp) {
+                continue; // no change
+            }
+
+            // Attempt to load + validate.
+            match crate::config::try_load_config(&config_path).await {
+                Ok(new_config) => {
+                    crate::config::set_live_config(new_config);
+                    let was_initialized = initialized;
+                    last_stamp = Some(stamp);
+                    initialized = true;
+                    if was_initialized {
+                        // Only log after the initial seed (not the first tick).
+                        tracing::info!(
+                            path = %config_path.display(),
+                            "Config hot-reloaded successfully"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Broken file — keep old config, log once per change attempt.
+                    tracing::warn!(
+                        path = %config_path.display(),
+                        "Config hot-reload skipped (file broken or invalid): {e}"
+                    );
+                    // Update stamp so we don't spam warnings on every tick
+                    // for the same broken version.
+                    last_stamp = Some(stamp);
+                    initialized = true;
+                }
+            }
+        }
+    })
+}
+
 fn has_supervised_channels(config: &Config) -> bool {
     config
         .channels_config
@@ -404,6 +474,8 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            api_base: "https://api.telegram.org".into(),
+            ack_reaction: true,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -536,9 +608,55 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            api_base: "https://api.telegram.org".into(),
+            ack_reaction: true,
         });
 
         let target = heartbeat_delivery_target(&config).unwrap();
         assert_eq!(target, Some(("telegram".to_string(), "123456".to_string())));
+    }
+
+    #[tokio::test]
+    async fn config_watcher_reloads_on_valid_change() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let config = Config {
+            config_path: config_path.clone(),
+            workspace_dir: tmp.path().join("workspace"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+
+        // Write initial config.
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        // Seed live config.
+        crate::config::init_live_config(&config);
+
+        // Modify the file (change temperature).
+        let modified = toml_str.replace(
+            &format!("default_temperature = {}", config.default_temperature),
+            "default_temperature = 0.42",
+        );
+        // Small sleep to ensure mtime changes.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        std::fs::write(&config_path, &modified).unwrap();
+
+        // Load via try_load_config and verify.
+        let reloaded = crate::config::try_load_config(&config_path).await.unwrap();
+        assert!((reloaded.default_temperature - 0.42).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn config_watcher_skips_broken_file() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Write garbage.
+        std::fs::write(&config_path, "this is [[[not valid toml!!!").unwrap();
+
+        let result = crate::config::try_load_config(&config_path).await;
+        assert!(result.is_err(), "Broken config should return Err");
     }
 }

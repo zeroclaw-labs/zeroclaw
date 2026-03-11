@@ -3550,7 +3550,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 let token_clone = token.clone();
                 let thread_result = std::thread::spawn(move || {
                     let client = reqwest::blocking::Client::new();
-                    let url = format!("https://api.telegram.org/bot{token_clone}/getMe");
+                    let api_base = crate::config::default_telegram_api_base();
+                    let url = format!("{api_base}/bot{token_clone}/getMe");
                     let resp = client.get(&url).send()?;
                     let ok = resp.status().is_success();
                     let data: serde_json::Value = resp.json().unwrap_or_default();
@@ -3618,6 +3619,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     draft_update_interval_ms: 1000,
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    api_base: crate::config::default_telegram_api_base(),
+                    ack_reaction: true,
                 });
             }
             ChannelMenuChoice::Discord => {

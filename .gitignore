@@ -30,3 +30,4 @@ venv/
 credentials.json
 .worktrees/
 .zeroclaw/*
+.zeroclaw-docker/*

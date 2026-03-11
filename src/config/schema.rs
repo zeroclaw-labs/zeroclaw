@@ -2734,10 +2734,20 @@ pub enum StreamMode {
     Off,
     /// Update a draft message with every flush interval.
     Partial,
+    /// Use the Telegram Bot API `sendMessageDraft` for native streaming animation.
+    Native,
 }
 
 fn default_draft_update_interval_ms() -> u64 {
     1000
+}
+
+fn default_ack_reaction_enabled() -> bool {
+    true
+}
+
+pub fn default_telegram_api_base() -> String {
+    "https://api.telegram.org".to_string()
 }
 
 /// Telegram bot channel configuration.
@@ -2747,6 +2757,10 @@ pub struct TelegramConfig {
     pub bot_token: String,
     /// Allowed Telegram user IDs or usernames. Empty = deny all.
     pub allowed_users: Vec<String>,
+    /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
+    /// Override for local Bot API servers (e.g. `http://localhost:8081`).
+    #[serde(default = "default_telegram_api_base")]
+    pub api_base: String,
     /// Streaming mode for progressive response delivery via message edits.
     #[serde(default)]
     pub stream_mode: StreamMode,
@@ -2761,6 +2775,9 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// When true, send a random emoji reaction to acknowledge incoming messages.
+    #[serde(default = "default_ack_reaction_enabled")]
+    pub ack_reaction: bool,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -4814,6 +4831,67 @@ impl Config {
     }
 }
 
+// ── Global live config (hot-reload) ────────────────────────────────
+//
+// `init_live_config()` seeds the store on daemon startup.
+// `spawn_config_watcher()` in the daemon polls for changes.
+// Consumers call `live_config()` to get the latest snapshot.
+
+static LIVE_CONFIG: OnceLock<RwLock<Config>> = OnceLock::new();
+
+/// Initialize the global live-config store with the startup config.
+/// Must be called once during daemon startup before `live_config()` is used.
+pub fn init_live_config(config: &Config) {
+    let _ = LIVE_CONFIG.get_or_init(|| RwLock::new(config.clone()));
+}
+
+/// Return a read-snapshot of the current live config.
+/// Falls back to `Config::default()` if `init_live_config()` was never called.
+pub fn live_config() -> Config {
+    LIVE_CONFIG
+        .get()
+        .and_then(|rw| rw.read().ok())
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
+}
+
+/// Replace the global live config with a freshly loaded version.
+/// Called by the config watcher after a successful reload.
+pub fn set_live_config(config: Config) {
+    if let Some(rw) = LIVE_CONFIG.get() {
+        if let Ok(mut guard) = rw.write() {
+            *guard = config;
+        }
+    }
+}
+
+/// Try to load and validate a config from `path`.
+/// Returns `Ok(Config)` on success, `Err` if the file is missing, corrupt, or fails validation.
+/// This never touches env overrides or secrets — it is a pure parse + validate check
+/// suitable for deciding whether a hot-reload is safe.
+pub async fn try_load_config(path: &Path) -> Result<Config> {
+    let contents = tokio::fs::read_to_string(path)
+        .await
+        .with_context(|| format!("Failed to read config at {}", path.display()))?;
+    let mut config: Config = toml::from_str(&contents)
+        .with_context(|| format!("Failed to parse config at {}", path.display()))?;
+    config.config_path = path.to_path_buf();
+
+    // Decrypt secrets when possible.
+    if let Some(zeroclaw_dir) = path.parent() {
+        let store = crate::security::SecretStore::new(zeroclaw_dir, config.secrets.encrypt);
+        if let Some(raw) = config.api_key.clone() {
+            if crate::security::SecretStore::is_encrypted(&raw) {
+                config.api_key = Some(store.decrypt(&raw).unwrap_or(raw));
+            }
+        }
+    }
+
+    config.apply_env_overrides();
+    config.validate()?;
+    Ok(config)
+}
+
 async fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -5119,6 +5197,8 @@ default_temperature = 0.7
                     draft_update_interval_ms: default_draft_update_interval_ms(),
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    api_base: default_telegram_api_base(),
+                    ack_reaction: true,
                 }),
                 discord: None,
                 slack: None,
@@ -5490,6 +5570,8 @@ tool_dispatcher = "xml"
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
             mention_only: false,
+            api_base: default_telegram_api_base(),
+            ack_reaction: true,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -5498,6 +5580,7 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.stream_mode, StreamMode::Partial);
         assert_eq!(parsed.draft_update_interval_ms, 500);
         assert!(parsed.interrupt_on_new_message);
+        assert_eq!(parsed.api_base, "https://api.telegram.org");
     }
 
     #[test]
@@ -5507,6 +5590,15 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.stream_mode, StreamMode::Off);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
         assert!(!parsed.interrupt_on_new_message);
+        assert_eq!(parsed.api_base, "https://api.telegram.org");
+    }
+
+    #[test]
+    async fn telegram_config_custom_api_base_serde() {
+        let json =
+            r#"{"bot_token":"tok","allowed_users":[],"api_base":"http://localhost:8081"}"#;
+        let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.api_base, "http://localhost:8081");
     }
 
     #[test]

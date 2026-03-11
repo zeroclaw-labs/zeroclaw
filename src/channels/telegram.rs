@@ -7,6 +7,7 @@ use directories::UserDirs;
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::fs;
@@ -308,6 +309,10 @@ pub struct TelegramChannel {
     /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
     /// Override for local Bot API servers or testing.
     api_base: String,
+    ack_reaction_enabled: bool,
+    native_draft_counter: AtomicU64,
+    /// Last incoming message_id per chat, used to set reply_to_message_id on responses.
+    last_incoming_message_id: Mutex<std::collections::HashMap<String, i64>>,
     transcription: Option<crate::config::TranscriptionConfig>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
@@ -339,6 +344,9 @@ impl TelegramChannel {
             mention_only,
             bot_username: Mutex::new(None),
             api_base: "https://api.telegram.org".to_string(),
+            ack_reaction_enabled: true,
+            native_draft_counter: AtomicU64::new(1),
+            last_incoming_message_id: Mutex::new(std::collections::HashMap::new()),
             transcription: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
@@ -365,7 +373,13 @@ impl TelegramChannel {
     /// Override the Telegram Bot API base URL.
     /// Useful for local Bot API servers or testing.
     pub fn with_api_base(mut self, api_base: String) -> Self {
-        self.api_base = api_base;
+        self.api_base = api_base.trim_end_matches('/').to_string();
+        self
+    }
+
+    /// Configure whether to send an ACK emoji reaction on incoming messages.
+    pub fn with_ack_reaction(mut self, enabled: bool) -> Self {
+        self.ack_reaction_enabled = enabled;
         self
     }
 
@@ -384,6 +398,90 @@ impl TelegramChannel {
         } else {
             (reply_target.to_string(), None)
         }
+    }
+
+    /// Truncate a string to at most `max` bytes on a valid UTF-8 boundary.
+    fn truncate_utf8_safe(text: &str, max: usize) -> &str {
+        if text.len() <= max {
+            return text;
+        }
+        let mut end = 0;
+        for (idx, ch) in text.char_indices() {
+            let next = idx + ch.len_utf8();
+            if next > max {
+                break;
+            }
+            end = next;
+        }
+        &text[..end]
+    }
+
+    /// Send a final `sendMessage` with HTML formatting, falling back to plain text on failure.
+    async fn send_final_message(
+        &self,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let reply_id = self.last_incoming_message_id.lock().get(chat_id).copied();
+
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+            "text": Self::markdown_to_telegram_html(text),
+            "parse_mode": "HTML",
+        });
+        if let Some(tid) = thread_id {
+            body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+        }
+        if let Some(id) = reply_id {
+            body["reply_to_message_id"] = serde_json::json!(id);
+        }
+
+        let resp = self
+            .client
+            .post(self.api_url("sendMessage"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            return Ok(());
+        }
+
+        // HTML failed — retry as plain text
+        let mut plain_body = serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+        });
+        if let Some(tid) = thread_id {
+            plain_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+        }
+        if let Some(id) = reply_id {
+            plain_body["reply_to_message_id"] = serde_json::json!(id);
+        }
+
+        let resp = self
+            .client
+            .post(self.api_url("sendMessage"))
+            .json(&plain_body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Telegram sendMessage (final) failed: {err}");
+        }
+
+        Ok(())
+    }
+
+    /// Parse a native draft message ID in the format `"draft:{chat_id}:{draft_id}"`.
+    /// Returns `(chat_id, draft_id)` if the format matches.
+    fn parse_native_draft_id(message_id: &str) -> Option<(String, u64)> {
+        let rest = message_id.strip_prefix("draft:")?;
+        let (chat_id, draft_id_str) = rest.rsplit_once(':')?;
+        let draft_id = draft_id_str.parse::<u64>().ok()?;
+        Some((chat_id.to_string(), draft_id))
     }
 
     fn extract_update_message_target(update: &serde_json::Value) -> Option<(String, i64)> {
@@ -828,8 +926,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Download a file from the Telegram CDN.
     async fn download_file(&self, file_path: &str) -> anyhow::Result<Vec<u8>> {
         let url = format!(
-            "https://api.telegram.org/file/bot{}/{file_path}",
-            self.bot_token
+            "{}/file/bot{}/{file_path}",
+            self.api_base, self.bot_token
         );
         let resp = self
             .http_client()
@@ -1325,8 +1423,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         // Step 2: download the actual file
         let download_url = format!(
-            "https://api.telegram.org/file/bot{}/{}",
-            self.bot_token, file_path
+            "{}/file/bot{}/{}",
+            self.api_base, self.bot_token, file_path
         );
         let img_resp = self.http_client().get(&download_url).send().await?;
         let bytes = img_resp.bytes().await?;
@@ -2159,6 +2257,42 @@ impl Channel for TelegramChannel {
             message.content.clone()
         };
 
+        if self.stream_mode == StreamMode::Native {
+            let draft_id = self.native_draft_counter.fetch_add(1, Ordering::Relaxed);
+            let display_text = Self::truncate_utf8_safe(&initial_text, TELEGRAM_MAX_MESSAGE_LENGTH);
+
+            let mut body = serde_json::json!({
+                "chat_id": chat_id,
+                "draft_id": draft_id,
+                "text": display_text,
+            });
+            if let Some(tid) = &thread_id {
+                body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+            }
+            if let Some(&reply_id) = self.last_incoming_message_id.lock().get(&chat_id) {
+                body["reply_to_message_id"] = serde_json::json!(reply_id);
+            }
+
+            let resp = self
+                .client
+                .post(self.api_url("sendMessageDraft"))
+                .json(&body)
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let err = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Telegram sendMessageDraft failed: {err}");
+            }
+
+            self.last_draft_edit
+                .lock()
+                .insert(chat_id.to_string(), std::time::Instant::now());
+
+            return Ok(Some(format!("draft:{chat_id}:{draft_id}")));
+        }
+
+        // StreamMode::Partial — existing logic
         let mut body = serde_json::json!({
             "chat_id": chat_id,
             "text": initial_text,
@@ -2212,21 +2346,37 @@ impl Channel for TelegramChannel {
             }
         }
 
-        // Truncate to Telegram limit for mid-stream edits (UTF-8 safe)
-        let display_text = if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
-            let mut end = 0;
-            for (idx, ch) in text.char_indices() {
-                let next = idx + ch.len_utf8();
-                if next > TELEGRAM_MAX_MESSAGE_LENGTH {
-                    break;
-                }
-                end = next;
-            }
-            &text[..end]
-        } else {
-            text
-        };
+        let display_text = Self::truncate_utf8_safe(text, TELEGRAM_MAX_MESSAGE_LENGTH);
 
+        // Native draft path: call sendMessageDraft with the same draft_id
+        if let Some((native_chat_id, draft_id)) = Self::parse_native_draft_id(message_id) {
+            let body = serde_json::json!({
+                "chat_id": native_chat_id,
+                "draft_id": draft_id,
+                "text": display_text,
+            });
+
+            let resp = self
+                .client
+                .post(self.api_url("sendMessageDraft"))
+                .json(&body)
+                .send()
+                .await?;
+
+            if resp.status().is_success() {
+                self.last_draft_edit
+                    .lock()
+                    .insert(native_chat_id, std::time::Instant::now());
+            } else {
+                let status = resp.status();
+                let err = resp.text().await.unwrap_or_default();
+                tracing::debug!("Telegram sendMessageDraft update failed ({status}): {err}");
+            }
+
+            return Ok(());
+        }
+
+        // Partial draft path: editMessageText
         let message_id_parsed = match message_id.parse::<i64>() {
             Ok(id) => id,
             Err(e) => {
@@ -2275,6 +2425,40 @@ impl Channel for TelegramChannel {
 
         // Parse attachments before processing
         let (text_without_markers, attachments) = parse_attachment_markers(text);
+
+        let is_native = Self::parse_native_draft_id(message_id).is_some();
+
+        // Native draft path: draft auto-clears when sendMessage is sent.
+        // Just send the final message(s) directly.
+        if is_native {
+            if !attachments.is_empty() {
+                if !text_without_markers.is_empty() {
+                    self.send_text_chunks(
+                        &text_without_markers,
+                        &chat_id,
+                        thread_id.as_deref(),
+                    )
+                    .await?;
+                }
+                for attachment in &attachments {
+                    self.send_attachment(&chat_id, thread_id.as_deref(), attachment)
+                        .await?;
+                }
+                return Ok(());
+            }
+
+            if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
+                return self
+                    .send_text_chunks(text, &chat_id, thread_id.as_deref())
+                    .await;
+            }
+
+            return self
+                .send_final_message(&chat_id, thread_id.as_deref(), text)
+                .await;
+        }
+
+        // Partial draft path — existing logic
 
         // Parse message ID once for reuse
         let msg_id = match message_id.parse::<i64>() {
@@ -2388,6 +2572,11 @@ impl Channel for TelegramChannel {
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
         let (chat_id, _) = Self::parse_reply_target(recipient);
         self.last_draft_edit.lock().remove(&chat_id);
+
+        // Native drafts time out automatically — no explicit cancel needed
+        if Self::parse_native_draft_id(message_id).is_some() {
+            return Ok(());
+        }
 
         let message_id = match message_id.parse::<i64>() {
             Ok(id) => id,
@@ -2614,13 +2803,24 @@ Ensure only one `zeroclaw` process is using this bot token."
                         continue;
                     };
 
-                    if let Some((reaction_chat_id, reaction_message_id)) =
+                    if self.ack_reaction_enabled {
+                        if let Some((reaction_chat_id, reaction_message_id)) =
+                            Self::extract_update_message_target(update)
+                        {
+                            self.try_add_ack_reaction_nonblocking(
+                                reaction_chat_id,
+                                reaction_message_id,
+                            );
+                        }
+                    }
+
+                    // Track last incoming message_id per chat for reply anchoring
+                    if let Some((incoming_chat_id, incoming_msg_id)) =
                         Self::extract_update_message_target(update)
                     {
-                        self.try_add_ack_reaction_nonblocking(
-                            reaction_chat_id,
-                            reaction_message_id,
-                        );
+                        self.last_incoming_message_id
+                            .lock()
+                            .insert(incoming_chat_id, incoming_msg_id);
                     }
 
                     // Send "typing" indicator immediately when we receive a message
@@ -2795,6 +2995,63 @@ mod tests {
         assert_eq!(partial.draft_update_interval_ms, 750);
     }
 
+    #[test]
+    fn ack_reaction_default_enabled() {
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        assert!(ch.ack_reaction_enabled);
+    }
+
+    #[test]
+    fn ack_reaction_can_be_disabled() {
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+            .with_ack_reaction(false);
+        assert!(!ch.ack_reaction_enabled);
+    }
+
+    #[test]
+    fn stream_mode_native_serde() {
+        let json = serde_json::json!("native");
+        let mode: StreamMode = serde_json::from_value(json).unwrap();
+        assert_eq!(mode, StreamMode::Native);
+
+        let serialized = serde_json::to_value(StreamMode::Native).unwrap();
+        assert_eq!(serialized, "native");
+    }
+
+    #[test]
+    fn supports_draft_updates_native() {
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+            .with_streaming(StreamMode::Native, 300);
+        assert!(ch.supports_draft_updates());
+    }
+
+    #[test]
+    fn native_draft_id_format() {
+        let parsed = TelegramChannel::parse_native_draft_id("draft:123456:7");
+        assert_eq!(parsed, Some(("123456".to_string(), 7)));
+
+        // Negative chat IDs (groups/supergroups)
+        let parsed = TelegramChannel::parse_native_draft_id("draft:-100200300:42");
+        assert_eq!(parsed, Some(("-100200300".to_string(), 42)));
+
+        // Not a native draft
+        assert!(TelegramChannel::parse_native_draft_id("12345").is_none());
+        assert!(TelegramChannel::parse_native_draft_id("not-a-draft").is_none());
+    }
+
+    #[test]
+    fn truncate_utf8_safe_handles_multibyte() {
+        // ASCII — exact boundary
+        let text = "hello";
+        assert_eq!(TelegramChannel::truncate_utf8_safe(text, 5), "hello");
+        assert_eq!(TelegramChannel::truncate_utf8_safe(text, 3), "hel");
+
+        // Multi-byte: '😀' is 4 bytes; truncating at 5 should keep only one emoji
+        let emoji_text = "😀😀😀";
+        assert_eq!(TelegramChannel::truncate_utf8_safe(emoji_text, 5), "😀");
+        assert_eq!(TelegramChannel::truncate_utf8_safe(emoji_text, 8), "😀😀");
+    }
+
     #[tokio::test]
     async fn send_draft_returns_none_when_stream_mode_off() {
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
@@ -2849,6 +3106,40 @@ mod tests {
         assert_eq!(
             ch.api_url("getMe"),
             "https://api.telegram.org/bot123:ABC/getMe"
+        );
+    }
+
+    #[test]
+    fn telegram_api_url_custom_base() {
+        let ch = TelegramChannel::new("123:ABC".into(), vec![], false)
+            .with_api_base("http://localhost:8081".into());
+        assert_eq!(
+            ch.api_url("getMe"),
+            "http://localhost:8081/bot123:ABC/getMe"
+        );
+        assert_eq!(
+            ch.api_url("sendMessage"),
+            "http://localhost:8081/bot123:ABC/sendMessage"
+        );
+    }
+
+    #[test]
+    fn telegram_api_url_custom_base_no_trailing_slash() {
+        let ch = TelegramChannel::new("tok".into(), vec![], false)
+            .with_api_base("http://10.0.0.1:8081".into());
+        assert_eq!(
+            ch.api_url("getUpdates"),
+            "http://10.0.0.1:8081/bottok/getUpdates"
+        );
+    }
+
+    #[test]
+    fn telegram_api_url_custom_base_strips_trailing_slash() {
+        let ch = TelegramChannel::new("123:ABC".into(), vec![], false)
+            .with_api_base("http://localhost:8081/".into());
+        assert_eq!(
+            ch.api_url("getMe"),
+            "http://localhost:8081/bot123:ABC/getMe"
         );
     }
 
