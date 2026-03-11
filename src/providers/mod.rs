@@ -67,6 +67,7 @@ const QWEN_CN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v
 const QWEN_INTL_BASE_URL: &str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
 const QWEN_US_BASE_URL: &str = "https://dashscope-us.aliyuncs.com/compatible-mode/v1";
 const QWEN_OAUTH_BASE_FALLBACK_URL: &str = QWEN_CN_BASE_URL;
+const BAILIAN_BASE_URL: &str = "https://coding.dashscope.aliyuncs.com/v1";
 const QWEN_OAUTH_TOKEN_ENDPOINT: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
 const QWEN_OAUTH_PLACEHOLDER: &str = "qwen-oauth";
 const QWEN_OAUTH_TOKEN_ENV: &str = "QWEN_OAUTH_TOKEN";
@@ -148,6 +149,10 @@ pub(crate) fn is_qwen_us_alias(name: &str) -> bool {
 
 pub(crate) fn is_qwen_oauth_alias(name: &str) -> bool {
     matches!(name, "qwen-code" | "qwen-oauth" | "qwen_oauth")
+}
+
+pub(crate) fn is_bailian_alias(name: &str) -> bool {
+    matches!(name, "bailian" | "aliyun-bailian" | "aliyun")
 }
 
 pub(crate) fn is_qwen_alias(name: &str) -> bool {
@@ -1237,6 +1242,16 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
+        "bailian" | "aliyun-bailian" | "aliyun" => Ok(Box::new(
+            OpenAiCompatibleProvider::new_with_user_agent_and_vision(
+                "Bailian",
+                BAILIAN_BASE_URL,
+                key,
+                AuthStyle::Bearer,
+                "openclaw",
+                true,
+            )
+        )),
         name if qwen_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new_with_vision(
             "Qwen",
             qwen_base_url(name).expect("checked in guard"),
@@ -1866,6 +1881,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
                 "qwen-oauth",
                 "qwen_oauth",
             ],
+            local: false,
+        },
+        ProviderInfo {
+            name: "bailian",
+            display_name: "Bailian (Aliyun)",
+            aliases: &["aliyun-bailian", "aliyun"],
             local: false,
         },
         ProviderInfo {
