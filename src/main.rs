@@ -795,8 +795,24 @@ async fn main() -> Result<()> {
                     match shutdown_gateway(&host, port).await {
                         Ok(()) => {
                             info!("   ✓ Existing gateway on {addr} shut down gracefully");
-                            // Small delay to allow port to be released
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            // Poll until the port is free (connection refused) or timeout
+                            let deadline =
+                                tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+                            loop {
+                                match tokio::net::TcpStream::connect(&addr).await {
+                                    Err(_) => break, // port is free
+                                    Ok(_) if tokio::time::Instant::now() >= deadline => {
+                                        warn!(
+                                            "   Timed out waiting for port {port} to be released"
+                                        );
+                                        break;
+                                    }
+                                    Ok(_) => {
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(50))
+                                            .await;
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             info!("   No existing gateway to shut down: {e}");
