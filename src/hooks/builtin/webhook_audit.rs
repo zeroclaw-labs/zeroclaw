@@ -68,10 +68,10 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
 
     // Now check that the middle segments appear in order between pos and
     // the end boundary.
-    let end_boundary = if !pattern.ends_with('*') {
-        text.len() - parts[parts.len() - 1].len()
-    } else {
+    let end_boundary = if pattern.ends_with('*') {
         text.len()
+    } else {
+        text.len() - parts[parts.len() - 1].len()
     };
 
     let start_idx = if pattern.starts_with('*') { 0 } else { 1 };
@@ -101,6 +101,7 @@ fn matches_any_pattern(patterns: &[String], tool: &str) -> bool {
 }
 
 /// Truncate serialised args to `max_bytes`. If 0, no truncation.
+#[allow(clippy::cast_possible_truncation)]
 fn truncate_args(args: Value, max_bytes: u64) -> Value {
     if max_bytes == 0 {
         return args;
@@ -112,10 +113,7 @@ fn truncate_args(args: Value, max_bytes: u64) -> Value {
     if (serialised.len() as u64) <= max_bytes {
         args
     } else {
-        let truncated: String = serialised
-            .chars()
-            .take(max_bytes as usize)
-            .collect();
+        let truncated: String = serialised.chars().take(max_bytes as usize).collect();
         Value::String(format!("{}...[truncated]", truncated))
     }
 }
@@ -167,12 +165,15 @@ impl HookHandler for WebhookAuditHook {
             Value::Null
         };
 
+        #[allow(clippy::cast_possible_truncation)]
+        let duration_ms = duration.as_millis() as u64;
+
         let payload = serde_json::json!({
             "event": "tool_call",
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "tool": tool,
             "success": result.success,
-            "duration_ms": duration.as_millis() as u64,
+            "duration_ms": duration_ms,
             "error": result.error,
             "args": args_value,
         });
