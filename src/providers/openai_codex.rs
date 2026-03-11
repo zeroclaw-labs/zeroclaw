@@ -1013,6 +1013,7 @@ data: [DONE]
     fn capabilities_includes_vision() {
         let options = ProviderRuntimeOptions {
             provider_api_url: None,
+            api_path: None,
             zeroclaw_dir: None,
             secrets_encrypt: false,
             auth_profile_override: None,

@@ -5734,6 +5734,7 @@ default_temperature = 0.7
             config_path: PathBuf::from("/tmp/test/config.toml"),
             api_key: Some("sk-test-key".into()),
             api_url: None,
+        api_path: None,
             default_provider: Some("openrouter".into()),
             default_model: Some("gpt-4o".into()),
             model_providers: HashMap::new(),
@@ -5974,6 +5975,7 @@ tool_dispatcher = "xml"
             config_path: config_path.clone(),
             api_key: Some("sk-roundtrip".into()),
             api_url: None,
+        api_path: None,
             default_provider: Some("openrouter".into()),
             default_model: Some("test-model".into()),
             model_providers: HashMap::new(),
@@ -7157,6 +7159,7 @@ requires_openai_auth = true
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    api_path: None,
                     wire_api: None,
                     requires_openai_auth: false,
                     azure_openai_resource: None,
@@ -7188,6 +7191,7 @@ requires_openai_auth = true
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue".to_string()),
+                    api_path: None,
                     wire_api: Some("responses".to_string()),
                     requires_openai_auth: true,
                     azure_openai_resource: None,
@@ -7215,6 +7219,7 @@ requires_openai_auth = true
             default_provider: Some("ollama".to_string()),
             default_model: Some("glm-5:cloud".to_string()),
             api_url: None,
+        api_path: None,
             api_key: Some("ollama-key".to_string()),
             ..Config::default()
         };
@@ -7253,6 +7258,7 @@ requires_openai_auth = true
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    api_path: None,
                     wire_api: Some("ws".to_string()),
                     requires_openai_auth: false,
                     azure_openai_resource: None,
