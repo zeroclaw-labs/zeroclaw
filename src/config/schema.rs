@@ -2834,6 +2834,8 @@ pub struct ChannelsConfig {
     pub dingtalk: Option<DingTalkConfig>,
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
+    /// WeCom AI bot channel configuration.
+    pub wecom: Option<WeComConfig>,
     #[cfg(feature = "channel-nostr")]
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
@@ -2920,6 +2922,10 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.qq.as_ref())),
                 self.qq.is_some()
             ),
+            (
+                Box::new(ConfigWrapper::new(self.wecom.as_ref())),
+                self.wecom.is_some()
+            ),
             #[cfg(feature = "channel-nostr")]
             (
                 Box::new(ConfigWrapper::new(self.nostr.as_ref())),
@@ -2968,6 +2974,7 @@ impl Default for ChannelsConfig {
             feishu: None,
             dingtalk: None,
             qq: None,
+            wecom: None,
             #[cfg(feature = "channel-nostr")]
             nostr: None,
             clawdtalk: None,
@@ -3796,6 +3803,46 @@ impl ChannelConfig for QQConfig {
     }
     fn desc() -> &'static str {
         "Tencent QQ Bot"
+    }
+}
+
+fn default_wecom_file_retention_days() -> u32 {
+    7
+}
+
+fn default_wecom_max_file_size_mb() -> u64 {
+    20
+}
+
+fn default_wecom_history_max_turns() -> usize {
+    50
+}
+
+/// WeCom AI Bot channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WeComConfig {
+    /// Bot ID for WeCom WebSocket subscription.
+    pub bot_id: String,
+    /// Secret for WeCom WebSocket subscription authentication.
+    pub secret: String,
+    /// File retention days for downloaded WeCom attachments under workspace cache.
+    #[serde(default = "default_wecom_file_retention_days")]
+    pub file_retention_days: u32,
+    /// Maximum accepted file size (MiB) for WeCom attachment download attempts.
+    #[serde(default = "default_wecom_max_file_size_mb")]
+    pub max_file_size_mb: u64,
+    /// Maximum retained turns per WeCom conversation scope.
+    #[serde(default = "default_wecom_history_max_turns")]
+    pub history_max_turns: usize,
+}
+
+impl ChannelConfig for WeComConfig {
+    fn name() -> &'static str {
+        "WeCom"
+    }
+
+    fn desc() -> &'static str {
+        "WeCom AI Bot (WebSocket)"
     }
 }
 
@@ -5824,6 +5871,7 @@ default_temperature = 0.7
                 feishu: None,
                 dingtalk: None,
                 qq: None,
+                wecom: None,
                 #[cfg(feature = "channel-nostr")]
                 nostr: None,
                 clawdtalk: None,
@@ -6404,6 +6452,7 @@ allowed_users = ["@ops:matrix.org"]
             feishu: None,
             dingtalk: None,
             qq: None,
+            wecom: None,
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: 300,
@@ -6618,6 +6667,7 @@ channel_id = "C123"
             feishu: None,
             dingtalk: None,
             qq: None,
+            wecom: None,
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: 300,

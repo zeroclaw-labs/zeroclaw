@@ -38,6 +38,7 @@ pub mod traits;
 pub mod transcription;
 pub mod tts;
 pub mod wati;
+pub mod wecom;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
@@ -68,6 +69,7 @@ pub use traits::{Channel, SendMessage};
 #[allow(unused_imports)]
 pub use tts::{TtsManager, TtsProvider};
 pub use wati::WatiChannel;
+pub use wecom::WeComChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
@@ -191,6 +193,31 @@ const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
+
+fn live_channels_registry() -> &'static Mutex<HashMap<String, Arc<dyn Channel>>> {
+    static STORE: OnceLock<Mutex<HashMap<String, Arc<dyn Channel>>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_live_channels(channels_by_name: &HashMap<String, Arc<dyn Channel>>) {
+    let mut guard = live_channels_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.clear();
+    guard.extend(
+        channels_by_name
+            .iter()
+            .map(|(name, channel)| (name.clone(), Arc::clone(channel))),
+    );
+}
+
+pub(crate) fn get_live_channel(name: &str) -> Option<Arc<dyn Channel>> {
+    live_channels_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(name)
+        .cloned()
+}
 
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
@@ -336,6 +363,12 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
 }
 
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
+    // WeCom uses reply_target as conversation scope (group--xxx or user--xxx).
+    // Group chats share history across all members; single chats isolate by user.
+    if msg.channel == "wecom" {
+        return format!("wecom_{}", msg.reply_target);
+    }
+
     // Include thread_ts for per-topic session isolation in forum groups
     match &msg.thread_ts {
         Some(tid) => format!("{}_{}_{}", msg.channel, tid, msg.sender),
@@ -345,6 +378,32 @@ fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
 
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
+}
+
+fn llm_user_content_with_sender_identity(msg: &traits::ChannelMessage, content: &str) -> String {
+    if msg.channel != "wecom" || !msg.reply_target.starts_with("group--") {
+        return content.to_string();
+    }
+
+    let sender = msg.sender.trim();
+    if sender.is_empty() {
+        return content.to_string();
+    }
+
+    let prefix = format!("[sender_userid={sender}]");
+    if content.trim_start().starts_with(prefix.as_str()) {
+        return content.to_string();
+    }
+
+    format!("{prefix} {content}")
+}
+
+fn persisted_channel_user_content(msg: &traits::ChannelMessage, content: &str) -> String {
+    if msg.channel == "wecom" && msg.reply_target.starts_with("group--") {
+        return llm_user_content_with_sender_identity(msg, content);
+    }
+
+    content.to_string()
 }
 
 /// Strip tool-call XML tags from outgoing messages.
@@ -486,6 +545,15 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
+        "wecom" => Some(
+            "When responding on WeCom (企业微信):\n\
+             - Use standard markdown for formatting: **bold**, *italic*, `code`, code blocks, lists, links.\n\
+             - Keep responses concise and well-structured for enterprise chat contexts.\n\
+             - Image/file attachments are automatically downloaded and provided as local paths like [IMAGE:/path/to/file.png] or [Document: /path/to/file.bin].\n\
+             - Quoted messages are injected as [WECOM_QUOTE]...[/WECOM_QUOTE] blocks containing msgtype and content.\n\
+             - In shared group chats, each turn includes a [sender_userid=xxx] prefix to identify who is speaking.\n\
+             - Use tool results silently: answer the user's question directly without narrating internal execution steps.",
+        ),
         _ => None,
     }
 }
@@ -535,6 +603,24 @@ fn build_channel_system_prompt(
         prompt.push_str(&context);
     }
 
+    if channel_name == "wecom" && !reply_target.is_empty() {
+        let (chat_type, conversation_scope) = if reply_target.starts_with("group--") {
+            ("group", reply_target.to_string())
+        } else {
+            ("single", reply_target.to_string())
+        };
+        let mut lines = vec![
+            "\n\n[WECOM_STATIC_CONTEXT_V1]".to_string(),
+            format!("chat_type={chat_type}"),
+            format!("conversation_scope={conversation_scope}"),
+        ];
+        if let Some(userid) = reply_target.strip_prefix("user--") {
+            lines.push(format!("sender_userid={userid}"));
+        }
+        lines.push("[/WECOM_STATIC_CONTEXT_V1]".to_string());
+        prompt.push_str(&lines.join("\n"));
+    }
+
     prompt
 }
 
@@ -576,10 +662,6 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
-    if !supports_runtime_model_switch(channel_name) {
-        return None;
-    }
-
     let trimmed = content.trim();
     if !trimmed.starts_with('/') {
         return None;
@@ -594,7 +676,8 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         .to_ascii_lowercase();
 
     match base_command.as_str() {
-        "/models" => {
+        "/new" => Some(ChannelRuntimeCommand::NewSession),
+        "/models" if supports_runtime_model_switch(channel_name) => {
             if let Some(provider) = parts.next() {
                 Some(ChannelRuntimeCommand::SetProvider(
                     provider.trim().to_string(),
@@ -603,7 +686,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::ShowProviders)
             }
         }
-        "/model" => {
+        "/model" if supports_runtime_model_switch(channel_name) => {
             let model = parts.collect::<Vec<_>>().join(" ").trim().to_string();
             if model.is_empty() {
                 Some(ChannelRuntimeCommand::ShowModel)
@@ -611,7 +694,6 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::SetModel(model))
             }
         }
-        "/new" => Some(ChannelRuntimeCommand::NewSession),
         _ => None,
     }
 }
@@ -1745,8 +1827,15 @@ async fn process_channel_message(
         .get(&history_key)
         .is_some_and(|turns| !turns.is_empty());
 
+    let llm_user_content = llm_user_content_with_sender_identity(&msg, &msg.content);
+    let persisted_user_content = persisted_channel_user_content(&msg, &msg.content);
+
     // Preserve user turn before the LLM call so interrupted requests keep context.
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+    append_sender_turn(
+        ctx.as_ref(),
+        &history_key,
+        ChatMessage::user(&persisted_user_content),
+    );
 
     // Build history from per-sender conversation cache.
     let prior_turns_raw = ctx
@@ -1758,14 +1847,26 @@ async fn process_channel_message(
         .unwrap_or_default();
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
-    // Only enrich with memory context when there is no prior conversation
-    // history. Follow-up turns already include context from previous messages.
-    if !had_prior_history {
-        let memory_context =
-            build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
-        if let Some(last_turn) = prior_turns.last_mut() {
-            if last_turn.role == "user" && !memory_context.is_empty() {
-                last_turn.content = format!("{memory_context}{}", msg.content);
+    if let Some(last_turn) = prior_turns.last_mut() {
+        if last_turn.role == "user" {
+            if let Some(prefix) = last_turn.content.strip_suffix(&persisted_user_content) {
+                last_turn.content = format!("{prefix}{llm_user_content}");
+            } else {
+                last_turn.content = llm_user_content.clone();
+            }
+
+            // Only enrich with memory context when there is no prior conversation
+            // history. Follow-up turns already include context from previous messages.
+            if !had_prior_history {
+                let memory_context = build_memory_context(
+                    ctx.memory.as_ref(),
+                    &msg.content,
+                    ctx.min_relevance_score,
+                )
+                .await;
+                if !memory_context.is_empty() {
+                    last_turn.content = format!("{memory_context}{}", last_turn.content);
+                }
             }
         }
     }
@@ -2318,8 +2419,8 @@ async fn run_message_dispatch_loop(
         let task_sequence = Arc::clone(&task_sequence);
         workers.spawn(async move {
             let _permit = permit;
-            let interrupt_enabled =
-                worker_ctx.interrupt_on_new_message && msg.channel == "telegram";
+            let interrupt_enabled = worker_ctx.interrupt_on_new_message
+                && (msg.channel == "telegram" || msg.channel == "wecom");
             let sender_scope_key = interruption_scope_key(&msg);
             let cancellation_token = CancellationToken::new();
             let completion = Arc::new(InFlightTaskCompletion::new());
@@ -3224,6 +3325,16 @@ fn collect_configured_channels(
         });
     }
 
+    if let Some(ref wecom_cfg) = config.channels_config.wecom {
+        match WeComChannel::new(wecom_cfg, &config.workspace_dir) {
+            Ok(channel) => channels.push(ConfiguredChannel {
+                display_name: "WeCom",
+                channel: Arc::new(channel),
+            }),
+            Err(err) => tracing::warn!("WeCom channel config invalid; skipping startup: {err}"),
+        }
+    }
+
     if let Some(ref ct) = config.channels_config.clawdtalk {
         channels.push(ConfiguredChannel {
             display_name: "ClawdTalk",
@@ -3549,6 +3660,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
+    register_live_channels(channels_by_name.as_ref());
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
@@ -3985,10 +4097,45 @@ mod tests {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
     }
 
+    #[derive(Default)]
+    struct WecomRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
     #[async_trait::async_trait]
     impl Channel for TelegramRecordingChannel {
         fn name(&self) -> &str {
             "telegram"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for WecomRecordingChannel {
+        fn name(&self) -> &str {
+            "wecom"
         }
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -5982,6 +6129,54 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    #[test]
+    fn conversation_history_key_uses_reply_target_for_wecom() {
+        let msg = traits::ChannelMessage {
+            id: "msg_wecom".into(),
+            sender: "hanxiao".into(),
+            reply_target: "group--room-1".into(),
+            content: "hello".into(),
+            channel: "wecom".into(),
+            timestamp: 1,
+            thread_ts: Some("req-1".into()),
+        };
+
+        assert_eq!(conversation_history_key(&msg), "wecom_group--room-1");
+    }
+
+    #[test]
+    fn wecom_group_messages_persist_sender_identity_in_history() {
+        let msg = traits::ChannelMessage {
+            id: "msg_1".into(),
+            sender: "hanxiao".into(),
+            reply_target: "group--room-1".into(),
+            content: "who am i?".into(),
+            channel: "wecom".into(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+
+        let persisted = persisted_channel_user_content(&msg, &msg.content);
+        assert_eq!(persisted, "[sender_userid=hanxiao] who am i?");
+    }
+
+    #[test]
+    fn parse_runtime_command_allows_new_session_for_wecom() {
+        assert!(matches!(
+            parse_runtime_command("wecom", "/new"),
+            Some(ChannelRuntimeCommand::NewSession)
+        ));
+    }
+
+    #[test]
+    fn parse_runtime_command_keeps_provider_switch_scoped_to_supported_channels() {
+        assert!(parse_runtime_command("wecom", "/models openrouter").is_none());
+        assert!(matches!(
+            parse_runtime_command("telegram", "/models openrouter"),
+            Some(ChannelRuntimeCommand::SetProvider(provider)) if provider == "openrouter"
+        ));
+    }
+
     #[tokio::test]
     async fn autosave_keys_preserve_multiple_conversation_facts() {
         let tmp = TempDir::new().unwrap();
@@ -6169,6 +6364,89 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(calls[1][1].1.contains("hello"));
         assert!(calls[1][2].1.contains("response-1"));
         assert!(calls[1][3].1.contains("follow up"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_wecom_group_history_preserves_sender_identity() {
+        let channel_impl = Arc::new(WecomRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureProvider::default());
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-a".to_string(),
+                sender: "hanxiao".to_string(),
+                reply_target: "group--project-room".to_string(),
+                content: "first turn".to_string(),
+                channel: "wecom".to_string(),
+                timestamp: 1,
+                thread_ts: Some("req-1".to_string()),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-b".to_string(),
+                sender: "lin".to_string(),
+                reply_target: "group--project-room".to_string(),
+                content: "second turn".to_string(),
+                channel: "wecom".to_string(),
+                timestamp: 2,
+                thread_ts: Some("req-2".to_string()),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].len(), 4);
+        assert_eq!(calls[1][1].0, "user");
+        assert_eq!(calls[1][2].0, "assistant");
+        assert_eq!(calls[1][3].0, "user");
+        assert!(calls[1][1].1.contains("[sender_userid=hanxiao] first turn"));
+        assert!(calls[1][2].1.contains("response-1"));
+        assert!(calls[1][3].1.contains("[sender_userid=lin] second turn"));
     }
 
     #[tokio::test]
