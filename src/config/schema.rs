@@ -84,6 +84,10 @@ pub struct Config {
     #[serde(default)]
     pub model_providers: HashMap<String, ModelProviderConfig>,
     /// Default model temperature (0.0–2.0). Default: `0.7`.
+    #[serde(
+        default = "default_temperature",
+        deserialize_with = "deserialize_temperature"
+    )]
     pub default_temperature: f64,
 
     /// Observability backend configuration (`[observability]`).
@@ -217,6 +221,10 @@ pub struct Config {
     /// Voice transcription configuration (Whisper API via Groq).
     #[serde(default)]
     pub transcription: TranscriptionConfig,
+
+    /// Text-to-Speech configuration (`[tts]`).
+    #[serde(default)]
+    pub tts: TtsConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -266,6 +274,38 @@ pub struct DelegateAgentConfig {
     /// Maximum tool-call iterations in agentic mode.
     #[serde(default = "default_max_tool_iterations")]
     pub max_iterations: usize,
+}
+
+/// Valid temperature range for all paths (config, CLI, env override).
+pub const TEMPERATURE_RANGE: std::ops::RangeInclusive<f64> = 0.0..=2.0;
+
+/// Default temperature when the field is absent from config.
+const DEFAULT_TEMPERATURE: f64 = 0.7;
+
+fn default_temperature() -> f64 {
+    DEFAULT_TEMPERATURE
+}
+
+/// Validate that a temperature value is within the allowed range.
+pub fn validate_temperature(value: f64) -> std::result::Result<f64, String> {
+    if TEMPERATURE_RANGE.contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "temperature {value} is out of range (expected {}..={})",
+            TEMPERATURE_RANGE.start(),
+            TEMPERATURE_RANGE.end()
+        ))
+    }
+}
+
+/// Custom serde deserializer that rejects out-of-range temperature values at parse time.
+fn deserialize_temperature<'de, D>(deserializer: D) -> std::result::Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: f64 = serde::Deserialize::deserialize(deserializer)?;
+    validate_temperature(value).map_err(serde::de::Error::custom)
 }
 
 fn default_max_depth() -> u32 {
@@ -390,6 +430,150 @@ impl Default for TranscriptionConfig {
             max_duration_secs: default_transcription_max_duration_secs(),
         }
     }
+}
+
+// ── TTS (Text-to-Speech) ─────────────────────────────────────────
+
+fn default_tts_provider() -> String {
+    "openai".into()
+}
+
+fn default_tts_voice() -> String {
+    "alloy".into()
+}
+
+fn default_tts_format() -> String {
+    "mp3".into()
+}
+
+fn default_tts_max_text_length() -> usize {
+    4096
+}
+
+fn default_openai_tts_model() -> String {
+    "tts-1".into()
+}
+
+fn default_openai_tts_speed() -> f64 {
+    1.0
+}
+
+fn default_elevenlabs_model_id() -> String {
+    "eleven_monolingual_v1".into()
+}
+
+fn default_elevenlabs_stability() -> f64 {
+    0.5
+}
+
+fn default_elevenlabs_similarity_boost() -> f64 {
+    0.5
+}
+
+fn default_google_tts_language_code() -> String {
+    "en-US".into()
+}
+
+fn default_edge_tts_binary_path() -> String {
+    "edge-tts".into()
+}
+
+/// Text-to-Speech configuration (`[tts]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TtsConfig {
+    /// Enable TTS synthesis.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Default TTS provider (`"openai"`, `"elevenlabs"`, `"google"`, `"edge"`).
+    #[serde(default = "default_tts_provider")]
+    pub default_provider: String,
+    /// Default voice ID passed to the selected provider.
+    #[serde(default = "default_tts_voice")]
+    pub default_voice: String,
+    /// Default audio output format (`"mp3"`, `"opus"`, `"wav"`).
+    #[serde(default = "default_tts_format")]
+    pub default_format: String,
+    /// Maximum input text length in characters (default 4096).
+    #[serde(default = "default_tts_max_text_length")]
+    pub max_text_length: usize,
+    /// OpenAI TTS provider configuration (`[tts.openai]`).
+    #[serde(default)]
+    pub openai: Option<OpenAiTtsConfig>,
+    /// ElevenLabs TTS provider configuration (`[tts.elevenlabs]`).
+    #[serde(default)]
+    pub elevenlabs: Option<ElevenLabsTtsConfig>,
+    /// Google Cloud TTS provider configuration (`[tts.google]`).
+    #[serde(default)]
+    pub google: Option<GoogleTtsConfig>,
+    /// Edge TTS provider configuration (`[tts.edge]`).
+    #[serde(default)]
+    pub edge: Option<EdgeTtsConfig>,
+}
+
+impl Default for TtsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_provider: default_tts_provider(),
+            default_voice: default_tts_voice(),
+            default_format: default_tts_format(),
+            max_text_length: default_tts_max_text_length(),
+            openai: None,
+            elevenlabs: None,
+            google: None,
+            edge: None,
+        }
+    }
+}
+
+/// OpenAI TTS provider configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OpenAiTtsConfig {
+    /// API key for OpenAI TTS.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Model name (default `"tts-1"`).
+    #[serde(default = "default_openai_tts_model")]
+    pub model: String,
+    /// Playback speed multiplier (default `1.0`).
+    #[serde(default = "default_openai_tts_speed")]
+    pub speed: f64,
+}
+
+/// ElevenLabs TTS provider configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ElevenLabsTtsConfig {
+    /// API key for ElevenLabs.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Model ID (default `"eleven_monolingual_v1"`).
+    #[serde(default = "default_elevenlabs_model_id")]
+    pub model_id: String,
+    /// Voice stability (0.0-1.0, default `0.5`).
+    #[serde(default = "default_elevenlabs_stability")]
+    pub stability: f64,
+    /// Similarity boost (0.0-1.0, default `0.5`).
+    #[serde(default = "default_elevenlabs_similarity_boost")]
+    pub similarity_boost: f64,
+}
+
+/// Google Cloud TTS provider configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GoogleTtsConfig {
+    /// API key for Google Cloud TTS.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Language code (default `"en-US"`).
+    #[serde(default = "default_google_tts_language_code")]
+    pub language_code: String,
+}
+
+/// Edge TTS provider configuration (free, subprocess-based).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EdgeTtsConfig {
+    /// Path to the `edge-tts` binary (default `"edge-tts"`).
+    #[serde(default = "default_edge_tts_binary_path")]
+    pub binary_path: String,
 }
 
 /// Agent orchestration configuration (`[agent]` section).
@@ -3577,7 +3761,7 @@ impl Default for Config {
             default_provider: Some("openrouter".to_string()),
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             model_providers: HashMap::new(),
-            default_temperature: 0.7,
+            default_temperature: default_temperature(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
@@ -3611,6 +3795,7 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
+            tts: TtsConfig::default(),
         }
     }
 }
@@ -4076,6 +4261,29 @@ impl Config {
                 decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
             }
 
+            // Decrypt TTS provider API keys
+            if let Some(ref mut openai) = config.tts.openai {
+                decrypt_optional_secret(
+                    &store,
+                    &mut openai.api_key,
+                    "config.tts.openai.api_key",
+                )?;
+            }
+            if let Some(ref mut elevenlabs) = config.tts.elevenlabs {
+                decrypt_optional_secret(
+                    &store,
+                    &mut elevenlabs.api_key,
+                    "config.tts.elevenlabs.api_key",
+                )?;
+            }
+            if let Some(ref mut google) = config.tts.google {
+                decrypt_optional_secret(
+                    &store,
+                    &mut google.api_key,
+                    "config.tts.google.api_key",
+                )?;
+            }
+
             if let Some(ref mut ns) = config.channels_config.nostr {
                 decrypt_secret(
                     &store,
@@ -4498,9 +4706,22 @@ impl Config {
 
         // Temperature: ZEROCLAW_TEMPERATURE
         if let Ok(temp_str) = std::env::var("ZEROCLAW_TEMPERATURE") {
-            if let Ok(temp) = temp_str.parse::<f64>() {
-                if (0.0..=2.0).contains(&temp) {
+            match temp_str.parse::<f64>() {
+                Ok(temp) if TEMPERATURE_RANGE.contains(&temp) => {
                     self.default_temperature = temp;
+                }
+                Ok(temp) => {
+                    tracing::warn!(
+                        "Ignoring ZEROCLAW_TEMPERATURE={temp}: \
+                         value out of range (expected {}..={})",
+                        TEMPERATURE_RANGE.start(),
+                        TEMPERATURE_RANGE.end()
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Ignoring ZEROCLAW_TEMPERATURE={temp_str:?}: not a valid number"
+                    );
                 }
             }
         }
@@ -4696,6 +4917,29 @@ impl Config {
 
         for agent in config_to_save.agents.values_mut() {
             encrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
+        }
+
+        // Encrypt TTS provider API keys
+        if let Some(ref mut openai) = config_to_save.tts.openai {
+            encrypt_optional_secret(
+                &store,
+                &mut openai.api_key,
+                "config.tts.openai.api_key",
+            )?;
+        }
+        if let Some(ref mut elevenlabs) = config_to_save.tts.elevenlabs {
+            encrypt_optional_secret(
+                &store,
+                &mut elevenlabs.api_key,
+                "config.tts.elevenlabs.api_key",
+            )?;
+        }
+        if let Some(ref mut google) = config_to_save.tts.google {
+            encrypt_optional_secret(
+                &store,
+                &mut google.api_key,
+                "config.tts.google.api_key",
+            )?;
         }
 
         if let Some(ref mut ns) = config_to_save.channels_config.nostr {
@@ -5143,6 +5387,7 @@ default_temperature = 0.7
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            tts: TtsConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -5325,6 +5570,7 @@ tool_dispatcher = "xml"
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
+            tts: TtsConfig::default(),
         };
 
         config.save().await.unwrap();
