@@ -12,7 +12,7 @@ import Cost from './pages/Cost';
 import Logs from './pages/Logs';
 import Doctor from './pages/Doctor';
 import { AuthProvider, useAuth } from './hooks/useAuth';
-import { setLocale, type Locale } from './lib/i18n';
+import { setLocale, t, useLocale, type Locale } from './lib/i18n';
 
 // Locale context
 interface LocaleContextType {
@@ -21,11 +21,24 @@ interface LocaleContextType {
 }
 
 export const LocaleContext = createContext<LocaleContextType>({
-  locale: 'tr',
+  locale: 'en',
   setAppLocale: (_locale: Locale) => {},
 });
 
 export const useLocaleContext = () => useContext(LocaleContext);
+
+const LOCALE_STORAGE_KEY = 'zeroclaw.web.locale';
+
+function readStoredLocale(): Locale | null {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  const stored = window.localStorage.getItem(LOCALE_STORAGE_KEY);
+  return stored === 'en' || stored === 'tr' || stored === 'zh-CN'
+    ? stored
+    : null;
+}
 
 // Pairing dialog component
 function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) {
@@ -40,7 +53,7 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
     try {
       await onPair(code);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Pairing failed');
+      setError(err instanceof Error ? err.message : t('auth.pairing_failed'));
     } finally {
       setLoading(false);
     }
@@ -51,14 +64,14 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
       <div className="bg-gray-900 rounded-xl p-8 w-full max-w-md border border-gray-800">
         <div className="text-center mb-6">
           <h1 className="text-2xl font-bold text-white mb-2">ZeroClaw</h1>
-          <p className="text-gray-400">Enter the pairing code from your terminal</p>
+          <p className="text-gray-400">{t('auth.enter_code_terminal')}</p>
         </div>
         <form onSubmit={handleSubmit}>
           <input
             type="text"
             value={code}
             onChange={(e) => setCode(e.target.value)}
-            placeholder="6-digit code"
+            placeholder={t('auth.code_placeholder')}
             className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white text-center text-2xl tracking-widest focus:outline-none focus:border-blue-500 mb-4"
             maxLength={6}
             autoFocus
@@ -71,7 +84,7 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
             disabled={loading || code.length < 6}
             className="w-full py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-lg font-medium transition-colors"
           >
-            {loading ? 'Pairing...' : 'Pair'}
+            {loading ? t('auth.pairing_progress') : t('auth.pair_button')}
           </button>
         </form>
       </div>
@@ -81,9 +94,29 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 
 function AppContent() {
   const { isAuthenticated, loading, pair, logout } = useAuth();
-  const [locale, setLocaleState] = useState<Locale>('tr');
+  const { locale: detectedLocale } = useLocale();
+  const [locale, setLocaleState] = useState<Locale>(() => readStoredLocale() ?? detectedLocale);
+  const [hasStoredLocale, setHasStoredLocale] = useState(() => readStoredLocale() !== null);
+
+  useEffect(() => {
+    if (hasStoredLocale) {
+      const storedLocale = readStoredLocale();
+      if (storedLocale) {
+        setLocaleState(storedLocale);
+        setLocale(storedLocale);
+      }
+      return;
+    }
+
+    setLocaleState(detectedLocale);
+    setLocale(detectedLocale);
+  }, [detectedLocale, hasStoredLocale]);
 
   const setAppLocale = (newLocale: Locale) => {
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem(LOCALE_STORAGE_KEY, newLocale);
+    }
+    setHasStoredLocale(true);
     setLocaleState(newLocale);
     setLocale(newLocale);
   };
@@ -100,7 +133,7 @@ function AppContent() {
   if (loading) {
     return (
       <div className="min-h-screen bg-gray-950 flex items-center justify-center">
-        <p className="text-gray-400">Connecting...</p>
+        <p className="text-gray-400">{t('agent.connecting')}</p>
       </div>
     );
   }

@@ -10,11 +10,12 @@ import {
 } from 'lucide-react';
 import type { CronJob } from '@/types/api';
 import { getCronJobs, addCronJob, deleteCronJob } from '@/lib/api';
+import { getLocale, t, tf } from '@/lib/i18n';
 
 function formatDate(iso: string | null): string {
   if (!iso) return '-';
   const d = new Date(iso);
-  return d.toLocaleString();
+  return d.toLocaleString(getLocale());
 }
 
 export default function Cron() {
@@ -45,7 +46,7 @@ export default function Cron() {
 
   const handleAdd = async () => {
     if (!formSchedule.trim() || !formCommand.trim()) {
-      setFormError('Schedule and command are required.');
+      setFormError(t('cron.required_fields'));
       return;
     }
     setSubmitting(true);
@@ -62,7 +63,7 @@ export default function Cron() {
       setFormSchedule('');
       setFormCommand('');
     } catch (err: unknown) {
-      setFormError(err instanceof Error ? err.message : 'Failed to add job');
+      setFormError(err instanceof Error ? err.message : t('cron.add_error'));
     } finally {
       setSubmitting(false);
     }
@@ -73,7 +74,7 @@ export default function Cron() {
       await deleteCronJob(id);
       setJobs((prev) => prev.filter((j) => j.id !== id));
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to delete job');
+      setError(err instanceof Error ? err.message : t('cron.delete_error'));
     } finally {
       setConfirmDelete(null);
     }
@@ -97,7 +98,7 @@ export default function Cron() {
     return (
       <div className="p-6">
         <div className="rounded-lg bg-red-900/30 border border-red-700 p-4 text-red-300">
-          Failed to load cron jobs: {error}
+          {tf('cron.load_error', { error })}
         </div>
       </div>
     );
@@ -118,7 +119,7 @@ export default function Cron() {
         <div className="flex items-center gap-2">
           <Clock className="h-5 w-5 text-blue-400" />
           <h2 className="text-base font-semibold text-white">
-            Scheduled Tasks ({jobs.length})
+            {t('cron.title')} ({jobs.length})
           </h2>
         </div>
         <button
@@ -126,7 +127,7 @@ export default function Cron() {
           className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors"
         >
           <Plus className="h-4 w-4" />
-          Add Job
+          {t('cron.add')}
         </button>
       </div>
 
@@ -135,7 +136,7 @@ export default function Cron() {
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
           <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-md mx-4">
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-semibold text-white">Add Cron Job</h3>
+              <h3 className="text-lg font-semibold text-white">{t('cron.modal_title')}</h3>
               <button
                 onClick={() => {
                   setShowForm(false);
@@ -156,37 +157,37 @@ export default function Cron() {
             <div className="space-y-4">
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-1">
-                  Name (optional)
+                  {t('cron.name_optional')}
                 </label>
                 <input
                   type="text"
                   value={formName}
                   onChange={(e) => setFormName(e.target.value)}
-                  placeholder="e.g. Daily cleanup"
+                  placeholder={t('cron.name_placeholder')}
                   className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-1">
-                  Schedule <span className="text-red-400">*</span>
+                  {t('cron.schedule')} <span className="text-red-400">*</span>
                 </label>
                 <input
                   type="text"
                   value={formSchedule}
                   onChange={(e) => setFormSchedule(e.target.value)}
-                  placeholder="e.g. 0 0 * * * (cron expression)"
+                  placeholder={t('cron.schedule_placeholder')}
                   className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-1">
-                  Command <span className="text-red-400">*</span>
+                  {t('cron.command')} <span className="text-red-400">*</span>
                 </label>
                 <input
                   type="text"
                   value={formCommand}
                   onChange={(e) => setFormCommand(e.target.value)}
-                  placeholder="e.g. cleanup --older-than 7d"
+                  placeholder={t('cron.command_placeholder')}
                   className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
               </div>
@@ -200,14 +201,14 @@ export default function Cron() {
                 }}
                 className="px-4 py-2 text-sm font-medium text-gray-300 hover:text-white border border-gray-700 rounded-lg hover:bg-gray-800 transition-colors"
               >
-                Cancel
+                {t('common.cancel')}
               </button>
               <button
                 onClick={handleAdd}
                 disabled={submitting}
                 className="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors disabled:opacity-50"
               >
-                {submitting ? 'Adding...' : 'Add Job'}
+                {submitting ? t('cron.adding') : t('cron.add')}
               </button>
             </div>
           </div>
@@ -218,35 +219,35 @@ export default function Cron() {
       {jobs.length === 0 ? (
         <div className="bg-gray-900 rounded-xl border border-gray-800 p-8 text-center">
           <Clock className="h-10 w-10 text-gray-600 mx-auto mb-3" />
-          <p className="text-gray-400">No scheduled tasks configured.</p>
+          <p className="text-gray-400">{t('cron.empty_configured')}</p>
         </div>
       ) : (
         <div className="bg-gray-900 rounded-xl border border-gray-800 overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
-              <tr className="border-b border-gray-800">
-                <th className="text-left px-4 py-3 text-gray-400 font-medium">
-                  ID
-                </th>
-                <th className="text-left px-4 py-3 text-gray-400 font-medium">
-                  Name
-                </th>
-                <th className="text-left px-4 py-3 text-gray-400 font-medium">
-                  Command
-                </th>
-                <th className="text-left px-4 py-3 text-gray-400 font-medium">
-                  Next Run
-                </th>
-                <th className="text-left px-4 py-3 text-gray-400 font-medium">
-                  Last Status
-                </th>
-                <th className="text-left px-4 py-3 text-gray-400 font-medium">
-                  Enabled
-                </th>
-                <th className="text-right px-4 py-3 text-gray-400 font-medium">
-                  Actions
-                </th>
-              </tr>
+                <tr className="border-b border-gray-800">
+                  <th className="text-left px-4 py-3 text-gray-400 font-medium">
+                    {t('common.id')}
+                  </th>
+                  <th className="text-left px-4 py-3 text-gray-400 font-medium">
+                    {t('cron.name')}
+                  </th>
+                  <th className="text-left px-4 py-3 text-gray-400 font-medium">
+                    {t('cron.command')}
+                  </th>
+                  <th className="text-left px-4 py-3 text-gray-400 font-medium">
+                    {t('cron.next_run')}
+                  </th>
+                  <th className="text-left px-4 py-3 text-gray-400 font-medium">
+                    {t('cron.last_status')}
+                  </th>
+                  <th className="text-left px-4 py-3 text-gray-400 font-medium">
+                    {t('cron.enabled')}
+                  </th>
+                  <th className="text-right px-4 py-3 text-gray-400 font-medium">
+                    {t('common.actions')}
+                  </th>
+                </tr>
             </thead>
             <tbody>
               {jobs.map((job) => (
@@ -282,24 +283,24 @@ export default function Cron() {
                           : 'bg-gray-800 text-gray-500 border border-gray-700'
                       }`}
                     >
-                      {job.enabled ? 'Enabled' : 'Disabled'}
+                      {job.enabled ? t('common.enabled') : t('common.disabled')}
                     </span>
                   </td>
                   <td className="px-4 py-3 text-right">
                     {confirmDelete === job.id ? (
                       <div className="flex items-center justify-end gap-2">
-                        <span className="text-xs text-red-400">Delete?</span>
+                        <span className="text-xs text-red-400">{t('cron.delete_prompt')}</span>
                         <button
                           onClick={() => handleDelete(job.id)}
                           className="text-red-400 hover:text-red-300 text-xs font-medium"
                         >
-                          Yes
+                          {t('common.yes')}
                         </button>
                         <button
                           onClick={() => setConfirmDelete(null)}
                           className="text-gray-400 hover:text-white text-xs font-medium"
                         >
-                          No
+                          {t('common.no')}
                         </button>
                       </div>
                     ) : (
