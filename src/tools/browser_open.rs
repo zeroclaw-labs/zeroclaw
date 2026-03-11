@@ -8,13 +8,19 @@ use std::sync::Arc;
 pub struct BrowserOpenTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
+    net_policy: crate::tools::NetworkAccessPolicy,
 }
 
 impl BrowserOpenTool {
-    pub fn new(security: Arc<SecurityPolicy>, allowed_domains: Vec<String>) -> Self {
+    pub fn new(
+        security: Arc<SecurityPolicy>,
+        allowed_domains: Vec<String>,
+        net_policy: crate::tools::NetworkAccessPolicy,
+    ) -> Self {
         Self {
             security,
             allowed_domains: normalize_allowed_domains(allowed_domains),
+            net_policy,
         }
     }
 
@@ -29,8 +35,16 @@ impl BrowserOpenTool {
             anyhow::bail!("URL cannot contain whitespace");
         }
 
-        if !url.starts_with("https://") {
-            anyhow::bail!("Only https:// URLs are allowed");
+        if !url.starts_with("https://") && !url.starts_with("http://") && !url.starts_with("file://") {
+            anyhow::bail!("Only http://, https://, and file:// URLs are allowed");
+        }
+
+        // file:// URLs require local network access
+        if url.starts_with("file://") {
+            if !self.net_policy.allow_local_network {
+                anyhow::bail!("file:// URLs are blocked (security.allow_local_network = false)");
+            }
+            return Ok(url.to_string());
         }
 
         if self.allowed_domains.is_empty() {
@@ -41,8 +55,13 @@ impl BrowserOpenTool {
 
         let host = extract_host(url)?;
 
+        // Apply network access policy
         if is_private_or_local_host(&host) {
-            anyhow::bail!("Blocked local/private host: {host}");
+            if !self.net_policy.allow_local_network {
+                anyhow::bail!("Blocked local/private host: {host} (security.allow_local_network = false)");
+            }
+        } else if !self.net_policy.allow_public_internet {
+            anyhow::bail!("Blocked public host: {host} (security.allow_public_internet = false)");
         }
 
         if !host_matches_allowlist(&host, &self.allowed_domains) {
@@ -60,7 +79,7 @@ impl Tool for BrowserOpenTool {
     }
 
     fn description(&self) -> &str {
-        "Open an approved HTTPS URL in the system browser. Security constraints: allowlist-only domains, no local/private hosts, no scraping."
+        "Open a URL in the system browser. Supports http://, https://, and file:// URLs. Domain allowlist applies to http/https."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -273,7 +292,8 @@ fn normalize_domain(raw: &str) -> Option<String> {
 fn extract_host(url: &str) -> anyhow::Result<String> {
     let rest = url
         .strip_prefix("https://")
-        .ok_or_else(|| anyhow::anyhow!("Only https:// URLs are allowed"))?;
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or_else(|| anyhow::anyhow!("Only http:// and https:// URLs are allowed"))?;
 
     let authority = rest
         .split(['/', '?', '#'])
@@ -369,6 +389,7 @@ mod tests {
         BrowserOpenTool::new(
             security,
             allowed_domains.into_iter().map(String::from).collect(),
+            crate::tools::NetworkAccessPolicy::default(),
         )
     }
 
@@ -408,43 +429,33 @@ mod tests {
     }
 
     #[test]
-    fn validate_wildcard_allowlist_still_rejects_private_host() {
+    fn validate_wildcard_allowlist_accepts_localhost() {
         let tool = test_tool(vec!["*"]);
-        let err = tool
-            .validate_url("https://localhost:8443")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("local/private"));
+        assert!(tool.validate_url("https://localhost:8443").is_ok());
     }
 
     #[test]
-    fn validate_rejects_http() {
+    fn validate_accepts_http() {
         let tool = test_tool(vec!["example.com"]);
-        let err = tool
-            .validate_url("http://example.com")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("https://"));
+        assert!(tool.validate_url("http://example.com").is_ok());
     }
 
     #[test]
-    fn validate_rejects_localhost() {
+    fn validate_accepts_localhost() {
         let tool = test_tool(vec!["localhost"]);
-        let err = tool
-            .validate_url("https://localhost:8080")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("local/private"));
+        assert!(tool.validate_url("https://localhost:8080").is_ok());
     }
 
     #[test]
-    fn validate_rejects_private_ipv4() {
+    fn validate_accepts_private_ipv4() {
         let tool = test_tool(vec!["192.168.1.5"]);
-        let err = tool
-            .validate_url("https://192.168.1.5")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("local/private"));
+        assert!(tool.validate_url("https://192.168.1.5").is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_file_url() {
+        let tool = test_tool(vec!["example.com"]);
+        assert!(tool.validate_url("file:///tmp/test.html").is_ok());
     }
 
     #[test]
@@ -480,7 +491,7 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserOpenTool::new(security, vec![]);
+        let tool = BrowserOpenTool::new(security, vec![], crate::tools::NetworkAccessPolicy::default());
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -506,7 +517,7 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = BrowserOpenTool::new(security, vec!["example.com".into()]);
+        let tool = BrowserOpenTool::new(security, vec!["example.com".into()], crate::tools::NetworkAccessPolicy::default());
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -521,7 +532,7 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = BrowserOpenTool::new(security, vec!["example.com".into()]);
+        let tool = BrowserOpenTool::new(security, vec!["example.com".into()], crate::tools::NetworkAccessPolicy::default());
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await

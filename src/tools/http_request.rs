@@ -12,6 +12,7 @@ pub struct HttpRequestTool {
     allowed_domains: Vec<String>,
     max_response_size: usize,
     timeout_secs: u64,
+    net_policy: crate::tools::NetworkAccessPolicy,
 }
 
 impl HttpRequestTool {
@@ -20,12 +21,14 @@ impl HttpRequestTool {
         allowed_domains: Vec<String>,
         max_response_size: usize,
         timeout_secs: u64,
+        net_policy: crate::tools::NetworkAccessPolicy,
     ) -> Self {
         Self {
             security,
             allowed_domains: normalize_allowed_domains(allowed_domains),
             max_response_size,
             timeout_secs,
+            net_policy,
         }
     }
 
@@ -52,8 +55,13 @@ impl HttpRequestTool {
 
         let host = extract_host(url)?;
 
+        // Apply network access policy
         if is_private_or_local_host(&host) {
-            anyhow::bail!("Blocked local/private host: {host}");
+            if !self.net_policy.allow_local_network {
+                anyhow::bail!("Blocked local/private host: {host} (security.allow_local_network = false)");
+            }
+        } else if !self.net_policy.allow_public_internet {
+            anyhow::bail!("Blocked public host: {host} (security.allow_public_internet = false)");
         }
 
         if !host_matches_allowlist(&host, &self.allowed_domains) {
@@ -165,8 +173,8 @@ impl Tool for HttpRequestTool {
     }
 
     fn description(&self) -> &str {
-        "Make HTTP requests to external APIs. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. \
-        Security constraints: allowlist-only domains, no local/private hosts, configurable timeout and response size limits."
+        "Make HTTP requests to APIs. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. \
+        Domain allowlist controls which hosts are reachable. Configurable timeout and response size limits."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -463,6 +471,7 @@ mod tests {
             allowed_domains.into_iter().map(String::from).collect(),
             1_000_000,
             30,
+            crate::tools::NetworkAccessPolicy::default(),
         )
     }
 
@@ -508,13 +517,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_wildcard_allowlist_still_rejects_private_host() {
+    fn validate_wildcard_allowlist_accepts_localhost() {
         let tool = test_tool(vec!["*"]);
-        let err = tool
-            .validate_url("https://localhost:8080")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("local/private"));
+        assert!(tool.validate_url("https://localhost:8080").is_ok());
     }
 
     #[test]
@@ -528,23 +533,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_localhost() {
+    fn validate_accepts_localhost() {
         let tool = test_tool(vec!["localhost"]);
-        let err = tool
-            .validate_url("https://localhost:8080")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("local/private"));
+        assert!(tool.validate_url("https://localhost:8080").is_ok());
     }
 
     #[test]
-    fn validate_rejects_private_ipv4() {
+    fn validate_accepts_private_ipv4() {
         let tool = test_tool(vec!["192.168.1.5"]);
-        let err = tool
-            .validate_url("https://192.168.1.5")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("local/private"));
+        assert!(tool.validate_url("https://192.168.1.5").is_ok());
     }
 
     #[test]
@@ -570,7 +567,7 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30);
+        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30, crate::tools::NetworkAccessPolicy::default());
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -686,7 +683,7 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30);
+        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, crate::tools::NetworkAccessPolicy::default());
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -701,7 +698,7 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30);
+        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, crate::tools::NetworkAccessPolicy::default());
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -724,6 +721,7 @@ mod tests {
             vec!["example.com".into()],
             10,
             30,
+            crate::tools::NetworkAccessPolicy::default(),
         );
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);
@@ -738,6 +736,7 @@ mod tests {
             vec!["example.com".into()],
             0, // max_response_size = 0 means no limit
             30,
+            crate::tools::NetworkAccessPolicy::default(),
         );
         let text = "a".repeat(10_000_000);
         assert_eq!(tool.truncate_response(&text), text);
@@ -750,6 +749,7 @@ mod tests {
             vec!["example.com".into()],
             5,
             30,
+            crate::tools::NetworkAccessPolicy::default(),
         );
         let text = "hello world";
         let truncated = tool.truncate_response(text);

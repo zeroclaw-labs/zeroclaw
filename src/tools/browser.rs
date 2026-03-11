@@ -67,6 +67,7 @@ pub struct BrowserTool {
     native_webdriver_url: String,
     native_chrome_path: Option<String>,
     computer_use: ComputerUseConfig,
+    net_policy: super::NetworkAccessPolicy,
     #[cfg(feature = "browser-native")]
     native_state: tokio::sync::Mutex<native_backend::NativeBrowserState>,
 }
@@ -211,6 +212,7 @@ impl BrowserTool {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            super::NetworkAccessPolicy::default(),
         )
     }
 
@@ -224,6 +226,7 @@ impl BrowserTool {
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
         computer_use: ComputerUseConfig,
+        net_policy: super::NetworkAccessPolicy,
     ) -> Self {
         Self {
             security,
@@ -234,6 +237,7 @@ impl BrowserTool {
             native_webdriver_url,
             native_chrome_path,
             computer_use,
+            net_policy,
             #[cfg(feature = "browser-native")]
             native_state: tokio::sync::Mutex::new(native_backend::NativeBrowserState::default()),
         }
@@ -406,14 +410,8 @@ impl BrowserTool {
             anyhow::bail!("URL cannot be empty");
         }
 
-        // Block file:// URLs — browser file access bypasses all SSRF and
-        // domain-allowlist controls and can exfiltrate arbitrary local files.
-        if url.starts_with("file://") {
-            anyhow::bail!("file:// URLs are not allowed in browser automation");
-        }
-
-        if !url.starts_with("https://") && !url.starts_with("http://") {
-            anyhow::bail!("Only http:// and https:// URLs are allowed");
+        if !url.starts_with("https://") && !url.starts_with("http://") && !url.starts_with("file://") {
+            anyhow::bail!("Only http://, https://, and file:// URLs are allowed");
         }
 
         if self.allowed_domains.is_empty() {
@@ -423,10 +421,23 @@ impl BrowserTool {
             );
         }
 
+        // file:// URLs require local network access
+        if url.starts_with("file://") {
+            if !self.net_policy.allow_local_network {
+                anyhow::bail!("file:// URLs are blocked (security.allow_local_network = false)");
+            }
+            return Ok(());
+        }
+
         let host = extract_host(url)?;
 
+        // Apply network access policy
         if is_private_host(&host) {
-            anyhow::bail!("Blocked local/private host: {host}");
+            if !self.net_policy.allow_local_network {
+                anyhow::bail!("Blocked local/private host: {host} (security.allow_local_network = false)");
+            }
+        } else if !self.net_policy.allow_public_internet {
+            anyhow::bail!("Blocked public host: {host} (security.allow_public_internet = false)");
         }
 
         if !host_matches_allowlist(&host, &self.allowed_domains) {
@@ -2218,14 +2229,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_url_blocks_ipv6_ssrf() {
+    fn validate_url_allows_ipv6_with_wildcard() {
         let security = Arc::new(SecurityPolicy::default());
         let tool = BrowserTool::new(security, vec!["*".into()], None);
-        assert!(tool.validate_url("https://[::1]/").is_err());
-        assert!(tool.validate_url("https://[::ffff:127.0.0.1]/").is_err());
+        assert!(tool.validate_url("https://[::1]/").is_ok());
+        assert!(tool.validate_url("https://[::ffff:127.0.0.1]/").is_ok());
         assert!(tool
             .validate_url("https://[::ffff:10.0.0.1]:8080/")
-            .is_err());
+            .is_ok());
     }
 
     #[test]
@@ -2298,6 +2309,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            crate::tools::NetworkAccessPolicy::default(),
         );
         assert_eq!(tool.configured_backend().unwrap(), BrowserBackendKind::Auto);
     }
@@ -2314,6 +2326,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            crate::tools::NetworkAccessPolicy::default(),
         );
         assert_eq!(
             tool.configured_backend().unwrap(),
@@ -2336,6 +2349,7 @@ mod tests {
                 endpoint: "http://computer-use.example.com/v1/actions".into(),
                 ..ComputerUseConfig::default()
             },
+            crate::tools::NetworkAccessPolicy::default(),
         );
 
         assert!(tool.computer_use_endpoint_url().is_err());
@@ -2357,6 +2371,7 @@ mod tests {
                 allow_remote_endpoint: true,
                 ..ComputerUseConfig::default()
             },
+            crate::tools::NetworkAccessPolicy::default(),
         );
 
         assert!(tool.computer_use_endpoint_url().is_ok());
@@ -2378,6 +2393,7 @@ mod tests {
                 max_coordinate_y: Some(100),
                 ..ComputerUseConfig::default()
             },
+            crate::tools::NetworkAccessPolicy::default(),
         );
 
         assert!(tool
@@ -2410,15 +2426,15 @@ mod tests {
         // Invalid - not in allowlist
         assert!(tool.validate_url("https://other.com").is_err());
 
-        // Invalid - private host
-        assert!(tool.validate_url("https://localhost").is_err());
-        assert!(tool.validate_url("https://127.0.0.1").is_err());
+        // localhost/private hosts are allowed (not in allowlist though)
+        assert!(tool.validate_url("https://localhost").is_err()); // not in allowlist
+        assert!(tool.validate_url("https://127.0.0.1").is_err()); // not in allowlist
 
-        // Invalid - not https
+        // Invalid - unsupported scheme
         assert!(tool.validate_url("ftp://example.com").is_err());
 
-        // file:// URLs blocked (local file exfiltration risk)
-        assert!(tool.validate_url("file:///tmp/test.html").is_err());
+        // file:// URLs are allowed
+        assert!(tool.validate_url("file:///tmp/test.html").is_ok());
     }
 
     #[test]

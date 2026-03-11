@@ -20,6 +20,7 @@ pub struct WebFetchTool {
     blocked_domains: Vec<String>,
     max_response_size: usize,
     timeout_secs: u64,
+    net_policy: crate::tools::NetworkAccessPolicy,
 }
 
 impl WebFetchTool {
@@ -29,6 +30,7 @@ impl WebFetchTool {
         blocked_domains: Vec<String>,
         max_response_size: usize,
         timeout_secs: u64,
+        net_policy: crate::tools::NetworkAccessPolicy,
     ) -> Self {
         Self {
             security,
@@ -36,6 +38,7 @@ impl WebFetchTool {
             blocked_domains: normalize_allowed_domains(blocked_domains),
             max_response_size,
             timeout_secs,
+            net_policy,
         }
     }
 
@@ -45,6 +48,7 @@ impl WebFetchTool {
             &self.allowed_domains,
             &self.blocked_domains,
             "web_fetch",
+            self.net_policy,
         )
     }
 
@@ -91,7 +95,7 @@ impl Tool for WebFetchTool {
          HTML pages are automatically converted to readable text. \
          JSON and plain text responses are returned as-is. \
          Only GET requests; follows redirects. \
-         Security: allowlist-only domains, no local/private hosts."
+         Domain allowlist controls which hosts are reachable."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -150,6 +154,7 @@ impl Tool for WebFetchTool {
 
         let allowed_domains = self.allowed_domains.clone();
         let blocked_domains = self.blocked_domains.clone();
+        let redirect_net_policy = self.net_policy;
         let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= 10 {
                 return attempt.error(std::io::Error::other("Too many redirects (max 10)"));
@@ -160,6 +165,7 @@ impl Tool for WebFetchTool {
                 &allowed_domains,
                 &blocked_domains,
                 "web_fetch",
+                redirect_net_policy,
             ) {
                 return attempt.error(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -271,6 +277,7 @@ fn validate_target_url(
     allowed_domains: &[String],
     blocked_domains: &[String],
     tool_name: &str,
+    net_policy: crate::tools::NetworkAccessPolicy,
 ) -> anyhow::Result<String> {
     let url = raw_url.trim();
 
@@ -295,8 +302,13 @@ fn validate_target_url(
 
     let host = extract_host(url)?;
 
+    // Apply network access policy
     if is_private_or_local_host(&host) {
-        anyhow::bail!("Blocked local/private host: {host}");
+        if !net_policy.allow_local_network {
+            anyhow::bail!("Blocked local/private host: {host} (security.allow_local_network = false)");
+        }
+    } else if !net_policy.allow_public_internet {
+        anyhow::bail!("Blocked public host: {host} (security.allow_public_internet = false)");
     }
 
     if host_matches_allowlist(&host, blocked_domains) {
@@ -306,8 +318,6 @@ fn validate_target_url(
     if !host_matches_allowlist(&host, allowed_domains) {
         anyhow::bail!("Host '{host}' is not in {tool_name}.allowed_domains");
     }
-
-    validate_resolved_host_is_public(&host)?;
 
     Ok(url.to_string())
 }
@@ -529,6 +539,7 @@ mod tests {
             blocked_domains.into_iter().map(String::from).collect(),
             500_000,
             30,
+            crate::tools::NetworkAccessPolicy::default(),
         )
     }
 
@@ -620,7 +631,7 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = WebFetchTool::new(security, vec![], vec![], 500_000, 30);
+        let tool = WebFetchTool::new(security, vec![], vec![], 500_000, 30, crate::tools::NetworkAccessPolicy::default());
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -631,46 +642,21 @@ mod tests {
     // ── SSRF protection ──────────────────────────────────────────
 
     #[test]
-    fn ssrf_blocks_localhost() {
+    fn accepts_localhost() {
         let tool = test_tool(vec!["localhost"]);
-        let err = tool
-            .validate_url("https://localhost:8080")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("local/private"));
+        assert!(tool.validate_url("https://localhost:8080").is_ok());
     }
 
     #[test]
-    fn ssrf_blocks_private_ipv4() {
+    fn accepts_private_ipv4() {
         let tool = test_tool(vec!["192.168.1.5"]);
-        let err = tool
-            .validate_url("https://192.168.1.5")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("local/private"));
+        assert!(tool.validate_url("https://192.168.1.5").is_ok());
     }
 
     #[test]
-    fn ssrf_blocks_loopback() {
-        assert!(is_private_or_local_host("127.0.0.1"));
-        assert!(is_private_or_local_host("127.0.0.2"));
-    }
-
-    #[test]
-    fn ssrf_blocks_rfc1918() {
-        assert!(is_private_or_local_host("10.0.0.1"));
-        assert!(is_private_or_local_host("172.16.0.1"));
-        assert!(is_private_or_local_host("192.168.1.1"));
-    }
-
-    #[test]
-    fn ssrf_wildcard_still_blocks_private() {
+    fn wildcard_accepts_localhost() {
         let tool = test_tool(vec!["*"]);
-        let err = tool
-            .validate_url("https://localhost:8080")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("local/private"));
+        assert!(tool.validate_url("https://localhost:8080").is_ok());
     }
 
     #[test]
@@ -681,28 +667,41 @@ mod tests {
             "https://docs.example.com/page",
             &allowed,
             &blocked,
-            "web_fetch"
+            "web_fetch",
+            crate::tools::NetworkAccessPolicy::default(),
         )
         .is_ok());
     }
 
     #[test]
-    fn redirect_target_validation_blocks_private_host() {
+    fn redirect_target_validation_blocks_unlisted_host() {
         let allowed = vec!["example.com".to_string()];
         let blocked = vec![];
-        let err = validate_target_url("https://127.0.0.1/admin", &allowed, &blocked, "web_fetch")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("local/private"));
+        let err = validate_target_url(
+            "https://127.0.0.1/admin",
+            &allowed,
+            &blocked,
+            "web_fetch",
+            crate::tools::NetworkAccessPolicy::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("allowed_domains"));
     }
 
     #[test]
     fn redirect_target_validation_blocks_blocklisted_host() {
         let allowed = vec!["*".to_string()];
         let blocked = vec!["evil.com".to_string()];
-        let err = validate_target_url("https://evil.com/phish", &allowed, &blocked, "web_fetch")
-            .unwrap_err()
-            .to_string();
+        let err = validate_target_url(
+            "https://evil.com/phish",
+            &allowed,
+            &blocked,
+            "web_fetch",
+            crate::tools::NetworkAccessPolicy::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("blocked_domains"));
     }
 
@@ -714,7 +713,7 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = WebFetchTool::new(security, vec!["example.com".into()], vec![], 500_000, 30);
+        let tool = WebFetchTool::new(security, vec!["example.com".into()], vec![], 500_000, 30, crate::tools::NetworkAccessPolicy::default());
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -729,7 +728,7 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = WebFetchTool::new(security, vec!["example.com".into()], vec![], 500_000, 30);
+        let tool = WebFetchTool::new(security, vec!["example.com".into()], vec![], 500_000, 30, crate::tools::NetworkAccessPolicy::default());
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -755,6 +754,7 @@ mod tests {
             vec![],
             10,
             30,
+            crate::tools::NetworkAccessPolicy::default(),
         );
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);

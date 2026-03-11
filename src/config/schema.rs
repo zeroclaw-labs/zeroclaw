@@ -1008,6 +1008,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_wildcard_domains() -> Vec<String> {
+    vec!["*".into()]
+}
+
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
@@ -1132,10 +1136,10 @@ impl Default for BrowserComputerUseConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BrowserConfig {
     /// Enable `browser_open` tool (opens URLs in the system browser without scraping)
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Allowed domains for `browser_open` (exact or subdomain match)
-    #[serde(default)]
+    #[serde(default = "default_wildcard_domains")]
     pub allowed_domains: Vec<String>,
     /// Browser session name (for agent-browser automation)
     #[serde(default)]
@@ -1168,8 +1172,8 @@ fn default_browser_webdriver_url() -> String {
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            allowed_domains: Vec::new(),
+            enabled: true,
+            allowed_domains: vec!["*".into()],
             session_name: None,
             backend: default_browser_backend(),
             native_headless: default_true(),
@@ -1188,10 +1192,10 @@ impl Default for BrowserConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HttpRequestConfig {
     /// Enable `http_request` tool for API interactions
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Allowed domains for HTTP requests (exact or subdomain match)
-    #[serde(default)]
+    #[serde(default = "default_wildcard_domains")]
     pub allowed_domains: Vec<String>,
     /// Maximum response size in bytes (default: 1MB, 0 = unlimited)
     #[serde(default = "default_http_max_response_size")]
@@ -1204,8 +1208,8 @@ pub struct HttpRequestConfig {
 impl Default for HttpRequestConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            allowed_domains: vec![],
+            enabled: true,
+            allowed_domains: vec!["*".into()],
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
         }
@@ -1231,7 +1235,7 @@ fn default_http_timeout_secs() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebFetchConfig {
     /// Enable `web_fetch` tool for fetching web page content
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Allowed domains for web fetch (exact or subdomain match; `["*"]` = all public hosts)
     #[serde(default)]
@@ -1258,7 +1262,7 @@ fn default_web_fetch_timeout_secs() -> u64 {
 impl Default for WebFetchConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             allowed_domains: vec!["*".into()],
             blocked_domains: vec![],
             max_response_size: default_web_fetch_max_response_size(),
@@ -1273,7 +1277,7 @@ impl Default for WebFetchConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
     #[serde(default = "default_web_search_provider")]
@@ -1304,7 +1308,7 @@ fn default_web_search_timeout_secs() -> u64 {
 impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             provider: default_web_search_provider(),
             brave_api_key: None,
             max_results: default_web_search_max_results(),
@@ -3426,6 +3430,16 @@ pub struct SecurityConfig {
     /// Emergency-stop state machine configuration.
     #[serde(default)]
     pub estop: EstopConfig,
+
+    /// Allow tools to access localhost, private IPs (10.x, 192.168.x, etc.), and file:// URLs.
+    /// Set to false to block local/private network access and file:// URLs.
+    #[serde(default = "default_true")]
+    pub allow_local_network: bool,
+
+    /// Allow tools to access public internet hosts.
+    /// Set to false to block all public internet access from tools.
+    #[serde(default = "default_true")]
+    pub allow_public_internet: bool,
 }
 
 /// OTP validation strategy.
@@ -5062,8 +5076,8 @@ mod tests {
         let cfg = HttpRequestConfig::default();
         assert_eq!(cfg.timeout_secs, 30);
         assert_eq!(cfg.max_response_size, 1_000_000);
-        assert!(!cfg.enabled);
-        assert!(cfg.allowed_domains.is_empty());
+        assert!(cfg.enabled);
+        assert_eq!(cfg.allowed_domains, vec!["*"]);
     }
 
     #[test]
@@ -6366,15 +6380,15 @@ default_temperature = 0.7
         assert!(!c.composio.enabled);
         assert!(c.composio.api_key.is_none());
         assert!(c.secrets.encrypt);
-        assert!(!c.browser.enabled);
-        assert!(c.browser.allowed_domains.is_empty());
+        assert!(c.browser.enabled);
+        assert_eq!(c.browser.allowed_domains, vec!["*"]);
     }
 
     #[test]
-    async fn browser_config_default_disabled() {
+    async fn browser_config_default_enabled() {
         let b = BrowserConfig::default();
-        assert!(!b.enabled);
-        assert!(b.allowed_domains.is_empty());
+        assert!(b.enabled);
+        assert_eq!(b.allowed_domains, vec!["*"]);
         assert_eq!(b.backend, "agent_browser");
         assert!(b.native_headless);
         assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
@@ -6439,8 +6453,8 @@ config_path = "/tmp/config.toml"
 default_temperature = 0.7
 "#;
         let parsed: Config = toml::from_str(minimal).unwrap();
-        assert!(!parsed.browser.enabled);
-        assert!(parsed.browser.allowed_domains.is_empty());
+        assert!(parsed.browser.enabled);
+        assert_eq!(parsed.browser.allowed_domains, vec!["*"]);
     }
 
     // ── Environment variable overrides (Docker support) ─────────
