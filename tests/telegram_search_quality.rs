@@ -969,6 +969,7 @@ API_HASH  = os.environ["ZC_API_HASH"]
 BOT       = os.environ["ZC_BOT"]
 AFTER_ID  = int(os.environ["ZC_AFTER_ID"])
 AFTER_TS  = int(os.environ["ZC_AFTER_TS"])
+REPLY_TO  = int(os.environ.get("ZC_REPLY_TO_ID", "0"))
 
 async def main():
     client = TelegramClient(SESSION, API_ID, API_HASH)
@@ -984,6 +985,9 @@ async def main():
             # picking up stale replies from a previous test session.
             msg_ts = int(m.date.timestamp()) if m.date else 0
             if msg_ts >= AFTER_TS:
+                if REPLY_TO > 0 and m.reply_to_msg_id is not None:
+                    if m.reply_to_msg_id != REPLY_TO:
+                        continue
                 results.append({"id": m.id, "text": m.text or ""})
     print(json.dumps({"success": True, "messages": results}))
     await client.disconnect()
@@ -1000,6 +1004,7 @@ asyncio.run(main())
             .env("ZC_BOT", bot_username)
             .env("ZC_AFTER_ID", &after_id_str)
             .env("ZC_AFTER_TS", &after_ts_str)
+            .env("ZC_REPLY_TO_ID", &after_id_str)
             .output()
             .await
             .expect("failed to run wait_for_bot_reply script");
