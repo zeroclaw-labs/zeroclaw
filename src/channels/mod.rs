@@ -2698,6 +2698,7 @@ fn collect_configured_channels(
                 .with_api_base(tg.api_base.clone())
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_ack_reaction(tg.ack_reaction)
+                .with_pin_user_message(tg.pin_user_message)
                 .with_transcription(config.transcription.clone())
                 .with_workspace_dir(config.workspace_dir.clone()),
             ),
@@ -3036,6 +3037,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        custom_headers: config.custom_headers.clone(),
     };
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(

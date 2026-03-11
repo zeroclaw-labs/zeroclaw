@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub struct AnthropicProvider {
     credential: Option<String>,
     base_url: String,
+    /// Custom HTTP headers injected into every request.
+    custom_headers: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -170,7 +172,14 @@ impl AnthropicProvider {
                 .filter(|k| !k.is_empty())
                 .map(ToString::to_string),
             base_url,
+            custom_headers: std::collections::HashMap::new(),
         }
+    }
+
+    /// Set custom HTTP headers that will be included in every request.
+    pub fn with_custom_headers(mut self, headers: std::collections::HashMap<String, String>) -> Self {
+        self.custom_headers = headers;
+        self
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -417,6 +426,27 @@ impl AnthropicProvider {
     }
 
     fn http_client(&self) -> Client {
+        if !self.custom_headers.is_empty() {
+            let mut headers = reqwest::header::HeaderMap::new();
+            for (key, val) in &self.custom_headers {
+                if let (Ok(name), Ok(value)) = (
+                    reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                    reqwest::header::HeaderValue::from_str(val),
+                ) {
+                    headers.insert(name, value);
+                }
+            }
+            let builder = Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .default_headers(headers);
+            let builder =
+                crate::config::apply_runtime_proxy_to_builder(builder, "provider.anthropic");
+            return builder.build().unwrap_or_else(|error| {
+                tracing::warn!("Failed to build proxied client with custom headers: {error}");
+                Client::new()
+            });
+        }
         crate::config::build_runtime_proxy_client_with_timeouts("provider.anthropic", 120, 10)
     }
 }
@@ -1245,6 +1275,7 @@ mod tests {
         let provider = AnthropicProvider {
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
+            custom_headers: std::collections::HashMap::new(),
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)

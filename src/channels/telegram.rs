@@ -310,9 +310,13 @@ pub struct TelegramChannel {
     /// Override for local Bot API servers or testing.
     api_base: String,
     ack_reaction_enabled: bool,
+    pin_user_message: bool,
     native_draft_counter: AtomicU64,
     /// Last incoming message_id per chat, used to set reply_to_message_id on responses.
     last_incoming_message_id: Mutex<std::collections::HashMap<String, i64>>,
+    /// Background tasks that animate "..." while waiting for the first LLM token.
+    /// Keyed by draft id string (e.g. "draft:{chat_id}:{draft_id}").
+    dancing_dots_handles: Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
     transcription: Option<crate::config::TranscriptionConfig>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
@@ -345,8 +349,10 @@ impl TelegramChannel {
             bot_username: Mutex::new(None),
             api_base: "https://api.telegram.org".to_string(),
             ack_reaction_enabled: true,
+            pin_user_message: false,
             native_draft_counter: AtomicU64::new(1),
             last_incoming_message_id: Mutex::new(std::collections::HashMap::new()),
+            dancing_dots_handles: Mutex::new(std::collections::HashMap::new()),
             transcription: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
@@ -380,6 +386,12 @@ impl TelegramChannel {
     /// Configure whether to send an ACK emoji reaction on incoming messages.
     pub fn with_ack_reaction(mut self, enabled: bool) -> Self {
         self.ack_reaction_enabled = enabled;
+        self
+    }
+
+    /// Configure whether to pin the user's message while processing.
+    pub fn with_pin_user_message(mut self, enabled: bool) -> Self {
+        self.pin_user_message = enabled;
         self
     }
 
@@ -2252,7 +2264,11 @@ impl Channel for TelegramChannel {
 
         let (chat_id, thread_id) = Self::parse_reply_target(&message.recipient);
         let initial_text = if message.content.is_empty() {
-            "...".to_string()
+            if self.stream_mode == StreamMode::Native {
+                "●  ·  ·".to_string()
+            } else {
+                "...".to_string()
+            }
         } else {
             message.content.clone()
         };
@@ -2289,7 +2305,40 @@ impl Channel for TelegramChannel {
                 .lock()
                 .insert(chat_id.to_string(), std::time::Instant::now());
 
-            return Ok(Some(format!("draft:{chat_id}:{draft_id}")));
+            // Spawn dancing dots animation — a bouncing dot moves across three
+            // positions using middle-dot (·) for idle and bullet (●) for active,
+            // creating a wave/pulse effect until the first LLM token arrives.
+            let draft_key = format!("draft:{chat_id}:{draft_id}");
+            {
+                let client = self.client.clone();
+                let url = self.api_url("sendMessageDraft");
+                let animate_chat_id = chat_id.to_string();
+                let key_clone = draft_key.clone();
+                let interval_ms = self.draft_update_interval_ms.max(200);
+                let handle = tokio::spawn(async move {
+                    // Bouncing dot: ● travels left→right→left across three positions
+                    let frames = [
+                        "●  ·  ·",
+                        "·  ●  ·",
+                        "·  ·  ●",
+                        "·  ●  ·",
+                    ];
+                    let mut idx = 0usize;
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                        idx = (idx + 1) % frames.len();
+                        let body = serde_json::json!({
+                            "chat_id": animate_chat_id,
+                            "draft_id": draft_id,
+                            "text": frames[idx],
+                        });
+                        let _ = client.post(&url).json(&body).send().await;
+                    }
+                });
+                self.dancing_dots_handles.lock().insert(key_clone, handle);
+            }
+
+            return Ok(Some(draft_key));
         }
 
         // StreamMode::Partial — existing logic
@@ -2333,6 +2382,11 @@ impl Channel for TelegramChannel {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
+        // Cancel dancing dots animation on first real content update.
+        if let Some(handle) = self.dancing_dots_handles.lock().remove(message_id) {
+            handle.abort();
+        }
+
         let (chat_id, _) = Self::parse_reply_target(recipient);
 
         // Rate-limit edits per chat
@@ -2417,8 +2471,30 @@ impl Channel for TelegramChannel {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
+        // Cancel dancing dots if still running.
+        if let Some(handle) = self.dancing_dots_handles.lock().remove(message_id) {
+            handle.abort();
+        }
+
         let text = &strip_tool_call_tags(text);
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
+
+        // Unpin the user's message now that we have a reply
+        if self.pin_user_message {
+            let pinned_msg_id = self.last_incoming_message_id.lock().get(&chat_id).copied();
+            if let Some(pinned_msg_id) = pinned_msg_id {
+                let unpin_body = serde_json::json!({
+                    "chat_id": &chat_id,
+                    "message_id": pinned_msg_id,
+                });
+                let _ = self
+                    .client
+                    .post(self.api_url("unpinChatMessage"))
+                    .json(&unpin_body)
+                    .send()
+                    .await;
+            }
+        }
 
         // Clean up rate-limit tracking for this chat
         self.last_draft_edit.lock().remove(&chat_id);
@@ -2821,6 +2897,25 @@ Ensure only one `zeroclaw` process is using this bot token."
                         self.last_incoming_message_id
                             .lock()
                             .insert(incoming_chat_id, incoming_msg_id);
+                    }
+
+                    // Pin the user's message as a processing indicator
+                    if self.pin_user_message {
+                        if let Some((pin_chat_id, pin_msg_id)) =
+                            Self::extract_update_message_target(update)
+                        {
+                            let pin_body = serde_json::json!({
+                                "chat_id": pin_chat_id,
+                                "message_id": pin_msg_id,
+                                "disable_notification": true,
+                            });
+                            let _ = self
+                                .http_client()
+                                .post(self.api_url("pinChatMessage"))
+                                .json(&pin_body)
+                                .send()
+                                .await;
+                        }
                     }
 
                     // Send "typing" indicator immediately when we receive a message

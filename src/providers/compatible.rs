@@ -37,6 +37,8 @@ pub struct OpenAiCompatibleProvider {
     /// Whether this provider supports OpenAI-style native tool calling.
     /// When false, tools are injected into the system prompt as text.
     native_tool_calling: bool,
+    /// Custom HTTP headers injected into every request to this provider.
+    custom_headers: std::collections::HashMap<String, String>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -170,7 +172,14 @@ impl OpenAiCompatibleProvider {
             user_agent: user_agent.map(ToString::to_string),
             merge_system_into_user,
             native_tool_calling: !merge_system_into_user,
+            custom_headers: std::collections::HashMap::new(),
         }
+    }
+
+    /// Set custom HTTP headers that will be included in every request.
+    pub fn with_custom_headers(mut self, headers: std::collections::HashMap<String, String>) -> Self {
+        self.custom_headers = headers;
+        self
     }
 
     /// Collect all `system` role messages, concatenate their content,
@@ -205,12 +214,25 @@ impl OpenAiCompatibleProvider {
     }
 
     fn http_client(&self) -> Client {
+        let mut headers = HeaderMap::new();
+
         if let Some(ua) = self.user_agent.as_deref() {
-            let mut headers = HeaderMap::new();
             if let Ok(value) = HeaderValue::from_str(ua) {
                 headers.insert(USER_AGENT, value);
             }
+        }
 
+        // Inject custom headers from config
+        for (key, val) in &self.custom_headers {
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                HeaderValue::from_str(val),
+            ) {
+                headers.insert(name, value);
+            }
+        }
+
+        if !headers.is_empty() {
             let builder = Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -219,7 +241,7 @@ impl OpenAiCompatibleProvider {
                 crate::config::apply_runtime_proxy_to_builder(builder, "provider.compatible");
 
             return builder.build().unwrap_or_else(|error| {
-                tracing::warn!("Failed to build proxied timeout client with user-agent: {error}");
+                tracing::warn!("Failed to build proxied timeout client with custom headers: {error}");
                 Client::new()
             });
         }

@@ -86,6 +86,11 @@ pub struct Config {
     /// Default model temperature (0.0–2.0). Default: `0.7`.
     pub default_temperature: f64,
 
+    /// Custom HTTP headers to send with every LLM provider request.
+    /// Example: `{ "Anthropic-Beta" = "context-1m-2025-08-07" }`.
+    #[serde(default)]
+    pub custom_headers: HashMap<String, String>,
+
     /// Observability backend configuration (`[observability]`).
     #[serde(default)]
     pub observability: ObservabilityConfig,
@@ -2778,6 +2783,9 @@ pub struct TelegramConfig {
     /// When true, send a random emoji reaction to acknowledge incoming messages.
     #[serde(default = "default_ack_reaction_enabled")]
     pub ack_reaction: bool,
+    /// When true, pin the user's message while processing and unpin after reply.
+    #[serde(default)]
+    pub pin_user_message: bool,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -3613,6 +3621,7 @@ impl Default for Config {
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             model_providers: HashMap::new(),
             default_temperature: 0.7,
+            custom_headers: HashMap::new(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
@@ -5150,6 +5159,7 @@ default_temperature = 0.7
             default_model: Some("gpt-4o".into()),
             model_providers: HashMap::new(),
             default_temperature: 0.5,
+            custom_headers: HashMap::new(),
             observability: ObservabilityConfig {
                 backend: "log".into(),
                 ..ObservabilityConfig::default()
@@ -5199,6 +5209,7 @@ default_temperature = 0.7
                     mention_only: false,
                     api_base: default_telegram_api_base(),
                     ack_reaction: true,
+                    pin_user_message: false,
                 }),
                 discord: None,
                 slack: None,
@@ -5390,6 +5401,7 @@ tool_dispatcher = "xml"
             default_model: Some("test-model".into()),
             model_providers: HashMap::new(),
             default_temperature: 0.9,
+            custom_headers: HashMap::new(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
@@ -5572,6 +5584,7 @@ tool_dispatcher = "xml"
             mention_only: false,
             api_base: default_telegram_api_base(),
             ack_reaction: true,
+            pin_user_message: false,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();

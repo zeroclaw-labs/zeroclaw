@@ -676,6 +676,8 @@ pub struct ProviderRuntimeOptions {
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
+    /// Custom HTTP headers injected into every LLM API request.
+    pub custom_headers: std::collections::HashMap<String, String>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -686,6 +688,7 @@ impl Default for ProviderRuntimeOptions {
             zeroclaw_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: None,
+            custom_headers: std::collections::HashMap::new(),
         }
     }
 }
@@ -1222,7 +1225,7 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
                 true,
-            )))
+            ).with_custom_headers(options.custom_headers.clone())))
         }
 
         // ── Anthropic-compatible custom endpoints ───────────
@@ -1236,7 +1239,7 @@ fn create_provider_with_url_and_options(
             Ok(Box::new(anthropic::AnthropicProvider::with_base_url(
                 key,
                 Some(&base_url),
-            )))
+            ).with_custom_headers(options.custom_headers.clone())))
         }
 
         _ => anyhow::bail!(

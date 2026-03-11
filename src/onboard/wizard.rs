@@ -136,6 +136,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         default_model: Some(model),
         model_providers: std::collections::HashMap::new(),
         default_temperature: 0.7,
+        custom_headers: std::collections::HashMap::new(),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         security: crate::config::SecurityConfig::default(),
@@ -487,6 +488,7 @@ async fn run_quick_setup_with_home(
         default_model: Some(model.clone()),
         model_providers: std::collections::HashMap::new(),
         default_temperature: 0.7,
+        custom_headers: std::collections::HashMap::new(),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         security: crate::config::SecurityConfig::default(),
@@ -3621,6 +3623,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     mention_only: false,
                     api_base: crate::config::default_telegram_api_base(),
                     ack_reaction: true,
+                    pin_user_message: false,
                 });
             }
             ChannelMenuChoice::Discord => {

@@ -476,6 +476,7 @@ mod tests {
             mention_only: false,
             api_base: "https://api.telegram.org".into(),
             ack_reaction: true,
+            pin_user_message: false,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -610,6 +611,7 @@ mod tests {
             mention_only: false,
             api_base: "https://api.telegram.org".into(),
             ack_reaction: true,
+            pin_user_message: false,
         });
 
         let target = heartbeat_delivery_target(&config).unwrap();
