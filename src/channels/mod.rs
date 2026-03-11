@@ -74,8 +74,8 @@ use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_cre
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
-use crate::observability::{self, runtime_trace, Observer};
 use crate::observability::traits::{ObserverEvent, ObserverMetric};
+use crate::observability::{self, runtime_trace, Observer};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
@@ -118,11 +118,19 @@ impl Observer for ChannelNotifyObserver {
                                 format!(": {u}")
                             } else {
                                 let s = args.to_string();
-                                if s.len() > 120 { format!(": {}…", &s[..120]) } else { format!(": {s}") }
+                                if s.len() > 120 {
+                                    format!(": {}…", &s[..120])
+                                } else {
+                                    format!(": {s}")
+                                }
                             }
                         } else {
                             let s = args.to_string();
-                            if s.len() > 120 { format!(": {}…", &s[..120]) } else { format!(": {s}") }
+                            if s.len() > 120 {
+                                format!(": {}…", &s[..120])
+                            } else {
+                                format!(": {s}")
+                            }
                         }
                     }
                     _ => String::new(),
