@@ -3929,7 +3929,7 @@ pub struct ComplianceConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Active regulatory frameworks (e.g. ["FINMA", "GDPR"]).
+    /// Active regulatory frameworks (e.g. `["FINMA", "GDPR"]`).
     #[serde(default)]
     pub frameworks: Vec<String>,
 
@@ -6064,6 +6064,7 @@ impl Config {
     }
 }
 
+#[allow(clippy::unused_async)]
 async fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -6089,6 +6090,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    #[cfg(unix)]
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;

@@ -112,8 +112,8 @@ impl ComplianceTool {
         let log = self.open_log()?;
         let entries = log.read_entries()?;
 
-        let from_dt = from.map(|s| parse_date_start(s)).transpose()?;
-        let to_dt = to.map(|s| parse_date_end_exclusive(s)).transpose()?;
+        let from_dt = from.map(parse_date_start).transpose()?;
+        let to_dt = to.map(parse_date_end_exclusive).transpose()?;
 
         if let (Some(f), Some(t)) = (from_dt, to_dt) {
             if f >= t {
@@ -148,24 +148,23 @@ impl ComplianceTool {
             .filter(|e| e.compliance_tags.contains(&framework.label().to_string()))
             .collect();
 
+        use std::fmt::Write;
         let mut report = String::new();
-        report.push_str(&format!("# {} Compliance Report\n\n", framework.label()));
-        report.push_str(&format!("Generated: {}\n", Utc::now().to_rfc3339()));
+        let _ = writeln!(report, "# {} Compliance Report\n", framework.label());
+        let _ = writeln!(report, "Generated: {}", Utc::now().to_rfc3339());
         if let Some(f) = from {
-            report.push_str(&format!("From: {}\n", f));
+            let _ = writeln!(report, "From: {}", f);
         }
         if let Some(t) = to {
-            report.push_str(&format!("To: {}\n", t));
+            let _ = writeln!(report, "To: {}", t);
         }
-        report.push_str(&format!(
-            "Total audit entries in range: {}\n",
-            filtered.len()
-        ));
-        report.push_str(&format!(
-            "{}-tagged entries: {}\n\n",
+        let _ = writeln!(report, "Total audit entries in range: {}", filtered.len());
+        let _ = writeln!(
+            report,
+            "{}-tagged entries: {}\n",
             framework.label(),
             tagged.len()
-        ));
+        );
 
         // Framework-specific sections
         match framework {
@@ -175,7 +174,7 @@ impl ComplianceTool {
                 report.push_str("- KYC/AML flagged actions: included\n");
                 report.push_str("- Data residency: ");
                 if let Some(ref region) = self.config.data_residency_region {
-                    report.push_str(&format!("enforced ({})\n", region));
+                    let _ = writeln!(report, "enforced ({})", region);
                 } else {
                     report.push_str("not configured\n");
                 }
@@ -205,7 +204,7 @@ impl ComplianceTool {
                 report.push_str("- Asset management operations: tracked\n");
             }
             ComplianceFramework::Custom(ref name) => {
-                report.push_str(&format!("## {}-Specific Fields\n\n", name));
+                let _ = writeln!(report, "## {}-Specific Fields\n", name);
                 report.push_str("- Custom framework: all tagged entries included\n");
             }
         }
@@ -217,23 +216,25 @@ impl ComplianceTool {
             let summary = sanitize_control_chars(&entry.result_summary);
             let actor = redact_field(&actor, MAX_ACTOR_DISPLAY_LEN);
             let summary = redact_field(&summary, MAX_SUMMARY_DISPLAY_LEN);
-            report.push_str(&format!(
-                "- [{}] {} by {} -> {}\n",
+            let _ = writeln!(
+                report,
+                "- [{}] {} by {} -> {}",
                 entry.timestamp.format("%Y-%m-%d %H:%M:%S"),
                 action,
                 actor,
                 summary,
-            ));
+            );
             if report.len() >= MAX_REPORT_SIZE {
                 report.push_str("\n... report truncated (size limit reached)\n");
                 break;
             }
         }
         if tagged.len() > MAX_REPORT_ENTRIES {
-            report.push_str(&format!(
-                "\n... and {} more entries\n",
+            let _ = writeln!(
+                report,
+                "\n... and {} more entries",
                 tagged.len() - MAX_REPORT_ENTRIES
-            ));
+            );
         }
 
         if report.len() > MAX_REPORT_SIZE {
@@ -272,56 +273,59 @@ impl ComplianceTool {
 
     /// Show current compliance posture.
     fn compliance_status(&self) -> String {
+        use std::fmt::Write;
         let mut status = String::from("# Compliance Posture\n\n");
-        status.push_str(&format!("Compliance enabled: {}\n", self.config.enabled));
-        status.push_str(&format!(
-            "Active frameworks: {}\n",
+        let _ = writeln!(status, "Compliance enabled: {}", self.config.enabled);
+        let _ = writeln!(
+            status,
+            "Active frameworks: {}",
             if self.config.frameworks.is_empty() {
                 "none".to_string()
             } else {
                 self.config.frameworks.join(", ")
             }
-        ));
-        status.push_str(&format!(
-            "Tamper-evident logging: {}\n",
+        );
+        let _ = writeln!(
+            status,
+            "Tamper-evident logging: {}",
             self.config.tamper_evident_logging
-        ));
-        status.push_str(&format!("Hash algorithm: {}\n", self.config.hash_algorithm));
+        );
+        let _ = writeln!(status, "Hash algorithm: {}", self.config.hash_algorithm);
         if let Some(ref region) = self.config.data_residency_region {
-            status.push_str(&format!("Data residency region: {}\n", region));
-            status.push_str(&format!(
-                "Block on violation: {}\n",
+            let _ = writeln!(status, "Data residency region: {}", region);
+            let _ = writeln!(
+                status,
+                "Block on violation: {}",
                 self.config.block_on_residency_violation
-            ));
+            );
         } else {
             status.push_str("Data residency: not configured\n");
         }
-        status.push_str(&format!(
-            "Report output: {}\n",
-            self.config.report_output_dir
-        ));
-        status.push_str(&format!(
-            "Audit retention: {} days\n",
+        let _ = writeln!(status, "Report output: {}", self.config.report_output_dir);
+        let _ = writeln!(
+            status,
+            "Audit retention: {} days",
             self.config.audit_retention_days
-        ));
-        status.push_str(&format!(
-            "SIEM export format: {}\n",
+        );
+        let _ = writeln!(
+            status,
+            "SIEM export format: {}",
             self.config.siem_export_format
-        ));
+        );
 
         let log_path = self.log_path();
         if log_path.exists() {
             match TamperEvidentLog::new(log_path, 0) {
                 Ok(log) => match log.verify_chain() {
                     Ok(count) => {
-                        status.push_str(&format!("\nAudit log: {} entries, chain intact\n", count));
+                        let _ = writeln!(status, "\nAudit log: {} entries, chain intact", count);
                     }
                     Err(e) => {
-                        status.push_str(&format!("\nAudit log: chain BROKEN ({})\n", e));
+                        let _ = writeln!(status, "\nAudit log: chain BROKEN ({})", e);
                     }
                 },
                 Err(e) => {
-                    status.push_str(&format!("\nAudit log: unavailable ({})\n", e));
+                    let _ = writeln!(status, "\nAudit log: unavailable ({})", e);
                 }
             }
         } else {

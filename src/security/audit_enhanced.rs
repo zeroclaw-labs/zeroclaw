@@ -309,8 +309,10 @@ impl TamperEvidentLog {
             "timestamp,entry_id,actor,action,tool,result_summary,compliance_tags,hash,prev_hash\n",
         );
         for e in entries {
-            out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{}\n",
+            use std::fmt::Write;
+            let _ = writeln!(
+                out,
+                "{},{},{},{},{},{},{},{},{}",
                 e.timestamp.to_rfc3339(),
                 e.entry_id,
                 csv_escape(&e.actor),
@@ -320,7 +322,7 @@ impl TamperEvidentLog {
                 csv_escape(&e.compliance_tags.join(";")),
                 e.hash,
                 e.prev_hash,
-            ));
+            );
         }
         Ok(out)
     }
@@ -329,15 +331,17 @@ impl TamperEvidentLog {
         let mut out = String::new();
         for e in entries {
             // CEF:Version|Device Vendor|Device Product|Device Version|Signature ID|Name|Severity|Extension
-            out.push_str(&format!(
-                "CEF:0|ZeroClaw|AgentRuntime|0.1.0|{}|{}|5|act={} suser={} outcome={} cs1Label=compliance cs1={}\n",
+            use std::fmt::Write;
+            let _ = writeln!(
+                out,
+                "CEF:0|ZeroClaw|AgentRuntime|0.1.0|{}|{}|5|act={} suser={} outcome={} cs1Label=compliance cs1={}",
                 e.entry_id,
                 cef_escape(&e.action),
                 cef_escape(&e.action),
                 cef_escape(&e.actor),
                 cef_escape(&e.result_summary),
                 e.compliance_tags.join(";"),
-            ));
+            );
         }
         Ok(out)
     }

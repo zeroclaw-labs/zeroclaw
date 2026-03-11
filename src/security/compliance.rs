@@ -74,71 +74,65 @@ impl ComplianceClassifier {
         let mut tags = Vec::new();
 
         // GDPR: personal data, consent, erasure
-        if self.active_frameworks.contains(&ComplianceFramework::Gdpr) {
-            if lower.contains("personal_data")
+        if self.active_frameworks.contains(&ComplianceFramework::Gdpr)
+            && (lower.contains("personal_data")
                 || lower.contains("pii")
                 || lower.contains("consent")
                 || lower.contains("erasure")
                 || lower.contains("data_subject")
-                || lower.contains("gdpr")
-            {
-                tags.push(ComplianceFramework::Gdpr);
-            }
+                || lower.contains("gdpr"))
+        {
+            tags.push(ComplianceFramework::Gdpr);
         }
 
         // FINMA: financial transactions, account access, reporting
-        if self.active_frameworks.contains(&ComplianceFramework::Finma) {
-            if lower.contains("transaction")
+        if self.active_frameworks.contains(&ComplianceFramework::Finma)
+            && (lower.contains("transaction")
                 || lower.contains("account")
                 || lower.contains("financial")
                 || lower.contains("payment")
                 || lower.contains("finma")
                 || lower.contains("kyc")
-                || lower.contains("aml")
-            {
-                tags.push(ComplianceFramework::Finma);
-            }
+                || lower.contains("aml"))
+        {
+            tags.push(ComplianceFramework::Finma);
         }
 
         // DORA: ICT risk, resilience, incident reporting
-        if self.active_frameworks.contains(&ComplianceFramework::Dora) {
-            if lower.contains("ict_risk")
+        if self.active_frameworks.contains(&ComplianceFramework::Dora)
+            && (lower.contains("ict_risk")
                 || lower.contains("incident")
                 || lower.contains("resilience")
                 || lower.contains("third_party")
                 || lower.contains("dora")
-                || lower.contains("continuity")
-            {
-                tags.push(ComplianceFramework::Dora);
-            }
+                || lower.contains("continuity"))
+        {
+            tags.push(ComplianceFramework::Dora);
         }
 
         // SOC2: security controls, availability, confidentiality
-        if self.active_frameworks.contains(&ComplianceFramework::Soc2) {
-            if lower.contains("access_control")
+        if self.active_frameworks.contains(&ComplianceFramework::Soc2)
+            && (lower.contains("access_control")
                 || lower.contains("encryption")
                 || lower.contains("availability")
                 || lower.contains("confidential")
                 || lower.contains("soc2")
-                || lower.contains("audit")
-            {
-                tags.push(ComplianceFramework::Soc2);
-            }
+                || lower.contains("audit"))
+        {
+            tags.push(ComplianceFramework::Soc2);
         }
 
         // ISO27001: information security management
         if self
             .active_frameworks
             .contains(&ComplianceFramework::Iso27001)
-        {
-            if lower.contains("security_policy")
+            && (lower.contains("security_policy")
                 || lower.contains("risk_assessment")
                 || lower.contains("asset_management")
                 || lower.contains("iso27001")
-                || lower.contains("information_security")
-            {
-                tags.push(ComplianceFramework::Iso27001);
-            }
+                || lower.contains("information_security"))
+        {
+            tags.push(ComplianceFramework::Iso27001);
         }
 
         tags
@@ -146,19 +140,14 @@ impl ComplianceClassifier {
 }
 
 /// Enforcement mode for data residency violations.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResidencyEnforcementMode {
     /// Block the action entirely.
+    #[default]
     Block,
     /// Log a warning but allow the action.
     Warn,
-}
-
-impl Default for ResidencyEnforcementMode {
-    fn default() -> Self {
-        Self::Block
-    }
 }
 
 /// Data classification level for residency policy.
