@@ -671,6 +671,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_url_rejects_javascript_scheme() {
+        let tool = test_tool(config_with_domains(vec![], vec![]));
+        let result = tool.validate_url("javascript:alert(1)");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported URL scheme"));
+    }
+
+    #[test]
+    fn validate_url_rejects_data_scheme() {
+        let tool = test_tool(config_with_domains(vec![], vec![]));
+        let result = tool.validate_url("data:text/html,<h1>hi</h1>");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported URL scheme"));
+    }
+
+    #[test]
     fn validate_url_allows_http_scheme() {
         let tool = test_tool(config_with_domains(vec![], vec![]));
         assert!(tool.validate_url("http://example.com/page").is_ok());
