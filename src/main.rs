@@ -42,10 +42,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
-    if !(0.0..=2.0).contains(&t) {
-        return Err("temperature must be between 0.0 and 2.0".to_string());
-    }
-    Ok(t)
+    config::schema::validate_temperature(t)
 }
 
 mod agent;
@@ -187,9 +184,9 @@ Examples:
         #[arg(long)]
         model: Option<String>,
 
-        /// Temperature (0.0 - 2.0)
-        #[arg(short, long, default_value = "0.7", value_parser = parse_temperature)]
-        temperature: f64,
+        /// Temperature override (0.0 - 2.0). Defaults to config.default_temperature when omitted.
+        #[arg(short, long, value_parser = parse_temperature)]
+        temperature: Option<f64>,
 
         /// Attach a peripheral (board:path, e.g. nucleo-f401re:/dev/ttyACM0)
         #[arg(long)]
@@ -767,17 +764,25 @@ async fn main() -> Result<()> {
             model,
             temperature,
             peripheral,
-        } => agent::run(
-            config,
-            message,
-            provider,
-            model,
-            temperature,
-            peripheral,
-            true,
-        )
-        .await
-        .map(|_| ()),
+        } => {
+            // Implement temperature fallback logic:
+            // 1. Use --temperature if provided
+            // 2. Use config.default_temperature if --temperature not provided
+            // 3. Use hardcoded 0.7 if config.default_temperature not set (from Config::default())
+            let final_temperature = temperature.unwrap_or(config.default_temperature);
+
+            agent::run(
+                config,
+                message,
+                provider,
+                model,
+                final_temperature,
+                peripheral,
+                true,
+            )
+            .await
+            .map(|_| ())
+        }
 
         Commands::Gateway { gateway_command } => {
             match gateway_command {
@@ -2119,5 +2124,57 @@ mod tests {
             } => assert_eq!(domains, vec!["*.chase.com".to_string()]),
             other => panic!("expected estop resume command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn agent_command_parses_with_temperature() {
+        let cli = Cli::try_parse_from(["zeroclaw", "agent", "--temperature", "0.5"])
+            .expect("agent command with temperature should parse");
+
+        match cli.command {
+            Commands::Agent { temperature, .. } => {
+                assert_eq!(temperature, Some(0.5));
+            }
+            other => panic!("expected agent command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_command_parses_without_temperature() {
+        let cli = Cli::try_parse_from(["zeroclaw", "agent", "--message", "hello"])
+            .expect("agent command without temperature should parse");
+
+        match cli.command {
+            Commands::Agent { temperature, .. } => {
+                assert_eq!(temperature, None);
+            }
+            other => panic!("expected agent command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_fallback_uses_config_default_temperature() {
+        // Test that when user doesn't provide --temperature,
+        // the fallback logic works correctly
+        let mut config = Config::default(); // default_temperature = 0.7
+        config.default_temperature = 1.5;
+
+        // Simulate None temperature (user didn't provide --temperature)
+        let user_temperature: Option<f64> = std::hint::black_box(None);
+        let final_temperature = user_temperature.unwrap_or(config.default_temperature);
+
+        assert!((final_temperature - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn agent_fallback_uses_hardcoded_when_config_uses_default() {
+        // Test that when config uses default value (0.7), fallback still works
+        let config = Config::default(); // default_temperature = 0.7
+
+        // Simulate None temperature (user didn't provide --temperature)
+        let user_temperature: Option<f64> = std::hint::black_box(None);
+        let final_temperature = user_temperature.unwrap_or(config.default_temperature);
+
+        assert!((final_temperature - 0.7).abs() < f64::EPSILON);
     }
 }
