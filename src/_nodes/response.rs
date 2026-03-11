@@ -9,7 +9,7 @@ use chrono::Utc;
 use crate::gateway::AppState;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::StreamExt;
+use tokio_stream::{once, StreamExt};
 
 /// OpenAI-compatible chat message.
 #[derive(Deserialize)]
@@ -188,23 +188,28 @@ pub async fn handle_http_response(
         }));
     });
 
-    let stream = ReceiverStream::new(rx).map(move |chunk| {
-        let payload = serde_json::json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model_label,
-            "choices": [{
-                "index": 0,
-                "delta": {
-                    "role": "assistant",
-                    "content": chunk,
-                },
-                "finish_reason": null,
-            }],
-        });
-        Ok::<Event, axum::Error>(Event::default().data(payload.to_string()))
-    });
+    let model_label_for_stream = model_label.clone();
+    let stream = ReceiverStream::new(rx)
+        .map(move |chunk| {
+            let payload = serde_json::json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_label_for_stream,
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": chunk,
+                    },
+                    "finish_reason": null,
+                }],
+            });
+            Ok::<Event, axum::Error>(Event::default().data(payload.to_string()))
+        })
+        .chain(once(Ok::<Event, axum::Error>(
+            Event::default().data("[DONE]"),
+        )));
 
     axum::response::Sse::new(stream).into_response()
 }
