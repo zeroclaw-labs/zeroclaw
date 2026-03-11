@@ -84,6 +84,10 @@ pub struct Config {
     #[serde(default)]
     pub model_providers: HashMap<String, ModelProviderConfig>,
     /// Default model temperature (0.0–2.0). Default: `0.7`.
+    #[serde(
+        default = "default_temperature",
+        deserialize_with = "deserialize_temperature"
+    )]
     pub default_temperature: f64,
 
     /// Observability backend configuration (`[observability]`).
@@ -266,6 +270,38 @@ pub struct DelegateAgentConfig {
     /// Maximum tool-call iterations in agentic mode.
     #[serde(default = "default_max_tool_iterations")]
     pub max_iterations: usize,
+}
+
+/// Valid temperature range for all paths (config, CLI, env override).
+pub const TEMPERATURE_RANGE: std::ops::RangeInclusive<f64> = 0.0..=2.0;
+
+/// Default temperature when the field is absent from config.
+const DEFAULT_TEMPERATURE: f64 = 0.7;
+
+fn default_temperature() -> f64 {
+    DEFAULT_TEMPERATURE
+}
+
+/// Validate that a temperature value is within the allowed range.
+pub fn validate_temperature(value: f64) -> std::result::Result<f64, String> {
+    if TEMPERATURE_RANGE.contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "temperature {value} is out of range (expected {}..={})",
+            TEMPERATURE_RANGE.start(),
+            TEMPERATURE_RANGE.end()
+        ))
+    }
+}
+
+/// Custom serde deserializer that rejects out-of-range temperature values at parse time.
+fn deserialize_temperature<'de, D>(deserializer: D) -> std::result::Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: f64 = serde::Deserialize::deserialize(deserializer)?;
+    validate_temperature(value).map_err(serde::de::Error::custom)
 }
 
 fn default_max_depth() -> u32 {
@@ -3577,7 +3613,7 @@ impl Default for Config {
             default_provider: Some("openrouter".to_string()),
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             model_providers: HashMap::new(),
-            default_temperature: 0.7,
+            default_temperature: default_temperature(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
@@ -4498,9 +4534,22 @@ impl Config {
 
         // Temperature: ZEROCLAW_TEMPERATURE
         if let Ok(temp_str) = std::env::var("ZEROCLAW_TEMPERATURE") {
-            if let Ok(temp) = temp_str.parse::<f64>() {
-                if (0.0..=2.0).contains(&temp) {
+            match temp_str.parse::<f64>() {
+                Ok(temp) if TEMPERATURE_RANGE.contains(&temp) => {
                     self.default_temperature = temp;
+                }
+                Ok(temp) => {
+                    tracing::warn!(
+                        "Ignoring ZEROCLAW_TEMPERATURE={temp}: \
+                         value out of range (expected {}..={})",
+                        TEMPERATURE_RANGE.start(),
+                        TEMPERATURE_RANGE.end()
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Ignoring ZEROCLAW_TEMPERATURE={temp_str:?}: not a valid number"
+                    );
                 }
             }
         }
