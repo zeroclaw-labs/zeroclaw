@@ -60,6 +60,14 @@ struct NativeMessage {
 }
 
 #[derive(Debug, Serialize)]
+struct ImageSource {
+    #[serde(rename = "type")]
+    source_type: String,
+    media_type: String,
+    data: String,
+}
+
+#[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 enum NativeContentOut {
     #[serde(rename = "text")]
@@ -68,6 +76,8 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -201,16 +211,18 @@ impl AnthropicProvider {
         messages.iter().filter(|m| m.role != "system").count() > 4
     }
 
-    /// Apply cache control to the last message content block
+    /// Apply cache control to the last cacheable content block in the last message.
+    /// Walks backwards so trailing non-cacheable blocks (Image, ToolUse) are skipped.
     fn apply_cache_to_last_message(messages: &mut [NativeMessage]) {
         if let Some(last_msg) = messages.last_mut() {
-            if let Some(last_content) = last_msg.content.last_mut() {
-                match last_content {
+            for block in last_msg.content.iter_mut().rev() {
+                match block {
                     NativeContentOut::Text { cache_control, .. }
                     | NativeContentOut::ToolResult { cache_control, .. } => {
                         *cache_control = Some(CacheControl::ephemeral());
+                        return;
                     }
-                    NativeContentOut::ToolUse { .. } => {}
+                    NativeContentOut::ToolUse { .. } | NativeContentOut::Image { .. } => {}
                 }
             }
         }
@@ -291,6 +303,87 @@ impl AnthropicProvider {
         })
     }
 
+    /// Image MIME types accepted by the Anthropic Vision API.
+    /// See: https://docs.anthropic.com/en/docs/build-with-claude/vision#faq
+    const SUPPORTED_IMAGE_MEDIA_TYPES: [&str; 4] =
+        ["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+    /// Parse user message content, extracting `[IMAGE:data:...]` markers into image blocks.
+    fn parse_user_content_blocks(content: &str) -> Vec<NativeContentOut> {
+        if !content.contains("[IMAGE:") {
+            return vec![NativeContentOut::Text {
+                text: content.to_string(),
+                cache_control: None,
+            }];
+        }
+
+        let mut blocks = Vec::new();
+        let mut remaining = content;
+
+        while let Some(start) = remaining.find("[IMAGE:") {
+            let text_before = &remaining[..start];
+            if !text_before.trim().is_empty() {
+                blocks.push(NativeContentOut::Text {
+                    text: text_before.to_string(),
+                    cache_control: None,
+                });
+            }
+
+            let after = &remaining[start + 7..]; // skip "[IMAGE:"
+            if let Some(end) = after.find(']') {
+                let src = &after[..end];
+                remaining = &after[end + 1..];
+
+                if let Some(rest) = src.strip_prefix("data:") {
+                    if let Some(semi) = rest.find(';') {
+                        let mime = &rest[..semi];
+                        if Self::SUPPORTED_IMAGE_MEDIA_TYPES.contains(&mime) {
+                            if let Some(b64) = rest[semi + 1..].strip_prefix("base64,") {
+                                blocks.push(NativeContentOut::Image {
+                                    source: ImageSource {
+                                        source_type: "base64".to_string(),
+                                        media_type: mime.to_string(),
+                                        data: b64.to_string(),
+                                    },
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                }
+                // Not a valid data-URI image marker — keep as text.
+                blocks.push(NativeContentOut::Text {
+                    text: format!("[IMAGE:{src}]"),
+                    cache_control: None,
+                });
+            } else {
+                // Unclosed bracket — keep remaining as text.
+                blocks.push(NativeContentOut::Text {
+                    text: remaining[start..].to_string(),
+                    cache_control: None,
+                });
+                remaining = "";
+                break;
+            }
+        }
+
+        if !remaining.trim().is_empty() {
+            blocks.push(NativeContentOut::Text {
+                text: remaining.to_string(),
+                cache_control: None,
+            });
+        }
+
+        if blocks.is_empty() {
+            blocks.push(NativeContentOut::Text {
+                text: content.to_string(),
+                cache_control: None,
+            });
+        }
+
+        blocks
+    }
+
     fn convert_messages(messages: &[ChatMessage]) -> (Option<SystemPrompt>, Vec<NativeMessage>) {
         let mut system_text = None;
         let mut native_messages = Vec::new();
@@ -324,20 +417,14 @@ impl AnthropicProvider {
                     } else {
                         native_messages.push(NativeMessage {
                             role: "user".to_string(),
-                            content: vec![NativeContentOut::Text {
-                                text: msg.content.clone(),
-                                cache_control: None,
-                            }],
+                            content: Self::parse_user_content_blocks(&msg.content),
                         });
                     }
                 }
                 _ => {
                     native_messages.push(NativeMessage {
                         role: "user".to_string(),
-                        content: vec![NativeContentOut::Text {
-                            text: msg.content.clone(),
-                            cache_control: None,
-                        }],
+                        content: Self::parse_user_content_blocks(&msg.content),
                     });
                 }
             }
@@ -423,10 +510,39 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
+    fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+        crate::providers::traits::ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
         message: &str,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        let mut messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: message.to_string(),
+        }];
+        if let Some(sys) = system_prompt {
+            messages.insert(
+                0,
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: sys.to_string(),
+                },
+            );
+        }
+        self.chat_with_history(&messages, model, temperature).await
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
@@ -436,34 +552,38 @@ impl Provider for AnthropicProvider {
             )
         })?;
 
-        let request = ChatRequest {
+        let (system_prompt, mut native_messages) = Self::convert_messages(messages);
+
+        if Self::should_cache_conversation(messages) {
+            Self::apply_cache_to_last_message(&mut native_messages);
+        }
+
+        let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: 4096,
-            system: system_prompt.map(ToString::to_string),
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: message.to_string(),
-            }],
+            system: system_prompt,
+            messages: native_messages,
             temperature,
+            tools: None,
         };
 
-        let mut request = self
+        let req = self
             .http_client()
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&request);
+            .json(&native_request);
 
-        request = self.apply_auth(request, credential);
-
-        let response = request.send().await?;
-
+        let response = self.apply_auth(req, credential).send().await?;
         if !response.status().is_success() {
             return Err(super::api_error("Anthropic", response).await);
         }
 
-        let chat_response: ChatResponse = response.json().await?;
-        Self::parse_text_response(chat_response)
+        let native_response: NativeChatResponse = response.json().await?;
+        let parsed = Self::parse_native_response(native_response);
+        parsed
+            .text
+            .ok_or_else(|| anyhow::anyhow!("No text response from Anthropic"))
     }
 
     async fn chat(
@@ -1352,5 +1472,94 @@ mod tests {
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicProvider::parse_native_response(resp);
         assert!(result.usage.is_none());
+    }
+
+    #[test]
+    fn parse_user_content_blocks_plain_text() {
+        let blocks = AnthropicProvider::parse_user_content_blocks("Hello world");
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], NativeContentOut::Text { text, .. } if text == "Hello world"));
+    }
+
+    #[test]
+    fn parse_user_content_blocks_extracts_image() {
+        let input = "Check this [IMAGE:data:image/png;base64,abc123] please";
+        let blocks = AnthropicProvider::parse_user_content_blocks(input);
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(&blocks[0], NativeContentOut::Text { text, .. } if text == "Check this "));
+        assert!(
+            matches!(&blocks[1], NativeContentOut::Image { source } if source.source_type == "base64" && source.media_type == "image/png" && source.data == "abc123")
+        );
+        assert!(matches!(&blocks[2], NativeContentOut::Text { text, .. } if text == " please"));
+    }
+
+    #[test]
+    fn parse_user_content_blocks_invalid_marker_kept_as_text() {
+        let input = "See [IMAGE:/tmp/photo.png] here";
+        let blocks = AnthropicProvider::parse_user_content_blocks(input);
+        assert_eq!(blocks.len(), 3);
+        assert!(
+            matches!(&blocks[1], NativeContentOut::Text { text, .. } if text == "[IMAGE:/tmp/photo.png]")
+        );
+    }
+
+    #[test]
+    fn image_source_serializes_correctly() {
+        let block = NativeContentOut::Image {
+            source: ImageSource {
+                source_type: "base64".to_string(),
+                media_type: "image/jpeg".to_string(),
+                data: "AAAA".to_string(),
+            },
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "image");
+        assert_eq!(json["source"]["type"], "base64");
+        assert_eq!(json["source"]["media_type"], "image/jpeg");
+        assert_eq!(json["source"]["data"], "AAAA");
+    }
+
+    #[test]
+    fn apply_cache_to_last_message_skips_trailing_image() {
+        let mut messages = vec![NativeMessage {
+            role: "user".to_string(),
+            content: vec![
+                NativeContentOut::Text {
+                    text: "Describe this".to_string(),
+                    cache_control: None,
+                },
+                NativeContentOut::Image {
+                    source: ImageSource {
+                        source_type: "base64".to_string(),
+                        media_type: "image/png".to_string(),
+                        data: "abc".to_string(),
+                    },
+                },
+            ],
+        }];
+
+        AnthropicProvider::apply_cache_to_last_message(&mut messages);
+
+        // Cache should land on the Text block, not be silently dropped.
+        match &messages[0].content[0] {
+            NativeContentOut::Text { cache_control, .. } => {
+                assert!(
+                    cache_control.is_some(),
+                    "Text block should have cache control"
+                );
+            }
+            _ => panic!("Expected Text variant"),
+        }
+    }
+
+    #[test]
+    fn parse_user_content_blocks_non_image_data_uri_kept_as_text() {
+        let input = "See [IMAGE:data:text/plain;base64,SGk=] here";
+        let blocks = AnthropicProvider::parse_user_content_blocks(input);
+        assert_eq!(blocks.len(), 3);
+        // Non-image MIME should not become an Image block
+        assert!(
+            matches!(&blocks[1], NativeContentOut::Text { text, .. } if text == "[IMAGE:data:text/plain;base64,SGk=]")
+        );
     }
 }
