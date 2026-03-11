@@ -211,14 +211,16 @@ impl AnthropicProvider {
         messages.iter().filter(|m| m.role != "system").count() > 4
     }
 
-    /// Apply cache control to the last message content block
+    /// Apply cache control to the last cacheable content block in the last message.
+    /// Walks backwards so trailing non-cacheable blocks (Image, ToolUse) are skipped.
     fn apply_cache_to_last_message(messages: &mut [NativeMessage]) {
         if let Some(last_msg) = messages.last_mut() {
-            if let Some(last_content) = last_msg.content.last_mut() {
-                match last_content {
+            for block in last_msg.content.iter_mut().rev() {
+                match block {
                     NativeContentOut::Text { cache_control, .. }
                     | NativeContentOut::ToolResult { cache_control, .. } => {
                         *cache_control = Some(CacheControl::ephemeral());
+                        return;
                     }
                     NativeContentOut::ToolUse { .. } | NativeContentOut::Image { .. } => {}
                 }
@@ -301,6 +303,11 @@ impl AnthropicProvider {
         })
     }
 
+    /// Image MIME types accepted by the Anthropic Vision API.
+    /// See: https://docs.anthropic.com/en/docs/build-with-claude/vision#faq
+    const SUPPORTED_IMAGE_MEDIA_TYPES: [&str; 4] =
+        ["image/jpeg", "image/png", "image/gif", "image/webp"];
+
     /// Parse user message content, extracting `[IMAGE:data:...]` markers into image blocks.
     fn parse_user_content_blocks(content: &str) -> Vec<NativeContentOut> {
         if !content.contains("[IMAGE:") {
@@ -330,7 +337,7 @@ impl AnthropicProvider {
                 if let Some(rest) = src.strip_prefix("data:") {
                     if let Some(semi) = rest.find(';') {
                         let mime = &rest[..semi];
-                        if mime.starts_with("image/") {
+                        if Self::SUPPORTED_IMAGE_MEDIA_TYPES.contains(&mime) {
                             if let Some(b64) = rest[semi + 1..].strip_prefix("base64,") {
                                 blocks.push(NativeContentOut::Image {
                                     source: ImageSource {
@@ -1510,6 +1517,36 @@ mod tests {
         assert_eq!(json["source"]["type"], "base64");
         assert_eq!(json["source"]["media_type"], "image/jpeg");
         assert_eq!(json["source"]["data"], "AAAA");
+    }
+
+    #[test]
+    fn apply_cache_to_last_message_skips_trailing_image() {
+        let mut messages = vec![NativeMessage {
+            role: "user".to_string(),
+            content: vec![
+                NativeContentOut::Text {
+                    text: "Describe this".to_string(),
+                    cache_control: None,
+                },
+                NativeContentOut::Image {
+                    source: ImageSource {
+                        source_type: "base64".to_string(),
+                        media_type: "image/png".to_string(),
+                        data: "abc".to_string(),
+                    },
+                },
+            ],
+        }];
+
+        AnthropicProvider::apply_cache_to_last_message(&mut messages);
+
+        // Cache should land on the Text block, not be silently dropped.
+        match &messages[0].content[0] {
+            NativeContentOut::Text { cache_control, .. } => {
+                assert!(cache_control.is_some(), "Text block should have cache control");
+            }
+            _ => panic!("Expected Text variant"),
+        }
     }
 
     #[test]
