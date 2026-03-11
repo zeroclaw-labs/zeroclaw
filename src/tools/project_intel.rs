@@ -76,10 +76,7 @@ impl ProjectIntelTool {
             .get("jira_summary")
             .and_then(|v| v.as_str())
             .unwrap_or("No Jira data provided");
-        let notes = args
-            .get("notes")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let notes = args.get("notes").and_then(|v| v.as_str()).unwrap_or("");
 
         let tpl = report_templates::weekly_status_template(lang);
         let mut vars = HashMap::new();
@@ -149,8 +146,7 @@ impl ProjectIntelTool {
             });
         }
 
-        if velocity.to_lowercase().contains("declining")
-            || velocity.to_lowercase().contains("slow")
+        if velocity.to_lowercase().contains("declining") || velocity.to_lowercase().contains("slow")
         {
             risks.push(RiskItem {
                 title: "Velocity degradation".into(),
@@ -172,7 +168,14 @@ impl ProjectIntelTool {
         let tpl = report_templates::risk_register_template(lang);
         let risks_text = risks
             .iter()
-            .map(|r| format!("- [{}] {}: {}", r.severity.to_uppercase(), r.title, r.detail))
+            .map(|r| {
+                format!(
+                    "- [{}] {}: {}",
+                    r.severity.to_uppercase(),
+                    r.title,
+                    r.detail
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let mitigations_text = risks
@@ -218,10 +221,7 @@ impl ProjectIntelTool {
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("missing required 'highlights' for draft_update"))?;
-        let concerns = args
-            .get("concerns")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let concerns = args.get("concerns").and_then(|v| v.as_str()).unwrap_or("");
 
         let greeting = match (audience, tone) {
             ("client", "casual") => "Hi there,".to_string(),
@@ -296,10 +296,7 @@ impl ProjectIntelTool {
     }
 
     fn execute_effort_estimate(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
-        let tasks = args
-            .get("tasks")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let tasks = args.get("tasks").and_then(|v| v.as_str()).unwrap_or("");
 
         if tasks.trim().is_empty() {
             return Ok(ToolResult {
@@ -362,19 +359,15 @@ fn estimate_task_effort(description: &str) -> (&'static str, &'static str) {
         "new module",
     ];
     let small_signals = [
-        "fix",
-        "update",
-        "tweak",
-        "adjust",
-        "rename",
-        "typo",
-        "bump",
-        "config",
+        "fix", "update", "tweak", "adjust", "rename", "typo", "bump", "config",
     ];
 
     if complexity_signals.iter().any(|s| lower.contains(s)) {
         if word_count > 15 {
-            return ("XXL", "Large-scope structural change with extensive description");
+            return (
+                "XXL",
+                "Large-scope structural change with extensive description",
+            );
         }
         return ("XL", "Structural change requiring significant effort");
     }
@@ -596,10 +589,7 @@ mod tests {
     #[tokio::test]
     async fn risk_scan_no_signals_returns_low_risk() {
         let t = tool();
-        let result = t
-            .execute(json!({ "action": "risk_scan" }))
-            .await
-            .unwrap();
+        let result = t.execute(json!({ "action": "risk_scan" })).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("No significant risks"));
     }
@@ -721,8 +711,12 @@ mod tests {
 
     #[test]
     fn risk_sensitivity_threshold_ordering() {
-        assert!(RiskSensitivity::High.threshold_factor() < RiskSensitivity::Medium.threshold_factor());
-        assert!(RiskSensitivity::Medium.threshold_factor() < RiskSensitivity::Low.threshold_factor());
+        assert!(
+            RiskSensitivity::High.threshold_factor() < RiskSensitivity::Medium.threshold_factor()
+        );
+        assert!(
+            RiskSensitivity::Medium.threshold_factor() < RiskSensitivity::Low.threshold_factor()
+        );
     }
 
     #[test]
@@ -730,7 +724,10 @@ mod tests {
         assert_eq!(RiskSensitivity::from_str("low"), RiskSensitivity::Low);
         assert_eq!(RiskSensitivity::from_str("high"), RiskSensitivity::High);
         assert_eq!(RiskSensitivity::from_str("medium"), RiskSensitivity::Medium);
-        assert_eq!(RiskSensitivity::from_str("unknown"), RiskSensitivity::Medium);
+        assert_eq!(
+            RiskSensitivity::from_str("unknown"),
+            RiskSensitivity::Medium
+        );
     }
 
     #[tokio::test]
