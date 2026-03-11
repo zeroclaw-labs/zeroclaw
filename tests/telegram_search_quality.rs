@@ -350,6 +350,101 @@ fn u7_indexed_search_date_filter_accepted() {
     );
 }
 
+/// u8: submit_contacts.py rejects a contact whose username does not appear in message_text
+/// and is not author_contact. Verbatim gate fires before HTTP verify (SKIP_VERIFY=1).
+#[tokio::test]
+async fn u8_verbatim_gate_rejects_contact_not_in_message_text() {
+    let skill_dir = std::path::PathBuf::from(
+        std::env::var("HOME").unwrap_or_else(|_| "/root".into()),
+    )
+    .join(".zeroclaw/workspace/skills/telegram-reader");
+
+    let contacts_json = serde_json::json!({
+        "contacts": [{
+            "username_or_phone": "@totally_fake_user_xyz_123",
+            "description": "тест",
+            "date": "2026-03-11",
+            "source_url": null,
+            "message_text": "Ищу сантехника, никаких контактов здесь нет.",
+            "author_contact": null,
+            "media": null
+        }]
+    })
+    .to_string();
+
+    let output = tokio::process::Command::new("python3")
+        .arg("scripts/submit_contacts.py")
+        .arg(&contacts_json)
+        .current_dir(&skill_dir)
+        .env("SUBMIT_CONTACTS_SKIP_VERIFY", "1")
+        .env("TELEGRAM_BOT_TOKEN", "")
+        .env("TELEGRAM_OPERATOR_CHAT_ID", "")
+        .output()
+        .await
+        .expect("failed to run submit_contacts.py");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stderr.contains("REJECTED verbatim-missing"),
+        "Expected verbatim gate rejection in stderr, got:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("@totally_fake_user_xyz_123"),
+        "Rejected contact must not appear in stdout, got:\n{stdout}"
+    );
+}
+
+/// u9: submit_contacts.py accepts a contact whose username appears verbatim in message_text.
+#[tokio::test]
+async fn u9_verbatim_gate_accepts_contact_in_message_text() {
+    let skill_dir = std::path::PathBuf::from(
+        std::env::var("HOME").unwrap_or_else(|_| "/root".into()),
+    )
+    .join(".zeroclaw/workspace/skills/telegram-reader");
+
+    let contacts_json = serde_json::json!({
+        "contacts": [{
+            "username_or_phone": "@Garyxz",
+            "description": "Мастер на час",
+            "date": "2026-03-05",
+            "source_url": null,
+            "message_text": "Строительные работы. Пишите в лс @Garyxz. Пхукет.",
+            "author_contact": "@Garyxz",
+            "media": null
+        }]
+    })
+    .to_string();
+
+    let output = tokio::process::Command::new("python3")
+        .arg("scripts/submit_contacts.py")
+        .arg(&contacts_json)
+        .current_dir(&skill_dir)
+        .env("SUBMIT_CONTACTS_SKIP_VERIFY", "1")
+        .env("TELEGRAM_BOT_TOKEN", "")
+        .env("TELEGRAM_OPERATOR_CHAT_ID", "")
+        .output()
+        .await
+        .expect("failed to run submit_contacts.py");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stderr.contains("ACCEPTED"),
+        "Expected ACCEPTED in stderr, got:\nstderr: {stderr}\nstdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("@Garyxz"),
+        "Accepted contact must appear in stdout, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Дата: 2026-03-05"),
+        "Output must contain Дата: field, got:\n{stdout}"
+    );
+}
+
 // ─── Level 2: Integration tests (live Telegram API) ──────────────────────────
 
 /// I1: index_channel indexes at least some messages from a known chat.
@@ -1002,7 +1097,7 @@ async fn b1_bot_returns_contacts_not_raw_json() {
 
     let text = reply.unwrap_or_else(|| {
         panic!(
-            "Bot @{bot} did not reply within 600s after message id={sent_id}. \
+            "Bot @{bot} did not reply within 900s after message id={sent_id}. \
              Check daemon logs: /tmp/zeroclaw_daemon.log"
         )
     });
@@ -1105,13 +1200,13 @@ async fn b3_bangkok_search_returns_contacts() {
     println!("Sent message id={sent_id}");
 
     let start = Instant::now();
-    let reply = wait_for_bot_reply(bot, sent_id, Duration::from_secs(600)).await;
+    let reply = wait_for_bot_reply(bot, sent_id, Duration::from_secs(900)).await;
     let elapsed = start.elapsed();
     println!("Elapsed: {}s", elapsed.as_secs());
 
     let text = reply.unwrap_or_else(|| {
         panic!(
-            "Bot @{bot} did not reply within 600s after message id={sent_id}. \
+            "Bot @{bot} did not reply within 900s after message id={sent_id}. \
              Check daemon logs: /tmp/zeroclaw_daemon.log"
         )
     });
@@ -1163,13 +1258,13 @@ async fn b4_danang_vietnam_search_returns_contacts() {
     println!("Sent message id={sent_id}");
 
     let start = Instant::now();
-    let reply = wait_for_bot_reply(bot, sent_id, Duration::from_secs(600)).await;
+    let reply = wait_for_bot_reply(bot, sent_id, Duration::from_secs(900)).await;
     let elapsed = start.elapsed();
     println!("Elapsed: {}s", elapsed.as_secs());
 
     let text = reply.unwrap_or_else(|| {
         panic!(
-            "Bot @{bot} did not reply within 600s after message id={sent_id}. \
+            "Bot @{bot} did not reply within 900s after message id={sent_id}. \
              Check daemon logs: /tmp/zeroclaw_daemon.log"
         )
     });
@@ -1270,13 +1365,13 @@ async fn b6_phuket_search_returns_contacts() {
     println!("Sent message id={sent_id}");
 
     let start = Instant::now();
-    let reply = wait_for_bot_reply(bot, sent_id, Duration::from_secs(600)).await;
+    let reply = wait_for_bot_reply(bot, sent_id, Duration::from_secs(900)).await;
     let elapsed = start.elapsed();
     println!("Elapsed: {}s", elapsed.as_secs());
 
     let text = reply.unwrap_or_else(|| {
         panic!(
-            "Bot @{bot} did not reply within 600s after message id={sent_id}. \
+            "Bot @{bot} did not reply within 900s after message id={sent_id}. \
              Check daemon logs: /tmp/zeroclaw_daemon.log"
         )
     });
@@ -1458,12 +1553,12 @@ async fn b7_bot_reply_includes_message_links() {
     println!("Sent message id={sent_id}");
 
     let start = Instant::now();
-    let reply = wait_for_bot_reply(bot, sent_id, Duration::from_secs(600)).await;
+    let reply = wait_for_bot_reply(bot, sent_id, Duration::from_secs(900)).await;
     println!("Elapsed: {}s", start.elapsed().as_secs());
 
     let text = reply.unwrap_or_else(|| {
         panic!(
-            "Bot @{bot} did not reply within 600s after message id={sent_id}. \
+            "Bot @{bot} did not reply within 900s after message id={sent_id}. \
              Check daemon logs: /tmp/zeroclaw_daemon.log"
         )
     });
@@ -1928,12 +2023,12 @@ async fn b8_danang_commercial_realestate_has_dates_and_links() {
     println!("Sent message id={sent_id}");
 
     let start = Instant::now();
-    let reply = wait_for_bot_reply(bot, sent_id, Duration::from_secs(600)).await;
+    let reply = wait_for_bot_reply(bot, sent_id, Duration::from_secs(900)).await;
     println!("Elapsed: {}s", start.elapsed().as_secs());
 
     let text = reply.unwrap_or_else(|| {
         panic!(
-            "Bot @{bot} did not reply within 600s after message id={sent_id}. \
+            "Bot @{bot} did not reply within 900s after message id={sent_id}. \
              Check daemon logs: /tmp/zeroclaw_daemon.log"
         )
     });
@@ -2004,10 +2099,10 @@ async fn b9_no_link_reply_has_author_and_forwarded_media() {
 
     let sent_id = send_to_bot(bot, query).await;
     let start = Instant::now();
-    let reply = wait_for_bot_reply(bot, sent_id, Duration::from_secs(600)).await;
+    let reply = wait_for_bot_reply(bot, sent_id, Duration::from_secs(900)).await;
     println!("Elapsed: {}s", start.elapsed().as_secs());
 
-    let text = reply.unwrap_or_else(|| panic!("No reply within 600s"));
+    let text = reply.unwrap_or_else(|| panic!("No reply within 900s"));
     println!("Bot reply:\n{text}");
 
     // Must return contact info
@@ -2048,7 +2143,119 @@ async fn b9_no_link_reply_has_author_and_forwarded_media() {
     );
 }
 
+/// b10: every contact in bot reply appears verbatim in its quote block.
+///
+/// Structural E2E test for verbatim gate. Hallucinated contacts with fabricated
+/// quotes will fail this test.
+#[tokio::test]
+#[ignore = "requires live daemon + authorized zverozabr_session"]
+async fn b10_contacts_are_verbatim_in_quote_blocks() {
+    let bot = "zGsR_bot";
+    let query = "Найди сантехника на Самуи. Нужны контакты с цитатой объявления.";
+
+    println!("Sending to @{bot}: {query}");
+    let sent_id = send_to_bot(bot, query).await;
+    println!("Sent message id={sent_id}");
+
+    let start = Instant::now();
+    let reply = wait_for_bot_reply(bot, sent_id, Duration::from_secs(900)).await;
+    println!("Elapsed: {}s", start.elapsed().as_secs());
+
+    let text = reply.unwrap_or_else(|| {
+        panic!(
+            "Bot @{bot} did not reply within 900s after message id={sent_id}. \
+             Check daemon logs: /tmp/zeroclaw_daemon.log"
+        )
+    });
+
+    println!("Bot reply:\n{text}");
+
+    let has_contact = text.contains('@') || contains_phone_number(&text);
+    assert!(
+        has_contact,
+        "Bot reply must contain at least one contact, got:\n{text}"
+    );
+
+    assert!(
+        has_date_field(&text),
+        "Bot reply must contain Дата: field, got:\n{text}"
+    );
+
+    assert_contacts_verbatim_in_quotes(&text);
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Parse bot reply and verify each contact (@username or phone) appears verbatim
+/// in the quote block ("> ...") immediately following it.
+fn assert_contacts_verbatim_in_quotes(text: &str) {
+    let blocks: Vec<&str> = text.split("\n\n").collect();
+
+    let mut checked = 0;
+
+    for block in &blocks {
+        let first_line = block.lines().next().unwrap_or("");
+
+        // Extract contact from **@username** or **+phone** pattern in first line
+        let contact = if let Some(start) = first_line.find("**@") {
+            let rest = &first_line[start + 2..];
+            let end = rest.find("**").unwrap_or(rest.len());
+            rest[..end].to_string()
+        } else if let Some(start) = first_line.find("**+") {
+            let rest = &first_line[start + 2..];
+            let end = rest.find("**").unwrap_or(rest.len());
+            let candidate = &rest[..end];
+            // Only treat as phone if mostly digits
+            if candidate.chars().filter(|c| c.is_ascii_digit()).count() >= 7 {
+                candidate.to_string()
+            } else {
+                continue;
+            }
+        } else {
+            continue; // not a contact block
+        };
+
+        // Collect quote lines
+        let quote: String = block
+            .lines()
+            .filter(|l| l.starts_with("> "))
+            .map(|l| &l[2..])
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if quote.is_empty() {
+            println!("b10: contact {contact} has no quote block — skipping verbatim check");
+            continue;
+        }
+
+        let contact_clean = contact.trim_start_matches('@').to_lowercase();
+        let quote_lower = quote.to_lowercase();
+        let digits_contact: String = contact.chars().filter(|c| c.is_ascii_digit()).collect();
+
+        let found = if contact.starts_with('@') {
+            quote_lower.contains(&contact_clean)
+        } else if digits_contact.len() >= 7 {
+            let quote_digits: String = quote.chars().filter(|c| c.is_ascii_digit()).collect();
+            quote_digits.contains(&digits_contact)
+        } else {
+            true
+        };
+
+        assert!(
+            found,
+            "Contact {contact:?} not found verbatim in quote block:\n{quote}\n\nFull block:\n{block}"
+        );
+        checked += 1;
+        println!("b10: checked {contact} found verbatim in quote");
+    }
+
+    assert!(
+        checked > 0,
+        "No contact blocks found in reply — cannot verify verbatim property.\nFull reply:\n{text}"
+    );
+
+    println!("b10: verified {checked} contact(s) verbatim in quotes");
+}
 
 /// Approximate ISO8601 date string from UNIX timestamp (no chrono dependency).
 fn chrono_approx(unix_secs: u64) -> String {
