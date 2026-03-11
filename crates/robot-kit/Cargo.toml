@@ -25,7 +25,7 @@ vision = []           # Camera + vision model
 # zeroclaw = { path = "../..", optional = true }
 
 # Async runtime
-tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "time", "sync", "process", "fs", "io-util"] }
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "time", "sync", "process", "fs", "io-util"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -61,7 +61,7 @@ rppal = { version = "0.22", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
-tempfile = "3.14"
+tempfile = "3.26"
 
 [package.metadata.docs.rs]
 all-features = true
