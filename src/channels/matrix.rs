@@ -1360,6 +1360,17 @@ impl Channel for MatrixChannel {
                     return;
                 }
 
+                // Deduplicate early — before downloading media or transcribing
+                // to avoid repeated I/O and billable external calls on redelivery.
+                let event_id = event.event_id.to_string();
+                {
+                    let mut guard = dedupe.lock().await;
+                    let (recent_order, recent_lookup) = &mut *guard;
+                    if MatrixChannel::cache_event_id(&event_id, recent_order, recent_lookup) {
+                        return;
+                    }
+                }
+
                 let body = match &event.content.msgtype {
                     MessageType::Text(content) => content.body.clone(),
                     MessageType::Notice(content) => content.body.clone(),
@@ -1482,15 +1493,6 @@ impl Channel for MatrixChannel {
 
                 if !MatrixChannel::has_non_empty_body(&body) {
                     return;
-                }
-
-                let event_id = event.event_id.to_string();
-                {
-                    let mut guard = dedupe.lock().await;
-                    let (recent_order, recent_lookup) = &mut *guard;
-                    if MatrixChannel::cache_event_id(&event_id, recent_order, recent_lookup) {
-                        return;
-                    }
                 }
 
                 // Mark message as read + start typing indicator.
