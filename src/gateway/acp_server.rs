@@ -633,4 +633,220 @@ mod tests {
         assert_eq!(params.prompt.len(), 1);
         assert_eq!(params.prompt[0].text.as_deref(), Some("hello"));
     }
+
+    // ── Integration tests: handler-level ────────────────────────
+
+    /// Helper to extract SSE body text from a Response.
+    async fn extract_sse_body(resp: Response) -> String {
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Parse the JSON-RPC result from an SSE body (strips `data: ` prefix).
+    fn parse_sse_jsonrpc(body: &str) -> serde_json::Value {
+        let data = body.strip_prefix("data: ").unwrap_or(body);
+        let data = data.trim();
+        serde_json::from_str(data).unwrap()
+    }
+
+    #[tokio::test]
+    async fn initialize_returns_transport_session_id() {
+        let store = AcpSessionStore::new(3600);
+        let req = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            method: "initialize".into(),
+            id: serde_json::json!(1),
+            params: serde_json::json!({"protocolVersion": "2025-03-26"}),
+        };
+
+        let resp = handle_initialize(&req, &store);
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Must have Acp-Session-Id header
+        let session_id = resp
+            .headers()
+            .get("Acp-Session-Id")
+            .expect("missing Acp-Session-Id header")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(!session_id.is_empty());
+
+        // Content-Type must be text/event-stream
+        let ct = resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+        assert!(ct.contains("text/event-stream"));
+
+        // Body contains JSON-RPC result with serverInfo
+        let body = extract_sse_body(resp).await;
+        let msg = parse_sse_jsonrpc(&body);
+        assert_eq!(msg["jsonrpc"], "2.0");
+        assert_eq!(msg["id"], 1);
+        assert_eq!(msg["result"]["serverInfo"]["name"], "zeroclaw-acp");
+
+        // Session should exist in store
+        assert!(store.get(&session_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn session_new_requires_valid_transport_session() {
+        let store = AcpSessionStore::new(3600);
+        let req = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            method: "session/new".into(),
+            id: serde_json::json!(2),
+            params: serde_json::json!({}),
+        };
+
+        // No Acp-Session-Id header → error
+        let headers = HeaderMap::new();
+        let resp = handle_session_new(&req, &headers, &store);
+        let body = extract_sse_body(resp).await;
+        let msg = parse_sse_jsonrpc(&body);
+        assert!(msg["error"]["message"].as_str().unwrap().contains("Invalid or expired"));
+    }
+
+    #[tokio::test]
+    async fn full_lifecycle_initialize_then_session_new() {
+        let store = AcpSessionStore::new(3600);
+
+        // Step 1: initialize
+        let init_req = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            method: "initialize".into(),
+            id: serde_json::json!(1),
+            params: serde_json::json!({"protocolVersion": "2025-03-26"}),
+        };
+        let init_resp = handle_initialize(&init_req, &store);
+        let transport_id = init_resp
+            .headers()
+            .get("Acp-Session-Id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Step 2: session/new with valid transport session
+        let mut headers = HeaderMap::new();
+        headers.insert("Acp-Session-Id", transport_id.parse().unwrap());
+        let new_req = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            method: "session/new".into(),
+            id: serde_json::json!(2),
+            params: serde_json::json!({}),
+        };
+        let new_resp = handle_session_new(&new_req, &headers, &store);
+        assert_eq!(new_resp.status(), StatusCode::OK);
+
+        let body = extract_sse_body(new_resp).await;
+        let msg = parse_sse_jsonrpc(&body);
+        let session_id = msg["result"]["sessionId"].as_str().unwrap();
+        assert!(session_id.starts_with("acp:"));
+
+        // Verify session store was updated with agent session ID
+        let session = store.get(&transport_id).unwrap();
+        assert_eq!(session.agent_session_id.as_deref(), Some(session_id));
+    }
+
+    #[tokio::test]
+    async fn delete_removes_session() {
+        let store = AcpSessionStore::new(3600);
+        let id = store.create();
+        assert!(store.get(&id).is_some());
+        assert!(store.remove(&id));
+        assert!(store.get(&id).is_none());
+    }
+
+    #[test]
+    fn history_persists_across_updates() {
+        let store = AcpSessionStore::new(3600);
+        let id = store.create();
+
+        // Simulate session/new
+        let mut session = store.get(&id).unwrap();
+        session.agent_session_id = Some("acp:test-session".into());
+        store.update(session);
+
+        // Simulate first prompt adding to history
+        let mut session = store.get(&id).unwrap();
+        session.history.push(crate::providers::ChatMessage::user("first prompt"));
+        session
+            .history
+            .push(crate::providers::ChatMessage::assistant("first response"));
+        store.update(session);
+
+        // Verify history persisted
+        let session = store.get(&id).unwrap();
+        assert_eq!(session.history.len(), 2);
+
+        // Simulate second prompt appending to history
+        let mut session = store.get(&id).unwrap();
+        session.history.push(crate::providers::ChatMessage::user("follow-up"));
+        session
+            .history
+            .push(crate::providers::ChatMessage::assistant("follow-up response"));
+        store.update(session);
+
+        // Verify full history chain
+        let session = store.get(&id).unwrap();
+        assert_eq!(session.history.len(), 4);
+    }
+
+    #[test]
+    fn multiple_concurrent_sessions_are_isolated() {
+        let store = AcpSessionStore::new(3600);
+        let id1 = store.create();
+        let id2 = store.create();
+
+        // Update session 1
+        let mut s1 = store.get(&id1).unwrap();
+        s1.agent_session_id = Some("agent-1".into());
+        s1.history.push(crate::providers::ChatMessage::user("session 1 msg"));
+        store.update(s1);
+
+        // Update session 2
+        let mut s2 = store.get(&id2).unwrap();
+        s2.agent_session_id = Some("agent-2".into());
+        store.update(s2);
+
+        // Verify isolation
+        let s1 = store.get(&id1).unwrap();
+        let s2 = store.get(&id2).unwrap();
+        assert_eq!(s1.agent_session_id.as_deref(), Some("agent-1"));
+        assert_eq!(s2.agent_session_id.as_deref(), Some("agent-2"));
+        assert_eq!(s1.history.len(), 1);
+        assert_eq!(s2.history.len(), 0);
+    }
+
+    #[test]
+    fn notification_format_matches_acp_spec() {
+        let notif = jsonrpc_notification(
+            "notifications/update",
+            serde_json::json!({"update": {"content": {"text": "Working on it..."}}}),
+        );
+        assert_eq!(notif["jsonrpc"], "2.0");
+        assert!(notif.get("id").is_none());
+        assert_eq!(notif["method"], "notifications/update");
+        assert_eq!(
+            notif["params"]["update"]["content"]["text"],
+            "Working on it..."
+        );
+    }
+
+    #[test]
+    fn session_prompt_params_multi_content() {
+        let json = r#"{"sessionId":"acp:test","prompt":[{"type":"text","text":"hello"},{"type":"text","text":" world"}]}"#;
+        let params: SessionPromptParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.prompt.len(), 2);
+        // Verify prompt concatenation logic
+        let combined: String = params
+            .prompt
+            .iter()
+            .filter_map(|p| p.text.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(combined, "hello\n world");
+    }
 }
