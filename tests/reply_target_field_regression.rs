@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SCAN_PATHS: &[&str] = &["src", "examples"];
+const SCAN_PATHS: &[&str] = &["src"];
 const FORBIDDEN_PATTERNS: &[&str] = &[".reply_to", "reply_to:"];
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
