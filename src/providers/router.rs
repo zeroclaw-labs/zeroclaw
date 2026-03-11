@@ -1,4 +1,4 @@
-use super::traits::ChatMessage;
+use super::traits::{ChatMessage, ChatRequest, ChatResponse};
 use super::Provider;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -14,7 +14,7 @@ pub struct Route {
 /// based on a task hint encoded in the model parameter.
 ///
 /// The model parameter can be:
-/// - A regular model name (e.g. "anthropic/claude-sonnet-4-20250514") → uses default provider
+/// - A regular model name (e.g. "anthropic/claude-sonnet-4") → uses default provider
 /// - A hint-prefixed string (e.g. "hint:reasoning") → resolves via route table
 ///
 /// This wraps multiple pre-created providers and selects the right one per request.
@@ -126,6 +126,44 @@ impl Provider for RouterProvider {
             .await
     }
 
+    async fn chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let (_, provider) = &self.providers[provider_idx];
+        provider.chat(request, &resolved_model, temperature).await
+    }
+
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let (_, provider) = &self.providers[provider_idx];
+        provider
+            .chat_with_tools(messages, tools, &resolved_model, temperature)
+            .await
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        self.providers
+            .get(self.default_index)
+            .map(|(_, p)| p.supports_native_tools())
+            .unwrap_or(false)
+    }
+
+    fn supports_vision(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|(_, provider)| provider.supports_vision())
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         for (name, provider) in &self.providers {
             tracing::info!(provider = name, "Warming up routed provider");
@@ -146,7 +184,7 @@ mod tests {
     struct MockProvider {
         calls: Arc<AtomicUsize>,
         response: &'static str,
-        last_model: std::sync::Mutex<String>,
+        last_model: parking_lot::Mutex<String>,
     }
 
     impl MockProvider {
@@ -154,7 +192,7 @@ mod tests {
             Self {
                 calls: Arc::new(AtomicUsize::new(0)),
                 response,
-                last_model: std::sync::Mutex::new(String::new()),
+                last_model: parking_lot::Mutex::new(String::new()),
             }
         }
 
@@ -163,7 +201,7 @@ mod tests {
         }
 
         fn last_model(&self) -> String {
-            self.last_model.lock().unwrap().clone()
+            self.last_model.lock().clone()
         }
     }
 
@@ -177,7 +215,7 @@ mod tests {
             _temperature: f64,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            *self.last_model.lock().unwrap() = model.to_string();
+            *self.last_model.lock() = model.to_string();
             Ok(self.response.to_string())
         }
     }
@@ -246,7 +284,10 @@ mod tests {
             ],
         );
 
-        let result = router.chat("hello", "hint:reasoning", 0.5).await.unwrap();
+        let result = router
+            .simple_chat("hello", "hint:reasoning", 0.5)
+            .await
+            .unwrap();
         assert_eq!(result, "smart-response");
         assert_eq!(mocks[1].call_count(), 1);
         assert_eq!(mocks[1].last_model(), "claude-opus");
@@ -260,7 +301,7 @@ mod tests {
             vec![("fast", "fast", "llama-3-70b")],
         );
 
-        let result = router.chat("hello", "hint:fast", 0.5).await.unwrap();
+        let result = router.simple_chat("hello", "hint:fast", 0.5).await.unwrap();
         assert_eq!(result, "fast-response");
         assert_eq!(mocks[0].call_count(), 1);
         assert_eq!(mocks[0].last_model(), "llama-3-70b");
@@ -273,7 +314,10 @@ mod tests {
             vec![],
         );
 
-        let result = router.chat("hello", "hint:nonexistent", 0.5).await.unwrap();
+        let result = router
+            .simple_chat("hello", "hint:nonexistent", 0.5)
+            .await
+            .unwrap();
         assert_eq!(result, "default-response");
         assert_eq!(mocks[0].call_count(), 1);
         // Falls back to default with the hint as model name
@@ -291,7 +335,7 @@ mod tests {
         );
 
         let result = router
-            .chat("hello", "anthropic/claude-sonnet-4-20250514", 0.5)
+            .simple_chat("hello", "anthropic/claude-sonnet-4-20250514", 0.5)
             .await
             .unwrap();
         assert_eq!(result, "primary-response");
@@ -357,5 +401,64 @@ mod tests {
             .unwrap();
         assert_eq!(result, "response");
         assert_eq!(mock.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_delegates_to_resolved_provider() {
+        let mock = Arc::new(MockProvider::new("tool-response"));
+        let router = RouterProvider::new(
+            vec![(
+                "default".into(),
+                Box::new(Arc::clone(&mock)) as Box<dyn Provider>,
+            )],
+            vec![],
+            "model".into(),
+        );
+
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "use tools".to_string(),
+        }];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Run shell command",
+                "parameters": {}
+            }
+        })];
+
+        // chat_with_tools should delegate through the router to the mock.
+        // MockProvider's default chat_with_tools calls chat_with_history -> chat_with_system.
+        let result = router
+            .chat_with_tools(&messages, &tools, "model", 0.7)
+            .await
+            .unwrap();
+        assert_eq!(result.text.as_deref(), Some("tool-response"));
+        assert_eq!(mock.call_count(), 1);
+        assert_eq!(mock.last_model(), "model");
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_routes_hint_correctly() {
+        let (router, mocks) = make_router(
+            vec![("fast", "fast-tool"), ("smart", "smart-tool")],
+            vec![("reasoning", "smart", "claude-opus")],
+        );
+
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "reason about this".to_string(),
+        }];
+        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "test"}})];
+
+        let result = router
+            .chat_with_tools(&messages, &tools, "hint:reasoning", 0.5)
+            .await
+            .unwrap();
+        assert_eq!(result.text.as_deref(), Some("smart-tool"));
+        assert_eq!(mocks[1].call_count(), 1);
+        assert_eq!(mocks[1].last_model(), "claude-opus");
+        assert_eq!(mocks[0].call_count(), 0);
     }
 }

@@ -43,7 +43,6 @@ impl EmbeddingProvider for NoopEmbedding {
 // ── OpenAI-compatible embedding provider ─────────────────────
 
 pub struct OpenAiEmbedding {
-    client: reqwest::Client,
     base_url: String,
     api_key: String,
     model: String,
@@ -53,11 +52,43 @@ pub struct OpenAiEmbedding {
 impl OpenAiEmbedding {
     pub fn new(base_url: &str, api_key: &str, model: &str, dims: usize) -> Self {
         Self {
-            client: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             model: model.to_string(),
             dims,
+        }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        crate::config::build_runtime_proxy_client("memory.embeddings")
+    }
+
+    fn has_explicit_api_path(&self) -> bool {
+        let Ok(url) = reqwest::Url::parse(&self.base_url) else {
+            return false;
+        };
+
+        let path = url.path().trim_end_matches('/');
+        !path.is_empty() && path != "/"
+    }
+
+    fn has_embeddings_endpoint(&self) -> bool {
+        let Ok(url) = reqwest::Url::parse(&self.base_url) else {
+            return false;
+        };
+
+        url.path().trim_end_matches('/').ends_with("/embeddings")
+    }
+
+    fn embeddings_url(&self) -> String {
+        if self.has_embeddings_endpoint() {
+            return self.base_url.clone();
+        }
+
+        if self.has_explicit_api_path() {
+            format!("{}/embeddings", self.base_url)
+        } else {
+            format!("{}/v1/embeddings", self.base_url)
         }
     }
 }
@@ -83,8 +114,8 @@ impl EmbeddingProvider for OpenAiEmbedding {
         });
 
         let resp = self
-            .client
-            .post(format!("{}/v1/embeddings", self.base_url))
+            .http_client()
+            .post(self.embeddings_url())
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .json(&body)
@@ -141,6 +172,15 @@ pub fn create_embedding_provider(
                 dims,
             ))
         }
+        "openrouter" => {
+            let key = api_key.unwrap_or("");
+            Box::new(OpenAiEmbedding::new(
+                "https://openrouter.ai/api/v1",
+                key,
+                model,
+                dims,
+            ))
+        }
         name if name.starts_with("custom:") => {
             let base_url = name.strip_prefix("custom:").unwrap_or("");
             let key = api_key.unwrap_or("");
@@ -178,6 +218,18 @@ mod tests {
     fn factory_openai() {
         let p = create_embedding_provider("openai", Some("key"), "text-embedding-3-small", 1536);
         assert_eq!(p.name(), "openai");
+        assert_eq!(p.dimensions(), 1536);
+    }
+
+    #[test]
+    fn factory_openrouter() {
+        let p = create_embedding_provider(
+            "openrouter",
+            Some("sk-or-test"),
+            "openai/text-embedding-3-small",
+            1536,
+        );
+        assert_eq!(p.name(), "openai"); // uses OpenAiEmbedding internally
         assert_eq!(p.dimensions(), 1536);
     }
 
@@ -248,5 +300,59 @@ mod tests {
     fn openai_dimensions_custom() {
         let p = OpenAiEmbedding::new("http://localhost", "k", "m", 384);
         assert_eq!(p.dimensions(), 384);
+    }
+
+    #[test]
+    fn embeddings_url_openrouter() {
+        let p = OpenAiEmbedding::new(
+            "https://openrouter.ai/api/v1",
+            "key",
+            "openai/text-embedding-3-small",
+            1536,
+        );
+        assert_eq!(
+            p.embeddings_url(),
+            "https://openrouter.ai/api/v1/embeddings"
+        );
+    }
+
+    #[test]
+    fn embeddings_url_standard_openai() {
+        let p = OpenAiEmbedding::new("https://api.openai.com", "key", "model", 1536);
+        assert_eq!(p.embeddings_url(), "https://api.openai.com/v1/embeddings");
+    }
+
+    #[test]
+    fn embeddings_url_base_with_v1_no_duplicate() {
+        let p = OpenAiEmbedding::new("https://api.example.com/v1", "key", "model", 1536);
+        assert_eq!(p.embeddings_url(), "https://api.example.com/v1/embeddings");
+    }
+
+    #[test]
+    fn embeddings_url_non_v1_api_path_uses_raw_suffix() {
+        let p = OpenAiEmbedding::new(
+            "https://api.example.com/api/coding/v3",
+            "key",
+            "model",
+            1536,
+        );
+        assert_eq!(
+            p.embeddings_url(),
+            "https://api.example.com/api/coding/v3/embeddings"
+        );
+    }
+
+    #[test]
+    fn embeddings_url_custom_full_endpoint() {
+        let p = OpenAiEmbedding::new(
+            "https://my-api.example.com/api/v2/embeddings",
+            "key",
+            "model",
+            1536,
+        );
+        assert_eq!(
+            p.embeddings_url(),
+            "https://my-api.example.com/api/v2/embeddings"
+        );
     }
 }

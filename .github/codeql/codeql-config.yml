@@ -1,0 +1,8 @@
+# CodeQL configuration for ZeroClaw
+#
+# We intentionally ignore integration tests under `tests/` because they often
+# contain security-focused fixtures (example secrets, malformed payloads, etc.)
+# that can trigger false positives in security queries.
+
+paths-ignore:
+    - tests/**

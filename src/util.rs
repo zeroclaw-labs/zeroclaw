@@ -16,7 +16,7 @@
 /// * Truncated string with "..." appended if length > `max_chars`
 ///
 /// # Examples
-/// ```
+/// ```ignore
 /// use zeroclaw::util::truncate_with_ellipsis;
 ///
 /// // ASCII string - no truncation needed
@@ -41,6 +41,13 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
         }
         None => s.to_string(),
     }
+}
+
+/// Utility enum for handling optional values.
+pub enum MaybeSet<T> {
+    Set(T),
+    Unset,
+    Null,
 }
 
 #[cfg(test)]

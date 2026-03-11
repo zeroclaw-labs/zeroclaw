@@ -1,0 +1,21 @@
+{
+  "contributor_tier_color": "2ED9FF",
+  "contributor_tiers": [
+    {
+      "label": "distinguished contributor",
+      "min_merged_prs": 50
+    },
+    {
+      "label": "principal contributor",
+      "min_merged_prs": 20
+    },
+    {
+      "label": "experienced contributor",
+      "min_merged_prs": 10
+    },
+    {
+      "label": "trusted contributor",
+      "min_merged_prs": 5
+    }
+  ]
+}

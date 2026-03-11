@@ -14,12 +14,26 @@ else
 fi
 
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
+if [ "$BASE_DIR" = "dev" ]; then
+    ENV_FILE=".env"
+else
+    ENV_FILE="../.env"
+fi
 
 # Colors
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
+
+function load_env {
+    if [ -f "$ENV_FILE" ]; then
+        # Auto-export variables from .env for docker compose passthrough.
+        set -a
+        source "$ENV_FILE"
+        set +a
+    fi
+}
 
 function ensure_config {
     CONFIG_DIR="$HOST_TARGET_DIR/.zeroclaw"
@@ -46,6 +60,7 @@ function print_help {
     echo -e "  ${GREEN}agent${NC}   Enter Agent (ZeroClaw CLI)"
     echo -e "  ${GREEN}logs${NC}    View logs"
     echo -e "  ${GREEN}build${NC}   Rebuild images"
+    echo -e "  ${GREEN}ci${NC}      Run local CI checks in Docker (see ./dev/ci.sh)"
     echo -e "  ${GREEN}clean${NC}   Stop and wipe workspace data"
 }
 
@@ -54,6 +69,8 @@ if [ -z "$1" ]; then
     exit 1
 fi
 
+load_env
+
 case "$1" in
     up)
         ensure_config
@@ -61,7 +78,7 @@ case "$1" in
         # Build context MUST be set correctly for docker compose
         docker compose -f "$COMPOSE_FILE" up -d
         echo -e "${GREEN}✅ Environment is running!${NC}"
-        echo -e "   - Agent: http://127.0.0.1:3000"
+        echo -e "   - Agent: http://127.0.0.1:42617"
         echo -e "   - Sandbox: running (background)"
         echo -e "   - Config: target/.zeroclaw/config.toml (Edit locally to apply changes)"
         ;;
@@ -92,6 +109,15 @@ case "$1" in
         ensure_config
         docker compose -f "$COMPOSE_FILE" up -d
         echo -e "${GREEN}✅ Rebuild complete.${NC}"
+        ;;
+
+    ci)
+        shift
+        if [ "$BASE_DIR" = "." ]; then
+            ./ci.sh "${@:-all}"
+        else
+            ./dev/ci.sh "${@:-all}"
+        fi
         ;;
 
     clean)

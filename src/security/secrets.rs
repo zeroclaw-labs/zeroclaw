@@ -334,8 +334,8 @@ mod tests {
         assert!(!SecretStore::is_encrypted(""));
     }
 
-    #[test]
-    fn key_file_created_on_first_encrypt() {
+    #[tokio::test]
+    async fn key_file_created_on_first_encrypt() {
         let tmp = TempDir::new().unwrap();
         let store = SecretStore::new(tmp.path(), true);
         assert!(!store.key_path.exists());
@@ -343,7 +343,7 @@ mod tests {
         store.encrypt("test").unwrap();
         assert!(store.key_path.exists(), "Key file should be created");
 
-        let key_hex = fs::read_to_string(&store.key_path).unwrap();
+        let key_hex = tokio::fs::read_to_string(&store.key_path).await.unwrap();
         assert_eq!(
             key_hex.len(),
             KEY_LEN * 2,

@@ -1,4 +1,5 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
+use std::any::Any;
 
 /// Combine multiple observers — fan-out events to all backends
 pub struct MultiObserver {
@@ -32,6 +33,10 @@ impl Observer for MultiObserver {
 
     fn name(&self) -> &str {
         "multi"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -75,6 +80,10 @@ mod tests {
         }
         fn name(&self) -> &str {
             "counting"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
         }
     }
 

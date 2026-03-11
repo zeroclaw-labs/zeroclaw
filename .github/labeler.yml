@@ -1,59 +1,147 @@
-"type: docs":
+"docs":
   - changed-files:
       - any-glob-to-any-file:
           - "docs/**"
           - "**/*.md"
+          - "**/*.mdx"
           - "LICENSE"
+          - ".markdownlint-cli2.yaml"
 
-"type: dependencies":
+"dependencies":
   - changed-files:
       - any-glob-to-any-file:
           - "Cargo.toml"
           - "Cargo.lock"
           - "deny.toml"
+          - ".github/dependabot.yml"
 
-"type: ci":
+"ci":
   - changed-files:
       - any-glob-to-any-file:
           - ".github/**"
           - ".githooks/**"
 
-"area: providers":
+"core":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/providers/**"
+          - "src/*.rs"
 
-"area: channels":
+"agent":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/agent/**"
+
+"channel":
   - changed-files:
       - any-glob-to-any-file:
           - "src/channels/**"
 
-"area: memory":
+"gateway":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/gateway/**"
+
+"config":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/config/**"
+
+"cron":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/cron/**"
+
+"daemon":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/daemon/**"
+
+"doctor":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/doctor/**"
+
+"health":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/health/**"
+
+"heartbeat":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/heartbeat/**"
+
+"integration":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/integrations/**"
+
+"memory":
   - changed-files:
       - any-glob-to-any-file:
           - "src/memory/**"
 
-"area: security":
+"security":
   - changed-files:
       - any-glob-to-any-file:
           - "src/security/**"
 
-"area: runtime":
+"runtime":
   - changed-files:
       - any-glob-to-any-file:
           - "src/runtime/**"
 
-"area: tools":
+"onboard":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/onboard/**"
+
+"provider":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/providers/**"
+
+"service":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/service/**"
+
+"skillforge":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/skillforge/**"
+
+"skills":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/skills/**"
+
+"tool":
   - changed-files:
       - any-glob-to-any-file:
           - "src/tools/**"
 
-"area: observability":
+"tunnel":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/tunnel/**"
+
+"observability":
   - changed-files:
       - any-glob-to-any-file:
           - "src/observability/**"
 
-"area: tests":
+"tests":
   - changed-files:
       - any-glob-to-any-file:
           - "tests/**"
+
+"scripts":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "scripts/**"
+
+"dev":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "dev/**"

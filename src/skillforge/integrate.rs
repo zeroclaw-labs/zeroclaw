@@ -191,8 +191,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn integrate_creates_files() {
+    #[tokio::test]
+    async fn integrate_creates_files() {
         let tmp = std::env::temp_dir().join("zeroclaw-test-integrate");
         let _ = fs::remove_dir_all(&tmp);
 
@@ -203,11 +203,15 @@ mod tests {
         assert!(path.join("SKILL.toml").exists());
         assert!(path.join("SKILL.md").exists());
 
-        let toml = fs::read_to_string(path.join("SKILL.toml")).unwrap();
+        let toml = tokio::fs::read_to_string(path.join("SKILL.toml"))
+            .await
+            .unwrap();
         assert!(toml.contains("name = \"test-skill\""));
         assert!(toml.contains("stars = 42"));
 
-        let md = fs::read_to_string(path.join("SKILL.md")).unwrap();
+        let md = tokio::fs::read_to_string(path.join("SKILL.md"))
+            .await
+            .unwrap();
         assert!(md.contains("# test-skill"));
         assert!(md.contains("A test skill for unit tests"));
 

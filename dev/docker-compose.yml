@@ -20,18 +20,27 @@ services:
     container_name: zeroclaw-dev
     restart: unless-stopped
     environment:
-      - API_KEY
-      - PROVIDER
-      - ZEROCLAW_MODEL
-      - ZEROCLAW_GATEWAY_PORT=3000
+      - ZEROCLAW_GATEWAY_PORT=42617
       - SANDBOX_HOST=zeroclaw-sandbox
+    secrets:
+      - source: zeroclaw_env
+        target: zeroclaw_env
+    entrypoint: ["/bin/bash", "-lc"]
+    command:
+      - |
+        if [ -f /run/secrets/zeroclaw_env ]; then
+          set -a
+          . /run/secrets/zeroclaw_env
+          set +a
+        fi
+        exec zeroclaw gateway --port "${ZEROCLAW_GATEWAY_PORT:-42617}" --host "[::]"
     volumes:
       # Mount single config file (avoids shadowing other files in .zeroclaw)
       - ../target/.zeroclaw/config.toml:/zeroclaw-data/.zeroclaw/config.toml
       # Mount shared workspace
       - ../playground:/zeroclaw-data/workspace
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:42617:42617"
     networks:
       - dev-net
 
@@ -57,3 +66,7 @@ services:
 networks:
   dev-net:
     driver: bridge
+
+secrets:
+  zeroclaw_env:
+    file: ../.env

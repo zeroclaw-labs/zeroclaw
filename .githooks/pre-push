@@ -6,21 +6,46 @@
 
 set -euo pipefail
 
-echo "==> pre-push: checking formatting..."
-cargo fmt -- --check || {
-    echo "FAIL: cargo fmt -- --check found unformatted code."
-    echo "Run 'cargo fmt' and try again."
+echo "==> pre-push: running rust quality gate..."
+./scripts/ci/rust_quality_gate.sh || {
+    echo "FAIL: rust quality gate failed."
     exit 1
 }
 
-echo "==> pre-push: running clippy..."
-cargo clippy -- -D warnings || {
-    echo "FAIL: clippy reported warnings."
-    exit 1
-}
+if [ "${ZEROCLAW_STRICT_LINT:-0}" = "1" ]; then
+    echo "==> pre-push: running strict clippy warnings gate (ZEROCLAW_STRICT_LINT=1)..."
+    ./scripts/ci/rust_quality_gate.sh --strict || {
+        echo "FAIL: strict clippy warnings gate reported issues."
+        exit 1
+    }
+fi
+
+if [ "${ZEROCLAW_STRICT_DELTA_LINT:-0}" = "1" ]; then
+    echo "==> pre-push: running strict delta lint gate (ZEROCLAW_STRICT_DELTA_LINT=1)..."
+    ./scripts/ci/rust_strict_delta_gate.sh || {
+        echo "FAIL: strict delta lint gate reported issues."
+        exit 1
+    }
+fi
+
+if [ "${ZEROCLAW_DOCS_LINT:-0}" = "1" ]; then
+    echo "==> pre-push: running docs quality gate (ZEROCLAW_DOCS_LINT=1)..."
+    ./scripts/ci/docs_quality_gate.sh || {
+        echo "FAIL: docs quality gate reported issues."
+        exit 1
+    }
+fi
+
+if [ "${ZEROCLAW_DOCS_LINKS:-0}" = "1" ]; then
+    echo "==> pre-push: running docs links gate (ZEROCLAW_DOCS_LINKS=1)..."
+    ./scripts/ci/docs_links_gate.sh || {
+        echo "FAIL: docs links gate reported issues."
+        exit 1
+    }
+fi
 
 echo "==> pre-push: running tests..."
-cargo test || {
+cargo test --locked || {
     echo "FAIL: some tests did not pass."
     exit 1
 }

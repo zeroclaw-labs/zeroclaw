@@ -1,19 +1,41 @@
 name: Bug Report
 description: Report a reproducible defect in ZeroClaw
 title: "[Bug]: "
+labels:
+  - bug
 body:
   - type: markdown
     attributes:
       value: |
         Thanks for taking the time to report a bug.
         Please provide a minimal reproducible case so maintainers can triage quickly.
+        Do not include personal/sensitive data; redact and anonymize all logs/payloads.
 
-  - type: input
-    id: summary
+  - type: dropdown
+    id: component
     attributes:
-      label: Summary
-      description: One-line description of the problem.
-      placeholder: zeroclaw daemon exits immediately when ...
+      label: Affected component
+      options:
+        - runtime/daemon
+        - provider
+        - channel
+        - memory
+        - security/sandbox
+        - tooling/ci
+        - docs
+        - unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - S0 - data loss / security risk
+        - S1 - workflow blocked
+        - S2 - degraded behavior
+        - S3 - minor issue
     validations:
       required: true
 
@@ -49,10 +71,22 @@ body:
       required: true
 
   - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Who is affected, how often, and practical consequences (optional but helps triage).
+      placeholder: |
+        Affected users: ...
+        Frequency: always/intermittent
+        Consequence: ...
+    validations:
+      required: false
+
+  - type: textarea
     id: logs
     attributes:
       label: Logs / stack traces
-      description: Paste relevant logs (redact secrets).
+      description: Paste relevant logs (redact secrets, personal identifiers, and sensitive data).
       render: text
     validations:
       required: false
@@ -69,9 +103,10 @@ body:
     id: rust
     attributes:
       label: Rust version
+      description: Required for runtime/build bugs; optional for docs/config issues.
       placeholder: rustc 1.xx.x
     validations:
-      required: true
+      required: false
 
   - type: input
     id: os
@@ -91,3 +126,13 @@ body:
         - No, first-time setup
     validations:
       required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I reproduced this on the latest master branch or latest release.
+          required: true
+        - label: I redacted secrets, tokens, and personal data from all submitted content.
+          required: true

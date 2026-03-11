@@ -1,0 +1,150 @@
+# ZeroClaw Robot Kit Configuration
+# Copy to ~/.zeroclaw/robot.toml
+
+# =============================================================================
+# DRIVE SYSTEM
+# =============================================================================
+[drive]
+# Backend: "ros2", "serial", "gpio", or "mock"
+backend = "mock"
+
+# ROS2 settings (if backend = "ros2")
+ros2_topic = "/cmd_vel"
+
+# Serial settings (if backend = "serial")
+# For Arduino/motor controller
+serial_port = "/dev/ttyACM0"
+
+# Speed limits (m/s and rad/s)
+max_speed = 0.5
+max_rotation = 1.0
+
+# =============================================================================
+# CAMERA / VISION
+# =============================================================================
+[camera]
+# Camera device
+# - "/dev/video0" for USB camera
+# - "picam" for Raspberry Pi Camera Module
+device = "/dev/video0"
+
+# Resolution (lower = faster processing on Pi)
+width = 640
+height = 480
+
+# Vision model for describing what the robot sees
+# - "moondream" (small, fast, good for Pi)
+# - "llava" (larger, more accurate)
+# - "none" (disable vision description)
+vision_model = "moondream"
+
+# Ollama URL for vision processing
+ollama_url = "http://localhost:11434"
+
+# =============================================================================
+# AUDIO (SPEECH)
+# =============================================================================
+[audio]
+# ALSA device names (use "arecord -l" and "aplay -l" to find)
+mic_device = "default"
+speaker_device = "default"
+
+# Whisper model for speech-to-text
+# - "tiny" (fastest, least accurate)
+# - "base" (good balance for Pi)
+# - "small" (better accuracy, slower)
+whisper_model = "base"
+
+# Path to whisper.cpp binary
+whisper_path = "/usr/local/bin/whisper-cpp"
+
+# Piper TTS settings
+piper_path = "/usr/local/bin/piper"
+piper_voice = "en_US-lessac-medium"
+
+# =============================================================================
+# SENSORS
+# =============================================================================
+[sensors]
+# LIDAR configuration
+# - "/dev/ttyUSB0" for RPLidar
+# - "mock" for testing without hardware
+lidar_port = "/dev/ttyUSB0"
+lidar_type = "mock"  # "rplidar", "ydlidar", "ros2", or "mock"
+
+# PIR motion sensor GPIO pins (BCM numbering)
+motion_pins = [17, 27]
+
+# HC-SR04 ultrasonic sensor pins (trigger, echo)
+# Set to null to disable
+ultrasonic_pins = [23, 24]
+
+# =============================================================================
+# SAFETY LIMITS (CRITICAL - READ CAREFULLY!)
+# =============================================================================
+[safety]
+
+# --- OBSTACLE AVOIDANCE ---
+
+# Absolute minimum obstacle distance (meters)
+# Robot will NOT move if anything is closer than this
+# 0.3m (30cm) is good for indoor use
+min_obstacle_distance = 0.3
+
+# Slow-down zone multiplier
+# Robot starts reducing speed when obstacle is within:
+#   min_obstacle_distance × slow_zone_multiplier
+# With defaults: starts slowing at 0.3 × 3.0 = 0.9m (90cm)
+slow_zone_multiplier = 3.0
+
+# Maximum speed when approaching obstacles (0.0 - 1.0)
+# In slow-down zone, speed is limited to this fraction
+# 0.3 = 30% of max_speed when near walls/obstacles
+approach_speed_limit = 0.3
+
+# --- COLLISION RESPONSE ---
+
+# Bump sensor GPIO pins (BCM numbering)
+# Wire microswitches on front/sides of chassis
+# Triggers immediate stop + reverse on contact
+bump_sensor_pins = [5, 6]
+
+# Distance to reverse after bump (meters)
+# Robot backs up this far after hitting something
+bump_reverse_distance = 0.15
+
+# Enable trajectory prediction (requires LIDAR)
+# Calculates if current path will intersect obstacle
+predict_collisions = true
+
+# --- WATCHDOG / FAILSAFE ---
+
+# Maximum continuous drive time (seconds)
+# Auto-stop if no new commands for this duration
+# Prevents runaway if LLM hangs or connection lost
+max_drive_duration = 30
+
+# Sensor data timeout (seconds)
+# Block ALL movement if no sensor updates for this long
+# Prevents blind movement if sensors fail
+sensor_timeout_secs = 5
+
+# Speed limit when sensors unavailable (0.0 - 1.0)
+# Extra caution when "flying blind"
+blind_mode_speed_limit = 0.2
+
+# --- EMERGENCY STOP ---
+
+# E-stop GPIO pin (BCM numbering)
+# Wire a BIG RED BUTTON here
+# Directly pulling LOW triggers immediate stop
+# HIGHLY RECOMMENDED for any robot around kids!
+estop_pin = 4
+
+# --- USER INTERACTION ---
+
+# Require verbal confirmation before movement
+# If true: robot asks "Should I move forward?" before each move
+# Set true for extra safety with young kids
+# Set false for responsive gameplay with older kids
+confirm_movement = false

@@ -428,7 +428,7 @@ mod tests {
     async fn execute_real_file() {
         // Create a minimal valid PNG
         let dir = std::env::temp_dir().join("zeroclaw_image_info_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let _ = tokio::fs::create_dir_all(&dir).await;
         let png_path = dir.join("test.png");
 
         // Minimal 1x1 red PNG (67 bytes)
@@ -448,7 +448,7 @@ mod tests {
             0x49, 0x45, 0x4E, 0x44, // IEND
             0xAE, 0x42, 0x60, 0x82, // CRC
         ];
-        std::fs::write(&png_path, &png_bytes).unwrap();
+        tokio::fs::write(&png_path, &png_bytes).await.unwrap();
 
         let tool = ImageInfoTool::new(test_security());
         let result = tool
@@ -461,13 +461,13 @@ mod tests {
         assert!(!result.output.contains("data:"));
 
         // Clean up
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn execute_with_base64() {
         let dir = std::env::temp_dir().join("zeroclaw_image_info_b64");
-        let _ = std::fs::create_dir_all(&dir);
+        let _ = tokio::fs::create_dir_all(&dir).await;
         let png_path = dir.join("test_b64.png");
 
         // Minimal 1x1 PNG
@@ -478,7 +478,7 @@ mod tests {
             0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
             0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ];
-        std::fs::write(&png_path, &png_bytes).unwrap();
+        tokio::fs::write(&png_path, &png_bytes).await.unwrap();
 
         let tool = ImageInfoTool::new(test_security());
         let result = tool
@@ -488,6 +488,6 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("data:image/png;base64,"));
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

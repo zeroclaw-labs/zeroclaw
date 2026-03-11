@@ -1,0 +1,83 @@
+component StatusBar inherits Rectangle {
+    in property <string> title_text: "ZeroClaw ESP32 UI";
+    in property <string> status_text: "disconnected";
+
+    height: 32px;
+    background: #1f2937;
+    border-radius: 6px;
+
+    HorizontalLayout {
+        padding: 8px;
+
+        Text {
+            text: root.title_text;
+            color: #e5e7eb;
+            font-size: 14px;
+            vertical-alignment: center;
+        }
+
+        Text {
+            text: root.status_text;
+            color: #93c5fd;
+            font-size: 12px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component MessageList inherits Rectangle {
+    in property <string> message_text: "UI scaffold is running";
+
+    background: #0f172a;
+    border-radius: 6px;
+    border-color: #334155;
+    border-width: 1px;
+
+    Text {
+        text: root.message_text;
+        color: #cbd5e1;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component InputBar inherits Rectangle {
+    in property <string> hint_text: "Touch input integration pending";
+
+    height: 36px;
+    background: #1e293b;
+    border-radius: 6px;
+
+    Text {
+        text: root.hint_text;
+        color: #e2e8f0;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        font-size: 12px;
+    }
+}
+
+export component MainWindow inherits Window {
+    width: 320px;
+    height: 240px;
+    background: #020617;
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 10px;
+
+        StatusBar {
+            title_text: "ZeroClaw Edge UI";
+            status_text: "booting";
+        }
+
+        MessageList {
+            message_text: "Display/touch drivers can be wired here";
+        }
+
+        InputBar {
+            hint_text: "Use touch-xpt2046 or touch-ft6x36 feature later";
+        }
+    }
+}

@@ -1,13 +1,24 @@
 pub mod log;
 pub mod multi;
 pub mod noop;
+#[cfg(feature = "observability-otel")]
 pub mod otel;
+pub mod prometheus;
+pub mod runtime_trace;
 pub mod traits;
+pub mod verbose;
 
+#[allow(unused_imports)]
 pub use self::log::LogObserver;
+#[allow(unused_imports)]
+pub use self::multi::MultiObserver;
 pub use noop::NoopObserver;
+#[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
+pub use prometheus::PrometheusObserver;
 pub use traits::{Observer, ObserverEvent};
+#[allow(unused_imports)]
+pub use verbose::VerboseObserver;
 
 use crate::config::ObservabilityConfig;
 
@@ -15,7 +26,9 @@ use crate::config::ObservabilityConfig;
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     match config.backend.as_str() {
         "log" => Box::new(LogObserver::new()),
+        "prometheus" => Box::new(PrometheusObserver::new()),
         "otel" | "opentelemetry" | "otlp" => {
+            #[cfg(feature = "observability-otel")]
             match OtelObserver::new(
                 config.otel_endpoint.as_deref(),
                 config.otel_service_name.as_deref(),
@@ -34,6 +47,13 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
                     tracing::error!("Failed to create OTel observer: {e}. Falling back to noop.");
                     Box::new(NoopObserver)
                 }
+            }
+            #[cfg(not(feature = "observability-otel"))]
+            {
+                tracing::warn!(
+                    "OpenTelemetry backend requested but this build was compiled without `observability-otel`; falling back to noop."
+                );
+                Box::new(NoopObserver)
             }
         }
         "none" | "noop" => Box::new(NoopObserver),
@@ -79,13 +99,28 @@ mod tests {
     }
 
     #[test]
+    fn factory_prometheus_returns_prometheus() {
+        let cfg = ObservabilityConfig {
+            backend: "prometheus".into(),
+            ..ObservabilityConfig::default()
+        };
+        assert_eq!(create_observer(&cfg).name(), "prometheus");
+    }
+
+    #[test]
     fn factory_otel_returns_otel() {
         let cfg = ObservabilityConfig {
             backend: "otel".into(),
             otel_endpoint: Some("http://127.0.0.1:19999".into()),
             otel_service_name: Some("test".into()),
+            ..ObservabilityConfig::default()
         };
-        assert_eq!(create_observer(&cfg).name(), "otel");
+        let expected = if cfg!(feature = "observability-otel") {
+            "otel"
+        } else {
+            "noop"
+        };
+        assert_eq!(create_observer(&cfg).name(), expected);
     }
 
     #[test]
@@ -94,8 +129,14 @@ mod tests {
             backend: "opentelemetry".into(),
             otel_endpoint: Some("http://127.0.0.1:19999".into()),
             otel_service_name: Some("test".into()),
+            ..ObservabilityConfig::default()
         };
-        assert_eq!(create_observer(&cfg).name(), "otel");
+        let expected = if cfg!(feature = "observability-otel") {
+            "otel"
+        } else {
+            "noop"
+        };
+        assert_eq!(create_observer(&cfg).name(), expected);
     }
 
     #[test]
@@ -104,8 +145,14 @@ mod tests {
             backend: "otlp".into(),
             otel_endpoint: Some("http://127.0.0.1:19999".into()),
             otel_service_name: Some("test".into()),
+            ..ObservabilityConfig::default()
         };
-        assert_eq!(create_observer(&cfg).name(), "otel");
+        let expected = if cfg!(feature = "observability-otel") {
+            "otel"
+        } else {
+            "noop"
+        };
+        assert_eq!(create_observer(&cfg).name(), expected);
     }
 
     #[test]

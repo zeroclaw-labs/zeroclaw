@@ -1,0 +1,44 @@
+[package]
+name = "zeroclaw-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.zeroclaw]
+path = ".."
+
+[[bin]]
+name = "fuzz_config_parse"
+path = "fuzz_targets/fuzz_config_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_tool_params"
+path = "fuzz_targets/fuzz_tool_params.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_webhook_payload"
+path = "fuzz_targets/fuzz_webhook_payload.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_provider_response"
+path = "fuzz_targets/fuzz_provider_response.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_command_validation"
+path = "fuzz_targets/fuzz_command_validation.rs"
+test = false
+doc = false

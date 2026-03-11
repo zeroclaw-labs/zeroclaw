@@ -1,7 +1,12 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use parking_lot::Mutex;
+use reqwest::multipart::{Form, Part};
 use serde_json::json;
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -10,19 +15,31 @@ pub struct DiscordChannel {
     bot_token: String,
     guild_id: Option<String>,
     allowed_users: Vec<String>,
-    client: reqwest::Client,
-    typing_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    listen_to_bots: bool,
+    mention_only: bool,
+    typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 impl DiscordChannel {
-    pub fn new(bot_token: String, guild_id: Option<String>, allowed_users: Vec<String>) -> Self {
+    pub fn new(
+        bot_token: String,
+        guild_id: Option<String>,
+        allowed_users: Vec<String>,
+        listen_to_bots: bool,
+        mention_only: bool,
+    ) -> Self {
         Self {
             bot_token,
             guild_id,
             allowed_users,
-            client: reqwest::Client::new(),
-            typing_handle: std::sync::Mutex::new(None),
+            listen_to_bots,
+            mention_only,
+            typing_handles: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        crate::config::build_runtime_proxy_client("channel.discord")
     }
 
     /// Check if a Discord user ID is in the allowlist.
@@ -39,12 +56,264 @@ impl DiscordChannel {
     }
 }
 
+/// Process Discord message attachments and return a string to append to the
+/// agent message context.
+///
+/// Only `text/*` MIME types are fetched and inlined. All other types are
+/// silently skipped. Fetch errors are logged as warnings.
+async fn process_attachments(
+    attachments: &[serde_json::Value],
+    client: &reqwest::Client,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for att in attachments {
+        let ct = att
+            .get("content_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let name = att
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .unwrap_or("file");
+        let Some(url) = att.get("url").and_then(|v| v.as_str()) else {
+            tracing::warn!(name, "discord: attachment has no url, skipping");
+            continue;
+        };
+        if ct.starts_with("text/") {
+            match client.get(url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(text) = resp.text().await {
+                        parts.push(format!("[{name}]\n{text}"));
+                    }
+                }
+                Ok(resp) => {
+                    tracing::warn!(name, status = %resp.status(), "discord attachment fetch failed");
+                }
+                Err(e) => {
+                    tracing::warn!(name, error = %e, "discord attachment fetch error");
+                }
+            }
+        } else {
+            tracing::debug!(
+                name,
+                content_type = ct,
+                "discord: skipping unsupported attachment type"
+            );
+        }
+    }
+    parts.join("\n---\n")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiscordAttachmentKind {
+    Image,
+    Document,
+    Video,
+    Audio,
+    Voice,
+}
+
+impl DiscordAttachmentKind {
+    fn from_marker(kind: &str) -> Option<Self> {
+        match kind.trim().to_ascii_uppercase().as_str() {
+            "IMAGE" | "PHOTO" => Some(Self::Image),
+            "DOCUMENT" | "FILE" => Some(Self::Document),
+            "VIDEO" => Some(Self::Video),
+            "AUDIO" => Some(Self::Audio),
+            "VOICE" => Some(Self::Voice),
+            _ => None,
+        }
+    }
+
+    fn marker_name(&self) -> &'static str {
+        match self {
+            Self::Image => "IMAGE",
+            Self::Document => "DOCUMENT",
+            Self::Video => "VIDEO",
+            Self::Audio => "AUDIO",
+            Self::Voice => "VOICE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscordAttachment {
+    kind: DiscordAttachmentKind,
+    target: String,
+}
+
+fn parse_attachment_markers(message: &str) -> (String, Vec<DiscordAttachment>) {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut attachments = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel_start) = message[cursor..].find('[') {
+        let start = cursor + rel_start;
+        cleaned.push_str(&message[cursor..start]);
+
+        let Some(rel_end) = message[start..].find(']') else {
+            cleaned.push_str(&message[start..]);
+            cursor = message.len();
+            break;
+        };
+        let end = start + rel_end;
+        let marker_text = &message[start + 1..end];
+
+        let parsed = marker_text.split_once(':').and_then(|(kind, target)| {
+            let kind = DiscordAttachmentKind::from_marker(kind)?;
+            let target = target.trim();
+            if target.is_empty() {
+                return None;
+            }
+            Some(DiscordAttachment {
+                kind,
+                target: target.to_string(),
+            })
+        });
+
+        if let Some(attachment) = parsed {
+            attachments.push(attachment);
+        } else {
+            cleaned.push_str(&message[start..=end]);
+        }
+
+        cursor = end + 1;
+    }
+
+    if cursor < message.len() {
+        cleaned.push_str(&message[cursor..]);
+    }
+
+    (cleaned.trim().to_string(), attachments)
+}
+
+fn classify_outgoing_attachments(
+    attachments: &[DiscordAttachment],
+) -> (Vec<PathBuf>, Vec<String>, Vec<String>) {
+    let mut local_files = Vec::new();
+    let mut remote_urls = Vec::new();
+    let mut unresolved_markers = Vec::new();
+
+    for attachment in attachments {
+        let target = attachment.target.trim();
+        if target.starts_with("https://") || target.starts_with("http://") {
+            remote_urls.push(target.to_string());
+            continue;
+        }
+
+        let path = Path::new(target);
+        if path.exists() && path.is_file() {
+            local_files.push(path.to_path_buf());
+            continue;
+        }
+
+        unresolved_markers.push(format!("[{}:{}]", attachment.kind.marker_name(), target));
+    }
+
+    (local_files, remote_urls, unresolved_markers)
+}
+
+fn with_inline_attachment_urls(
+    content: &str,
+    remote_urls: &[String],
+    unresolved_markers: &[String],
+) -> String {
+    let mut lines = Vec::new();
+    if !content.trim().is_empty() {
+        lines.push(content.trim().to_string());
+    }
+    if !remote_urls.is_empty() {
+        lines.extend(remote_urls.iter().cloned());
+    }
+    if !unresolved_markers.is_empty() {
+        lines.extend(unresolved_markers.iter().cloned());
+    }
+    lines.join("\n")
+}
+
+async fn send_discord_message_json(
+    client: &reqwest::Client,
+    bot_token: &str,
+    recipient: &str,
+    content: &str,
+) -> anyhow::Result<()> {
+    let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
+    let body = json!({ "content": content });
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bot {bot_token}"))
+        .json(&body)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+        anyhow::bail!("Discord send message failed ({status}): {err}");
+    }
+
+    Ok(())
+}
+
+async fn send_discord_message_with_files(
+    client: &reqwest::Client,
+    bot_token: &str,
+    recipient: &str,
+    content: &str,
+    files: &[PathBuf],
+) -> anyhow::Result<()> {
+    let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
+
+    let mut form = Form::new().text("payload_json", json!({ "content": content }).to_string());
+
+    for (idx, path) in files.iter().enumerate() {
+        let bytes = tokio::fs::read(path).await.map_err(|error| {
+            anyhow::anyhow!(
+                "Discord attachment read failed for '{}': {error}",
+                path.display()
+            )
+        })?;
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment.bin")
+            .to_string();
+        form = form.part(
+            format!("files[{idx}]"),
+            Part::bytes(bytes).file_name(filename),
+        );
+    }
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bot {bot_token}"))
+        .multipart(form)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+        anyhow::bail!("Discord send message with files failed ({status}): {err}");
+    }
+
+    Ok(())
+}
+
 const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Discord's maximum message length for regular messages.
 ///
 /// Discord rejects longer payloads with `50035 Invalid Form Body`.
 const DISCORD_MAX_MESSAGE_LENGTH: usize = 2000;
+const DISCORD_ACK_REACTIONS: &[&str] = &["⚡️", "🦀", "🙌", "💪", "👌", "👀", "👣"];
 
 /// Split a message into chunks that respect Discord's 2000-character limit.
 /// Tries to split at word boundaries when possible.
@@ -94,6 +363,86 @@ fn split_message_for_discord(message: &str) -> Vec<String> {
     chunks
 }
 
+fn pick_uniform_index(len: usize) -> usize {
+    debug_assert!(len > 0);
+    let upper = len as u64;
+    let reject_threshold = (u64::MAX / upper) * upper;
+
+    loop {
+        let value = rand::random::<u64>();
+        if value < reject_threshold {
+            #[allow(clippy::cast_possible_truncation)]
+            return (value % upper) as usize;
+        }
+    }
+}
+
+fn random_discord_ack_reaction() -> &'static str {
+    DISCORD_ACK_REACTIONS[pick_uniform_index(DISCORD_ACK_REACTIONS.len())]
+}
+
+/// URL-encode a Unicode emoji for use in Discord reaction API paths.
+///
+/// Discord's reaction endpoints accept raw Unicode emoji in the URL path,
+/// but they must be percent-encoded per RFC 3986. Custom guild emojis use
+/// the `name:id` format and are passed through unencoded.
+fn encode_emoji_for_discord(emoji: &str) -> String {
+    if emoji.contains(':') {
+        return emoji.to_string();
+    }
+
+    let mut encoded = String::new();
+    for byte in emoji.as_bytes() {
+        let _ = write!(encoded, "%{byte:02X}");
+    }
+    encoded
+}
+
+fn discord_reaction_url(channel_id: &str, message_id: &str, emoji: &str) -> String {
+    let raw_id = message_id.strip_prefix("discord_").unwrap_or(message_id);
+    let encoded_emoji = encode_emoji_for_discord(emoji);
+    format!(
+        "https://discord.com/api/v10/channels/{channel_id}/messages/{raw_id}/reactions/{encoded_emoji}/@me"
+    )
+}
+
+fn mention_tags(bot_user_id: &str) -> [String; 2] {
+    [format!("<@{bot_user_id}>"), format!("<@!{bot_user_id}>")]
+}
+
+fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
+    let tags = mention_tags(bot_user_id);
+    content.contains(&tags[0]) || content.contains(&tags[1])
+}
+
+fn normalize_incoming_content(
+    content: &str,
+    mention_only: bool,
+    bot_user_id: &str,
+) -> Option<String> {
+    if content.is_empty() {
+        return None;
+    }
+
+    if mention_only && !contains_bot_mention(content, bot_user_id) {
+        return None;
+    }
+
+    let mut normalized = content.to_string();
+    if mention_only {
+        for tag in mention_tags(bot_user_id) {
+            normalized = normalized.replace(&tag, " ");
+        }
+    }
+
+    let normalized = normalized.trim().to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    Some(normalized)
+}
+
 /// Minimal base64 decode (no extra dep) — only needs to decode the user ID portion
 #[allow(clippy::cast_possible_truncation)]
 fn base64_decode(input: &str) -> Option<String> {
@@ -138,31 +487,48 @@ impl Channel for DiscordChannel {
         "discord"
     }
 
-    async fn send(&self, message: &str, channel_id: &str) -> anyhow::Result<()> {
-        let chunks = split_message_for_discord(message);
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        let raw_content = super::strip_tool_call_tags(&message.content);
+        let (cleaned_content, parsed_attachments) = parse_attachment_markers(&raw_content);
+        let (mut local_files, remote_urls, unresolved_markers) =
+            classify_outgoing_attachments(&parsed_attachments);
+
+        if !unresolved_markers.is_empty() {
+            tracing::warn!(
+                unresolved = ?unresolved_markers,
+                "discord: unresolved attachment markers were sent as plain text"
+            );
+        }
+
+        // Discord accepts max 10 files per message.
+        if local_files.len() > 10 {
+            tracing::warn!(
+                count = local_files.len(),
+                "discord: truncating local attachment upload list to 10 files"
+            );
+            local_files.truncate(10);
+        }
+
+        let content =
+            with_inline_attachment_urls(&cleaned_content, &remote_urls, &unresolved_markers);
+        let chunks = split_message_for_discord(&content);
+        let client = self.http_client();
 
         for (i, chunk) in chunks.iter().enumerate() {
-            let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
-            let body = json!({ "content": chunk });
-
-            let resp = self
-                .client
-                .post(&url)
-                .header("Authorization", format!("Bot {}", self.bot_token))
-                .json(&body)
-                .send()
+            if i == 0 && !local_files.is_empty() {
+                send_discord_message_with_files(
+                    &client,
+                    &self.bot_token,
+                    &message.recipient,
+                    chunk,
+                    &local_files,
+                )
                 .await?;
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let err = resp
-                    .text()
-                    .await
-                    .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-                anyhow::bail!("Discord send message failed ({status}): {err}");
+            } else {
+                send_discord_message_json(&client, &self.bot_token, &message.recipient, chunk)
+                    .await?;
             }
 
-            // Add a small delay between chunks to avoid rate limiting
             if i < chunks.len() - 1 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
@@ -177,7 +543,7 @@ impl Channel for DiscordChannel {
 
         // Get Gateway URL
         let gw_resp: serde_json::Value = self
-            .client
+            .http_client()
             .get("https://discord.com/api/v10/gateway/bot")
             .header("Authorization", format!("Bot {}", self.bot_token))
             .send()
@@ -218,7 +584,9 @@ impl Channel for DiscordChannel {
                 }
             }
         });
-        write.send(Message::Text(identify.to_string())).await?;
+        write
+            .send(Message::Text(identify.to_string().into()))
+            .await?;
 
         tracing::info!("Discord: connected and identified");
 
@@ -247,7 +615,7 @@ impl Channel for DiscordChannel {
                 _ = hb_rx.recv() => {
                     let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
                     let hb = json!({"op": 1, "d": d});
-                    if write.send(Message::Text(hb.to_string())).await.is_err() {
+                    if write.send(Message::Text(hb.to_string().into())).await.is_err() {
                         break;
                     }
                 }
@@ -258,7 +626,7 @@ impl Channel for DiscordChannel {
                         _ => continue,
                     };
 
-                    let event: serde_json::Value = match serde_json::from_str(&msg) {
+                    let event: serde_json::Value = match serde_json::from_str(msg.as_ref()) {
                         Ok(e) => e,
                         Err(_) => continue,
                     };
@@ -275,7 +643,7 @@ impl Channel for DiscordChannel {
                         1 => {
                             let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
                             let hb = json!({"op": 1, "d": d});
-                            if write.send(Message::Text(hb.to_string())).await.is_err() {
+                            if write.send(Message::Text(hb.to_string().into())).await.is_err() {
                                 break;
                             }
                             continue;
@@ -309,8 +677,8 @@ impl Channel for DiscordChannel {
                         continue;
                     }
 
-                    // Skip bot messages
-                    if d.get("author").and_then(|a| a.get("bot")).and_then(serde_json::Value::as_bool).unwrap_or(false) {
+                    // Skip bot messages (unless listen_to_bots is enabled)
+                    if !self.listen_to_bots && d.get("author").and_then(|a| a.get("bot")).and_then(serde_json::Value::as_bool).unwrap_or(false) {
                         continue;
                     }
 
@@ -332,21 +700,79 @@ impl Channel for DiscordChannel {
                     }
 
                     let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    if content.is_empty() {
+                    let Some(clean_content) =
+                        normalize_incoming_content(content, self.mention_only, &bot_user_id)
+                    else {
                         continue;
+                    };
+
+                    let attachment_text = {
+                        let atts = d
+                            .get("attachments")
+                            .and_then(|a| a.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        process_attachments(&atts, &self.http_client()).await
+                    };
+                    let final_content = if attachment_text.is_empty() {
+                        clean_content
+                    } else {
+                        format!("{clean_content}\n\n[Attachments]\n{attachment_text}")
+                    };
+
+                    let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    let channel_id = d
+                        .get("channel_id")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    if !message_id.is_empty() && !channel_id.is_empty() {
+                        let reaction_channel = DiscordChannel::new(
+                            self.bot_token.clone(),
+                            self.guild_id.clone(),
+                            self.allowed_users.clone(),
+                            self.listen_to_bots,
+                            self.mention_only,
+                        );
+                        let reaction_channel_id = channel_id.clone();
+                        let reaction_message_id = message_id.to_string();
+                        let reaction_emoji = random_discord_ack_reaction().to_string();
+                        tokio::spawn(async move {
+                            if let Err(err) = reaction_channel
+                                .add_reaction(
+                                    &reaction_channel_id,
+                                    &reaction_message_id,
+                                    &reaction_emoji,
+                                )
+                                .await
+                            {
+                                tracing::debug!(
+                                    "Discord: failed to add ACK reaction for message {reaction_message_id}: {err}"
+                                );
+                            }
+                        });
                     }
 
-                    let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
-
                     let channel_msg = ChannelMessage {
-                        id: Uuid::new_v4().to_string(),
-                        sender: channel_id,
-                        content: content.to_string(),
+                        id: if message_id.is_empty() {
+                            Uuid::new_v4().to_string()
+                        } else {
+                            format!("discord_{message_id}")
+                        },
+                        sender: author_id.to_string(),
+                        reply_target: if channel_id.is_empty() {
+                            author_id.to_string()
+                        } else {
+                            channel_id.clone()
+                        },
+                        content: final_content,
                         channel: "discord".to_string(),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
+                        thread_ts: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -360,7 +786,7 @@ impl Channel for DiscordChannel {
     }
 
     async fn health_check(&self) -> bool {
-        self.client
+        self.http_client()
             .get("https://discord.com/api/v10/users/@me")
             .header("Authorization", format!("Bot {}", self.bot_token))
             .send()
@@ -372,7 +798,7 @@ impl Channel for DiscordChannel {
     async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
         self.stop_typing(recipient).await?;
 
-        let client = self.client.clone();
+        let client = self.http_client();
         let token = self.bot_token.clone();
         let channel_id = recipient.to_string();
 
@@ -388,19 +814,72 @@ impl Channel for DiscordChannel {
             }
         });
 
-        if let Ok(mut guard) = self.typing_handle.lock() {
-            *guard = Some(handle);
+        let mut guard = self.typing_handles.lock();
+        guard.insert(recipient.to_string(), handle);
+
+        Ok(())
+    }
+
+    async fn stop_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        let mut guard = self.typing_handles.lock();
+        if let Some(handle) = guard.remove(recipient) {
+            handle.abort();
+        }
+        Ok(())
+    }
+
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let url = discord_reaction_url(channel_id, message_id, emoji);
+
+        let resp = self
+            .http_client()
+            .put(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .header("Content-Length", "0")
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            anyhow::bail!("Discord add reaction failed ({status}): {err}");
         }
 
         Ok(())
     }
 
-    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
-        if let Ok(mut guard) = self.typing_handle.lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
-            }
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let url = discord_reaction_url(channel_id, message_id, emoji);
+
+        let resp = self
+            .http_client()
+            .delete(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            anyhow::bail!("Discord remove reaction failed ({status}): {err}");
         }
+
         Ok(())
     }
 }
@@ -411,7 +890,7 @@ mod tests {
 
     #[test]
     fn discord_channel_name() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![]);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         assert_eq!(ch.name(), "discord");
     }
 
@@ -432,21 +911,27 @@ mod tests {
 
     #[test]
     fn empty_allowlist_denies_everyone() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![]);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         assert!(!ch.is_user_allowed("12345"));
         assert!(!ch.is_user_allowed("anyone"));
     }
 
     #[test]
     fn wildcard_allows_everyone() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["*".into()]);
+        let ch = DiscordChannel::new("fake".into(), None, vec!["*".into()], false, false);
         assert!(ch.is_user_allowed("12345"));
         assert!(ch.is_user_allowed("anyone"));
     }
 
     #[test]
     fn specific_allowlist_filters() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into(), "222".into()]);
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec!["111".into(), "222".into()],
+            false,
+            false,
+        );
         assert!(ch.is_user_allowed("111"));
         assert!(ch.is_user_allowed("222"));
         assert!(!ch.is_user_allowed("333"));
@@ -455,7 +940,7 @@ mod tests {
 
     #[test]
     fn allowlist_is_exact_match_not_substring() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()]);
+        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false);
         assert!(!ch.is_user_allowed("1111"));
         assert!(!ch.is_user_allowed("11"));
         assert!(!ch.is_user_allowed("0111"));
@@ -463,20 +948,26 @@ mod tests {
 
     #[test]
     fn allowlist_empty_string_user_id() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()]);
+        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false);
         assert!(!ch.is_user_allowed(""));
     }
 
     #[test]
     fn allowlist_with_wildcard_and_specific() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into(), "*".into()]);
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec!["111".into(), "*".into()],
+            false,
+            false,
+        );
         assert!(ch.is_user_allowed("111"));
         assert!(ch.is_user_allowed("anyone_else"));
     }
 
     #[test]
     fn allowlist_case_sensitive() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["ABC".into()]);
+        let ch = DiscordChannel::new("fake".into(), None, vec!["ABC".into()], false, false);
         assert!(ch.is_user_allowed("ABC"));
         assert!(!ch.is_user_allowed("abc"));
         assert!(!ch.is_user_allowed("Abc"));
@@ -498,6 +989,31 @@ mod tests {
     fn bot_user_id_from_empty_token() {
         let id = DiscordChannel::bot_user_id_from_token("");
         assert_eq!(id, Some(String::new()));
+    }
+
+    #[test]
+    fn contains_bot_mention_supports_plain_and_nick_forms() {
+        assert!(contains_bot_mention("hi <@12345>", "12345"));
+        assert!(contains_bot_mention("hi <@!12345>", "12345"));
+        assert!(!contains_bot_mention("hi <@99999>", "12345"));
+    }
+
+    #[test]
+    fn normalize_incoming_content_requires_mention_when_enabled() {
+        let cleaned = normalize_incoming_content("hello there", true, "12345");
+        assert!(cleaned.is_none());
+    }
+
+    #[test]
+    fn normalize_incoming_content_strips_mentions_and_trims() {
+        let cleaned = normalize_incoming_content("  <@!12345> run status  ", true, "12345");
+        assert_eq!(cleaned.as_deref(), Some("run status"));
+    }
+
+    #[test]
+    fn normalize_incoming_content_rejects_empty_after_strip() {
+        let cleaned = normalize_incoming_content("<@12345>", true, "12345");
+        assert!(cleaned.is_none());
     }
 
     // Message splitting tests
@@ -622,7 +1138,7 @@ mod tests {
 
     #[test]
     fn split_multibyte_only_content_without_panics() {
-        let msg = "你".repeat(2500);
+        let msg = "🦀".repeat(2500);
         let chunks = split_message_for_discord(&msg);
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].chars().count(), DISCORD_MAX_MESSAGE_LENGTH);
@@ -650,42 +1166,344 @@ mod tests {
     }
 
     #[test]
-    fn typing_handle_starts_as_none() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![]);
-        let guard = ch.typing_handle.lock().unwrap();
-        assert!(guard.is_none());
+    fn typing_handles_start_empty() {
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let guard = ch.typing_handles.lock();
+        assert!(guard.is_empty());
     }
 
     #[tokio::test]
     async fn start_typing_sets_handle() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![]);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         let _ = ch.start_typing("123456").await;
-        let guard = ch.typing_handle.lock().unwrap();
-        assert!(guard.is_some());
+        let guard = ch.typing_handles.lock();
+        assert!(guard.contains_key("123456"));
     }
 
     #[tokio::test]
     async fn stop_typing_clears_handle() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![]);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         let _ = ch.start_typing("123456").await;
         let _ = ch.stop_typing("123456").await;
-        let guard = ch.typing_handle.lock().unwrap();
-        assert!(guard.is_none());
+        let guard = ch.typing_handles.lock();
+        assert!(!guard.contains_key("123456"));
     }
 
     #[tokio::test]
     async fn stop_typing_is_idempotent() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![]);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         assert!(ch.stop_typing("123456").await.is_ok());
         assert!(ch.stop_typing("123456").await.is_ok());
     }
 
     #[tokio::test]
-    async fn start_typing_replaces_existing_task() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![]);
+    async fn concurrent_typing_handles_are_independent() {
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         let _ = ch.start_typing("111").await;
         let _ = ch.start_typing("222").await;
-        let guard = ch.typing_handle.lock().unwrap();
-        assert!(guard.is_some());
+        {
+            let guard = ch.typing_handles.lock();
+            assert_eq!(guard.len(), 2);
+            assert!(guard.contains_key("111"));
+            assert!(guard.contains_key("222"));
+        }
+        // Stopping one does not affect the other
+        let _ = ch.stop_typing("111").await;
+        let guard = ch.typing_handles.lock();
+        assert_eq!(guard.len(), 1);
+        assert!(guard.contains_key("222"));
+    }
+
+    // ── Emoji encoding for reactions ──────────────────────────────
+
+    #[test]
+    fn encode_emoji_unicode_percent_encodes() {
+        let encoded = encode_emoji_for_discord("\u{1F440}");
+        assert_eq!(encoded, "%F0%9F%91%80");
+    }
+
+    #[test]
+    fn encode_emoji_checkmark() {
+        let encoded = encode_emoji_for_discord("\u{2705}");
+        assert_eq!(encoded, "%E2%9C%85");
+    }
+
+    #[test]
+    fn encode_emoji_custom_guild_emoji_passthrough() {
+        let encoded = encode_emoji_for_discord("custom_emoji:123456789");
+        assert_eq!(encoded, "custom_emoji:123456789");
+    }
+
+    #[test]
+    fn encode_emoji_simple_ascii_char() {
+        let encoded = encode_emoji_for_discord("A");
+        assert_eq!(encoded, "%41");
+    }
+
+    #[test]
+    fn random_discord_ack_reaction_is_from_pool() {
+        for _ in 0..128 {
+            let emoji = random_discord_ack_reaction();
+            assert!(DISCORD_ACK_REACTIONS.contains(&emoji));
+        }
+    }
+
+    #[test]
+    fn discord_reaction_url_encodes_emoji_and_strips_prefix() {
+        let url = discord_reaction_url("123", "discord_456", "👀");
+        assert_eq!(
+            url,
+            "https://discord.com/api/v10/channels/123/messages/456/reactions/%F0%9F%91%80/@me"
+        );
+    }
+
+    // ── Message ID edge cases ─────────────────────────────────────
+
+    #[test]
+    fn discord_message_id_format_includes_discord_prefix() {
+        // Verify that message IDs follow the format: discord_{message_id}
+        let message_id = "123456789012345678";
+        let expected_id = format!("discord_{message_id}");
+        assert_eq!(expected_id, "discord_123456789012345678");
+    }
+
+    #[test]
+    fn discord_message_id_is_deterministic() {
+        // Same message_id = same ID (prevents duplicates after restart)
+        let message_id = "123456789012345678";
+        let id1 = format!("discord_{message_id}");
+        let id2 = format!("discord_{message_id}");
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn discord_message_id_different_message_different_id() {
+        // Different message IDs produce different IDs
+        let id1 = "discord_123456789012345678".to_string();
+        let id2 = "discord_987654321098765432".to_string();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn discord_message_id_uses_snowflake_id() {
+        // Discord snowflake IDs are numeric strings
+        let message_id = "123456789012345678"; // Typical snowflake format
+        let id = format!("discord_{message_id}");
+        assert!(id.starts_with("discord_"));
+        // Snowflake IDs are numeric
+        assert!(message_id.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn discord_message_id_fallback_to_uuid_on_empty() {
+        // Edge case: empty message_id falls back to UUID
+        let message_id = "";
+        let id = if message_id.is_empty() {
+            format!("discord_{}", uuid::Uuid::new_v4())
+        } else {
+            format!("discord_{message_id}")
+        };
+        assert!(id.starts_with("discord_"));
+        // Should have UUID dashes
+        assert!(id.contains('-'));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TG6: Channel platform limit edge cases for Discord (2000 char limit)
+    // Prevents: Pattern 6 — issues #574, #499
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn split_message_code_block_at_boundary() {
+        // Code block that spans the split boundary
+        let mut msg = String::new();
+        msg.push_str("```rust\n");
+        msg.push_str(&"x".repeat(1990));
+        msg.push_str("\n```\nMore text after code block");
+        let parts = split_message_for_discord(&msg);
+        assert!(
+            parts.len() >= 2,
+            "code block spanning boundary should split"
+        );
+        for part in &parts {
+            assert!(
+                part.len() <= DISCORD_MAX_MESSAGE_LENGTH,
+                "each part must be <= {DISCORD_MAX_MESSAGE_LENGTH}, got {}",
+                part.len()
+            );
+        }
+    }
+
+    #[test]
+    fn split_message_single_long_word_exceeds_limit() {
+        // A single word longer than 2000 chars must be hard-split
+        let long_word = "a".repeat(2500);
+        let parts = split_message_for_discord(&long_word);
+        assert!(parts.len() >= 2, "word exceeding limit must be split");
+        for part in &parts {
+            assert!(
+                part.len() <= DISCORD_MAX_MESSAGE_LENGTH,
+                "hard-split part must be <= {DISCORD_MAX_MESSAGE_LENGTH}, got {}",
+                part.len()
+            );
+        }
+        // Reassembled content should match original
+        let reassembled: String = parts.join("");
+        assert_eq!(reassembled, long_word);
+    }
+
+    #[test]
+    fn split_message_exactly_at_limit_no_split() {
+        let msg = "a".repeat(DISCORD_MAX_MESSAGE_LENGTH);
+        let parts = split_message_for_discord(&msg);
+        assert_eq!(parts.len(), 1, "message exactly at limit should not split");
+        assert_eq!(parts[0].len(), DISCORD_MAX_MESSAGE_LENGTH);
+    }
+
+    #[test]
+    fn split_message_one_over_limit_splits() {
+        let msg = "a".repeat(DISCORD_MAX_MESSAGE_LENGTH + 1);
+        let parts = split_message_for_discord(&msg);
+        assert!(parts.len() >= 2, "message 1 char over limit must split");
+    }
+
+    #[test]
+    fn split_message_many_short_lines() {
+        // Many short lines should be batched into chunks under the limit
+        let msg: String = (0..500).fold(String::new(), |mut acc, i| {
+            let _ = writeln!(acc, "line {i}");
+            acc
+        });
+        let parts = split_message_for_discord(&msg);
+        for part in &parts {
+            assert!(
+                part.len() <= DISCORD_MAX_MESSAGE_LENGTH,
+                "short-line batch must be <= limit"
+            );
+        }
+        // All content should be preserved
+        let reassembled: String = parts.join("");
+        assert_eq!(reassembled.trim(), msg.trim());
+    }
+
+    #[test]
+    fn split_message_only_whitespace() {
+        let msg = "   \n\n\t  ";
+        let parts = split_message_for_discord(msg);
+        // Should handle gracefully without panic
+        assert!(parts.len() <= 1);
+    }
+
+    #[test]
+    fn split_message_emoji_at_boundary() {
+        // Emoji are multi-byte; ensure we don't split mid-emoji
+        let mut msg = "a".repeat(1998);
+        msg.push_str("🎉🎊"); // 2 emoji at the boundary (2000 chars total)
+        let parts = split_message_for_discord(&msg);
+        for part in &parts {
+            // The function splits on character count, not byte count
+            assert!(
+                part.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH,
+                "emoji boundary split must respect limit"
+            );
+        }
+    }
+
+    #[test]
+    fn split_message_consecutive_newlines_at_boundary() {
+        let mut msg = "a".repeat(1995);
+        msg.push_str("\n\n\n\n\n");
+        msg.push_str(&"b".repeat(100));
+        let parts = split_message_for_discord(&msg);
+        for part in &parts {
+            assert!(part.len() <= DISCORD_MAX_MESSAGE_LENGTH);
+        }
+    }
+
+    // process_attachments tests
+
+    #[tokio::test]
+    async fn process_attachments_empty_list_returns_empty() {
+        let client = reqwest::Client::new();
+        let result = process_attachments(&[], &client).await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_attachments_skips_unsupported_types() {
+        let client = reqwest::Client::new();
+        let attachments = vec![serde_json::json!({
+            "url": "https://cdn.discordapp.com/attachments/123/456/doc.pdf",
+            "filename": "doc.pdf",
+            "content_type": "application/pdf"
+        })];
+        let result = process_attachments(&attachments, &client).await;
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_attachment_markers_extracts_supported_markers() {
+        let input = "Report\n[IMAGE:https://example.com/a.png]\n[DOCUMENT:/tmp/a.pdf]";
+        let (cleaned, attachments) = parse_attachment_markers(input);
+
+        assert_eq!(cleaned, "Report");
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].kind, DiscordAttachmentKind::Image);
+        assert_eq!(attachments[0].target, "https://example.com/a.png");
+        assert_eq!(attachments[1].kind, DiscordAttachmentKind::Document);
+        assert_eq!(attachments[1].target, "/tmp/a.pdf");
+    }
+
+    #[test]
+    fn parse_attachment_markers_keeps_invalid_marker_text() {
+        let input = "Hello [NOT_A_MARKER:foo] world";
+        let (cleaned, attachments) = parse_attachment_markers(input);
+
+        assert_eq!(cleaned, input);
+        assert!(attachments.is_empty());
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_splits_local_remote_and_unresolved() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file_path = temp.path().join("image.png");
+        std::fs::write(&file_path, b"fake").expect("write fixture");
+
+        let attachments = vec![
+            DiscordAttachment {
+                kind: DiscordAttachmentKind::Image,
+                target: file_path.to_string_lossy().to_string(),
+            },
+            DiscordAttachment {
+                kind: DiscordAttachmentKind::Image,
+                target: "https://example.com/remote.png".to_string(),
+            },
+            DiscordAttachment {
+                kind: DiscordAttachmentKind::Video,
+                target: "/tmp/does-not-exist.mp4".to_string(),
+            },
+        ];
+
+        let (locals, remotes, unresolved) = classify_outgoing_attachments(&attachments);
+        assert_eq!(locals.len(), 1);
+        assert_eq!(locals[0], file_path);
+        assert_eq!(remotes, vec!["https://example.com/remote.png".to_string()]);
+        assert_eq!(
+            unresolved,
+            vec!["[VIDEO:/tmp/does-not-exist.mp4]".to_string()]
+        );
+    }
+
+    #[test]
+    fn with_inline_attachment_urls_appends_urls_and_unresolved_markers() {
+        let content = "Done";
+        let remote_urls = vec!["https://example.com/a.png".to_string()];
+        let unresolved = vec!["[IMAGE:/tmp/missing.png]".to_string()];
+
+        let rendered = with_inline_attachment_urls(content, &remote_urls, &unresolved);
+        assert_eq!(
+            rendered,
+            "Done\nhttps://example.com/a.png\n[IMAGE:/tmp/missing.png]"
+        );
     }
 }

@@ -1,4 +1,5 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
+use std::any::Any;
 use tracing::info;
 
 /// Log-based observer — uses tracing, zero external deps
@@ -17,11 +18,17 @@ impl Observer for LogObserver {
                 info!(provider = %provider, model = %model, "agent.start");
             }
             ObserverEvent::AgentEnd {
+                provider,
+                model,
                 duration,
                 tokens_used,
+                cost_usd,
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-                info!(duration_ms = ms, tokens = ?tokens_used, "agent.end");
+                info!(provider = %provider, model = %model, duration_ms = ms, tokens = ?tokens_used, cost_usd = ?cost_usd, "agent.end");
+            }
+            ObserverEvent::ToolCallStart { tool } => {
+                info!(tool = %tool, "tool.start");
             }
             ObserverEvent::ToolCall {
                 tool,
@@ -31,6 +38,9 @@ impl Observer for LogObserver {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 info!(tool = %tool, duration_ms = ms, success = success, "tool.call");
             }
+            ObserverEvent::TurnComplete => {
+                info!("turn.complete");
+            }
             ObserverEvent::ChannelMessage { channel, direction } => {
                 info!(channel = %channel, direction = %direction, "channel.message");
             }
@@ -39,6 +49,39 @@ impl Observer for LogObserver {
             }
             ObserverEvent::Error { component, message } => {
                 info!(component = %component, error = %message, "error");
+            }
+            ObserverEvent::LlmRequest {
+                provider,
+                model,
+                messages_count,
+            } => {
+                info!(
+                    provider = %provider,
+                    model = %model,
+                    messages_count = messages_count,
+                    "llm.request"
+                );
+            }
+            ObserverEvent::LlmResponse {
+                provider,
+                model,
+                duration,
+                success,
+                error_message,
+                input_tokens,
+                output_tokens,
+            } => {
+                let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                info!(
+                    provider = %provider,
+                    model = %model,
+                    duration_ms = ms,
+                    success = success,
+                    error = ?error_message,
+                    input_tokens = ?input_tokens,
+                    output_tokens = ?output_tokens,
+                    "llm.response"
+                );
             }
         }
     }
@@ -64,6 +107,10 @@ impl Observer for LogObserver {
     fn name(&self) -> &str {
         "log"
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 #[cfg(test)]
@@ -84,12 +131,36 @@ mod tests {
             model: "claude-sonnet".into(),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
             duration: Duration::from_millis(500),
             tokens_used: Some(100),
+            cost_usd: Some(0.0015),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
             duration: Duration::ZERO,
             tokens_used: None,
+            cost_usd: None,
+        });
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(150),
+            success: true,
+            error_message: None,
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+        });
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(200),
+            success: false,
+            error_message: Some("rate limited".into()),
+            input_tokens: None,
+            output_tokens: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),

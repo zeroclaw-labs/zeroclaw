@@ -4,7 +4,7 @@ use crate::config::Config;
 use anyhow::Result;
 
 /// Integration status
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum IntegrationStatus {
     /// Fully implemented and ready to use
     Available,
@@ -15,7 +15,7 @@ pub enum IntegrationStatus {
 }
 
 /// Integration category
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum IntegrationCategory {
     Chat,
     AiModel,
@@ -107,7 +107,7 @@ fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("  Setup:");
             println!("    1. Message @BotFather on Telegram");
             println!("    2. Create a bot and copy the token");
-            println!("    3. Run: zeroclaw onboard");
+            println!("    3. Run: zeroclaw onboard --channels-only");
             println!("    4. Start: zeroclaw channel start");
         }
         "Discord" => {
@@ -115,13 +115,13 @@ fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("    1. Go to https://discord.com/developers/applications");
             println!("    2. Create app → Bot → Copy token");
             println!("    3. Enable MESSAGE CONTENT intent");
-            println!("    4. Run: zeroclaw onboard");
+            println!("    4. Run: zeroclaw onboard --channels-only");
         }
         "Slack" => {
             println!("  Setup:");
             println!("    1. Go to https://api.slack.com/apps");
             println!("    2. Create app → Bot Token Scopes → Install");
-            println!("    3. Run: zeroclaw onboard");
+            println!("    3. Run: zeroclaw onboard --channels-only");
         }
         "OpenRouter" => {
             println!("  Setup:");
@@ -163,11 +163,65 @@ fn show_integration_info(config: &Config, name: &str) -> Result<()> {
         _ => {
             if status == IntegrationStatus::ComingSoon {
                 println!("  This integration is planned. Stay tuned!");
-                println!("  Track progress: https://github.com/theonlyhennygod/zeroclaw");
+                println!("  Track progress: https://github.com/zeroclaw-labs/zeroclaw");
             }
         }
     }
 
     println!();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integration_category_all_includes_every_variant_once() {
+        let all = IntegrationCategory::all();
+        assert_eq!(all.len(), 9);
+
+        let labels: Vec<&str> = all.iter().map(|cat| cat.label()).collect();
+        assert!(labels.contains(&"Chat Providers"));
+        assert!(labels.contains(&"AI Models"));
+        assert!(labels.contains(&"Productivity"));
+        assert!(labels.contains(&"Music & Audio"));
+        assert!(labels.contains(&"Smart Home"));
+        assert!(labels.contains(&"Tools & Automation"));
+        assert!(labels.contains(&"Media & Creative"));
+        assert!(labels.contains(&"Social"));
+        assert!(labels.contains(&"Platforms"));
+    }
+
+    #[test]
+    fn handle_command_info_is_case_insensitive_for_known_integrations() {
+        let config = Config::default();
+        let first_name = registry::all_integrations()
+            .first()
+            .expect("registry should define at least one integration")
+            .name
+            .to_lowercase();
+
+        let result = handle_command(
+            crate::IntegrationCommands::Info { name: first_name },
+            &config,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn handle_command_info_returns_error_for_unknown_integration() {
+        let config = Config::default();
+        let result = handle_command(
+            crate::IntegrationCommands::Info {
+                name: "definitely-not-a-real-integration".into(),
+            },
+            &config,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Unknown integration"));
+    }
 }

@@ -1,0 +1,15 @@
+config:
+  default: true
+  MD013: false
+  MD007: false
+  MD031: false
+  MD032: false
+  MD033: false
+  MD040: false
+  MD041: false
+  MD060: false
+  MD024:
+    allow_different_nesting: true
+
+ignores:
+  - "target/**"

@@ -128,6 +128,7 @@ mod tests {
     use crate::config::schema::{
         CloudflareTunnelConfig, CustomTunnelConfig, NgrokTunnelConfig, TunnelConfig,
     };
+    use tokio::process::Command;
 
     /// Helper: assert `create_tunnel` returns an error containing `needle`.
     fn assert_tunnel_err(cfg: &TunnelConfig, needle: &str) {
@@ -312,5 +313,63 @@ mod tests {
         let t = CustomTunnel::new("echo hi".into(), None, None);
         assert_eq!(t.name(), "custom");
         assert!(t.public_url().is_none());
+    }
+
+    #[tokio::test]
+    async fn kill_shared_no_process_is_ok() {
+        let proc = new_shared_process();
+        let result = kill_shared(&proc).await;
+
+        assert!(result.is_ok());
+        assert!(proc.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn kill_shared_terminates_and_clears_child() {
+        let proc = new_shared_process();
+
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("sleep should spawn for lifecycle test");
+
+        {
+            let mut guard = proc.lock().await;
+            *guard = Some(TunnelProcess {
+                child,
+                public_url: "https://example.test".into(),
+            });
+        }
+
+        kill_shared(&proc).await.unwrap();
+
+        let guard = proc.lock().await;
+        assert!(guard.is_none());
+    }
+
+    #[tokio::test]
+    async fn cloudflare_health_false_before_start() {
+        let tunnel = CloudflareTunnel::new("tok".into());
+        assert!(!tunnel.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn ngrok_health_false_before_start() {
+        let tunnel = NgrokTunnel::new("tok".into(), None);
+        assert!(!tunnel.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn tailscale_health_false_before_start() {
+        let tunnel = TailscaleTunnel::new(false, None);
+        assert!(!tunnel.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn custom_health_false_before_start_without_health_url() {
+        let tunnel = CustomTunnel::new("echo hi".into(), None, Some("https://".into()));
+        assert!(!tunnel.health_check().await);
     }
 }

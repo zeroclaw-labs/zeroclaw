@@ -1,0 +1,13 @@
+[build]
+target = "riscv32imc-esp-espidf"
+
+[target.riscv32imc-esp-espidf]
+linker = "ldproxy"
+rustflags = [
+    "--cfg", 'espidf_time64',
+    "-C", "default-linker-libraries",
+]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+build-std-features = ["panic_immediate_abort"]

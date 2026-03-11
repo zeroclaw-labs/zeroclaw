@@ -20,16 +20,12 @@ reviews:
     enabled: true
     # Only review PRs targeting these branches
     base_branches:
-      - main
-      - develop
+      - master
     # Skip reviews for draft PRs or WIP
     drafts: false
-    # Enable base branch analysis
-    base_branch_analysis: true
   
-  # Poem configuration
-  poem:
-    enabled: false
+  # Poem feature toggle (must be a boolean, not an object)
+  poem: false
   
   # Reviewer suggestions
   reviewer:
