@@ -358,7 +358,6 @@ pub fn all_tools_with_runtime(
         }
     }
 
-
     // Compliance tool (enabled via [security.compliance] config)
     if root_config.security.compliance.enabled {
         let zeroclaw_dir = root_config

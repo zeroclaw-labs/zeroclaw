@@ -77,7 +77,10 @@ impl AuditEntry {
         result_summary: String,
         compliance_tags: Vec<ComplianceFramework>,
     ) -> Self {
-        let tag_labels: Vec<String> = compliance_tags.iter().map(|f| f.label().to_string()).collect();
+        let tag_labels: Vec<String> = compliance_tags
+            .iter()
+            .map(|f| f.label().to_string())
+            .collect();
         let timestamp = Utc::now();
         let hash = Self::compute_hash(
             prev_hash,
@@ -302,7 +305,9 @@ impl TamperEvidentLog {
     }
 
     fn export_csv(entries: &[AuditEntry]) -> Result<String> {
-        let mut out = String::from("timestamp,entry_id,actor,action,tool,result_summary,compliance_tags,hash,prev_hash\n");
+        let mut out = String::from(
+            "timestamp,entry_id,actor,action,tool,result_summary,compliance_tags,hash,prev_hash\n",
+        );
         for e in entries {
             out.push_str(&format!(
                 "{},{},{},{},{},{},{},{},{}\n",
@@ -465,8 +470,22 @@ mod tests {
         let log_path = tmp.path().join("audit.jsonl");
         let log = TamperEvidentLog::new(log_path.clone(), 0)?;
 
-        log.append("zeroclaw_agent".into(), "action_a".into(), None, None, "ok".into(), vec![])?;
-        log.append("zeroclaw_agent".into(), "action_b".into(), None, None, "ok".into(), vec![])?;
+        log.append(
+            "zeroclaw_agent".into(),
+            "action_a".into(),
+            None,
+            None,
+            "ok".into(),
+            vec![],
+        )?;
+        log.append(
+            "zeroclaw_agent".into(),
+            "action_b".into(),
+            None,
+            None,
+            "ok".into(),
+            vec![],
+        )?;
 
         // Tamper: rewrite first entry hash in the file
         let content = std::fs::read_to_string(&log_path)?;
@@ -491,13 +510,27 @@ mod tests {
         // First session
         {
             let log = TamperEvidentLog::new(log_path.clone(), 0)?;
-            log.append("zeroclaw_agent".into(), "action_a".into(), None, None, "ok".into(), vec![])?;
+            log.append(
+                "zeroclaw_agent".into(),
+                "action_a".into(),
+                None,
+                None,
+                "ok".into(),
+                vec![],
+            )?;
         }
 
         // Second session — should resume chain
         {
             let log = TamperEvidentLog::new(log_path.clone(), 0)?;
-            log.append("zeroclaw_agent".into(), "action_b".into(), None, None, "ok".into(), vec![])?;
+            log.append(
+                "zeroclaw_agent".into(),
+                "action_b".into(),
+                None,
+                None,
+                "ok".into(),
+                vec![],
+            )?;
         }
 
         let count = TamperEvidentLog::verify_chain_at(&log_path)?;
@@ -510,7 +543,14 @@ mod tests {
         let tmp = TempDir::new()?;
         let log_path = tmp.path().join("audit.jsonl");
         let log = TamperEvidentLog::new(log_path, 0)?;
-        log.append("zeroclaw_agent".into(), "test".into(), None, None, "ok".into(), vec![])?;
+        log.append(
+            "zeroclaw_agent".into(),
+            "test".into(),
+            None,
+            None,
+            "ok".into(),
+            vec![],
+        )?;
 
         let json = log.export(ExportFormat::Json)?;
         let parsed: Vec<AuditEntry> = serde_json::from_str(&json)?;
@@ -523,7 +563,14 @@ mod tests {
         let tmp = TempDir::new()?;
         let log_path = tmp.path().join("audit.jsonl");
         let log = TamperEvidentLog::new(log_path, 0)?;
-        log.append("zeroclaw_agent".into(), "test".into(), None, None, "ok".into(), vec![])?;
+        log.append(
+            "zeroclaw_agent".into(),
+            "test".into(),
+            None,
+            None,
+            "ok".into(),
+            vec![],
+        )?;
 
         let csv = log.export(ExportFormat::Csv)?;
         assert!(csv.starts_with("timestamp,"));
@@ -537,7 +584,14 @@ mod tests {
         let tmp = TempDir::new()?;
         let log_path = tmp.path().join("audit.jsonl");
         let log = TamperEvidentLog::new(log_path, 0)?;
-        log.append("zeroclaw_agent".into(), "test".into(), None, None, "ok".into(), vec![])?;
+        log.append(
+            "zeroclaw_agent".into(),
+            "test".into(),
+            None,
+            None,
+            "ok".into(),
+            vec![],
+        )?;
 
         let cef = log.export(ExportFormat::Cef)?;
         assert!(cef.starts_with("CEF:0|ZeroClaw|"));

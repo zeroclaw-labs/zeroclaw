@@ -51,7 +51,14 @@ fn redact_field(value: &str, max_len: usize) -> String {
     // Use char_indices to find safe UTF-8 boundaries and avoid panics on
     // multi-byte characters.
     let start: String = value.chars().take(keep).collect();
-    let end: String = value.chars().rev().take(keep).collect::<Vec<_>>().into_iter().rev().collect();
+    let end: String = value
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("{}[...]{}", start, end)
 }
 
@@ -105,16 +112,15 @@ impl ComplianceTool {
         let log = self.open_log()?;
         let entries = log.read_entries()?;
 
-        let from_dt = from
-            .map(|s| parse_date_start(s))
-            .transpose()?;
-        let to_dt = to
-            .map(|s| parse_date_end_exclusive(s))
-            .transpose()?;
+        let from_dt = from.map(|s| parse_date_start(s)).transpose()?;
+        let to_dt = to.map(|s| parse_date_end_exclusive(s)).transpose()?;
 
         if let (Some(f), Some(t)) = (from_dt, to_dt) {
             if f >= t {
-                anyhow::bail!("Invalid date range: 'from' ({}) must be before 'to'", from.unwrap_or("?"));
+                anyhow::bail!(
+                    "Invalid date range: 'from' ({}) must be before 'to'",
+                    from.unwrap_or("?")
+                );
             }
         }
 
@@ -290,7 +296,10 @@ impl ComplianceTool {
         } else {
             status.push_str("Data residency: not configured\n");
         }
-        status.push_str(&format!("Report output: {}\n", self.config.report_output_dir));
+        status.push_str(&format!(
+            "Report output: {}\n",
+            self.config.report_output_dir
+        ));
         status.push_str(&format!(
             "Audit retention: {} days\n",
             self.config.audit_retention_days
@@ -305,21 +314,14 @@ impl ComplianceTool {
             match TamperEvidentLog::new(log_path, 0) {
                 Ok(log) => match log.verify_chain() {
                     Ok(count) => {
-                        status.push_str(&format!(
-                            "\nAudit log: {} entries, chain intact\n",
-                            count
-                        ));
+                        status.push_str(&format!("\nAudit log: {} entries, chain intact\n", count));
                     }
                     Err(e) => {
-                        status
-                            .push_str(&format!("\nAudit log: chain BROKEN ({})\n", e));
+                        status.push_str(&format!("\nAudit log: chain BROKEN ({})\n", e));
                     }
                 },
                 Err(e) => {
-                    status.push_str(&format!(
-                        "\nAudit log: unavailable ({})\n",
-                        e
-                    ));
+                    status.push_str(&format!("\nAudit log: unavailable ({})\n", e));
                 }
             }
         } else {
@@ -426,10 +428,7 @@ impl Tool for ComplianceTool {
             });
         }
 
-        let command = args
-            .get("command")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
 
         match command {
             "report" => {

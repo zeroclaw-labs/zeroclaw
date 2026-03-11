@@ -127,7 +127,10 @@ impl ComplianceClassifier {
         }
 
         // ISO27001: information security management
-        if self.active_frameworks.contains(&ComplianceFramework::Iso27001) {
+        if self
+            .active_frameworks
+            .contains(&ComplianceFramework::Iso27001)
+        {
             if lower.contains("security_policy")
                 || lower.contains("risk_assessment")
                 || lower.contains("asset_management")
@@ -186,9 +189,15 @@ pub enum ResidencyCheckResult {
     /// Action is allowed (region is in the allowed set).
     Allowed,
     /// Action is blocked due to residency violation.
-    Blocked { region: String, allowed: Vec<String> },
+    Blocked {
+        region: String,
+        allowed: Vec<String>,
+    },
     /// Action is warned but not blocked.
-    Warned { region: String, allowed: Vec<String> },
+    Warned {
+        region: String,
+        allowed: Vec<String>,
+    },
 }
 
 impl DataResidencyPolicy {
@@ -224,8 +233,14 @@ mod tests {
 
     #[test]
     fn framework_from_name_roundtrip() {
-        assert_eq!(ComplianceFramework::from_name("finma"), ComplianceFramework::Finma);
-        assert_eq!(ComplianceFramework::from_name("GDPR"), ComplianceFramework::Gdpr);
+        assert_eq!(
+            ComplianceFramework::from_name("finma"),
+            ComplianceFramework::Finma
+        );
+        assert_eq!(
+            ComplianceFramework::from_name("GDPR"),
+            ComplianceFramework::Gdpr
+        );
         // Custom frameworks preserve original case
         assert_eq!(
             ComplianceFramework::from_name("CUSTOM_RULE"),
@@ -246,10 +261,8 @@ mod tests {
 
     #[test]
     fn classifier_tags_finma_action() {
-        let classifier = ComplianceClassifier::new(&[
-            ComplianceFramework::Finma,
-            ComplianceFramework::Gdpr,
-        ]);
+        let classifier =
+            ComplianceClassifier::new(&[ComplianceFramework::Finma, ComplianceFramework::Gdpr]);
         let tags = classifier.classify("submit_financial_transaction");
         assert!(tags.contains(&ComplianceFramework::Finma));
         assert!(!tags.contains(&ComplianceFramework::Gdpr));
@@ -257,10 +270,8 @@ mod tests {
 
     #[test]
     fn classifier_returns_empty_for_unrelated_action() {
-        let classifier = ComplianceClassifier::new(&[
-            ComplianceFramework::Gdpr,
-            ComplianceFramework::Finma,
-        ]);
+        let classifier =
+            ComplianceClassifier::new(&[ComplianceFramework::Gdpr, ComplianceFramework::Finma]);
         let tags = classifier.classify("list_directory_contents");
         assert!(tags.is_empty());
     }
@@ -272,8 +283,14 @@ mod tests {
             data_classification: DataClassification::Confidential,
             enforcement_mode: ResidencyEnforcementMode::Block,
         };
-        assert!(matches!(policy.check_region("CH"), ResidencyCheckResult::Allowed));
-        assert!(matches!(policy.check_region("ch"), ResidencyCheckResult::Allowed));
+        assert!(matches!(
+            policy.check_region("CH"),
+            ResidencyCheckResult::Allowed
+        ));
+        assert!(matches!(
+            policy.check_region("ch"),
+            ResidencyCheckResult::Allowed
+        ));
     }
 
     #[test]

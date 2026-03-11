@@ -20,9 +20,9 @@
 
 pub mod audit;
 pub mod audit_enhanced;
-pub mod compliance;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
+pub mod compliance;
 pub mod detect;
 pub mod docker;
 
