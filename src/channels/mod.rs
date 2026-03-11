@@ -35,6 +35,7 @@ pub mod slack;
 pub mod telegram;
 pub mod traits;
 pub mod transcription;
+pub mod tts;
 pub mod wati;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
@@ -62,6 +63,8 @@ pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
+#[allow(unused_imports)]
+pub use tts::{TtsManager, TtsProvider};
 pub use wati::WatiChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
@@ -632,6 +635,28 @@ async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRu
     if let Some(zeroclaw_dir) = path.parent() {
         let store = crate::security::SecretStore::new(zeroclaw_dir, parsed.secrets.encrypt);
         decrypt_optional_secret_for_runtime_reload(&store, &mut parsed.api_key, "config.api_key")?;
+        // Decrypt TTS provider API keys for runtime reload
+        if let Some(ref mut openai) = parsed.tts.openai {
+            decrypt_optional_secret_for_runtime_reload(
+                &store,
+                &mut openai.api_key,
+                "config.tts.openai.api_key",
+            )?;
+        }
+        if let Some(ref mut elevenlabs) = parsed.tts.elevenlabs {
+            decrypt_optional_secret_for_runtime_reload(
+                &store,
+                &mut elevenlabs.api_key,
+                "config.tts.elevenlabs.api_key",
+            )?;
+        }
+        if let Some(ref mut google) = parsed.tts.google {
+            decrypt_optional_secret_for_runtime_reload(
+                &store,
+                &mut google.api_key,
+                "config.tts.google.api_key",
+            )?;
+        }
     }
 
     parsed.apply_env_overrides();
@@ -1295,9 +1320,7 @@ fn sanitize_tool_json_value(
         return None;
     }
 
-    let Some(object) = value.as_object() else {
-        return None;
-    };
+    let object = value.as_object()?;
 
     if let Some(tool_calls) = object.get("tool_calls").and_then(|value| value.as_array()) {
         if !tool_calls.is_empty()
@@ -1337,7 +1360,7 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
     let mut saw_tool_call_payload = false;
 
     while cursor < message.len() {
-        let Some(rel_start) = message[cursor..].find(|ch: char| ch == '{' || ch == '[') else {
+        let Some(rel_start) = message[cursor..].find(['{', '[']) else {
             cleaned.push_str(&message[cursor..]);
             break;
         };
@@ -2682,7 +2705,7 @@ struct ConfiguredChannel {
 
 fn collect_configured_channels(
     config: &Config,
-    _matrix_skip_context: &str,
+    matrix_skip_context: &str,
 ) -> Vec<ConfiguredChannel> {
     let mut channels = Vec::new();
 
@@ -2718,11 +2741,16 @@ fn collect_configured_channels(
     if let Some(ref sl) = config.channels_config.slack {
         channels.push(ConfiguredChannel {
             display_name: "Slack",
-            channel: Arc::new(SlackChannel::new(
-                sl.bot_token.clone(),
-                sl.channel_id.clone(),
-                sl.allowed_users.clone(),
-            )),
+            channel: Arc::new(
+                SlackChannel::new(
+                    sl.bot_token.clone(),
+                    sl.app_token.clone(),
+                    sl.channel_id.clone(),
+                    Vec::new(),
+                    sl.allowed_users.clone(),
+                )
+                .with_workspace_dir(config.workspace_dir.clone()),
+            ),
         });
     }
 
@@ -2767,7 +2795,7 @@ fn collect_configured_channels(
     if config.channels_config.matrix.is_some() {
         tracing::warn!(
             "Matrix channel is configured but this build was compiled without `channel-matrix`; skipping Matrix {}.",
-            _matrix_skip_context
+            matrix_skip_context
         );
     }
 
@@ -3076,8 +3104,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
     ));
     let model = resolved_default_model(&config);
     let temperature = config.default_temperature;
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
         &config.memory,
+        &config.embedding_routes,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),

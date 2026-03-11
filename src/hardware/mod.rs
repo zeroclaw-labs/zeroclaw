@@ -109,7 +109,7 @@ pub fn handle_command(cmd: crate::HardwareCommands, _config: &Config) -> Result<
         let _ = &cmd;
         println!("Hardware discovery requires the 'hardware' feature.");
         println!("Build with: cargo build --features hardware");
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(all(

@@ -19,4 +19,4 @@ Tra cứu lệnh, provider, channel, config và tích hợp.
 
 Sử dụng bộ sưu tập này khi bạn cần chi tiết CLI/config chính xác hoặc các mẫu tích hợp provider thay vì hướng dẫn từng bước.
 
-Khi thêm tài liệu tham chiếu/tích hợp mới, hãy đảm bảo nó được liên kết trong cả [../SUMMARY.md](../SUMMARY.md) và [docs-inventory.md](../../../docs-inventory.md).
+Khi thêm tài liệu tham chiếu/tích hợp mới, hãy đảm bảo nó được liên kết trong cả [../SUMMARY.md](../SUMMARY.md) và [docs-inventory.md](../../../maintainers/docs-inventory.md).
