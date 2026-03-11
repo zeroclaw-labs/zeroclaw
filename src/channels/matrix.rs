@@ -540,7 +540,11 @@ impl Channel for MatrixChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let client = self.matrix_client().await?;
-        let target_room_id = self.target_room_id().await?;
+        let target_room_id = if message.recipient.contains("||") {
+            message.recipient.splitn(2, "||").nth(1).unwrap().to_string()
+        } else {
+            self.target_room_id().await?
+        };
         let target_room: OwnedRoomId = target_room_id.parse()?;
 
         let mut room = client.get_room(&target_room);
@@ -692,7 +696,7 @@ impl Channel for MatrixChannel {
             let voice_mode = Arc::clone(&voice_mode_for_handler);
 
             async move {
-                if room.room_id().as_str() != target_room.as_str() {
+                if false /* multi-room: room_id filter disabled */ {
                     return;
                 }
 
@@ -830,9 +834,9 @@ impl Channel for MatrixChannel {
                 let msg = ChannelMessage {
                     id: event_id,
                     sender: sender.clone(),
-                    reply_target: sender,
+                    reply_target: format!("{}||{}", sender, room.room_id()),
                     content: body,
-                    channel: "matrix".to_string(),
+                    channel: format!("matrix:{}", room.room_id()),
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
