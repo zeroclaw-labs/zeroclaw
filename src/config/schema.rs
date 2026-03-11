@@ -11147,6 +11147,149 @@ denied_tools = ["shell"]
         let _ = fs::remove_dir_all(&dir).await;
     }
 
+    // RED: verify that save→load round-trip decrypts channel credentials and
+    // paired_tokens back to their original plaintext values (regression guard
+    // for issues #3173 and #3175).
+    #[tokio::test]
+    async fn config_secrets_survive_save_load_roundtrip() {
+        let _env_guard = env_override_lock().await;
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_roundtrip_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let original_config_dir = std::env::var("ZEROCLAW_CONFIG_DIR").ok();
+        std::env::set_var("ZEROCLAW_CONFIG_DIR", &dir);
+
+        // Build a config with secrets on every critical path.
+        let mut config = Config::default();
+        config.workspace_dir = dir.join("workspace");
+        config.config_path = dir.join("config.toml");
+        config.secrets.encrypt = true;
+        config.api_key = Some("sk-roundtrip-root".into());
+        config.gateway.paired_tokens = vec!["zc_paired_token_abc123".into()];
+        config.channels_config.telegram = Some(TelegramConfig {
+            bot_token: "telegram-bot-token-roundtrip".into(),
+            allowed_users: Vec::new(),
+            stream_mode: StreamMode::Off,
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+            progress_mode: ProgressMode::default(),
+            ack_enabled: true,
+            group_reply: None,
+            base_url: None,
+        });
+        config.channels_config.discord = Some(DiscordConfig {
+            bot_token: "discord-bot-token-roundtrip".into(),
+            guild_id: None,
+            allowed_users: Vec::new(),
+            listen_to_bots: false,
+            mention_only: false,
+            group_reply: None,
+        });
+        config.channels_config.slack = Some(SlackConfig {
+            bot_token: "slack-bot-token-roundtrip".into(),
+            app_token: Some("slack-app-token-roundtrip".into()),
+            channel_id: None,
+            channel_ids: Vec::new(),
+            allowed_users: Vec::new(),
+            group_reply: None,
+        });
+
+        config.save().await.unwrap();
+
+        // Confirm the saved file actually contains encrypted values (not plaintext).
+        let saved_toml = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        assert!(
+            saved_toml.contains("enc2:"),
+            "save() must produce enc2: encrypted values"
+        );
+        assert!(
+            !saved_toml.contains("sk-roundtrip-root"),
+            "api_key must not be stored in plaintext"
+        );
+        assert!(
+            !saved_toml.contains("telegram-bot-token-roundtrip"),
+            "telegram bot_token must not be stored in plaintext"
+        );
+        assert!(
+            !saved_toml.contains("zc_paired_token_abc123"),
+            "paired_tokens must not be stored in plaintext"
+        );
+
+        // Load via load_or_init — this exercises the full decrypt path.
+        let loaded = Config::load_or_init().await.unwrap();
+
+        // Root api_key
+        assert_eq!(
+            loaded.api_key.as_deref(),
+            Some("sk-roundtrip-root"),
+            "api_key must be decrypted after load"
+        );
+
+        // Gateway paired_tokens: after load, the raw token should be present
+        // so PairingGuard can accept it. OR it is stored as its SHA-256 hash
+        // (which is also valid — PairingGuard handles both forms). Either way
+        // neither form may start with "enc2:".
+        assert_eq!(
+            loaded.gateway.paired_tokens.len(),
+            1,
+            "paired_tokens count must survive round-trip"
+        );
+        assert!(
+            !loaded.gateway.paired_tokens[0].starts_with("enc2:"),
+            "paired_tokens[0] must be decrypted after load, got: {:?}",
+            loaded.gateway.paired_tokens[0]
+        );
+
+        // Channel credentials
+        let tg = loaded
+            .channels_config
+            .telegram
+            .as_ref()
+            .expect("telegram config must survive round-trip");
+        assert_eq!(
+            tg.bot_token, "telegram-bot-token-roundtrip",
+            "telegram bot_token must be decrypted after load"
+        );
+
+        let dc = loaded
+            .channels_config
+            .discord
+            .as_ref()
+            .expect("discord config must survive round-trip");
+        assert_eq!(
+            dc.bot_token, "discord-bot-token-roundtrip",
+            "discord bot_token must be decrypted after load"
+        );
+
+        let sl = loaded
+            .channels_config
+            .slack
+            .as_ref()
+            .expect("slack config must survive round-trip");
+        assert_eq!(
+            sl.bot_token, "slack-bot-token-roundtrip",
+            "slack bot_token must be decrypted after load"
+        );
+        assert_eq!(
+            sl.app_token.as_deref(),
+            Some("slack-app-token-roundtrip"),
+            "slack app_token must be decrypted after load"
+        );
+
+        // Restore env.
+        match original_config_dir {
+            Some(v) => std::env::set_var("ZEROCLAW_CONFIG_DIR", v),
+            None => std::env::remove_var("ZEROCLAW_CONFIG_DIR"),
+        }
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
     #[tokio::test]
     async fn config_save_atomic_cleanup() {
         let dir =
