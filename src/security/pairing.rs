@@ -286,6 +286,18 @@ impl PairingGuard {
         tokens.iter().cloned().collect()
     }
 
+    /// Generate a new pairing code, even if already paired.
+    /// This allows adding additional clients without restarting the gateway.
+    /// The new code can be used exactly once to pair a new client.
+    pub fn generate_new_pairing_code(&self) -> Option<String> {
+        if !self.require_pairing {
+            return None;
+        }
+        let new_code = generate_code();
+        *self.pairing_code.lock() = Some(new_code.clone());
+        Some(new_code)
+    }
+
     /// List paired devices with non-secret metadata for dashboard management.
     pub fn paired_devices(&self) -> Vec<PairedDevice> {
         let token_hashes: Vec<String> = {
@@ -436,6 +448,7 @@ fn is_token_hash(value: &str) -> bool {
 ///
 /// Does not short-circuit on length mismatch — always iterates over the
 /// longer input to avoid leaking length information via timing.
+#[allow(clippy::needless_bitwise_bool)]
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();

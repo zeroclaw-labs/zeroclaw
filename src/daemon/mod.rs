@@ -357,7 +357,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 }
 
 fn heartbeat_announcement_text(output: &str) -> Option<String> {
-    if crate::cron::scheduler::is_no_reply_sentinel(output) || is_heartbeat_ok_sentinel(output) {
+    if output.trim().eq_ignore_ascii_case("NO_REPLY") || is_heartbeat_ok_sentinel(output) {
         return None;
     }
     if output.trim().is_empty() {

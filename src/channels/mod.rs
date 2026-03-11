@@ -5445,7 +5445,8 @@ fn collect_configured_channels(
                 .with_group_reply_policy(
                     sl.effective_group_reply_mode().requires_mention(),
                     sl.group_reply_allowed_sender_ids(),
-                ),
+                )
+                .with_workspace_dir(config.workspace_dir.clone()),
             ),
         });
     }
