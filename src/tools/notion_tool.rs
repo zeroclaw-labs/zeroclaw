@@ -789,7 +789,11 @@ mod tests {
         NotionTool::new(
             "test-key".into(),
             Arc::new(SecurityPolicy::default()),
-            NotionPermissions::default(),
+            NotionPermissions {
+                allow_read: true,
+                allow_insert: true,
+                allow_update: true,
+            },
         )
     }
 
@@ -797,7 +801,11 @@ mod tests {
         NotionTool::with_base_url(
             "test-key".into(),
             Arc::new(SecurityPolicy::default()),
-            NotionPermissions::default(),
+            NotionPermissions {
+                allow_read: true,
+                allow_insert: true,
+                allow_update: true,
+            },
             base_url,
         )
     }
@@ -1368,7 +1376,11 @@ mod tests {
         let tool = NotionTool::with_base_url(
             "test-key".into(),
             Arc::new(policy),
-            NotionPermissions::default(),
+            NotionPermissions {
+                allow_read: true,
+                allow_insert: true,
+                allow_update: true,
+            },
             "http://unused".into(),
         );
 
