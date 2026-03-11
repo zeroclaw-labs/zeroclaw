@@ -80,6 +80,7 @@ Last refreshed: **February 18, 2026**.
 - [reviewer-playbook.md](contributing/reviewer-playbook.md)
 - [ci-map.md](contributing/ci-map.md)
 - [actions-source-policy.md](contributing/actions-source-policy.md)
+- [extension-examples.md](contributing/extension-examples.md)
 
 ### 7) Project Status & Snapshot
 
