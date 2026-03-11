@@ -3914,6 +3914,20 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
+                let hs_trimmed = homeserver.trim().trim_end_matches('/');
+                if !hs_trimmed.starts_with("https://") {
+                    let is_loopback = hs_trimmed.starts_with("http://localhost")
+                        || hs_trimmed.starts_with("http://127.0.0.1")
+                        || hs_trimmed.starts_with("http://[::1]");
+                    if !is_loopback {
+                        println!(
+                            "  {} HTTPS required for non-local homeservers",
+                            style("✗").red()
+                        );
+                        continue;
+                    }
+                }
+
                 let auth_choices = vec!["Access token", "Password"];
                 let auth_choice = Select::new()
                     .with_prompt("  Authentication method")

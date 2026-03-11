@@ -377,8 +377,8 @@ async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result
 fn compress_image_if_needed(bytes: &[u8], mime: &str) -> (Vec<u8>, String) {
     const MAX_DIM: u32 = 1024;
 
-    // GIF may be animated — skip compression entirely to preserve animation.
-    if mime == "image/gif" {
+    // GIF/WebP may be animated — skip compression entirely to preserve animation.
+    if matches!(mime, "image/gif" | "image/webp") {
         return (bytes.to_vec(), mime.to_string());
     }
 
@@ -396,7 +396,7 @@ fn compress_image_if_needed(bytes: &[u8], mime: &str) -> (Vec<u8>, String) {
 
     // Choose output format based on whether the image has transparency.
     // PNG/WebP with alpha would lose transparency if re-encoded as JPEG.
-    let has_alpha = matches!(mime, "image/png" | "image/webp") && resized.color().has_alpha();
+    let has_alpha = mime == "image/png" && resized.color().has_alpha();
 
     let (format, out_mime) = if has_alpha {
         (image::ImageFormat::Png, "image/png".to_string())
