@@ -400,29 +400,30 @@ impl KnowledgeGraph {
         let depth = depth.min(Self::MAX_SUBGRAPH_DEPTH);
 
         let mut visited: HashSet<String> = HashSet::new();
-        let mut frontier = vec![root_id.to_string()];
         let mut nodes = Vec::new();
         let mut edges = Vec::new();
 
+        // Visit the root node first, then expand outward `depth` levels.
+        visited.insert(root_id.to_string());
+        if let Some(root_node) = self.get_node(root_id)? {
+            nodes.push(root_node);
+        }
+
+        let mut frontier = vec![root_id.to_string()];
         for _ in 0..depth {
             if frontier.is_empty() {
                 break;
             }
             let mut next_frontier = Vec::new();
             for nid in &frontier {
-                if !visited.insert(nid.clone()) {
-                    continue;
-                }
-                if let Some(node) = self.get_node(nid)? {
-                    nodes.push(node);
-                }
                 for (related, relation) in self.find_related(nid)? {
                     edges.push(KnowledgeEdge {
                         from_id: nid.clone(),
                         to_id: related.id.clone(),
                         relation,
                     });
-                    if !visited.contains(&related.id) {
+                    if visited.insert(related.id.clone()) {
+                        nodes.push(related.clone());
                         next_frontier.push(related.id.clone());
                     }
                 }
