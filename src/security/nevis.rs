@@ -284,7 +284,12 @@ impl NevisAuthProvider {
                 .split_whitespace()
                 .map(String::from)
                 .collect(),
-            mfa_verified: body.acr.as_deref() == Some("mfa"),
+            mfa_verified: body.acr.as_deref() == Some("mfa")
+                || body
+                    .amr
+                    .iter()
+                    .flatten()
+                    .any(|m| m == "fido2" || m == "passkey" || m == "otp" || m == "webauthn"),
             session_expiry: now + self.session_timeout.as_secs(),
         };
 
@@ -360,6 +365,8 @@ struct UserInfoResponse {
     realm_access: Option<RealmAccess>,
     scope: Option<String>,
     acr: Option<String>,
+    /// Authentication Methods References
+    amr: Option<Vec<String>>,
 }
 
 // ── Tests ──────────────────────────────────────────────────────────

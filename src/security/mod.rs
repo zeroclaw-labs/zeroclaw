@@ -68,13 +68,16 @@ pub use leak_detector::{LeakDetector, LeakResult};
 #[allow(unused_imports)]
 pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
 
-/// Redact sensitive values for safe logging. Shows first 4 chars + "***" suffix.
+/// Redact sensitive values for safe logging. Shows first 4 characters + "***" suffix.
+/// Uses char-boundary-safe indexing to avoid panics on multi-byte UTF-8 strings.
 /// This function intentionally breaks the data-flow taint chain for static analysis.
 pub fn redact(value: &str) -> String {
-    if value.len() <= 4 {
+    let char_count = value.chars().count();
+    if char_count <= 4 {
         "***".to_string()
     } else {
-        format!("{}***", &value[..4])
+        let prefix: String = value.chars().take(4).collect();
+        format!("{prefix}***")
     }
 }
 

@@ -4,6 +4,7 @@
 //! deny-by-default policy model. All policy decisions are audit-logged.
 
 use super::nevis::NevisIdentity;
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -57,7 +58,10 @@ struct CompiledRole {
 
 impl IamPolicy {
     /// Build a policy from role mappings (typically from config).
-    pub fn from_mappings(mappings: &[RoleMapping]) -> Self {
+    ///
+    /// Returns an error if duplicate normalized role names are detected,
+    /// since silent last-wins overwrites can accidentally broaden or revoke access.
+    pub fn from_mappings(mappings: &[RoleMapping]) -> Result<Self> {
         let mut role_map = HashMap::new();
 
         for mapping in mappings {
@@ -89,10 +93,11 @@ impl IamPolicy {
                 .collect();
 
             if role_map.contains_key(&key) {
-                tracing::warn!(
-                    role = %key,
-                    "IAM policy: duplicate role mapping for '{}' — later definition overwrites earlier one",
-                    key
+                bail!(
+                    "IAM policy: duplicate role mapping for normalized key '{}' \
+                     (from nevis_role '{}') — remove or merge the duplicate entry",
+                    key,
+                    mapping.nevis_role
                 );
             }
 
@@ -107,7 +112,7 @@ impl IamPolicy {
             );
         }
 
-        Self { role_map }
+        Ok(Self { role_map })
     }
 
     /// Evaluate whether an identity is allowed to use a specific tool.
@@ -246,7 +251,7 @@ mod tests {
 
     #[test]
     fn admin_gets_all_tools() {
-        let policy = IamPolicy::from_mappings(&test_mappings());
+        let policy = IamPolicy::from_mappings(&test_mappings()).unwrap();
         let identity = identity_with_roles(vec!["admin"]);
 
         assert!(policy.evaluate_tool_access(&identity, "shell").is_allowed());
@@ -260,7 +265,7 @@ mod tests {
 
     #[test]
     fn admin_gets_all_workspaces() {
-        let policy = IamPolicy::from_mappings(&test_mappings());
+        let policy = IamPolicy::from_mappings(&test_mappings()).unwrap();
         let identity = identity_with_roles(vec!["admin"]);
 
         assert!(policy
@@ -273,7 +278,7 @@ mod tests {
 
     #[test]
     fn operator_gets_subset_of_tools() {
-        let policy = IamPolicy::from_mappings(&test_mappings());
+        let policy = IamPolicy::from_mappings(&test_mappings()).unwrap();
         let identity = identity_with_roles(vec!["operator"]);
 
         assert!(policy.evaluate_tool_access(&identity, "shell").is_allowed());
@@ -287,7 +292,7 @@ mod tests {
 
     #[test]
     fn operator_workspace_access_is_scoped() {
-        let policy = IamPolicy::from_mappings(&test_mappings());
+        let policy = IamPolicy::from_mappings(&test_mappings()).unwrap();
         let identity = identity_with_roles(vec!["operator"]);
 
         assert!(policy
@@ -303,7 +308,7 @@ mod tests {
 
     #[test]
     fn viewer_is_read_only() {
-        let policy = IamPolicy::from_mappings(&test_mappings());
+        let policy = IamPolicy::from_mappings(&test_mappings()).unwrap();
         let identity = identity_with_roles(vec!["viewer"]);
 
         assert!(policy
@@ -320,7 +325,7 @@ mod tests {
 
     #[test]
     fn deny_by_default_for_unknown_role() {
-        let policy = IamPolicy::from_mappings(&test_mappings());
+        let policy = IamPolicy::from_mappings(&test_mappings()).unwrap();
         let identity = identity_with_roles(vec!["unknown_role"]);
 
         assert!(!policy.evaluate_tool_access(&identity, "shell").is_allowed());
@@ -331,7 +336,7 @@ mod tests {
 
     #[test]
     fn deny_by_default_for_no_roles() {
-        let policy = IamPolicy::from_mappings(&test_mappings());
+        let policy = IamPolicy::from_mappings(&test_mappings()).unwrap();
         let identity = identity_with_roles(vec![]);
 
         assert!(!policy
@@ -341,7 +346,7 @@ mod tests {
 
     #[test]
     fn multiple_roles_union_permissions() {
-        let policy = IamPolicy::from_mappings(&test_mappings());
+        let policy = IamPolicy::from_mappings(&test_mappings()).unwrap();
         let identity = identity_with_roles(vec!["viewer", "operator"]);
 
         // viewer has file_read, operator has shell — both should be accessible
@@ -353,7 +358,7 @@ mod tests {
 
     #[test]
     fn role_matching_is_case_insensitive() {
-        let policy = IamPolicy::from_mappings(&test_mappings());
+        let policy = IamPolicy::from_mappings(&test_mappings()).unwrap();
         let identity = identity_with_roles(vec!["ADMIN"]);
 
         assert!(policy.evaluate_tool_access(&identity, "shell").is_allowed());
@@ -361,7 +366,7 @@ mod tests {
 
     #[test]
     fn tool_matching_is_case_insensitive() {
-        let policy = IamPolicy::from_mappings(&test_mappings());
+        let policy = IamPolicy::from_mappings(&test_mappings()).unwrap();
         let identity = identity_with_roles(vec!["operator"]);
 
         assert!(policy.evaluate_tool_access(&identity, "SHELL").is_allowed());
@@ -372,7 +377,7 @@ mod tests {
 
     #[test]
     fn empty_tool_name_is_denied() {
-        let policy = IamPolicy::from_mappings(&test_mappings());
+        let policy = IamPolicy::from_mappings(&test_mappings()).unwrap();
         let identity = identity_with_roles(vec!["admin"]);
 
         assert!(!policy.evaluate_tool_access(&identity, "").is_allowed());
@@ -381,7 +386,7 @@ mod tests {
 
     #[test]
     fn empty_workspace_name_is_denied() {
-        let policy = IamPolicy::from_mappings(&test_mappings());
+        let policy = IamPolicy::from_mappings(&test_mappings()).unwrap();
         let identity = identity_with_roles(vec!["admin"]);
 
         assert!(!policy.evaluate_workspace_access(&identity, "").is_allowed());
@@ -389,7 +394,7 @@ mod tests {
 
     #[test]
     fn empty_mappings_deny_everything() {
-        let policy = IamPolicy::from_mappings(&[]);
+        let policy = IamPolicy::from_mappings(&[]).unwrap();
         let identity = identity_with_roles(vec!["admin"]);
 
         assert!(policy.is_empty());
@@ -398,7 +403,7 @@ mod tests {
 
     #[test]
     fn policy_decision_deny_contains_reason() {
-        let policy = IamPolicy::from_mappings(&test_mappings());
+        let policy = IamPolicy::from_mappings(&test_mappings()).unwrap();
         let identity = identity_with_roles(vec!["viewer"]);
 
         let decision = policy.evaluate_tool_access(&identity, "shell");
@@ -417,7 +422,7 @@ mod tests {
             zeroclaw_permissions: vec!["all".into()],
             workspace_access: vec![],
         }];
-        let policy = IamPolicy::from_mappings(&mappings);
+        let policy = IamPolicy::from_mappings(&mappings).unwrap();
         assert!(policy.is_empty());
     }
 }
