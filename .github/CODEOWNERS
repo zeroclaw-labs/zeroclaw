@@ -1,32 +1,32 @@
 # Default owner for all files
-* @jordanthejet
+* @JordanTheJet @SimianAstronaut7
 
 # Important functional modules
-/src/agent/** @theonlyhennygod
-/src/providers/** @theonlyhennygod
-/src/channels/** @theonlyhennygod
-/src/tools/** @theonlyhennygod
-/src/gateway/** @theonlyhennygod
-/src/runtime/** @theonlyhennygod
-/src/memory/** @theonlyhennygod
-/Cargo.toml @theonlyhennygod
-/Cargo.lock @theonlyhennygod
+/src/agent/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/src/providers/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/src/channels/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/src/tools/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/src/gateway/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/src/runtime/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/src/memory/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/Cargo.toml @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/Cargo.lock @theonlyhennygod @JordanTheJet @SimianAstronaut7
 
 # Security / tests / CI-CD ownership
-/src/security/** @jordanthejet
-/tests/** @jordanthejet
-/.github/** @jordanthejet
-/.github/workflows/** @jordanthejet
-/.github/codeql/** @jordanthejet
-/.github/dependabot.yml @jordanthejet
-/SECURITY.md @jordanthejet
-/docs/actions-source-policy.md @jordanthejet
-/docs/ci-map.md @jordanthejet
+/src/security/** @JordanTheJet @SimianAstronaut7
+/tests/** @JordanTheJet @SimianAstronaut7
+/.github/** @JordanTheJet @SimianAstronaut7
+/.github/workflows/** @JordanTheJet @SimianAstronaut7
+/.github/codeql/** @JordanTheJet @SimianAstronaut7
+/.github/dependabot.yml @JordanTheJet @SimianAstronaut7
+/SECURITY.md @JordanTheJet @SimianAstronaut7
+/docs/actions-source-policy.md @JordanTheJet @SimianAstronaut7
+/docs/ci-map.md @JordanTheJet @SimianAstronaut7
 
 # Docs & governance
-/docs/** @jordanthejet
-/AGENTS.md @jordanthejet
-/CLAUDE.md @jordanthejet
-/CONTRIBUTING.md @jordanthejet
-/docs/pr-workflow.md @jordanthejet
-/docs/reviewer-playbook.md @jordanthejet
+/docs/** @JordanTheJet @SimianAstronaut7
+/AGENTS.md @JordanTheJet @SimianAstronaut7
+/CLAUDE.md @JordanTheJet @SimianAstronaut7
+/CONTRIBUTING.md @JordanTheJet @SimianAstronaut7
+/docs/pr-workflow.md @JordanTheJet @SimianAstronaut7
+/docs/reviewer-playbook.md @JordanTheJet @SimianAstronaut7
