@@ -187,10 +187,7 @@ impl NevisAuthProvider {
             .filter(|s| !s.trim().is_empty())
             .context("Token has missing or empty `sub` claim")?;
 
-        let mut roles = body
-            .realm_access
-            .map(|ra| ra.roles)
-            .unwrap_or_default();
+        let mut roles = body.realm_access.map(|ra| ra.roles).unwrap_or_default();
         roles.sort();
         roles.dedup();
 
@@ -204,9 +201,11 @@ impl NevisAuthProvider {
                 .map(String::from)
                 .collect(),
             mfa_verified: body.acr.as_deref() == Some("mfa")
-                || body.amr.iter().flatten().any(|m| {
-                    m == "fido2" || m == "passkey" || m == "otp" || m == "webauthn"
-                }),
+                || body
+                    .amr
+                    .iter()
+                    .flatten()
+                    .any(|m| m == "fido2" || m == "passkey" || m == "otp" || m == "webauthn"),
             session_expiry: body.exp.unwrap_or(0),
         })
     }
@@ -271,10 +270,7 @@ impl NevisAuthProvider {
             .unwrap_or_default()
             .as_secs();
 
-        let mut roles = body
-            .realm_access
-            .map(|ra| ra.roles)
-            .unwrap_or_default();
+        let mut roles = body.realm_access.map(|ra| ra.roles).unwrap_or_default();
         roles.sort();
         roles.dedup();
 
@@ -317,10 +313,7 @@ impl NevisAuthProvider {
             .context("Nevis health check failed: cannot reach instance")?;
 
         if !resp.status().is_success() {
-            bail!(
-                "Nevis health check failed: HTTP {}",
-                resp.status().as_u16()
-            );
+            bail!("Nevis health check failed: HTTP {}", resp.status().as_u16());
         }
 
         Ok(())
@@ -400,10 +393,7 @@ mod tests {
             3600,
         );
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("jwks_url"));
+        assert!(result.unwrap_err().to_string().contains("jwks_url"));
     }
 
     #[test]

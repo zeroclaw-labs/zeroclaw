@@ -27,13 +27,13 @@ pub mod docker;
 // Prompt injection defense (contributed from RustyClaw, MIT licensed)
 pub mod domain_matcher;
 pub mod estop;
-pub mod iam_policy;
-pub mod nevis;
 #[cfg(target_os = "linux")]
 pub mod firejail;
+pub mod iam_policy;
 #[cfg(feature = "sandbox-landlock")]
 pub mod landlock;
 pub mod leak_detector;
+pub mod nevis;
 pub mod otp;
 pub mod pairing;
 pub mod policy;

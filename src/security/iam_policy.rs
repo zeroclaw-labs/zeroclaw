@@ -128,10 +128,7 @@ impl IamPolicy {
             let key = role.trim().to_ascii_lowercase();
             if let Some(compiled) = self.role_map.get(&key) {
                 if compiled.all_tools
-                    || compiled
-                        .allowed_tools
-                        .iter()
-                        .any(|t| t == &normalized_tool)
+                    || compiled.allowed_tools.iter().any(|t| t == &normalized_tool)
                 {
                     tracing::trace!(
                         user_id = %crate::security::redact(&identity.user_id),
@@ -253,7 +250,9 @@ mod tests {
         let identity = identity_with_roles(vec!["admin"]);
 
         assert!(policy.evaluate_tool_access(&identity, "shell").is_allowed());
-        assert!(policy.evaluate_tool_access(&identity, "file_read").is_allowed());
+        assert!(policy
+            .evaluate_tool_access(&identity, "file_read")
+            .is_allowed());
         assert!(policy
             .evaluate_tool_access(&identity, "any_tool_name")
             .is_allowed());
@@ -385,9 +384,7 @@ mod tests {
         let policy = IamPolicy::from_mappings(&test_mappings());
         let identity = identity_with_roles(vec!["admin"]);
 
-        assert!(!policy
-            .evaluate_workspace_access(&identity, "")
-            .is_allowed());
+        assert!(!policy.evaluate_workspace_access(&identity, "").is_allowed());
     }
 
     #[test]
