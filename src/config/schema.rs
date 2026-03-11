@@ -74,6 +74,10 @@ pub struct Config {
     pub api_key: Option<String>,
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
     pub api_url: Option<String>,
+    /// Custom API path suffix for provider endpoints (e.g. "/chat/completions").
+    /// Overrides the default /v1/chat/completions path for custom endpoints.
+    #[serde(default)]
+    pub api_path: Option<String>,
     /// Default provider ID or alias (e.g. `"openrouter"`, `"ollama"`, `"anthropic"`). Default: `"openrouter"`.
     #[serde(alias = "model_provider")]
     pub default_provider: Option<String>,
@@ -236,6 +240,10 @@ pub struct ModelProviderConfig {
     /// Optional base URL for OpenAI-compatible endpoints.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Optional custom API path suffix (e.g. "/chat/completions" or "/v1/chat/completions").
+    /// When set, overrides the default path construction for custom endpoints.
+    #[serde(default)]
+    pub api_path: Option<String>,
     /// Provider protocol variant ("responses" or "chat_completions").
     #[serde(default)]
     pub wire_api: Option<String>,
