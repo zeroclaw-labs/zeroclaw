@@ -1555,13 +1555,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
-        // Check mention_only for group messages
-        // Voice messages cannot contain mentions, so skip in group chats when mention_only is set
-        let is_group = Self::is_group_message(message);
-        if self.mention_only && is_group {
-            return None;
-        }
-
         // Download and transcribe
         let file_path = match self.get_file_path(&metadata.file_id).await {
             Ok(p) => p,
@@ -3233,6 +3226,8 @@ Ensure only one `zeroclaw` process is using this bot token."
 mod tests {
     use super::*;
     use std::path::Path;
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[cfg(unix)]
     fn symlink_file(src: &Path, dst: &Path) {
@@ -5043,6 +5038,83 @@ mod tests {
         let parsed = ch.try_parse_voice_message(&update).await;
         assert!(parsed.is_none());
         assert!(ch.voice_transcriptions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_parse_voice_message_allows_group_sender_override_and_transcribes() {
+        let telegram_api = MockServer::start().await;
+        let transcription_api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bottoken/getFile"))
+            .and(query_param("file_id", "voice_file"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "voice/file_without_ext" }
+            })))
+            .mount(&telegram_api)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file/bottoken/voice/file_without_ext"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(vec![0x4f, 0x67, 0x67, 0x53, 0x00, 0x02, 0x03, 0x04]),
+            )
+            .mount(&telegram_api)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/transcribe"))
+            .and(header("authorization", "Bearer test-groq-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "hello from telegram voice"
+            })))
+            .mount(&transcription_api)
+            .await;
+
+        let previous_api_key = std::env::var("GROQ_API_KEY").ok();
+        std::env::set_var("GROQ_API_KEY", "test-groq-key");
+
+        let mut tc = crate::config::TranscriptionConfig::default();
+        tc.enabled = true;
+        tc.api_url = format!("{}/transcribe", transcription_api.uri());
+
+        let ch = TelegramChannel::new("token".into(), vec!["555".into()], true)
+            .with_group_reply_allowed_senders(vec!["555".into()])
+            .with_api_base(telegram_api.uri())
+            .with_transcription(tc);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 42,
+                "voice": {
+                    "file_id": "voice_file",
+                    "duration": 4,
+                    "mime_type": "audio/ogg"
+                },
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100123, "type": "supergroup" }
+            }
+        });
+
+        let parsed = ch
+            .try_parse_voice_message(&update)
+            .await
+            .expect("voice message should be transcribed for configured sender override");
+
+        match previous_api_key {
+            Some(value) => std::env::set_var("GROQ_API_KEY", value),
+            None => std::env::remove_var("GROQ_API_KEY"),
+        }
+
+        assert_eq!(parsed.reply_target, "-100123");
+        assert_eq!(parsed.sender, "alice");
+        assert_eq!(parsed.content, "[Voice] hello from telegram voice");
+        assert_eq!(
+            ch.voice_transcriptions
+                .lock()
+                .get("-100123:42")
+                .cloned()
+                .as_deref(),
+            Some("hello from telegram voice")
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────

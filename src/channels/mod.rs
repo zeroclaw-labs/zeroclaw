@@ -72,9 +72,12 @@ pub use whatsapp_web::WhatsAppWebChannel;
 use crate::agent::loop_::{
     build_shell_policy_instructions, build_tool_instructions_from_specs,
     run_tool_call_loop_with_non_cli_approval_context, scrub_credentials, NonCliApprovalContext,
+    ToolLoopCostTrackingContext,
 };
 use crate::approval::{ApprovalManager, ApprovalResponse, PendingApprovalError};
+use crate::config::schema::ModelPricing;
 use crate::config::{Config, NonCliNaturalLanguageApprovalMode};
+use crate::cost::CostTracker;
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, runtime_trace, Observer};
@@ -207,6 +210,12 @@ struct RuntimeConfigState {
     last_applied_stamp: Option<ConfigFileStamp>,
 }
 
+#[derive(Clone)]
+struct ChannelCostTrackingState {
+    tracker: Arc<CostTracker>,
+    prices: Arc<HashMap<String, ModelPricing>>,
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeAutonomyPolicy {
     auto_approve: Vec<String>,
@@ -221,6 +230,11 @@ struct RuntimeAutonomyPolicy {
 fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>> {
     static STORE: OnceLock<Mutex<HashMap<PathBuf, RuntimeConfigState>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn channel_cost_tracking_store() -> &'static Mutex<Option<ChannelCostTrackingState>> {
+    static STORE: OnceLock<Mutex<Option<ChannelCostTrackingState>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(None))
 }
 
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
@@ -3309,6 +3323,14 @@ semantic_match={:.2} (threshold {:.2}), category={}.",
         sender: msg.sender.clone(),
         message_id: msg.id.clone(),
     };
+    let cost_tracking_context = {
+        let store = channel_cost_tracking_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        store
+            .clone()
+            .map(|state| ToolLoopCostTrackingContext::new(state.tracker, state.prices))
+    };
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
@@ -3327,6 +3349,7 @@ semantic_match={:.2} (threshold {:.2}), category={}.",
                     Some(ctx.approval_manager.as_ref()),
                     msg.channel.as_str(),
                     non_cli_approval_context,
+                    cost_tracking_context,
                     &ctx.multimodal,
                     ctx.max_tool_iterations,
                     Some(cancellation_token.clone()),
@@ -5071,6 +5094,26 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .telegram
         .as_ref()
         .is_some_and(|tg| tg.interrupt_on_new_message);
+    let cost_tracking_state = if config.cost.enabled {
+        match CostTracker::new(config.cost.clone(), &config.workspace_dir) {
+            Ok(tracker) => Some(ChannelCostTrackingState {
+                tracker: Arc::new(tracker),
+                prices: Arc::new(config.cost.prices.clone()),
+            }),
+            Err(error) => {
+                tracing::warn!("Failed to initialize channel cost tracker: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    {
+        let mut store = channel_cost_tracking_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *store = cost_tracking_state;
+    }
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -5118,6 +5161,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Wait for all channel tasks
     for h in handles {
         let _ = h.await;
+    }
+
+    {
+        let mut store = channel_cost_tracking_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *store = None;
     }
 
     Ok(())

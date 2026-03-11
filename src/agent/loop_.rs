@@ -1,5 +1,7 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
+use crate::config::schema::ModelPricing;
 use crate::config::Config;
+use crate::cost::{CostTracker, TokenUsage as CostTokenUsage};
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
@@ -15,7 +17,7 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use regex::{Regex, RegexSet};
 use rustyline::error::ReadlineError;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
@@ -200,6 +202,84 @@ pub(crate) struct NonCliApprovalContext {
 
 tokio::task_local! {
     static TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT: Option<NonCliApprovalContext>;
+}
+
+#[derive(Clone)]
+pub(crate) struct ToolLoopCostTrackingContext {
+    tracker: Arc<CostTracker>,
+    prices: Arc<HashMap<String, ModelPricing>>,
+}
+
+impl ToolLoopCostTrackingContext {
+    pub(crate) fn new(
+        tracker: Arc<CostTracker>,
+        prices: Arc<HashMap<String, ModelPricing>>,
+    ) -> Self {
+        Self { tracker, prices }
+    }
+}
+
+tokio::task_local! {
+    static TOOL_LOOP_COST_TRACKING_CONTEXT: Option<ToolLoopCostTrackingContext>;
+}
+
+fn lookup_model_pricing<'a>(
+    prices: &'a HashMap<String, ModelPricing>,
+    provider_name: &str,
+    model: &str,
+) -> Option<&'a ModelPricing> {
+    prices
+        .get(model)
+        .or_else(|| prices.get(&format!("{provider_name}/{model}")))
+        .or_else(|| {
+            model
+                .rsplit_once('/')
+                .and_then(|(_, suffix)| prices.get(suffix))
+        })
+}
+
+fn record_tool_loop_cost_usage(
+    provider_name: &str,
+    model: &str,
+    usage: &crate::providers::traits::TokenUsage,
+) -> Option<(u64, f64)> {
+    let input_tokens = usage.input_tokens.unwrap_or(0);
+    let output_tokens = usage.output_tokens.unwrap_or(0);
+    let total_tokens = input_tokens.saturating_add(output_tokens);
+    if total_tokens == 0 {
+        return None;
+    }
+
+    let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()?;
+    let pricing = lookup_model_pricing(&ctx.prices, provider_name, model);
+    let cost_usage = CostTokenUsage::new(
+        model,
+        input_tokens,
+        output_tokens,
+        pricing.map_or(0.0, |entry| entry.input),
+        pricing.map_or(0.0, |entry| entry.output),
+    );
+
+    if pricing.is_none() {
+        tracing::debug!(
+            provider = provider_name,
+            model,
+            "Cost tracking recorded token usage with zero pricing because no model price was configured"
+        );
+    }
+
+    if let Err(error) = ctx.tracker.record_usage(cost_usage.clone()) {
+        tracing::warn!(
+            provider = provider_name,
+            model,
+            "Failed to record cost tracking usage: {error}"
+        );
+    }
+
+    Some((cost_usage.total_tokens, cost_usage.cost_usd))
 }
 
 /// Extract a short hint from tool call arguments for progress display.
@@ -742,6 +822,7 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
     approval: Option<&ApprovalManager>,
     channel_name: &str,
     non_cli_approval_context: Option<NonCliApprovalContext>,
+    cost_tracking_context: Option<ToolLoopCostTrackingContext>,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
@@ -758,23 +839,26 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
             non_cli_approval_context,
             TOOL_LOOP_REPLY_TARGET.scope(
                 reply_target,
-                run_tool_call_loop(
-                    provider,
-                    history,
-                    tools_registry,
-                    observer,
-                    provider_name,
-                    model,
-                    temperature,
-                    silent,
-                    approval,
-                    channel_name,
-                    multimodal_config,
-                    max_tool_iterations,
-                    cancellation_token,
-                    on_delta,
-                    hooks,
-                    excluded_tools,
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    cost_tracking_context,
+                    run_tool_call_loop(
+                        provider,
+                        history,
+                        tools_registry,
+                        observer,
+                        provider_name,
+                        model,
+                        temperature,
+                        silent,
+                        approval,
+                        channel_name,
+                        multimodal_config,
+                        max_tool_iterations,
+                        cancellation_token,
+                        on_delta,
+                        hooks,
+                        excluded_tools,
+                    ),
                 ),
             ),
         )
@@ -1026,6 +1110,11 @@ pub(crate) async fn run_tool_call_loop(
                     input_tokens: resp_input_tokens,
                     output_tokens: resp_output_tokens,
                 });
+
+                let _ = resp
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| record_tool_loop_cost_usage(provider_name, model, usage));
 
                 let response_text = resp.text_or_empty().to_string();
                 // Always derive a text-only view of the model response for CLI
@@ -2511,7 +2600,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -3475,6 +3564,7 @@ mod tests {
                 reply_target: "chat-approval".to_string(),
                 prompt_tx,
             }),
+            None,
             &crate::config::MultimodalConfig::default(),
             4,
             None,
@@ -3491,6 +3581,86 @@ mod tests {
             max_active.load(Ordering::SeqCst),
             1,
             "shell tool should execute after non-cli approval is resolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_records_cost_usage_when_tracking_context_is_scoped() {
+        let provider = ScriptedProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(crate::providers::traits::TokenUsage {
+                    input_tokens: Some(1_200),
+                    output_tokens: Some(300),
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let workspace = TempDir::new().expect("temp workspace should be created");
+        let mut cost_config = crate::config::CostConfig {
+            enabled: true,
+            ..crate::config::CostConfig::default()
+        };
+        cost_config.prices = HashMap::from([(
+            "mock-provider/mock-model".to_string(),
+            ModelPricing {
+                input: 2.0,
+                output: 4.0,
+            },
+        )]);
+        let tracker = Arc::new(
+            CostTracker::new(cost_config.clone(), workspace.path())
+                .expect("cost tracker should initialize"),
+        );
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("hello"),
+        ];
+
+        let result = run_tool_call_loop_with_non_cli_approval_context(
+            &provider,
+            &mut history,
+            &[],
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            None,
+            Some(ToolLoopCostTrackingContext::new(
+                Arc::clone(&tracker),
+                Arc::new(cost_config.prices.clone()),
+            )),
+            &crate::config::MultimodalConfig::default(),
+            2,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("tool loop should succeed");
+
+        assert_eq!(result, "done");
+
+        let summary = tracker
+            .get_summary()
+            .expect("cost summary should be readable");
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.total_tokens, 1_500);
+        assert!(summary.session_cost_usd > 0.0);
+        assert_eq!(
+            summary
+                .by_model
+                .get("mock-model")
+                .expect("model stats should exist")
+                .total_tokens,
+            1_500
         );
     }
 
