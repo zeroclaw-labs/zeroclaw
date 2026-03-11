@@ -202,7 +202,7 @@ jobs:
                 include:
                     # Keep GNU Linux release artifacts on Ubuntu 22.04 to preserve
                     # a broadly compatible GLIBC baseline for user distributions.
-                    - os: ubuntu-22.04
+                    - os: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2204]
                       target: x86_64-unknown-linux-gnu
                       artifact: zeroclaw
                       archive_ext: tar.gz
@@ -217,7 +217,7 @@ jobs:
                       linker_env: ""
                       linker: ""
                       use_cross: true
-                    - os: ubuntu-22.04
+                    - os: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2204]
                       target: aarch64-unknown-linux-gnu
                       artifact: zeroclaw
                       archive_ext: tar.gz
@@ -232,7 +232,7 @@ jobs:
                       linker_env: ""
                       linker: ""
                       use_cross: true
-                    - os: ubuntu-22.04
+                    - os: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2204]
                       target: armv7-unknown-linux-gnueabihf
                       artifact: zeroclaw
                       archive_ext: tar.gz
