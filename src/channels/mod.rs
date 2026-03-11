@@ -421,6 +421,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Markers: [IMAGE:<path>], [FILE:<path>], [AUDIO:<path>], [VOICE:<path>]\n\
              - Create the file first with your tools, then include the marker.\n\n\
              ## Reactions\n\
+             - Each incoming message starts with [msg_id:<event_id>] — use that event_id to react.\n\
              - You CAN react to messages with emoji: [REACT:<emoji>:<event_id>]\n\
              - React naturally and sparingly — only when genuinely appropriate.\n\
              - Do NOT react to every message. Do NOT copy the user's reaction back.\n\
