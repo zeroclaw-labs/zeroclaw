@@ -4292,6 +4292,19 @@ impl Config {
                 )?;
             }
 
+            if let Some(ref mut matrix) = config.channels_config.matrix {
+                decrypt_optional_secret(
+                    &store,
+                    &mut matrix.access_token,
+                    "config.channels_config.matrix.access_token",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut matrix.password,
+                    "config.channels_config.matrix.password",
+                )?;
+            }
+
             if let Some(ref mut ns) = config.channels_config.nostr {
                 decrypt_secret(
                     &store,
@@ -4577,6 +4590,28 @@ impl Config {
             if !has_ollama_cloud_credential(self.api_key.as_deref()) {
                 anyhow::bail!(
                     "default_model uses ':cloud' with provider 'ollama', but no API key is configured. Set api_key or OLLAMA_API_KEY."
+                );
+            }
+        }
+
+        // Matrix: password-only login requires user_id
+        if let Some(ref matrix) = self.channels_config.matrix {
+            let has_access_token = matrix
+                .access_token
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty());
+            let has_password = matrix
+                .password
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty());
+            let has_user_id = matrix
+                .user_id
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty());
+
+            if has_password && !has_access_token && !has_user_id {
+                anyhow::bail!(
+                    "channels_config.matrix.user_id is required when password is set and access_token is omitted"
                 );
             }
         }
@@ -4947,6 +4982,19 @@ impl Config {
                 &store,
                 &mut google.api_key,
                 "config.tts.google.api_key",
+            )?;
+        }
+
+        if let Some(ref mut matrix) = config_to_save.channels_config.matrix {
+            encrypt_optional_secret(
+                &store,
+                &mut matrix.access_token,
+                "config.channels_config.matrix.access_token",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut matrix.password,
+                "config.channels_config.matrix.password",
             )?;
         }
 

@@ -308,12 +308,27 @@ fn is_image_extension(path: &Path) -> bool {
 }
 
 /// Download media from a Matrix media source via the SDK client, save to disk.
+///
+/// When `size_hint` is provided (from the event's `info.size`), the download is
+/// rejected before fetching the payload. The post-download check remains as a
+/// safety net because metadata can be spoofed.
 async fn download_and_save_matrix_media(
     client: &MatrixSdkClient,
     source: &MediaSource,
     filename: &str,
     save_dir: &Path,
+    size_hint: Option<u64>,
 ) -> anyhow::Result<PathBuf> {
+    // Pre-download size check using event metadata (avoids buffering large payloads).
+    if let Some(size) = size_hint {
+        if size as usize > MATRIX_MAX_MEDIA_DOWNLOAD_BYTES {
+            anyhow::bail!(
+                "Matrix media metadata size exceeds limit ({size} bytes > {} bytes); skipping download",
+                MATRIX_MAX_MEDIA_DOWNLOAD_BYTES,
+            );
+        }
+    }
+
     let request = MediaRequestParameters {
         source: source.clone(),
         format: MediaFormat::File,
@@ -321,6 +336,7 @@ async fn download_and_save_matrix_media(
 
     let data = client.media().get_media_content(&request, false).await?;
 
+    // Post-download safety net (metadata can be spoofed).
     if data.len() > MATRIX_MAX_MEDIA_DOWNLOAD_BYTES {
         anyhow::bail!(
             "Matrix media exceeds size limit ({} bytes > {} bytes)",
@@ -450,11 +466,20 @@ impl MatrixChannel {
     }
 
     /// Returns the Bearer token for HTTP API calls.
-    /// Reads from config access_token first, falls back to persisted session.json.
+    /// Prefers the live SDK client session, falls back to config access_token,
+    /// then to persisted session.json.
     async fn auth_header_value(&self) -> anyhow::Result<String> {
+        // 1. Try live SDK client session (most up-to-date after password login).
+        if let Some(client) = self.sdk_client.get() {
+            if let Some(token) = client.access_token() {
+                return Ok(format!("Bearer {token}"));
+            }
+        }
+        // 2. Config access_token.
         if let Some(ref token) = self.access_token {
             return Ok(format!("Bearer {token}"));
         }
+        // 3. Persisted session.json.
         if let Some(saved) = self.load_saved_session().await {
             return Ok(format!("Bearer {}", saved.access_token));
         }
@@ -487,13 +512,22 @@ impl MatrixChannel {
             tokio::fs::create_dir_all(parent).await?;
         }
         let data = serde_json::to_string_pretty(session)?;
-        tokio::fs::write(&path, data).await?;
-        // Restrict permissions to owner-only on Unix.
+        // Write to a temp file with restricted permissions, then rename atomically
+        // to avoid a window where the token is world-readable.
+        let tmp_path = path.with_extension("json.tmp");
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
+            let mut opts = tokio::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true).mode(0o600);
+            let mut file = opts.open(&tmp_path).await?;
+            tokio::io::AsyncWriteExt::write_all(&mut file, data.as_bytes()).await?;
+            tokio::io::AsyncWriteExt::flush(&mut file).await?;
         }
+        #[cfg(not(unix))]
+        {
+            tokio::fs::write(&tmp_path, &data).await?;
+        }
+        tokio::fs::rename(&tmp_path, &path).await?;
         Ok(())
     }
 
@@ -721,7 +755,7 @@ impl MatrixChannel {
                     resolved_user_id = response.user_id.to_string();
                     tracing::info!(
                         "Matrix: logged in with password (device_id={})",
-                        response.device_id
+                        crate::security::redact(&response.device_id.to_string())
                     );
 
                     // Persist session.json so future runs use Path 1 (no password needed).
@@ -1381,8 +1415,9 @@ impl Channel for MatrixChannel {
                         };
                         let filename = content.filename().to_string();
                         let source = content.source.clone();
+                        let size_hint = content.info.as_ref().and_then(|i| i.size.map(u64::from));
                         let sdk_client = room.client();
-                        match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir).await {
+                        match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir, size_hint).await {
                             Ok(local_path) => {
                                 if is_image_extension(&local_path) {
                                     format!("[IMAGE:{}]", local_path.display())
@@ -1403,8 +1438,9 @@ impl Channel for MatrixChannel {
                         };
                         let filename = content.filename().to_string();
                         let source = content.source.clone();
+                        let size_hint = content.info.as_ref().and_then(|i| i.size.map(u64::from));
                         let sdk_client = room.client();
-                        match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir).await {
+                        match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir, size_hint).await {
                             Ok(local_path) => {
                                 format!("[Document: {}] {}", filename, local_path.display())
                             }
@@ -1417,7 +1453,16 @@ impl Channel for MatrixChannel {
                     MessageType::Audio(content) => {
                         let filename = content.filename().to_string();
                         let source = content.source.clone();
+                        let size_hint = content.info.as_ref().and_then(|i| i.size.map(u64::from));
                         let sdk_client = room.client();
+
+                        // Pre-download size check for audio.
+                        if let Some(size) = size_hint {
+                            if size as usize > MATRIX_MAX_MEDIA_DOWNLOAD_BYTES {
+                                tracing::warn!("Matrix audio exceeds size limit ({size} bytes); skipping");
+                                return;
+                            }
+                        }
 
                         // Try transcription first if enabled.
                         if let Some(ref config) = transcription_config {
@@ -1444,7 +1489,7 @@ impl Channel for MatrixChannel {
                                                 tracing::warn!("Matrix audio received but no zeroclaw_dir configured for media storage");
                                                 return;
                                             };
-                                            match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir).await {
+                                            match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir, size_hint).await {
                                                 Ok(local_path) => {
                                                     format!("[Document: {}] {}", filename, local_path.display())
                                                 }
@@ -1467,7 +1512,7 @@ impl Channel for MatrixChannel {
                                 tracing::warn!("Matrix audio received but no zeroclaw_dir configured for media storage");
                                 return;
                             };
-                            match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir).await {
+                            match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir, size_hint).await {
                                 Ok(local_path) => {
                                     format!("[Document: {}] {}", filename, local_path.display())
                                 }
