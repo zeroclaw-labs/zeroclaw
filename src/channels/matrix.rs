@@ -763,6 +763,130 @@ impl Channel for MatrixChannel {
 
         Ok(())
     }
+
+
+    async fn pin_message(
+        &self,
+        _channel_id: &str,
+        message_id: &str,
+    ) -> anyhow::Result<()> {
+        let room_id = self.target_room_id().await?;
+        let encoded_room = Self::encode_path_segment(&room_id);
+
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/state/m.room.pinned_events",
+            self.homeserver, encoded_room
+        );
+        let resp = self
+            .http_client
+            .get(&url)
+            .header("Authorization", self.auth_header_value())
+            .send()
+            .await?;
+
+        let mut pinned: Vec<String> = if resp.status().is_success() {
+            let body: serde_json::Value = resp.json().await?;
+            body.get("pinned")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let msg_id = message_id.to_string();
+        if pinned.contains(&msg_id) {
+            return Ok(());
+        }
+        pinned.push(msg_id);
+
+        let put_url = format!(
+            "{}/_matrix/client/v3/rooms/{}/state/m.room.pinned_events",
+            self.homeserver, encoded_room
+        );
+        let body = serde_json::json!({ "pinned": pinned });
+        let resp = self
+            .http_client
+            .put(&put_url)
+            .header("Authorization", self.auth_header_value())
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Matrix pin_message failed: {err}");
+        }
+
+        Ok(())
+    }
+
+    async fn unpin_message(
+        &self,
+        _channel_id: &str,
+        message_id: &str,
+    ) -> anyhow::Result<()> {
+        let room_id = self.target_room_id().await?;
+        let encoded_room = Self::encode_path_segment(&room_id);
+
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/state/m.room.pinned_events",
+            self.homeserver, encoded_room
+        );
+        let resp = self
+            .http_client
+            .get(&url)
+            .header("Authorization", self.auth_header_value())
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Ok(());
+        }
+
+        let body: serde_json::Value = resp.json().await?;
+        let mut pinned: Vec<String> = body
+            .get("pinned")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let msg_id = message_id.to_string();
+        let original_len = pinned.len();
+        pinned.retain(|id| id != &msg_id);
+
+        if pinned.len() == original_len {
+            return Ok(());
+        }
+
+        let put_url = format!(
+            "{}/_matrix/client/v3/rooms/{}/state/m.room.pinned_events",
+            self.homeserver, encoded_room
+        );
+        let body = serde_json::json!({ "pinned": pinned });
+        let resp = self
+            .http_client
+            .put(&put_url)
+            .header("Authorization", self.auth_header_value())
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Matrix unpin_message failed: {err}");
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
