@@ -181,6 +181,8 @@ jobs:
                   context: .
                   push: false
                   load: true
+                  build-args: |
+                      ZEROCLAW_CARGO_FEATURES=channel-matrix
                   tags: zeroclaw-release-candidate:${{ steps.meta.outputs.release_tag }}
                   platforms: linux/amd64
                   cache-from: type=gha,scope=pub-docker-release-${{ steps.meta.outputs.release_tag }}
@@ -282,7 +284,7 @@ jobs:
                   context: .
                   push: true
                   build-args: |
-                      ZEROCLAW_CARGO_ALL_FEATURES=true
+                      ZEROCLAW_CARGO_FEATURES=channel-matrix
                   tags: ${{ steps.meta.outputs.tags }}
                   platforms: linux/amd64,linux/arm64
                   cache-from: type=gha,scope=pub-docker-release-${{ steps.meta.outputs.release_tag }}

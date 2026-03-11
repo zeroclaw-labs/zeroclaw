@@ -6,6 +6,7 @@ use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use crate::tools::SharedToolRegistry;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
@@ -36,7 +37,7 @@ pub struct DelegateTool {
     /// Depth at which this tool instance lives in the delegation chain.
     depth: u32,
     /// Parent tool registry for agentic sub-agents.
-    parent_tools: Arc<Vec<Arc<dyn Tool>>>,
+    parent_tools: SharedToolRegistry,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
     /// Optional typed coordination bus used to trace delegate lifecycle events.
@@ -72,7 +73,7 @@ impl DelegateTool {
             fallback_credential,
             provider_runtime_options,
             depth: 0,
-            parent_tools: Arc::new(Vec::new()),
+            parent_tools: crate::tools::new_shared_tool_registry(),
             multimodal_config: crate::config::MultimodalConfig::default(),
             coordination_bus,
             coordination_lead_agent: DEFAULT_COORDINATION_LEAD_AGENT.to_string(),
@@ -111,7 +112,7 @@ impl DelegateTool {
             fallback_credential,
             provider_runtime_options,
             depth,
-            parent_tools: Arc::new(Vec::new()),
+            parent_tools: crate::tools::new_shared_tool_registry(),
             multimodal_config: crate::config::MultimodalConfig::default(),
             coordination_bus,
             coordination_lead_agent: DEFAULT_COORDINATION_LEAD_AGENT.to_string(),
@@ -119,7 +120,7 @@ impl DelegateTool {
     }
 
     /// Attach parent tools used to build sub-agent allowlist registries.
-    pub fn with_parent_tools(mut self, parent_tools: Arc<Vec<Arc<dyn Tool>>>) -> Self {
+    pub fn with_parent_tools(mut self, parent_tools: SharedToolRegistry) -> Self {
         self.parent_tools = parent_tools;
         self
     }
@@ -461,9 +462,13 @@ impl DelegateTool {
             .map(|name| name.trim())
             .filter(|name| !name.is_empty())
             .collect::<std::collections::HashSet<_>>();
-
-        let sub_tools: Vec<Box<dyn Tool>> = self
+        let parent_tools = self
             .parent_tools
+            .lock()
+            .map(|tools| tools.clone())
+            .unwrap_or_default();
+
+        let sub_tools: Vec<Box<dyn Tool>> = parent_tools
             .iter()
             .filter(|tool| allowed.contains(tool.name()))
             .filter(|tool| tool.name() != "delegate")
@@ -967,6 +972,12 @@ mod tests {
         }
     }
 
+    fn shared_parent_tools(tools: Vec<Arc<dyn Tool>>) -> SharedToolRegistry {
+        let shared = crate::tools::new_shared_tool_registry();
+        crate::tools::sync_shared_tool_registry(&shared, &tools);
+        shared
+    }
+
     #[test]
     fn name_and_schema() {
         let tool = DelegateTool::new(sample_agents(), None, test_security());
@@ -1278,7 +1289,7 @@ mod tests {
         );
 
         let tool = DelegateTool::new(agents, None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+            .with_parent_tools(shared_parent_tools(vec![Arc::new(EchoTool)]));
         let result = tool
             .execute(json!({"agent": "agentic", "prompt": "test"}))
             .await
@@ -1296,7 +1307,7 @@ mod tests {
     async fn execute_agentic_runs_tool_call_loop_with_filtered_tools() {
         let config = agentic_config(vec!["echo_tool".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
-            Arc::new(vec![
+            shared_parent_tools(vec![
                 Arc::new(EchoTool),
                 Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
             ]),
@@ -1314,10 +1325,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_agentic_reads_late_bound_parent_tools() {
+        let config = agentic_config(vec!["echo_tool".to_string()], 10);
+        let parent_tools = crate::tools::new_shared_tool_registry();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_parent_tools(parent_tools.clone());
+
+        crate::tools::sync_shared_tool_registry(
+            &parent_tools,
+            &[Arc::new(EchoTool) as Arc<dyn Tool>],
+        );
+
+        let provider = OneToolThenFinalProvider;
+        let result = tool
+            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("done"));
+    }
+
+    #[tokio::test]
     async fn execute_agentic_excludes_delegate_even_if_allowlisted() {
         let config = agentic_config(vec!["delegate".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
-            Arc::new(vec![Arc::new(DelegateTool::new(
+            shared_parent_tools(vec![Arc::new(DelegateTool::new(
                 HashMap::new(),
                 None,
                 test_security(),
@@ -1342,7 +1375,7 @@ mod tests {
     async fn execute_agentic_respects_max_iterations() {
         let config = agentic_config(vec!["echo_tool".to_string()], 2);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+            .with_parent_tools(shared_parent_tools(vec![Arc::new(EchoTool)]));
 
         let provider = InfiniteToolCallProvider;
         let result = tool
@@ -1362,7 +1395,7 @@ mod tests {
     async fn execute_agentic_propagates_provider_errors() {
         let config = agentic_config(vec!["echo_tool".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+            .with_parent_tools(shared_parent_tools(vec![Arc::new(EchoTool)]));
 
         let provider = FailingProvider;
         let result = tool

@@ -9,6 +9,7 @@ use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use anyhow::Context;
 use async_trait::async_trait;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::ErrorKind;
@@ -119,6 +120,8 @@ struct AgentBrowserResponse {
     data: Option<Value>,
     error: Option<String>,
 }
+
+const AGENT_BROWSER_CLICK_RETRY_DELAY_MS: u64 = 180;
 
 /// Response format from computer-use sidecar.
 #[derive(Debug, Deserialize)]
@@ -522,7 +525,9 @@ impl BrowserTool {
             }
 
             BrowserAction::Click { selector } => {
-                let resp = self.run_command(&["click", &selector]).await?;
+                let resp = self
+                    .run_agent_browser_click_with_recovery(&selector)
+                    .await?;
                 self.to_result(resp)
             }
 
@@ -624,6 +629,62 @@ impl BrowserTool {
                 self.to_result(resp)
             }
         }
+    }
+
+    async fn run_agent_browser_click_with_recovery(
+        &self,
+        selector: &str,
+    ) -> anyhow::Result<AgentBrowserResponse> {
+        let first = self.run_command(&["click", selector]).await?;
+        if first.success || !is_agent_browser_click_retryable(first.error.as_deref()) {
+            return Ok(first);
+        }
+
+        tokio::time::sleep(Duration::from_millis(AGENT_BROWSER_CLICK_RETRY_DELAY_MS)).await;
+
+        if is_agent_browser_ref_selector(selector) {
+            let _ = self.run_command(&["snapshot", "-i"]).await;
+        }
+
+        let retry = self.run_command(&["click", selector]).await?;
+        if retry.success || is_agent_browser_ref_selector(selector) {
+            return Ok(retry);
+        }
+
+        let js_fallback = self.run_agent_browser_js_click(selector).await?;
+        if js_fallback.success {
+            return Ok(AgentBrowserResponse {
+                success: true,
+                data: Some(json!({
+                    "backend": "agent_browser",
+                    "action": "click",
+                    "selector": selector,
+                    "fallback": "javascript_eval",
+                    "data": js_fallback.data.unwrap_or_else(|| json!({"clicked": true})),
+                })),
+                error: None,
+            });
+        }
+
+        Ok(AgentBrowserResponse {
+            success: false,
+            data: None,
+            error: Some(format!(
+                "agent-browser click failed for selector '{selector}'. direct_error={}; retry_error={}; js_fallback_error={}",
+                first.error.as_deref().unwrap_or("unknown"),
+                retry.error.as_deref().unwrap_or("unknown"),
+                js_fallback.error.as_deref().unwrap_or("unknown"),
+            )),
+        })
+    }
+
+    async fn run_agent_browser_js_click(
+        &self,
+        selector: &str,
+    ) -> anyhow::Result<AgentBrowserResponse> {
+        let script = agent_browser_js_click_script(selector);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(script);
+        self.run_command(&["eval", "-b", &encoded]).await
     }
 
     #[allow(clippy::unused_async)]
@@ -996,6 +1057,84 @@ impl BrowserTool {
             })
         }
     }
+}
+
+fn is_agent_browser_ref_selector(selector: &str) -> bool {
+    let trimmed = selector.trim();
+    trimmed.starts_with('@') && trimmed.len() > 1
+}
+
+fn is_agent_browser_click_retryable(error: Option<&str>) -> bool {
+    let Some(error) = error else {
+        return false;
+    };
+
+    let message = error.to_ascii_lowercase();
+    [
+        "timeout",
+        "not found",
+        "detached",
+        "stale",
+        "not attached",
+        "intercept",
+        "not clickable",
+        "not visible",
+        "element is outside of the viewport",
+        "another element",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn agent_browser_js_click_script(selector: &str) -> String {
+    let selector_literal = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
+
+    format!(
+        r#"(() => {{
+  const raw = {selector_literal};
+  const normalizedText = raw.startsWith('text=') ? raw.slice(5).trim().toLowerCase() : null;
+
+  const interactiveCandidates = () => Array.from(
+    document.querySelectorAll('a,button,input,select,textarea,label,summary,[role],[tabindex],[onclick]')
+  );
+
+  let el = null;
+  if (normalizedText !== null) {{
+    el = interactiveCandidates().find((candidate) => {{
+      const text = (candidate.innerText || candidate.textContent || '').trim().toLowerCase();
+      return text.includes(normalizedText);
+    }}) || null;
+  }} else {{
+    try {{
+      el = document.querySelector(raw);
+    }} catch (error) {{
+      return {{ clicked: false, error: `invalid selector: ${{error.message}}` }};
+    }}
+  }}
+
+  if (!el) {{
+    return {{ clicked: false, error: 'element not found' }};
+  }}
+
+  el.scrollIntoView({{ block: 'center', inline: 'center' }});
+  const rect = el.getBoundingClientRect();
+  const centerX = rect.left + rect.width / 2;
+  const centerY = rect.top + rect.height / 2;
+  const topElement = document.elementFromPoint(centerX, centerY);
+  const target = topElement && (topElement === el || el.contains(topElement)) ? topElement : el;
+
+  target.dispatchEvent(new MouseEvent('mouseover', {{ bubbles: true, cancelable: true, view: window }}));
+  target.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true, view: window }}));
+  target.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true, cancelable: true, view: window }}));
+  target.click();
+
+  return {{
+    clicked: true,
+    tag: target.tagName ? target.tagName.toLowerCase() : null,
+    text: (target.innerText || target.textContent || '').trim().slice(0, 120),
+  }};
+}})()"#
+    )
 }
 
 #[async_trait]
@@ -2614,6 +2753,42 @@ mod tests {
             tool.configured_backend().unwrap(),
             BrowserBackendKind::ComputerUse
         );
+    }
+
+    #[test]
+    fn agent_browser_ref_selector_detection_matches_snapshot_refs() {
+        assert!(is_agent_browser_ref_selector("@e1"));
+        assert!(is_agent_browser_ref_selector(" @node-42 "));
+        assert!(!is_agent_browser_ref_selector("#submit"));
+        assert!(!is_agent_browser_ref_selector("text=Continue"));
+    }
+
+    #[test]
+    fn agent_browser_click_retry_detection_matches_interactability_failures() {
+        assert!(is_agent_browser_click_retryable(Some(
+            "Element is outside of the viewport"
+        )));
+        assert!(is_agent_browser_click_retryable(Some(
+            "element click intercepted by overlay"
+        )));
+        assert!(is_agent_browser_click_retryable(Some(
+            "Node is detached from document"
+        )));
+        assert!(!is_agent_browser_click_retryable(Some(
+            "Host 'localhost' not in browser.allowed_domains"
+        )));
+        assert!(!is_agent_browser_click_retryable(None));
+    }
+
+    #[test]
+    fn agent_browser_js_click_script_supports_text_and_css_selectors() {
+        let text_script = agent_browser_js_click_script("text=Continue");
+        assert!(text_script.contains("raw.startsWith('text=')"));
+        assert!(text_script.contains("interactiveCandidates"));
+
+        let css_script = agent_browser_js_click_script("#submit");
+        assert!(css_script.contains("document.querySelector(raw)"));
+        assert!(css_script.contains("target.click()"));
     }
 
     #[test]

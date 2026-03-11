@@ -1,7 +1,32 @@
 export const TOKEN_STORAGE_KEY = 'zeroclaw_token';
 let inMemoryToken: string | null = null;
 
-function readStorage(key: string): string | null {
+function readPersistentStorage(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writePersistentStorage(key: string, value: string): boolean {
+  try {
+    localStorage.setItem(key, value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function removePersistentStorage(key: string): void {
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    // Ignore
+  }
+}
+
+function readSessionFallback(key: string): string | null {
   try {
     return sessionStorage.getItem(key);
   } catch {
@@ -9,7 +34,7 @@ function readStorage(key: string): string | null {
   }
 }
 
-function writeStorage(key: string, value: string): void {
+function writeSessionFallback(key: string, value: string): void {
   try {
     sessionStorage.setItem(key, value);
   } catch {
@@ -17,17 +42,9 @@ function writeStorage(key: string, value: string): void {
   }
 }
 
-function removeStorage(key: string): void {
+function removeSessionFallback(key: string): void {
   try {
     sessionStorage.removeItem(key);
-  } catch {
-    // Ignore
-  }
-}
-
-function clearLegacyLocalStorageToken(key: string): void {
-  try {
-    localStorage.removeItem(key);
   } catch {
     // Ignore
   }
@@ -41,23 +58,21 @@ export function getToken(): string | null {
     return inMemoryToken;
   }
 
-  const sessionToken = readStorage(TOKEN_STORAGE_KEY);
-  if (sessionToken && sessionToken.length > 0) {
-    inMemoryToken = sessionToken;
-    return sessionToken;
+  const persistedToken = readPersistentStorage(TOKEN_STORAGE_KEY);
+  if (persistedToken && persistedToken.length > 0) {
+    inMemoryToken = persistedToken;
+    return persistedToken;
   }
 
-  // One-time migration from older localStorage-backed sessions.
-  try {
-    const legacy = localStorage.getItem(TOKEN_STORAGE_KEY);
-    if (legacy && legacy.length > 0) {
-      inMemoryToken = legacy;
-      writeStorage(TOKEN_STORAGE_KEY, legacy);
-      localStorage.removeItem(TOKEN_STORAGE_KEY);
-      return legacy;
+  // Migrate session-only pairings created by previous dashboard builds into
+  // persistent storage so pairing survives a browser restart.
+  const sessionToken = readSessionFallback(TOKEN_STORAGE_KEY);
+  if (sessionToken && sessionToken.length > 0) {
+    inMemoryToken = sessionToken;
+    if (writePersistentStorage(TOKEN_STORAGE_KEY, sessionToken)) {
+      removeSessionFallback(TOKEN_STORAGE_KEY);
     }
-  } catch {
-    // Ignore
+    return sessionToken;
   }
 
   return null;
@@ -68,8 +83,11 @@ export function getToken(): string | null {
  */
 export function setToken(token: string): void {
   inMemoryToken = token;
-  writeStorage(TOKEN_STORAGE_KEY, token);
-  clearLegacyLocalStorageToken(TOKEN_STORAGE_KEY);
+  if (!writePersistentStorage(TOKEN_STORAGE_KEY, token)) {
+    writeSessionFallback(TOKEN_STORAGE_KEY, token);
+    return;
+  }
+  removeSessionFallback(TOKEN_STORAGE_KEY);
 }
 
 /**
@@ -77,8 +95,8 @@ export function setToken(token: string): void {
  */
 export function clearToken(): void {
   inMemoryToken = null;
-  removeStorage(TOKEN_STORAGE_KEY);
-  clearLegacyLocalStorageToken(TOKEN_STORAGE_KEY);
+  removePersistentStorage(TOKEN_STORAGE_KEY);
+  removeSessionFallback(TOKEN_STORAGE_KEY);
 }
 
 /**

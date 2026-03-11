@@ -13,25 +13,26 @@ import {
   getStatus,
   putIntegrationCredentials,
 } from '@/lib/api';
+import { t, tf } from '@/lib/i18n';
 
 function statusBadge(status: Integration['status']) {
   switch (status) {
     case 'Active':
       return {
         icon: Check,
-        label: 'Active',
+        label: t('integrations.active'),
         classes: 'bg-green-900/40 text-green-400 border-green-700/50',
       };
     case 'Available':
       return {
         icon: Zap,
-        label: 'Available',
+        label: t('integrations.available'),
         classes: 'bg-blue-900/40 text-blue-400 border-blue-700/50',
       };
     case 'ComingSoon':
       return {
         icon: Clock,
-        label: 'Coming Soon',
+        label: t('integrations.coming_soon'),
         classes: 'bg-gray-800 text-gray-400 border-gray-700',
       };
   }
@@ -70,9 +71,9 @@ const FALLBACK_MODEL_OPTIONS: Record<string, string[]> = {
 
 function customModelFormatHint(integrationId: string): string {
   if (integrationId === 'openrouter' || integrationId === 'vercel') {
-    return 'Format: anthropic/claude-sonnet-4-6';
+    return t('integrations.custom_model_hint_scoped');
   }
-  return 'Format: claude-sonnet-4-6 (or provider/model when required)';
+  return t('integrations.custom_model_hint_generic');
 }
 
 function modelOptionsForField(
@@ -175,7 +176,7 @@ export default function Integrations() {
       setRuntimeStatus(status ? { model: status.model } : null);
       return nextSettingsByName;
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to load integrations');
+      setError(err instanceof Error ? err.message : t('common.error'));
       setActiveAiIntegrationId(null);
       setRuntimeStatus(null);
       return null;
@@ -252,7 +253,7 @@ export default function Integrations() {
       if (isSelectField) {
         if (value === SELECT_KEEP) {
           if (field.required && !field.has_value) {
-            setSaveError(`${field.label} is required.`);
+            setSaveError(tf('integrations.field_required', { field: field.label }));
             return;
           }
           if (isDirty) {
@@ -268,12 +269,14 @@ export default function Integrations() {
       const trimmed = resolvedValue.trim();
 
       if (isSelectField && value === SELECT_CUSTOM && !trimmed) {
-        setSaveError(`Enter a custom value for ${field.label} or choose a recommended model.`);
+        setSaveError(
+          tf('integrations.custom_value_required', { field: field.label }),
+        );
         return;
       }
 
       if (field.required && !trimmed && !field.has_value) {
-        setSaveError(`${field.label} is required.`);
+        setSaveError(tf('integrations.field_required', { field: field.label }));
         return;
       }
 
@@ -289,7 +292,7 @@ export default function Integrations() {
       Object.keys(payload).length === 0 &&
       !activeEditor.activates_default_provider
     ) {
-      setSaveError('No changes to save.');
+      setSaveError(t('integrations.no_changes'));
       return;
     }
 
@@ -298,9 +301,13 @@ export default function Integrations() {
       activeAiIntegrationId &&
       activeEditor.id !== activeAiIntegrationId
     ) {
-      const currentProvider = activeAiIntegration?.name ?? 'current provider';
+      const currentProvider =
+        activeAiIntegration?.name ?? t('integrations.current_provider');
       const confirmed = window.confirm(
-        `Switch default AI provider from ${currentProvider} to ${activeEditor.name}?`,
+        tf('integrations.confirm_switch_provider', {
+          current: currentProvider,
+          target: activeEditor.name,
+        }),
       );
       if (!confirmed) {
         return;
@@ -315,10 +322,10 @@ export default function Integrations() {
       });
 
       await loadData(false);
-      setSaveSuccess(`${activeEditor.name} credentials saved.`);
+      setSaveSuccess(tf('integrations.credentials_saved', { name: activeEditor.name }));
       closeEditor();
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Failed to save credentials';
+      const message = err instanceof Error ? err.message : t('integrations.save_error');
       if (message.includes('API 409')) {
         const refreshed = await loadData(false);
         if (refreshed) {
@@ -331,7 +338,7 @@ export default function Integrations() {
           }
         }
         setSaveError(
-          'Configuration changed elsewhere. Refreshed latest settings; re-enter values and save again.',
+          t('integrations.stale_save'),
         );
       } else {
         setSaveError(message);
@@ -357,9 +364,14 @@ export default function Integrations() {
       !isActiveDefaultProvider &&
       integration.id !== activeAiIntegrationId
     ) {
-      const currentProvider = activeAiIntegration?.name ?? 'current provider';
+      const currentProvider =
+        activeAiIntegration?.name ?? t('integrations.current_provider');
       const confirmed = window.confirm(
-        `Switch default AI provider from ${currentProvider} to ${integration.name} and set model to ${trimmedTarget}?`,
+        tf('integrations.confirm_switch_provider_with_model', {
+          current: currentProvider,
+          target: integration.name,
+          model: trimmedTarget,
+        }),
       );
       if (!confirmed) {
         return;
@@ -378,19 +390,22 @@ export default function Integrations() {
       });
 
       await loadData(false);
-      setSaveSuccess(`Model updated to ${trimmedTarget} for ${integration.name}.`);
+      setSaveSuccess(
+        tf('integrations.model_updated', {
+          model: trimmedTarget,
+          name: integration.name,
+        }),
+      );
       setQuickModelDrafts((prev) => {
         const next = { ...prev };
         delete next[integration.id];
         return next;
       });
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Failed to update model';
+      const message = err instanceof Error ? err.message : t('integrations.update_model_error');
       if (message.includes('API 409')) {
         await loadData(false);
-        setQuickModelError(
-          'Configuration changed elsewhere. Refreshed latest settings; choose the model again.',
-        );
+        setQuickModelError(t('integrations.stale_model'));
       } else {
         setQuickModelError(message);
       }
@@ -421,7 +436,7 @@ export default function Integrations() {
     return (
       <div className="p-6">
         <div className="rounded-lg bg-red-900/30 border border-red-700 p-4 text-red-300">
-          Failed to load integrations: {error}
+          {tf('integrations.load_error', { error })}
         </div>
       </div>
     );
@@ -441,7 +456,7 @@ export default function Integrations() {
       <div className="flex items-center gap-2">
         <Puzzle className="h-5 w-5 text-blue-400" />
         <h2 className="text-base font-semibold text-white">
-          Integrations ({integrations.length})
+          {t('integrations.title')} ({integrations.length})
         </h2>
       </div>
 
@@ -469,7 +484,7 @@ export default function Integrations() {
                 : 'bg-gray-900 text-gray-400 border border-gray-700 hover:bg-gray-800 hover:text-white'
             }`}
           >
-            {cat === 'all' ? 'All' : formatCategory(cat)}
+            {cat === 'all' ? t('common.all') : formatCategory(cat)}
           </button>
         ))}
       </div>
@@ -478,7 +493,7 @@ export default function Integrations() {
       {Object.keys(grouped).length === 0 ? (
         <div className="bg-gray-900 rounded-xl border border-gray-800 p-8 text-center">
           <Puzzle className="h-10 w-10 text-gray-600 mx-auto mb-3" />
-          <p className="text-gray-400">No integrations found.</p>
+          <p className="text-gray-400">{t('integrations.empty')}</p>
         </div>
       ) : (
         Object.entries(grouped)
@@ -510,8 +525,8 @@ export default function Integrations() {
                   const modelSummary = currentModel
                     ? currentModel
                     : fallbackModel
-                      ? `default: ${fallbackModel}`
-                      : 'default';
+                      ? tf('integrations.default_summary', { model: fallbackModel })
+                      : t('integrations.default_only');
                   const modelBaseline = currentModel ?? fallbackModel ?? '';
                   const quickDraft = editable
                     ? quickModelDrafts[editable.id] ?? modelBaseline
@@ -555,7 +570,9 @@ export default function Integrations() {
                                   : 'bg-gray-800 text-gray-300 border-gray-700'
                               }`}
                             >
-                              {isActiveDefaultProvider ? 'Default' : 'Configured'}
+                              {isActiveDefaultProvider
+                                ? t('integrations.default_badge')
+                                : t('integrations.configured_badge')}
                             </span>
                           )}
                           <span
@@ -571,7 +588,7 @@ export default function Integrations() {
                         <div className="mt-3 rounded-lg border border-gray-800 bg-gray-950/50 p-3 space-y-2">
                           <div className="flex items-center justify-between gap-2">
                             <span className="text-[11px] uppercase tracking-wider text-gray-500">
-                              Current model
+                              {t('integrations.current_model')}
                             </span>
                             <span className="text-xs text-gray-200 truncate" title={modelSummary}>
                               {modelSummary}
@@ -615,11 +632,13 @@ export default function Integrations() {
                                   }
                                   className="px-2.5 py-1.5 rounded-lg text-xs font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors disabled:opacity-50"
                                 >
-                                  {quickModelSavingId === editable.id ? 'Saving...' : 'Apply'}
+                                  {quickModelSavingId === editable.id
+                                    ? t('common.saving')
+                                    : t('common.apply')}
                                 </button>
                               </div>
                               <p className="text-[11px] text-gray-500">
-                                For custom model IDs, use Edit Keys.
+                                {t('integrations.quick_model_help')}
                               </p>
                             </div>
                           )}
@@ -632,17 +651,19 @@ export default function Integrations() {
                             {editable.configured
                               ? editable.activates_default_provider
                                 ? isActiveDefaultProvider
-                                  ? 'Default provider configured'
-                                  : 'Provider configured'
-                                : 'Credentials configured'
-                              : 'Credentials not configured'}
+                                  ? t('integrations.default_provider_configured')
+                                  : t('integrations.provider_configured')
+                                : t('integrations.credentials_configured')
+                              : t('integrations.credentials_not_configured')}
                           </div>
                           <button
                             onClick={() => openEditor(editable)}
                             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-blue-700/70 bg-blue-900/30 hover:bg-blue-900/50 text-blue-300 text-xs font-medium transition-colors"
                           >
                             <KeyRound className="h-3.5 w-3.5" />
-                            {editable.configured ? 'Edit Keys' : 'Configure'}
+                            {editable.configured
+                              ? t('integrations.edit_keys')
+                              : t('integrations.configure')}
                           </button>
                         </div>
                       )}
@@ -667,19 +688,19 @@ export default function Integrations() {
             <div className="px-5 py-4 border-b border-gray-800 flex items-center justify-between gap-3">
               <div>
                 <h3 className="text-sm font-semibold text-white">
-                  Configure {activeEditor.name}
+                  {tf('integrations.configure_title', { name: activeEditor.name })}
                 </h3>
                 <p className="text-xs text-gray-400 mt-0.5">
                   {activeEditor.configured
-                    ? 'Enter only fields you want to update.'
-                    : 'Enter required fields to configure this integration.'}
+                    ? t('integrations.configure_intro_update')
+                    : t('integrations.configure_intro_new')}
                 </p>
               </div>
               <button
                 onClick={closeEditor}
                 disabled={saving}
                 className="text-gray-400 hover:text-white transition-colors disabled:opacity-50"
-                aria-label="Close"
+                aria-label={t('common.close')}
               >
                 <X className="h-4 w-4" />
               </button>
@@ -688,10 +709,11 @@ export default function Integrations() {
             <div className="p-5 space-y-4">
               {activeEditor.activates_default_provider && (
                 <div className="rounded-lg border border-blue-800 bg-blue-950/30 p-3 text-xs text-blue-200">
-                  Saving here updates credentials and switches your default AI provider to{' '}
-                  <strong>{activeEditor.name}</strong>. For advanced provider settings, use{' '}
+                  {t('integrations.default_provider_notice_prefix')}{' '}
+                  <strong>{activeEditor.name}</strong>.{' '}
+                  {t('integrations.default_provider_notice_suffix')}{' '}
                   <Link to="/config" className="underline underline-offset-2 hover:text-blue-100">
-                    Configuration
+                    {t('config.title')}
                   </Link>
                   .
                 </div>
@@ -712,8 +734,10 @@ export default function Integrations() {
                     field.current_value?.trim() ||
                     (activeEditorIsDefaultProvider ? runtimeStatus?.model?.trim() || '' : '');
                   const keepCurrentLabel = currentModelValue
-                    ? `Keep current model (${currentModelValue})`
-                    : 'Keep current model';
+                    ? tf('integrations.keep_current_model_with_value', {
+                        model: currentModelValue,
+                      })
+                    : t('integrations.keep_current_model');
 
                   return (
                     <div key={field.key}>
@@ -722,7 +746,7 @@ export default function Integrations() {
                         {field.required && <span className="text-red-400">*</span>}
                         {field.has_value && (
                           <span className="text-[11px] text-green-400 bg-green-900/30 border border-green-800 px-1.5 py-0.5 rounded">
-                            Configured
+                            {t('common.configured')}
                           </span>
                         )}
                       </label>
@@ -737,7 +761,7 @@ export default function Integrations() {
                               <option value={SELECT_KEEP}>{keepCurrentLabel}</option>
                             ) : (
                               <option value="" disabled>
-                                Select a recommended model
+                                {t('integrations.select_recommended_model')}
                               </option>
                             )}
                             {selectOptions.map((option) => (
@@ -745,8 +769,12 @@ export default function Integrations() {
                                 {option}
                               </option>
                             ))}
-                            <option value={SELECT_CUSTOM}>Custom model...</option>
-                            {field.has_value && <option value={SELECT_CLEAR}>Clear current model</option>}
+                            <option value={SELECT_CUSTOM}>{t('integrations.custom_model')}</option>
+                            {field.has_value && (
+                              <option value={SELECT_CLEAR}>
+                                {t('integrations.clear_current_model')}
+                              </option>
+                            )}
                           </select>
 
                           {fieldValues[field.key] === SELECT_CUSTOM && (
@@ -760,14 +788,17 @@ export default function Integrations() {
                           )}
 
                           <p className="text-[11px] text-gray-500">
-                            Pick a recommended model or choose Custom model. {customModelFormatHint(activeEditor.id)}.
+                            {tf('integrations.pick_model_help', {
+                              hint: customModelFormatHint(activeEditor.id),
+                            })}
                           </p>
                         </div>
                       ) : (
                         <div className="space-y-2">
                           {maskedSecretValue && (
                             <p className="text-[11px] text-gray-500">
-                              Current value: <span className="font-mono text-gray-300">{maskedSecretValue}</span>
+                              {t('integrations.current_value')}{' '}
+                              <span className="font-mono text-gray-300">{maskedSecretValue}</span>
                             </p>
                           )}
                           <input
@@ -777,11 +808,11 @@ export default function Integrations() {
                             placeholder={
                               field.required
                                 ? field.has_value
-                                  ? 'Enter a new value to replace current'
-                                  : 'Enter value'
+                                  ? t('integrations.replace_current_placeholder')
+                                  : t('integrations.enter_value_placeholder')
                                 : field.has_value
-                                  ? 'Type new value, or leave empty to keep current'
-                                  : 'Optional'
+                                  ? t('integrations.keep_current_placeholder')
+                                  : t('common.optional')
                             }
                             className="w-full px-3 py-2 rounded-lg bg-gray-950 border border-gray-700 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                           />
@@ -805,7 +836,7 @@ export default function Integrations() {
                 disabled={saving}
                 className="px-4 py-2 rounded-lg text-sm border border-gray-700 text-gray-300 hover:bg-gray-800 transition-colors disabled:opacity-50"
               >
-                Cancel
+                {t('common.cancel')}
               </button>
               <button
                 onClick={saveCredentials}
@@ -813,10 +844,10 @@ export default function Integrations() {
                 className="px-4 py-2 rounded-lg text-sm font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors disabled:opacity-50"
               >
                 {saving
-                  ? 'Saving...'
+                  ? t('common.saving')
                   : activeEditor.activates_default_provider
-                    ? 'Save & Activate'
-                    : 'Save Keys'}
+                    ? t('integrations.save_activate')
+                    : t('integrations.save_keys')}
               </button>
             </div>
           </div>

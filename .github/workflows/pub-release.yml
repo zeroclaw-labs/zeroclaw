@@ -202,7 +202,7 @@ jobs:
                 include:
                     # Keep GNU Linux release artifacts on Ubuntu 22.04 to preserve
                     # a broadly compatible GLIBC baseline for user distributions.
-                    - os: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
+                    - os: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2204]
                       target: x86_64-unknown-linux-gnu
                       artifact: zeroclaw
                       archive_ext: tar.gz
@@ -217,7 +217,7 @@ jobs:
                       linker_env: ""
                       linker: ""
                       use_cross: true
-                    - os: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
+                    - os: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2204]
                       target: aarch64-unknown-linux-gnu
                       artifact: zeroclaw
                       archive_ext: tar.gz
@@ -232,7 +232,7 @@ jobs:
                       linker_env: ""
                       linker: ""
                       use_cross: true
-                    - os: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2404]
+                    - os: [self-hosted, Linux, X64, blacksmith-2vcpu-ubuntu-2204]
                       target: armv7-unknown-linux-gnueabihf
                       artifact: zeroclaw
                       archive_ext: tar.gz
@@ -418,16 +418,21 @@ jobs:
                   LINKER_ENV: ${{ matrix.linker_env }}
                   LINKER: ${{ matrix.linker }}
                   USE_CROSS: ${{ matrix.use_cross }}
+                  ZEROCLAW_RELEASE_CARGO_FEATURES: channel-matrix
               run: |
+                  BUILD_ARGS=(--profile release-fast --locked --target ${{ matrix.target }})
+                  if [ -n "$ZEROCLAW_RELEASE_CARGO_FEATURES" ]; then
+                    BUILD_ARGS+=(--features "$ZEROCLAW_RELEASE_CARGO_FEATURES")
+                  fi
                   if [ -n "$LINKER_ENV" ] && [ -n "$LINKER" ]; then
                     echo "Using linker override: $LINKER_ENV=$LINKER"
                     export "$LINKER_ENV=$LINKER"
                   fi
                   if [ "$USE_CROSS" = "true" ]; then
-                    echo "Using cross for MUSL target"
-                    cross build --profile release-fast --locked --target ${{ matrix.target }}
+                    echo "Using cross for official release build"
+                    cross build "${BUILD_ARGS[@]}"
                   else
-                    cargo build --profile release-fast --locked --target ${{ matrix.target }}
+                    cargo build "${BUILD_ARGS[@]}"
                   fi
 
             - name: Check binary size (Unix)

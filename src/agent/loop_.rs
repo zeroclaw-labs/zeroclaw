@@ -131,6 +131,14 @@ const NON_CLI_APPROVAL_POLL_INTERVAL_MS: u64 = 250;
 const MISSING_TOOL_CALL_RETRY_PROMPT: &str = "Internal correction: your last reply implied a follow-up action or claimed action completion, but no valid tool call was emitted. If a tool is needed, emit it now using the required <tool_call>...</tool_call> format. If no tool is needed, provide the complete final answer now and do not defer action.";
 const TOOL_UNAVAILABLE_RETRY_PROMPT_PREFIX: &str = "Internal correction: your prior reply claimed required tools were unavailable. Use only the runtime-allowed tools listed below. If file changes are requested and `file_write`/`file_edit` are listed, call them directly.";
 
+fn display_text_for_tool_execution_turn(response_text: &str, parsed_text: &str) -> String {
+    if !parsed_text.is_empty() {
+        return parsed_text.to_string();
+    }
+
+    response_text.to_string()
+}
+
 /// Detect completion claims that imply state-changing work already happened
 /// without an accompanying tool call.
 static ACTION_COMPLETION_CUE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -1020,18 +1028,17 @@ pub(crate) async fn run_tool_call_loop(
                 });
 
                 let response_text = resp.text_or_empty().to_string();
-                // First try native structured tool calls (OpenAI-format).
-                // Fall back to text-based parsing (XML tags, markdown blocks,
-                // GLM format) only if the provider returned no native calls —
-                // this ensures we support both native and prompt-guided models.
+                // Always derive a text-only view of the model response for CLI
+                // and channel display so raw <tool_call> payloads are hidden
+                // even when the provider also returned native structured calls.
                 let mut calls = parse_structured_tool_calls(&resp.tool_calls);
+                let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
                 let mut parsed_text = String::new();
+                if !fallback_text.is_empty() {
+                    parsed_text = fallback_text;
+                }
 
                 if calls.is_empty() {
-                    let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-                    if !fallback_text.is_empty() {
-                        parsed_text = fallback_text;
-                    }
                     calls = fallback_calls;
                 }
 
@@ -1135,11 +1142,7 @@ pub(crate) async fn run_tool_call_loop(
             }
         };
 
-        let display_text = if parsed_text.is_empty() {
-            response_text.clone()
-        } else {
-            parsed_text
-        };
+        let display_text = display_text_for_tool_execution_turn(&response_text, &parsed_text);
 
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -1805,7 +1808,7 @@ pub async fn run(
     message: Option<String>,
     provider_override: Option<String>,
     model_override: Option<String>,
-    temperature: f64,
+    temperature: Option<f64>,
     peripheral_overrides: Vec<String>,
     interactive: bool,
 ) -> Result<String> {
@@ -1878,6 +1881,7 @@ pub async fn run(
         .as_deref()
         .or(config.default_model.as_deref())
         .unwrap_or("anthropic/claude-sonnet-4");
+    let temperature = temperature.unwrap_or(config.default_temperature);
 
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -4337,6 +4341,31 @@ mod tests {
         let (text, calls) = parse_tool_calls(response);
         assert_eq!(text, "Just a normal response with no tools.");
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn display_text_for_tool_execution_turn_hides_raw_tool_call_payloads() {
+        let response = r#"<tool_call>
+{"name": "shell", "arguments": {"command": "pwd"}}
+</tool_call>"#;
+        let (parsed_text, _calls) = parse_tool_calls(response);
+
+        let display = display_text_for_tool_execution_turn(response, &parsed_text);
+
+        assert!(display.is_empty());
+    }
+
+    #[test]
+    fn display_text_for_tool_execution_turn_preserves_preface_while_stripping_payloads() {
+        let response = r#"Let me check that.
+<tool_call>
+{"name": "shell", "arguments": {"command": "pwd"}}
+</tool_call>"#;
+        let (parsed_text, _calls) = parse_tool_calls(response);
+
+        let display = display_text_for_tool_execution_turn(response, &parsed_text);
+
+        assert_eq!(display, "Let me check that.");
     }
 
     #[test]

@@ -119,6 +119,7 @@ it pulls `ghcr.io/zeroclaw-labs/zeroclaw:latest` and tags it locally before runn
 
 ```bash
 ./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter
+./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter --model "openrouter/auto"
 ```
 
 Or with environment variables:

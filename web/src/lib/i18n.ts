@@ -37,6 +37,15 @@ const translations: Record<Locale, Record<string, string>> = {
     'dashboard.overview': 'Overview',
     'dashboard.system_info': 'System Information',
     'dashboard.quick_actions': 'Quick Actions',
+    'dashboard.provider_model': 'Provider / Model',
+    'dashboard.since_restart': 'Since last restart',
+    'dashboard.cost_overview': 'Cost Overview',
+    'dashboard.active_channels': 'Active Channels',
+    'dashboard.no_channels': 'No channels configured',
+    'dashboard.component_health': 'Component Health',
+    'dashboard.no_components': 'No components reporting',
+    'dashboard.restarts': 'Restarts: {count}',
+    'dashboard.load_error': 'Failed to load dashboard: {error}',
 
     // Agent / Chat
     'agent.title': 'Agent Chat',
@@ -49,6 +58,17 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.thinking': 'Thinking...',
     'agent.tool_call': 'Tool Call',
     'agent.tool_result': 'Tool Result',
+    'agent.empty_title': 'ZeroClaw Agent',
+    'agent.empty_subtitle': 'Send a message to start the conversation',
+    'agent.connection_error': 'Connection error. Attempting to reconnect...',
+    'agent.send_failed': 'Failed to send message. Please try again.',
+    'agent.done_without_text': 'Tool execution completed, but no final response text was returned.',
+    'agent.tool_call_message': '[Tool Call] {name}({args})',
+    'agent.tool_result_message': '[Tool Result] {output}',
+    'agent.error_message': '[Error] {message}',
+    'agent.typing': 'Typing...',
+    'agent.unknown_tool': 'unknown',
+    'agent.unknown_error': 'Unknown error',
 
     // Tools
     'tools.title': 'Available Tools',
@@ -58,6 +78,11 @@ const translations: Record<Locale, Record<string, string>> = {
     'tools.search': 'Search tools...',
     'tools.empty': 'No tools available.',
     'tools.count': 'Total tools',
+    'tools.agent_tools': 'Agent Tools',
+    'tools.cli_tools': 'CLI Tools',
+    'tools.parameter_schema': 'Parameter Schema',
+    'tools.no_match': 'No tools match your search.',
+    'tools.load_error': 'Failed to load tools: {error}',
 
     // Cron
     'cron.title': 'Scheduled Jobs',
@@ -74,6 +99,18 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.enabled': 'Enabled',
     'cron.empty': 'No scheduled jobs.',
     'cron.confirm_delete': 'Are you sure you want to delete this job?',
+    'cron.load_error': 'Failed to load cron jobs: {error}',
+    'cron.required_fields': 'Schedule and command are required.',
+    'cron.add_error': 'Failed to add job',
+    'cron.delete_error': 'Failed to delete job',
+    'cron.modal_title': 'Add Cron Job',
+    'cron.name_optional': 'Name (optional)',
+    'cron.name_placeholder': 'e.g. Daily cleanup',
+    'cron.schedule_placeholder': 'e.g. 0 0 * * * (cron expression)',
+    'cron.command_placeholder': 'e.g. cleanup --older-than 7d',
+    'cron.adding': 'Adding...',
+    'cron.empty_configured': 'No scheduled tasks configured.',
+    'cron.delete_prompt': 'Delete?',
 
     // Integrations
     'integrations.title': 'Integrations',
@@ -86,6 +123,58 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.empty': 'No integrations found.',
     'integrations.activate': 'Activate',
     'integrations.deactivate': 'Deactivate',
+    'integrations.load_error': 'Failed to load integrations: {error}',
+    'integrations.current_provider': 'current provider',
+    'integrations.custom_model_hint_scoped': 'Format: anthropic/claude-sonnet-4-6',
+    'integrations.custom_model_hint_generic': 'Format: claude-sonnet-4-6 (or provider/model when required)',
+    'integrations.field_required': '{field} is required.',
+    'integrations.custom_value_required':
+      'Enter a custom value for {field} or choose a recommended model.',
+    'integrations.no_changes': 'No changes to save.',
+    'integrations.confirm_switch_provider':
+      'Switch default AI provider from {current} to {target}?',
+    'integrations.confirm_switch_provider_with_model':
+      'Switch default AI provider from {current} to {target} and set model to {model}?',
+    'integrations.credentials_saved': '{name} credentials saved.',
+    'integrations.save_error': 'Failed to save credentials',
+    'integrations.stale_save':
+      'Configuration changed elsewhere. Refreshed latest settings; re-enter values and save again.',
+    'integrations.model_updated': 'Model updated to {model} for {name}.',
+    'integrations.update_model_error': 'Failed to update model',
+    'integrations.stale_model':
+      'Configuration changed elsewhere. Refreshed latest settings; choose the model again.',
+    'integrations.default_summary': 'default: {model}',
+    'integrations.default_only': 'default',
+    'integrations.default_badge': 'Default',
+    'integrations.configured_badge': 'Configured',
+    'integrations.current_model': 'Current model',
+    'integrations.quick_model_help': 'For custom model IDs, use Edit Keys.',
+    'integrations.default_provider_configured': 'Default provider configured',
+    'integrations.provider_configured': 'Provider configured',
+    'integrations.credentials_configured': 'Credentials configured',
+    'integrations.credentials_not_configured': 'Credentials not configured',
+    'integrations.edit_keys': 'Edit Keys',
+    'integrations.configure': 'Configure',
+    'integrations.configure_title': 'Configure {name}',
+    'integrations.configure_intro_update': 'Enter only fields you want to update.',
+    'integrations.configure_intro_new': 'Enter required fields to configure this integration.',
+    'integrations.default_provider_notice_prefix':
+      'Saving here updates credentials and switches your default AI provider to',
+    'integrations.default_provider_notice_suffix':
+      'For advanced provider settings, use',
+    'integrations.keep_current_model': 'Keep current model',
+    'integrations.keep_current_model_with_value': 'Keep current model ({model})',
+    'integrations.select_recommended_model': 'Select a recommended model',
+    'integrations.custom_model': 'Custom model...',
+    'integrations.clear_current_model': 'Clear current model',
+    'integrations.pick_model_help':
+      'Pick a recommended model or choose Custom model. {hint}.',
+    'integrations.current_value': 'Current value:',
+    'integrations.replace_current_placeholder': 'Enter a new value to replace current',
+    'integrations.enter_value_placeholder': 'Enter value',
+    'integrations.keep_current_placeholder': 'Type new value, or leave empty to keep current',
+    'integrations.save_activate': 'Save & Activate',
+    'integrations.save_keys': 'Save Keys',
 
     // Memory
     'memory.title': 'Memory Store',
@@ -101,6 +190,16 @@ const translations: Record<Locale, Record<string, string>> = {
     'memory.empty': 'No memory entries found.',
     'memory.confirm_delete': 'Are you sure you want to delete this memory entry?',
     'memory.all_categories': 'All Categories',
+    'memory.load_error': 'Failed to load memory: {error}',
+    'memory.required_fields': 'Key and content are required.',
+    'memory.store_error': 'Failed to store memory',
+    'memory.delete_error': 'Failed to delete memory',
+    'memory.add_button': 'Add Memory',
+    'memory.key_placeholder': 'e.g. user_preferences',
+    'memory.content_placeholder': 'Memory content...',
+    'memory.category_optional': 'Category (optional)',
+    'memory.category_placeholder': 'e.g. preferences, context, facts',
+    'memory.delete_prompt': 'Delete?',
 
     // Config
     'config.title': 'Configuration',
@@ -110,6 +209,10 @@ const translations: Record<Locale, Record<string, string>> = {
     'config.error': 'Failed to save configuration.',
     'config.loading': 'Loading configuration...',
     'config.editor_placeholder': 'TOML configuration...',
+    'config.sensitive_title': 'Sensitive fields are masked',
+    'config.sensitive_body':
+      'API keys, tokens, and passwords are hidden for security. To update a masked field, replace the entire masked value with your new value.',
+    'config.editor_title': 'TOML Configuration',
 
     // Cost
     'cost.title': 'Cost Tracker',
@@ -123,6 +226,14 @@ const translations: Record<Locale, Record<string, string>> = {
     'cost.tokens': 'Tokens',
     'cost.requests': 'Requests',
     'cost.usd': 'Cost (USD)',
+    'cost.load_error': 'Failed to load cost data: {error}',
+    'cost.total_requests': 'Total Requests',
+    'cost.token_statistics': 'Token Statistics',
+    'cost.average_tokens_per_request': 'Avg Tokens / Request',
+    'cost.cost_per_1k_tokens': 'Cost per 1K Tokens',
+    'cost.model_breakdown': 'Model Breakdown',
+    'cost.no_models': 'No model data available.',
+    'cost.share': 'Share',
 
     // Logs
     'logs.title': 'Live Logs',
@@ -133,6 +244,11 @@ const translations: Record<Locale, Record<string, string>> = {
     'logs.empty': 'No log entries.',
     'logs.connected': 'Connected to event stream.',
     'logs.disconnected': 'Disconnected from event stream.',
+    'logs.jump_to_bottom': 'Jump to bottom',
+    'logs.events': 'events',
+    'logs.filter_label': 'Filter:',
+    'logs.paused_empty': 'Log streaming is paused.',
+    'logs.waiting_empty': 'Waiting for events...',
 
     // Doctor
     'doctor.title': 'System Diagnostics',
@@ -146,6 +262,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'doctor.message': 'Message',
     'doctor.empty': 'No diagnostics have been run yet.',
     'doctor.summary': 'Diagnostic Summary',
+    'doctor.run_error': 'Failed to run diagnostics',
+    'doctor.running_short': 'Running...',
+    'doctor.may_take_seconds': 'This may take a few seconds.',
+    'doctor.issues_found': 'Issues Found',
+    'doctor.warnings': 'Warnings',
+    'doctor.all_clear': 'All Clear',
+    'doctor.empty_help': 'Click "Run Diagnostics" to check your ZeroClaw installation.',
 
     // Auth / Pairing
     'auth.pair': 'Pair Device',
@@ -155,6 +278,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'auth.pairing_success': 'Pairing successful!',
     'auth.pairing_failed': 'Pairing failed. Please try again.',
     'auth.enter_code': 'Enter your pairing code to connect to the agent.',
+    'auth.enter_code_terminal': 'Enter the pairing code from your terminal',
+    'auth.code_placeholder': '6-digit code',
+    'auth.pairing_progress': 'Pairing...',
 
     // Common
     'common.loading': 'Loading...',
@@ -178,6 +304,27 @@ const translations: Record<Locale, Record<string, string>> = {
     'common.status': 'Status',
     'common.created': 'Created',
     'common.updated': 'Updated',
+    'common.saving': 'Saving...',
+    'common.adding': 'Adding...',
+    'common.enabled': 'Enabled',
+    'common.disabled': 'Disabled',
+    'common.active': 'Active',
+    'common.inactive': 'Inactive',
+    'common.optional': 'optional',
+    'common.id': 'ID',
+    'common.path': 'Path',
+    'common.version': 'Version',
+    'common.all': 'All',
+    'common.unknown': 'Unknown',
+    'common.current': 'Current',
+    'common.current_value': 'Current value',
+    'common.apply': 'Apply',
+    'common.configured': 'Configured',
+    'common.configure': 'Configure',
+    'common.default': 'Default',
+    'common.events': 'events',
+    'common.lines': 'lines',
+    'common.select': 'Select',
 
     // Health
     'health.title': 'System Health',
@@ -220,6 +367,15 @@ const translations: Record<Locale, Record<string, string>> = {
     'dashboard.overview': 'Genel Bakis',
     'dashboard.system_info': 'Sistem Bilgisi',
     'dashboard.quick_actions': 'Hizli Islemler',
+    'dashboard.provider_model': 'Saglayici / Model',
+    'dashboard.since_restart': 'Son yeniden baslatmadan beri',
+    'dashboard.cost_overview': 'Maliyet Ozeti',
+    'dashboard.active_channels': 'Aktif Kanallar',
+    'dashboard.no_channels': 'Yapilandirilmis kanal yok',
+    'dashboard.component_health': 'Bilesen Sagligi',
+    'dashboard.no_components': 'Raporlayan bilesen yok',
+    'dashboard.restarts': 'Yeniden baslatmalar: {count}',
+    'dashboard.load_error': 'Kontrol paneli yuklenemedi: {error}',
 
     // Agent / Chat
     'agent.title': 'Ajan Sohbet',
@@ -232,6 +388,17 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.thinking': 'Dusunuyor...',
     'agent.tool_call': 'Arac Cagrisi',
     'agent.tool_result': 'Arac Sonucu',
+    'agent.empty_title': 'ZeroClaw Ajan',
+    'agent.empty_subtitle': 'Sohbeti baslatmak icin bir mesaj gonderin',
+    'agent.connection_error': 'Baglanti hatasi. Yeniden baglanmayi deniyor...',
+    'agent.send_failed': 'Mesaj gonderilemedi. Lutfen tekrar deneyin.',
+    'agent.done_without_text': 'Arac calismasi tamamlandi ancak son yanit metni dondurulmedi.',
+    'agent.tool_call_message': '[Arac Cagrisi] {name}({args})',
+    'agent.tool_result_message': '[Arac Sonucu] {output}',
+    'agent.error_message': '[Hata] {message}',
+    'agent.typing': 'Yaziyor...',
+    'agent.unknown_tool': 'bilinmeyen',
+    'agent.unknown_error': 'Bilinmeyen hata',
 
     // Tools
     'tools.title': 'Mevcut Araclar',
@@ -241,6 +408,11 @@ const translations: Record<Locale, Record<string, string>> = {
     'tools.search': 'Arac ara...',
     'tools.empty': 'Mevcut arac yok.',
     'tools.count': 'Toplam arac',
+    'tools.agent_tools': 'Ajan Araclari',
+    'tools.cli_tools': 'CLI Araclari',
+    'tools.parameter_schema': 'Parametre Semasi',
+    'tools.no_match': 'Aramanizla eslesen arac yok.',
+    'tools.load_error': 'Araclar yuklenemedi: {error}',
 
     // Cron
     'cron.title': 'Zamanlanmis Gorevler',
@@ -257,6 +429,18 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.enabled': 'Etkin',
     'cron.empty': 'Zamanlanmis gorev yok.',
     'cron.confirm_delete': 'Bu gorevi silmek istediginizden emin misiniz?',
+    'cron.load_error': 'Zamanlanmis gorevler yuklenemedi: {error}',
+    'cron.required_fields': 'Zamanlama ve komut gereklidir.',
+    'cron.add_error': 'Gorev eklenemedi',
+    'cron.delete_error': 'Gorev silinemedi',
+    'cron.modal_title': 'Cron Gorevi Ekle',
+    'cron.name_optional': 'Ad (istege bagli)',
+    'cron.name_placeholder': 'ornegin Gunluk temizleme',
+    'cron.schedule_placeholder': 'ornegin 0 0 * * * (cron ifadesi)',
+    'cron.command_placeholder': 'ornegin cleanup --older-than 7d',
+    'cron.adding': 'Ekleniyor...',
+    'cron.empty_configured': 'Yapilandirilmis zamanlanmis gorev yok.',
+    'cron.delete_prompt': 'Silinsin mi?',
 
     // Integrations
     'integrations.title': 'Entegrasyonlar',
@@ -269,6 +453,60 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.empty': 'Entegrasyon bulunamadi.',
     'integrations.activate': 'Etkinlestir',
     'integrations.deactivate': 'Devre Disi Birak',
+    'integrations.load_error': 'Entegrasyonlar yuklenemedi: {error}',
+    'integrations.current_provider': 'mevcut saglayici',
+    'integrations.custom_model_hint_scoped': 'Format: anthropic/claude-sonnet-4-6',
+    'integrations.custom_model_hint_generic':
+      'Format: claude-sonnet-4-6 (gerektiginde provider/model)',
+    'integrations.field_required': '{field} gereklidir.',
+    'integrations.custom_value_required':
+      '{field} icin ozel bir deger girin veya onerilen bir model secin.',
+    'integrations.no_changes': 'Kaydedilecek degisiklik yok.',
+    'integrations.confirm_switch_provider':
+      'Varsayilan AI saglayicisini {current} konumundan {target} konumuna gecirmek istiyor musunuz?',
+    'integrations.confirm_switch_provider_with_model':
+      'Varsayilan AI saglayicisini {current} konumundan {target} konumuna gecirip modeli {model} olarak ayarlamak istiyor musunuz?',
+    'integrations.credentials_saved': '{name} kimlik bilgileri kaydedildi.',
+    'integrations.save_error': 'Kimlik bilgileri kaydedilemedi',
+    'integrations.stale_save':
+      'Yapilandirma baska yerde degisti. En guncel ayarlar yenilendi; degerleri yeniden girip tekrar kaydedin.',
+    'integrations.model_updated': '{name} icin model {model} olarak guncellendi.',
+    'integrations.update_model_error': 'Model guncellenemedi',
+    'integrations.stale_model':
+      'Yapilandirma baska yerde degisti. En guncel ayarlar yenilendi; modeli yeniden secin.',
+    'integrations.default_summary': 'varsayilan: {model}',
+    'integrations.default_only': 'varsayilan',
+    'integrations.default_badge': 'Varsayilan',
+    'integrations.configured_badge': 'Yapilandirildi',
+    'integrations.current_model': 'Guncel model',
+    'integrations.quick_model_help': 'Ozel model kimlikleri icin Anahtarlari Duzenle secenegini kullanin.',
+    'integrations.default_provider_configured': 'Varsayilan saglayici yapilandirildi',
+    'integrations.provider_configured': 'Saglayici yapilandirildi',
+    'integrations.credentials_configured': 'Kimlik bilgileri yapilandirildi',
+    'integrations.credentials_not_configured': 'Kimlik bilgileri yapilandirilmadi',
+    'integrations.edit_keys': 'Anahtarlari Duzenle',
+    'integrations.configure': 'Yapilandir',
+    'integrations.configure_title': '{name} Yapilandir',
+    'integrations.configure_intro_update': 'Yalnizca guncellemek istediginiz alanlari girin.',
+    'integrations.configure_intro_new': 'Bu entegrasyonu yapilandirmak icin gerekli alanlari girin.',
+    'integrations.default_provider_notice_prefix':
+      'Burada kaydetmek kimlik bilgilerini gunceller ve varsayilan AI saglayicinizi su olarak degistirir:',
+    'integrations.default_provider_notice_suffix':
+      'Gelismis saglayici ayarlari icin sunu kullanin:',
+    'integrations.keep_current_model': 'Guncel modeli koru',
+    'integrations.keep_current_model_with_value': 'Guncel modeli koru ({model})',
+    'integrations.select_recommended_model': 'Onerilen bir model secin',
+    'integrations.custom_model': 'Ozel model...',
+    'integrations.clear_current_model': 'Guncel modeli temizle',
+    'integrations.pick_model_help':
+      'Onerilen bir model secin veya Ozel model secenegini kullanin. {hint}.',
+    'integrations.current_value': 'Guncel deger:',
+    'integrations.replace_current_placeholder': 'Gunceli degistirmek icin yeni bir deger girin',
+    'integrations.enter_value_placeholder': 'Deger girin',
+    'integrations.keep_current_placeholder':
+      'Yeni deger yazin veya gunceli korumak icin bos birakin',
+    'integrations.save_activate': 'Kaydet ve Etkinlestir',
+    'integrations.save_keys': 'Anahtarlari Kaydet',
 
     // Memory
     'memory.title': 'Hafiza Deposu',
@@ -284,6 +522,16 @@ const translations: Record<Locale, Record<string, string>> = {
     'memory.empty': 'Hafiza kaydi bulunamadi.',
     'memory.confirm_delete': 'Bu hafiza kaydini silmek istediginizden emin misiniz?',
     'memory.all_categories': 'Tum Kategoriler',
+    'memory.load_error': 'Hafiza yuklenemedi: {error}',
+    'memory.required_fields': 'Anahtar ve icerik gereklidir.',
+    'memory.store_error': 'Hafiza kaydedilemedi',
+    'memory.delete_error': 'Hafiza silinemedi',
+    'memory.add_button': 'Hafiza Ekle',
+    'memory.key_placeholder': 'ornegin user_preferences',
+    'memory.content_placeholder': 'Hafiza icerigi...',
+    'memory.category_optional': 'Kategori (istege bagli)',
+    'memory.category_placeholder': 'ornegin preferences, context, facts',
+    'memory.delete_prompt': 'Silinsin mi?',
 
     // Config
     'config.title': 'Yapilandirma',
@@ -293,6 +541,10 @@ const translations: Record<Locale, Record<string, string>> = {
     'config.error': 'Yapilandirma kaydedilemedi.',
     'config.loading': 'Yapilandirma yukleniyor...',
     'config.editor_placeholder': 'TOML yapilandirmasi...',
+    'config.sensitive_title': 'Hassas alanlar maskelenir',
+    'config.sensitive_body':
+      'Guvenlik icin API anahtarlari, tokenlar ve parolalar gizlenir. Maskeli bir alani guncellemek icin tum maskeli degeri yeni degerinizle degistirin.',
+    'config.editor_title': 'TOML Yapilandirmasi',
 
     // Cost
     'cost.title': 'Maliyet Takibi',
@@ -306,6 +558,14 @@ const translations: Record<Locale, Record<string, string>> = {
     'cost.tokens': 'Token',
     'cost.requests': 'Istekler',
     'cost.usd': 'Maliyet (USD)',
+    'cost.load_error': 'Maliyet verileri yuklenemedi: {error}',
+    'cost.total_requests': 'Toplam Istek',
+    'cost.token_statistics': 'Token Istatistikleri',
+    'cost.average_tokens_per_request': 'Istek Basina Ort. Token',
+    'cost.cost_per_1k_tokens': '1K Token Basina Maliyet',
+    'cost.model_breakdown': 'Model Dagilimi',
+    'cost.no_models': 'Model verisi yok.',
+    'cost.share': 'Pay',
 
     // Logs
     'logs.title': 'Canli Kayitlar',
@@ -316,6 +576,11 @@ const translations: Record<Locale, Record<string, string>> = {
     'logs.empty': 'Kayit girisi yok.',
     'logs.connected': 'Olay akisina baglandi.',
     'logs.disconnected': 'Olay akisi baglantisi kesildi.',
+    'logs.jump_to_bottom': 'En alta git',
+    'logs.events': 'olay',
+    'logs.filter_label': 'Filtre:',
+    'logs.paused_empty': 'Kayit akisi duraklatildi.',
+    'logs.waiting_empty': 'Olaylar bekleniyor...',
 
     // Doctor
     'doctor.title': 'Sistem Teshisleri',
@@ -329,6 +594,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'doctor.message': 'Mesaj',
     'doctor.empty': 'Henuz teshis calistirilmadi.',
     'doctor.summary': 'Teshis Ozeti',
+    'doctor.run_error': 'Teshisler calistirilamadi',
+    'doctor.running_short': 'Calisiyor...',
+    'doctor.may_take_seconds': 'Bu islem birkac saniye surebilir.',
+    'doctor.issues_found': 'Sorunlar Bulundu',
+    'doctor.warnings': 'Uyarilar',
+    'doctor.all_clear': 'Her Sey Yolunda',
+    'doctor.empty_help': 'ZeroClaw kurulumunuzu kontrol etmek icin "Teshis Calistir" dugmesine tiklayin.',
 
     // Auth / Pairing
     'auth.pair': 'Cihaz Esle',
@@ -338,6 +610,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'auth.pairing_success': 'Eslestirme basarili!',
     'auth.pairing_failed': 'Eslestirme basarisiz. Lutfen tekrar deneyin.',
     'auth.enter_code': 'Ajana baglanmak icin eslestirme kodunuzu girin.',
+    'auth.enter_code_terminal': 'Terminalinizdeki eslestirme kodunu girin',
+    'auth.code_placeholder': '6 haneli kod',
+    'auth.pairing_progress': 'Eslestiriliyor...',
 
     // Common
     'common.loading': 'Yukleniyor...',
@@ -361,6 +636,27 @@ const translations: Record<Locale, Record<string, string>> = {
     'common.status': 'Durum',
     'common.created': 'Olusturulma',
     'common.updated': 'Guncellenme',
+    'common.saving': 'Kaydediliyor...',
+    'common.adding': 'Ekleniyor...',
+    'common.enabled': 'Etkin',
+    'common.disabled': 'Devre disi',
+    'common.active': 'Aktif',
+    'common.inactive': 'Pasif',
+    'common.optional': 'istege bagli',
+    'common.id': 'Kimlik',
+    'common.path': 'Yol',
+    'common.version': 'Surum',
+    'common.all': 'Tum',
+    'common.unknown': 'Bilinmeyen',
+    'common.current': 'Guncel',
+    'common.current_value': 'Guncel deger',
+    'common.apply': 'Uygula',
+    'common.configured': 'Yapilandirildi',
+    'common.configure': 'Yapilandir',
+    'common.default': 'Varsayilan',
+    'common.events': 'olay',
+    'common.lines': 'satir',
+    'common.select': 'Sec',
 
     // Health
     'health.title': 'Sistem Sagligi',
@@ -403,6 +699,15 @@ const translations: Record<Locale, Record<string, string>> = {
     'dashboard.overview': '总览',
     'dashboard.system_info': '系统信息',
     'dashboard.quick_actions': '快捷操作',
+    'dashboard.provider_model': '提供商 / 模型',
+    'dashboard.since_restart': '自上次重启以来',
+    'dashboard.cost_overview': '成本总览',
+    'dashboard.active_channels': '活跃渠道',
+    'dashboard.no_channels': '未配置任何渠道',
+    'dashboard.component_health': '组件健康状态',
+    'dashboard.no_components': '没有组件上报状态',
+    'dashboard.restarts': '重启次数：{count}',
+    'dashboard.load_error': '加载仪表盘失败：{error}',
 
     // Agent / Chat
     'agent.title': '智能体聊天',
@@ -415,6 +720,17 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.thinking': '思考中...',
     'agent.tool_call': '工具调用',
     'agent.tool_result': '工具结果',
+    'agent.empty_title': 'ZeroClaw 智能体',
+    'agent.empty_subtitle': '发送一条消息以开始对话',
+    'agent.connection_error': '连接出错，正在尝试重新连接...',
+    'agent.send_failed': '发送消息失败，请重试。',
+    'agent.done_without_text': '工具执行已完成，但未返回最终响应文本。',
+    'agent.tool_call_message': '[工具调用] {name}({args})',
+    'agent.tool_result_message': '[工具结果] {output}',
+    'agent.error_message': '[错误] {message}',
+    'agent.typing': '输入中...',
+    'agent.unknown_tool': '未知',
+    'agent.unknown_error': '未知错误',
 
     // Tools
     'tools.title': '可用工具',
@@ -424,6 +740,11 @@ const translations: Record<Locale, Record<string, string>> = {
     'tools.search': '搜索工具...',
     'tools.empty': '暂无可用工具。',
     'tools.count': '工具总数',
+    'tools.agent_tools': '智能体工具',
+    'tools.cli_tools': 'CLI 工具',
+    'tools.parameter_schema': '参数结构',
+    'tools.no_match': '没有工具符合你的搜索。',
+    'tools.load_error': '加载工具失败：{error}',
 
     // Cron
     'cron.title': '定时任务',
@@ -440,6 +761,18 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.enabled': '已启用',
     'cron.empty': '暂无定时任务。',
     'cron.confirm_delete': '确定要删除此任务吗？',
+    'cron.load_error': '加载定时任务失败：{error}',
+    'cron.required_fields': '计划和命令为必填项。',
+    'cron.add_error': '添加任务失败',
+    'cron.delete_error': '删除任务失败',
+    'cron.modal_title': '添加 Cron 任务',
+    'cron.name_optional': '名称（可选）',
+    'cron.name_placeholder': '例如：每日清理',
+    'cron.schedule_placeholder': '例如：0 0 * * *（cron 表达式）',
+    'cron.command_placeholder': '例如：cleanup --older-than 7d',
+    'cron.adding': '添加中...',
+    'cron.empty_configured': '尚未配置定时任务。',
+    'cron.delete_prompt': '删除？',
 
     // Integrations
     'integrations.title': '集成',
@@ -452,6 +785,55 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.empty': '未找到集成。',
     'integrations.activate': '激活',
     'integrations.deactivate': '停用',
+    'integrations.load_error': '加载集成失败：{error}',
+    'integrations.current_provider': '当前提供商',
+    'integrations.custom_model_hint_scoped': '格式：anthropic/claude-sonnet-4-6',
+    'integrations.custom_model_hint_generic':
+      '格式：claude-sonnet-4-6（需要时使用 provider/model）',
+    'integrations.field_required': '{field} 为必填项。',
+    'integrations.custom_value_required': '请为 {field} 输入自定义值，或选择推荐模型。',
+    'integrations.no_changes': '没有可保存的更改。',
+    'integrations.confirm_switch_provider': '要将默认 AI 提供商从 {current} 切换到 {target} 吗？',
+    'integrations.confirm_switch_provider_with_model':
+      '要将默认 AI 提供商从 {current} 切换到 {target}，并将模型设置为 {model} 吗？',
+    'integrations.credentials_saved': '{name} 凭据已保存。',
+    'integrations.save_error': '保存凭据失败',
+    'integrations.stale_save':
+      '配置已在其他地方发生变化。已刷新最新设置；请重新输入值后再次保存。',
+    'integrations.model_updated': '{name} 的模型已更新为 {model}。',
+    'integrations.update_model_error': '更新模型失败',
+    'integrations.stale_model':
+      '配置已在其他地方发生变化。已刷新最新设置；请重新选择模型。',
+    'integrations.default_summary': '默认：{model}',
+    'integrations.default_only': '默认',
+    'integrations.default_badge': '默认',
+    'integrations.configured_badge': '已配置',
+    'integrations.current_model': '当前模型',
+    'integrations.quick_model_help': '如需自定义模型 ID，请使用“编辑密钥”。',
+    'integrations.default_provider_configured': '默认提供商已配置',
+    'integrations.provider_configured': '提供商已配置',
+    'integrations.credentials_configured': '凭据已配置',
+    'integrations.credentials_not_configured': '凭据未配置',
+    'integrations.edit_keys': '编辑密钥',
+    'integrations.configure': '配置',
+    'integrations.configure_title': '配置 {name}',
+    'integrations.configure_intro_update': '只输入你想更新的字段。',
+    'integrations.configure_intro_new': '输入必填字段以配置此集成。',
+    'integrations.default_provider_notice_prefix':
+      '在此保存会更新凭据，并将你的默认 AI 提供商切换为',
+    'integrations.default_provider_notice_suffix': '如需高级提供商设置，请使用',
+    'integrations.keep_current_model': '保留当前模型',
+    'integrations.keep_current_model_with_value': '保留当前模型（{model}）',
+    'integrations.select_recommended_model': '选择推荐模型',
+    'integrations.custom_model': '自定义模型...',
+    'integrations.clear_current_model': '清除当前模型',
+    'integrations.pick_model_help': '请选择推荐模型或使用自定义模型。{hint}。',
+    'integrations.current_value': '当前值：',
+    'integrations.replace_current_placeholder': '输入新值以替换当前值',
+    'integrations.enter_value_placeholder': '输入值',
+    'integrations.keep_current_placeholder': '输入新值，或留空以保留当前值',
+    'integrations.save_activate': '保存并激活',
+    'integrations.save_keys': '保存密钥',
 
     // Memory
     'memory.title': '记忆存储',
@@ -467,6 +849,16 @@ const translations: Record<Locale, Record<string, string>> = {
     'memory.empty': '未找到记忆条目。',
     'memory.confirm_delete': '确定要删除此记忆条目吗？',
     'memory.all_categories': '全部分类',
+    'memory.load_error': '加载记忆失败：{error}',
+    'memory.required_fields': '键和内容为必填项。',
+    'memory.store_error': '存储记忆失败',
+    'memory.delete_error': '删除记忆失败',
+    'memory.add_button': '添加记忆',
+    'memory.key_placeholder': '例如：user_preferences',
+    'memory.content_placeholder': '记忆内容...',
+    'memory.category_optional': '分类（可选）',
+    'memory.category_placeholder': '例如：preferences、context、facts',
+    'memory.delete_prompt': '删除？',
 
     // Config
     'config.title': '配置',
@@ -476,6 +868,10 @@ const translations: Record<Locale, Record<string, string>> = {
     'config.error': '配置保存失败。',
     'config.loading': '配置加载中...',
     'config.editor_placeholder': 'TOML 配置...',
+    'config.sensitive_title': '敏感字段已隐藏',
+    'config.sensitive_body':
+      '为了安全，API 密钥、令牌和密码会被隐藏。要更新已隐藏的字段，请用你的新值替换整个隐藏值。',
+    'config.editor_title': 'TOML 配置',
 
     // Cost
     'cost.title': '成本追踪',
@@ -489,6 +885,14 @@ const translations: Record<Locale, Record<string, string>> = {
     'cost.tokens': 'Token',
     'cost.requests': '请求',
     'cost.usd': '成本（USD）',
+    'cost.load_error': '加载成本数据失败：{error}',
+    'cost.total_requests': '总请求数',
+    'cost.token_statistics': 'Token 统计',
+    'cost.average_tokens_per_request': '每次请求平均 Token',
+    'cost.cost_per_1k_tokens': '每 1K Token 成本',
+    'cost.model_breakdown': '模型拆分',
+    'cost.no_models': '暂无模型数据。',
+    'cost.share': '占比',
 
     // Logs
     'logs.title': '实时日志',
@@ -499,6 +903,11 @@ const translations: Record<Locale, Record<string, string>> = {
     'logs.empty': '暂无日志条目。',
     'logs.connected': '已连接到事件流。',
     'logs.disconnected': '与事件流断开连接。',
+    'logs.jump_to_bottom': '跳到末尾',
+    'logs.events': '事件',
+    'logs.filter_label': '筛选：',
+    'logs.paused_empty': '日志流已暂停。',
+    'logs.waiting_empty': '正在等待事件...',
 
     // Doctor
     'doctor.title': '系统诊断',
@@ -512,6 +921,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'doctor.message': '消息',
     'doctor.empty': '尚未运行诊断。',
     'doctor.summary': '诊断摘要',
+    'doctor.run_error': '运行诊断失败',
+    'doctor.running_short': '运行中...',
+    'doctor.may_take_seconds': '这可能需要几秒钟。',
+    'doctor.issues_found': '发现问题',
+    'doctor.warnings': '警告',
+    'doctor.all_clear': '一切正常',
+    'doctor.empty_help': '点击“运行诊断”以检查你的 ZeroClaw 安装。',
 
     // Auth / Pairing
     'auth.pair': '设备配对',
@@ -521,6 +937,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'auth.pairing_success': '配对成功！',
     'auth.pairing_failed': '配对失败，请重试。',
     'auth.enter_code': '输入配对码以连接到智能体。',
+    'auth.enter_code_terminal': '输入终端中的配对码',
+    'auth.code_placeholder': '6 位代码',
+    'auth.pairing_progress': '配对中...',
 
     // Common
     'common.loading': '加载中...',
@@ -544,6 +963,27 @@ const translations: Record<Locale, Record<string, string>> = {
     'common.status': '状态',
     'common.created': '创建时间',
     'common.updated': '更新时间',
+    'common.saving': '保存中...',
+    'common.adding': '添加中...',
+    'common.enabled': '已启用',
+    'common.disabled': '已禁用',
+    'common.active': '激活',
+    'common.inactive': '未激活',
+    'common.optional': '可选',
+    'common.id': 'ID',
+    'common.path': '路径',
+    'common.version': '版本',
+    'common.all': '全部',
+    'common.unknown': '未知',
+    'common.current': '当前',
+    'common.current_value': '当前值',
+    'common.apply': '应用',
+    'common.configured': '已配置',
+    'common.configure': '配置',
+    'common.default': '默认',
+    'common.events': '事件',
+    'common.lines': '行',
+    'common.select': '选择',
 
     // Health
     'health.title': '系统健康',
@@ -582,6 +1022,16 @@ export function setLocale(locale: Locale): void {
  */
 export function t(key: string): string {
   return translations[currentLocale]?.[key] ?? translations.en[key] ?? key;
+}
+
+export function tf(
+  key: string,
+  values: Record<string, string | number>,
+): string {
+  return Object.entries(values).reduce((result, [name, value]) => {
+    const token = `{${name}}`;
+    return result.split(token).join(String(value));
+  }, t(key));
 }
 
 /**

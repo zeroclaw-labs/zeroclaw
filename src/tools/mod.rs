@@ -126,7 +126,7 @@ use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 struct ArcDelegatingTool {
@@ -160,6 +160,21 @@ impl Tool for ArcDelegatingTool {
 
 fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
     tools.into_iter().map(ArcDelegatingTool::boxed).collect()
+}
+
+pub(crate) type SharedToolRegistry = Arc<Mutex<Vec<Arc<dyn Tool>>>>;
+
+pub(crate) fn new_shared_tool_registry() -> SharedToolRegistry {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+pub(crate) fn sync_shared_tool_registry(
+    shared_registry: &SharedToolRegistry,
+    tools: &[Arc<dyn Tool>],
+) {
+    if let Ok(mut guard) = shared_registry.lock() {
+        *guard = tools.to_vec();
+    }
 }
 
 /// Create the default tool registry
@@ -417,6 +432,7 @@ pub fn all_tools_with_runtime(
     }
 
     // Add delegation and sub-agent orchestration tools when agents are configured
+    let mut shared_parent_tools = None;
     if !agents.is_empty() {
         let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
             .iter()
@@ -442,7 +458,8 @@ pub fn all_tools_with_runtime(
             max_tokens_override: None,
             model_support_vision: root_config.model_support_vision,
         };
-        let parent_tools = Arc::new(tool_arcs.clone());
+        let parent_tools = new_shared_tool_registry();
+        shared_parent_tools = Some(parent_tools.clone());
         let mut delegate_tool = DelegateTool::new_with_options(
             delegate_agents.clone(),
             delegate_fallback_credential.clone(),
@@ -534,6 +551,10 @@ pub fn all_tools_with_runtime(
                 tracing::warn!("agents_ipc: failed to open IPC database: {e}");
             }
         }
+    }
+
+    if let Some(shared_registry) = shared_parent_tools.as_ref() {
+        sync_shared_tool_registry(shared_registry, &tool_arcs);
     }
 
     boxed_registry_from_arcs(tool_arcs)
@@ -651,6 +672,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             listen_to_bots: false,
             mention_only: false,
+            group_reply: None,
         });
 
         let tools = all_tools(

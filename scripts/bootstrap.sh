@@ -56,7 +56,8 @@ Examples:
   ./zeroclaw_install.sh --install-system-deps --install-rust
   ./zeroclaw_install.sh --prefer-prebuilt
   ./zeroclaw_install.sh --prebuilt-only
-  ./zeroclaw_install.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
+  ./zeroclaw_install.sh --onboard --api-key "sk-..." --provider openrouter
+  ./zeroclaw_install.sh --onboard --api-key "sk-..." --provider openrouter --model "openrouter/auto"
   ./zeroclaw_install.sh --interactive-onboard
   ./zeroclaw_install.sh --docker --docker-config ./config.toml --docker-daemon
 
@@ -131,29 +132,33 @@ get_available_disk_mb() {
   fi
 }
 
-detect_release_target() {
+detect_release_targets() {
   local os arch
   os="$(uname -s)"
   arch="$(uname -m)"
 
   case "$os:$arch" in
     Linux:x86_64)
-      echo "x86_64-unknown-linux-gnu"
+      printf '%s\n' \
+        "x86_64-unknown-linux-musl" \
+        "x86_64-unknown-linux-gnu"
       ;;
     Linux:aarch64|Linux:arm64)
-      echo "aarch64-unknown-linux-gnu"
+      printf '%s\n' \
+        "aarch64-unknown-linux-musl" \
+        "aarch64-unknown-linux-gnu"
       ;;
     Linux:armv7l|Linux:armv6l)
-      echo "armv7-unknown-linux-gnueabihf"
+      printf '%s\n' "armv7-unknown-linux-gnueabihf"
       ;;
     Darwin:x86_64)
-      echo "x86_64-apple-darwin"
+      printf '%s\n' "x86_64-apple-darwin"
       ;;
     Darwin:arm64|Darwin:aarch64)
-      echo "aarch64-apple-darwin"
+      printf '%s\n' "aarch64-apple-darwin"
       ;;
     FreeBSD:amd64|FreeBSD:x86_64)
-      echo "x86_64-unknown-freebsd"
+      printf '%s\n' "x86_64-unknown-freebsd"
       ;;
     *)
       return 1
@@ -263,6 +268,7 @@ detect_config_channel_features() {
 
 install_prebuilt_binary() {
   local target archive_url temp_dir archive_path extracted_bin install_dir
+  local -a candidate_targets=()
 
   if ! have_cmd curl; then
     warn "curl is required for pre-built binary installation."
@@ -273,19 +279,25 @@ install_prebuilt_binary() {
     return 1
   fi
 
-  target="$(detect_release_target || true)"
-  if [[ -z "$target" ]]; then
+  mapfile -t candidate_targets < <(detect_release_targets || true)
+  if [[ "${#candidate_targets[@]}" -eq 0 ]]; then
     warn "No pre-built binary target mapping for $(uname -s)/$(uname -m)."
     return 1
   fi
 
-  archive_url="https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-${target}.tar.gz"
   temp_dir="$(mktemp -d -t zeroclaw-prebuilt-XXXXXX)"
-  archive_path="$temp_dir/zeroclaw-${target}.tar.gz"
-
-  info "Attempting pre-built binary install for target: $target"
-  if ! curl -fsSL "$archive_url" -o "$archive_path"; then
-    warn "Could not download release asset: $archive_url"
+  for target in "${candidate_targets[@]}"; do
+    archive_url="https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-${target}.tar.gz"
+    archive_path="$temp_dir/zeroclaw-${target}.tar.gz"
+    info "Attempting pre-built binary install for target: $target"
+    if curl -fsSL "$archive_url" -o "$archive_path"; then
+      break
+    fi
+    rm -f "$archive_path"
+    archive_path=""
+  done
+  if [[ -z "${archive_path:-}" || ! -f "$archive_path" ]]; then
+    warn "Could not download a compatible release asset."
     rm -rf "$temp_dir"
     return 1
   fi
@@ -1257,7 +1269,7 @@ MSG
 
     if [[ "$CONTAINER_CLI" == "podman" ]]; then
       "$CONTAINER_CLI" run --rm -it \
-        "${container_run_namespace_args[@]}" \
+        "${container_run_namespace_args[@]+"${container_run_namespace_args[@]}"}" \
         "${container_run_user_args[@]}" \
         "${container_extra_run_args[@]+${container_extra_run_args[@]}}" \
         -e HOME=/zeroclaw-data \

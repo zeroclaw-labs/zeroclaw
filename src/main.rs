@@ -195,8 +195,8 @@ Examples:
         model: Option<String>,
 
         /// Temperature (0.0 - 2.0)
-        #[arg(short, long, default_value = "0.7", value_parser = parse_temperature)]
-        temperature: f64,
+        #[arg(short, long, value_parser = parse_temperature)]
+        temperature: Option<f64>,
 
         /// Attach a peripheral (board:path, e.g. nucleo-f401re:/dev/ttyACM0)
         #[arg(long)]
@@ -2233,6 +2233,44 @@ mod tests {
             has_new_pairing_flag,
             "gateway help should include --new-pairing"
         );
+    }
+
+    #[test]
+    fn agent_cli_does_not_force_temperature_override_when_flag_is_absent() {
+        let cli = Cli::try_parse_from(["zeroclaw", "agent", "--provider", "openrouter", "-m", "hi"])
+            .expect("agent invocation should parse without temperature");
+
+        match cli.command {
+            Commands::Agent { temperature, .. } => {
+                assert_eq!(
+                    temperature, None,
+                    "temperature should stay unset so config.default_temperature is preserved"
+                );
+            }
+            other => panic!("expected agent command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_cli_parses_explicit_temperature_override() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "agent",
+            "--provider",
+            "openrouter",
+            "-m",
+            "hi",
+            "--temperature",
+            "1.1",
+        ])
+        .expect("agent invocation should parse explicit temperature");
+
+        match cli.command {
+            Commands::Agent { temperature, .. } => {
+                assert_eq!(temperature, Some(1.1));
+            }
+            other => panic!("expected agent command, got {other:?}"),
+        }
     }
 
     #[test]

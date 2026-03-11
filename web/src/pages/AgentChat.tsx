@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { Send, Bot, User, AlertCircle } from 'lucide-react';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
+import { getLocale, t, tf } from '@/lib/i18n';
 
 interface ChatMessage {
   id: string;
@@ -18,8 +19,6 @@ interface PersistedChatMessage {
 }
 
 let fallbackMessageIdCounter = 0;
-const EMPTY_DONE_FALLBACK =
-  'Tool execution completed, but no final response text was returned.';
 const CHAT_HISTORY_STORAGE_KEY = 'zeroclaw.agent_chat.messages.v1';
 const MAX_PERSISTED_MESSAGES = 500;
 
@@ -124,7 +123,7 @@ export default function AgentChat() {
     };
 
     ws.onError = () => {
-      setError('Connection error. Attempting to reconnect...');
+      setError(t('agent.connection_error'));
     };
 
     ws.onMessage = (msg: WsMessage) => {
@@ -137,7 +136,7 @@ export default function AgentChat() {
         case 'message':
         case 'done': {
           const content = (msg.full_response ?? msg.content ?? pendingContentRef.current ?? '').trim();
-          const finalContent = content || EMPTY_DONE_FALLBACK;
+          const finalContent = content || t('agent.done_without_text');
 
           setMessages((prev) => [
             ...prev,
@@ -160,7 +159,10 @@ export default function AgentChat() {
             {
               id: makeMessageId(),
               role: 'agent',
-              content: `[Tool Call] ${msg.name ?? 'unknown'}(${JSON.stringify(msg.args ?? {})})`,
+              content: tf('agent.tool_call_message', {
+                name: msg.name ?? t('agent.unknown_tool'),
+                args: JSON.stringify(msg.args ?? {}),
+              }),
               timestamp: new Date(),
             },
           ]);
@@ -172,7 +174,9 @@ export default function AgentChat() {
             {
               id: makeMessageId(),
               role: 'agent',
-              content: `[Tool Result] ${msg.output ?? ''}`,
+              content: tf('agent.tool_result_message', {
+                output: msg.output ?? '',
+              }),
               timestamp: new Date(),
             },
           ]);
@@ -184,7 +188,9 @@ export default function AgentChat() {
             {
               id: makeMessageId(),
               role: 'agent',
-              content: `[Error] ${msg.message ?? 'Unknown error'}`,
+              content: tf('agent.error_message', {
+                message: msg.message ?? t('agent.unknown_error'),
+              }),
               timestamp: new Date(),
             },
           ]);
@@ -229,7 +235,7 @@ export default function AgentChat() {
       setTyping(true);
       pendingContentRef.current = '';
     } catch {
-      setError('Failed to send message. Please try again.');
+      setError(t('agent.send_failed'));
     }
 
     setInput('');
@@ -258,8 +264,8 @@ export default function AgentChat() {
         {messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-gray-500">
             <Bot className="h-12 w-12 mb-3 text-gray-600" />
-            <p className="text-lg font-medium">ZeroClaw Agent</p>
-            <p className="text-sm mt-1">Send a message to start the conversation</p>
+            <p className="text-lg font-medium">{t('agent.empty_title')}</p>
+            <p className="text-sm mt-1">{t('agent.empty_subtitle')}</p>
           </div>
         )}
 
@@ -296,7 +302,7 @@ export default function AgentChat() {
                   msg.role === 'user' ? 'text-blue-200' : 'text-gray-500'
                 }`}
               >
-                {msg.timestamp.toLocaleTimeString()}
+                {msg.timestamp.toLocaleTimeString(getLocale())}
               </p>
             </div>
           </div>
@@ -313,7 +319,7 @@ export default function AgentChat() {
                 <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
                 <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
               </div>
-              <p className="text-xs text-gray-500 mt-1">Typing...</p>
+              <p className="text-xs text-gray-500 mt-1">{t('agent.typing')}</p>
             </div>
           </div>
         )}
@@ -331,7 +337,7 @@ export default function AgentChat() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder={connected ? 'Type a message...' : 'Connecting...'}
+              placeholder={connected ? t('agent.placeholder') : t('agent.connecting')}
               disabled={!connected}
               className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
             />
@@ -351,7 +357,7 @@ export default function AgentChat() {
             }`}
           />
           <span className="text-xs text-gray-500">
-            {connected ? 'Connected' : 'Disconnected'}
+            {connected ? t('agent.connected') : t('agent.disconnected')}
           </span>
         </div>
       </div>

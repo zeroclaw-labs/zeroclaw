@@ -3428,6 +3428,16 @@ class CiScriptsBehaviorTest(unittest.TestCase):
         self.assertIn("required_checks.rc", joined)
         self.assertIn("required_checks.stable", joined)
 
+    def test_bootstrap_uses_bash32_safe_optional_array_expansion(self) -> None:
+        bootstrap = (ROOT / "scripts" / "bootstrap.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            '"${container_run_namespace_args[@]+"${container_run_namespace_args[@]}"}"',
+            bootstrap,
+        )
+        self.assertNotIn(
+            '"${container_run_namespace_args[@]}" \\\n        "${container_run_user_args[@]}"',
+            bootstrap,
+        )
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)

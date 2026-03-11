@@ -23,13 +23,23 @@ run_privileged() {
   fi
 }
 
-linux_triple() {
+linux_triples() {
   local arch
   arch="$(uname -m)"
   case "$arch" in
-    x86_64|amd64) echo "x86_64-unknown-linux-gnu" ;;
-    aarch64|arm64) echo "aarch64-unknown-linux-gnu" ;;
-    armv7l|armv7) echo "armv7-unknown-linux-gnueabihf" ;;
+    x86_64|amd64)
+      printf '%s\n' \
+        "x86_64-unknown-linux-musl" \
+        "x86_64-unknown-linux-gnu"
+      ;;
+    aarch64|arm64)
+      printf '%s\n' \
+        "aarch64-unknown-linux-musl" \
+        "aarch64-unknown-linux-gnu"
+      ;;
+    armv7l|armv7)
+      printf '%s\n' "armv7-unknown-linux-gnueabihf"
+      ;;
     *)
       echo "error: unsupported Linux architecture: $arch" >&2
       echo "supported: x86_64, aarch64, armv7" >&2
@@ -90,9 +100,8 @@ need_cmd tar
 need_cmd mktemp
 need_cmd install
 
-TRIPLE="$(linux_triple)"
-ASSET="zeroclaw-${TRIPLE}.tar.gz"
-DOWNLOAD_URL="${RELEASE_BASE}/${ASSET}"
+TRIPLE=""
+ASSET=""
 
 TMP_DIR="$(mktemp -d)"
 cleanup() {
@@ -106,8 +115,27 @@ if ! curl -fsSL "$API_URL" >/dev/null; then
   exit 1
 fi
 
-echo "==> Downloading ${ASSET}"
-curl -fL "$DOWNLOAD_URL" -o "$TMP_DIR/$ASSET"
+download_asset() {
+  local triple asset download_url
+  while IFS= read -r triple; do
+    [ -n "$triple" ] || continue
+    asset="zeroclaw-${triple}.tar.gz"
+    download_url="${RELEASE_BASE}/${asset}"
+    echo "==> Attempting ${asset}"
+    if curl -fsSL "$download_url" -o "$TMP_DIR/$asset"; then
+      TRIPLE="$triple"
+      ASSET="$asset"
+      return 0
+    fi
+  done < <(linux_triples)
+
+  return 1
+}
+
+if ! download_asset; then
+  echo "error: unable to download a compatible Linux release artifact" >&2
+  exit 1
+fi
 
 echo "==> Extracting release archive"
 tar -xzf "$TMP_DIR/$ASSET" -C "$TMP_DIR"

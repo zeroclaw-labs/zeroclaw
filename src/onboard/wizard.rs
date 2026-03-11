@@ -2939,6 +2939,21 @@ fn provider_supports_device_flow(provider_name: &str) -> bool {
     )
 }
 
+fn onboarding_custom_model_rerun_command(config: &Config, provider: &str) -> Option<String> {
+    let model = config.default_model.as_deref()?.trim();
+    if model.is_empty() {
+        return None;
+    }
+
+    if model == default_model_for_provider(provider) {
+        return None;
+    }
+
+    Some(format!(
+        "zeroclaw onboard --api-key \"sk-...\" --provider {provider} --model {model}"
+    ))
+}
+
 fn prompt_allowed_domains_for_tool(tool_name: &str) -> Result<Vec<String>> {
     let prompt = format!(
         "  {}.allowed_domains (comma-separated, '*' allows all)",
@@ -5915,6 +5930,14 @@ fn print_summary(config: &Config) {
                 "       {}",
                 style(format!("export {env_var}=\"sk-...\"")).yellow()
             );
+            if let Some(command) = onboarding_custom_model_rerun_command(config, provider) {
+                println!();
+                println!(
+                    "    {} Or re-run with your custom model:",
+                    style(format!("{step}.")).cyan().bold()
+                );
+                println!("       {}", style(command).yellow());
+            }
         }
         println!();
         step += 1;
@@ -7326,6 +7349,25 @@ mod tests {
         assert!(provider_supports_device_flow("openai-codex"));
         assert!(!provider_supports_device_flow("openai"));
         assert!(!provider_supports_device_flow("openrouter"));
+    }
+
+    #[test]
+    fn onboarding_custom_model_rerun_command_only_for_non_default_models() {
+        let mut config = Config::default();
+        config.default_model = Some("openrouter/auto".to_string());
+        assert_eq!(
+            onboarding_custom_model_rerun_command(&config, "openrouter"),
+            Some(
+                "zeroclaw onboard --api-key \"sk-...\" --provider openrouter --model openrouter/auto"
+                    .to_string()
+            )
+        );
+
+        config.default_model = Some(default_model_for_provider("openrouter"));
+        assert_eq!(
+            onboarding_custom_model_rerun_command(&config, "openrouter"),
+            None
+        );
     }
 
     #[test]

@@ -1,32 +1,32 @@
 # Default owner for all files
-* @theonlyhennygod @JordanTheJet @chumyin
+* @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
 
 # Important functional modules
-/src/agent/** @theonlyhennygod @JordanTheJet @chumyin
-/src/providers/** @theonlyhennygod @JordanTheJet @chumyin
-/src/channels/** @theonlyhennygod @JordanTheJet @chumyin
-/src/tools/** @theonlyhennygod @JordanTheJet @chumyin
-/src/gateway/** @theonlyhennygod @JordanTheJet @chumyin
-/src/runtime/** @theonlyhennygod @JordanTheJet @chumyin
-/src/memory/** @theonlyhennygod @JordanTheJet @chumyin
-/Cargo.toml @theonlyhennygod @JordanTheJet @chumyin
-/Cargo.lock @theonlyhennygod @JordanTheJet @chumyin
+/src/agent/** @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/src/providers/** @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/src/channels/** @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/src/tools/** @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/src/gateway/** @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/src/runtime/** @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/src/memory/** @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/Cargo.toml @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/Cargo.lock @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
 
 # Security / tests / CI-CD ownership
-/src/security/** @theonlyhennygod @JordanTheJet @chumyin
-/tests/** @theonlyhennygod @JordanTheJet @chumyin
-/.github/** @theonlyhennygod @JordanTheJet @chumyin
-/.github/workflows/** @theonlyhennygod @JordanTheJet @chumyin
-/.github/codeql/** @theonlyhennygod @JordanTheJet @chumyin
-/.github/dependabot.yml @theonlyhennygod @JordanTheJet @chumyin
-/SECURITY.md @theonlyhennygod @JordanTheJet @chumyin
-/docs/actions-source-policy.md @theonlyhennygod @JordanTheJet @chumyin
-/docs/ci-map.md @theonlyhennygod @JordanTheJet @chumyin
+/src/security/** @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/tests/** @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/.github/** @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/.github/workflows/** @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/.github/codeql/** @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/.github/dependabot.yml @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/SECURITY.md @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/docs/actions-source-policy.md @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/docs/ci-map.md @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
 
 # Docs & governance
-/docs/** @theonlyhennygod @JordanTheJet @chumyin
-/AGENTS.md @theonlyhennygod @JordanTheJet @chumyin
-/CLAUDE.md @theonlyhennygod @JordanTheJet @chumyin
-/CONTRIBUTING.md @theonlyhennygod @JordanTheJet @chumyin
-/docs/pr-workflow.md @theonlyhennygod @JordanTheJet @chumyin
-/docs/reviewer-playbook.md @theonlyhennygod @JordanTheJet @chumyin
+/docs/** @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/AGENTS.md @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/CLAUDE.md @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/CONTRIBUTING.md @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/docs/pr-workflow.md @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
+/docs/reviewer-playbook.md @theonlyhennygod @JordanTheJet @SimianAstronaut7 @chumyin
