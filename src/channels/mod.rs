@@ -3282,7 +3282,9 @@ fn collect_configured_channels(
             let api_key = api_key.trim().to_string();
 
             if let Some(ref db_id) = notion.database_id {
-                if !api_key.is_empty() {
+                if api_key.is_empty() {
+                    tracing::warn!("Notion channel enabled but API key is missing. Set it in config or NOTION_API_KEY env var.");
+                } else {
                     let status_type = match notion.status_type.as_str() {
                         "status" => notion::NotionStatusType::Status,
                         _ => notion::NotionStatusType::Select,
@@ -3311,8 +3313,6 @@ fn collect_configured_channels(
                             recover_stale: notion.recover_stale,
                         })),
                     });
-                } else {
-                    tracing::warn!("Notion channel enabled but API key is missing. Set it in config or NOTION_API_KEY env var.");
                 }
             } else {
                 tracing::warn!("Notion channel enabled but database_id is missing.");
