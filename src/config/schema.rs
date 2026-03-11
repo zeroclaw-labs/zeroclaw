@@ -5345,6 +5345,30 @@ impl Config {
             if self.security.compliance.audit_retention_days == 0 {
                 anyhow::bail!("security.compliance.audit_retention_days must be greater than 0");
             }
+            let known_frameworks = ["FINMA", "DORA", "GDPR", "SOC2", "ISO27001"];
+            for (i, fw) in self.security.compliance.frameworks.iter().enumerate() {
+                let trimmed = fw.trim();
+                if trimmed.is_empty() {
+                    anyhow::bail!("security.compliance.frameworks[{i}] must not be empty");
+                }
+                if !trimmed
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    anyhow::bail!(
+                        "security.compliance.frameworks[{i}] contains invalid characters: '{trimmed}'. \
+                         Use alphanumeric, underscore, or hyphen only"
+                    );
+                }
+                let upper = trimmed.to_ascii_uppercase();
+                if !known_frameworks.contains(&upper.as_str()) {
+                    tracing::warn!(
+                        "security.compliance.frameworks[{i}] = '{trimmed}' is not a \
+                         recognized framework ({}); treating as custom",
+                        known_frameworks.join(", ")
+                    );
+                }
+            }
         }
 
         self.proxy.validate()?;

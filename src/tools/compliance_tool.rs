@@ -4,7 +4,7 @@
 //! reports, verifying audit log integrity, checking compliance posture, and
 //! classifying actions by regulatory relevance.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Days, NaiveDate, Utc};
 use std::path::PathBuf;
@@ -272,7 +272,7 @@ impl ComplianceTool {
     }
 
     /// Show current compliance posture.
-    fn compliance_status(&self) -> String {
+    fn compliance_status(&self) -> Result<String> {
         use std::fmt::Write;
         let mut status = String::from("# Compliance Posture\n\n");
         let _ = writeln!(status, "Compliance enabled: {}", self.config.enabled);
@@ -315,24 +315,21 @@ impl ComplianceTool {
 
         let log_path = self.log_path();
         if log_path.exists() {
-            match TamperEvidentLog::new(log_path, 0) {
-                Ok(log) => match log.verify_chain() {
-                    Ok(count) => {
-                        let _ = writeln!(status, "\nAudit log: {} entries, chain intact", count);
-                    }
-                    Err(e) => {
-                        let _ = writeln!(status, "\nAudit log: chain BROKEN ({})", e);
-                    }
-                },
+            let log = TamperEvidentLog::new(log_path, 0)
+                .context("Failed to open audit log for health check")?;
+            match log.verify_chain() {
+                Ok(count) => {
+                    let _ = writeln!(status, "\nAudit log: {} entries, chain intact", count);
+                }
                 Err(e) => {
-                    let _ = writeln!(status, "\nAudit log: unavailable ({})", e);
+                    let _ = writeln!(status, "\nAudit log: chain BROKEN ({})", e);
                 }
             }
         } else {
             status.push_str("\nAudit log: no entries yet\n");
         }
 
-        status
+        Ok(status)
     }
 
     /// Classify an action by regulatory relevance.
@@ -474,11 +471,18 @@ impl Tool for ComplianceTool {
                     error: Some(format!("Verification failed: {}", e)),
                 }),
             },
-            "status" => Ok(ToolResult {
-                success: true,
-                output: self.compliance_status(),
-                error: None,
-            }),
+            "status" => match self.compliance_status() {
+                Ok(output) => Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                }),
+                Err(e) => Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Status check failed: {}", e)),
+                }),
+            },
             "classify" => {
                 let action = args.get("action").and_then(|v| v.as_str());
                 let Some(action) = action else {
