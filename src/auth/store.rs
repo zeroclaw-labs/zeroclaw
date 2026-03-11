@@ -562,6 +562,29 @@ impl AuthStore {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Reverse lookup: find a channel platform_uid for a given user_id.
+    ///
+    /// Returns the platform_uid (e.g. Kakao ID) linked to this user on the
+    /// given channel, if any.
+    pub fn get_channel_uid_for_user(
+        &self,
+        channel: &str,
+        user_id: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        let row = conn.query_row(
+            "SELECT platform_uid FROM channel_links WHERE channel = ?1 AND user_id = ?2",
+            rusqlite::params![channel, user_id],
+            |row| row.get::<_, String>(0),
+        );
+
+        match row {
+            Ok(uid) => Ok(Some(uid)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 // ── Cryptographic Helpers ───────────────────────────────────────────

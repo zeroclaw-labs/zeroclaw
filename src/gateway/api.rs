@@ -45,6 +45,19 @@ fn require_auth(
     }
 }
 
+/// Resolve the Kakao ID for the current session user (for Supabase lookups).
+///
+/// Returns `None` if auth is not configured or the user has no Kakao link.
+fn resolve_kakao_id_from_session(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    let auth_store = state.auth_store.as_ref()?;
+    let token = extract_bearer_token(headers)?;
+    let session = auth_store.validate_session(token)?;
+    auth_store
+        .get_channel_uid_for_user("kakao", &session.user_id)
+        .ok()
+        .flatten()
+}
+
 // ── Query parameters ─────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -565,11 +578,33 @@ pub async fn handle_api_credits_balance(
         return e.into_response();
     }
 
+    // Try Supabase first (cloud source of truth for credits).
+    if let Some(ref sb) = state.supabase {
+        // Resolve the user's kakao_id from their session.
+        let kakao_id = resolve_kakao_id_from_session(&state, &headers);
+        if let Some(kakao_id) = kakao_id {
+            match sb.get_or_create_user(&kakao_id).await {
+                Ok(user) => {
+                    return Json(serde_json::json!({
+                        "balance": user.credits,
+                        "total_spent": user.total_spent,
+                        "enabled": true,
+                        "source": "supabase",
+                    }))
+                    .into_response();
+                }
+                Err(e) => {
+                    tracing::warn!("Supabase credit lookup failed, falling back to local: {e}");
+                }
+            }
+        }
+    }
+
+    // Fallback to local PaymentManager.
     let Some(ref pm) = state.payment_manager else {
         return Json(serde_json::json!({"balance": 0, "enabled": false})).into_response();
     };
 
-    // Use device ID as user identifier for local gateway
     let user_id = state
         .sync_coordinator
         .as_ref()
@@ -579,7 +614,8 @@ pub async fn handle_api_credits_balance(
     let pm_guard = pm.lock();
     match pm_guard.get_balance(&user_id) {
         Ok(balance) => {
-            Json(serde_json::json!({"balance": balance, "enabled": true})).into_response()
+            Json(serde_json::json!({"balance": balance, "enabled": true, "source": "local"}))
+                .into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

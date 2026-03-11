@@ -585,18 +585,45 @@ pub async fn handle_auth_kakao_callback(
         }
     };
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "ok",
-            "token": session_token,
-            "user_id": user_id,
-            "username": username,
-            "kakao_id": kakao_id,
-            "kakao_nickname": nickname,
-        })),
-    )
-        .into_response()
+    // Sync user to Supabase (cloud user management + credits).
+    // This runs best-effort: local auth is the source of truth.
+    let mut supabase_credits: Option<i32> = None;
+    if let Some(ref sb) = state.supabase {
+        match sb.get_or_create_user(&kakao_id).await {
+            Ok(sb_user) => {
+                supabase_credits = Some(sb_user.credits);
+                let _ = sb
+                    .log_audit(&crate::integrations::supabase::AuditLogEntry {
+                        user_id: kakao_id.clone(),
+                        action: "kakao_login".into(),
+                        details: serde_json::json!({
+                            "username": username,
+                            "nickname": nickname,
+                        }),
+                        result: "success".into(),
+                    })
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!("Supabase user sync failed (non-fatal): {e}");
+            }
+        }
+    }
+
+    let mut response = serde_json::json!({
+        "status": "ok",
+        "token": session_token,
+        "user_id": user_id,
+        "username": username,
+        "kakao_id": kakao_id,
+        "kakao_nickname": nickname,
+    });
+
+    if let Some(credits) = supabase_credits {
+        response["credits"] = serde_json::json!(credits);
+    }
+
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 // ── GET /api/auth/kakao/redirect ────────────────────────────────

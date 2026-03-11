@@ -375,6 +375,9 @@ pub struct AppState {
     pub device_router: Option<Arc<remote::DeviceRouter>>,
     /// Email verification service for 3rd-factor auth on remote device access.
     pub email_verify_service: Option<Arc<crate::auth::email_verify::EmailVerifyService>>,
+    /// Supabase client for cloud user management, credits, and audit logging.
+    /// Present only when SUPABASE_URL + SUPABASE_SERVICE_KEY are configured.
+    pub supabase: Option<Arc<crate::integrations::supabase::SupabaseClient>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -570,6 +573,27 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             Ok(pm) => Some(Arc::new(Mutex::new(pm))),
             Err(e) => {
                 tracing::warn!("Failed to initialize payment manager: {e}");
+                None
+            }
+        }
+    };
+
+    // Supabase client for cloud user management + credits
+    let supabase = {
+        match crate::integrations::supabase::SupabaseConfig::from_env() {
+            Some(sb_config) => match crate::integrations::supabase::SupabaseClient::new(sb_config)
+            {
+                Ok(client) => {
+                    tracing::info!("Supabase cloud backend initialized");
+                    Some(Arc::new(client))
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to initialize Supabase client: {e}");
+                    None
+                }
+            },
+            None => {
+                tracing::debug!("Supabase not configured (set SUPABASE_URL + SUPABASE_SERVICE_KEY to enable)");
                 None
             }
         }
@@ -967,6 +991,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         auth_allow_registration,
         device_router,
         email_verify_service,
+        supabase,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -3097,6 +3122,7 @@ mod tests {
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -3167,6 +3193,7 @@ mod tests {
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -3220,6 +3247,7 @@ mod tests {
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let response = handle_metrics(State(state), test_public_connect_info(), HeaderMap::new())
@@ -3274,6 +3302,7 @@ mod tests {
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let unauthorized =
@@ -3770,6 +3799,7 @@ Reminder set successfully."#;
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -3852,6 +3882,7 @@ Reminder set successfully."#;
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let response = handle_webhook(
@@ -3915,6 +3946,7 @@ Reminder set successfully."#;
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let response = handle_webhook(
@@ -3979,6 +4011,7 @@ Reminder set successfully."#;
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let response = handle_webhook(
@@ -4052,6 +4085,7 @@ Reminder set successfully."#;
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let response = handle_node_control(
@@ -4117,6 +4151,7 @@ Reminder set successfully."#;
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let response = handle_node_control(
@@ -4187,6 +4222,7 @@ Reminder set successfully."#;
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let headers = HeaderMap::new();
@@ -4283,6 +4319,7 @@ Reminder set successfully."#;
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let response = handle_webhook(
@@ -4349,6 +4386,7 @@ Reminder set successfully."#;
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4420,6 +4458,7 @@ Reminder set successfully."#;
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4505,6 +4544,7 @@ Reminder set successfully."#;
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let response = handle_github_webhook(
@@ -4569,6 +4609,7 @@ Reminder set successfully."#;
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let body = r#"{
@@ -4644,6 +4685,7 @@ Reminder set successfully."#;
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let body = r#"{
@@ -4724,6 +4766,7 @@ Reminder set successfully."#;
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -4794,6 +4837,7 @@ Reminder set successfully."#;
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4857,6 +4901,7 @@ Reminder set successfully."#;
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let response = handle_qq_webhook(
@@ -4919,6 +4964,7 @@ Reminder set successfully."#;
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
+            supabase: None,
         };
 
         let mut headers = HeaderMap::new();

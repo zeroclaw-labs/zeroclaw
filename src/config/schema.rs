@@ -110,6 +110,113 @@ pub fn resolve_default_model_id(
     default_model_fallback_for_provider(provider_name).to_string()
 }
 
+/// Detect if the user has set a provider-specific API key in the environment.
+///
+/// Returns the canonical provider name if a provider-specific key is found.
+/// Generic keys (`ZEROCLAW_API_KEY`, `API_KEY`) are NOT considered user-specific
+/// — they are platform-level defaults.
+///
+/// This is used to determine routing strategy: user-key → user's provider best
+/// models; no user-key → platform tiered routing.
+fn detect_user_provider_from_env() -> Option<String> {
+    // Check provider-specific env vars in popularity order.
+    // Only non-empty values count.
+    let candidates: &[(&str, &str)] = &[
+        ("ANTHROPIC_API_KEY", "anthropic"),
+        ("ANTHROPIC_OAUTH_TOKEN", "anthropic"),
+        ("OPENAI_API_KEY", "openai"),
+        ("GEMINI_API_KEY", "gemini"),
+        ("GOOGLE_API_KEY", "gemini"),
+        ("OPENROUTER_API_KEY", "openrouter"),
+        ("DEEPSEEK_API_KEY", "deepseek"),
+        ("XAI_API_KEY", "xai"),
+        ("GROQ_API_KEY", "groq"),
+        ("MISTRAL_API_KEY", "mistral"),
+        ("PERPLEXITY_API_KEY", "perplexity"),
+        ("COHERE_API_KEY", "cohere"),
+        ("MOONSHOT_API_KEY", "moonshot"),
+        ("GLM_API_KEY", "glm"),
+        ("ZAI_API_KEY", "zai"),
+        ("DASHSCOPE_API_KEY", "qwen"),
+    ];
+
+    for &(env_var, provider) in candidates {
+        if std::env::var(env_var)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .is_some()
+        {
+            return Some(provider.to_string());
+        }
+    }
+
+    None
+}
+
+/// Returns (fast_model, thinking_model) for a given provider.
+///
+/// - `fast_model`: best model for chat, simple Q&A, document writing (fast, capable).
+/// - `thinking_model`: best model for coding, architecture, deep reasoning (top-tier).
+///
+/// These are the provider's latest top models — suitable when user pays their own
+/// API costs and wants maximum quality.
+fn best_models_for_provider(provider: &str) -> (&'static str, &'static str) {
+    match provider {
+        "anthropic" => (
+            "claude-sonnet-4-20250514",     // fast + capable
+            "claude-opus-4-20250514",       // best reasoning/code
+        ),
+        "openai" => (
+            "gpt-4.1",                      // fast + capable
+            "o3",                           // best reasoning
+        ),
+        "gemini" | "google" => (
+            "gemini-3.1-flash-lite-preview", // fast + cheap
+            "gemini-3.1-pro-preview",        // best reasoning
+        ),
+        "openrouter" => (
+            "anthropic/claude-sonnet-4-20250514",
+            "anthropic/claude-opus-4-20250514",
+        ),
+        "deepseek" => (
+            "deepseek-chat",                // fast chat
+            "deepseek-reasoner",            // deep thinking
+        ),
+        "xai" | "grok" => (
+            "grok-3-fast",                  // fast
+            "grok-3",                       // full reasoning
+        ),
+        "groq" => (
+            "llama-3.3-70b-versatile",      // fast
+            "llama-3.3-70b-versatile",      // same (groq is speed-focused)
+        ),
+        "mistral" => (
+            "mistral-medium-latest",        // fast
+            "mistral-large-latest",         // best reasoning
+        ),
+        "perplexity" => (
+            "sonar",                        // fast search
+            "sonar-pro",                    // deep search
+        ),
+        "moonshot" => (
+            "kimi-k2.5",                    // fast
+            "kimi-k2.5",                    // same top model
+        ),
+        "glm" | "zai" => (
+            "glm-4-flash",                  // fast + free
+            "glm-5",                        // best reasoning
+        ),
+        "qwen" => (
+            "qwen-plus",                    // fast
+            "qwen-max",                     // best reasoning
+        ),
+        _ => (
+            "anthropic/claude-sonnet-4-20250514",
+            "anthropic/claude-opus-4-20250514",
+        ),
+    }
+}
+
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "provider.anthropic",
     "provider.compatible",
@@ -9304,6 +9411,363 @@ impl Config {
         }
 
         set_runtime_proxy_config(self.proxy.clone());
+
+        // ── Model route env overrides ───────────────────────────────
+        //
+        // Routing strategy:
+        //
+        // 1. Tier 1 (daily/flash-lite) is ALWAYS injected for online mode.
+        //    It handles initial routing, scheduling, simple Q&A, web browsing.
+        //
+        // 2. When the user has NOT provided a provider-specific API key:
+        //    → Inject platform-default tiered routes (document, code, review).
+        //
+        // 3. When the user HAS provided a provider-specific API key:
+        //    → They chose that provider. Inject routes using that provider's
+        //      best fast model (chat) and best thinking model (reasoning/code).
+        //      Cost is on the user, so use top-tier models.
+        //
+        // Explicit ZEROCLAW_ROUTE_<HINT>_* env vars always take precedence
+        // over auto-generated routes.
+
+        // Phase 1: Collect explicit env-defined routes.
+        {
+            let known_hints = [
+                "DAILY", "DOCUMENT", "CODE", "REVIEW", "REASONING", "FAST", "SUMMARIZE",
+            ];
+
+            let mut env_routes: Vec<ModelRouteConfig> = Vec::new();
+
+            for hint_upper in &known_hints {
+                let provider_key = format!("ZEROCLAW_ROUTE_{hint_upper}_PROVIDER");
+                let model_key = format!("ZEROCLAW_ROUTE_{hint_upper}_MODEL");
+
+                let provider = std::env::var(&provider_key).ok().filter(|v| !v.is_empty());
+                let model = std::env::var(&model_key).ok().filter(|v| !v.is_empty());
+
+                if let (Some(provider), Some(model)) = (provider, model) {
+                    let hint = hint_upper.to_lowercase();
+
+                    let max_tokens_key = format!("ZEROCLAW_ROUTE_{hint_upper}_MAX_TOKENS");
+                    let max_tokens = std::env::var(&max_tokens_key)
+                        .ok()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .filter(|&n| n > 0);
+
+                    let api_key_key = format!("ZEROCLAW_ROUTE_{hint_upper}_API_KEY");
+                    let api_key = std::env::var(&api_key_key).ok().filter(|v| !v.is_empty());
+
+                    env_routes.push(ModelRouteConfig {
+                        hint,
+                        provider,
+                        model,
+                        max_tokens,
+                        api_key,
+                        transport: None,
+                    });
+                }
+            }
+
+            // Env routes override TOML routes with the same hint.
+            for env_route in env_routes {
+                if let Some(existing) = self
+                    .model_routes
+                    .iter_mut()
+                    .find(|r| r.hint == env_route.hint)
+                {
+                    *existing = env_route;
+                } else {
+                    self.model_routes.push(env_route);
+                }
+            }
+        }
+
+        // Phase 2: Auto-inject routes based on user credential context.
+        //
+        // - "daily" route is always injected (online gateway router).
+        // - If user provided a provider-specific API key, inject fast+thinking
+        //   routes for that provider (user pays, so use best models).
+        // - If no user key, inject platform-default tiered routes.
+        {
+            // Collect which hints are already defined to avoid borrow conflicts.
+            let existing_hints: std::collections::HashSet<String> = self
+                .model_routes
+                .iter()
+                .map(|r| r.hint.clone())
+                .collect();
+
+            let need = |hint: &str| !existing_hints.contains(hint);
+
+            // Always inject "daily" route if not explicitly set.
+            if need("daily") {
+                self.model_routes.push(ModelRouteConfig {
+                    hint: "daily".into(),
+                    provider: "google".into(),
+                    model: "gemini-3.1-flash-lite-preview".into(),
+                    max_tokens: None,
+                    api_key: None,
+                    transport: None,
+                });
+            }
+
+            // Detect if user provided a provider-specific API key.
+            // Provider-specific keys indicate explicit user choice.
+            let user_provider = detect_user_provider_from_env();
+
+            if let Some(ref user_prov) = user_provider {
+                // User chose a provider — inject fast (chat) and thinking
+                // (reasoning/code) routes using that provider's best models.
+                let (fast_model, thinking_model) =
+                    best_models_for_provider(user_prov);
+
+                if need("fast") {
+                    self.model_routes.push(ModelRouteConfig {
+                        hint: "fast".into(),
+                        provider: user_prov.clone(),
+                        model: fast_model.to_string(),
+                        max_tokens: None,
+                        api_key: None,
+                        transport: None,
+                    });
+                }
+
+                if need("reasoning") {
+                    self.model_routes.push(ModelRouteConfig {
+                        hint: "reasoning".into(),
+                        provider: user_prov.clone(),
+                        model: thinking_model.to_string(),
+                        max_tokens: None,
+                        api_key: None,
+                        transport: None,
+                    });
+                }
+
+                // Map document → user's fast model, code → user's thinking model.
+                if need("document") {
+                    self.model_routes.push(ModelRouteConfig {
+                        hint: "document".into(),
+                        provider: user_prov.clone(),
+                        model: fast_model.to_string(),
+                        max_tokens: None,
+                        api_key: None,
+                        transport: None,
+                    });
+                }
+
+                if need("code") {
+                    self.model_routes.push(ModelRouteConfig {
+                        hint: "code".into(),
+                        provider: user_prov.clone(),
+                        model: thinking_model.to_string(),
+                        max_tokens: None,
+                        api_key: None,
+                        transport: None,
+                    });
+                }
+            } else {
+                // No user-specific key — inject platform-default tiered routes.
+                if need("document") {
+                    self.model_routes.push(ModelRouteConfig {
+                        hint: "document".into(),
+                        provider: "google".into(),
+                        model: "gemini-3.1-pro-preview".into(),
+                        max_tokens: None,
+                        api_key: None,
+                        transport: None,
+                    });
+                }
+
+                if need("code") {
+                    self.model_routes.push(ModelRouteConfig {
+                        hint: "code".into(),
+                        provider: "anthropic".into(),
+                        model: "claude-4.6-opus".into(),
+                        max_tokens: None,
+                        api_key: None,
+                        transport: None,
+                    });
+                }
+
+                if need("review") {
+                    self.model_routes.push(ModelRouteConfig {
+                        hint: "review".into(),
+                        provider: "openai".into(),
+                        model: "gpt-5.4".into(),
+                        max_tokens: None,
+                        api_key: None,
+                        transport: None,
+                    });
+                }
+            }
+        }
+
+        // ── Query classification env override ───────────────────────
+        //
+        // ZEROCLAW_QUERY_CLASSIFICATION_ENABLED=1  enables auto-classification.
+        // When enabled and no rules are defined, injects default tiered rules
+        // matching the well-known hints (daily, document, code, review).
+        if let Ok(val) = std::env::var("ZEROCLAW_QUERY_CLASSIFICATION_ENABLED") {
+            let enabled = matches!(
+                val.to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+            self.query_classification.enabled = enabled;
+
+            // Inject default classification rules only when enabled and no
+            // rules have been defined (TOML or otherwise).
+            if enabled && self.query_classification.rules.is_empty() {
+                let hint_exists = |h: &str| self.model_routes.iter().any(|r| r.hint == h);
+
+                let mut default_rules = Vec::new();
+
+                // Code detection (highest priority)
+                if hint_exists("code") || hint_exists("reasoning") {
+                    let target_hint = if hint_exists("code") {
+                        "code"
+                    } else {
+                        "reasoning"
+                    };
+                    default_rules.push(ClassificationRule {
+                        hint: target_hint.into(),
+                        keywords: vec![
+                            "code".into(),
+                            "코드".into(),
+                            "코딩".into(),
+                            "implement".into(),
+                            "구현".into(),
+                            "refactor".into(),
+                            "리팩토링".into(),
+                            "debug".into(),
+                            "디버그".into(),
+                            "compile".into(),
+                            "컴파일".into(),
+                            "function".into(),
+                            "함수".into(),
+                            "class".into(),
+                            "클래스".into(),
+                            "variable".into(),
+                            "변수".into(),
+                            "api".into(),
+                            "bug".into(),
+                            "버그".into(),
+                            "error".into(),
+                            "에러".into(),
+                            "fix".into(),
+                            "수정".into(),
+                            "algorithm".into(),
+                            "알고리즘".into(),
+                            "architecture".into(),
+                            "아키텍처".into(),
+                            "design".into(),
+                            "설계".into(),
+                            "explain".into(),
+                            "설명".into(),
+                            "analyze".into(),
+                            "분석".into(),
+                            "reason".into(),
+                            "추론".into(),
+                            "think".into(),
+                            "생각".into(),
+                            "why".into(),
+                            "왜".into(),
+                        ],
+                        patterns: vec![
+                            "```".into(),
+                            "fn ".into(),
+                            "def ".into(),
+                            "class ".into(),
+                            "import ".into(),
+                            "const ".into(),
+                            "let ".into(),
+                            "var ".into(),
+                            "func ".into(),
+                            "pub fn".into(),
+                            "async fn".into(),
+                        ],
+                        priority: 20,
+                        ..Default::default()
+                    });
+                }
+
+                // Document writing (high priority)
+                if hint_exists("document") {
+                    default_rules.push(ClassificationRule {
+                        hint: "document".into(),
+                        keywords: vec![
+                            "write".into(),
+                            "작성".into(),
+                            "draft".into(),
+                            "초안".into(),
+                            "report".into(),
+                            "보고서".into(),
+                            "document".into(),
+                            "문서".into(),
+                            "essay".into(),
+                            "에세이".into(),
+                            "article".into(),
+                            "기사".into(),
+                            "summarize".into(),
+                            "요약".into(),
+                            "plan".into(),
+                            "기획".into(),
+                            "proposal".into(),
+                            "제안서".into(),
+                            "email".into(),
+                            "이메일".into(),
+                            "letter".into(),
+                            "편지".into(),
+                        ],
+                        min_length: Some(30),
+                        priority: 15,
+                        ..Default::default()
+                    });
+                }
+
+                // Daily/fast (low priority — catch-all for simple queries)
+                if hint_exists("daily") || hint_exists("fast") {
+                    let target_hint = if hint_exists("daily") {
+                        "daily"
+                    } else {
+                        "fast"
+                    };
+                    default_rules.push(ClassificationRule {
+                        hint: target_hint.into(),
+                        keywords: vec![
+                            "hi".into(),
+                            "hello".into(),
+                            "안녕".into(),
+                            "thanks".into(),
+                            "감사".into(),
+                            "schedule".into(),
+                            "일정".into(),
+                            "remind".into(),
+                            "리마인드".into(),
+                            "weather".into(),
+                            "날씨".into(),
+                            "time".into(),
+                            "시간".into(),
+                            "what".into(),
+                            "뭐".into(),
+                            "who".into(),
+                            "누구".into(),
+                            "when".into(),
+                            "언제".into(),
+                            "where".into(),
+                            "어디".into(),
+                            "search".into(),
+                            "검색".into(),
+                            "find".into(),
+                            "찾아".into(),
+                        ],
+                        max_length: Some(200),
+                        priority: 5,
+                        ..Default::default()
+                    });
+                }
+
+                self.query_classification.rules = default_rules;
+            }
+        }
     }
 
     pub async fn save(&self) -> Result<()> {
@@ -14536,6 +15000,246 @@ reserve_percent = 15
         config
             .validate()
             .expect("matching route_down hint route should validate");
+    }
+
+    // ── Model route env override tests ──────────────────────────
+
+    fn clear_route_env_vars() {
+        for hint in ["DAILY", "DOCUMENT", "CODE", "REVIEW", "REASONING", "FAST", "SUMMARIZE"] {
+            std::env::remove_var(format!("ZEROCLAW_ROUTE_{hint}_PROVIDER"));
+            std::env::remove_var(format!("ZEROCLAW_ROUTE_{hint}_MODEL"));
+            std::env::remove_var(format!("ZEROCLAW_ROUTE_{hint}_MAX_TOKENS"));
+            std::env::remove_var(format!("ZEROCLAW_ROUTE_{hint}_API_KEY"));
+        }
+        std::env::remove_var("ZEROCLAW_QUERY_CLASSIFICATION_ENABLED");
+        // Clear provider-specific keys to prevent auto-detection cross-contamination.
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_OAUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "OPENROUTER_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "XAI_API_KEY",
+            "GROQ_API_KEY",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    async fn env_override_explicit_routes_take_precedence() {
+        let _env_guard = env_override_lock().await;
+        clear_route_env_vars();
+        clear_proxy_env_test_vars();
+
+        let mut config = Config::default();
+
+        // Set explicit routes — these override auto-injected defaults.
+        std::env::set_var("ZEROCLAW_ROUTE_DAILY_PROVIDER", "google");
+        std::env::set_var("ZEROCLAW_ROUTE_DAILY_MODEL", "gemini-3.1-flash-lite-preview");
+        std::env::set_var("ZEROCLAW_ROUTE_CODE_PROVIDER", "anthropic");
+        std::env::set_var("ZEROCLAW_ROUTE_CODE_MODEL", "claude-4.6-opus");
+
+        config.apply_env_overrides();
+
+        // Explicit routes present with correct models.
+        let daily = config.model_routes.iter().find(|r| r.hint == "daily").unwrap();
+        assert_eq!(daily.provider, "google");
+        assert_eq!(daily.model, "gemini-3.1-flash-lite-preview");
+
+        let code = config.model_routes.iter().find(|r| r.hint == "code").unwrap();
+        assert_eq!(code.provider, "anthropic");
+        assert_eq!(code.model, "claude-4.6-opus");
+
+        clear_route_env_vars();
+    }
+
+    #[test]
+    async fn env_override_model_routes_overrides_toml_route() {
+        let _env_guard = env_override_lock().await;
+        clear_route_env_vars();
+        clear_proxy_env_test_vars();
+
+        let mut config = Config::default();
+        config.model_routes = vec![ModelRouteConfig {
+            hint: "daily".to_string(),
+            provider: "ollama".to_string(),
+            model: "llama3.2".to_string(),
+            max_tokens: None,
+            api_key: None,
+            transport: None,
+        }];
+
+        std::env::set_var("ZEROCLAW_ROUTE_DAILY_PROVIDER", "google");
+        std::env::set_var("ZEROCLAW_ROUTE_DAILY_MODEL", "gemini-3.1-flash-lite-preview");
+
+        config.apply_env_overrides();
+
+        let daily = config.model_routes.iter().find(|r| r.hint == "daily").unwrap();
+        assert_eq!(daily.provider, "google");
+        assert_eq!(daily.model, "gemini-3.1-flash-lite-preview");
+
+        clear_route_env_vars();
+    }
+
+    #[test]
+    async fn env_override_model_routes_with_max_tokens_and_api_key() {
+        let _env_guard = env_override_lock().await;
+        clear_route_env_vars();
+        clear_proxy_env_test_vars();
+
+        let mut config = Config::default();
+
+        std::env::set_var("ZEROCLAW_ROUTE_CODE_PROVIDER", "anthropic");
+        std::env::set_var("ZEROCLAW_ROUTE_CODE_MODEL", "claude-4.6-opus");
+        std::env::set_var("ZEROCLAW_ROUTE_CODE_MAX_TOKENS", "8192");
+        std::env::set_var("ZEROCLAW_ROUTE_CODE_API_KEY", "sk-test-route-key");
+
+        config.apply_env_overrides();
+
+        let code = config.model_routes.iter().find(|r| r.hint == "code").unwrap();
+        assert_eq!(code.max_tokens, Some(8192));
+        assert_eq!(code.api_key.as_deref(), Some("sk-test-route-key"));
+
+        clear_route_env_vars();
+    }
+
+    #[test]
+    async fn env_override_auto_injects_platform_defaults_without_user_key() {
+        let _env_guard = env_override_lock().await;
+        clear_route_env_vars();
+        clear_proxy_env_test_vars();
+
+        let mut config = Config::default();
+        assert!(config.model_routes.is_empty());
+
+        // No provider-specific keys set → platform defaults injected.
+        config.apply_env_overrides();
+
+        // Should have at least daily, document, code, review.
+        assert!(config.model_routes.iter().any(|r| r.hint == "daily"));
+        assert!(config.model_routes.iter().any(|r| r.hint == "document"));
+        assert!(config.model_routes.iter().any(|r| r.hint == "code"));
+        assert!(config.model_routes.iter().any(|r| r.hint == "review"));
+
+        // daily should be gemini flash-lite.
+        let daily = config.model_routes.iter().find(|r| r.hint == "daily").unwrap();
+        assert_eq!(daily.model, "gemini-3.1-flash-lite-preview");
+
+        // code should be claude-4.6-opus (platform default).
+        let code = config.model_routes.iter().find(|r| r.hint == "code").unwrap();
+        assert_eq!(code.model, "claude-4.6-opus");
+
+        // review should be gpt-5.4 (platform default).
+        let review = config.model_routes.iter().find(|r| r.hint == "review").unwrap();
+        assert_eq!(review.model, "gpt-5.4");
+
+        clear_route_env_vars();
+    }
+
+    #[test]
+    async fn env_override_user_api_key_triggers_provider_routes() {
+        let _env_guard = env_override_lock().await;
+        clear_route_env_vars();
+        clear_proxy_env_test_vars();
+
+        let mut config = Config::default();
+
+        // User provides Anthropic API key → routes should use Anthropic's best.
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-key");
+
+        config.apply_env_overrides();
+
+        // daily is still always Gemini flash-lite.
+        let daily = config.model_routes.iter().find(|r| r.hint == "daily").unwrap();
+        assert_eq!(daily.model, "gemini-3.1-flash-lite-preview");
+
+        // fast and reasoning should use Anthropic models.
+        let fast = config.model_routes.iter().find(|r| r.hint == "fast").unwrap();
+        assert_eq!(fast.provider, "anthropic");
+
+        let reasoning = config.model_routes.iter().find(|r| r.hint == "reasoning").unwrap();
+        assert_eq!(reasoning.provider, "anthropic");
+
+        // No platform-default review route (user has their own provider).
+        // review is not injected when user has a provider key.
+
+        clear_route_env_vars();
+    }
+
+    #[test]
+    async fn env_override_classification_enabled_injects_default_rules() {
+        let _env_guard = env_override_lock().await;
+        clear_route_env_vars();
+        clear_proxy_env_test_vars();
+
+        let mut config = Config::default();
+
+        std::env::set_var("ZEROCLAW_QUERY_CLASSIFICATION_ENABLED", "true");
+
+        config.apply_env_overrides();
+
+        assert!(config.query_classification.enabled);
+        assert!(!config.query_classification.rules.is_empty());
+
+        // Auto-injected routes (daily, document, code) should have matching rules.
+        let hints: Vec<&str> = config
+            .query_classification
+            .rules
+            .iter()
+            .map(|r| r.hint.as_str())
+            .collect();
+        assert!(hints.contains(&"code"));
+        assert!(hints.contains(&"daily"));
+        assert!(hints.contains(&"document"));
+
+        clear_route_env_vars();
+    }
+
+    #[test]
+    async fn env_override_classification_does_not_overwrite_existing_rules() {
+        let _env_guard = env_override_lock().await;
+        clear_route_env_vars();
+        clear_proxy_env_test_vars();
+
+        let mut config = Config::default();
+        config.query_classification.rules = vec![ClassificationRule {
+            hint: "custom".into(),
+            keywords: vec!["test".into()],
+            ..Default::default()
+        }];
+
+        std::env::set_var("ZEROCLAW_QUERY_CLASSIFICATION_ENABLED", "true");
+
+        config.apply_env_overrides();
+
+        assert!(config.query_classification.enabled);
+        // Existing rules preserved, no default injection.
+        assert_eq!(config.query_classification.rules.len(), 1);
+        assert_eq!(config.query_classification.rules[0].hint, "custom");
+
+        clear_route_env_vars();
+    }
+
+    #[test]
+    async fn env_override_partial_route_still_gets_auto_injected_routes() {
+        let _env_guard = env_override_lock().await;
+        clear_route_env_vars();
+        clear_proxy_env_test_vars();
+
+        let mut config = Config::default();
+
+        // Only provider, no model — explicit route ignored, but auto-injection still works.
+        std::env::set_var("ZEROCLAW_ROUTE_DAILY_PROVIDER", "google");
+
+        config.apply_env_overrides();
+
+        // daily should still be auto-injected (from phase 2).
+        assert!(config.model_routes.iter().any(|r| r.hint == "daily"));
+
+        clear_route_env_vars();
     }
 }
 

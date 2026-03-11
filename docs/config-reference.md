@@ -1033,6 +1033,98 @@ max_length = 50
 priority = 5
 ```
 
+### Tiered multi-model routing (recommended preset)
+
+Route different task categories to cost-optimal models. Set `default_model = "hint:daily"` so the cheap/fast model handles most traffic, and only escalate when the classifier detects a heavier task.
+
+**TOML configuration:**
+
+```toml
+default_model = "hint:daily"
+
+# Tier 1 — Daily: fast router, scheduling, simple Q&A, web browsing
+[[model_routes]]
+hint = "daily"
+provider = "google"
+model = "gemini-3.1-flash-lite-preview"
+
+# Tier 2 — Document: reports, essays, deep summaries, planning
+[[model_routes]]
+hint = "document"
+provider = "google"
+model = "gemini-3.1-pro-preview"
+
+# Tier 3 — Code: implementation, architecture, refactoring
+[[model_routes]]
+hint = "code"
+provider = "anthropic"
+model = "claude-4.6-opus"
+
+# Tier 4 — Review: optional premium code review (user-initiated only)
+[[model_routes]]
+hint = "review"
+provider = "openai"
+model = "gpt-5.4"
+
+[query_classification]
+enabled = true
+
+[[query_classification.rules]]
+hint = "code"
+keywords = ["code", "implement", "refactor", "debug", "compile", "function", "class", "bug", "fix", "algorithm"]
+patterns = ["```", "fn ", "def ", "class ", "import ", "pub fn"]
+priority = 20
+
+[[query_classification.rules]]
+hint = "document"
+keywords = ["write", "draft", "report", "document", "essay", "summarize", "analyze", "plan", "proposal", "email"]
+min_length = 30
+priority = 15
+
+[[query_classification.rules]]
+hint = "daily"
+keywords = ["hi", "hello", "thanks", "schedule", "remind", "weather", "time", "what", "who", "when", "where", "search", "find"]
+max_length = 200
+priority = 5
+```
+
+**Environment variable equivalent (for Railway / PaaS):**
+
+```bash
+# Core
+ZEROCLAW_MODEL=hint:daily
+
+# Tier 1 — Daily
+ZEROCLAW_ROUTE_DAILY_PROVIDER=google
+ZEROCLAW_ROUTE_DAILY_MODEL=gemini-3.1-flash-lite-preview
+
+# Tier 2 — Document
+ZEROCLAW_ROUTE_DOCUMENT_PROVIDER=google
+ZEROCLAW_ROUTE_DOCUMENT_MODEL=gemini-3.1-pro-preview
+
+# Tier 3 — Code
+ZEROCLAW_ROUTE_CODE_PROVIDER=anthropic
+ZEROCLAW_ROUTE_CODE_MODEL=claude-4.6-opus
+
+# Tier 4 — Review (user-initiated via chat command)
+ZEROCLAW_ROUTE_REVIEW_PROVIDER=openai
+ZEROCLAW_ROUTE_REVIEW_MODEL=gpt-5.4
+
+# Enable auto-classification (injects default rules for defined hints)
+ZEROCLAW_QUERY_CLASSIFICATION_ENABLED=true
+```
+
+**Cost optimization notes:**
+
+| Tier | Hint | When used | Cost profile |
+|---|---|---|---|
+| 1 | `daily` | Default for most messages | Lowest (fast, high throughput) |
+| 2 | `document` | Long-form writing detected | Medium (slower, high quality) |
+| 3 | `code` | Code patterns detected | High (best coding capability) |
+| 4 | `review` | User explicitly requests | Highest (on-demand only) |
+
+The `review` hint is **never auto-triggered** — it requires explicit user action (e.g., "review this code" chat command or UI button). This prevents unexpected cost spikes from dual-model calls.
+
 ## `[channels_config]`
 
 Top-level channel options are configured under `channels_config`.
