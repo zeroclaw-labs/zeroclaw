@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { Send, Bot, User, AlertCircle } from 'lucide-react';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
@@ -10,6 +10,9 @@ interface ChatMessage {
   timestamp: Date;
 }
 
+const COMPOSER_MIN_HEIGHT = 48;
+const COMPOSER_MAX_HEIGHT = 160;
+
 export default function AgentChat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
@@ -19,7 +22,7 @@ export default function AgentChat() {
 
   const wsRef = useRef<WebSocketClient | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const pendingContentRef = useRef('');
 
   useEffect(() => {
@@ -115,6 +118,32 @@ export default function AgentChat() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, typing]);
+
+  const resizeComposer = () => {
+    const composer = inputRef.current;
+    if (!composer) return;
+
+    composer.style.height = 'auto';
+    const nextHeight = Math.min(
+      Math.max(composer.scrollHeight, COMPOSER_MIN_HEIGHT),
+      COMPOSER_MAX_HEIGHT,
+    );
+
+    composer.style.height = `${nextHeight}px`;
+    composer.style.overflowY = composer.scrollHeight > COMPOSER_MAX_HEIGHT ? 'auto' : 'hidden';
+  };
+
+  useLayoutEffect(() => {
+    resizeComposer();
+  }, [input]);
+
+  useEffect(() => {
+    window.addEventListener('resize', resizeComposer);
+
+    return () => {
+      window.removeEventListener('resize', resizeComposer);
+    };
+  }, []);
 
   const handleSend = () => {
     const trimmed = input.trim();
@@ -229,17 +258,21 @@ export default function AgentChat() {
 
       {/* Input area */}
       <div className="border-t border-gray-800 bg-gray-900 p-4">
-        <div className="flex items-center gap-3 max-w-4xl mx-auto">
+        <div className="flex items-end gap-3 max-w-4xl mx-auto">
           <div className="flex-1 relative">
-            <input
+            <textarea
               ref={inputRef}
-              type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
+              rows={1}
               placeholder={connected ? 'Type a message...' : 'Connecting...'}
               disabled={!connected}
-              className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
+              style={{
+                minHeight: `${COMPOSER_MIN_HEIGHT}px`,
+                maxHeight: `${COMPOSER_MAX_HEIGHT}px`,
+              }}
+              className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm leading-5 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50 resize-none"
             />
           </div>
           <button
