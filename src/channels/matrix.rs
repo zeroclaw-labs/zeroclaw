@@ -1,25 +1,24 @@
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use matrix_sdk::{
     authentication::matrix::MatrixSession,
     config::SyncSettings,
     ruma::{
+        events::reaction::ReactionEventContent,
+        events::relation::{Annotation, InReplyTo, Thread},
         events::room::message::{
             MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
         },
-        events::reaction::ReactionEventContent,
-        events::relation::{Annotation, InReplyTo, Thread},
         events::room::MediaSource,
-        OwnedEventId,
-        OwnedRoomId, OwnedUserId,
+        OwnedEventId, OwnedRoomId, OwnedUserId,
     },
     Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
 };
 use reqwest::Client;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, OnceCell, RwLock};
 
@@ -541,7 +540,12 @@ impl Channel for MatrixChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let client = self.matrix_client().await?;
         let target_room_id = if message.recipient.contains("||") {
-            message.recipient.splitn(2, "||").nth(1).unwrap().to_string()
+            message
+                .recipient
+                .splitn(2, "||")
+                .nth(1)
+                .unwrap()
+                .to_string()
         } else {
             self.target_room_id().await?
         };
@@ -582,14 +586,20 @@ impl Channel for MatrixChannel {
             let _ = tokio::fs::create_dir_all(&voice_work).await;
             let mp3_path = voice_work.join("reply.mp3");
 
-            let tts_text = message.content
-                .replace("**", "").replace("*", "")
-                .replace("`", "").replace("# ", "");
+            let tts_text = message
+                .content
+                .replace("**", "")
+                .replace("*", "")
+                .replace("`", "")
+                .replace("# ", "");
 
             let tts_ok = tokio::process::Command::new("edge-tts")
-                .arg("--text").arg(&tts_text)
-                .arg("--write-media").arg(&mp3_path)
-                .output().await
+                .arg("--text")
+                .arg(&tts_text)
+                .arg("--write-media")
+                .arg(&mp3_path)
+                .output()
+                .await
                 .map(|o| o.status.success())
                 .unwrap_or(false);
 
@@ -599,21 +609,25 @@ impl Channel for MatrixChannel {
                         "{}/_matrix/media/v3/upload?filename=voice-reply.mp3",
                         self.homeserver
                     );
-                    if let Ok(resp) = self.http_client
+                    if let Ok(resp) = self
+                        .http_client
                         .post(&upload_url)
                         .header("Authorization", self.auth_header_value())
                         .header("Content-Type", "audio/mpeg")
                         .body(audio_data)
-                        .send().await
+                        .send()
+                        .await
                     {
                         if resp.status().is_success() {
                             if let Ok(body) = resp.json::<serde_json::Value>().await {
                                 if let Some(content_uri) = body["content_uri"].as_str() {
                                     let encoded_room = Self::encode_path_segment(&target_room_id);
-                                    let txn_id = format!("voice_{}",
+                                    let txn_id = format!(
+                                        "voice_{}",
                                         std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default().as_millis()
+                                            .unwrap_or_default()
+                                            .as_millis()
                                     );
                                     let audio_msg = serde_json::json!({
                                         "msgtype": "m.audio",
@@ -625,11 +639,13 @@ impl Channel for MatrixChannel {
                                         "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
                                         self.homeserver, encoded_room, txn_id
                                     );
-                                    let _ = self.http_client
+                                    let _ = self
+                                        .http_client
                                         .put(&send_url)
                                         .header("Authorization", self.auth_header_value())
                                         .json(&audio_msg)
-                                        .send().await;
+                                        .send()
+                                        .await;
                                 }
                             }
                         }
@@ -696,7 +712,9 @@ impl Channel for MatrixChannel {
             let voice_mode = Arc::clone(&voice_mode_for_handler);
 
             async move {
-                if false /* multi-room: room_id filter disabled */ {
+                if false
+                /* multi-room: room_id filter disabled */
+                {
                     return;
                 }
 
@@ -714,10 +732,8 @@ impl Channel for MatrixChannel {
                     match source {
                         MediaSource::Plain(mxc) => {
                             let rest = mxc.as_str().strip_prefix("mxc://")?;
-                            let url = format!(
-                                "{}/_matrix/client/v1/media/download/{}",
-                                homeserver, rest
-                            );
+                            let url =
+                                format!("{}/_matrix/client/v1/media/download/{}", homeserver, rest);
                             Some((url, name.to_string()))
                         }
                         _ => None,
@@ -749,27 +765,25 @@ impl Channel for MatrixChannel {
                 // Download media to workspace if present
                 let body = if let Some((url, filename)) = media_download {
                     let workspace = std::path::PathBuf::from(
-                        std::env::var("ZEROCLAW_WORKSPACE").unwrap_or_else(|_| "/tmp/zeroclaw-uploads".to_string())
+                        std::env::var("ZEROCLAW_WORKSPACE")
+                            .unwrap_or_else(|_| "/tmp/zeroclaw-uploads".to_string()),
                     );
                     let _ = tokio::fs::create_dir_all(&workspace).await;
                     let dest = workspace.join(&filename);
                     let client = reqwest::Client::new();
-                    match client.get(&url)
+                    match client
+                        .get(&url)
                         .header("Authorization", format!("Bearer {}", access_token))
                         .send()
                         .await
                     {
-                        Ok(resp) if resp.status().is_success() => {
-                            match resp.bytes().await {
-                                Ok(bytes) => {
-                                    match tokio::fs::write(&dest, &bytes).await {
-                                        Ok(_) => format!("{} — saved to {}", body, dest.display()),
-                                        Err(_) => format!("{} — failed to write to disk", body),
-                                    }
-                                }
-                                Err(_) => format!("{} — download failed", body),
-                            }
-                        }
+                        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                            Ok(bytes) => match tokio::fs::write(&dest, &bytes).await {
+                                Ok(_) => format!("{} — saved to {}", body, dest.display()),
+                                Err(_) => format!("{} — failed to write to disk", body),
+                            },
+                            Err(_) => format!("{} — download failed", body),
+                        },
                         _ => format!("{} — download failed (auth error?)", body),
                     }
                 } else {
@@ -782,7 +796,18 @@ impl Channel for MatrixChannel {
                         let audio_path = body[path_start + 9..].to_string();
                         let wav_path = format!("{}.16k.wav", audio_path);
                         let convert_ok = tokio::process::Command::new("ffmpeg")
-                            .args(["-y", "-i", &audio_path, "-ar", "16000", "-ac", "1", "-f", "wav", &wav_path])
+                            .args([
+                                "-y",
+                                "-i",
+                                &audio_path,
+                                "-ar",
+                                "16000",
+                                "-ac",
+                                "1",
+                                "-f",
+                                "wav",
+                                &wav_path,
+                            ])
                             .stderr(std::process::Stdio::null())
                             .output()
                             .await
@@ -790,8 +815,14 @@ impl Channel for MatrixChannel {
                             .unwrap_or(false);
                         if convert_ok {
                             let transcription = tokio::process::Command::new("whisper-cpp")
-                                .args(["-m", "/tmp/ggml-base.en.bin",
-                                       "-f", &wav_path, "--no-timestamps", "-nt"])
+                                .args([
+                                    "-m",
+                                    "/tmp/ggml-base.en.bin",
+                                    "-f",
+                                    &wav_path,
+                                    "--no-timestamps",
+                                    "-nt",
+                                ])
                                 .output()
                                 .await
                                 .ok()
@@ -930,9 +961,9 @@ impl Channel for MatrixChannel {
                 .get_room(&target_room)
                 .ok_or_else(|| anyhow::anyhow!("Matrix room not found for reaction removal"))?;
 
-            let event_id: OwnedEventId = reaction_event_id.parse().map_err(|_| {
-                anyhow::anyhow!("Invalid reaction event ID: {}", reaction_event_id)
-            })?;
+            let event_id: OwnedEventId = reaction_event_id
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid reaction event ID: {}", reaction_event_id))?;
 
             room.redact(&event_id, None, None).await?;
         }
@@ -940,12 +971,7 @@ impl Channel for MatrixChannel {
         Ok(())
     }
 
-
-    async fn pin_message(
-        &self,
-        _channel_id: &str,
-        message_id: &str,
-    ) -> anyhow::Result<()> {
+    async fn pin_message(&self, _channel_id: &str, message_id: &str) -> anyhow::Result<()> {
         let room_id = self.target_room_id().await?;
         let encoded_room = Self::encode_path_segment(&room_id);
 
@@ -1001,11 +1027,7 @@ impl Channel for MatrixChannel {
         Ok(())
     }
 
-    async fn unpin_message(
-        &self,
-        _channel_id: &str,
-        message_id: &str,
-    ) -> anyhow::Result<()> {
+    async fn unpin_message(&self, _channel_id: &str, message_id: &str) -> anyhow::Result<()> {
         let room_id = self.target_room_id().await?;
         let encoded_room = Self::encode_path_segment(&room_id);
 
