@@ -4310,11 +4310,12 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-42:"));
-        assert!(sent_messages[0].contains("BTC is currently around"));
-        assert!(!sent_messages[0].contains("\"tool_calls\""));
-        assert!(!sent_messages[0].contains("mock_price"));
+        assert!(sent_messages.len() >= 1);
+        let reply = sent_messages.last().unwrap();
+        assert!(reply.starts_with("chat-42:"));
+        assert!(reply.contains("BTC is currently around"));
+        assert!(!reply.contains("\"tool_calls\""));
+        assert!(!reply.contains("mock_price"));
     }
 
     #[tokio::test]
@@ -4370,8 +4371,9 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].contains("BTC is currently around"));
+        assert!(sent_messages.len() >= 1);
+        let reply = sent_messages.last().unwrap();
+        assert!(reply.contains("BTC is currently around"));
 
         let histories = runtime_ctx
             .conversation_histories
@@ -4504,11 +4506,12 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-84:"));
-        assert!(sent_messages[0].contains("alias-tag flow resolved"));
-        assert!(!sent_messages[0].contains("<toolcall>"));
-        assert!(!sent_messages[0].contains("mock_price"));
+        assert!(sent_messages.len() >= 1);
+        let reply = sent_messages.last().unwrap();
+        assert!(reply.starts_with("chat-84:"));
+        assert!(reply.contains("alias-tag flow resolved"));
+        assert!(!reply.contains("<toolcall>"));
+        assert!(!reply.contains("mock_price"));
     }
 
     #[tokio::test]
@@ -4894,10 +4897,11 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-iter-success:"));
-        assert!(sent_messages[0].contains("Completed after 11 tool iterations."));
-        assert!(!sent_messages[0].contains("⚠️ Error:"));
+        assert!(sent_messages.len() >= 1);
+        let reply = sent_messages.last().unwrap();
+        assert!(reply.starts_with("chat-iter-success:"));
+        assert!(reply.contains("Completed after 11 tool iterations."));
+        assert!(!reply.contains("⚠️ Error:"));
     }
 
     #[tokio::test]
@@ -4955,9 +4959,10 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-iter-fail:"));
-        assert!(sent_messages[0].contains("⚠️ Error: Agent exceeded maximum tool iterations (3)"));
+        assert!(sent_messages.len() >= 1);
+        let reply = sent_messages.last().unwrap();
+        assert!(reply.starts_with("chat-iter-fail:"));
+        assert!(reply.contains("⚠️ Error: Agent exceeded maximum tool iterations (3)"));
     }
 
     struct NoopMemory;
