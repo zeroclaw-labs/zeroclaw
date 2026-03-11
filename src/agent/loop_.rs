@@ -1,4 +1,5 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
+use crate::channels::telegram::TelegramApprovalRequest;
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
@@ -1884,6 +1885,7 @@ pub(crate) async fn agent_turn(
         temperature,
         silent,
         None,
+        None,
         "channel",
         multimodal_config,
         max_tool_iterations,
@@ -2074,6 +2076,7 @@ pub(crate) async fn run_tool_call_loop(
     temperature: f64,
     silent: bool,
     approval: Option<&ApprovalManager>,
+    telegram_approval: Option<&TelegramApprovalRequest>,
     channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
@@ -2451,11 +2454,22 @@ pub(crate) async fn run_tool_call_loop(
                         arguments: tool_args.clone(),
                     };
 
-                    // Only prompt interactively on CLI; auto-approve on other channels.
+                    // Prompt interactively on CLI, use inline buttons on Telegram,
+                    // deny by default on other channels without approval mechanism.
                     let decision = if channel_name == "cli" {
                         mgr.prompt_cli(&request)
+                    } else if let Some(tg) = telegram_approval {
+                        let args_str = scrub_credentials(
+                            &serde_json::to_string_pretty(&tool_args)
+                                .unwrap_or_else(|_| tool_args.to_string()),
+                        );
+                        if tg.request(&tool_name, &args_str).await {
+                            ApprovalResponse::Yes
+                        } else {
+                            ApprovalResponse::No
+                        }
                     } else {
-                        ApprovalResponse::Yes
+                        ApprovalResponse::No
                     };
 
                     mgr.record_decision(&tool_name, &tool_args, decision, channel_name);
@@ -3028,6 +3042,7 @@ pub async fn run(
             temperature,
             false,
             approval_manager.as_ref(),
+            None,
             channel_name,
             &config.multimodal,
             config.agent.max_tool_iterations,
@@ -3150,6 +3165,7 @@ pub async fn run(
                 temperature,
                 false,
                 approval_manager.as_ref(),
+                None,
                 channel_name,
                 &config.multimodal,
                 config.agent.max_tool_iterations,
@@ -3694,6 +3710,7 @@ mod tests {
             0.0,
             true,
             None,
+            None,
             "cli",
             &crate::config::MultimodalConfig::default(),
             3,
@@ -3740,6 +3757,7 @@ mod tests {
             0.0,
             true,
             None,
+            None,
             "cli",
             &multimodal,
             3,
@@ -3779,6 +3797,7 @@ mod tests {
             "mock-model",
             0.0,
             true,
+            None,
             None,
             "cli",
             &crate::config::MultimodalConfig::default(),
@@ -3906,6 +3925,7 @@ mod tests {
             0.0,
             true,
             Some(&approval_mgr),
+            None,
             "telegram",
             &crate::config::MultimodalConfig::default(),
             4,
@@ -3975,6 +3995,7 @@ mod tests {
             0.0,
             true,
             None,
+            None,
             "cli",
             &crate::config::MultimodalConfig::default(),
             4,
@@ -4030,6 +4051,7 @@ mod tests {
             "mock-model",
             0.0,
             true,
+            None,
             None,
             "cli",
             &crate::config::MultimodalConfig::default(),

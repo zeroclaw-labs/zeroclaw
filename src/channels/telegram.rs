@@ -6,11 +6,14 @@ use async_trait::async_trait;
 use directories::UserDirs;
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::fs;
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use uuid::Uuid;
 
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
@@ -295,6 +298,167 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
 /// Telegram Bot API maximum file download size (20 MB).
 const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 
+/// Manages pending Telegram inline-button approval requests.
+/// One instance is shared across all messages for a given bot token.
+pub(crate) struct TelegramApprovalBroker {
+    pending: Arc<AsyncMutex<HashMap<String, oneshot::Sender<bool>>>>,
+    bot_token: String,
+    api_base: String,
+    client: reqwest::Client,
+    pub timeout_secs: u64,
+}
+
+impl TelegramApprovalBroker {
+    pub fn new(
+        bot_token: String,
+        api_base: String,
+        client: reqwest::Client,
+        timeout_secs: u64,
+    ) -> Self {
+        Self {
+            pending: Arc::new(AsyncMutex::new(HashMap::new())),
+            bot_token,
+            api_base,
+            client,
+            timeout_secs,
+        }
+    }
+
+    fn api_url(&self, method: &str) -> String {
+        format!("{}/bot{}/{}", self.api_base, self.bot_token, method)
+    }
+
+    /// Send an inline-keyboard approval message and wait for user response.
+    /// Returns `true` = approved, `false` = denied or timeout.
+    pub async fn request_approval(
+        &self,
+        chat_id: i64,
+        message_thread_id: Option<i64>,
+        tool_name: &str,
+        args_preview: &str,
+    ) -> bool {
+        let id = Uuid::new_v4().to_string();
+
+        // Truncate args preview to avoid Telegram message size limits (UTF-8-safe)
+        let preview = crate::util::truncate_with_ellipsis(args_preview, 300);
+
+        let text = format!(
+            "⚠️ *Approval required*\n\nTool: `{}`\n```\n{}\n```",
+            tool_name, preview
+        );
+
+        let keyboard = serde_json::json!({
+            "inline_keyboard": [[
+                {"text": "✅ Approve", "callback_data": format!("approve:{id}")},
+                {"text": "❌ Deny",    "callback_data": format!("deny:{id}")}
+            ]]
+        });
+
+        // Register pending approval BEFORE sending the message to avoid race
+        // where a fast callback arrives before the entry exists.
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id.clone(), tx);
+
+        let mut payload = serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "reply_markup": keyboard
+        });
+        if let Some(thread_id) = message_thread_id {
+            payload["message_thread_id"] = serde_json::json!(thread_id);
+        }
+        let send_result = self
+            .client
+            .post(self.api_url("sendMessage"))
+            .json(&payload)
+            .send()
+            .await;
+
+        let msg_id: Option<i64> = match send_result {
+            Ok(resp) => resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v["result"]["message_id"].as_i64()),
+            Err(_) => {
+                // Cleanup pending entry on send failure
+                self.pending.lock().await.remove(&id);
+                tracing::warn!("TelegramApprovalBroker: failed to send approval message");
+                return false; // fail-safe: deny
+            }
+        };
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(self.timeout_secs), rx).await;
+
+        // Cleanup: remove from pending (no-op if already resolved by callback)
+        self.pending.lock().await.remove(&id);
+
+        let timed_out;
+        let approved = match result {
+            Ok(Ok(v)) => {
+                timed_out = false;
+                v
+            }
+            _ => {
+                timed_out = true;
+                false
+            }
+        };
+
+        // Edit original message to show outcome
+        if let Some(mid) = msg_id {
+            let outcome_text = if approved {
+                "✅ Approved"
+            } else if timed_out {
+                "⏱ Timed out — action denied"
+            } else {
+                "❌ Denied"
+            };
+            let _ = self
+                .client
+                .post(self.api_url("editMessageText"))
+                .json(&serde_json::json!({
+                    "chat_id": chat_id,
+                    "message_id": mid,
+                    "text": outcome_text
+                }))
+                .send()
+                .await;
+        }
+
+        approved
+    }
+
+    /// Called by the callback handler when the user presses a button.
+    /// Returns true if a pending entry was found and resolved, false if expired/unknown.
+    pub async fn resolve(&self, id: &str, approved: bool) -> bool {
+        let mut pending = self.pending.lock().await;
+        if let Some(sender) = pending.remove(id) {
+            let _ = sender.send(approved);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Per-message handle for requesting approval from a specific Telegram chat.
+pub(crate) struct TelegramApprovalRequest {
+    pub broker: Arc<TelegramApprovalBroker>,
+    pub chat_id: i64,
+    pub message_thread_id: Option<i64>,
+}
+
+impl TelegramApprovalRequest {
+    pub async fn request(&self, tool_name: &str, args: &str) -> bool {
+        self.broker
+            .request_approval(self.chat_id, self.message_thread_id, tool_name, args)
+            .await
+    }
+}
+
 /// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
     bot_token: String,
@@ -313,6 +477,7 @@ pub struct TelegramChannel {
     transcription: Option<crate::config::TranscriptionConfig>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
+    approval_broker: Arc<TelegramApprovalBroker>,
 }
 
 impl TelegramChannel {
@@ -329,21 +494,30 @@ impl TelegramChannel {
             None
         };
 
+        let client = reqwest::Client::new();
+        let api_base = "https://api.telegram.org".to_string();
+        let broker = Arc::new(TelegramApprovalBroker::new(
+            bot_token.clone(),
+            api_base.clone(),
+            client.clone(),
+            300,
+        ));
         Self {
             bot_token,
             allowed_users: Arc::new(RwLock::new(normalized_allowed)),
             pairing,
-            client: reqwest::Client::new(),
+            client,
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
             mention_only,
             bot_username: Mutex::new(None),
-            api_base: "https://api.telegram.org".to_string(),
+            api_base,
             transcription: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
+            approval_broker: broker,
         }
     }
 
@@ -368,6 +542,7 @@ impl TelegramChannel {
     /// Useful for local Bot API servers or testing.
     pub fn with_api_base(mut self, api_base: String) -> Self {
         self.api_base = api_base;
+        self.rebuild_approval_broker(self.approval_broker.timeout_secs);
         self
     }
 
@@ -377,6 +552,26 @@ impl TelegramChannel {
             self.transcription = Some(config);
         }
         self
+    }
+
+    fn rebuild_approval_broker(&mut self, timeout_secs: u64) {
+        self.approval_broker = Arc::new(TelegramApprovalBroker::new(
+            self.bot_token.clone(),
+            self.api_base.clone(),
+            self.client.clone(),
+            timeout_secs,
+        ));
+    }
+
+    /// Configure approval timeout for inline-button approval requests.
+    pub fn with_approval_timeout(mut self, timeout_secs: u64) -> Self {
+        self.rebuild_approval_broker(timeout_secs);
+        self
+    }
+
+    /// Returns a reference to the approval broker for use in the agent loop.
+    pub(crate) fn approval_broker(&self) -> &Arc<TelegramApprovalBroker> {
+        &self.approval_broker
     }
 
     /// Parse reply_target into (chat_id, optional thread_id).
@@ -2467,7 +2662,7 @@ impl Channel for TelegramChannel {
             let probe = serde_json::json!({
                 "offset": offset,
                 "timeout": 0,
-                "allowed_updates": ["message"]
+                "allowed_updates": ["message", "callback_query"]
             });
             match self.http_client().post(&url).json(&probe).send().await {
                 Err(e) => {
@@ -2540,7 +2735,7 @@ impl Channel for TelegramChannel {
             let body = serde_json::json!({
                 "offset": offset,
                 "timeout": 30,
-                "allowed_updates": ["message"]
+                "allowed_updates": ["message", "callback_query"]
             });
 
             let resp = match self.http_client().post(&url).json(&body).send().await {
@@ -2599,6 +2794,64 @@ Ensure only one `zeroclaw` process is using this bot token."
                     // Advance offset past this update
                     if let Some(uid) = update.get("update_id").and_then(serde_json::Value::as_i64) {
                         offset = uid + 1;
+                    }
+
+                    // Handle callback_query (inline button presses for approval)
+                    if let Some(callback) = update.get("callback_query") {
+                        let callback_id = callback["id"].as_str().unwrap_or_default();
+                        let data = callback["data"].as_str().unwrap_or_default();
+
+                        // Authorize: only allowlisted users can approve/deny tools
+                        let from = &callback["from"];
+                        let clicker_username = from["username"].as_str().unwrap_or_default();
+                        let clicker_id = from["id"].as_i64().map(|id| id.to_string());
+                        let mut identities: Vec<&str> = vec![clicker_username];
+                        if let Some(ref id_str) = clicker_id {
+                            identities.push(id_str);
+                        }
+                        let authorized = self.is_any_user_allowed(identities);
+
+                        // answerCallbackQuery is mandatory (otherwise Telegram shows loading spinner)
+                        if !authorized {
+                            let _ = self
+                                .http_client()
+                                .post(self.api_url("answerCallbackQuery"))
+                                .json(&serde_json::json!({
+                                    "callback_query_id": callback_id,
+                                    "text": "You are not authorized to approve or deny tool execution",
+                                    "show_alert": true
+                                }))
+                                .send()
+                                .await;
+                            continue;
+                        }
+
+                        let _ = self
+                            .http_client()
+                            .post(self.api_url("answerCallbackQuery"))
+                            .json(&serde_json::json!({"callback_query_id": callback_id}))
+                            .send()
+                            .await;
+
+                        if let Some((action, id)) = data.split_once(':') {
+                            let approved = action == "approve";
+                            let found = self.approval_broker.resolve(id, approved).await;
+
+                            if !found {
+                                // Expired or already answered: show alert
+                                let _ = self
+                                    .http_client()
+                                    .post(self.api_url("answerCallbackQuery"))
+                                    .json(&serde_json::json!({
+                                        "callback_query_id": callback_id,
+                                        "text": "This request has already expired",
+                                        "show_alert": true
+                                    }))
+                                    .send()
+                                    .await;
+                            }
+                        }
+                        continue;
                     }
 
                     let msg = if let Some(m) = self.parse_update_message(update) {
@@ -4603,5 +4856,49 @@ mod tests {
         // The combination of marker_count > 0 && !supports_vision() means
         // the agent loop will return ProviderCapabilityError before calling
         // the provider, and the channel will send "⚠️ Error: ..." to the user.
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+
+    fn make_broker() -> TelegramApprovalBroker {
+        TelegramApprovalBroker::new(
+            "fake_token".into(),
+            "https://api.telegram.org".into(),
+            reqwest::Client::new(),
+            5,
+        )
+    }
+
+    #[tokio::test]
+    async fn resolve_returns_true_when_pending_exists() {
+        let broker = make_broker();
+        let (tx, rx) = oneshot::channel::<bool>();
+        broker.pending.lock().await.insert("abc123".to_string(), tx);
+
+        let found = broker.resolve("abc123", true).await;
+        assert!(found);
+        assert!(rx.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolve_returns_false_when_id_unknown() {
+        let broker = make_broker();
+        let found = broker.resolve("nonexistent", false).await;
+        assert!(!found);
+    }
+
+    #[tokio::test]
+    async fn resolve_removes_entry_after_first_call() {
+        let broker = make_broker();
+        let (tx, _rx) = oneshot::channel::<bool>();
+        broker.pending.lock().await.insert("abc".to_string(), tx);
+
+        broker.resolve("abc", true).await;
+        // Second call: entry already removed
+        let found = broker.resolve("abc", false).await;
+        assert!(!found);
     }
 }
