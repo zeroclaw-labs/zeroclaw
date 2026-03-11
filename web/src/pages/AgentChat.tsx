@@ -19,7 +19,7 @@ export default function AgentChat() {
 
   const wsRef = useRef<WebSocketClient | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const pendingContentRef = useRef('');
 
   useEffect(() => {
@@ -139,14 +139,28 @@ export default function AgentChat() {
     }
 
     setInput('');
+    // Reset textarea height
+    if (inputRef.current) {
+      inputRef.current.style.height = 'auto';
+    }
     inputRef.current?.focus();
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
     }
+  };
+
+  // Auto-resize textarea based on content
+  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setInput(e.target.value);
+    // Reset height to auto to get correct scrollHeight
+    e.target.style.height = 'auto';
+    // Set new height with max limit (200px = ~8 rows)
+    const newHeight = Math.min(e.target.scrollHeight, 200);
+    e.target.style.height = `${newHeight}px`;
   };
 
   return (
@@ -231,15 +245,15 @@ export default function AgentChat() {
       <div className="border-t border-gray-800 bg-gray-900 p-4">
         <div className="flex items-center gap-3 max-w-4xl mx-auto">
           <div className="flex-1 relative">
-            <input
+            <textarea
               ref={inputRef}
-              type="text"
               value={input}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={handleInputChange}
               onKeyDown={handleKeyDown}
-              placeholder={connected ? 'Type a message...' : 'Connecting...'}
+              placeholder={connected ? 'Type a message... (Shift+Enter for new line)' : 'Connecting...'}
               disabled={!connected}
-              className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
+              rows={1}
+              className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50 resize-none overflow-y-auto min-h-[46px] max-h-[200px]"
             />
           </div>
           <button
