@@ -555,7 +555,7 @@ mod tests {
     #[test]
     fn template_outlook_includes_count() {
         let t = BrowserTaskTemplates::read_outlook_inbox(5);
-        assert!(t.contains("5"));
+        assert!(t.contains('5'));
         assert!(t.contains("Outlook"));
     }
 
