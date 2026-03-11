@@ -138,9 +138,9 @@ impl GeminiCliProvider {
 
         let mut child = cmd.spawn().map_err(|err| {
             anyhow::anyhow!(
-                "Failed to spawn Gemini CLI binary at {:?}: {err}. \
+                "Failed to spawn Gemini CLI binary at {}: {err}. \
                  Ensure `gemini` is installed and in PATH, or set GEMINI_CLI_PATH.",
-                self.binary_path
+                self.binary_path.display()
             )
         })?;
 
@@ -157,9 +157,9 @@ impl GeminiCliProvider {
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
-                    "Gemini CLI request timed out after {:?} (binary: {:?})",
+                    "Gemini CLI request timed out after {:?} (binary: {})",
                     GEMINI_CLI_REQUEST_TIMEOUT,
-                    self.binary_path
+                    self.binary_path.display()
                 )
             })?
             .map_err(|err| anyhow::anyhow!("Gemini CLI process failed: {err}"))?;

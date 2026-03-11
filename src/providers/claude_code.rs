@@ -138,9 +138,9 @@ impl ClaudeCodeProvider {
 
         let mut child = cmd.spawn().map_err(|err| {
             anyhow::anyhow!(
-                "Failed to spawn Claude Code binary at {:?}: {err}. \
+                "Failed to spawn Claude Code binary at {}: {err}. \
                  Ensure `claude` is installed and in PATH, or set CLAUDE_CODE_PATH.",
-                self.binary_path
+                self.binary_path.display()
             )
         })?;
 
@@ -157,9 +157,9 @@ impl ClaudeCodeProvider {
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
-                    "Claude Code request timed out after {:?} (binary: {:?})",
+                    "Claude Code request timed out after {:?} (binary: {})",
                     CLAUDE_CODE_REQUEST_TIMEOUT,
-                    self.binary_path
+                    self.binary_path.display()
                 )
             })?
             .map_err(|err| anyhow::anyhow!("Claude Code process failed: {err}"))?;
