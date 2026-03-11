@@ -93,15 +93,14 @@ impl PromptSection for IdentitySection {
         }
 
         if !has_aieos {
-            prompt.push_str(
-                "The following workspace files define your identity, behavior, and context.\n\n",
-            );
+            prompt.push_str("The following IDENTITY.md defines your identity.\n\n");
+            inject_workspace_file(&mut prompt, ctx.workspace_dir, "IDENTITY.md");
         }
+        prompt.push_str("The following files define your behavior and context.\n\n");
         for file in [
             "AGENTS.md",
             "SOUL.md",
             "TOOLS.md",
-            "IDENTITY.md",
             "USER.md",
             "HEARTBEAT.md",
             "BOOTSTRAP.md",
