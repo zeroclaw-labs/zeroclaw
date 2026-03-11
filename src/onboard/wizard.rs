@@ -1,6 +1,7 @@
 use crate::config::schema::{
-    default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig,
-    NextcloudTalkConfig, NostrConfig, QQConfig, SignalConfig, StreamMode, WhatsAppConfig,
+    default_nostr_relays, default_telegram_approval_timeout_secs, DingTalkConfig, IrcConfig,
+    LarkReceiveMode, LinqConfig, NextcloudTalkConfig, NostrConfig, QQConfig, SignalConfig,
+    StreamMode, WhatsAppConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
@@ -3618,7 +3619,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     draft_update_interval_ms: 1000,
                     interrupt_on_new_message: false,
                     mention_only: false,
-                    approval_timeout_secs: 300,
+                    approval_timeout_secs: default_telegram_approval_timeout_secs(),
                 });
             }
             ChannelMenuChoice::Discord => {

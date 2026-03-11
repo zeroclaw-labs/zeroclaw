@@ -333,17 +333,14 @@ impl TelegramApprovalBroker {
     pub async fn request_approval(
         &self,
         chat_id: i64,
+        message_thread_id: Option<i64>,
         tool_name: &str,
         args_preview: &str,
     ) -> bool {
         let id = Uuid::new_v4().to_string();
 
-        // Truncate args preview to avoid Telegram message size limits
-        let preview = if args_preview.len() > 300 {
-            format!("{}…", &args_preview[..300])
-        } else {
-            args_preview.to_string()
-        };
+        // Truncate args preview to avoid Telegram message size limits (UTF-8-safe)
+        let preview = crate::util::truncate_with_ellipsis(args_preview, 300);
 
         let text = format!(
             "⚠️ *Approval required*\n\nTool: `{}`\n```\n{}\n```",
@@ -357,15 +354,24 @@ impl TelegramApprovalBroker {
             ]]
         });
 
+        // Register pending approval BEFORE sending the message to avoid race
+        // where a fast callback arrives before the entry exists.
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id.clone(), tx);
+
+        let mut payload = serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "reply_markup": keyboard
+        });
+        if let Some(thread_id) = message_thread_id {
+            payload["message_thread_id"] = serde_json::json!(thread_id);
+        }
         let send_result = self
             .client
             .post(self.api_url("sendMessage"))
-            .json(&serde_json::json!({
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "Markdown",
-                "reply_markup": keyboard
-            }))
+            .json(&payload)
             .send()
             .await;
 
@@ -376,13 +382,12 @@ impl TelegramApprovalBroker {
                 .ok()
                 .and_then(|v| v["result"]["message_id"].as_i64()),
             Err(_) => {
+                // Cleanup pending entry on send failure
+                self.pending.lock().await.remove(&id);
                 tracing::warn!("TelegramApprovalBroker: failed to send approval message");
                 return false; // fail-safe: deny
             }
         };
-
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id.clone(), tx);
 
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(self.timeout_secs), rx).await;
@@ -443,12 +448,13 @@ impl TelegramApprovalBroker {
 pub(crate) struct TelegramApprovalRequest {
     pub broker: Arc<TelegramApprovalBroker>,
     pub chat_id: i64,
+    pub message_thread_id: Option<i64>,
 }
 
 impl TelegramApprovalRequest {
     pub async fn request(&self, tool_name: &str, args: &str) -> bool {
         self.broker
-            .request_approval(self.chat_id, tool_name, args)
+            .request_approval(self.chat_id, self.message_thread_id, tool_name, args)
             .await
     }
 }
@@ -536,6 +542,7 @@ impl TelegramChannel {
     /// Useful for local Bot API servers or testing.
     pub fn with_api_base(mut self, api_base: String) -> Self {
         self.api_base = api_base;
+        self.rebuild_approval_broker(self.approval_broker.timeout_secs);
         self
     }
 
@@ -547,14 +554,18 @@ impl TelegramChannel {
         self
     }
 
-    /// Configure approval timeout for inline-button approval requests.
-    pub fn with_approval_timeout(mut self, timeout_secs: u64) -> Self {
+    fn rebuild_approval_broker(&mut self, timeout_secs: u64) {
         self.approval_broker = Arc::new(TelegramApprovalBroker::new(
             self.bot_token.clone(),
             self.api_base.clone(),
             self.client.clone(),
             timeout_secs,
         ));
+    }
+
+    /// Configure approval timeout for inline-button approval requests.
+    pub fn with_approval_timeout(mut self, timeout_secs: u64) -> Self {
+        self.rebuild_approval_broker(timeout_secs);
         self
     }
 
@@ -2790,7 +2801,31 @@ Ensure only one `zeroclaw` process is using this bot token."
                         let callback_id = callback["id"].as_str().unwrap_or_default();
                         let data = callback["data"].as_str().unwrap_or_default();
 
+                        // Authorize: only allowlisted users can approve/deny tools
+                        let from = &callback["from"];
+                        let clicker_username = from["username"].as_str().unwrap_or_default();
+                        let clicker_id = from["id"].as_i64().map(|id| id.to_string());
+                        let mut identities: Vec<&str> = vec![clicker_username];
+                        if let Some(ref id_str) = clicker_id {
+                            identities.push(id_str);
+                        }
+                        let authorized = self.is_any_user_allowed(identities);
+
                         // answerCallbackQuery is mandatory (otherwise Telegram shows loading spinner)
+                        if !authorized {
+                            let _ = self
+                                .http_client()
+                                .post(self.api_url("answerCallbackQuery"))
+                                .json(&serde_json::json!({
+                                    "callback_query_id": callback_id,
+                                    "text": "You are not authorized to approve or deny tool execution",
+                                    "show_alert": true
+                                }))
+                                .send()
+                                .await;
+                            continue;
+                        }
+
                         let _ = self
                             .http_client()
                             .post(self.api_url("answerCallbackQuery"))

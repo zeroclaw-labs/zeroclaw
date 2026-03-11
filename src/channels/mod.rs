@@ -1732,17 +1732,16 @@ async fn process_channel_message(
     let tg_approval = if msg.channel == "telegram" {
         ctx.telegram_approval_broker.as_ref().and_then(|broker| {
             // reply_target may be "chat_id" or "chat_id:thread_id"
-            let chat_id_str = msg
-                .reply_target
-                .split(':')
-                .next()
-                .unwrap_or(&msg.reply_target);
+            let mut parts = msg.reply_target.split(':');
+            let chat_id_str = parts.next().unwrap_or(&msg.reply_target);
+            let thread_id = parts.next().and_then(|s| s.parse::<i64>().ok());
             chat_id_str
                 .parse::<i64>()
                 .ok()
                 .map(|chat_id| telegram::TelegramApprovalRequest {
                     broker: Arc::clone(broker),
                     chat_id,
+                    message_thread_id: thread_id,
                 })
         })
     } else {

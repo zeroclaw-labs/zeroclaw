@@ -403,8 +403,8 @@ impl DelegateTool {
                 &agent_config.model,
                 temperature,
                 true,
-                None,
-                None,
+                None, // approval: TODO propagate parent ApprovalManager
+                None, // telegram_approval: TODO propagate parent TelegramApprovalRequest (requires trait change)
                 "delegate",
                 &self.multimodal_config,
                 agent_config.max_iterations,

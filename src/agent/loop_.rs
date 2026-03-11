@@ -2459,8 +2459,10 @@ pub(crate) async fn run_tool_call_loop(
                     let decision = if channel_name == "cli" {
                         mgr.prompt_cli(&request)
                     } else if let Some(tg) = telegram_approval {
-                        let args_str = serde_json::to_string_pretty(&tool_args)
-                            .unwrap_or_else(|_| tool_args.to_string());
+                        let args_str = scrub_credentials(
+                            &serde_json::to_string_pretty(&tool_args)
+                                .unwrap_or_else(|_| tool_args.to_string()),
+                        );
                         if tg.request(&tool_name, &args_str).await {
                             ApprovalResponse::Yes
                         } else {
