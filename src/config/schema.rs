@@ -4112,6 +4112,156 @@ fn encrypt_secret(
     Ok(())
 }
 
+fn encrypt_channel_secrets(
+    store: &crate::security::SecretStore,
+    channels: &mut ChannelsConfig,
+) -> Result<()> {
+    if let Some(ref mut telegram) = channels.telegram {
+        encrypt_secret(store, &mut telegram.bot_token, "config.channels_config.telegram.bot_token")?;
+    }
+    if let Some(ref mut discord) = channels.discord {
+        encrypt_secret(store, &mut discord.bot_token, "config.channels_config.discord.bot_token")?;
+    }
+    if let Some(ref mut slack) = channels.slack {
+        encrypt_secret(store, &mut slack.bot_token, "config.channels_config.slack.bot_token")?;
+        encrypt_optional_secret(
+            store,
+            &mut slack.app_token,
+            "config.channels_config.slack.app_token",
+        )?;
+    }
+    if let Some(ref mut mattermost) = channels.mattermost {
+        encrypt_secret(
+            store,
+            &mut mattermost.bot_token,
+            "config.channels_config.mattermost.bot_token",
+        )?;
+    }
+    if let Some(ref mut webhook) = channels.webhook {
+        encrypt_optional_secret(store, &mut webhook.secret, "config.channels_config.webhook.secret")?;
+    }
+    if let Some(ref mut matrix) = channels.matrix {
+        encrypt_secret(
+            store,
+            &mut matrix.access_token,
+            "config.channels_config.matrix.access_token",
+        )?;
+    }
+    if let Some(ref mut whatsapp) = channels.whatsapp {
+        encrypt_optional_secret(
+            store,
+            &mut whatsapp.access_token,
+            "config.channels_config.whatsapp.access_token",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut whatsapp.app_secret,
+            "config.channels_config.whatsapp.app_secret",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut whatsapp.verify_token,
+            "config.channels_config.whatsapp.verify_token",
+        )?;
+    }
+    if let Some(ref mut linq) = channels.linq {
+        encrypt_secret(store, &mut linq.api_token, "config.channels_config.linq.api_token")?;
+        encrypt_optional_secret(
+            store,
+            &mut linq.signing_secret,
+            "config.channels_config.linq.signing_secret",
+        )?;
+    }
+    if let Some(ref mut nextcloud) = channels.nextcloud_talk {
+        encrypt_secret(
+            store,
+            &mut nextcloud.app_token,
+            "config.channels_config.nextcloud_talk.app_token",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut nextcloud.webhook_secret,
+            "config.channels_config.nextcloud_talk.webhook_secret",
+        )?;
+    }
+    if let Some(ref mut wati) = channels.wati {
+        encrypt_secret(store, &mut wati.api_token, "config.channels_config.wati.api_token")?;
+    }
+    if let Some(ref mut irc) = channels.irc {
+        encrypt_optional_secret(
+            store,
+            &mut irc.server_password,
+            "config.channels_config.irc.server_password",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut irc.nickserv_password,
+            "config.channels_config.irc.nickserv_password",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut irc.sasl_password,
+            "config.channels_config.irc.sasl_password",
+        )?;
+    }
+    if let Some(ref mut lark) = channels.lark {
+        encrypt_secret(store, &mut lark.app_secret, "config.channels_config.lark.app_secret")?;
+        encrypt_optional_secret(
+            store,
+            &mut lark.encrypt_key,
+            "config.channels_config.lark.encrypt_key",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut lark.verification_token,
+            "config.channels_config.lark.verification_token",
+        )?;
+    }
+    if let Some(ref mut feishu) = channels.feishu {
+        encrypt_secret(
+            store,
+            &mut feishu.app_secret,
+            "config.channels_config.feishu.app_secret",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut feishu.encrypt_key,
+            "config.channels_config.feishu.encrypt_key",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut feishu.verification_token,
+            "config.channels_config.feishu.verification_token",
+        )?;
+    }
+    if let Some(ref mut dingtalk) = channels.dingtalk {
+        encrypt_secret(
+            store,
+            &mut dingtalk.client_secret,
+            "config.channels_config.dingtalk.client_secret",
+        )?;
+    }
+    if let Some(ref mut qq) = channels.qq {
+        encrypt_secret(store, &mut qq.app_secret, "config.channels_config.qq.app_secret")?;
+    }
+    if let Some(ref mut clawdtalk) = channels.clawdtalk {
+        encrypt_secret(
+            store,
+            &mut clawdtalk.api_key,
+            "config.channels_config.clawdtalk.api_key",
+        )?;
+        encrypt_optional_secret(
+            store,
+            &mut clawdtalk.webhook_secret,
+            "config.channels_config.clawdtalk.webhook_secret",
+        )?;
+    }
+    if let Some(ref mut email) = channels.email {
+        encrypt_secret(store, &mut email.password, "config.channels_config.email.password")?;
+    }
+    Ok(())
+}
+
 fn config_dir_creation_error(path: &Path) -> String {
     format!(
         "Failed to create config directory: {}. If running as an OpenRC service, \
@@ -4933,6 +5083,7 @@ impl Config {
                 "config.channels_config.nostr.private_key",
             )?;
         }
+        encrypt_channel_secrets(&store, &mut config_to_save.channels_config)?;
 
         let toml_str =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
@@ -5591,6 +5742,43 @@ tool_dispatcher = "xml"
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
+        config.channels_config.telegram = Some(TelegramConfig {
+            bot_token: "telegram-token".into(),
+            allowed_users: vec!["*".into()],
+            stream_mode: StreamMode::Edit,
+            draft_update_interval_ms: 500,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+        config.channels_config.slack = Some(SlackConfig {
+            bot_token: "slack-token".into(),
+            app_token: Some("slack-app-token".into()),
+            channel_id: Some("C123".into()),
+            allowed_users: vec!["U123".into()],
+        });
+        config.channels_config.webhook = Some(WebhookConfig {
+            port: 42600,
+            secret: Some("webhook-secret".into()),
+        });
+        config.channels_config.matrix = Some(MatrixConfig {
+            homeserver: "https://matrix.example.com".into(),
+            access_token: "matrix-token".into(),
+            user_id: Some("@bot:example.com".into()),
+            device_id: Some("DEVICE".into()),
+            room_id: "!room:example.com".into(),
+            allowed_users: vec!["@user:example.com".into()],
+        });
+        config.channels_config.lark = Some(LarkConfig {
+            app_id: "cli_aabbcc".into(),
+            app_secret: "lark-secret".into(),
+            encrypt_key: Some("lark-encrypt".into()),
+            verification_token: Some("lark-verify".into()),
+            allowed_users: vec!["*".into()],
+            mention_only: false,
+            use_feishu: false,
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+        });
 
         config.agents.insert(
             "worker".into(),
@@ -5657,6 +5845,40 @@ tool_dispatcher = "xml"
             store.decrypt(storage_db_url).unwrap(),
             "postgres://user:pw@host/db"
         );
+
+        let telegram = stored.channels_config.telegram.as_ref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(&telegram.bot_token));
+        assert_eq!(store.decrypt(&telegram.bot_token).unwrap(), "telegram-token");
+
+        let slack = stored.channels_config.slack.as_ref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(&slack.bot_token));
+        assert_eq!(store.decrypt(&slack.bot_token).unwrap(), "slack-token");
+        let slack_app_token = slack.app_token.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(slack_app_token));
+        assert_eq!(store.decrypt(slack_app_token).unwrap(), "slack-app-token");
+
+        let webhook_secret = stored
+            .channels_config
+            .webhook
+            .as_ref()
+            .and_then(|cfg| cfg.secret.as_deref())
+            .unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(webhook_secret));
+        assert_eq!(store.decrypt(webhook_secret).unwrap(), "webhook-secret");
+
+        let matrix = stored.channels_config.matrix.as_ref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(&matrix.access_token));
+        assert_eq!(store.decrypt(&matrix.access_token).unwrap(), "matrix-token");
+
+        let lark = stored.channels_config.lark.as_ref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(&lark.app_secret));
+        assert_eq!(store.decrypt(&lark.app_secret).unwrap(), "lark-secret");
+        let lark_encrypt_key = lark.encrypt_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(lark_encrypt_key));
+        assert_eq!(store.decrypt(lark_encrypt_key).unwrap(), "lark-encrypt");
+        let lark_verification_token = lark.verification_token.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(lark_verification_token));
+        assert_eq!(store.decrypt(lark_verification_token).unwrap(), "lark-verify");
 
         let _ = fs::remove_dir_all(&dir).await;
     }
