@@ -1083,7 +1083,7 @@ pub struct AgentConfig {
     pub loop_detection_ping_pong_cycles: usize,
     /// Loop detection: consecutive failure streak threshold.
     /// Triggers when the same tool fails this many times in a row.
-    /// Set to `0` to disable. Default: `3`.
+    /// Set to `0` to disable. Default: `5`.
     #[serde(default = "default_loop_detection_failure_streak")]
     pub loop_detection_failure_streak: usize,
     /// Safety heartbeat injection interval inside `run_tool_call_loop`.
@@ -1184,7 +1184,7 @@ fn default_loop_detection_ping_pong_cycles() -> usize {
 }
 
 fn default_loop_detection_failure_streak() -> usize {
-    3
+    5
 }
 
 fn default_safety_heartbeat_interval() -> usize {
@@ -1780,6 +1780,10 @@ pub struct GatewayConfig {
     /// Node-control protocol scaffold (`[gateway.node_control]`).
     #[serde(default)]
     pub node_control: NodeControlConfig,
+
+    /// ACP server settings (`[gateway.acp_server]`).
+    #[serde(default)]
+    pub acp_server: AcpServerConfig,
 }
 
 /// Node-control scaffold settings under `[gateway.node_control]`.
@@ -1798,6 +1802,34 @@ pub struct NodeControlConfig {
     /// Empty means "no explicit allowlist" (accept all IDs).
     #[serde(default)]
     pub allowed_node_ids: Vec<String>,
+}
+
+/// ACP-over-HTTP server settings under `[gateway.acp_server]`.
+///
+/// When enabled, zeroclaw exposes a `/acp` endpoint that speaks JSON-RPC 2.0
+/// over HTTP+SSE, allowing other agents to delegate tasks via the ACP protocol.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AcpServerConfig {
+    /// Enable the ACP server endpoint (`POST /acp`, `DELETE /acp`).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Maximum session lifetime in seconds before automatic cleanup.
+    #[serde(default = "default_acp_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+}
+
+impl Default for AcpServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            session_ttl_secs: default_acp_session_ttl_secs(),
+        }
+    }
+}
+
+fn default_acp_session_ttl_secs() -> u64 {
+    7200 // 2 hours
 }
 
 fn default_gateway_port() -> u16 {
@@ -1847,6 +1879,7 @@ impl Default for GatewayConfig {
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             node_control: NodeControlConfig::default(),
+            acp_server: AcpServerConfig::default(),
         }
     }
 }
@@ -11745,6 +11778,7 @@ channel_id = "C123"
                 auth_token: Some("node-token".into()),
                 allowed_node_ids: vec!["node-1".into(), "node-2".into()],
             },
+            acp_server: AcpServerConfig::default(),
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();

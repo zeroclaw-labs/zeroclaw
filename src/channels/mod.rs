@@ -16,6 +16,7 @@
 
 pub(crate) mod ack_reaction;
 pub mod acp;
+pub(crate) mod injection;
 pub mod bluebubbles;
 pub mod clawdtalk;
 pub mod cli;
@@ -99,6 +100,7 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use arc_swap::ArcSwap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
@@ -262,6 +264,9 @@ struct ChannelRuntimeDefaults {
     recovery: crate::config::RecoveryConfig,
     strip_prior_reasoning: bool,
     context_window_tokens: usize,
+    loop_detection_no_progress_threshold: usize,
+    loop_detection_ping_pong_cycles: usize,
+    loop_detection_failure_streak: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +306,20 @@ const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "zeroclaw.service"
 const OPENRC_STATUS_ARGS: [&str; 2] = ["zeroclaw", "status"];
 const OPENRC_RESTART_ARGS: [&str; 2] = ["zeroclaw", "restart"];
 
+/// Configuration snapshot captured at startup for rebuilding the system prompt
+/// on `/new` without restarting the daemon.
+#[derive(Clone)]
+struct SystemPromptRebuildConfig {
+    /// Owned tool descriptions: `(name, description)`.
+    tool_descs: Vec<(String, String)>,
+    skills: Vec<crate::skills::Skill>,
+    identity_config: crate::config::IdentityConfig,
+    bootstrap_max_chars: Option<usize>,
+    native_tools: bool,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    autonomy: crate::config::AutonomyConfig,
+}
+
 #[derive(Clone)]
 struct ChannelRuntimeContext {
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
@@ -309,7 +328,9 @@ struct ChannelRuntimeContext {
     memory: Arc<dyn Memory>,
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
     observer: Arc<dyn Observer>,
-    system_prompt: Arc<String>,
+    system_prompt: Arc<ArcSwap<String>>,
+    /// Frozen config snapshot used to rebuild the system prompt on `/new`.
+    prompt_rebuild_config: Arc<SystemPromptRebuildConfig>,
     model: Arc<String>,
     temperature: f64,
     auto_save_memory: bool,
@@ -337,6 +358,9 @@ struct ChannelRuntimeContext {
     safety_heartbeat: Option<SafetyHeartbeatConfig>,
     startup_perplexity_filter: crate::config::PerplexityFilterConfig,
     proactive_messaging: Arc<crate::config::ProactiveMessagingConfig>,
+    /// Per-conversation injection queues for mid-turn message injection.
+    /// Populated when a loop starts for a sender, removed on exit.
+    injection_queues: injection::InjectionQueueMap,
 }
 
 #[derive(Clone)]
@@ -1106,6 +1130,9 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         recovery: config.recovery.clone(),
         strip_prior_reasoning: config.strip_prior_reasoning,
         context_window_tokens: config.context_window_tokens,
+        loop_detection_no_progress_threshold: config.agent.loop_detection_no_progress_threshold,
+        loop_detection_ping_pong_cycles: config.agent.loop_detection_ping_pong_cycles,
+        loop_detection_failure_streak: config.agent.loop_detection_failure_streak,
     }
 }
 
@@ -1163,6 +1190,9 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         recovery: crate::config::RecoveryConfig::default(),
         strip_prior_reasoning: false,
         context_window_tokens: 128_000,
+        loop_detection_no_progress_threshold: crate::config::AgentConfig::default().loop_detection_no_progress_threshold,
+        loop_detection_ping_pong_cycles: crate::config::AgentConfig::default().loop_detection_ping_pong_cycles,
+        loop_detection_failure_streak: crate::config::AgentConfig::default().loop_detection_failure_streak,
     }
 }
 
@@ -1827,6 +1857,41 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
         .remove(sender_key);
 }
 
+/// Rebuild the system prompt from identity files and swap it in atomically.
+///
+/// Called on `/new` so that changes to TOOLS.md, AGENTS.md, and other bootstrap
+/// files are picked up without restarting the daemon.
+fn rebuild_system_prompt(ctx: &ChannelRuntimeContext) {
+    let cfg = &ctx.prompt_rebuild_config;
+    let tool_descs: Vec<(&str, &str)> = cfg
+        .tool_descs
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_str()))
+        .collect();
+    let mut prompt = build_system_prompt_with_mode(
+        ctx.workspace_dir.as_path(),
+        ctx.model.as_str(),
+        &tool_descs,
+        &cfg.skills,
+        Some(&cfg.identity_config),
+        cfg.bootstrap_max_chars,
+        cfg.native_tools,
+        cfg.skills_prompt_mode,
+    );
+    if !cfg.native_tools {
+        let excluded: Vec<String> = ctx
+            .non_cli_excluded_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let filtered_specs =
+            filtered_tool_specs_for_runtime(ctx.tools_registry.as_ref(), &excluded);
+        prompt.push_str(&build_tool_instructions_from_specs(&filtered_specs));
+    }
+    prompt.push_str(&build_shell_policy_instructions(&cfg.autonomy));
+    ctx.system_prompt.store(Arc::new(prompt));
+}
+
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
     let mut histories = ctx
         .conversation_histories
@@ -2376,6 +2441,7 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::NewSession => {
             clear_sender_history(ctx, &sender_key);
+            rebuild_system_prompt(ctx);
             "Conversation history cleared. Starting fresh.".to_string()
         }
         ChannelRuntimeCommand::RequestAllToolsOnce => {
@@ -3637,8 +3703,9 @@ or tune thresholds in config.",
     } else {
         snapshot_non_cli_excluded_tools(ctx.as_ref())
     };
+    let current_system_prompt = ctx.system_prompt.load();
     let mut system_prompt = build_channel_system_prompt(
-        ctx.system_prompt.as_str(),
+        current_system_prompt.as_str(),
         &msg.channel,
         &msg.reply_target,
         expose_internal_tool_details,
@@ -3651,6 +3718,22 @@ or tune thresholds in config.",
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let _ = trim_channel_prompt_history(&mut history);
+
+    // Register injection queue so concurrent messages for this sender can be
+    // injected mid-turn instead of waiting for the loop to finish.
+    let history_key = conversation_history_key(&msg);
+    let (injection_tx, injection_rx) =
+        tokio::sync::mpsc::unbounded_channel::<injection::InjectedMessage>();
+    {
+        let mut queues = ctx
+            .injection_queues
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        queues.insert(history_key.clone(), injection_tx);
+    }
+    let _injection_guard =
+        injection::InjectionGuard::new(Arc::clone(&ctx.injection_queues), history_key.clone());
+
     let use_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
@@ -3833,6 +3916,7 @@ or tune thresholds in config.",
         0
     };
     let mut recovery_attempt: u32 = 0;
+    let mut injection_rx_opt = Some(injection_rx);
 
     let llm_result = loop {
         let history_snapshot = if recovery_attempt == 0 {
@@ -3900,6 +3984,12 @@ or tune thresholds in config.",
                             max_history_messages: MAX_CHANNEL_HISTORY,
                             context_window_tokens: runtime_defaults.context_window_tokens,
                         }),
+                        Some(crate::agent::loop_::detection::LoopDetectionConfig {
+                            no_progress_threshold: runtime_defaults.loop_detection_no_progress_threshold,
+                            ping_pong_cycles: runtime_defaults.loop_detection_ping_pong_cycles,
+                            failure_streak_threshold: runtime_defaults.loop_detection_failure_streak,
+                        }),
+                        if recovery_attempt == 0 { injection_rx_opt.take() } else { None },
                     ),
                 ),
             ) => LlmExecutionResult::Completed(result),
@@ -4522,6 +4612,49 @@ async fn run_message_dispatch_loop(
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
+        // ── Mid-turn injection: route to active loop if one exists ──
+        // Skip injection when the channel uses cancel-and-restart interruption
+        // (e.g. Telegram with interrupt_on_new_message=true), since the intent
+        // there is to replace the running loop, not augment it.
+        {
+            let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
+            let uses_cancel_interrupt =
+                runtime_defaults.interrupt_on_new_message && msg.channel == "telegram";
+            if !uses_cancel_interrupt {
+                let history_key = conversation_history_key(&msg);
+                let maybe_tx = {
+                    let queues = ctx
+                        .injection_queues
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    queues.get(&history_key).cloned()
+                };
+                if let Some(tx) = maybe_tx {
+                    let injected = injection::InjectedMessage {
+                        content: msg.content.clone(),
+                        channel: msg.channel.clone(),
+                        sender: msg.sender.clone(),
+                    };
+                    if tx.send(injected).is_ok() {
+                        tracing::info!(
+                            channel = %msg.channel,
+                            sender = %msg.sender,
+                            "mid-turn injection: queued message for active loop"
+                        );
+                        // Acknowledge with 👀 reaction so user knows it was received
+                        if let Some(channel) = ctx.channels_by_name.get(&msg.channel) {
+                            let _ = channel
+                                .add_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
+                                .await;
+                        }
+                        continue; // skip spawning a new worker
+                    }
+                    // tx.send failed — receiver dropped (loop just ended).
+                    // Fall through to normal dispatch.
+                }
+            }
+        }
+
         let permit = match Arc::clone(&semaphore).acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => break,
@@ -5847,6 +5980,19 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
     system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
 
+    let prompt_rebuild_config = Arc::new(SystemPromptRebuildConfig {
+        tool_descs: tool_descs
+            .iter()
+            .map(|(n, d)| (n.to_string(), d.to_string()))
+            .collect(),
+        skills: skills.clone(),
+        identity_config: config.identity.clone(),
+        bootstrap_max_chars,
+        native_tools,
+        skills_prompt_mode: config.skills.prompt_injection_mode,
+        autonomy: config.autonomy.clone(),
+    });
+
     if !skills.is_empty() {
         println!(
             "  🧩 Skills:   {}",
@@ -5979,7 +6125,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         memory: Arc::clone(&mem),
         tools_registry: Arc::clone(&tools_registry),
         observer,
-        system_prompt: Arc::new(system_prompt),
+        system_prompt: Arc::new(ArcSwap::from_pointee(system_prompt)),
+        prompt_rebuild_config,
         model: Arc::new(model.clone()),
         temperature,
         auto_save_memory: config.memory.auto_save,
@@ -6022,6 +6169,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             None
         },
         proactive_messaging: Arc::new(config.proactive_messaging.clone()),
+        injection_queues: Arc::new(Mutex::new(HashMap::new())),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -6081,6 +6229,18 @@ mod tests {
             autonomy.auto_approve.push("mock_price".to_string());
         }
         Arc::new(ApprovalManager::from_config(&autonomy))
+    }
+
+    fn test_prompt_rebuild_config() -> Arc<SystemPromptRebuildConfig> {
+        Arc::new(SystemPromptRebuildConfig {
+            tool_descs: Vec::new(),
+            skills: Vec::new(),
+            identity_config: crate::config::IdentityConfig::default(),
+            bootstrap_max_chars: None,
+            native_tools: false,
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::default(),
+            autonomy: crate::config::AutonomyConfig::default(),
+        })
     }
 
     #[test]
@@ -6340,7 +6500,8 @@ mod tests {
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("system".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("system".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -6368,6 +6529,7 @@ mod tests {
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -6398,7 +6560,8 @@ mod tests {
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("system".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("system".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -6426,6 +6589,7 @@ mod tests {
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -6459,7 +6623,8 @@ mod tests {
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("system".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("system".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -6487,6 +6652,7 @@ mod tests {
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -7143,7 +7309,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool), Box::new(MockEchoTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7171,6 +7338,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7231,7 +7399,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7259,6 +7428,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7306,7 +7476,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7334,6 +7505,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7395,7 +7567,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7423,6 +7596,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7483,7 +7657,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7511,6 +7686,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7556,7 +7732,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7584,6 +7761,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7631,7 +7809,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7659,6 +7838,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7708,7 +7888,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7736,6 +7917,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7813,7 +7995,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7844,6 +8027,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
         assert_eq!(
             runtime_ctx
@@ -7955,7 +8139,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7983,6 +8168,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8045,7 +8231,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -8073,6 +8260,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8124,7 +8312,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -8152,6 +8341,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let runtime_ctx_for_first_turn = runtime_ctx.clone();
@@ -8286,7 +8476,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -8317,6 +8508,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
         assert_eq!(
             runtime_ctx
@@ -8402,7 +8594,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -8433,6 +8626,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8513,7 +8707,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -8544,6 +8739,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8609,7 +8805,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -8637,6 +8834,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8712,7 +8910,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -8740,6 +8939,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8813,7 +9013,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -8844,6 +9045,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8965,7 +9167,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -8996,6 +9199,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
         maybe_apply_runtime_config_update(runtime_ctx.as_ref())
             .await
@@ -9063,7 +9267,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -9094,6 +9299,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9214,7 +9420,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -9245,6 +9452,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9335,7 +9543,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -9366,6 +9575,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9436,7 +9646,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -9467,6 +9678,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9559,7 +9771,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -9587,6 +9800,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9680,7 +9894,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -9708,6 +9923,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9760,7 +9976,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -9788,6 +10005,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9851,6 +10069,9 @@ BTC is currently around $65,000 based on latest tool output."#
                         recovery: crate::config::RecoveryConfig::default(),
                         strip_prior_reasoning: false,
                         context_window_tokens: 128_000,
+                        loop_detection_no_progress_threshold: crate::config::AgentConfig::default().loop_detection_no_progress_threshold,
+                        loop_detection_ping_pong_cycles: crate::config::AgentConfig::default().loop_detection_ping_pong_cycles,
+                        loop_detection_failure_streak: crate::config::AgentConfig::default().loop_detection_failure_streak,
                     },
                     perplexity_filter: crate::config::PerplexityFilterConfig::default(),
                     outbound_leak_guard: crate::config::OutboundLeakGuardConfig::default(),
@@ -9866,7 +10087,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("startup-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -9899,6 +10121,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -10054,7 +10277,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("llama3.2".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -10087,6 +10311,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         maybe_apply_runtime_config_update(runtime_ctx.as_ref())
@@ -10217,7 +10442,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -10245,6 +10471,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -10286,7 +10513,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -10314,6 +10542,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -10467,7 +10696,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -10497,6 +10727,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -10558,7 +10789,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -10588,6 +10820,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -10661,7 +10894,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -10691,6 +10925,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -10746,7 +10981,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -10776,6 +11012,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -10816,7 +11053,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -10846,6 +11084,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -11448,7 +11687,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -11478,6 +11718,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -11545,7 +11786,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -11575,6 +11817,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -11641,7 +11884,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(RecallMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -11671,6 +11915,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -11741,7 +11986,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -11771,6 +12017,7 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -12570,7 +12817,8 @@ BTC is currently around $65,000 based on latest tool output."#;
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("You are a helpful assistant.".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -12600,6 +12848,7 @@ BTC is currently around $65,000 based on latest tool output."#;
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -12647,7 +12896,8 @@ BTC is currently around $65,000 based on latest tool output."#;
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("You are a helpful assistant.".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -12677,6 +12927,7 @@ BTC is currently around $65,000 based on latest tool output."#;
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(

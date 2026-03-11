@@ -27,7 +27,7 @@ pub(crate) struct LoopDetectionConfig {
     /// `0` = disabled.  Default: `2`.
     pub ping_pong_cycles: usize,
     /// Consecutive failures of the *same* tool before triggering.
-    /// `0` = disabled.  Default: `3`.
+    /// `0` = disabled.  Default: `5`.
     pub failure_streak_threshold: usize,
 }
 
@@ -36,7 +36,7 @@ impl Default for LoopDetectionConfig {
         Self {
             no_progress_threshold: 3,
             ping_pong_cycles: 2,
-            failure_streak_threshold: 3,
+            failure_streak_threshold: 5,
         }
     }
 }
@@ -344,12 +344,12 @@ mod tests {
     #[test]
     fn failure_streak_triggers_warning() {
         let mut det = LoopDetector::new(default_config());
-        det.record_call("shell", r#"{"cmd":"bad1"}"#, "error: not found 1", false);
-        det.record_call("shell", r#"{"cmd":"bad2"}"#, "error: not found 2", false);
-        det.record_call("shell", r#"{"cmd":"bad3"}"#, "error: not found 3", false);
+        for i in 0..5 {
+            det.record_call("shell", &format!(r#"{{"cmd":"bad{i}"}}"#), &format!("error: not found {i}"), false);
+        }
         match det.check() {
             DetectionVerdict::InjectWarning(msg) => {
-                assert!(msg.contains("failed 3 consecutive"), "msg: {msg}");
+                assert!(msg.contains("failed 5 consecutive"), "msg: {msg}");
             }
             other => panic!("expected InjectWarning, got {other:?}"),
         }
@@ -359,11 +359,15 @@ mod tests {
     #[test]
     fn failure_streak_resets_on_success() {
         let mut det = LoopDetector::new(default_config());
-        det.record_call("shell", r#"{"cmd":"bad"}"#, "err", false);
-        det.record_call("shell", r#"{"cmd":"bad"}"#, "err", false);
+        det.record_call("shell", r#"{"cmd":"bad1"}"#, "err1", false);
+        det.record_call("shell", r#"{"cmd":"bad2"}"#, "err2", false);
+        det.record_call("shell", r#"{"cmd":"bad3"}"#, "err3", false);
+        det.record_call("shell", r#"{"cmd":"bad4"}"#, "err4", false);
         det.record_call("shell", r#"{"cmd":"good"}"#, "ok", true); // resets
-        det.record_call("shell", r#"{"cmd":"bad"}"#, "err", false);
-        det.record_call("shell", r#"{"cmd":"bad"}"#, "err", false);
+        det.record_call("shell", r#"{"cmd":"bad5"}"#, "err5", false);
+        det.record_call("shell", r#"{"cmd":"bad6"}"#, "err6", false);
+        det.record_call("shell", r#"{"cmd":"bad7"}"#, "err7", false);
+        det.record_call("shell", r#"{"cmd":"bad8"}"#, "err8", false);
         assert_eq!(det.check(), DetectionVerdict::Continue);
     }
 

@@ -925,6 +925,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         &[],
+        None,
     )
     .await
 }
@@ -974,6 +975,7 @@ pub(crate) async fn run_tool_call_loop_with_reply_target(
                     on_delta,
                     hooks,
                     excluded_tools,
+                    None,
                 ),
             ),
         )
@@ -1004,45 +1006,53 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
     safety_heartbeat: Option<SafetyHeartbeatConfig>,
     strip_prior_reasoning_flag: bool,
     compaction_context: Option<ToolLoopCompactionContext>,
+    loop_detection_config: Option<LoopDetectionConfig>,
+    injection_rx: Option<crate::channels::injection::InjectionReceiver>,
 ) -> Result<String> {
     let reply_target = non_cli_approval_context
         .as_ref()
         .map(|ctx| ctx.reply_target.clone());
+
+    let ld_config = loop_detection_config.unwrap_or_default();
 
     TOOL_LOOP_PROGRESS_MODE
         .scope(
             progress_mode,
             SAFETY_HEARTBEAT_CONFIG.scope(
                 safety_heartbeat,
-                TOOL_LOOP_STRIP_PRIOR_REASONING.scope(
-                    strip_prior_reasoning_flag,
-                    TOOL_LOOP_COMPACTION_CONTEXT.scope(
-                        compaction_context,
-                        TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT.scope(
-                            non_cli_approval_context,
-                            TOOL_LOOP_REPLY_TARGET.scope(
-                                reply_target,
-                                run_tool_call_loop(
-                            provider,
-                            history,
-                            tools_registry,
-                            observer,
-                            provider_name,
-                            model,
-                            temperature,
-                            silent,
-                            approval,
-                            channel_name,
-                            multimodal_config,
-                            max_tool_iterations,
-                            cancellation_token,
-                            on_delta,
-                            hooks,
-                            excluded_tools,
+                LOOP_DETECTION_CONFIG.scope(
+                    ld_config,
+                    TOOL_LOOP_STRIP_PRIOR_REASONING.scope(
+                        strip_prior_reasoning_flag,
+                        TOOL_LOOP_COMPACTION_CONTEXT.scope(
+                            compaction_context,
+                            TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT.scope(
+                                non_cli_approval_context,
+                                TOOL_LOOP_REPLY_TARGET.scope(
+                                    reply_target,
+                                    run_tool_call_loop(
+                                provider,
+                                history,
+                                tools_registry,
+                                observer,
+                                provider_name,
+                                model,
+                                temperature,
+                                silent,
+                                approval,
+                                channel_name,
+                                multimodal_config,
+                                max_tool_iterations,
+                                cancellation_token,
+                                on_delta,
+                                hooks,
+                                excluded_tools,
+                                injection_rx,
+                            ),
                         ),
                     ),
-                ),
-                ),
+                    ),
+                    ),
                 ),
             ),
         )
@@ -1081,6 +1091,7 @@ pub async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    mut injection_rx: Option<crate::channels::injection::InjectionReceiver>,
 ) -> Result<String> {
     let non_cli_approval_context = TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT
         .try_with(Clone::clone)
@@ -1114,7 +1125,10 @@ pub async fn run_tool_call_loop(
     let mut missing_tool_call_retry_prompt: Option<String> = None;
     let ld_config = LOOP_DETECTION_CONFIG
         .try_with(Clone::clone)
-        .unwrap_or_default();
+        .unwrap_or_else(|_| {
+            tracing::warn!("LOOP_DETECTION_CONFIG task-local not set — using defaults; caller should set via scope()");
+            LoopDetectionConfig::default()
+        });
     let mut loop_detector = LoopDetector::new(ld_config);
     let mut loop_detection_prompt: Option<String> = None;
     let heartbeat_config = SAFETY_HEARTBEAT_CONFIG
@@ -1979,6 +1993,17 @@ pub async fn run_tool_call_loop(
                     let _ = tx.send(chunk).await;
                 }
             }
+            // Drain any messages that arrived while the LLM was thinking.
+            // They won't affect this response, but they'll be in history
+            // for the next turn.
+            if let Some(rx) = injection_rx.as_mut() {
+                while let Ok(msg) = rx.try_recv() {
+                    history.push(ChatMessage::user(format!(
+                        "[Mid-turn message from user]\n{}",
+                        msg.content
+                    )));
+                }
+            }
             history.push(ChatMessage::assistant(response_text.clone()));
             return Ok(display_text);
         }
@@ -2381,6 +2406,40 @@ pub async fn run_tool_call_loop(
                     "content": result,
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
+            }
+        }
+
+        // ── Mid-turn injection: drain any queued messages from concurrent senders ──
+        if let Some(rx) = injection_rx.as_mut() {
+            let mut injected_count = 0u32;
+            while let Ok(msg) = rx.try_recv() {
+                let content = format!(
+                    "[Mid-turn message from user]\n{}",
+                    msg.content
+                );
+                history.push(ChatMessage::user(content));
+                injected_count += 1;
+            }
+            if injected_count > 0 {
+                tracing::info!(
+                    iteration,
+                    injected_count,
+                    "mid-turn injection: {} message(s) appended to history",
+                    injected_count
+                );
+                runtime_trace::record_event(
+                    "mid_turn_injection",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(active_model.as_str()),
+                    Some(&turn_id),
+                    Some(true),
+                    Some("injected concurrent user message mid-tool-loop"),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "injected_count": injected_count,
+                    }),
+                );
             }
         }
 
@@ -2949,6 +3008,7 @@ pub async fn run(
                                 None,
                                 effective_hooks,
                                 &[],
+                                None,
                             ),
                         ),
                     ),
@@ -3145,6 +3205,7 @@ pub async fn run(
                                     None,
                                     effective_hooks,
                                     &[],
+                                    None,
                                 ),
                             ),
                         ),
@@ -3467,6 +3528,227 @@ pub async fn process_message_with_session(
         ),
     )
     .await
+}
+
+/// Run the agent loop with optional pre-existing conversation history.
+///
+/// If `existing_history` is non-empty, the user message is appended to it
+/// (follow-up turn). Otherwise a fresh system prompt + enriched user message
+/// is constructed (first turn).
+///
+/// Returns `(response_text, updated_history)` so the caller can persist the
+/// history for subsequent turns (used by the ACP server endpoint).
+pub async fn process_message_with_history(
+    config: Config,
+    message: &str,
+    existing_history: Vec<ChatMessage>,
+) -> Result<(String, Vec<ChatMessage>)> {
+    if let Err(error) = crate::plugins::runtime::initialize_from_config(&config.plugins) {
+        tracing::warn!("plugin registry initialization skipped: {error}");
+    }
+    let base_observer: Arc<dyn Observer> =
+        Arc::from(observability::create_observer(&config.observability));
+    let observer: Arc<dyn Observer> = Arc::new(
+        crate::plugins::bridge::observer::ObserverBridge::new(base_observer),
+    );
+    let runtime: Arc<dyn runtime::RuntimeAdapter> =
+        Arc::from(runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+        &config.memory,
+        Some(&config.storage.provider.config),
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+    )?);
+
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+    let mut tools_registry = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        mem.clone(),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+    );
+    let peripheral_tools: Vec<Box<dyn Tool>> =
+        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
+    tools_registry.extend(peripheral_tools);
+
+    let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+    let model_name = crate::config::resolve_default_model_id(
+        config.default_model.as_deref(),
+        Some(provider_name),
+    );
+    let provider_runtime_options = providers::ProviderRuntimeOptions {
+        auth_profile_override: None,
+        provider_api_url: config.api_url.clone(),
+        provider_transport: config.effective_provider_transport(),
+        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        secrets_encrypt: config.secrets.encrypt,
+        reasoning_enabled: config.runtime.reasoning_enabled,
+        reasoning_level: config.effective_provider_reasoning_level(),
+        custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
+        max_tokens_override: None,
+        model_support_vision: config.model_support_vision,
+    };
+    let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
+        provider_name,
+        config.api_key.as_deref(),
+        config.api_url.as_deref(),
+        &config.reliability,
+        &config.model_routes,
+        &model_name,
+        &provider_runtime_options,
+    )?;
+
+    let mut history = if existing_history.is_empty() {
+        // First turn: build system prompt + enriched user message
+        let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+        let mut tool_descs: Vec<(&str, &str)> = vec![
+            ("shell", "Execute terminal commands."),
+            ("file_read", "Read file contents."),
+            ("file_write", "Write file contents."),
+            ("memory_store", "Save to memory."),
+            ("memory_observe", "Store observation memory."),
+            ("memory_recall", "Search memory."),
+            ("memory_forget", "Delete a memory entry."),
+            (
+                "model_routing_config",
+                "Configure default model, scenario routing, and delegate agents.",
+            ),
+            (
+                "web_search_config",
+                "Configure web search providers/keys/fallbacks.",
+            ),
+            (
+                "web_access_config",
+                "Configure shared URL access policy for network tools.",
+            ),
+            ("screenshot", "Capture a screenshot."),
+            ("image_info", "Read image metadata."),
+        ];
+        if config.browser.enabled {
+            tool_descs.push(("browser_open", "Open approved URLs in browser."));
+            tool_descs.push(("browser", "Automate browser interactions."));
+        }
+        if config.composio.enabled {
+            tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
+        }
+        let bootstrap_max_chars = if config.agent.compact_context {
+            Some(6000)
+        } else {
+            None
+        };
+        let native_tools = provider.supports_native_tools();
+        let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+            &config.workspace_dir,
+            &model_name,
+            &tool_descs,
+            &skills,
+            Some(&config.identity),
+            bootstrap_max_chars,
+            native_tools,
+            config.skills.prompt_injection_mode,
+        );
+        if !native_tools {
+            system_prompt.push_str(&build_tool_instructions(&tools_registry));
+        }
+        system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
+
+        let mem_context = context::build_context(
+            mem.as_ref(),
+            message,
+            config.memory.min_relevance_score,
+            None,
+        )
+        .await;
+        let hardware_rag: Option<crate::rag::HardwareRag> = config
+            .peripherals
+            .datasheet_dir
+            .as_ref()
+            .filter(|d| !d.trim().is_empty())
+            .map(|dir| crate::rag::HardwareRag::load(&config.workspace_dir, dir.trim()))
+            .and_then(Result::ok)
+            .filter(|r: &crate::rag::HardwareRag| !r.is_empty());
+        let board_names: Vec<String> = config
+            .peripherals
+            .boards
+            .iter()
+            .map(|b| b.board.clone())
+            .collect();
+        let rag_limit = if config.agent.compact_context { 2 } else { 5 };
+        let hw_context = hardware_rag
+            .as_ref()
+            .map(|r| context::build_hardware_context(r, message, &board_names, rag_limit))
+            .unwrap_or_default();
+        let context_str = format!("{mem_context}{hw_context}");
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let enriched = if context_str.is_empty() {
+            format!("[{now}] {message}")
+        } else {
+            format!("{context_str}[{now}] {message}")
+        };
+
+        vec![
+            ChatMessage::system(&system_prompt),
+            ChatMessage::user(&enriched),
+        ]
+    } else {
+        // Follow-up turn: append timestamped user message
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let mut h = existing_history;
+        h.push(ChatMessage::user(&format!("[{now}] {message}")));
+        h
+    };
+
+    let cost_enforcement_context =
+        create_cost_enforcement_context(&config.cost, &config.workspace_dir);
+    let hb_cfg = if config.agent.safety_heartbeat_interval > 0 {
+        Some(SafetyHeartbeatConfig {
+            body: security.summary_for_heartbeat(),
+            interval: config.agent.safety_heartbeat_interval,
+        })
+    } else {
+        None
+    };
+    let result = scope_cost_enforcement_context(
+        cost_enforcement_context,
+        SAFETY_HEARTBEAT_CONFIG.scope(
+            hb_cfg,
+            agent_turn(
+                provider.as_ref(),
+                &mut history,
+                &tools_registry,
+                observer.as_ref(),
+                provider_name,
+                &model_name,
+                config.default_temperature,
+                true,
+                &config.multimodal,
+                config.agent.max_tool_iterations,
+            ),
+        ),
+    )
+    .await?;
+
+    Ok((result, history))
 }
 
 #[cfg(test)]
@@ -3936,6 +4218,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3971,6 +4254,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("anthropic route should not fail on a false-negative vision capability probe");
@@ -4015,6 +4299,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -4055,6 +4340,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -4181,6 +4467,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -4252,6 +4539,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("tool loop should complete with denied tool execution");
@@ -4308,6 +4596,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("tool loop should consume non-cli session grants");
@@ -4393,6 +4682,8 @@ mod tests {
             None,
             false,
             None,
+            None,
+            None,
         )
         .await
         .expect("tool loop should continue after non-cli approval");
@@ -4451,6 +4742,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("tool loop should consume one-time allow-all token");
@@ -4506,6 +4798,7 @@ mod tests {
             None,
             None,
             &excluded_tools,
+            None,
         )
         .await
         .expect("tool loop should complete with blocked tool execution");
@@ -4570,6 +4863,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4626,6 +4920,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -4685,6 +4980,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("loop should recover after one deferred-action reply");
@@ -4733,6 +5029,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect_err("second deferred response without tool call should hard-fail");
@@ -4818,6 +5115,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("truncated native arguments should trigger safe retry");
@@ -4916,6 +5214,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("invalid native args should force retry without text fallback execution");
@@ -4996,6 +5295,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("valid native tool calls must execute even when stop_reason is max_tokens");
@@ -5061,6 +5361,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("max-token continuation should complete");
@@ -5137,6 +5438,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("continuation should degrade to partial output");
@@ -5196,6 +5498,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("continuation should clamp oversized merge");
@@ -5255,6 +5558,7 @@ mod tests {
             None,
             Some(&hooks),
             &[],
+            None,
         )
         .await
         .expect("loop should complete");
@@ -7077,5 +7381,321 @@ Let me check the result."#;
         let completed = tracker.render_delta();
         assert!(completed.contains("✅ shell (2s)"));
         assert!(completed.contains("❌ web_search (1s)"));
+    }
+
+    // ── Mid-turn injection tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn mid_turn_injection_appears_in_history_after_tool_execution() {
+        // Provider: first response has a tool call, second is the final text.
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delay_a","arguments":{"value":"ping"}}
+</tool_call>"#,
+            "done with injection",
+        ]);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "delay_a",
+            50,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+
+        let approval_cfg = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("do something"),
+        ];
+        let observer = NoopObserver;
+
+        // Pre-populate the injection receiver with a message
+        let (tx, rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::channels::injection::InjectedMessage>();
+        tx.send(crate::channels::injection::InjectedMessage {
+            content: "hey, also check the logs".to_string(),
+            channel: "signal".to_string(),
+            sender: "dan".to_string(),
+        })
+        .unwrap();
+        // Drop sender so try_recv eventually returns Disconnected after draining
+        drop(tx);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(&approval_mgr),
+            "signal",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            Some(rx),
+        )
+        .await
+        .expect("tool loop with injection should complete");
+
+        assert_eq!(result, "done with injection");
+
+        // Verify the injected message appears in history between tool results and final response
+        let injected = history
+            .iter()
+            .find(|msg| {
+                msg.role == "user" && msg.content.contains("hey, also check the logs")
+            })
+            .expect("injected message should be present in history");
+        assert!(
+            injected.content.contains("[Mid-turn message from user]"),
+            "injected message should have the mid-turn prefix"
+        );
+
+        // Verify ordering: tool results before injection before final assistant response
+        let tool_result_idx = history
+            .iter()
+            .position(|msg| msg.role == "user" && msg.content.contains("[Tool results]"))
+            .expect("tool results should be present");
+        let injection_idx = history
+            .iter()
+            .position(|msg| msg.content.contains("hey, also check the logs"))
+            .expect("injection should be present");
+        let assistant_idx = history
+            .iter()
+            .rposition(|msg| msg.role == "assistant")
+            .expect("final assistant response should be present");
+        assert!(
+            tool_result_idx < injection_idx,
+            "tool results should come before injection"
+        );
+        assert!(
+            injection_idx < assistant_idx,
+            "injection should come before final assistant response"
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_turn_injection_drains_multiple_messages() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delay_a","arguments":{"value":"ping"}}
+</tool_call>"#,
+            "all done",
+        ]);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "delay_a",
+            50,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+
+        let approval_cfg = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("start task"),
+        ];
+        let observer = NoopObserver;
+
+        let (tx, rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::channels::injection::InjectedMessage>();
+        tx.send(crate::channels::injection::InjectedMessage {
+            content: "first update".to_string(),
+            channel: "signal".to_string(),
+            sender: "dan".to_string(),
+        })
+        .unwrap();
+        tx.send(crate::channels::injection::InjectedMessage {
+            content: "second update".to_string(),
+            channel: "signal".to_string(),
+            sender: "dan".to_string(),
+        })
+        .unwrap();
+        drop(tx);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(&approval_mgr),
+            "signal",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            Some(rx),
+        )
+        .await
+        .expect("tool loop with multiple injections should complete");
+
+        assert_eq!(result, "all done");
+
+        // Both messages should appear in history
+        let first = history
+            .iter()
+            .any(|msg| msg.content.contains("first update"));
+        let second = history
+            .iter()
+            .any(|msg| msg.content.contains("second update"));
+        assert!(first, "first injected message should be in history");
+        assert!(second, "second injected message should be in history");
+
+        // They should be in order
+        let first_idx = history
+            .iter()
+            .position(|msg| msg.content.contains("first update"))
+            .unwrap();
+        let second_idx = history
+            .iter()
+            .position(|msg| msg.content.contains("second update"))
+            .unwrap();
+        assert!(
+            first_idx < second_idx,
+            "injected messages should preserve arrival order"
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_turn_injection_at_final_response_preserves_in_history() {
+        // Provider returns a text-only response immediately (no tool calls).
+        // The injection should still end up in history via the exit-path drain.
+        let provider = ScriptedProvider::from_text_responses(vec!["immediate response"]);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("quick question"),
+        ];
+        let observer = NoopObserver;
+
+        let (tx, rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::channels::injection::InjectedMessage>();
+        tx.send(crate::channels::injection::InjectedMessage {
+            content: "actually nevermind".to_string(),
+            channel: "signal".to_string(),
+            sender: "dan".to_string(),
+        })
+        .unwrap();
+        drop(tx);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &[],
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "signal",
+            &crate::config::MultimodalConfig::default(),
+            3,
+            None,
+            None,
+            None,
+            &[],
+            Some(rx),
+        )
+        .await
+        .expect("text-only response with injection should complete");
+
+        assert_eq!(result, "immediate response");
+
+        // The injected message should be in history (before the assistant response)
+        let injected = history
+            .iter()
+            .any(|msg| msg.content.contains("actually nevermind"));
+        assert!(
+            injected,
+            "injected message should be preserved in history even for text-only response"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_injection_when_receiver_is_none() {
+        // Verify that passing None for injection_rx works fine (no panics).
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delay_a","arguments":{"value":"ping"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "delay_a",
+            50,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+
+        let approval_cfg = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("no injection"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(&approval_mgr),
+            "signal",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await
+        .expect("tool loop without injection should work fine");
+
+        assert_eq!(result, "done");
+        // No injected messages in history
+        let injected = history
+            .iter()
+            .any(|msg| msg.content.contains("[Mid-turn message from user]"));
+        assert!(!injected, "no injection messages should be present");
     }
 }
