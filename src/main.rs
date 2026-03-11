@@ -731,24 +731,39 @@ async fn main() -> Result<()> {
 
         // Handle --reinit: backup and reset configuration
         if reinit {
-            use std::path::PathBuf;
-            let zeroclaw_dir = dirs::home_dir()
-                .map(|h| h.join(".zeroclaw"))
-                .unwrap_or_else(|| PathBuf::from(".zeroclaw"));
+            let (zeroclaw_dir, _) =
+                crate::config::schema::resolve_runtime_dirs_for_onboarding().await?;
 
             if zeroclaw_dir.exists() {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
                 let backup_dir = format!("{}.backup.{}", zeroclaw_dir.display(), timestamp);
 
                 println!("⚠️  Reinitializing ZeroClaw configuration...");
-                println!("   Backing up existing config to: {}", backup_dir);
+                println!("   Current config directory: {}", zeroclaw_dir.display());
+                println!(
+                    "   This will back up your existing config to: {}",
+                    backup_dir
+                );
+                println!();
+                print!("Continue? [y/N] ");
+                std::io::stdout()
+                    .flush()
+                    .context("Failed to flush stdout")?;
+
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if !answer.trim().eq_ignore_ascii_case("y") {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+                println!();
 
                 // Rename existing directory as backup
-                tokio::fs::rename(&zeroclaw_dir, &backup_dir).await
-                    .with_context(|| format!("Failed to backup existing config to {}", backup_dir))?;
+                tokio::fs::rename(&zeroclaw_dir, &backup_dir)
+                    .await
+                    .with_context(|| {
+                        format!("Failed to backup existing config to {}", backup_dir)
+                    })?;
 
                 println!("   Backup created successfully.");
                 println!("   Starting fresh initialization...\n");
