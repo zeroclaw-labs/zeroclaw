@@ -482,6 +482,25 @@ fn build_channel_system_prompt(
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
+    // Refresh the stale datetime in the cached system prompt
+    {
+        let now = chrono::Local::now();
+        let fresh = format!(
+            "## Current Date & Time\n\n{} ({})\n",
+            now.format("%Y-%m-%d %H:%M:%S"),
+            now.format("%Z"),
+        );
+        if let Some(start) = prompt.find("## Current Date & Time\n\n") {
+            // Find the end of this section (next "## " heading or end of string)
+            let rest = &prompt[start + 24..]; // skip past "## Current Date & Time\n\n"
+            let section_end = rest
+                .find("\n## ")
+                .map(|i| start + 24 + i)
+                .unwrap_or(prompt.len());
+            prompt.replace_range(start..section_end, fresh.trim_end());
+        }
+    }
+
     if let Some(instructions) = channel_delivery_instructions(channel_name) {
         if prompt.is_empty() {
             prompt = instructions.to_string();
