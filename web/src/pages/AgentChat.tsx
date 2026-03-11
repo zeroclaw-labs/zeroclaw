@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Send, Bot, User, AlertCircle } from 'lucide-react';
+import { Send, Bot, User, AlertCircle, Copy, Check } from 'lucide-react';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
 
@@ -8,6 +8,37 @@ interface ChatMessage {
   role: 'user' | 'agent';
   content: string;
   timestamp: Date;
+}
+
+// Copy button component for individual messages
+function MessageCopyButton({ content }: { content: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Fallback for non-secure contexts
+      console.warn('Clipboard write failed');
+    }
+  };
+
+  return (
+    <button
+      onClick={handleCopy}
+      className="opacity-0 group-hover:opacity-100 focus:opacity-100 p-1.5 rounded-md bg-gray-700/50 hover:bg-gray-600 text-gray-400 hover:text-white transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+      aria-label={copied ? 'Copied' : 'Copy message'}
+      title={copied ? 'Copied!' : 'Copy to clipboard'}
+    >
+      {copied ? (
+        <Check className="h-3.5 w-3.5 text-green-400" />
+      ) : (
+        <Copy className="h-3.5 w-3.5" />
+      )}
+    </button>
+  );
 }
 
 export default function AgentChat() {
@@ -172,7 +203,7 @@ export default function AgentChat() {
         {messages.map((msg) => (
           <div
             key={msg.id}
-            className={`flex items-start gap-3 ${
+            className={`group flex items-start gap-3 ${
               msg.role === 'user' ? 'flex-row-reverse' : ''
             }`}
           >
@@ -189,21 +220,27 @@ export default function AgentChat() {
                 <Bot className="h-4 w-4 text-white" />
               )}
             </div>
-            <div
-              className={`max-w-[75%] rounded-xl px-4 py-3 ${
-                msg.role === 'user'
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-gray-800 text-gray-100 border border-gray-700'
-              }`}
-            >
-              <p className="text-sm whitespace-pre-wrap break-words">{msg.content}</p>
-              <p
-                className={`text-xs mt-1 ${
-                  msg.role === 'user' ? 'text-blue-200' : 'text-gray-500'
+            <div className="flex flex-col gap-1 max-w-[75%]">
+              <div
+                className={`relative rounded-xl px-4 py-3 ${
+                  msg.role === 'user'
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-gray-800 text-gray-100 border border-gray-700'
                 }`}
               >
-                {msg.timestamp.toLocaleTimeString()}
-              </p>
+                <p className="text-sm whitespace-pre-wrap break-words">{msg.content}</p>
+                <p
+                  className={`text-xs mt-1 ${
+                    msg.role === 'user' ? 'text-blue-200' : 'text-gray-500'
+                  }`}
+                >
+                  {msg.timestamp.toLocaleTimeString()}
+                </p>
+              </div>
+              {/* Copy button - appears on hover/focus */}
+              <div className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                <MessageCopyButton content={msg.content} />
+              </div>
             </div>
           </div>
         ))}
