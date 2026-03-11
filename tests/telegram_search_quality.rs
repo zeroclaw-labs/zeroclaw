@@ -933,6 +933,9 @@ asyncio.run(main())
 /// Poll for a bot reply after `after_message_id`, waiting up to `timeout`.
 /// Returns the reply text, or None if timeout elapsed without a reply.
 ///
+/// Uses both message ID *and* timestamp to filter out stale replies from
+/// previous test sessions that arrive after the current test's sent message ID.
+///
 /// All dynamic values go through env vars to avoid Python string-quoting issues.
 async fn wait_for_bot_reply(
     bot_username: &str,
@@ -943,17 +946,29 @@ async fn wait_for_bot_reply(
     let session = zverozabr_session_path();
     let deadline = Instant::now() + timeout;
     let after_id_str = after_message_id.to_string();
+    // Replies must have arrived AFTER this test started (Unix timestamp).
+    // This prevents stale replies from previous sessions from being picked up.
+    let after_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        // Subtract a small buffer so replies that started processing just before
+        // send_to_bot returned are not accidentally filtered out.
+        .saturating_sub(5);
+    let after_ts_str = after_ts.to_string();
 
     while Instant::now() < deadline {
         let script = r#"
 import asyncio, json, os, sys
 from telethon import TelegramClient
+import datetime, calendar
 
-SESSION  = os.environ["ZC_SESSION"]
-API_ID   = os.environ["ZC_API_ID"]
-API_HASH = os.environ["ZC_API_HASH"]
-BOT      = os.environ["ZC_BOT"]
-AFTER_ID = int(os.environ["ZC_AFTER_ID"])
+SESSION   = os.environ["ZC_SESSION"]
+API_ID    = os.environ["ZC_API_ID"]
+API_HASH  = os.environ["ZC_API_HASH"]
+BOT       = os.environ["ZC_BOT"]
+AFTER_ID  = int(os.environ["ZC_AFTER_ID"])
+AFTER_TS  = int(os.environ["ZC_AFTER_TS"])
 
 async def main():
     client = TelegramClient(SESSION, API_ID, API_HASH)
@@ -965,7 +980,11 @@ async def main():
     results = []
     for m in msgs:
         if m.id > AFTER_ID and m.out is False:
-            results.append({"id": m.id, "text": m.text or ""})
+            # Also require the message timestamp to be >= AFTER_TS to avoid
+            # picking up stale replies from a previous test session.
+            msg_ts = int(m.date.timestamp()) if m.date else 0
+            if msg_ts >= AFTER_TS:
+                results.append({"id": m.id, "text": m.text or ""})
     print(json.dumps({"success": True, "messages": results}))
     await client.disconnect()
 
@@ -980,6 +999,7 @@ asyncio.run(main())
             .env("ZC_API_HASH", &api_hash)
             .env("ZC_BOT", bot_username)
             .env("ZC_AFTER_ID", &after_id_str)
+            .env("ZC_AFTER_TS", &after_ts_str)
             .output()
             .await
             .expect("failed to run wait_for_bot_reply script");
