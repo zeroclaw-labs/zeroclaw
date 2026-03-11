@@ -467,7 +467,7 @@ impl EmailChannel {
                 channel: "email".to_string(),
                 timestamp: email.timestamp,
                 thread_ts: None,
-            is_voice: None,
+                is_voice: None,
             };
 
             if tx.send(msg).await.is_err() {
