@@ -114,6 +114,8 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - Keep docs quality checks low-noise (incremental markdown + incremental added-link checks).
 - Keep dependency update volume controlled (grouping + PR limits).
 - Avoid mixing onboarding/community automation with merge-gating logic.
+- Test levels: `cargo test --test component`, `cargo test --test integration`, `cargo test --test system`.
+- Live tests (manual only): `cargo test --test live -- --ignored`.
 
 ## Automation Side-Effect Controls
 

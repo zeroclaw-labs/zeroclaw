@@ -1,303 +1,149 @@
-# 🧪 Test Execution Guide
+# Testing Guide
 
-## Quick Reference
+ZeroClaw uses a five-level testing taxonomy with filesystem-based organization.
 
-```bash
-# Full automated test suite (~2 min)
-./tests/telegram/test_telegram_integration.sh
+## Testing Taxonomy
 
-# Quick smoke test (~10 sec)
-./tests/telegram/quick_test.sh
+| Level | What it tests | External boundaries | Directory |
+|-------|--------------|-------------------|-----------|
+| **Unit** | Single function/struct | Everything mocked | `#[cfg(test)]` blocks in `src/**/*.rs` or separate `src/**/tests.rs` files |
+| **Component** | One subsystem within its own boundary | Subsystem real, everything else mocked | `tests/component/` |
+| **Integration** | Multiple internal components wired together | Real internals, external APIs mocked | `tests/integration/` |
+| **System** | Full request→response across ALL internal boundaries | Only external APIs mocked | `tests/system/` |
+| **Live** | Full stack with real external services | Nothing mocked, `#[ignore]` | `tests/live/` |
 
-# Just compile and unit test (~30 sec)
-cargo test telegram --lib
-```
+## Directory Structure
 
-## 📝 What Was Created For You
+| Directory | Level | Description | Run command |
+|-----------|-------|-------------|-------------|
+| `src/**/*.rs` | Unit | Co-located `#[cfg(test)]` blocks or separate `tests.rs` files alongside source | `cargo test --lib` |
+| `tests/component/` | Component | One subsystem, real impl, mocked boundaries | `cargo test --test component` |
+| `tests/integration/` | Integration | Multiple components wired together | `cargo test --test integration` |
+| `tests/system/` | System | Full channel→agent→channel flow | `cargo test --test system` |
+| `tests/live/` | Live | Real external services, `#[ignore]` | `cargo test --test live -- --ignored` |
+| `tests/manual/` | — | Human-driven test scripts (shell, Python) | Run directly |
+| `tests/support/` | — | Shared mock infrastructure (not a test binary) | — |
+| `tests/fixtures/` | — | Test data files (JSON traces, media) | — |
 
-### 1. **test_telegram_integration.sh** (Main Test Suite)
-   - **20+ automated tests** covering all fixes
-   - **6 test phases**: Code quality, build, config, health, features, manual
-   - **Colored output** with pass/fail indicators
-   - **Detailed summary** at the end
-
-   ```bash
-   ./tests/telegram/test_telegram_integration.sh
-   ```
-
-### 2. **quick_test.sh** (Fast Validation)
-   - **4 essential tests** for quick feedback
-   - **<10 second** execution time
-   - Perfect for **pre-commit** checks
-
-   ```bash
-   ./tests/telegram/quick_test.sh
-   ```
-
-### 3. **generate_test_messages.py** (Test Helper)
-   - Generates test messages of various lengths
-   - Tests message splitting functionality
-   - 8 different message types
-
-   ```bash
-   # Generate a long message (>4096 chars)
-   python3 tests/telegram/generate_test_messages.py long
-
-   # Show all message types
-   python3 tests/telegram/generate_test_messages.py all
-   ```
-
-### 4. **TESTING_TELEGRAM.md** (Complete Guide)
-   - Comprehensive testing documentation
-   - Troubleshooting guide
-   - Performance benchmarks
-   - CI/CD integration examples
-
-## 🚀 Step-by-Step: First Run
-
-### Step 1: Run Automated Tests
+## How to Run Tests
 
 ```bash
-cd /Users/abdzsam/zeroclaw
+# Run all tests (unit + component + integration + system)
+cargo test
 
-# Make scripts executable (already done)
-chmod +x tests/telegram/test_telegram_integration.sh tests/telegram/quick_test.sh
+# Run only unit tests
+cargo test --lib
 
-# Run the full test suite
-./tests/telegram/test_telegram_integration.sh
+# Run component tests
+cargo test --test component
+
+# Run integration tests
+cargo test --test integration
+
+# Run system tests
+cargo test --test system
+
+# Run live tests (requires API credentials)
+cargo test --test live -- --ignored
+
+# Filter within a level
+cargo test --test integration agent
+
+# Full CI validation
+./dev/ci.sh all
+
+# Level-specific CI commands
+./dev/ci.sh test-component
+./dev/ci.sh test-integration
+./dev/ci.sh test-system
 ```
 
-**Expected output:**
-```
-⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡
+## How to Add a New Test
 
-███████╗███████╗██████╗  ██████╗  ██████╗██╗      █████╗ ██╗    ██╗
-...
+1. **Testing one subsystem in isolation?** → `tests/component/`
+2. **Testing multiple components together?** → `tests/integration/`
+3. **Testing full message flow?** → `tests/system/`
+4. **Requires real API keys?** → `tests/live/` with `#[ignore]`
 
-🧪 TELEGRAM INTEGRATION TEST SUITE 🧪
+After creating a test file, add it to the appropriate `mod.rs` and use shared infrastructure from `tests/support/`.
 
-Phase 1: Code Quality Tests
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## Shared Infrastructure (`tests/support/`)
 
-Test 1: Compiling test suite
-✓ PASS: Test suite compiles successfully
+All test binaries include `mod support;` making shared mocks available via `crate::support::*`.
 
-Test 2: Running Telegram unit tests
-✓ PASS: All Telegram unit tests passed (24 tests)
-...
+| Module | Contents |
+|--------|----------|
+| `mock_provider.rs` | `MockProvider` (FIFO scripted), `RecordingProvider` (captures requests), `TraceLlmProvider` (JSON fixture replay) |
+| `mock_tools.rs` | `EchoTool`, `CountingTool`, `FailingTool`, `RecordingTool` |
+| `mock_channel.rs` | `TestChannel` (captures sends, records typing events) |
+| `helpers.rs` | `make_memory()`, `make_observer()`, `build_agent()`, `text_response()`, `tool_response()`, `StaticMemoryLoader` |
+| `trace.rs` | `LlmTrace`, `TraceTurn`, `TraceStep` types + `LlmTrace::from_file()` |
+| `assertions.rs` | `verify_expects()` for declarative trace assertion |
 
-Test Summary
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Total Tests:   20
-Passed:        20
-Failed:        0
-Warnings:      0
+### Usage
 
-Pass Rate:     100%
-
-✓ ALL AUTOMATED TESTS PASSED! 🎉
+```rust
+use crate::support::{MockProvider, EchoTool, CountingTool};
+use crate::support::helpers::{build_agent, text_response, tool_response};
 ```
 
-### Step 2: Configure Telegram (if not done)
+## JSON Trace Fixtures
 
-```bash
-# Interactive setup
-zeroclaw onboard --interactive
+Trace fixtures are canned LLM response scripts stored as JSON files in `tests/fixtures/traces/`. They replace inline mock setup with declarative conversation scripts.
 
-# Or channels-only setup
-zeroclaw onboard --channels-only
+### How it works
+
+1. `TraceLlmProvider` loads a fixture and implements the `Provider` trait
+2. Each `provider.chat()` call returns the next step from the fixture in FIFO order
+3. Real tools execute normally (e.g., `EchoTool` processes arguments)
+4. After all turns, `verify_expects()` checks declarative assertions
+5. If the agent calls the provider more times than there are steps, the test fails
+
+### Fixture format
+
+```json
+{
+  "model_name": "test-name",
+  "turns": [
+    {
+      "user_input": "User message",
+      "steps": [
+        {
+          "response": {
+            "type": "text",
+            "content": "LLM response",
+            "input_tokens": 20,
+            "output_tokens": 10
+          }
+        }
+      ]
+    }
+  ],
+  "expects": {
+    "response_contains": ["expected text"],
+    "tools_used": ["echo"],
+    "max_tool_calls": 1
+  }
+}
 ```
 
-When prompted:
-1. Select **Telegram** channel
-2. Enter your **bot token** from @BotFather
-3. Enter your **Telegram user ID** or username
+**Response types**: `"text"` (plain text) or `"tool_calls"` (LLM requests tool execution).
 
-### Step 3: Verify Health
+**Expects fields**: `response_contains`, `response_not_contains`, `tools_used`, `tools_not_used`, `max_tool_calls`, `all_tools_succeeded`, `response_matches` (regex).
 
-```bash
-zeroclaw channel doctor
-```
+## Live Test Conventions
 
-**Expected output:**
-```
-🩺 ZeroClaw Channel Doctor
+- All live tests must be `#[ignore]`
+- Use `env::var("ZEROCLAW_TEST_*")` for credentials
+- Run with `cargo test --test live -- --ignored --nocapture`
 
-  ✅ Telegram  healthy
+## Manual Tests (`tests/manual/`)
 
-Summary: 1 healthy, 0 unhealthy, 0 timed out
-```
+Scripts for human-driven testing that can't be automated via `cargo test`:
 
-### Step 4: Manual Testing
+| Directory/File | What it does |
+|---|---|
+| `manual/telegram/` | Telegram integration test suite, smoke tests, message generator |
+| `manual/test_dockerignore.sh` | Validates `.dockerignore` excludes sensitive paths |
 
-#### Test 1: Basic Message
-
-```bash
-# Terminal 1: Start the channel
-zeroclaw channel start
-```
-
-**In Telegram:**
-- Find your bot
-- Send: `Hello bot!`
-- **Verify**: Bot responds within 3 seconds
-
-#### Test 2: Long Message (Split Test)
-
-```bash
-# Generate a long message
-python3 tests/telegram/generate_test_messages.py long
-```
-
-- **Copy the output**
-- **Paste into Telegram** to your bot
-- **Verify**:
-  - Message is split into 2+ chunks
-  - First chunk ends with `(continues...)`
-  - Middle chunks have `(continued)` and `(continues...)`
-  - Last chunk starts with `(continued)`
-  - All chunks arrive in order
-
-#### Test 3: Word Boundary Splitting
-
-```bash
-python3 tests/telegram/generate_test_messages.py word
-```
-
-- Send to bot
-- **Verify**: Splits at word boundaries (not mid-word)
-
-## 🎯 Test Results Checklist
-
-After running all tests, verify:
-
-### Automated Tests
-- [ ] ✅ All 20 automated tests passed
-- [ ] ✅ Build completed successfully
-- [ ] ✅ Binary size <10MB
-- [ ] ✅ Health check completes in <5s
-- [ ] ✅ No clippy warnings
-
-### Manual Tests
-- [ ] ✅ Bot responds to basic messages
-- [ ] ✅ Long messages split correctly
-- [ ] ✅ Continuation markers appear
-- [ ] ✅ Word boundaries respected
-- [ ] ✅ Allowlist blocks unauthorized users
-- [ ] ✅ No errors in logs
-
-### Performance
-- [ ] ✅ Response time <3 seconds
-- [ ] ✅ Memory usage <10MB
-- [ ] ✅ No message loss
-- [ ] ✅ Rate limiting works (100ms delays)
-
-## 🐛 Troubleshooting
-
-### Issue: Tests fail to compile
-
-```bash
-# Clean build
-cargo clean
-cargo build --release
-
-# Update dependencies
-cargo update
-```
-
-### Issue: "Bot token not configured"
-
-```bash
-# Check config
-cat ~/.zeroclaw/config.toml | grep -A 5 telegram
-
-# Reconfigure
-zeroclaw onboard --channels-only
-```
-
-### Issue: Health check fails
-
-```bash
-# Test bot token directly
-curl "https://api.telegram.org/bot<YOUR_TOKEN>/getMe"
-
-# Should return: {"ok":true,"result":{...}}
-```
-
-### Issue: Bot doesn't respond
-
-```bash
-# Enable debug logging
-RUST_LOG=debug zeroclaw channel start
-
-# Look for:
-# - "Telegram channel listening for messages..."
-# - "ignoring message from unauthorized user" (if allowlist issue)
-# - Any error messages
-```
-
-## 📊 Performance Benchmarks
-
-After all fixes, you should see:
-
-| Metric | Target | Command |
-|--------|--------|---------|
-| Unit test pass | 24/24 | `cargo test telegram --lib` |
-| Build time | <30s | `time cargo build --release` |
-| Binary size | ~3-4MB | `ls -lh target/release/zeroclaw` |
-| Health check | <5s | `time zeroclaw channel doctor` |
-| First response | <3s | Manual test in Telegram |
-| Message split | <50ms | Check debug logs |
-| Memory usage | <10MB | `ps aux \| grep zeroclaw` |
-
-## 🔄 CI/CD Integration
-
-Add to your workflow:
-
-```bash
-# Pre-commit hook
-#!/bin/bash
-./tests/telegram/quick_test.sh
-
-# CI pipeline
-./tests/telegram/test_telegram_integration.sh
-```
-
-## 📚 Next Steps
-
-1. **Run the tests:**
-   ```bash
-   ./tests/telegram/test_telegram_integration.sh
-   ```
-
-2. **Fix any failures** using the troubleshooting guide
-
-3. **Complete manual tests** using the checklist
-
-4. **Deploy to production** when all tests pass
-
-5. **Monitor logs** for any issues:
-   ```bash
-   zeroclaw daemon
-   # or
-   RUST_LOG=info zeroclaw channel start
-   ```
-
-## 🎉 Success!
-
-If all tests pass:
-- ✅ Message splitting works (4096 char limit)
-- ✅ Health check has 5s timeout
-- ✅ Empty chat_id is handled safely
-- ✅ All 24 unit tests pass
-- ✅ Code is production-ready
-
-**Your Telegram integration is ready to go!** 🚀
-
----
-
-## 📞 Support
-
-- Issues: https://github.com/zeroclaw-labs/zeroclaw/issues
-- Docs: [testing-telegram.md](../../tests/telegram/testing-telegram.md)
-- Help: `zeroclaw --help`
+For Telegram-specific testing details, see [testing-telegram.md](./testing-telegram.md).
