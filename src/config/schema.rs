@@ -4082,6 +4082,21 @@ fn decrypt_secret(
     Ok(())
 }
 
+fn decrypt_secret_vec(
+    store: &crate::security::SecretStore,
+    values: &mut Vec<String>,
+    field_name: &str,
+) -> Result<()> {
+    for (index, value) in values.iter_mut().enumerate() {
+        if crate::security::SecretStore::is_encrypted(value) {
+            *value = store
+                .decrypt(value)
+                .with_context(|| format!("Failed to decrypt {field_name}[{index}]"))?;
+        }
+    }
+    Ok(())
+}
+
 fn encrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
@@ -4283,6 +4298,11 @@ impl Config {
                     "config.channels_config.nostr.private_key",
                 )?;
             }
+            decrypt_secret_vec(
+                &store,
+                &mut config.gateway.paired_tokens,
+                "config.gateway.paired_tokens",
+            )?;
 
             config.apply_env_overrides();
             config.validate()?;
@@ -7093,6 +7113,55 @@ default_model = "legacy-model"
         assert_eq!(config.config_path, env_workspace_dir.join("config.toml"));
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[tokio::test]
+    async fn load_or_init_decrypts_paired_token_hashes() {
+        use sha2::{Digest, Sha256};
+
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_home.join(".zeroclaw");
+        let config_path = config_dir.join("config.toml");
+        fs::create_dir_all(&config_dir).await.unwrap();
+
+        let token = "zc_test_pair_token";
+        let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let store = crate::security::SecretStore::new(&config_dir, true);
+        let encrypted_hash = store.encrypt(&token_hash).unwrap();
+
+        fs::write(
+            &config_path,
+            format!(
+                r#"[secrets]
+encrypt = true
+
+[gateway]
+require_pairing = true
+paired_tokens = ["{encrypted_hash}"]
+"#
+            ),
+        )
+        .await
+        .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+
+        let config = Config::load_or_init().await.unwrap();
+        assert_eq!(config.gateway.paired_tokens, vec![token_hash.clone()]);
+
+        let pairing = crate::security::PairingGuard::new(true, &config.gateway.paired_tokens);
+        assert!(pairing.is_authenticated(token));
+
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
         } else {
