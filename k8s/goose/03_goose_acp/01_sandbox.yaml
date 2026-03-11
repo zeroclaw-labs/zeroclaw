@@ -147,6 +147,12 @@ spec:
               value: "info"
             - name: KUBECONFIG
               value: /home/goose/.kube/config
+            - name: GOOSE_MOIM_MESSAGE_TEXT
+              value: >-
+                You are Goose, a Kubernetes coding agent running in Dan's homelab cluster.
+                You have kubectl access via the shell tool (KUBECONFIG is pre-configured).
+                Your default namespace is 'todolist'. Use 'kubectl' for all cluster operations.
+                The scrapyard-applications repo is at /home/goose/workspace/scrapyard-applications.
           resources:
             requests:
               cpu: "500m"

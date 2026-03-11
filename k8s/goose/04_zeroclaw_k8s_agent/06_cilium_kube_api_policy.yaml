@@ -1,0 +1,17 @@
+# CiliumNetworkPolicy to allow zeroclaw-k8s-agent egress to the Kubernetes API server.
+#
+# Cilium assigns a special identity to kube-apiserver that doesn't match
+# standard ipBlock selectors in Kubernetes NetworkPolicy. The toEntities
+# selector is required for Cilium to allow this traffic.
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: zeroclaw-k8s-agent-allow-kube-apiserver
+  namespace: ai-agents
+spec:
+  endpointSelector:
+    matchLabels:
+      app: zeroclaw-k8s-agent
+  egress:
+    - toEntities:
+        - kube-apiserver

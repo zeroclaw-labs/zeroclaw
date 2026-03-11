@@ -1,0 +1,17 @@
+# Vault secrets for the zeroclaw k8s agent.
+# Reuses the existing zeroclaw Vault auth (same SA + VaultAuth in ai-agents),
+# but pulls from a separate vault path for agent-specific secrets.
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultStaticSecret
+metadata:
+  name: zeroclaw-k8s-agent-secret
+  namespace: ai-agents
+spec:
+  vaultAuthRef: zeroclaw-static-auth
+  mount: kvv2
+  type: kv-v2
+  path: zeroclaw/zeroclaw-k8s-agent
+  refreshAfter: 30s
+  destination:
+    name: zeroclaw-k8s-agent-secrets
+    create: true

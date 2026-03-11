@@ -75,7 +75,7 @@ spec:
               readOnly: true
       containers:
         - name: zeroclaw
-          image: citizendaniel/zeroclaw-sam:v1.3.8
+          image: citizendaniel/zeroclaw-sam:v1.3.9
           imagePullPolicy: IfNotPresent
           command:
             - bash
@@ -126,6 +126,12 @@ spec:
               value: "--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage"
             - name: PLAYWRIGHT_BROWSERS_PATH
               value: /opt/sam-tools/home/.cache/ms-playwright
+            - name: ACP_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: zeroclaw-k8s-agent-secrets
+                  key: gateway-paired-tokens
+                  optional: true
             - name: SERENA_SESSION_FILE
               value: /data/.zeroclaw/serena-session-id
             - name: SERENA_DEFAULT_PROJECT
@@ -148,7 +154,7 @@ spec:
               subPath: acp-client.py
               readOnly: true
         - name: serena
-          image: citizendaniel/zeroclaw-sam:v1.3.8
+          image: citizendaniel/zeroclaw-sam:v1.3.9
           imagePullPolicy: IfNotPresent
           command:
             - sh

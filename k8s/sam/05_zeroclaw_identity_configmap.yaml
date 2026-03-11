@@ -431,17 +431,15 @@ data:
 
     ---
 
-    ## Goose ACP Client (Agent-to-Agent Communication)
+    ## K8s Agent (Agent-to-Agent Communication)
 
-    `acp-client` is a CLI tool at `/usr/local/bin/acp-client` for talking to Goose, a coding agent running in the cluster, over the ACP (Agent Communication Protocol) HTTP interface.
+    `acp-client` is a CLI tool at `/usr/local/bin/acp-client` for talking to the K8s infrastructure agent running in the cluster over ACP (Agent Communication Protocol). The K8s agent has kubectl and cluster access — you don't. For anything involving the Kubernetes cluster (pods, namespaces, deployments, logs, manifests), delegate to the K8s agent via acp-client.
 
-    **CRITICAL: Always use the async send/poll workflow.** Goose typically takes 1-10+ minutes to respond. The shell tool has a 60s timeout. If you use a blocking command, it will be killed before Goose finishes.
-
-    **IMPORTANT: Use the zeroclaw `shell` tool** (not `serena__execute_shell_command`) for all acp-client calls. Serena runs in a different container that does not have acp-client installed.
+    Always use the async send/poll workflow — the agent typically takes 1-10+ minutes to respond and the shell tool has a 60s timeout. Use the zeroclaw `shell` tool (not `serena__execute_shell_command`) for all acp-client calls, since Serena runs in a different container.
 
     **Async workflow (always use this):**
     ```bash
-    # 1. Check Goose is alive
+    # 1. Check agent is alive
     acp-client health
 
     # 2. Send task (returns immediately)
@@ -464,7 +462,7 @@ data:
 
     | Command | Purpose |
     |---------|---------|
-    | `acp-client health` | Check if Goose is alive |
+    | `acp-client health` | Check if the K8s agent is alive |
     | `acp-client send "task"` | Non-blocking: sends prompt, returns immediately with session IDs |
     | `acp-client poll <acp-session-id>` | Check status: RUNNING (with partial output) or COMPLETE |
     | `acp-client result <acp-session-id>` | Get the full response text (waits up to 10s if still running) |
@@ -473,9 +471,9 @@ data:
     | `acp-client cleanup` | Remove completed session files older than 1 hour |
 
     **Notes:**
-    - Goose endpoint: `http://goose-acp.ai-agents.svc.cluster.local:8080`
+    - Endpoint: `http://zeroclaw-k8s-agent.ai-agents.svc.cluster.local:3000`
     - Override with: `ACP_BASE_URL=http://other-host:port acp-client send "..."`
-    - Goose has kubectl access to the cluster and the scrapyard-applications repo
+    - The K8s agent has kubectl access, the scrapyard-applications repo, and persistent memory via Serena
     - Session files are stored in `/tmp/acp-sessions/<acp-session-id>/`
 
     ---

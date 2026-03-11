@@ -6,9 +6,9 @@ metadata:
 data:
   acp-client.py: |
     #!/usr/bin/env python3
-    """Async ACP-over-HTTP client for delegating tasks to Goose.
+    """Async ACP-over-HTTP client for delegating tasks to the K8s infrastructure agent.
 
-    IMPORTANT: Goose typically takes 1-10+ minutes to respond. Use the async
+    The agent typically takes 1-10+ minutes to respond. Use the async
     send/poll workflow below — do NOT use send-sync unless you have a very
     long timeout.
 
@@ -51,8 +51,9 @@ data:
           Remove completed session files older than 1 hour.
 
     Environment:
-      ACP_BASE_URL  — default: http://goose-acp.ai-agents.svc.cluster.local:8080
-      ACP_CWD       — working directory for new sessions (default: /tmp)
+      ACP_BASE_URL   — default: http://zeroclaw-k8s-agent.ai-agents.svc.cluster.local:3000
+      ACP_AUTH_TOKEN — Bearer token for gateway auth (omit if pairing not required)
+      ACP_CWD        — working directory for new sessions (default: /tmp)
 
     Session files are stored in /tmp/acp-sessions/<acp-session-id>/
     """
@@ -66,9 +67,10 @@ data:
     import urllib.request
     import urllib.error
 
-    BASE_URL = os.environ.get("ACP_BASE_URL", "http://goose-acp.ai-agents.svc.cluster.local:8080")
+    BASE_URL = os.environ.get("ACP_BASE_URL", "http://zeroclaw-k8s-agent.ai-agents.svc.cluster.local:3000")
     ACP_ENDPOINT = f"{BASE_URL}/acp"
-    DEFAULT_CWD = os.environ.get("ACP_CWD", "/tmp")
+    AUTH_TOKEN = os.environ.get("ACP_AUTH_TOKEN", "")
+    DEFAULT_CWD = os.environ.get("ACP_CWD", "/data/workspace")
     SESSION_DIR = "/tmp/acp-sessions"
 
     INIT_PARAMS = {
@@ -90,6 +92,8 @@ data:
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
         }
+        if AUTH_TOKEN:
+            headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
         if acp_session_id:
             headers["Acp-Session-Id"] = acp_session_id
         req = urllib.request.Request(ACP_ENDPOINT, data=data, headers=headers, method="POST")
@@ -200,7 +204,10 @@ data:
     # --- Commands ---
 
     def cmd_health():
-        req = urllib.request.Request(f"{BASE_URL}/health")
+        headers = {}
+        if AUTH_TOKEN:
+            headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
+        req = urllib.request.Request(f"{BASE_URL}/health", headers=headers)
         resp = urllib.request.urlopen(req, timeout=5)
         print(resp.read().decode())
 
@@ -343,6 +350,8 @@ data:
     def cmd_delete(acp_session_id):
         """Delete an ACP session."""
         headers = {"Acp-Session-Id": acp_session_id}
+        if AUTH_TOKEN:
+            headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
         req = urllib.request.Request(ACP_ENDPOINT, headers=headers, method="DELETE")
         resp = urllib.request.urlopen(req, timeout=10)
         print(f"Deleted: HTTP {resp.status}")
