@@ -32,5 +32,8 @@ credentials.json
 .worktrees/
 .zeroclaw/*
 
+# Skill eval workspaces (test outputs, transcripts, grading)
+.claude/skills/*-workspace/
+
 # Coverage artifacts
 lcov.info
