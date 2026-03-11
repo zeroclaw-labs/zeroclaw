@@ -395,7 +395,6 @@ pub fn all_tools_with_runtime(
         Some(parent_tools)
     };
 
-
     // Workspace management tool (conditionally registered when workspace isolation is enabled)
     if root_config.workspace.enabled {
         let workspaces_dir = if root_config.workspace.workspaces_dir.starts_with("~/") {

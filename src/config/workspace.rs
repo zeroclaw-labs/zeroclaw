@@ -179,7 +179,9 @@ impl WorkspaceManager {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         {
-            bail!("workspace name must contain only alphanumeric characters, hyphens, or underscores");
+            bail!(
+                "workspace name must contain only alphanumeric characters, hyphens, or underscores"
+            );
         }
         if self.profiles.contains_key(name) {
             bail!("workspace '{}' already exists", name);
@@ -199,8 +201,7 @@ impl WorkspaceManager {
             tool_restrictions: Vec::new(),
         };
 
-        let toml_str =
-            toml::to_string_pretty(&profile).context("serializing workspace profile")?;
+        let toml_str = toml::to_string_pretty(&profile).context("serializing workspace profile")?;
         let profile_path = ws_dir.join("profile.toml");
         tokio::fs::write(&profile_path, toml_str)
             .await
@@ -219,7 +220,10 @@ impl WorkspaceManager {
 
         // Create an export-safe copy with credential_profile redacted
         let export = WorkspaceProfile {
-            credential_profile: profile.credential_profile.as_ref().map(|_| "***".to_string()),
+            credential_profile: profile
+                .credential_profile
+                .as_ref()
+                .map(|_| "***".to_string()),
             ..profile.clone()
         };
 

@@ -71,11 +71,7 @@ impl WorkspaceBoundary {
     ///
     /// When a workspace is active, paths outside the workspace directory
     /// and paths belonging to other workspaces are denied.
-    pub fn check_path_access(
-        &self,
-        path: &Path,
-        workspaces_base: &Path,
-    ) -> BoundaryVerdict {
+    pub fn check_path_access(&self, path: &Path, workspaces_base: &Path) -> BoundaryVerdict {
         let profile = match &self.profile {
             Some(p) => p,
             None => return BoundaryVerdict::Allow,
@@ -135,10 +131,7 @@ mod tests {
     #[test]
     fn boundary_inactive_allows_everything() {
         let boundary = WorkspaceBoundary::inactive();
-        assert_eq!(
-            boundary.check_tool_access("shell"),
-            BoundaryVerdict::Allow
-        );
+        assert_eq!(boundary.check_tool_access("shell"), BoundaryVerdict::Allow);
         assert_eq!(
             boundary.check_domain_access("any.domain"),
             BoundaryVerdict::Allow

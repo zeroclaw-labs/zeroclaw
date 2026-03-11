@@ -148,11 +148,7 @@ impl Tool for WorkspaceTool {
                         let dir = mgr.workspace_dir(ws_name);
                         Ok(ToolResult {
                             success: true,
-                            output: format!(
-                                "Created workspace '{}' at {}",
-                                name,
-                                dir.display()
-                            ),
+                            output: format!("Created workspace '{}' at {}", name, dir.display()),
                             error: None,
                         })
                     }
@@ -219,13 +215,9 @@ impl Tool for WorkspaceTool {
 
             "export" => {
                 let mgr = self.manager.read().await;
-                let ws_name = name
-                    .or_else(|| mgr.active_name())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "'name' parameter is required when no workspace is active"
-                        )
-                    })?;
+                let ws_name = name.or_else(|| mgr.active_name()).ok_or_else(|| {
+                    anyhow::anyhow!("'name' parameter is required when no workspace is active")
+                })?;
 
                 match mgr.export(ws_name) {
                     Ok(toml_str) => Ok(ToolResult {
@@ -339,10 +331,7 @@ mod tests {
     async fn workspace_tool_unknown_action() {
         let tmp = TempDir::new().unwrap();
         let tool = test_tool(&tmp);
-        let result = tool
-            .execute(json!({"action": "destroy"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"action": "destroy"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("unknown workspace action"));
     }
