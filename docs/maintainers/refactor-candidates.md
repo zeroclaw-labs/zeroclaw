@@ -176,6 +176,39 @@ Changes deferred from the project-cleanup pass. Each entry includes rationale an
 - Use `cargo fuzz coverage <target>` to generate lcov reports from corpus runs and track which code paths the fuzzer actually reaches
 - Track crash artifacts (`fuzz/artifacts/<target>/`) as issues
 
+### TODO: Test infrastructure follow-ups from `e2e-testing` branch
+
+Issues identified during quality review of the test restructuring work.
+
+**1. ~~`#[path]` attribute pattern in runner files~~ (resolved)**
+
+~~Runner files used `#[path]` attributes as a workaround for E0761.~~ Fixed: runner files renamed to `test_component.rs` etc., directories use standard `mod.rs` files. `Cargo.toml` `[[test]]` entries updated to match. `cargo test --test component` commands unchanged.
+
+**2. Dead infrastructure: `TestChannel`, `TraceLlmProvider`, trace fixtures, `verify_expects()`**
+
+These were built as scaffolding but have no consumers:
+- `tests/support/mock_channel.rs` (`TestChannel`) — planned for channel-driven system tests, but the agent has no public channel-driven loop API, so system tests use `agent.turn()` directly.
+- `tests/support/mock_provider.rs` (`TraceLlmProvider`) — replays JSON fixture traces, but no test loads or runs a fixture.
+- `tests/fixtures/traces/*.json` (3 files) — never loaded by any test.
+- `tests/support/assertions.rs` (`verify_expects()`) — never called.
+
+Either write tests that exercise this infrastructure or remove it to avoid dead code confusion.
+
+**3. Gateway component tests overlap with existing `whatsapp_webhook_security.rs`**
+
+`tests/component/gateway.rs` has 6 HMAC signature verification tests for `verify_whatsapp_signature()` — the same function tested by 8 tests in `tests/component/whatsapp_webhook_security.rs`. Only the 3 gateway constants tests (`MAX_BODY_SIZE`, `REQUEST_TIMEOUT_SECS`, `RATE_LIMIT_WINDOW_SECS`) provide genuinely new coverage. Consider consolidating the signature tests into one file or removing the duplicates from `gateway.rs`.
+
+**4. Security component tests are config-only — no behavioral coverage**
+
+The 10 security tests validate config defaults and TOML serialization only (`AutonomyConfig::default()`, `SecretsConfig`, round-trips). They don't test security *behavior* (policy enforcement, credential scrubbing, action rate limiting) because `src/security/` is `pub(crate)`. The `security_config_debug_does_not_leak_api_key` test is a no-op — it checks for a leak but has no assertion on failure (just a comment). To get real behavioral coverage, either:
+- Make targeted security functions `pub` for testing (e.g. `scrub_credentials`, `SecurityPolicy::evaluate`)
+- Add `#[cfg(test)] pub` escape hatches in `src/security/`
+- Write in-crate unit tests in `src/security/tests.rs` instead
+
+**5. `pub(crate)` visibility blocks integration testing of critical subsystems**
+
+The `security` and `gateway` modules use `pub(crate)` visibility, preventing integration tests from exercising core logic like `SecurityPolicy`, `GatewayRateLimiter`, and `IdempotencyStore`. This forced the new component tests to test only through the narrow public API surface (config structs, one signature function, constants). Consider whether key security types should expose a test-only public interface or whether these tests belong as in-crate unit tests.
+
 ### TODO: Automated release announcements — Twitter/X integration
 
 **Current state:** Releases are published on GitHub only. No automated cross-posting to social channels.

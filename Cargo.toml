@@ -234,6 +234,22 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"
 scopeguard = "1.2"
 
+[[test]]
+name = "component"
+path = "tests/test_component.rs"
+
+[[test]]
+name = "integration"
+path = "tests/test_integration.rs"
+
+[[test]]
+name = "system"
+path = "tests/test_system.rs"
+
+[[test]]
+name = "live"
+path = "tests/test_live.rs"
+
 [[bench]]
 name = "agent_benchmarks"
 harness = false
