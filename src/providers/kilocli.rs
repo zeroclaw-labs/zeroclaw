@@ -138,9 +138,9 @@ impl KiloCliProvider {
 
         let mut child = cmd.spawn().map_err(|err| {
             anyhow::anyhow!(
-                "Failed to spawn KiloCLI binary at {:?}: {err}. \
+                "Failed to spawn KiloCLI binary at {}: {err}. \
                  Ensure `kilo` is installed and in PATH, or set KILO_CLI_PATH.",
-                self.binary_path
+                self.binary_path.display()
             )
         })?;
 
@@ -159,9 +159,9 @@ impl KiloCliProvider {
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
-                    "KiloCLI request timed out after {:?} (binary: {:?})",
+                    "KiloCLI request timed out after {:?} (binary: {})",
                     KILO_CLI_REQUEST_TIMEOUT,
-                    self.binary_path
+                    self.binary_path.display()
                 )
             })?
             .map_err(|err| anyhow::anyhow!("KiloCLI process failed: {err}"))?;
