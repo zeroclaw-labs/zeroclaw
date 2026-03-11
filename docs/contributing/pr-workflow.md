@@ -12,8 +12,8 @@ This document defines how ZeroClaw handles high PR volume while maintaining:
 Related references:
 
 - [`docs/README.md`](../README.md) for documentation taxonomy and navigation.
-- [`docs/ci-map.md`](./ci-map.md) for per-workflow ownership, triggers, and triage flow.
-- [`docs/reviewer-playbook.md`](./reviewer-playbook.md) for day-to-day reviewer execution.
+- [`ci-map.md`](./ci-map.md) for per-workflow ownership, triggers, and triage flow.
+- [`reviewer-playbook.md`](./reviewer-playbook.md) for day-to-day reviewer execution.
 
 ## 0. Summary
 
@@ -44,7 +44,7 @@ Go to:
 
 Go to:
 
-- [docs/ci-map.md](./ci-map.md)
+- [ci-map.md](./ci-map.md)
 - [Section 4.2](#42-step-b-validation)
 
 ### 1.3 High-risk path touched
@@ -55,7 +55,7 @@ Go to:
 Go to:
 
 - [Section 9](#9-security-and-stability-rules)
-- [docs/reviewer-playbook.md](./reviewer-playbook.md)
+- [reviewer-playbook.md](./reviewer-playbook.md)
 
 ### 1.4 PR is superseded or duplicate
 
