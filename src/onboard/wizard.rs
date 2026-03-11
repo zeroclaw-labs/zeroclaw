@@ -18,7 +18,7 @@ use crate::providers::{
 };
 use anyhow::{bail, Context, Result};
 use console::style;
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Input, Password, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -3927,8 +3927,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     Option<String>,
                 ) = if auth_choice == 0 {
                     // Access token auth
-                    let token: String =
-                        Input::new().with_prompt("  Access token").interact_text()?;
+                    let token: String = Password::new().with_prompt("  Access token").interact()?;
                     if token.trim().is_empty() {
                         println!("  {} Skipped — token required", style("→").dim());
                         continue;
@@ -3943,7 +3942,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         println!("  {} Skipped — user ID required", style("→").dim());
                         continue;
                     }
-                    let pwd: String = Input::new().with_prompt("  Password").interact_text()?;
+                    let pwd: String = Password::new().with_prompt("  Password").interact()?;
                     if pwd.trim().is_empty() {
                         println!("  {} Skipped — password required", style("→").dim());
                         continue;
@@ -4019,10 +4018,26 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                         // Log out the test session to avoid orphan devices
                         if let Some(token) = payload.get("access_token").and_then(|v| v.as_str()) {
-                            let _ = client
+                            match client
                                 .post(format!("{hs_owned}/_matrix/client/v3/logout"))
                                 .header("Authorization", format!("Bearer {token}"))
-                                .send();
+                                .send()
+                            {
+                                Ok(resp) if resp.status().is_success() => {}
+                                Ok(resp) => {
+                                    eprintln!(
+                                        "  {} Warning: test-session logout returned HTTP {} — a stale device may remain on the homeserver",
+                                        style("⚠").yellow(),
+                                        resp.status()
+                                    );
+                                }
+                                Err(err) => {
+                                    eprintln!(
+                                        "  {} Warning: test-session logout failed ({err}) — a stale device may remain on the homeserver",
+                                        style("⚠").yellow()
+                                    );
+                                }
+                            }
                         }
 
                         Ok::<_, reqwest::Error>((true, Some(uid.clone()), device_id))

@@ -651,7 +651,39 @@ impl MatrixChannel {
                 let saved = self.load_saved_session().await;
                 let resolved_user_id: String;
 
-                if let Some(ref saved) = saved {
+                // Determine whether to use the saved session or fall through
+                // to config credentials. If config has fresh credentials and the
+                // saved session's user_id doesn't match the configured owner hint,
+                // prefer config to avoid stale session.json overriding intentional
+                // config changes.
+                let use_saved_session = if let Some(ref saved) = saved {
+                    let config_has_credentials =
+                        self.access_token.is_some() || self.password.is_some();
+                    let saved_matches_config = self
+                        .session_owner_hint
+                        .as_ref()
+                        .map_or(true, |hint| hint == &saved.user_id);
+
+                    if config_has_credentials && !saved_matches_config {
+                        tracing::warn!(
+                            "Matrix: session.json user_id ({}) does not match configured owner hint — ignoring saved session and using config credentials",
+                            crate::security::redact(&saved.user_id)
+                        );
+                        false
+                    } else {
+                        if config_has_credentials {
+                            tracing::debug!(
+                                "Matrix: config credentials present but session.json user matches — restoring saved session"
+                            );
+                        }
+                        true
+                    }
+                } else {
+                    false
+                };
+
+                if use_saved_session {
+                    let saved = saved.as_ref().unwrap();
                     // Path 1: Restore from persisted session.json (previous login).
                     let user_id: OwnedUserId = saved.user_id.parse()?;
                     let session = MatrixSession {
@@ -1103,13 +1135,21 @@ async fn handle_verification_request(
                     );
                 }
 
+                // Design decision: auto-confirm SAS for bot accounts.
+                // Bots cannot perform interactive emoji comparison with a
+                // human operator. Since the verification request is only
+                // processed for allowlisted senders (checked earlier in the
+                // listen() handler), auto-confirming is the intended behavior.
+                // The emojis are logged above so an operator can audit them
+                // after the fact if needed.
+
                 // Brief delay before auto-confirming: let the sync loop
                 // fully process the key exchange on both sides before
                 // sending our MAC. Without this, Element may receive the
                 // MAC before it has finished processing the key material.
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-                tracing::info!("Matrix SAS: confirming emojis match on bot side...");
+                tracing::info!("Matrix SAS: auto-confirming emojis on bot side (bot accounts cannot do interactive verification)...");
                 if let Err(error) = sas.confirm().await {
                     tracing::warn!("Matrix SAS verification confirm failed: {error}");
                     return;
@@ -1203,6 +1243,38 @@ impl Channel for MatrixChannel {
             if !path.exists() || !path.is_file() {
                 tracing::warn!(
                     "Matrix outgoing attachment not found or not a file: {}",
+                    target
+                );
+                continue;
+            }
+
+            // Security: restrict uploads to the workspace/media directory to
+            // prevent [IMAGE:path] markers in bot responses from exfiltrating
+            // arbitrary host files via Matrix media uploads.
+            if let Some(ref zdir) = self.zeroclaw_dir {
+                let allowed_dir = zdir.join("workspace");
+                match path.canonicalize() {
+                    Ok(canonical) => {
+                        if !canonical.starts_with(&allowed_dir) {
+                            tracing::warn!(
+                                "Matrix outgoing attachment path '{}' is outside workspace directory '{}' — refusing upload",
+                                canonical.display(),
+                                allowed_dir.display()
+                            );
+                            continue;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Matrix outgoing attachment path '{}' could not be canonicalized: {err} — refusing upload",
+                            target
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "Matrix: no zeroclaw_dir configured — cannot validate attachment path '{}', refusing upload",
                     target
                 );
                 continue;
@@ -1396,6 +1468,14 @@ impl Channel for MatrixChannel {
 
                 // Deduplicate early — before downloading media or transcribing
                 // to avoid repeated I/O and billable external calls on redelivery.
+                //
+                // Design tradeoff: caching the event_id before processing means
+                // that if media download or transcription fails, the event won't
+                // be retried. This is acceptable because Matrix sync does not
+                // redeliver events on handler failure — only on sync gaps (where
+                // the SDK replays from the sync token). Early dedupe prevents
+                // duplicate media downloads and duplicate billable transcription
+                // calls, which outweighs the theoretical loss of retry capability.
                 let event_id = event.event_id.to_string();
                 {
                     let mut guard = dedupe.lock().await;
@@ -1641,8 +1721,8 @@ impl Channel for MatrixChannel {
                 } else {
                     "their message"
                 };
-                let preview = if original_text.len() > 100 {
-                    format!("{}…", &original_text[..100])
+                let preview = if original_text.chars().count() > 100 {
+                    format!("{}…", original_text.chars().take(100).collect::<String>())
                 } else {
                     original_text.clone()
                 };
