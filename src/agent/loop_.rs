@@ -255,7 +255,9 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
         if !relevant.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &relevant {
-                if memory::is_assistant_autosave_key(&entry.key) {
+                if memory::is_assistant_autosave_key(&entry.key)
+                    || entry.key.starts_with("assistant_msg_")
+                {
                     continue;
                 }
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
@@ -268,6 +270,47 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
         }
     }
 
+    context
+}
+
+/// Load recent conversation entries for a session from memory in chronological order.
+/// Used in single-shot (`-m`) mode with `--session-id` to provide history context
+/// across invocations of the same named session.
+/// Includes both user_msg_* and assistant_msg_* entries to replay full turn context.
+async fn load_recent_conversation(
+    mem: &dyn Memory,
+    max_messages: usize,
+    session_id: &str,
+) -> String {
+    if max_messages == 0 {
+        return String::new();
+    }
+    let Ok(entries) = mem
+        .list(Some(&MemoryCategory::Conversation), Some(session_id))
+        .await
+    else {
+        return String::new();
+    };
+    // list() returns newest-first; include both user and assistant turns, take N, reverse for chronological
+    let mut recent: Vec<_> = entries
+        .into_iter()
+        .filter(|e| e.key.starts_with("user_msg_") || e.key.starts_with("assistant_msg_"))
+        .take(max_messages)
+        .collect();
+    if recent.is_empty() {
+        return String::new();
+    }
+    recent.reverse();
+    let mut context = String::from("[Conversation history]\n");
+    for entry in &recent {
+        let role = if entry.key.starts_with("assistant_msg_") {
+            "assistant"
+        } else {
+            "user"
+        };
+        let _ = writeln!(context, "- [{}] {role}: {}", entry.timestamp, entry.content);
+    }
+    context.push('\n');
     context
 }
 
@@ -2724,6 +2767,7 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
 pub async fn run(
     config: Config,
     message: Option<String>,
+    session_id: Option<String>,
     provider_override: Option<String>,
     model_override: Option<String>,
     temperature: f64,
@@ -2989,23 +3033,45 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
-        // Auto-save user message to memory (skip short/trivial messages)
-        if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
-            let user_key = autosave_memory_key("user_msg");
-            let _ = mem
-                .store(&user_key, &msg, MemoryCategory::Conversation, None)
-                .await;
-        }
+        // Normalize session_id: trim whitespace, treat empty/whitespace-only as None.
+        let sid: Option<&str> = session_id
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s as &str);
 
-        // Inject memory + hardware RAG context into user message
+        // When a session ID is provided, load that session's recent conversation history
+        // before auto-saving so the current message is not included.
+        // Respects max_history_messages from [agent] config.
+        let conv_history = if let Some(sid) = sid {
+            load_recent_conversation(mem.as_ref(), config.agent.max_history_messages, sid).await
+        } else {
+            String::new()
+        };
+
+        // Inject memory + hardware RAG context into user message.
+        // Auto-save happens after build_context so the current message is not
+        // recalled into its own prompt.
         let mem_context =
             build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
+
+        // Persist user message. When a session ID is set, always save regardless of
+        // auto_save or minimum-length gates so short follow-ups like "why?" are
+        // never silently dropped from session history.
+        let should_save_user = sid.is_some()
+            || (config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS);
+        if should_save_user {
+            let user_key = autosave_memory_key("user_msg");
+            let _ = mem
+                .store(&user_key, &msg, MemoryCategory::Conversation, sid)
+                .await;
+        }
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
             .map(|r| build_hardware_context(r, &msg, &board_names, rag_limit))
             .unwrap_or_default();
-        let context = format!("{mem_context}{hw_context}");
+        let context = format!("{conv_history}{mem_context}{hw_context}");
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
         let enriched = if context.is_empty() {
             format!("[{now}] {msg}")
@@ -3039,6 +3105,23 @@ pub async fn run(
         .await?;
         final_output = response.clone();
         println!("{response}");
+
+        // Persist the assistant reply so the next --session-id invocation can replay it.
+        // Always save when sid is set; do not gate on auto_save or length.
+        if let Some(sid) = sid {
+            if !response.is_empty() {
+                let assistant_key = autosave_memory_key("assistant_msg");
+                let _ = mem
+                    .store(
+                        &assistant_key,
+                        &response,
+                        MemoryCategory::Conversation,
+                        Some(sid),
+                    )
+                    .await;
+            }
+        }
+
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
         println!("🦀 ZeroClaw Interactive Mode");

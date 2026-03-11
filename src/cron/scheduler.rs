@@ -171,6 +171,7 @@ async fn run_agent_job(
                 config.clone(),
                 Some(prefixed_prompt),
                 None,
+                None,
                 model_override,
                 config.default_temperature,
                 vec![],

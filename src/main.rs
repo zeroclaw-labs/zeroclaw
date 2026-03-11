@@ -40,6 +40,13 @@ use std::io::Write;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
+fn parse_session_id(s: &str) -> std::result::Result<String, String> {
+    if s.trim().is_empty() {
+        return Err("--session-id must not be blank or whitespace-only".to_string());
+    }
+    Ok(s.to_string())
+}
+
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
     if !(0.0..=2.0).contains(&t) {
@@ -178,6 +185,11 @@ Examples:
         /// Single message mode (don't enter interactive mode)
         #[arg(short, long)]
         message: Option<String>,
+
+        /// Session ID for -m mode: loads this session's history and saves messages into it.
+        /// Enables stateful multi-call workflows: zeroclaw agent -m "..." --session-id my-task
+        #[arg(long, requires = "message", value_parser = parse_session_id)]
+        session_id: Option<String>,
 
         /// Provider to use (openrouter, anthropic, openai, openai-codex)
         #[arg(short, long)]
@@ -770,21 +782,14 @@ async fn main() -> Result<()> {
 
         Commands::Agent {
             message,
+            session_id,
             provider,
             model,
             temperature,
             peripheral,
-        } => agent::run(
-            config,
-            message,
-            provider,
-            model,
-            temperature,
-            peripheral,
-            true,
-        )
-        .await
-        .map(|_| ()),
+        } => agent::run(config, message, session_id, provider, model, temperature, peripheral, true)
+            .await
+            .map(|_| ()),
 
         Commands::Gateway { port, host } => {
             let port = port.unwrap_or(config.gateway.port);
@@ -1850,6 +1855,23 @@ mod tests {
     #[test]
     fn cli_definition_has_no_flag_conflicts() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn agent_session_id_rejects_blank_and_whitespace_values() {
+        for blank in ["", "   ", "\t", "\n"] {
+            let result = Cli::try_parse_from(["zeroclaw", "agent", "-m", "hello", "--session-id", blank]);
+            assert!(
+                result.is_err(),
+                "blank --session-id {:?} should be rejected",
+                blank
+            );
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("session-id") || err.contains("session_id"),
+                "error message should mention session-id, got: {err}"
+            );
+        }
     }
 
     #[test]
