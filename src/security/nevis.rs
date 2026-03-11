@@ -46,7 +46,6 @@ impl TokenValidationMode {
 ///
 /// Validates tokens, manages sessions, and resolves identities. The provider
 /// is designed to be shared across concurrent requests (`Send + Sync`).
-#[derive(Debug)]
 pub struct NevisAuthProvider {
     /// Base URL of the Nevis instance (e.g. `https://nevis.example.com`).
     instance_url: String,
@@ -66,6 +65,24 @@ pub struct NevisAuthProvider {
     session_timeout: Duration,
     /// HTTP client for Nevis API calls.
     http_client: reqwest::Client,
+}
+
+impl std::fmt::Debug for NevisAuthProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NevisAuthProvider")
+            .field("instance_url", &self.instance_url)
+            .field("realm", &self.realm)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("validation_mode", &self.validation_mode)
+            .field("jwks_url", &self.jwks_url)
+            .field("require_mfa", &self.require_mfa)
+            .field("session_timeout", &self.session_timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl NevisAuthProvider {
@@ -437,6 +454,31 @@ mod tests {
         assert_eq!(provider.realm(), "test-realm");
         assert!(provider.require_mfa);
         assert_eq!(provider.session_timeout, Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn debug_redacts_client_secret() {
+        let provider = NevisAuthProvider::new(
+            "https://nevis.example.com".into(),
+            "test-realm".into(),
+            "zeroclaw-client".into(),
+            Some("super-secret-value".into()),
+            "remote",
+            None,
+            false,
+            3600,
+        )
+        .unwrap();
+
+        let debug_output = format!("{:?}", provider);
+        assert!(
+            !debug_output.contains("super-secret-value"),
+            "Debug output must not contain the raw client_secret"
+        );
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug output must show [REDACTED] for client_secret"
+        );
     }
 
     #[tokio::test]
