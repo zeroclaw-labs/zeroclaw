@@ -141,8 +141,56 @@ impl HookHandler for WebhookAuditHook {
         HookResult::Continue((name, args))
     }
 
-    async fn on_after_tool_call(&self, _tool: &str, _result: &ToolResult, _duration: Duration) {
-        // Placeholder — will be implemented in a later commit.
+    async fn on_after_tool_call(&self, tool: &str, result: &ToolResult, duration: Duration) {
+        // Skip if no URL configured.
+        if self.config.url.is_empty() {
+            return;
+        }
+
+        // Skip tools that don't match the configured patterns.
+        if !matches_any_pattern(&self.config.tool_patterns, tool) {
+            return;
+        }
+
+        // Pop captured args (if any) and optionally truncate.
+        let args_value: Value = if self.config.include_args {
+            let raw = self
+                .pending_args
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(tool);
+            match raw {
+                Some(a) => truncate_args(a, self.config.max_args_bytes),
+                None => Value::Null,
+            }
+        } else {
+            Value::Null
+        };
+
+        let payload = serde_json::json!({
+            "event": "tool_call",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "tool": tool,
+            "success": result.success,
+            "duration_ms": duration.as_millis() as u64,
+            "error": result.error,
+            "args": args_value,
+        });
+
+        let client = self.client.clone();
+        let url = self.config.url.clone();
+
+        // Fire-and-forget — never block the agent loop.
+        tokio::spawn(async move {
+            if let Err(e) = client.post(&url).json(&payload).send().await {
+                tracing::warn!(
+                    hook = "webhook-audit",
+                    url = %url,
+                    error = %e,
+                    "failed to POST audit payload"
+                );
+            }
+        });
     }
 }
 
@@ -275,5 +323,42 @@ mod tests {
         let args = serde_json::json!({"key": "value"});
         let result = truncate_args(args.clone(), 0);
         assert_eq!(result, args);
+    }
+
+    // ── on_after_tool_call tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn on_after_tool_call_skips_non_matching() {
+        let hook = make_hook(vec!["Bash"], true);
+        let result = ToolResult {
+            success: true,
+            output: "ok".into(),
+            error: None,
+        };
+        // Call with a non-matching tool — should not panic or do anything.
+        hook.on_after_tool_call("Write", &result, Duration::from_millis(10))
+            .await;
+        // No assertion needed beyond "doesn't panic"; args map stays empty.
+        let pending = hook.pending_args.lock().unwrap();
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn on_after_tool_call_skips_empty_url() {
+        let hook = WebhookAuditHook::new(WebhookAuditConfig {
+            enabled: true,
+            url: String::new(),
+            tool_patterns: vec!["Bash".to_string()],
+            include_args: false,
+            max_args_bytes: 4096,
+        });
+        let result = ToolResult {
+            success: true,
+            output: "ok".into(),
+            error: None,
+        };
+        // Should return immediately without spawning any HTTP request.
+        hook.on_after_tool_call("Bash", &result, Duration::from_millis(5))
+            .await;
     }
 }
