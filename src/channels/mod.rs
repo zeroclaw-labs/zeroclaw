@@ -429,6 +429,22 @@ fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
 }
 
+/// Extract the Telegram message_id from a ChannelMessage `id` field.
+///
+/// The id format is `"telegram_{chat_id}_{message_id}"`.  Returns `Some(message_id)`
+/// when the prefix is `"telegram"`, or `None` for any other channel format.
+fn extract_telegram_message_id(channel_msg_id: &str) -> Option<String> {
+    let mut parts = channel_msg_id.splitn(3, '_');
+    let prefix = parts.next()?;
+    let _chat_id = parts.next()?;
+    let msg_id = parts.next()?;
+    if prefix == "telegram" {
+        Some(msg_id.to_string())
+    } else {
+        None
+    }
+}
+
 fn should_prefix_sender_identity(msg: &traits::ChannelMessage) -> bool {
     if msg.channel != "telegram" {
         return false;
@@ -2415,7 +2431,11 @@ async fn handle_runtime_command_if_needed(
         );
 
         if let Err(err) = channel
-            .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+            .send(
+                &SendMessage::new(response, &msg.reply_target)
+                    .in_thread(msg.thread_ts.clone())
+                    .reply_to(extract_telegram_message_id(&msg.id)),
+            )
             .await
         {
             tracing::warn!(
@@ -2450,7 +2470,8 @@ async fn handle_runtime_command_if_needed(
                 if let Err(err) = channel
                     .send(
                         &SendMessage::new(response, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
+                            .in_thread(msg.thread_ts.clone())
+                            .reply_to(extract_telegram_message_id(&msg.id)),
                     )
                     .await
                 {
@@ -3136,7 +3157,11 @@ async fn handle_runtime_command_if_needed(
     };
 
     if let Err(err) = channel
-        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .send(
+            &SendMessage::new(response, &msg.reply_target)
+                .in_thread(msg.thread_ts.clone())
+                .reply_to(extract_telegram_message_id(&msg.id)),
+        )
         .await
     {
         tracing::warn!(
@@ -3698,7 +3723,8 @@ If this input is legitimate, rephrase without instruction-overrides, system-prom
                 let _ = channel
                     .send(
                         &SendMessage::new(warning, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
+                            .in_thread(msg.thread_ts.clone())
+                            .reply_to(extract_telegram_message_id(&msg.id)),
                     )
                     .await;
             }
@@ -3742,7 +3768,8 @@ or tune thresholds in config.",
                 let _ = channel
                     .send(
                         &SendMessage::new(warning, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
+                            .in_thread(msg.thread_ts.clone())
+                            .reply_to(extract_telegram_message_id(&msg.id)),
                     )
                     .await;
             }
@@ -3813,7 +3840,8 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                 let _ = channel
                     .send(
                         &SendMessage::new(warning, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
+                            .in_thread(msg.thread_ts.clone())
+                            .reply_to(extract_telegram_message_id(&msg.id)),
                     )
                     .await;
             }
@@ -3896,7 +3924,8 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                 let _ = channel
                     .send(
                         &SendMessage::new(message, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
+                            .in_thread(msg.thread_ts.clone())
+                            .reply_to(extract_telegram_message_id(&msg.id)),
                     )
                     .await;
             }
@@ -4026,7 +4055,9 @@ If this input is legitimate, rephrase the request and avoid instruction-override
         if let Some(channel) = target_channel.as_ref() {
             match channel
                 .send_draft(
-                    &SendMessage::new("...", &msg.reply_target).in_thread(msg.thread_ts.clone()),
+                    &SendMessage::new("...", &msg.reply_target)
+                        .in_thread(msg.thread_ts.clone())
+                        .reply_to(extract_telegram_message_id(&msg.id)),
                 )
                 .await
             {
@@ -4396,6 +4427,11 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                 started_at.elapsed().as_millis(),
                 truncate_with_ellipsis(&delivered_response, 80)
             );
+            tracing::debug!(
+                channel_msg_id = %msg.id,
+                reply_to = ?extract_telegram_message_id(&msg.id),
+                "channel.send: dispatching reply"
+            );
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
                     if let Err(e) = channel
@@ -4406,14 +4442,16 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                         let _ = channel
                             .send(
                                 &SendMessage::new(&delivered_response, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
+                                    .in_thread(msg.thread_ts.clone())
+                                    .reply_to(extract_telegram_message_id(&msg.id)),
                             )
                             .await;
                     }
                 } else if let Err(e) = channel
                     .send(
                         &SendMessage::new(delivered_response, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
+                            .in_thread(msg.thread_ts.clone())
+                            .reply_to(extract_telegram_message_id(&msg.id)),
                     )
                     .await
                 {
@@ -4484,7 +4522,8 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                         let _ = channel
                             .send(
                                 &SendMessage::new(error_text, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
+                                    .in_thread(msg.thread_ts.clone())
+                                    .reply_to(extract_telegram_message_id(&msg.id)),
                             )
                             .await;
                     }
@@ -4524,7 +4563,8 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                         let _ = channel
                             .send(
                                 &SendMessage::new(pause_text, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
+                                    .in_thread(msg.thread_ts.clone())
+                                    .reply_to(extract_telegram_message_id(&msg.id)),
                             )
                             .await;
                     }
@@ -4576,7 +4616,8 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                         let _ = channel
                             .send(
                                 &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
+                                    .in_thread(msg.thread_ts.clone())
+                                    .reply_to(extract_telegram_message_id(&msg.id)),
                             )
                             .await;
                     }
@@ -4627,7 +4668,8 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                     let _ = channel
                         .send(
                             &SendMessage::new(error_text, &msg.reply_target)
-                                .in_thread(msg.thread_ts.clone()),
+                                .in_thread(msg.thread_ts.clone())
+                                .reply_to(extract_telegram_message_id(&msg.id)),
                         )
                         .await;
                 }
