@@ -553,6 +553,52 @@ impl Provider for AnthropicProvider {
         Self::parse_text_response(chat_response)
     }
 
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
+            )
+        })?;
+
+        let (system_prompt, mut native_messages) = Self::convert_messages(messages);
+
+        if Self::should_cache_conversation(messages) {
+            Self::apply_cache_to_last_message(&mut native_messages);
+        }
+
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            max_tokens: 4096,
+            system: system_prompt,
+            messages: native_messages,
+            temperature,
+            tools: None,
+        };
+
+        let req = self
+            .http_client()
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&native_request);
+
+        let response = self.apply_auth(req, credential).send().await?;
+        if !response.status().is_success() {
+            return Err(super::api_error("Anthropic", response).await);
+        }
+
+        let native_response: NativeChatResponse = response.json().await?;
+        let parsed = Self::parse_native_response(native_response);
+        Ok(parsed
+            .text
+            .unwrap_or_default())
+    }
+
     async fn chat(
         &self,
         request: ProviderChatRequest<'_>,
@@ -1484,5 +1530,16 @@ mod tests {
         assert_eq!(json["source"]["type"], "base64");
         assert_eq!(json["source"]["media_type"], "image/jpeg");
         assert_eq!(json["source"]["data"], "AAAA");
+    }
+
+    #[test]
+    fn parse_user_content_blocks_non_image_data_uri_kept_as_text() {
+        let input = "See [IMAGE:data:text/plain;base64,SGk=] here";
+        let blocks = AnthropicProvider::parse_user_content_blocks(input);
+        assert_eq!(blocks.len(), 3);
+        // Non-image MIME should not become an Image block
+        assert!(
+            matches!(&blocks[1], NativeContentOut::Text { text, .. } if text == "[IMAGE:data:text/plain;base64,SGk=]")
+        );
     }
 }
