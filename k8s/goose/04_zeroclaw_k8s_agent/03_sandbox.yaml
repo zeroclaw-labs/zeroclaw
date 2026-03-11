@@ -155,7 +155,7 @@ spec:
               mountPath: /data
       containers:
         - name: zeroclaw
-          image: citizendaniel/zeroclaw:feat-proactive-messaging
+          image: citizendaniel/zeroclaw-sam:feat-proactive-messaging
           imagePullPolicy: Always
           command:
             - bash

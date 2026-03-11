@@ -59,12 +59,21 @@ data:
 
       [heartbeat]
       enabled = false
+      interval_minutes = 30
 
       [proactive_messaging]
       enabled = false
 
+      [[proactive_messaging.quiet_hours]]
+      start_hour = 22
+      end_hour = 7
+      timezone = "America/Edmonton"
+
       [goal_loop]
       enabled = false
+      interval_minutes = 10
+      step_timeout_secs = 120
+      max_steps_per_cycle = 3
 
       [channels_config]
       cli = true
