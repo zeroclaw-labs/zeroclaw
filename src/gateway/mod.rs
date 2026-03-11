@@ -313,9 +313,9 @@ pub struct AppState {
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     /// Shutdown signal sender for graceful shutdown
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
-    /// Registry of dynamically connected nodes
-    pub node_registry: Arc<nodes::NodeRegistry>,
-    /// Optional node registry for multi-machine coordination
+    /// Registry of dynamically connected nodes (WebSocket-based discovery)
+    pub ws_node_registry: Arc<nodes::NodeRegistry>,
+    /// Optional node registry for multi-machine coordination (HTTP-based node system)
     pub node_registry: Option<Arc<crate::nodes::NodeRegistry>>,
 }
 
@@ -638,9 +638,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // Node registry for dynamic node discovery
-    let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
-
     let state = AppState {
         config: config_state,
         provider,
@@ -665,9 +662,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         cost_tracker,
         event_tx,
         shutdown_tx,
-        node_registry,
+        ws_node_registry: Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes)),
         node_registry: if config.node_system.enabled {
-            Some(Arc::new(crate::nodes::NodeRegistry::new(&config.node_system)))
+            Some(Arc::new(crate::nodes::NodeRegistry::new(
+                &config.node_system,
+            )))
         } else {
             None
         },
@@ -1807,7 +1806,10 @@ async fn handle_node_invoke(
     }
     let registry = state.node_registry.as_ref().unwrap();
     let client = crate::nodes::NodeClient::new(Arc::new(registry.as_ref().clone()));
-    match client.invoke(&req.node_id, &req.capability, req.arguments).await {
+    match client
+        .invoke(&req.node_id, &req.capability, req.arguments)
+        .await
+    {
         Ok(result) => (StatusCode::OK, Json(result)),
         Err(e) => (
             StatusCode::BAD_GATEWAY,
@@ -1936,7 +1938,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
-            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            ws_node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             node_registry: None,
         };
 
@@ -1989,7 +1991,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
-            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            ws_node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             node_registry: None,
         };
 
@@ -2366,7 +2368,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
-            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            ws_node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             node_registry: None,
         };
 
@@ -2433,7 +2435,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
-            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            ws_node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             node_registry: None,
         };
 
@@ -2512,7 +2514,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
-            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            ws_node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             node_registry: None,
         };
 
@@ -2563,7 +2565,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
-            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            ws_node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             node_registry: None,
         };
 
@@ -2619,7 +2621,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
-            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            ws_node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             node_registry: None,
         };
 
@@ -2680,7 +2682,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
-            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            ws_node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             node_registry: None,
         };
 
@@ -2737,7 +2739,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
-            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            ws_node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             node_registry: None,
         };
 

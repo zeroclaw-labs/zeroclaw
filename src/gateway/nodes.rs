@@ -273,7 +273,7 @@ pub async fn handle_ws_nodes(
         ws
     };
 
-    let registry = state.node_registry.clone();
+    let registry = state.ws_node_registry.clone();
     ws.on_upgrade(move |socket| handle_node_socket(socket, registry))
         .into_response()
 }

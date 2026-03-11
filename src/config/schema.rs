@@ -1230,7 +1230,7 @@ pub struct NodeSystemConfig {
     pub stale_timeout_secs: u64,
 
     /// Maximum number of nodes allowed in the registry.
-    #[serde(default = "default_max_nodes")]
+    #[serde(default = "default_node_system_max_nodes")]
     pub max_nodes: usize,
 
     /// Allowlist of node IDs that may register. Empty = accept all.
@@ -1259,7 +1259,7 @@ impl Default for NodeSystemConfig {
             advertise_address: String::new(),
             heartbeat_interval_secs: default_heartbeat_interval_secs(),
             stale_timeout_secs: default_stale_timeout_secs(),
-            max_nodes: default_max_nodes(),
+            max_nodes: default_node_system_max_nodes(),
             allowed_node_ids: Vec::new(),
             require_auth: true,
             shared_secret: String::new(),
@@ -1276,7 +1276,7 @@ fn default_stale_timeout_secs() -> u64 {
     120
 }
 
-fn default_max_nodes() -> usize {
+fn default_node_system_max_nodes() -> usize {
     32
 }
 

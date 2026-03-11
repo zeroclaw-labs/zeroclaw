@@ -94,7 +94,6 @@ pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
 #[allow(unused_imports)]
->>>>>>> 9dd885a8 (feat(nodes): implement functional multi-machine node system)
 pub use node_tool::NodeTool;
 pub use pdf_read::PdfReadTool;
 pub use proxy_config::ProxyConfigTool;
@@ -394,9 +393,6 @@ pub fn all_tools_with_runtime(
         Some(parent_tools)
     };
 
-<<<<<<< HEAD
-    (boxed_registry_from_arcs(tool_arcs), delegate_handle)
-=======
     // Register NodeTool when multi-machine node system is enabled.
     if root_config.node_system.enabled {
         let node_registry = Arc::new(crate::nodes::NodeRegistry::new(&root_config.node_system));
@@ -404,7 +400,7 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(NodeTool::new(node_client, security.clone())));
     }
 
-    boxed_registry_from_arcs(tool_arcs)
+    (boxed_registry_from_arcs(tool_arcs), delegate_handle)
 }
 
 #[cfg(test)]
