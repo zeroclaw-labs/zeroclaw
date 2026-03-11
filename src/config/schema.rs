@@ -4150,10 +4150,13 @@ fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
 
 fn normalize_wire_api(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "responses" => Some("responses"),
-        "chat_completions" | "chat-completions" | "chat" | "chatcompletions" => {
-            Some("chat_completions")
-        }
+        "responses" | "openai-responses" | "open-ai-responses" => Some("responses"),
+        "chat_completions"
+        | "chat-completions"
+        | "chat"
+        | "chatcompletions"
+        | "openai-chat-completions"
+        | "open-ai-chat-completions" => Some("chat_completions"),
         _ => None,
     }
 }
