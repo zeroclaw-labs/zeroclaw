@@ -387,7 +387,7 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
             return Some(ParsedToolCall {
                 name,
                 arguments,
-                tool_call_id: tool_call_id,
+                tool_call_id,
             });
         }
     }
@@ -409,7 +409,7 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     Some(ParsedToolCall {
         name,
         arguments,
-        tool_call_id: tool_call_id,
+        tool_call_id,
     })
 }
 
@@ -1694,6 +1694,26 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     (text_parts.join("\n"), calls)
 }
 
+/// Strip prompt-guided tool artifacts from visible output while preserving
+/// raw model text in history for future turns.
+fn strip_tool_result_blocks(text: &str) -> String {
+    static TOOL_RESULT_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)<tool_result[^>]*>.*?</tool_result>").unwrap());
+    static THINKING_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)<thinking>.*?</thinking>").unwrap());
+    static TOOL_RESULTS_PREFIX_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^\[Tool results\]\s*\n?").unwrap());
+    static EXCESS_BLANK_LINES_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
+
+    let result = TOOL_RESULT_RE.replace_all(text, "");
+    let result = THINKING_RE.replace_all(&result, "");
+    let result = TOOL_RESULTS_PREFIX_RE.replace_all(&result, "");
+    let result = EXCESS_BLANK_LINES_RE.replace_all(result.trim(), "\n\n");
+
+    result.trim().to_string()
+}
+
 fn detect_tool_call_parse_issue(response: &str, parsed_calls: &[ParsedToolCall]) -> Option<String> {
     if !parsed_calls.is_empty() {
         return None;
@@ -1902,8 +1922,13 @@ async fn execute_one_tool(
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<ToolExecutionOutcome> {
+    let args_summary = {
+        let raw = call_arguments.to_string();
+        if raw.len() > 300 { format!("{}…", &raw[..300]) } else { raw }
+    };
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
+        arguments: Some(args_summary),
     });
     let start = Instant::now();
 
@@ -2320,6 +2345,7 @@ pub(crate) async fn run_tool_call_loop(
         } else {
             parsed_text
         };
+        let display_text = strip_tool_result_blocks(&display_text);
 
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -2625,15 +2651,13 @@ pub(crate) async fn run_tool_call_loop(
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
-        for entry in ordered_results {
-            if let Some((tool_name, tool_call_id, outcome)) = entry {
-                individual_results.push((tool_call_id, outcome.output.clone()));
-                let _ = writeln!(
-                    tool_results,
-                    "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                    tool_name, outcome.output
-                );
-            }
+        for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
+            individual_results.push((tool_call_id, outcome.output.clone()));
+            let _ = writeln!(
+                tool_results,
+                "<tool_result name=\"{}\">\n{}\n</tool_result>",
+                tool_name, outcome.output
+            );
         }
 
         // Add assistant message with tool calls + tool results to history.
@@ -4775,6 +4799,52 @@ Done."#;
         let (text, calls) = parse_tool_calls(response);
         assert!(text.contains("Done."));
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_removes_single_block() {
+        let input = r#"<tool_result name="memory_recall" status="ok">
+{"matches":["hello"]}
+</tool_result>
+Here is my answer."#;
+        assert_eq!(strip_tool_result_blocks(input), "Here is my answer.");
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_removes_multiple_blocks() {
+        let input = r#"<tool_result name="memory_recall" status="ok">
+{"matches":[]}
+</tool_result>
+<tool_result name="shell" status="ok">
+done
+</tool_result>
+Final answer."#;
+        assert_eq!(strip_tool_result_blocks(input), "Final answer.");
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_removes_prefix() {
+        let input =
+            "[Tool results]\n<tool_result name=\"shell\" status=\"ok\">\nok\n</tool_result>\nDone.";
+        assert_eq!(strip_tool_result_blocks(input), "Done.");
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_removes_thinking() {
+        let input = "<thinking>\nLet me think...\n</thinking>\nHere is the answer.";
+        assert_eq!(strip_tool_result_blocks(input), "Here is the answer.");
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_preserves_clean_text() {
+        let input = "Hello, this is a normal response.";
+        assert_eq!(strip_tool_result_blocks(input), input);
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_returns_empty_for_only_tags() {
+        let input = "<tool_result name=\"memory_recall\" status=\"ok\">\n{}\n</tool_result>";
+        assert_eq!(strip_tool_result_blocks(input), "");
     }
 
     #[test]

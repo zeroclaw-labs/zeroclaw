@@ -76,7 +76,7 @@ Ghi chú quét gần đây nhất:
 
 - 2026-02-17: Cache phụ thuộc Rust được migrate từ `Swatinem/rust-cache` sang `useblacksmith/rust-cache`
     - Không cần mẫu allowlist mới (`useblacksmith/*` đã có trong allowlist)
-- 2026-02-16: Phụ thuộc ẩn được phát hiện trong `release.yml`: `sigstore/cosign-installer@...`
+- 2026-02-16: Phụ thuộc ẩn được phát hiện trong `release-beta-on-push.yml`: `sigstore/cosign-installer@...`
     - Đã thêm mẫu allowlist: `sigstore/cosign-installer@*`
 - 2026-02-16: Migration Blacksmith chặn thực thi workflow
     - Đã thêm mẫu allowlist: `useblacksmith/*` cho cơ sở hạ tầng self-hosted runner

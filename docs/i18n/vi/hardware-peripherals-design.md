@@ -277,12 +277,12 @@ JSON đơn giản qua serial cho các board không hỗ trợ gRPC:
 ### Phase 6: Edge-Native — ESP32
 
 - [x] ESP32 qua Host-Mediated (serial transport) — cùng giao thức JSON như STM32
-- [x] Crate firmware `zeroclaw-esp32` (`firmware/zeroclaw-esp32`) — GPIO qua UART
+- [x] Crate firmware `esp32` (`firmware/esp32`) — GPIO qua UART
 - [x] ESP32 trong hardware registry (CH340 VID/PID)
 - [ ] ZeroClaw *chạy trực tiếp trên* ESP32 (WiFi + LLM, edge-native) — tương lai
 - [ ] Thực thi Wasm hoặc dựa trên template cho logic do LLM tạo ra
 
-**Cách dùng:** Nạp `firmware/zeroclaw-esp32` vào ESP32, thêm `board = "esp32"`, `transport = "serial"`, `path = "/dev/ttyUSB0"` vào config.
+**Cách dùng:** Nạp `firmware/esp32` vào ESP32, thêm `board = "esp32"`, `transport = "serial"`, `path = "/dev/ttyUSB0"` vào config.
 
 ### Phase 7: Thực thi động (Code do LLM tạo ra)
 

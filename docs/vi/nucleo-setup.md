@@ -41,7 +41,7 @@ ZeroClaw bao gồm mọi thứ cần thiết cho Nucleo-F401RE:
 
 | Thành phần | Vị trí | Mục đích |
 |------------|--------|---------|
-| Firmware | `firmware/zeroclaw-nucleo/` | Embassy Rust — USART2 (115200), gpio_read, gpio_write |
+| Firmware | `firmware/nucleo/` | Embassy Rust — USART2 (115200), gpio_read, gpio_write |
 | Serial peripheral | `src/peripherals/serial.rs` | Giao thức JSON-over-serial (giống Arduino/ESP32) |
 | Flash command | `zeroclaw peripheral flash-nucleo` | Build firmware, nạp qua probe-rs |
 
@@ -72,14 +72,14 @@ Từ thư mục gốc của repo zeroclaw:
 zeroclaw peripheral flash-nucleo
 ```
 
-Lệnh này build `firmware/zeroclaw-nucleo` và chạy `probe-rs run --chip STM32F401RETx`. Firmware chạy ngay sau khi nạp xong.
+Lệnh này build `firmware/nucleo` và chạy `probe-rs run --chip STM32F401RETx`. Firmware chạy ngay sau khi nạp xong.
 
 ### 1.3 Nạp thủ công (Phương án thay thế)
 
 ```bash
-cd firmware/zeroclaw-nucleo
+cd firmware/nucleo
 cargo build --release --target thumbv7em-none-eabihf
-probe-rs run --chip STM32F401RETx target/thumbv7em-none-eabihf/release/zeroclaw-nucleo
+probe-rs run --chip STM32F401RETx target/thumbv7em-none-eabihf/release/nucleo
 ```
 
 ---

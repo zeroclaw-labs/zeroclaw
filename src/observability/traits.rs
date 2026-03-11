@@ -40,7 +40,7 @@ pub enum ObserverEvent {
         cost_usd: Option<f64>,
     },
     /// A tool call is about to be executed.
-    ToolCallStart { tool: String },
+    ToolCallStart { tool: String, arguments: Option<String> },
     /// A tool call has completed with a success/failure outcome.
     ToolCall {
         tool: String,
