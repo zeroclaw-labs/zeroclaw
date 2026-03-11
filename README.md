@@ -1,12 +1,18 @@
+<h1 align="center">🦀 ZeroClaw — Private AI Assistant</h1>
+
 <p align="center">
-  <img src="zeroclaw.png" alt="ZeroClaw" width="200" />
+  <img src="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/dev/docs/assets/zeroclaw-banner.png" alt="ZeroClaw banner" width="800" />
 </p>
 
-<h1 align="center">ZeroClaw 🦀</h1>
+<p align="center">
+  <strong>The hardened control plane for autonomous entities. Secured via local bridge. Performance without compromise.</strong><br>
+  <strong>Zero overhead. Zero compromise. 100% agnostic.</strong>
+</p>
 
 <p align="center">
-  <strong>Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.</strong><br>
-  ⚡️ <strong>Runs on $10 hardware with <5MB RAM: That's 99% less memory than OpenClaw and 98% cheaper than a Mac mini!</strong>
+  ZeroClaw is a next-generation AI assistant infrastructure: ultra-lightweight, blazing fast, memory-safe, and built for production.<br>
+  Deploy anywhere, swap anything. Runs on any hardware with <5MB RAM — trait-driven architecture, secure by default.<br>
+  99% less memory than OpenClaw · 98% cheaper than a Mac mini.
 </p>
 
 <p align="center">
@@ -25,7 +31,38 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 </p>
 
 <p align="center">
-  🌐 <strong>Languages:</strong> <a href="README.md">English</a> · <a href="docs/i18n/zh-CN/README.md">简体中文</a> · <a href="docs/i18n/ja/README.md">日本語</a> · <a href="docs/i18n/ru/README.md">Русский</a> · <a href="docs/i18n/fr/README.md">Français</a> · <a href="docs/i18n/vi/README.md">Tiếng Việt</a> · <a href="docs/i18n/el/README.md">Ελληνικά</a>
+  🌐 <strong>Languages:</strong>
+  <a href="README.md">🇺🇸 English</a> ·
+  <a href="README.zh-CN.md">🇨🇳 简体中文</a> ·
+  <a href="README.ja.md">🇯🇵 日本語</a> ·
+  <a href="README.ko.md">🇰🇷 한국어</a> ·
+  <a href="README.vi.md">🇻🇳 Tiếng Việt</a> ·
+  <a href="README.tl.md">🇵🇭 Tagalog</a> ·
+  <a href="README.es.md">🇪🇸 Español</a> ·
+  <a href="README.pt.md">🇧🇷 Português</a> ·
+  <a href="README.it.md">🇮🇹 Italiano</a> ·
+  <a href="README.de.md">🇩🇪 Deutsch</a> ·
+  <a href="README.fr.md">🇫🇷 Français</a> ·
+  <a href="README.ar.md">🇸🇦 العربية</a> ·
+  <a href="README.hi.md">🇮🇳 हिन्दी</a> ·
+  <a href="README.ru.md">🇷🇺 Русский</a> ·
+  <a href="README.bn.md">🇧🇩 বাংলা</a> ·
+  <a href="README.he.md">🇮🇱 עברית</a> ·
+  <a href="README.pl.md">🇵🇱 Polski</a> ·
+  <a href="README.cs.md">🇨🇿 Čeština</a> ·
+  <a href="README.nl.md">🇳🇱 Nederlands</a> ·
+  <a href="README.tr.md">🇹🇷 Türkçe</a> ·
+  <a href="README.uk.md">🇺🇦 Українська</a> ·
+  <a href="README.id.md">🇮🇩 Bahasa Indonesia</a> ·
+  <a href="README.th.md">🇹🇭 ไทย</a> ·
+  <a href="README.ur.md">🇵🇰 اردو</a> ·
+  <a href="README.ro.md">🇷🇴 Română</a> ·
+  <a href="README.sv.md">🇸🇪 Svenska</a> ·
+  <a href="README.el.md">🇬🇷 Ελληνικά</a> ·
+  <a href="README.hu.md">🇭🇺 Magyar</a> ·
+  <a href="README.fi.md">🇫🇮 Suomi</a> ·
+  <a href="README.da.md">🇩🇰 Dansk</a> ·
+  <a href="README.nb.md">🇳🇴 Norsk</a>
 </p>
 
 <p align="center">
@@ -147,7 +184,7 @@ Local machine quick benchmark (macOS arm64, Feb 2026) normalized for 0.8GHz edge
 | **RAM**                   | > 1GB         | > 100MB        | < 10MB          | **< 5MB**            |
 | **Startup (0.8GHz core)** | > 500s        | > 30s          | < 1s            | **< 10ms**           |
 | **Binary Size**           | ~28MB (dist)  | N/A (Scripts)  | ~8MB            | **~8.8 MB**          |
-| **Cost**                  | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | **Any hardware $10** |
+| **Cost**                  | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | **Any hardware** |
 
 > Notes: ZeroClaw results are measured on release builds using `/usr/bin/time -l`. OpenClaw requires Node.js runtime (typically ~390MB additional memory overhead), while NanoBot requires Python runtime. PicoClaw and ZeroClaw are static binaries. The RAM figures above are runtime memory; build-time compilation requirements are higher.
 
