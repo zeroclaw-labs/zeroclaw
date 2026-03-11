@@ -216,6 +216,7 @@ impl NevisAuthProvider {
     /// falling back to the remote introspection endpoint (which would hide a
     /// misconfiguration), this returns an explicit error directing the operator
     /// to use `token_validation = "remote"` until local JWKS support is added.
+    #[allow(clippy::unused_async)] // Will use async when JWKS validation is implemented
     async fn validate_token_local(&self, token: &str) -> Result<NevisIdentity> {
         // JWT structure check: header.payload.signature
         let parts: Vec<&str> = token.split('.').collect();
@@ -474,7 +475,7 @@ mod tests {
             roles: vec!["admin".into(), "operator".into()],
             scopes: vec!["openid".into(), "profile".into()],
             mfa_verified: true,
-            session_expiry: 1700000000,
+            session_expiry: 1_700_000_000,
         };
 
         let json = serde_json::to_string(&identity).unwrap();
