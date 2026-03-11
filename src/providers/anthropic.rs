@@ -1543,7 +1543,10 @@ mod tests {
         // Cache should land on the Text block, not be silently dropped.
         match &messages[0].content[0] {
             NativeContentOut::Text { cache_control, .. } => {
-                assert!(cache_control.is_some(), "Text block should have cache control");
+                assert!(
+                    cache_control.is_some(),
+                    "Text block should have cache control"
+                );
             }
             _ => panic!("Expected Text variant"),
         }
