@@ -1,0 +1,210 @@
+name: Release Stable
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Stable version to release (e.g. 0.2.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: promote-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  validate:
+    name: Validate Version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Validate semver and Cargo.toml match
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          input_version="${{ inputs.version }}"
+          cargo_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+
+          if [[ ! "$input_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version must be semver (X.Y.Z). Got: ${input_version}"
+            exit 1
+          fi
+
+          if [[ "$cargo_version" != "$input_version" ]]; then
+            echo "::error::Cargo.toml version (${cargo_version}) does not match input (${input_version}). Bump Cargo.toml first."
+            exit 1
+          fi
+
+          tag="v${input_version}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "::error::Tag ${tag} already exists."
+            exit 1
+          fi
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+  web:
+    name: Build Web Dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build web dashboard
+        run: cd web && npm ci && npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+          retention-days: 1
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [validate, web]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: zeroclaw
+            ext: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: zeroclaw
+            ext: tar.gz
+            cross_compiler: gcc-aarch64-linux-gnu
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
+            linker: aarch64-linux-gnu-gcc
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: zeroclaw
+            ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: zeroclaw.exe
+            ext: zip
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.92.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        if: runner.os != 'Windows'
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: web-dist
+          path: web/dist/
+
+      - name: Install cross compiler
+        if: matrix.cross_compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ${{ matrix.cross_compiler }}
+
+      - name: Build release
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
+            export "${{ matrix.linker_env }}=${{ matrix.linker }}"
+          fi
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zeroclaw-${{ matrix.target }}
+          path: zeroclaw-${{ matrix.target }}.${{ matrix.ext }}
+          retention-days: 14
+
+  publish:
+    name: Publish Stable Release
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          path: artifacts
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec sha256sum {} + | sed 's|  \./[^/]*/|  |' > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+        with:
+          tag_name: ${{ needs.validate.outputs.tag }}
+          name: ${{ needs.validate.outputs.tag }}
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    name: Push Docker Image
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -40,7 +40,7 @@ impl Tool for UnoQGpioReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read GPIO pin value (0 or 1) on Arduino Uno Q. Requires zeroclaw-uno-q-bridge app running."
+        "Read GPIO pin value (0 or 1) on Arduino Uno Q. Requires uno-q-bridge app running."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -96,7 +96,7 @@ impl Tool for UnoQGpioWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Set GPIO pin high (1) or low (0) on Arduino Uno Q. Requires zeroclaw-uno-q-bridge app running."
+        "Set GPIO pin high (1) or low (0) on Arduino Uno Q. Requires uno-q-bridge app running."
     }
 
     fn parameters_schema(&self) -> Value {

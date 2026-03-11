@@ -53,8 +53,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     while let Some(msg) = receiver.next().await {
         let msg = match msg {
             Ok(Message::Text(text)) => text,
-            Ok(Message::Close(_)) => break,
-            Err(_) => break,
+            Ok(Message::Close(_)) | Err(_) => break,
             _ => continue,
         };
 

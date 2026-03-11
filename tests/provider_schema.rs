@@ -292,7 +292,7 @@ fn provider_construction_with_different_auth_styles() {
 
 #[test]
 fn chat_messages_maintain_role_sequence() {
-    let history = vec![
+    let history = [
         ChatMessage::system("You are helpful"),
         ChatMessage::user("What is Rust?"),
         ChatMessage::assistant("Rust is a systems programming language"),
@@ -309,7 +309,7 @@ fn chat_messages_maintain_role_sequence() {
 
 #[test]
 fn chat_messages_with_tool_calls_maintain_sequence() {
-    let history = vec![
+    let history = [
         ChatMessage::system("You are helpful"),
         ChatMessage::user("Search for Rust"),
         ChatMessage::assistant("I'll search for that"),

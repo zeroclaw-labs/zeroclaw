@@ -72,6 +72,72 @@ pub(crate) mod util;
 
 pub use config::Config;
 
+/// Gateway management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GatewayCommands {
+    /// Start the gateway server (default if no subcommand specified)
+    #[command(long_about = "\
+Start the gateway server (webhooks, websockets).
+
+Runs the HTTP/WebSocket gateway that accepts incoming webhook events \
+and WebSocket connections. Bind address defaults to the values in \
+your config file (gateway.host / gateway.port).
+
+Examples:
+  zeroclaw gateway start              # use config defaults
+  zeroclaw gateway start -p 8080      # listen on port 8080
+  zeroclaw gateway start --host 0.0.0.0   # requires [gateway].allow_public_bind=true or a tunnel
+  zeroclaw gateway start -p 0         # random available port")]
+    Start {
+        /// Port to listen on (use 0 for random available port); defaults to config gateway.port
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Host to bind to; defaults to config gateway.host
+        /// Note: Binding to 0.0.0.0 requires `gateway.allow_public_bind = true` in config
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Restart the gateway server
+    #[command(long_about = "\
+Restart the gateway server.
+
+Stops the running gateway if present, then starts a new instance \
+with the current configuration.
+
+Examples:
+  zeroclaw gateway restart            # restart with config defaults
+  zeroclaw gateway restart -p 8080    # restart on port 8080")]
+    Restart {
+        /// Port to listen on (use 0 for random available port); defaults to config gateway.port
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Host to bind to; defaults to config gateway.host
+        /// Note: Binding to 0.0.0.0 requires `gateway.allow_public_bind = true` in config
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Show or generate the pairing code without restarting
+    #[command(long_about = "\
+Show or generate the gateway pairing code.
+
+Displays the pairing code for connecting new clients without \
+restarting the gateway. Requires the gateway to be running.
+
+With --new, generates a fresh pairing code even if the gateway \
+was previously paired (useful for adding additional clients).
+
+Examples:
+  zeroclaw gateway get-paircode       # show current pairing code
+  zeroclaw gateway get-paircode --new # generate a new pairing code")]
+    GetPaircode {
+        /// Generate a new pairing code (even if already paired)
+        #[arg(long)]
+        new: bool,
+    },
+}
+
 /// Service management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ServiceCommands {

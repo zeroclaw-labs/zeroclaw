@@ -342,9 +342,12 @@ pub(crate) async fn deliver_announcement(
                 .ok_or_else(|| anyhow::anyhow!("slack channel not configured"))?;
             let channel = SlackChannel::new(
                 sl.bot_token.clone(),
+                sl.app_token.clone(),
                 sl.channel_id.clone(),
+                Vec::new(),
                 sl.allowed_users.clone(),
-            );
+            )
+            .with_workspace_dir(config.workspace_dir.clone());
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "mattermost" => {

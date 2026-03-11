@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="zeroclaw.png" alt="ZeroClaw" width="200" />
+  <img src="docs/assets/zeroclaw.png" alt="ZeroClaw" width="200" />
 </p>
 
 <h1 align="center">ZeroClaw 🦀</h1>
@@ -25,12 +25,43 @@ Construit par des étudiants et membres des communautés Harvard, MIT et Sundai.
 </p>
 
 <p align="center">
-  🌐 <strong>Langues :</strong> <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.ru.md">Русский</a> · <a href="README.fr.md">Français</a> · <a href="README.vi.md">Tiếng Việt</a>
+  🌐 <strong>Langues :</strong>
+  <a href="README.md">🇺🇸 English</a> ·
+  <a href="README.zh-CN.md">🇨🇳 简体中文</a> ·
+  <a href="README.ja.md">🇯🇵 日本語</a> ·
+  <a href="README.ko.md">🇰🇷 한국어</a> ·
+  <a href="README.vi.md">🇻🇳 Tiếng Việt</a> ·
+  <a href="README.tl.md">🇵🇭 Tagalog</a> ·
+  <a href="README.es.md">🇪🇸 Español</a> ·
+  <a href="README.pt.md">🇧🇷 Português</a> ·
+  <a href="README.it.md">🇮🇹 Italiano</a> ·
+  <a href="README.de.md">🇩🇪 Deutsch</a> ·
+  <a href="README.fr.md">🇫🇷 Français</a> ·
+  <a href="README.ar.md">🇸🇦 العربية</a> ·
+  <a href="README.hi.md">🇮🇳 हिन्दी</a> ·
+  <a href="README.ru.md">🇷🇺 Русский</a> ·
+  <a href="README.bn.md">🇧🇩 বাংলা</a> ·
+  <a href="README.he.md">🇮🇱 עברית</a> ·
+  <a href="README.pl.md">🇵🇱 Polski</a> ·
+  <a href="README.cs.md">🇨🇿 Čeština</a> ·
+  <a href="README.nl.md">🇳🇱 Nederlands</a> ·
+  <a href="README.tr.md">🇹🇷 Türkçe</a> ·
+  <a href="README.uk.md">🇺🇦 Українська</a> ·
+  <a href="README.id.md">🇮🇩 Bahasa Indonesia</a> ·
+  <a href="README.th.md">🇹🇭 ไทย</a> ·
+  <a href="README.ur.md">🇵🇰 اردو</a> ·
+  <a href="README.ro.md">🇷🇴 Română</a> ·
+  <a href="README.sv.md">🇸🇪 Svenska</a> ·
+  <a href="README.el.md">🇬🇷 Ελληνικά</a> ·
+  <a href="README.hu.md">🇭🇺 Magyar</a> ·
+  <a href="README.fi.md">🇫🇮 Suomi</a> ·
+  <a href="README.da.md">🇩🇰 Dansk</a> ·
+  <a href="README.nb.md">🇳🇴 Norsk</a>
 </p>
 
 <p align="center">
   <a href="#démarrage-rapide">Démarrage</a> |
-  <a href="bootstrap.sh">Configuration en un clic</a> |
+  <a href="install.sh">Configuration en un clic</a> |
   <a href="docs/README.md">Hub Documentation</a> |
   <a href="docs/SUMMARY.md">Table des matières Documentation</a>
 </p>
@@ -38,8 +69,8 @@ Construit par des étudiants et membres des communautés Harvard, MIT et Sundai.
 <p align="center">
   <strong>Accès rapides :</strong>
   <a href="docs/reference/README.md">Référence</a> ·
-  <a href="docs/operations/README.md">Opérations</a> ·
-  <a href="docs/troubleshooting.md">Dépannage</a> ·
+  <a href="docs/ops/README.md">Opérations</a> ·
+  <a href="docs/ops/troubleshooting.md">Dépannage</a> ·
   <a href="docs/security/README.md">Sécurité</a> ·
   <a href="docs/hardware/README.md">Matériel</a> ·
   <a href="docs/contributing/README.md">Contribuer</a>
@@ -95,7 +126,7 @@ Benchmark rapide sur machine locale (macOS arm64, fév. 2026) normalisé pour ma
 > Notes : Les résultats ZeroClaw sont mesurés sur des builds de production utilisant `/usr/bin/time -l`. OpenClaw nécessite le runtime Node.js (typiquement ~390 Mo de surcharge mémoire supplémentaire), tandis que NanoBot nécessite le runtime Python. PicoClaw et ZeroClaw sont des binaires statiques. Les chiffres RAM ci-dessus sont la mémoire runtime ; les exigences de compilation build-time sont plus élevées.
 
 <p align="center">
-  <img src="zero-claw.jpeg" alt="Comparaison ZeroClaw vs OpenClaw" width="800" />
+  <img src="docs/assets/zeroclaw-comparison.jpeg" alt="Comparaison ZeroClaw vs OpenClaw" width="800" />
 </p>
 
 ### Mesure locale reproductible
@@ -188,10 +219,10 @@ Exemple d'échantillon (macOS arm64, mesuré le 18 février 2026) :
 
 ### Option 1 : Configuration automatisée (recommandée)
 
-Le script `bootstrap.sh` installe Rust, clone ZeroClaw, le compile, et configure votre environnement de développement initial :
+Le script `install.sh` installe Rust, clone ZeroClaw, le compile, et configure votre environnement de développement initial :
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/install.sh | bash
 ```
 
 Ceci va :
@@ -247,9 +278,9 @@ Une fois installé (via bootstrap ou manuellement), vous devriez voir :
 **Prochaines étapes :**
 
 1. Configurez vos fournisseurs d'IA dans `~/.zeroclaw/workspace/config.toml`
-2. Consultez la [référence de configuration](docs/config-reference.md) pour les options avancées
+2. Consultez la [référence de configuration](docs/reference/api/config-reference.md) pour les options avancées
 3. Lancez l'agent : `zeroclaw agent start`
-4. Testez via votre canal préféré (voir [référence des canaux](docs/channels-reference.md))
+4. Testez via votre canal préféré (voir [référence des canaux](docs/reference/api/channels-reference.md))
 
 ## Configuration
 
@@ -285,10 +316,10 @@ kind = "native"    # ou "docker" (nécessite Docker)
 
 **Documents de référence complets :**
 
-- [Référence de Configuration](docs/config-reference.md) — tous les paramètres, validations, valeurs par défaut
-- [Référence des Fournisseurs](docs/providers-reference.md) — configurations spécifiques aux fournisseurs d'IA
-- [Référence des Canaux](docs/channels-reference.md) — Telegram, Matrix, Slack, Discord et plus
-- [Opérations](docs/operations-runbook.md) — surveillance en production, rotation des secrets, mise à l'échelle
+- [Référence de Configuration](docs/reference/api/config-reference.md) — tous les paramètres, validations, valeurs par défaut
+- [Référence des Fournisseurs](docs/reference/api/providers-reference.md) — configurations spécifiques aux fournisseurs d'IA
+- [Référence des Canaux](docs/reference/api/channels-reference.md) — Telegram, Matrix, Slack, Discord et plus
+- [Opérations](docs/ops/operations-runbook.md) — surveillance en production, rotation des secrets, mise à l'échelle
 
 ### Support Runtime (actuel)
 
@@ -297,7 +328,7 @@ ZeroClaw prend en charge deux backends d'exécution de code :
 - **`native`** (par défaut) — exécution de processus directe, chemin le plus rapide, idéal pour les environnements de confiance
 - **`docker`** — isolation complète du conteneur, politiques de sécurité renforcées, nécessite Docker
 
-Utilisez `runtime.kind = "docker"` si vous avez besoin d'un sandboxing strict ou de l'isolation réseau. Voir [référence de configuration](docs/config-reference.md#runtime) pour les détails complets.
+Utilisez `runtime.kind = "docker"` si vous avez besoin d'un sandboxing strict ou de l'isolation réseau. Voir [référence de configuration](docs/reference/api/config-reference.md#runtime) pour les détails complets.
 
 ## Commandes
 
@@ -331,7 +362,7 @@ zeroclaw doctor              # Exécute les vérifications de santé du système
 zeroclaw version             # Affiche la version et les informations de build
 ```
 
-Voir [Référence des Commandes](docs/commands-reference.md) pour les options et exemples complets.
+Voir [Référence des Commandes](docs/reference/cli/commands-reference.md) pour les options et exemples complets.
 
 ## Architecture
 
@@ -378,7 +409,7 @@ Voir [Référence des Commandes](docs/commands-reference.md) pour les options et
 - Le runtime abstrait l'exécution de code (natif ou Docker)
 - Aucun verrouillage de fournisseur — échangez Anthropic ↔ OpenAI ↔ Gemini ↔ Ollama sans changement de code
 
-Voir [documentation architecture](docs/architecture.svg) pour les diagrammes détaillés et les détails d'implémentation.
+Voir [documentation architecture](docs/assets/architecture.svg) pour les diagrammes détaillés et les détails d'implémentation.
 
 ## Exemples
 
@@ -412,7 +443,7 @@ device_name = "zeroclaw-prod"
 e2ee_enabled = true
 ```
 
-Invitez `@zeroclaw:matrix.org` dans une salle chiffrée, et le bot répondra avec le chiffrement complet. Voir [Guide Matrix E2EE](docs/matrix-e2ee-guide.md) pour la configuration de vérification de dispositif.
+Invitez `@zeroclaw:matrix.org` dans une salle chiffrée, et le bot répondra avec le chiffrement complet. Voir [Guide Matrix E2EE](docs/security/matrix-e2ee-guide.md) pour la configuration de vérification de dispositif.
 
 ### Multi-Fournisseur
 
@@ -451,7 +482,7 @@ kind = "markdown"
 path = "~/.zeroclaw/workspace/memory/"
 ```
 
-Voir [Référence de Configuration](docs/config-reference.md#memory) pour toutes les options mémoire.
+Voir [Référence de Configuration](docs/reference/api/config-reference.md#memory) pour toutes les options mémoire.
 
 ## Support de Fournisseur
 
@@ -480,7 +511,7 @@ model = "your-model-name"
 
 Exemple : utilisez [LiteLLM](https://github.com/BerriAI/litellm) comme proxy pour accéder à n'importe quel LLM via l'interface OpenAI.
 
-Voir [Référence des Fournisseurs](docs/providers-reference.md) pour les détails de configuration complets.
+Voir [Référence des Fournisseurs](docs/reference/api/providers-reference.md) pour les détails de configuration complets.
 
 ## Support de Canal
 
@@ -494,7 +525,7 @@ Voir [Référence des Fournisseurs](docs/providers-reference.md) pour les détai
 | **CLI**      | ✅ Stable   | Aucun                    | Interface conversationnelle directe                       |
 | **Web**      | 🚧 Planifié | Clé API ou OAuth         | Interface de chat basée navigateur                        |
 
-Voir [Référence des Canaux](docs/channels-reference.md) pour les instructions de configuration complètes.
+Voir [Référence des Canaux](docs/reference/api/channels-reference.md) pour les instructions de configuration complètes.
 
 ## Support d'Outil
 
@@ -522,7 +553,7 @@ kind = "docker"
 allowed_tools = ["bash", "python", "filesystem_read"]  # Liste d'autorisation explicite
 ```
 
-Voir [Référence de Configuration](docs/config-reference.md#runtime) pour les options de sécurité complètes.
+Voir [Référence de Configuration](docs/reference/api/config-reference.md#runtime) pour les options de sécurité complètes.
 
 ## Déploiement
 
@@ -557,7 +588,7 @@ sudo systemctl status zeroclaw-daemon
 sudo systemctl status zeroclaw-agent
 ```
 
-Voir [Guide de Déploiement Réseau](docs/network-deployment.md) pour les instructions de déploiement en production complètes.
+Voir [Guide de Déploiement Réseau](docs/ops/network-deployment.md) pour les instructions de déploiement en production complètes.
 
 ### Docker
 
@@ -600,7 +631,7 @@ Fournisseurs de tunnel supportés :
 - **Ngrok** — configuration rapide, domaines personnalisés (plan payant)
 - **Tailscale** — réseau maillé privé, pas de port public
 
-Voir [Référence de Configuration](docs/config-reference.md#tunnel) pour les options de configuration complètes.
+Voir [Référence de Configuration](docs/reference/api/config-reference.md#tunnel) pour les options de configuration complètes.
 
 ## Sécurité
 
@@ -659,7 +690,7 @@ max_size_mb = 100                        # Pour rotation basée sur la taille
 retention_days = 30                      # Purge automatique après N jours
 ```
 
-Voir [Référence de Configuration](docs/config-reference.md#logging) pour toutes les options de journalisation.
+Voir [Référence de Configuration](docs/reference/api/config-reference.md#logging) pour toutes les options de journalisation.
 
 ### Métriques (Planifié)
 
@@ -776,32 +807,32 @@ Commencez par le hub de documentation pour une carte basée sur les tâches :
 
 - Hub de documentation : [`docs/README.md`](docs/README.md)
 - Table des matières unifiée docs : [`docs/SUMMARY.md`](docs/SUMMARY.md)
-- Référence des commandes : [`docs/commands-reference.md`](docs/commands-reference.md)
-- Référence de configuration : [`docs/config-reference.md`](docs/config-reference.md)
-- Référence des fournisseurs : [`docs/providers-reference.md`](docs/providers-reference.md)
-- Référence des canaux : [`docs/channels-reference.md`](docs/channels-reference.md)
-- Runbook des opérations : [`docs/operations-runbook.md`](docs/operations-runbook.md)
-- Dépannage : [`docs/troubleshooting.md`](docs/troubleshooting.md)
-- Inventaire/classification docs : [`docs/docs-inventory.md`](docs/docs-inventory.md)
-- Instantané triage PR/Issue (au 18 février 2026) : [`docs/project-triage-snapshot-2026-02-18.md`](docs/project-triage-snapshot-2026-02-18.md)
+- Référence des commandes : [`docs/reference/cli/commands-reference.md`](docs/reference/cli/commands-reference.md)
+- Référence de configuration : [`docs/reference/api/config-reference.md`](docs/reference/api/config-reference.md)
+- Référence des fournisseurs : [`docs/reference/api/providers-reference.md`](docs/reference/api/providers-reference.md)
+- Référence des canaux : [`docs/reference/api/channels-reference.md`](docs/reference/api/channels-reference.md)
+- Runbook des opérations : [`docs/ops/operations-runbook.md`](docs/ops/operations-runbook.md)
+- Dépannage : [`docs/ops/troubleshooting.md`](docs/ops/troubleshooting.md)
+- Inventaire/classification docs : [`docs/maintainers/docs-inventory.md`](docs/maintainers/docs-inventory.md)
+- Instantané triage PR/Issue (au 18 février 2026) : [`docs/maintainers/project-triage-snapshot-2026-02-18.md`](docs/maintainers/project-triage-snapshot-2026-02-18.md)
 
 Références de collaboration principales :
 
 - Hub de documentation : [docs/README.md](docs/README.md)
-- Modèle de documentation : [docs/doc-template.md](docs/doc-template.md)
+- Modèle de documentation : [docs/contributing/doc-template.md](docs/contributing/doc-template.md)
 - Checklist de modification de documentation : [docs/README.md#4-documentation-change-checklist](docs/README.md#4-documentation-change-checklist)
-- Référence de configuration des canaux : [docs/channels-reference.md](docs/channels-reference.md)
-- Opérations de salles chiffrées Matrix : [docs/matrix-e2ee-guide.md](docs/matrix-e2ee-guide.md)
+- Référence de configuration des canaux : [docs/reference/api/channels-reference.md](docs/reference/api/channels-reference.md)
+- Opérations de salles chiffrées Matrix : [docs/security/matrix-e2ee-guide.md](docs/security/matrix-e2ee-guide.md)
 - Guide de contribution : [CONTRIBUTING.md](CONTRIBUTING.md)
-- Politique de workflow PR : [docs/pr-workflow.md](docs/pr-workflow.md)
-- Playbook du relecteur (triage + revue approfondie) : [docs/reviewer-playbook.md](docs/reviewer-playbook.md)
-- Carte de propriété et triage CI : [docs/ci-map.md](docs/ci-map.md)
+- Politique de workflow PR : [docs/contributing/pr-workflow.md](docs/contributing/pr-workflow.md)
+- Playbook du relecteur (triage + revue approfondie) : [docs/contributing/reviewer-playbook.md](docs/contributing/reviewer-playbook.md)
+- Carte de propriété et triage CI : [docs/contributing/ci-map.md](docs/contributing/ci-map.md)
 - Politique de divulgation de sécurité : [SECURITY.md](SECURITY.md)
 
 Pour le déploiement et les opérations runtime :
 
-- Guide de déploiement réseau : [docs/network-deployment.md](docs/network-deployment.md)
-- Playbook d'agent proxy : [docs/proxy-agent-playbook.md](docs/proxy-agent-playbook.md)
+- Guide de déploiement réseau : [docs/ops/network-deployment.md](docs/ops/network-deployment.md)
+- Playbook d'agent proxy : [docs/ops/proxy-agent-playbook.md](docs/ops/proxy-agent-playbook.md)
 
 ## Soutenir ZeroClaw
 
@@ -826,7 +857,7 @@ Nous construisons en open source parce que les meilleures idées viennent de par
 
 > <https://github.com/zeroclaw-labs/zeroclaw>
 
-Tout autre dépôt, organisation, domaine ou package prétendant être "ZeroClaw" ou impliquant une affiliation avec ZeroClaw Labs est **non autorisé et non affilié à ce projet**. Les forks non autorisés connus seront listés dans [TRADEMARK.md](TRADEMARK.md).
+Tout autre dépôt, organisation, domaine ou package prétendant être "ZeroClaw" ou impliquant une affiliation avec ZeroClaw Labs est **non autorisé et non affilié à ce projet**. Les forks non autorisés connus seront listés dans [TRADEMARK.md](docs/maintainers/trademark.md).
 
 Si vous rencontrez une usurpation d'identité ou une utilisation abusive de marque, veuillez [ouvrir une issue](https://github.com/zeroclaw-labs/zeroclaw/issues).
 
@@ -841,11 +872,11 @@ ZeroClaw est sous double licence pour une ouverture maximale et la protection de
 | [MIT](LICENSE-MIT)               | Open-source, recherche, académique, usage personnel          |
 | [Apache 2.0](LICENSE-APACHE) | Protection de brevet, institutionnel, déploiement commercial |
 
-Vous pouvez choisir l'une ou l'autre licence. **Les contributeurs accordent automatiquement des droits sous les deux** — voir [CLA.md](CLA.md) pour l'accord de contributeur complet.
+Vous pouvez choisir l'une ou l'autre licence. **Les contributeurs accordent automatiquement des droits sous les deux** — voir [CLA.md](docs/contributing/cla.md) pour l'accord de contributeur complet.
 
 ### Marque
 
-Le nom **ZeroClaw** et le logo sont des marques déposées de ZeroClaw Labs. Cette licence n'accorde pas la permission de les utiliser pour impliquer une approbation ou une affiliation. Voir [TRADEMARK.md](TRADEMARK.md) pour les utilisations permises et interdites.
+Le nom **ZeroClaw** et le logo sont des marques déposées de ZeroClaw Labs. Cette licence n'accorde pas la permission de les utiliser pour impliquer une approbation ou une affiliation. Voir [TRADEMARK.md](docs/maintainers/trademark.md) pour les utilisations permises et interdites.
 
 ### Protections des Contributeurs
 
@@ -856,9 +887,9 @@ Le nom **ZeroClaw** et le logo sont des marques déposées de ZeroClaw Labs. Cet
 
 ## Contribuer
 
-Voir [CONTRIBUTING.md](CONTRIBUTING.md) et [CLA.md](CLA.md). Implémentez un trait, soumettez une PR :
+Voir [CONTRIBUTING.md](CONTRIBUTING.md) et [CLA.md](docs/contributing/cla.md). Implémentez un trait, soumettez une PR :
 
-- Guide de workflow CI : [docs/ci-map.md](docs/ci-map.md)
+- Guide de workflow CI : [docs/contributing/ci-map.md](docs/contributing/ci-map.md)
 - Nouveau `Provider` → `src/providers/`
 - Nouveau `Channel` → `src/channels/`
 - Nouveau `Observer` → `src/observability/`
