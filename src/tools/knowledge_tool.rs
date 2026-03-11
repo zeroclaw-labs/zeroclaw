@@ -162,10 +162,7 @@ impl KnowledgeTool {
     }
 
     fn handle_search(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
-        let query = args
-            .get("query")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
 
         // Apply optional filters.
         let filter_tags: Vec<String> = args
@@ -199,9 +196,7 @@ impl KnowledgeTool {
                 nodes.retain(|n| &n.node_type == nt);
             }
             if let Some(proj) = filter_project {
-                nodes.retain(|n| {
-                    n.source_project.as_deref() == Some(proj)
-                });
+                nodes.retain(|n| n.source_project.as_deref() == Some(proj));
             }
             nodes
                 .into_iter()
@@ -216,14 +211,11 @@ impl KnowledgeTool {
             }
             // Post-filter by project if specified.
             if let Some(proj) = filter_project {
-                search_results.retain(|r| {
-                    r.node.source_project.as_deref() == Some(proj)
-                });
+                search_results.retain(|r| r.node.source_project.as_deref() == Some(proj));
             }
             // Post-filter by tags if specified.
             if !filter_tags.is_empty() {
-                search_results
-                    .retain(|r| filter_tags.iter().all(|t| r.node.tags.contains(t)));
+                search_results.retain(|r| filter_tags.iter().all(|t| r.node.tags.contains(t)));
             }
 
             search_results
@@ -381,10 +373,7 @@ impl KnowledgeTool {
         let mut lessons: Vec<serde_json::Value> = Vec::new();
         for sentence in &sentences {
             let lower = sentence.to_ascii_lowercase();
-            let score: f64 = signal_words
-                .iter()
-                .filter(|w| lower.contains(**w))
-                .count() as f64;
+            let score: f64 = signal_words.iter().filter(|w| lower.contains(**w)).count() as f64;
             if score > 0.0 {
                 lessons.push(json!({
                     "text": sentence,

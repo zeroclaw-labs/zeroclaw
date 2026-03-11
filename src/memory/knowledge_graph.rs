@@ -213,8 +213,7 @@ impl KnowledgeGraph {
         let conn = self.conn.lock();
 
         // Enforce max_nodes limit.
-        let count: usize =
-            conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+        let count: usize = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
         if count >= self.max_nodes {
             anyhow::bail!(
                 "knowledge graph node limit reached ({}/{})",
@@ -261,10 +260,11 @@ impl KnowledgeGraph {
 
         // Verify both endpoints exist.
         let exists = |id: &str| -> anyhow::Result<bool> {
-            let c: usize =
-                conn.query_row("SELECT COUNT(*) FROM nodes WHERE id = ?1", params![id], |r| {
-                    r.get(0)
-                })?;
+            let c: usize = conn.query_row(
+                "SELECT COUNT(*) FROM nodes WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )?;
             Ok(c > 0)
         };
 
@@ -318,7 +318,11 @@ impl KnowledgeGraph {
     }
 
     /// Full-text search across node titles, content, and tags.
-    pub fn query_by_similarity(&self, query: &str, limit: usize) -> anyhow::Result<Vec<SearchResult>> {
+    pub fn query_by_similarity(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<SearchResult>> {
         let conn = self.conn.lock();
 
         // Sanitize FTS query: escape double quotes, wrap tokens in quotes.
@@ -457,7 +461,11 @@ impl KnowledgeGraph {
             }
         }
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         Ok(results)
     }
 
@@ -465,14 +473,13 @@ impl KnowledgeGraph {
     pub fn stats(&self) -> anyhow::Result<GraphStats> {
         let conn = self.conn.lock();
 
-        let total_nodes: usize =
-            conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
-        let total_edges: usize =
-            conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
+        let total_nodes: usize = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+        let total_edges: usize = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
 
         let mut by_type = HashMap::new();
         {
-            let mut stmt = conn.prepare("SELECT node_type, COUNT(*) FROM nodes GROUP BY node_type")?;
+            let mut stmt =
+                conn.prepare("SELECT node_type, COUNT(*) FROM nodes GROUP BY node_type")?;
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
                 let t: String = row.get(0)?;
@@ -561,7 +568,13 @@ mod tests {
     fn add_node_returns_unique_id() {
         let (_tmp, graph) = test_graph();
         let id1 = graph
-            .add_node(NodeType::Pattern, "Caching", "Use Redis for caching", &["redis".into()], None)
+            .add_node(
+                NodeType::Pattern,
+                "Caching",
+                "Use Redis for caching",
+                &["redis".into()],
+                None,
+            )
             .unwrap();
         let id2 = graph
             .add_node(NodeType::Lesson, "Lesson A", "Content A", &[], None)
@@ -705,7 +718,13 @@ mod tests {
     fn expert_ranking_by_authored_contributions() {
         let (_tmp, graph) = test_graph();
         let expert = graph
-            .add_node(NodeType::Expert, "zeroclaw_user", "Backend expert", &[], None)
+            .add_node(
+                NodeType::Expert,
+                "zeroclaw_user",
+                "Backend expert",
+                &[],
+                None,
+            )
             .unwrap();
         let p1 = graph
             .add_node(
@@ -726,12 +745,8 @@ mod tests {
             )
             .unwrap();
 
-        graph
-            .add_edge(&p1, &expert, Relation::AuthoredBy)
-            .unwrap();
-        graph
-            .add_edge(&p2, &expert, Relation::AuthoredBy)
-            .unwrap();
+        graph.add_edge(&p1, &expert, Relation::AuthoredBy).unwrap();
+        graph.add_edge(&p2, &expert, Relation::AuthoredBy).unwrap();
 
         let experts = graph.find_experts(&["caching".into()]).unwrap();
         assert_eq!(experts.len(), 1);
@@ -764,7 +779,13 @@ mod tests {
             .add_node(NodeType::Pattern, "P", "C", &["rust".into()], None)
             .unwrap();
         graph
-            .add_node(NodeType::Lesson, "L", "C", &["rust".into(), "async".into()], None)
+            .add_node(
+                NodeType::Lesson,
+                "L",
+                "C",
+                &["rust".into(), "async".into()],
+                None,
+            )
             .unwrap();
 
         let stats = graph.stats().unwrap();
