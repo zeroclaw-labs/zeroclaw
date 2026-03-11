@@ -2882,7 +2882,7 @@ struct ConfiguredChannel {
 
 fn collect_configured_channels(
     config: &Config,
-    matrix_skip_context: &str,
+    _matrix_skip_context: &str,
 ) -> Vec<ConfiguredChannel> {
     let mut channels = Vec::new();
 
@@ -2976,7 +2976,7 @@ fn collect_configured_channels(
     if config.channels_config.matrix.is_some() {
         tracing::warn!(
             "Matrix channel is configured but this build was compiled without `channel-matrix`; skipping Matrix {}.",
-            matrix_skip_context
+            _matrix_skip_context
         );
     }
 
