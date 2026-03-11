@@ -2826,18 +2826,19 @@ Ensure only one `zeroclaw` process is using this bot token."
                             continue;
                         }
 
-                        let _ = self
-                            .http_client()
-                            .post(self.api_url("answerCallbackQuery"))
-                            .json(&serde_json::json!({"callback_query_id": callback_id}))
-                            .send()
-                            .await;
-
                         if let Some((action, id)) = data.split_once(':') {
                             let approved = action == "approve";
                             let found = self.approval_broker.resolve(id, approved).await;
 
-                            if !found {
+                            if found {
+                                // Acknowledge successful resolution
+                                let _ = self
+                                    .http_client()
+                                    .post(self.api_url("answerCallbackQuery"))
+                                    .json(&serde_json::json!({"callback_query_id": callback_id}))
+                                    .send()
+                                    .await;
+                            } else {
                                 // Expired or already answered: show alert
                                 let _ = self
                                     .http_client()
@@ -2850,6 +2851,14 @@ Ensure only one `zeroclaw` process is using this bot token."
                                     .send()
                                     .await;
                             }
+                        } else {
+                            // Malformed callback data - just acknowledge
+                            let _ = self
+                                .http_client()
+                                .post(self.api_url("answerCallbackQuery"))
+                                .json(&serde_json::json!({"callback_query_id": callback_id}))
+                                .send()
+                                .await;
                         }
                         continue;
                     }

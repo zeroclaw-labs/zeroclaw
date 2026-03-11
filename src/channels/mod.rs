@@ -1729,6 +1729,7 @@ async fn process_channel_message(
     }
 
     // Build Telegram approval handle if this message comes from Telegram
+    let tg_broker_configured = msg.channel == "telegram" && ctx.telegram_approval_broker.is_some();
     let tg_approval = if msg.channel == "telegram" {
         ctx.telegram_approval_broker.as_ref().and_then(|broker| {
             // reply_target may be "chat_id" or "chat_id:thread_id"
@@ -1744,6 +1745,20 @@ async fn process_channel_message(
                     message_thread_id: thread_id,
                 })
         })
+    } else {
+        None
+    };
+    // Fail closed: if Telegram approval broker is configured but request parsing
+    // failed, keep ApprovalManager enabled so always_ask tools are denied rather
+    // than silently auto-approved.
+    if tg_broker_configured && tg_approval.is_none() {
+        tracing::warn!(
+            reply_target = %msg.reply_target,
+            "Failed to build Telegram approval request; approval-gated tools will be denied"
+        );
+    }
+    let approval = if tg_broker_configured {
+        ctx.approval_manager.as_deref()
     } else {
         None
     };
@@ -1763,10 +1778,7 @@ async fn process_channel_message(
                 route.model.as_str(),
                 runtime_defaults.temperature,
                 true,
-                // Only activate ApprovalManager when we have a channel-specific
-                // approval mechanism available (currently Telegram only).
-                // Other channels fall through to None → auto-approve as before.
-                if tg_approval.is_some() { ctx.approval_manager.as_deref() } else { None },
+                approval,
                 tg_approval.as_ref(),
                 msg.channel.as_str(),
                 &ctx.multimodal,
