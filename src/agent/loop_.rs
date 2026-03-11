@@ -41,7 +41,8 @@ mod parsing;
 use context::{build_context, build_hardware_context};
 use detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
 use execution::{
-    execute_tools_parallel, execute_tools_sequential, should_execute_tools_in_parallel,
+    execute_tools_parallel, execute_tools_sequential, execute_tools_staged,
+    is_search_phase_tool, is_terminal_tool, should_execute_tools_in_parallel,
     ToolExecutionOutcome,
 };
 #[cfg(test)]
@@ -2407,7 +2408,25 @@ pub async fn run_tool_call_loop(
             progress_indices.push(progress_idx);
         }
 
-        let executed_outcomes = if allow_parallel_execution && executable_calls.len() > 1 {
+        let has_terminal = executable_calls.iter().any(|c| is_terminal_tool(&c.name));
+        let has_search = executable_calls.iter().any(|c| is_search_phase_tool(&c.name));
+        let executed_outcomes = if has_terminal && has_search && executable_calls.len() > 1 {
+            // Mixed batch: search tools must complete before submit_contacts runs.
+            // Prevents the model from fabricating contacts before search results arrive.
+            tracing::info!(
+                terminal = executable_calls.iter().filter(|c| is_terminal_tool(&c.name)).count(),
+                search = executable_calls.iter().filter(|c| is_search_phase_tool(&c.name)).count(),
+                "tool.staged_execution mixed_batch=true",
+            );
+            execute_tools_staged(
+                &executable_calls,
+                tools_registry,
+                observer,
+                cancellation_token.as_ref(),
+                session_recorder.as_ref(),
+            )
+            .await?
+        } else if allow_parallel_execution && executable_calls.len() > 1 {
             execute_tools_parallel(
                 &executable_calls,
                 tools_registry,

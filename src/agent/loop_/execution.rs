@@ -10,6 +10,21 @@ use tokio_util::sync::CancellationToken;
 fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
+
+/// Tools that must run AFTER all search-phase tools in the same batch complete.
+/// Calling these in parallel with searches causes hallucination (model fabricates
+/// contacts before search results arrive).
+pub(super) fn is_terminal_tool(name: &str) -> bool {
+    matches!(name, "submit_contacts")
+}
+
+/// Tools that gather data for the current agent turn.
+pub(super) fn is_search_phase_tool(name: &str) -> bool {
+    name.starts_with("telegram_search_")
+        || name.starts_with("telegram_list_")
+        || name.starts_with("telegram_join_")
+        || name.starts_with("bg_")
+}
 async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
@@ -218,4 +233,65 @@ pub(super) async fn execute_tools_sequential(
     }
 
     Ok(outcomes)
+}
+
+/// Staged execution: run search-phase tools first (in parallel), then terminal tools.
+///
+/// Prevents submit_contacts from running before search results arrive when the
+/// model fires both in the same parallel batch.
+pub(super) async fn execute_tools_staged(
+    tool_calls: &[ParsedToolCall],
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+    session_recorder: Option<&SessionRecorder>,
+) -> Result<Vec<ToolExecutionOutcome>> {
+    // Partition: terminal tools second, everything else (including searches) first.
+    let (terminal_entries, non_terminal_entries): (
+        Vec<(usize, &ParsedToolCall)>,
+        Vec<(usize, &ParsedToolCall)>,
+    ) = tool_calls
+        .iter()
+        .enumerate()
+        .partition(|(_, c)| is_terminal_tool(&c.name));
+
+    let mut outcomes: Vec<Option<ToolExecutionOutcome>> =
+        (0..tool_calls.len()).map(|_| None).collect();
+
+    // Stage 1: all non-terminal tools in parallel
+    if !non_terminal_entries.is_empty() {
+        let stage1_futures: Vec<_> = non_terminal_entries
+            .iter()
+            .map(|(_, call)| {
+                execute_one_tool(
+                    &call.name,
+                    call.arguments.clone(),
+                    tools_registry,
+                    observer,
+                    cancellation_token,
+                    session_recorder,
+                )
+            })
+            .collect();
+        let stage1_results = futures_util::future::join_all(stage1_futures).await;
+        for ((orig_idx, _), result) in non_terminal_entries.iter().zip(stage1_results) {
+            outcomes[*orig_idx] = Some(result?);
+        }
+    }
+
+    // Stage 2: terminal tools sequentially (after all searches complete)
+    for (orig_idx, call) in &terminal_entries {
+        let result = execute_one_tool(
+            &call.name,
+            call.arguments.clone(),
+            tools_registry,
+            observer,
+            cancellation_token,
+            session_recorder,
+        )
+        .await?;
+        outcomes[*orig_idx] = Some(result);
+    }
+
+    Ok(outcomes.into_iter().flatten().collect())
 }
