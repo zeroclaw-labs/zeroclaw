@@ -18,6 +18,10 @@ Largest source files in `src/`, ranked by severity. Each does multiple jobs in a
 - `security/policy.rs` (2,338 lines) mixes policy definition, action tracking, and validation — could split by concern.
 - `providers/compatible.rs` (2,892 lines) and `providers/gemini.rs` (2,142 lines) are large for single provider implementations — likely mixing HTTP client logic, response parsing, and tool conversion.
 
+### Misplaced module: `channels/tts.rs` → `tools/`
+
+`channels/tts.rs` (642 lines, merged in PR #2994) is a multi-provider TTS synthesis system. It is not a channel — it does not implement `Channel` or provide a bidirectional messaging interface. TTS is a capability the agent invokes to produce audio output, which fits the `Tool` trait (`src/tools/traits.rs`). It should be moved to `src/tools/tts.rs` with a corresponding `Tool` implementation, and its config types extracted from the `channels` section of `schema.rs` into a `[tools.tts]` config namespace. As of merge, the module is not integrated into any calling code (re-exports are `#[allow(unused_imports)]`), so this move has zero runtime impact.
+
 ---
 
 ## Best Practices Audit Findings
