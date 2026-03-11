@@ -43,10 +43,7 @@ pub struct CheckResult {
 /// Intentionally minimal to avoid exposing internal details (uptime,
 /// config, version) to unauthenticated callers.
 pub async fn handle_liveness(State(_state): State<AppState>) -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        Json(LivenessResponse { status: "healthy" }),
-    )
+    (StatusCode::OK, Json(LivenessResponse { status: "healthy" }))
 }
 
 /// `GET /ready` — readiness probe.
