@@ -673,6 +673,7 @@ fn zai_base_url(name: &str) -> Option<&'static str> {
 pub struct ProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
     pub provider_api_url: Option<String>,
+    pub api_path: Option<String>,
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
@@ -683,6 +684,7 @@ impl Default for ProviderRuntimeOptions {
         Self {
             auth_profile_override: None,
             provider_api_url: None,
+            api_path: None,
             zeroclaw_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: None,
@@ -1216,9 +1218,22 @@ fn create_provider_with_url_and_options(
                 "Custom provider",
                 "custom:https://your-api.com",
             )?;
+            // Apply custom api_path if provided in options
+            let effective_url = if let Some(ref api_path) = options.api_path {
+                let api_path = api_path.trim_start_matches('/');
+                let trimmed_url = base_url.trim_end_matches('/');
+                if trimmed_url.ends_with("/chat/completions") || trimmed_url.ends_with("/v1/chat/completions") {
+                    // If URL already has full endpoint, respect it
+                    trimmed_url.to_string()
+                } else {
+                    format!("{}/{}", trimmed_url, api_path)
+                }
+            } else {
+                base_url
+            };
             Ok(Box::new(OpenAiCompatibleProvider::new_with_vision(
                 "Custom",
-                &base_url,
+                &effective_url,
                 key,
                 AuthStyle::Bearer,
                 true,
