@@ -535,6 +535,100 @@ mod tests {
         agents
     }
 
+    #[derive(Default)]
+    struct EchoTool;
+
+    #[async_trait]
+    impl Tool for EchoTool {
+        fn name(&self) -> &str {
+            "echo_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Echoes the `value` argument."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "string"}
+                },
+                "required": ["value"]
+            })
+        }
+
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            let value = args
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Ok(ToolResult {
+                success: true,
+                output: format!("echo:{value}"),
+                error: None,
+            })
+        }
+    }
+
+    struct OneToolThenFinalProvider;
+
+    #[async_trait]
+    impl Provider for OneToolThenFinalProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: crate::providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<crate::providers::ChatResponse> {
+            let has_tool_message = request.messages.iter().any(|m| m.role == "tool");
+            if has_tool_message {
+                Ok(crate::providers::ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(crate::providers::ChatResponse {
+                    text: None,
+                    tool_calls: vec![crate::providers::ToolCall {
+                        id: "call_1".to_string(),
+                        name: "echo_tool".to_string(),
+                        arguments: "{\"value\":\"ping\"}".to_string(),
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+
+    fn agentic_config(allowed_tools: Vec<String>, max_iterations: usize) -> DelegateAgentConfig {
+        DelegateAgentConfig {
+            provider: "openrouter".to_string(),
+            model: "model-test".to_string(),
+            system_prompt: Some("You are agentic.".to_string()),
+            api_key: Some("delegate-test-credential".to_string()),
+            temperature: Some(0.2),
+            max_depth: 3,
+            agentic: true,
+            allowed_tools,
+            max_iterations,
+        }
+    }
+
     fn make_tool(
         agents: HashMap<String, DelegateAgentConfig>,
         security: Arc<SecurityPolicy>,
@@ -730,5 +824,31 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(desc.contains("researcher"));
+    }
+
+    #[tokio::test]
+    async fn run_agentic_background_reads_late_bound_parent_tools() {
+        let config = agentic_config(vec!["echo_tool".to_string()], 10);
+        let parent_tools = crate::tools::new_shared_tool_registry();
+        let provider = OneToolThenFinalProvider;
+
+        crate::tools::sync_shared_tool_registry(
+            &parent_tools,
+            &[Arc::new(EchoTool) as Arc<dyn Tool>],
+        );
+
+        let result = run_agentic_background(
+            "agentic",
+            &config,
+            &provider,
+            "run",
+            &parent_tools,
+            &crate::config::MultimodalConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("done"));
     }
 }
