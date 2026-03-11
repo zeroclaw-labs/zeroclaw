@@ -37,12 +37,18 @@ data:
       acp-client result <acp-session-id>
           Print the full response text (waits up to 10s if still running).
 
+      acp-client wait <acp-session-id> [--timeout 600]
+          Block until the task completes, then print the full result.
+          Checks every 10s, prints progress to stderr. Default timeout: 600s.
+          Preferred for agent-to-agent workflows — consumes zero LLM slots
+          while waiting.
+
       acp-client send-sync "Your message here"
           Blocking version: waits for full response. WARNING: takes 1-10+
           minutes. Only use with a long timeout or for interactive testing.
 
       acp-client health
-          Check if Goose ACP server is reachable.
+          Check if the agent is reachable.
 
       acp-client delete <acp-session-id>
           Tear down an ACP session.
@@ -338,6 +344,61 @@ data:
             print(f"ERROR: {status.get('error', 'unknown error')}", file=sys.stderr)
             sys.exit(1)
 
+    def cmd_wait(acp_session_id, timeout=600):
+        """Block until the task completes, then print the result.
+
+        Checks the session status file every 10 seconds. Prints periodic
+        progress lines to stderr so the caller knows we're alive. Exits
+        with the full response on completion, or an error if the timeout
+        is exceeded.
+
+        This is the preferred way for an agent to wait for a delegated
+        task — it consumes zero LLM slots while waiting.
+        """
+        deadline = time.time() + timeout
+        checks = 0
+        while time.time() < deadline:
+            status = _read_status(acp_session_id)
+            if status is None:
+                # Session dir may not exist yet if collector hasn't started
+                if checks > 3:
+                    print(f"ERROR: no session found for {acp_session_id}", file=sys.stderr)
+                    sys.exit(1)
+            elif status["status"] != "running":
+                break
+            else:
+                elapsed = int(time.time() - status.get("started", status.get("updated", 0)))
+                last_chunk = status.get("last_chunk")
+                if last_chunk:
+                    chunk_ago = int(time.time() - last_chunk)
+                    print(f"[waiting] {elapsed}s elapsed, last activity {chunk_ago}s ago", file=sys.stderr)
+                else:
+                    print(f"[waiting] {elapsed}s elapsed", file=sys.stderr)
+
+            checks += 1
+            time.sleep(10)
+        else:
+            # Timeout reached
+            response_text = _read_response(acp_session_id)
+            print(f"TIMEOUT after {timeout}s", file=sys.stderr)
+            if response_text:
+                partial = response_text[-500:] if len(response_text) > 500 else response_text
+                print(f"---partial---\n{partial}")
+            sys.exit(1)
+
+        # Completed (or errored)
+        response_text = _read_response(acp_session_id)
+        if status["status"] == "complete":
+            print(response_text if response_text else "(empty response)")
+        elif status["status"] == "error":
+            print(f"ERROR: {status.get('error', 'unknown error')}", file=sys.stderr)
+            if response_text:
+                print(response_text)
+            sys.exit(1)
+        else:
+            print(f"UNEXPECTED status: {status['status']}", file=sys.stderr)
+            sys.exit(1)
+
     def cmd_send_sync(text):
         """Blocking: init → new session → prompt → stream full response."""
         try:
@@ -426,6 +487,16 @@ data:
                 print("Usage: acp-client result <acp-session-id>", file=sys.stderr)
                 sys.exit(1)
             cmd_result(sys.argv[2])
+        elif cmd == "wait":
+            if len(sys.argv) < 3:
+                print("Usage: acp-client wait <acp-session-id> [--timeout 600]", file=sys.stderr)
+                sys.exit(1)
+            timeout = 600
+            if "--timeout" in sys.argv:
+                idx = sys.argv.index("--timeout")
+                if idx + 1 < len(sys.argv):
+                    timeout = int(sys.argv[idx + 1])
+            cmd_wait(sys.argv[2], timeout)
         elif cmd == "_collect":
             if len(sys.argv) < 5:
                 sys.exit(1)

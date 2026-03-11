@@ -435,28 +435,28 @@ data:
 
     `acp-client` is a CLI tool at `/usr/local/bin/acp-client` for talking to the K8s infrastructure agent running in the cluster over ACP (Agent Communication Protocol). The K8s agent has kubectl and cluster access — you don't. For anything involving the Kubernetes cluster (pods, namespaces, deployments, logs, manifests), delegate to the K8s agent via acp-client.
 
-    Always use the async send/poll workflow — the agent typically takes 1-10+ minutes to respond and the shell tool has a 60s timeout. Use the zeroclaw `shell` tool (not `serena__execute_shell_command`) for all acp-client calls, since Serena runs in a different container.
+    Use the zeroclaw `shell` tool (not `serena__execute_shell_command`) for all acp-client calls, since Serena runs in a different container.
 
-    **Async workflow (always use this):**
+    **Primary workflow — send + wait (always use this):**
     ```bash
-    # 1. Check agent is alive
-    acp-client health
-
-    # 2. Send task (returns immediately)
+    # 1. Send task (returns immediately with session ID)
     acp-client send "Create a deployment in the todolist namespace"
-    # → PENDING acp_session_id=abc-123 session_id=20260310_1
+    # → PENDING acp_session_id=abc-123 session_id=acp:xyz
 
-    # 3. Poll status (repeat every 30-60s until COMPLETE)
-    acp-client poll abc-123
-    # → RUNNING (142s elapsed, last activity 3s ago)
-    # → ...partial response...
+    # 2. Wait for completion (blocks, prints result when done)
+    acp-client wait abc-123 --timeout 600
+    # → [waiting] 30s elapsed        (progress on stderr)
+    # → [waiting] 60s elapsed, last activity 5s ago
+    # → The actual response text     (result on stdout)
 
-    # 4. Get final result once COMPLETE
-    acp-client result abc-123
-
-    # 5. Cleanup when done
+    # 3. Cleanup when done
     acp-client delete abc-123
     ```
+
+    **IMPORTANT: Always use `wait`, never poll in a loop.** Each `poll` call triggers
+    an LLM round-trip for you to process the result and decide whether to poll again.
+    The `wait` command blocks the shell call without consuming any LLM slots — you
+    stay idle while the K8s agent works, then resume when the result arrives.
 
     **All commands:**
 
@@ -464,10 +464,11 @@ data:
     |---------|---------|
     | `acp-client health` | Check if the K8s agent is alive |
     | `acp-client send "task"` | Non-blocking: sends prompt, returns immediately with session IDs |
-    | `acp-client poll <acp-session-id>` | Check status: RUNNING (with partial output) or COMPLETE |
-    | `acp-client result <acp-session-id>` | Get the full response text (waits up to 10s if still running) |
+    | `acp-client wait <id> [--timeout 600]` | **Preferred**: block until complete, print result. Default timeout 600s |
+    | `acp-client poll <id>` | Quick status check (use sparingly — `wait` is preferred) |
+    | `acp-client result <id>` | Get the full response text (waits up to 10s if still running) |
     | `acp-client send-sync "task"` | **DO NOT USE** — blocks until complete, will be killed by shell timeout |
-    | `acp-client delete <acp-session-id>` | Tear down session |
+    | `acp-client delete <id>` | Tear down session |
     | `acp-client cleanup` | Remove completed session files older than 1 hour |
 
     **Notes:**
