@@ -205,7 +205,7 @@ Ví dụ mẫu (macOS arm64, đo ngày 18 tháng 2 năm 2026):
 Hoặc bỏ qua các bước trên, cài hết mọi thứ (system deps, Rust, ZeroClaw) chỉ bằng một lệnh:
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/install.sh | bash
+curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
 #### Yêu cầu tài nguyên biên dịch
@@ -278,7 +278,7 @@ ZEROCLAW_CONTAINER_CLI=podman ./install.sh --docker
 Cài từ xa bằng một lệnh (nên xem trước nếu môi trường nhạy cảm về bảo mật):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
 Chi tiết: [`docs/setup-guides/one-click-bootstrap.md`](docs/setup-guides/one-click-bootstrap.md) (chế độ toolchain có thể yêu cầu `sudo` cho các gói hệ thống).
