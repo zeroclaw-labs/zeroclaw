@@ -457,6 +457,13 @@ fn strip_tool_call_tags(message: &str) -> String {
 
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     match channel_name {
+        "matrix" => Some(
+            "When responding on Matrix:\n\
+             - Use Markdown formatting (bold, italic, code blocks)\n\
+             - Be concise and direct\n\
+             - When you receive a [Voice message], the user spoke to you. Respond naturally as in conversation.\n\
+             - Your text reply will automatically be converted to audio and sent back as a voice message.\n",
+        ),
         "telegram" => Some(
             "When responding on Telegram:\n\
              - Include media markers for files or URLs that should be sent as attachments\n\
