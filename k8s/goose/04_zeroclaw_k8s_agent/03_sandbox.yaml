@@ -178,6 +178,8 @@ spec:
           env:
             - name: HOME
               value: /data
+            - name: RUST_LOG
+              value: "info,zeroclaw::gateway::acp_server=debug,zeroclaw::agent=debug,zeroclaw::providers=debug"
             - name: API_KEY
               valueFrom:
                 secretKeyRef:

@@ -123,6 +123,15 @@ data:
         response.close()
         return None
 
+    def _extract_result_text(msg):
+        """Extract the final response text from a JSON-RPC result message."""
+        result = msg.get("result", {})
+        content = result.get("content", [])
+        if isinstance(content, list):
+            parts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+            return "\n".join(parts) if parts else ""
+        return ""
+
     def _extract_text(msg):
         """Extract human-readable text from an ACP notification or result."""
         if "result" in msg:
@@ -248,10 +257,14 @@ data:
 
             for msg in _read_sse_events(resp):
                 if "result" in msg:
+                    # Extract and store the final result text
+                    final_text = _extract_result_text(msg)
+                    if final_text:
+                        _append_response(acp_session_id, final_text)
                     break
                 text_chunk = _extract_text(msg)
                 if text_chunk:
-                    _append_response(acp_session_id, text_chunk)
+                    _append_response(acp_session_id, text_chunk + "\n")
                     # Touch status to show we're alive
                     _write_status(acp_session_id, "running", {
                         "session_id": session_id,
@@ -339,10 +352,14 @@ data:
         resp = _post(_jsonrpc("session/prompt", 3, params), acp_session_id)
         for msg in _read_sse_events(resp):
             if "result" in msg:
+                final_text = _extract_result_text(msg)
+                if final_text:
+                    sys.stdout.write(final_text)
+                    sys.stdout.flush()
                 break
             text_chunk = _extract_text(msg)
             if text_chunk:
-                sys.stdout.write(text_chunk)
+                sys.stdout.write(text_chunk + "\n")
                 sys.stdout.flush()
         resp.close()
         print()
