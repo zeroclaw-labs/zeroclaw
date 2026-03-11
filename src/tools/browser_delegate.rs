@@ -13,6 +13,7 @@
 use crate::security::SecurityPolicy;
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
+use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -118,6 +119,18 @@ impl BrowserDelegateTool {
         cmd.stderr(std::process::Stdio::piped());
 
         cmd
+    }
+
+    /// Extract URLs from free-form text and validate each against domain policy.
+    ///
+    /// Prevents policy bypass by embedding blocked URLs in the `task` text,
+    /// which is forwarded verbatim to the browser CLI subprocess.
+    fn validate_task_urls(&self, task: &str) -> anyhow::Result<()> {
+        let url_re = Regex::new(r#"https?://[^\s\)\]\},\"'`<>]+"#).expect("valid regex");
+        for m in url_re.find_iter(task) {
+            self.validate_url(m.as_str())?;
+        }
+        Ok(())
     }
 
     /// Validate URL against allowed/blocked domain lists and scheme restrictions.
@@ -258,6 +271,17 @@ impl Tool for BrowserDelegateTool {
                     error: Some(format!("URL validation failed: {e}")),
                 });
             }
+        }
+
+        // Scan task text for embedded URLs and validate against domain policy.
+        // This prevents bypassing domain restrictions by embedding blocked URLs
+        // in the task text, which is forwarded verbatim to the browser CLI.
+        if let Err(e) = self.validate_task_urls(task) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("task text contains a disallowed URL: {e}")),
+            });
         }
 
         let extract_format = args
@@ -650,6 +674,54 @@ mod tests {
     fn validate_url_allows_http_scheme() {
         let tool = test_tool(config_with_domains(vec![], vec![]));
         assert!(tool.validate_url("http://example.com/page").is_ok());
+    }
+
+    // ── Task text URL scanning ──────────────────────────────────────
+
+    #[test]
+    fn validate_task_urls_blocks_embedded_blocked_url() {
+        let tool = test_tool(config_with_domains(vec![], vec!["evil.com".into()]));
+        let result = tool.validate_task_urls("go to https://evil.com/steal and read it");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("blocked"));
+    }
+
+    #[test]
+    fn validate_task_urls_blocks_embedded_url_not_in_allowlist() {
+        let tool = test_tool(config_with_domains(vec!["corp.example.com".into()], vec![]));
+        let result =
+            tool.validate_task_urls("navigate to https://attacker.com/page and extract data");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not in"));
+    }
+
+    #[test]
+    fn validate_task_urls_allows_permitted_embedded_url() {
+        let tool = test_tool(config_with_domains(vec!["corp.example.com".into()], vec![]));
+        assert!(tool
+            .validate_task_urls("read https://corp.example.com/page and summarize")
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_task_urls_allows_text_without_urls() {
+        let tool = test_tool(config_with_domains(vec![], vec!["evil.com".into()]));
+        assert!(tool
+            .validate_task_urls("read the last 10 messages from engineering channel")
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_blocked_url_in_task_text() {
+        let tool = test_tool(config_with_domains(vec![], vec!["evil.com".into()]));
+        let result = tool
+            .execute(serde_json::json!({
+                "task": "navigate to https://evil.com/phish and extract credentials"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap().contains("disallowed URL"));
     }
 
     // ── extract_format validation ──────────────────────────────────
