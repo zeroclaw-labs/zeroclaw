@@ -1,6 +1,6 @@
 # Reviewer Playbook
 
-This playbook is the operational companion to [`docs/pr-workflow.md`](./pr-workflow.md).
+This playbook is the operational companion to [`pr-workflow.md`](./pr-workflow.md).
 For broader documentation navigation, use [`docs/README.md`](../README.md).
 
 ## 0. Summary
