@@ -1,3 +1,5 @@
+#[cfg(feature = "channel-matrix")]
+use crate::channels::MatrixChannel;
 use crate::channels::{
     Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
 };
@@ -365,6 +367,31 @@ pub(crate) async fn deliver_announcement(
                 mm.mention_only.unwrap_or(false),
             );
             channel.send(&SendMessage::new(output, target)).await?;
+        }
+        #[cfg(feature = "channel-matrix")]
+        "matrix" => {
+            let mx = config
+                .channels_config
+                .matrix
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("matrix channel not configured"))?;
+            let zeroclaw_dir = config.config_path.parent().map(|p| p.to_path_buf());
+            let channel = MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
+                mx.homeserver.clone(),
+                mx.access_token.clone(),
+                mx.room_id.clone(),
+                mx.allowed_users.clone(),
+                mx.user_id.clone(),
+                mx.device_id.clone(),
+                zeroclaw_dir,
+            );
+            channel.send(&SendMessage::new(output, target)).await?;
+        }
+        #[cfg(not(feature = "channel-matrix"))]
+        "matrix" => {
+            anyhow::bail!(
+                "matrix channel not configured: build with `channel-matrix` feature enabled"
+            );
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
@@ -1013,5 +1040,22 @@ mod tests {
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
+    }
+
+    #[cfg(feature = "channel-matrix")]
+    #[tokio::test]
+    async fn deliver_if_configured_matrix_not_configured() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("echo ok");
+
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("matrix".into()),
+            to: Some("target".into()),
+            best_effort: true,
+        };
+        let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
+        assert!(err.to_string().contains("matrix channel not configured"));
     }
 }
