@@ -75,6 +75,7 @@ use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, runtime_trace, Observer};
+use crate::observability::traits::{ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
@@ -90,6 +91,61 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
+
+/// Observer wrapper that forwards tool-call events to a channel sender
+/// for real-time threaded notifications.
+struct ChannelNotifyObserver {
+    inner: Arc<dyn Observer>,
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+    tools_used: AtomicBool,
+}
+
+impl Observer for ChannelNotifyObserver {
+    fn record_event(&self, event: &ObserverEvent) {
+        match event {
+            ObserverEvent::ToolCallStart { tool, arguments } => {
+                self.tools_used.store(true, Ordering::Relaxed);
+                let detail = match arguments {
+                    Some(args) if !args.is_empty() => {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+                            if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+                                format!(": `{}`", if cmd.len() > 200 { &cmd[..200] } else { cmd })
+                            } else if let Some(q) = v.get("query").and_then(|c| c.as_str()) {
+                                format!(": {}", if q.len() > 200 { &q[..200] } else { q })
+                            } else if let Some(p) = v.get("path").and_then(|c| c.as_str()) {
+                                format!(": {p}")
+                            } else if let Some(u) = v.get("url").and_then(|c| c.as_str()) {
+                                format!(": {u}")
+                            } else {
+                                let s = args.to_string();
+                                if s.len() > 120 { format!(": {}…", &s[..120]) } else { format!(": {s}") }
+                            }
+                        } else {
+                            let s = args.to_string();
+                            if s.len() > 120 { format!(": {}…", &s[..120]) } else { format!(": {s}") }
+                        }
+                    }
+                    _ => String::new(),
+                };
+                let _ = self.tx.send(format!("\u{1F527} `{tool}`{detail}"));
+            }
+            _ => {}
+        }
+        self.inner.record_event(event);
+    }
+    fn record_metric(&self, metric: &ObserverMetric) {
+        self.inner.record_metric(metric);
+    }
+    fn flush(&self) {
+        self.inner.flush();
+    }
+    fn name(&self) -> &str {
+        "channel-notify"
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
 
 /// Per-sender conversation history for channel messages.
 type ConversationHistoryMap = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
@@ -401,6 +457,13 @@ fn strip_tool_call_tags(message: &str) -> String {
 
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     match channel_name {
+        "matrix" => Some(
+            "When responding on Matrix:\n\
+             - Use Markdown formatting (bold, italic, code blocks)\n\
+             - Be concise and direct\n\
+             - When you receive a [Voice message], the user spoke to you. Respond naturally as in conversation.\n\
+             - Your text reply will automatically be converted to audio and sent back as a voice message.\n",
+        ),
         "telegram" => Some(
             "When responding on Telegram:\n\
              - Include media markers for files or URLs that should be sent as attachments\n\
@@ -425,6 +488,25 @@ fn build_channel_system_prompt(
     reply_target: &str,
 ) -> String {
     let mut prompt = base_prompt.to_string();
+
+    // Refresh the stale datetime in the cached system prompt
+    {
+        let now = chrono::Local::now();
+        let fresh = format!(
+            "## Current Date & Time\n\n{} ({})\n",
+            now.format("%Y-%m-%d %H:%M:%S"),
+            now.format("%Z"),
+        );
+        if let Some(start) = prompt.find("## Current Date & Time\n\n") {
+            // Find the end of this section (next "## " heading or end of string)
+            let rest = &prompt[start + 24..]; // skip past "## Current Date & Time\n\n"
+            let section_end = rest
+                .find("\n## ")
+                .map(|i| start + 24 + i)
+                .unwrap_or(prompt.len());
+            prompt.replace_range(start..section_end, fresh.trim_end());
+        }
+    }
 
     if let Some(instructions) = channel_delivery_instructions(channel_name) {
         if prompt.is_empty() {
@@ -1582,7 +1664,7 @@ async fn process_channel_message(
     );
 
     // ── Hook: on_message_received (modifying) ────────────
-    let msg = if let Some(hooks) = &ctx.hooks {
+    let mut msg = if let Some(hooks) = &ctx.hooks {
         match hooks.run_on_message_received(msg).await {
             crate::hooks::HookResult::Cancel(reason) => {
                 tracing::info!(%reason, "incoming message dropped by hook");
@@ -1764,6 +1846,37 @@ async fn process_channel_message(
         _ => None,
     };
 
+    // Wrap observer to forward tool events as live thread messages
+    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let notify_observer: Arc<ChannelNotifyObserver> = Arc::new(ChannelNotifyObserver {
+        inner: Arc::clone(&ctx.observer),
+        tx: notify_tx,
+        tools_used: AtomicBool::new(false),
+    });
+    let notify_observer_flag = Arc::clone(&notify_observer);
+    let notify_channel = target_channel.clone();
+    let notify_reply_target = msg.reply_target.clone();
+    let notify_thread_root = msg.id.clone();
+    let notify_task = if msg.channel != "cli" {
+        Some(tokio::spawn(async move {
+            let thread_ts = Some(notify_thread_root);
+            while let Some(text) = notify_rx.recv().await {
+                if let Some(ref ch) = notify_channel {
+                    let _ = ch
+                        .send(
+                            &SendMessage::new(&text, &notify_reply_target)
+                                .in_thread(thread_ts.clone()),
+                        )
+                        .await;
+                }
+            }
+        }))
+    } else {
+        Some(tokio::spawn(async move {
+            while notify_rx.recv().await.is_some() {}
+        }))
+    };
+
     // Record history length before tool loop so we can extract tool context after.
     let history_len_before_tools = history.len();
 
@@ -1782,7 +1895,7 @@ async fn process_channel_message(
                 active_provider.as_ref(),
                 &mut history,
                 ctx.tools_registry.as_ref(),
-                ctx.observer.as_ref(),
+                notify_observer.as_ref() as &dyn Observer,
                 route.provider.as_str(),
                 route.model.as_str(),
                 runtime_defaults.temperature,
@@ -1804,6 +1917,17 @@ async fn process_channel_message(
     };
 
     if let Some(handle) = draft_updater {
+        let _ = handle.await;
+    }
+
+    // Thread the final reply only if tools were used (multi-message response)
+    if notify_observer_flag.tools_used.load(Ordering::Relaxed) && msg.channel != "cli" {
+        msg.thread_ts = Some(msg.id.clone());
+    }
+    // Drop the notify sender so the forwarder task finishes
+    drop(notify_observer);
+    drop(notify_observer_flag);
+    if let Some(handle) = notify_task {
         let _ = handle.await;
     }
 
@@ -4186,11 +4310,12 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-42:"));
-        assert!(sent_messages[0].contains("BTC is currently around"));
-        assert!(!sent_messages[0].contains("\"tool_calls\""));
-        assert!(!sent_messages[0].contains("mock_price"));
+        assert!(sent_messages.len() >= 1);
+        let reply = sent_messages.last().unwrap();
+        assert!(reply.starts_with("chat-42:"));
+        assert!(reply.contains("BTC is currently around"));
+        assert!(!reply.contains("\"tool_calls\""));
+        assert!(!reply.contains("mock_price"));
     }
 
     #[tokio::test]
@@ -4246,8 +4371,9 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].contains("BTC is currently around"));
+        assert!(sent_messages.len() >= 1);
+        let reply = sent_messages.last().unwrap();
+        assert!(reply.contains("BTC is currently around"));
 
         let histories = runtime_ctx
             .conversation_histories
@@ -4380,11 +4506,12 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-84:"));
-        assert!(sent_messages[0].contains("alias-tag flow resolved"));
-        assert!(!sent_messages[0].contains("<toolcall>"));
-        assert!(!sent_messages[0].contains("mock_price"));
+        assert!(sent_messages.len() >= 1);
+        let reply = sent_messages.last().unwrap();
+        assert!(reply.starts_with("chat-84:"));
+        assert!(reply.contains("alias-tag flow resolved"));
+        assert!(!reply.contains("<toolcall>"));
+        assert!(!reply.contains("mock_price"));
     }
 
     #[tokio::test]
@@ -4770,10 +4897,11 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-iter-success:"));
-        assert!(sent_messages[0].contains("Completed after 11 tool iterations."));
-        assert!(!sent_messages[0].contains("⚠️ Error:"));
+        assert!(sent_messages.len() >= 1);
+        let reply = sent_messages.last().unwrap();
+        assert!(reply.starts_with("chat-iter-success:"));
+        assert!(reply.contains("Completed after 11 tool iterations."));
+        assert!(!reply.contains("⚠️ Error:"));
     }
 
     #[tokio::test]
@@ -4831,9 +4959,10 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-iter-fail:"));
-        assert!(sent_messages[0].contains("⚠️ Error: Agent exceeded maximum tool iterations (3)"));
+        assert!(sent_messages.len() >= 1);
+        let reply = sent_messages.last().unwrap();
+        assert!(reply.starts_with("chat-iter-fail:"));
+        assert!(reply.contains("⚠️ Error: Agent exceeded maximum tool iterations (3)"));
     }
 
     struct NoopMemory;

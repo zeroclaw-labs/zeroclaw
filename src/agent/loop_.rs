@@ -1922,8 +1922,13 @@ async fn execute_one_tool(
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<ToolExecutionOutcome> {
+    let args_summary = {
+        let raw = call_arguments.to_string();
+        if raw.len() > 300 { format!("{}…", &raw[..300]) } else { raw }
+    };
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
+        arguments: Some(args_summary),
     });
     let start = Instant::now();
 
