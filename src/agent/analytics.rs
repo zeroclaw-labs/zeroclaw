@@ -151,7 +151,12 @@ pub fn export_metrics_json(metrics: &ConversationMetrics) -> Result<String, serd
 mod tests {
     use super::*;
 
-    fn make_record(resolved: bool, escalated: bool, turns: usize, lang: &str) -> ConversationRecord {
+    fn make_record(
+        resolved: bool,
+        escalated: bool,
+        turns: usize,
+        lang: &str,
+    ) -> ConversationRecord {
         ConversationRecord {
             conversation_id: format!("conv-{turns}"),
             channel: "telegram".into(),

@@ -107,7 +107,11 @@ impl ConversationManager {
     }
 
     /// Get or create conversation state for the given ID and channel.
-    pub fn get_or_create(&mut self, conversation_id: &str, channel: &str) -> &mut ConversationState {
+    pub fn get_or_create(
+        &mut self,
+        conversation_id: &str,
+        channel: &str,
+    ) -> &mut ConversationState {
         let default_lang = self.default_language.clone();
         self.conversations
             .entry(conversation_id.to_string())
@@ -166,7 +170,11 @@ impl ConversationManager {
 /// Returns a BCP-47 language tag hint. For production use, delegate to the
 /// provider for proper NLU-based detection.
 pub fn detect_language_hint(text: &str) -> Option<&'static str> {
-    let sample: String = text.chars().filter(|c| c.is_alphabetic()).take(100).collect();
+    let sample: String = text
+        .chars()
+        .filter(|c| c.is_alphabetic())
+        .take(100)
+        .collect();
     if sample.is_empty() {
         return None;
     }
@@ -211,11 +219,7 @@ mod tests {
 
     #[test]
     fn conversation_state_new_has_zero_turns() {
-        let state = ConversationState::new(
-            "conv-1".into(),
-            "telegram".into(),
-            "en".into(),
-        );
+        let state = ConversationState::new("conv-1".into(), "telegram".into(), "en".into());
         assert_eq!(state.turn_count, 0);
         assert_eq!(state.escalation_status, EscalationStatus::None);
         assert_eq!(state.language, "en");
@@ -223,11 +227,7 @@ mod tests {
 
     #[test]
     fn conversation_state_record_turn_increments() {
-        let mut state = ConversationState::new(
-            "conv-1".into(),
-            "slack".into(),
-            "de".into(),
-        );
+        let mut state = ConversationState::new("conv-1".into(), "slack".into(), "de".into());
         state.record_turn();
         state.record_turn();
         assert_eq!(state.turn_count, 2);
@@ -235,11 +235,7 @@ mod tests {
 
     #[test]
     fn conversation_state_turn_limit_check() {
-        let mut state = ConversationState::new(
-            "conv-1".into(),
-            "discord".into(),
-            "en".into(),
-        );
+        let mut state = ConversationState::new("conv-1".into(), "discord".into(), "en".into());
         assert!(!state.is_over_turn_limit(3));
         state.turn_count = 3;
         assert!(state.is_over_turn_limit(3));
@@ -247,11 +243,7 @@ mod tests {
 
     #[test]
     fn conversation_state_record_intent() {
-        let mut state = ConversationState::new(
-            "conv-1".into(),
-            "web".into(),
-            "en".into(),
-        );
+        let mut state = ConversationState::new("conv-1".into(), "web".into(), "en".into());
         state.record_intent(DetectedIntent {
             name: "greeting".into(),
             confidence: 0.95,

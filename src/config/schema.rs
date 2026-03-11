@@ -3921,7 +3921,6 @@ impl Default for EstopConfig {
     }
 }
 
-
 // ── Conversational AI ──────────────────────────────────────────
 
 fn default_conversational_ai_language() -> String {
@@ -5328,19 +5327,13 @@ impl Config {
                 );
             }
             if cai.max_conversation_turns == 0 {
-                anyhow::bail!(
-                    "conversational_ai.max_conversation_turns must be greater than 0"
-                );
+                anyhow::bail!("conversational_ai.max_conversation_turns must be greater than 0");
             }
             if cai.conversation_timeout_secs == 0 {
-                anyhow::bail!(
-                    "conversational_ai.conversation_timeout_secs must be greater than 0"
-                );
+                anyhow::bail!("conversational_ai.conversation_timeout_secs must be greater than 0");
             }
             if cai.default_language.trim().is_empty() {
-                anyhow::bail!(
-                    "conversational_ai.default_language must not be empty"
-                );
+                anyhow::bail!("conversational_ai.default_language must not be empty");
             }
             if cai.supported_languages.is_empty() {
                 anyhow::bail!(

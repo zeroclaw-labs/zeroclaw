@@ -134,7 +134,10 @@ pub fn evaluate_escalation(
 }
 
 /// Apply the escalation trigger to a conversation state — mark as pending.
-pub fn apply_escalation(state: &mut ConversationState, trigger: EscalationTrigger) -> HandoffContext {
+pub fn apply_escalation(
+    state: &mut ConversationState,
+    trigger: EscalationTrigger,
+) -> HandoffContext {
     state.escalation_status = EscalationStatus::Pending;
     HandoffContext::from_conversation(state, trigger)
 }
@@ -193,11 +196,7 @@ mod tests {
 
     #[test]
     fn handoff_context_from_conversation_captures_state() {
-        let mut state = ConversationState::new(
-            "conv-1".into(),
-            "telegram".into(),
-            "en".into(),
-        );
+        let mut state = ConversationState::new("conv-1".into(), "telegram".into(), "en".into());
         state.record_turn();
         state.context.insert("user_tier".into(), "premium".into());
         state.record_intent(DetectedIntent {
@@ -205,10 +204,7 @@ mod tests {
             confidence: 0.8,
         });
 
-        let ctx = HandoffContext::from_conversation(
-            &state,
-            EscalationTrigger::ExplicitRequest,
-        );
+        let ctx = HandoffContext::from_conversation(&state, EscalationTrigger::ExplicitRequest);
         assert_eq!(ctx.conversation_id, "conv-1");
         assert_eq!(ctx.channel, "telegram");
         assert_eq!(ctx.turn_count, 1);
@@ -218,11 +214,7 @@ mod tests {
 
     #[test]
     fn apply_escalation_sets_pending_status() {
-        let mut state = ConversationState::new(
-            "conv-1".into(),
-            "discord".into(),
-            "en".into(),
-        );
+        let mut state = ConversationState::new("conv-1".into(), "discord".into(), "en".into());
         let _ctx = apply_escalation(&mut state, EscalationTrigger::ExplicitRequest);
         assert_eq!(state.escalation_status, EscalationStatus::Pending);
     }
