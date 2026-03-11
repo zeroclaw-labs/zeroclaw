@@ -4,9 +4,10 @@ use crate::providers::traits::{
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+
+const API_VERSION: &str = "2024-10-21";
+
 pub struct AzureOpenAiProvider {
     base_url: String,
     api_key: Option<String>,
@@ -328,16 +329,13 @@ impl AzureOpenAiProvider {
     }
 
     fn http_client(&self) -> reqwest::Client {
-        Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .unwrap_or_else(|_| Client::new())
+        crate::config::build_runtime_proxy_client_with_timeouts("provider.azure_openai", 120, 10)
     }
 
     fn chat_completions_url(&self, model: &str) -> String {
         format!(
-            "{}/openai/deployments/{}/chat/completions?api-version=2024-10-21",
-            self.base_url, model
+            "{}/openai/deployments/{}/chat/completions?api-version={}",
+            self.base_url, model, API_VERSION
         )
     }
 
@@ -565,8 +563,8 @@ impl Provider for AzureOpenAiProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
         if let Some(api_key) = self.api_key.as_ref() {
             let deployments_url = format!(
-                "{}/openai/deployments?api-version=2024-10-21",
-                self.base_url
+                "{}/openai/deployments?api-version={}",
+                self.base_url, API_VERSION
             );
             self.http_client()
                 .get(deployments_url)
