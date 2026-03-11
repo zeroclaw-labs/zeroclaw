@@ -4,8 +4,8 @@
 //! Request:  {"id":"1","cmd":"gpio_write","args":{"pin":13,"value":1}}
 //! Response: {"id":"1","ok":true,"result":"done"}
 
-use super::traits::Peripheral;
 use crate::config::PeripheralBoardConfig;
+use crate::peripherals::Peripheral;
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};

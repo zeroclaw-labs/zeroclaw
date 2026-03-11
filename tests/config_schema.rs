@@ -43,6 +43,26 @@ default_temperature = "hot"
 }
 
 #[test]
+fn config_out_of_range_temperature_fails() {
+    let toml_str = "default_temperature = 99.0\n";
+    let result: Result<Config, _> = toml::from_str(toml_str);
+    assert!(
+        result.is_err(),
+        "temperature 99.0 should be rejected at deserialization"
+    );
+}
+
+#[test]
+fn config_negative_temperature_fails() {
+    let toml_str = "default_temperature = -0.5\n";
+    let result: Result<Config, _> = toml::from_str(toml_str);
+    assert!(
+        result.is_err(),
+        "negative temperature should be rejected at deserialization"
+    );
+}
+
+#[test]
 fn config_negative_port_fails() {
     let toml_str = r#"
 [gateway]
@@ -99,11 +119,13 @@ fn gateway_config_idempotency_defaults() {
 
 #[test]
 fn gateway_config_toml_roundtrip() {
-    let mut gw = GatewayConfig::default();
-    gw.port = 8080;
-    gw.host = "0.0.0.0".into();
-    gw.require_pairing = false;
-    gw.pair_rate_limit_per_minute = 5;
+    let gw = GatewayConfig {
+        port: 8080,
+        host: "0.0.0.0".into(),
+        require_pairing: false,
+        pair_rate_limit_per_minute: 5,
+        ..Default::default()
+    };
 
     let toml_str = toml::to_string(&gw).expect("gateway config should serialize");
     let parsed: GatewayConfig = toml::from_str(&toml_str).expect("should deserialize back");
@@ -218,12 +240,14 @@ fn autonomy_config_toml_roundtrip() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn config_empty_toml_requires_temperature() {
+fn config_empty_toml_uses_default_temperature() {
     let result: Result<Config, _> = toml::from_str("");
     assert!(
-        result.is_err(),
-        "empty TOML should fail because default_temperature is required"
+        result.is_ok(),
+        "empty TOML should succeed and use default temperature"
     );
+    let config = result.unwrap();
+    assert!((config.default_temperature - 0.7).abs() < f64::EPSILON);
 }
 
 #[test]

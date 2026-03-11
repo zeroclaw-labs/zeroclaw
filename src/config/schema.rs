@@ -84,6 +84,10 @@ pub struct Config {
     #[serde(default)]
     pub model_providers: HashMap<String, ModelProviderConfig>,
     /// Default model temperature (0.0–2.0). Default: `0.7`.
+    #[serde(
+        default = "default_temperature",
+        deserialize_with = "deserialize_temperature"
+    )]
     pub default_temperature: f64,
 
     /// Observability backend configuration (`[observability]`).
@@ -266,6 +270,38 @@ pub struct DelegateAgentConfig {
     /// Maximum tool-call iterations in agentic mode.
     #[serde(default = "default_max_tool_iterations")]
     pub max_iterations: usize,
+}
+
+/// Valid temperature range for all paths (config, CLI, env override).
+pub const TEMPERATURE_RANGE: std::ops::RangeInclusive<f64> = 0.0..=2.0;
+
+/// Default temperature when the field is absent from config.
+const DEFAULT_TEMPERATURE: f64 = 0.7;
+
+fn default_temperature() -> f64 {
+    DEFAULT_TEMPERATURE
+}
+
+/// Validate that a temperature value is within the allowed range.
+pub fn validate_temperature(value: f64) -> std::result::Result<f64, String> {
+    if TEMPERATURE_RANGE.contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "temperature {value} is out of range (expected {}..={})",
+            TEMPERATURE_RANGE.start(),
+            TEMPERATURE_RANGE.end()
+        ))
+    }
+}
+
+/// Custom serde deserializer that rejects out-of-range temperature values at parse time.
+fn deserialize_temperature<'de, D>(deserializer: D) -> std::result::Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: f64 = serde::Deserialize::deserialize(deserializer)?;
+    validate_temperature(value).map_err(serde::de::Error::custom)
 }
 
 fn default_max_depth() -> u32 {
@@ -457,7 +493,7 @@ fn parse_skills_prompt_injection_mode(raw: &str) -> Option<SkillsPromptInjection
 }
 
 /// Skills loading configuration (`[skills]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct SkillsConfig {
     /// Enable loading and syncing the community open-skills repository.
     /// Default: `false` (opt-in).
@@ -471,16 +507,6 @@ pub struct SkillsConfig {
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
-}
-
-impl Default for SkillsConfig {
-    fn default() -> Self {
-        Self {
-            open_skills_enabled: false,
-            open_skills_dir: None,
-            prompt_injection_mode: SkillsPromptInjectionMode::default(),
-        }
-    }
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
@@ -1940,18 +1966,10 @@ impl Default for HooksConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct BuiltinHooksConfig {
     /// Enable the command-logger hook (logs tool calls for auditing).
     pub command_logger: bool,
-}
-
-impl Default for BuiltinHooksConfig {
-    fn default() -> Self {
-        Self {
-            command_logger: false,
-        }
-    }
 }
 
 // ── Autonomy / Security ──────────────────────────────────────────
@@ -2528,7 +2546,7 @@ pub struct CustomTunnelConfig {
 struct ConfigWrapper<T: ChannelConfig>(std::marker::PhantomData<T>);
 
 impl<T: ChannelConfig> ConfigWrapper<T> {
-    fn new(_: &Option<T>) -> Self {
+    fn new(_: Option<&T>) -> Self {
         Self(std::marker::PhantomData)
     }
 }
@@ -2588,7 +2606,7 @@ pub struct ChannelsConfig {
     pub qq: Option<QQConfig>,
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
-    pub clawdtalk: Option<crate::channels::clawdtalk::ClawdTalkConfig>,
+    pub clawdtalk: Option<crate::channels::ClawdTalkConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -2604,79 +2622,79 @@ impl ChannelsConfig {
     pub fn channels_except_webhook(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
         vec![
             (
-                Box::new(ConfigWrapper::new(&self.telegram)),
+                Box::new(ConfigWrapper::new(self.telegram.as_ref())),
                 self.telegram.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.discord)),
+                Box::new(ConfigWrapper::new(self.discord.as_ref())),
                 self.discord.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.slack)),
+                Box::new(ConfigWrapper::new(self.slack.as_ref())),
                 self.slack.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.mattermost)),
+                Box::new(ConfigWrapper::new(self.mattermost.as_ref())),
                 self.mattermost.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.imessage)),
+                Box::new(ConfigWrapper::new(self.imessage.as_ref())),
                 self.imessage.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.matrix)),
+                Box::new(ConfigWrapper::new(self.matrix.as_ref())),
                 self.matrix.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.signal)),
+                Box::new(ConfigWrapper::new(self.signal.as_ref())),
                 self.signal.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.whatsapp)),
+                Box::new(ConfigWrapper::new(self.whatsapp.as_ref())),
                 self.whatsapp.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.linq)),
+                Box::new(ConfigWrapper::new(self.linq.as_ref())),
                 self.linq.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.wati)),
+                Box::new(ConfigWrapper::new(self.wati.as_ref())),
                 self.wati.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.nextcloud_talk)),
+                Box::new(ConfigWrapper::new(self.nextcloud_talk.as_ref())),
                 self.nextcloud_talk.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.email)),
+                Box::new(ConfigWrapper::new(self.email.as_ref())),
                 self.email.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.irc)),
+                Box::new(ConfigWrapper::new(self.irc.as_ref())),
                 self.irc.is_some()
             ),
             (
-                Box::new(ConfigWrapper::new(&self.lark)),
+                Box::new(ConfigWrapper::new(self.lark.as_ref())),
                 self.lark.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.feishu)),
+                Box::new(ConfigWrapper::new(self.feishu.as_ref())),
                 self.feishu.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.dingtalk)),
+                Box::new(ConfigWrapper::new(self.dingtalk.as_ref())),
                 self.dingtalk.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.qq)),
+                Box::new(ConfigWrapper::new(self.qq.as_ref())),
                 self.qq.is_some()
             ),
             (
-                Box::new(ConfigWrapper::new(&self.nostr)),
+                Box::new(ConfigWrapper::new(self.nostr.as_ref())),
                 self.nostr.is_some(),
             ),
             (
-                Box::new(ConfigWrapper::new(&self.clawdtalk)),
+                Box::new(ConfigWrapper::new(self.clawdtalk.as_ref())),
                 self.clawdtalk.is_some(),
             ),
         ]
@@ -2685,7 +2703,7 @@ impl ChannelsConfig {
     pub fn channels(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
         let mut ret = self.channels_except_webhook();
         ret.push((
-            Box::new(ConfigWrapper::new(&self.webhook)),
+            Box::new(ConfigWrapper::new(self.webhook.as_ref())),
             self.webhook.is_some(),
         ));
         ret
@@ -3595,7 +3613,7 @@ impl Default for Config {
             default_provider: Some("openrouter".to_string()),
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             model_providers: HashMap::new(),
-            default_temperature: 0.7,
+            default_temperature: default_temperature(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
@@ -4516,9 +4534,22 @@ impl Config {
 
         // Temperature: ZEROCLAW_TEMPERATURE
         if let Ok(temp_str) = std::env::var("ZEROCLAW_TEMPERATURE") {
-            if let Ok(temp) = temp_str.parse::<f64>() {
-                if (0.0..=2.0).contains(&temp) {
+            match temp_str.parse::<f64>() {
+                Ok(temp) if TEMPERATURE_RANGE.contains(&temp) => {
                     self.default_temperature = temp;
+                }
+                Ok(temp) => {
+                    tracing::warn!(
+                        "Ignoring ZEROCLAW_TEMPERATURE={temp}: \
+                         value out of range (expected {}..={})",
+                        TEMPERATURE_RANGE.start(),
+                        TEMPERATURE_RANGE.end()
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Ignoring ZEROCLAW_TEMPERATURE={temp_str:?}: not a valid number"
+                    );
                 }
             }
         }
@@ -4823,7 +4854,7 @@ async fn sync_directory(path: &Path) -> Result<()> {
         dir.sync_all()
             .await
             .with_context(|| format!("Failed to fsync directory metadata: {}", path.display()))?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]
