@@ -517,40 +517,20 @@ impl Provider for AnthropicProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
-            )
-        })?;
-
-        let request = ChatRequest {
-            model: model.to_string(),
-            max_tokens: 4096,
-            system: system_prompt.map(ToString::to_string),
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: message.to_string(),
-            }],
-            temperature,
-        };
-
-        let mut request = self
-            .http_client()
-            .post(format!("{}/v1/messages", self.base_url))
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&request);
-
-        request = self.apply_auth(request, credential);
-
-        let response = request.send().await?;
-
-        if !response.status().is_success() {
-            return Err(super::api_error("Anthropic", response).await);
+        let mut messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: message.to_string(),
+        }];
+        if let Some(sys) = system_prompt {
+            messages.insert(
+                0,
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: sys.to_string(),
+                },
+            );
         }
-
-        let chat_response: ChatResponse = response.json().await?;
-        Self::parse_text_response(chat_response)
+        self.chat_with_history(&messages, model, temperature).await
     }
 
     async fn chat_with_history(
@@ -594,7 +574,9 @@ impl Provider for AnthropicProvider {
 
         let native_response: NativeChatResponse = response.json().await?;
         let parsed = Self::parse_native_response(native_response);
-        Ok(parsed.text.unwrap_or_default())
+        parsed
+            .text
+            .ok_or_else(|| anyhow::anyhow!("No text response from Anthropic"))
     }
 
     async fn chat(
