@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ── Stage 1: Build ────────────────────────────────────────────
-FROM rust:1.93-slim@sha256:9663b80a1621253d30b146454f903de48f0af925c967be48c84745537cd35d8b AS builder
+FROM rust:1.94-slim@sha256:d6782f2b326a10eaf593eb90cafc34a03a287b4a25fe4d0c693c90304b06f6d7 AS builder
 
 WORKDIR /app
 
@@ -31,6 +31,7 @@ COPY src/ src/
 COPY benches/ benches/
 COPY crates/ crates/
 COPY firmware/ firmware/
+COPY data/ data/
 COPY web/ web/
 # Keep release builds resilient when frontend dist assets are not prebuilt in Git.
 RUN mkdir -p web/dist && \
@@ -58,20 +59,20 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
 
 # Prepare runtime directory structure and default config inline (no extra stage)
 RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
-    cat > /zeroclaw-data/.zeroclaw/config.toml <<EOF && \
+    printf '%s\n' \
+        'workspace_dir = "/zeroclaw-data/workspace"' \
+        'config_path = "/zeroclaw-data/.zeroclaw/config.toml"' \
+        'api_key = ""' \
+        'default_provider = "openrouter"' \
+        'default_model = "anthropic/claude-sonnet-4-20250514"' \
+        'default_temperature = 0.7' \
+        '' \
+        '[gateway]' \
+        'port = 42617' \
+        'host = "[::]"' \
+        'allow_public_bind = true' \
+        > /zeroclaw-data/.zeroclaw/config.toml && \
     chown -R 65534:65534 /zeroclaw-data
-workspace_dir = "/zeroclaw-data/workspace"
-config_path = "/zeroclaw-data/.zeroclaw/config.toml"
-api_key = ""
-default_provider = "openrouter"
-default_model = "anthropic/claude-sonnet-4-20250514"
-default_temperature = 0.7
-
-[gateway]
-port = 42617
-host = "[::]"
-allow_public_bind = true
-EOF
 
 # ── Stage 2: Development Runtime (Debian) ────────────────────
 FROM debian:trixie-slim@sha256:f6e2cfac5cf956ea044b4bd75e6397b4372ad88fe00908045e9a0d21712ae3ba AS dev
