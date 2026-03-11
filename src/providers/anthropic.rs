@@ -330,15 +330,17 @@ impl AnthropicProvider {
                 if let Some(rest) = src.strip_prefix("data:") {
                     if let Some(semi) = rest.find(';') {
                         let mime = &rest[..semi];
-                        if let Some(b64) = rest[semi + 1..].strip_prefix("base64,") {
-                            blocks.push(NativeContentOut::Image {
-                                source: ImageSource {
-                                    source_type: "base64".to_string(),
-                                    media_type: mime.to_string(),
-                                    data: b64.to_string(),
-                                },
-                            });
-                            continue;
+                        if mime.starts_with("image/") {
+                            if let Some(b64) = rest[semi + 1..].strip_prefix("base64,") {
+                                blocks.push(NativeContentOut::Image {
+                                    source: ImageSource {
+                                        source_type: "base64".to_string(),
+                                        media_type: mime.to_string(),
+                                        data: b64.to_string(),
+                                    },
+                                });
+                                continue;
+                            }
                         }
                     }
                 }
