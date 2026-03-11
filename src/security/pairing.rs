@@ -216,6 +216,19 @@ impl PairingGuard {
         let tokens = self.paired_tokens.lock();
         tokens.iter().cloned().collect()
     }
+
+    /// Generate a new pairing code, even if already paired.
+    ///
+    /// This allows adding additional clients without restarting the gateway.
+    /// The new code can be used exactly once to pair a new client.
+    pub fn generate_new_pairing_code(&self) -> Option<String> {
+        if !self.require_pairing {
+            return None;
+        }
+        let new_code = generate_code();
+        *self.pairing_code.lock() = Some(new_code.clone());
+        Some(new_code)
+    }
 }
 
 /// Normalize a client identifier: trim whitespace, map empty to `"unknown"`.
@@ -283,8 +296,21 @@ fn is_token_hash(value: &str) -> bool {
 
 /// Constant-time string comparison to prevent timing attacks.
 ///
-/// Does not short-circuit on length mismatch — always iterates over the
-/// longer input to avoid leaking length information via timing.
+/// This function is critical to the security of the pairing mechanism:
+/// when verifying the one-time pairing code, timing side-channels could
+/// allow an attacker to deduce the correct code character-by-character.
+///
+/// Implementation details that ensure constant-time execution:
+/// 1. Does not short-circuit on length mismatch — always iterates over
+///    the longer input to avoid leaking length information via timing.
+/// 2. Uses bitwise AND (&) instead of logical AND (&&) to ensure both
+///    comparisons always execute, preventing timing variations that could
+///    reveal whether the length check or byte comparison failed first.
+///
+/// SECURITY NOTE: The use of `&` instead of `&&` is intentional and
+/// required for constant-time behavior. Do not change to `&&` or clippy
+/// suggestions that would reintroduce short-circuit evaluation.
+#[allow(clippy::needless_bitwise_bool)]
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
@@ -301,6 +327,8 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
         let y = *b.get(i).unwrap_or(&0);
         byte_diff |= x ^ y;
     }
+    // Intentional use of bitwise & (not &&) to ensure constant-time execution
+    // and prevent timing side-channel attacks. Both comparisons must execute.
     (len_diff == 0) & (byte_diff == 0)
 }
 
