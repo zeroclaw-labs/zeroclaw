@@ -3056,8 +3056,18 @@ impl Channel for TelegramChannel {
             "chat_id": chat_id,
             "text": initial_text,
         });
-        if let Some(tid) = thread_id {
+        if let Some(tid) = &thread_id {
             body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+        }
+        // Attach reply_to_message_id so the "..." placeholder is already threaded
+        // to the user's original message. finalize_draft edits this message in place
+        // via editMessageText, which preserves the reply relationship set here.
+        if let Some(reply_id) = message
+            .reply_to_message_id
+            .as_ref()
+            .and_then(|id| id.parse::<i64>().ok())
+        {
+            body["reply_to_message_id"] = serde_json::json!(reply_id);
         }
 
         let resp = self

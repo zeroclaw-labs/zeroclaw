@@ -7,7 +7,37 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const SCAN_PATHS: &[&str] = &["src", "examples"];
-const FORBIDDEN_PATTERNS: &[&str] = &[".reply_to", "reply_to:"];
+
+// Forbidden patterns for legacy `ChannelMessage::reply_to` field.
+//
+// Allowed (legitimate new API — must NOT be caught):
+//   `.reply_to(` — builder method on `SendMessage`
+//   `reply_to_message_id` — new dedicated field name
+//
+// Forbidden (legacy patterns that indicate the old field is back):
+//   `reply_to:` — struct-literal field assignment or field declaration
+//   `.reply_to` not followed by `(` — field access on ChannelMessage
+//
+// Implementation note: `.reply_to` is checked with an inline allowlist so that
+// the builder method call `.reply_to(` and the new field name `reply_to_message_id`
+// do not produce false positives.
+const FORBIDDEN_EXACT_PATTERNS: &[&str] = &["reply_to:"];
+
+fn is_legacy_reply_to_access(line: &str) -> bool {
+    // Find every occurrence of `.reply_to` and check that it is NOT followed by `(`
+    // and NOT part of `reply_to_message_id`.
+    let needle = ".reply_to";
+    let mut search = line;
+    while let Some(pos) = search.find(needle) {
+        let after = &search[pos + needle.len()..];
+        // Allow: `.reply_to(` (builder call) and `.reply_to_message_id` (new field)
+        if !after.starts_with('(') && !after.starts_with('_') {
+            return true;
+        }
+        search = &search[pos + 1..];
+    }
+    false
+}
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = fs::read_dir(dir)
@@ -45,19 +75,34 @@ fn source_does_not_use_legacy_reply_to_field() {
         });
 
         for (line_idx, line) in content.lines().enumerate() {
-            for pattern in FORBIDDEN_PATTERNS {
+            let rel = || {
+                file_path
+                    .strip_prefix(root)
+                    .unwrap_or(&file_path)
+                    .display()
+                    .to_string()
+            };
+
+            // Check exact forbidden string patterns (struct literal / field declaration).
+            for pattern in FORBIDDEN_EXACT_PATTERNS {
                 if line.contains(pattern) {
-                    let rel = file_path
-                        .strip_prefix(root)
-                        .unwrap_or(&file_path)
-                        .display()
-                        .to_string();
                     violations.push(format!(
-                        "{rel}:{} contains forbidden pattern `{pattern}`: {}",
+                        "{}:{} contains forbidden pattern `{pattern}`: {}",
+                        rel(),
                         line_idx + 1,
                         line.trim()
                     ));
                 }
+            }
+
+            // Check for legacy field access `.reply_to` (excluding the builder and new field).
+            if is_legacy_reply_to_access(line) {
+                violations.push(format!(
+                    "{}:{} contains forbidden pattern `.reply_to` (field access): {}",
+                    rel(),
+                    line_idx + 1,
+                    line.trim()
+                ));
             }
         }
     }
