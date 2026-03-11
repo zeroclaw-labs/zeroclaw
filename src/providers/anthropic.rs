@@ -594,9 +594,7 @@ impl Provider for AnthropicProvider {
 
         let native_response: NativeChatResponse = response.json().await?;
         let parsed = Self::parse_native_response(native_response);
-        Ok(parsed
-            .text
-            .unwrap_or_default())
+        Ok(parsed.text.unwrap_or_default())
     }
 
     async fn chat(
