@@ -341,6 +341,7 @@ pub(crate) async fn deliver_announcement(
                 tg.bot_token.clone(),
                 tg.allowed_users.clone(),
                 tg.mention_only,
+                tg.ack_reaction,
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }
