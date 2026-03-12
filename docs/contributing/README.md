@@ -10,6 +10,7 @@ For contributors, reviewers, and maintainers.
 - CI map and ownership: [./ci-map.md](./ci-map.md)
 - Actions source policy: [./actions-source-policy.md](./actions-source-policy.md)
 - Extension examples: [./extension-examples.md](./extension-examples.md)
+- Testing guide: [./testing.md](./testing.md)
 
 ## Suggested Reading Order
 

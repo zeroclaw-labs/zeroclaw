@@ -44,6 +44,7 @@ const SLACK_ATTACHMENT_IMAGE_INLINE_FALLBACK_MAX_BYTES: usize = 512 * 1024;
 const SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES: usize = 256 * 1024;
 const SLACK_ATTACHMENT_TEXT_INLINE_MAX_CHARS: usize = 12_000;
 const SLACK_ATTACHMENT_FILENAME_MAX_CHARS: usize = 128;
+const SLACK_USER_CACHE_MAX_ENTRIES: usize = 1000;
 const SLACK_ATTACHMENT_SAVE_SUBDIR: &str = "slack_files";
 const SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE: usize = 8;
 const SLACK_ATTACHMENT_RENDER_CONCURRENCY: usize = 3;
@@ -98,7 +99,7 @@ impl SlackChannel {
     }
 
     fn http_client(&self) -> reqwest::Client {
-        crate::config::build_runtime_proxy_client("channel.slack")
+        crate::config::build_runtime_proxy_client_with_timeouts("channel.slack", 30, 10)
     }
 
     /// Check if a Slack user ID is in the allowlist.
@@ -255,6 +256,10 @@ impl SlackChannel {
         let Ok(mut cache) = self.user_display_name_cache.lock() else {
             return;
         };
+        if cache.len() >= SLACK_USER_CACHE_MAX_ENTRIES {
+            let now = Instant::now();
+            cache.retain(|_, v| v.expires_at > now);
+        }
         cache.insert(
             user_id.to_string(),
             CachedSlackDisplayName {
@@ -714,7 +719,10 @@ impl SlackChannel {
 
     fn slack_media_http_client_no_redirect(&self) -> anyhow::Result<reqwest::Client> {
         let builder = crate::config::apply_runtime_proxy_to_builder(
-            reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(10)),
             "channel.slack",
         );
         builder
@@ -736,12 +744,11 @@ impl SlackChannel {
 
         for redirect_hop in 0..=SLACK_MEDIA_REDIRECT_MAX_HOPS {
             let redacted_current = Self::redact_slack_url(&current_url);
-            let response = match client
-                .get(current_url.clone())
-                .bearer_auth(&self.bot_token)
-                .send()
-                .await
-            {
+            let mut req = client.get(current_url.clone());
+            if redirect_hop == 0 {
+                req = req.bearer_auth(&self.bot_token);
+            }
+            let response = match req.send().await {
                 Ok(response) => response,
                 Err(err) => {
                     tracing::warn!("Slack file fetch failed for {}: {}", redacted_current, err);
@@ -1086,6 +1093,21 @@ impl SlackChannel {
         }
         drop(temp_file);
 
+        // Reject symlinks at the destination to prevent a symlink-following attack
+        // where an attacker places a symlink at the target path to redirect writes
+        // outside the workspace.
+        match tokio::fs::symlink_metadata(&output_path).await {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                tracing::warn!(
+                    "Slack image attachment refused: output path is a symlink: {}",
+                    output_path.display()
+                );
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return None;
+            }
+            _ => {}
+        }
+
         if let Err(err) = tokio::fs::rename(&temp_path, &output_path).await {
             tracing::warn!(
                 "Slack image attachment finalize failed for {}: {err}",
@@ -1215,11 +1237,12 @@ impl SlackChannel {
             out.push(ch);
             count += 1;
         }
+        let was_truncated = count >= max_chars && value.chars().nth(max_chars).is_some();
         let mut out = out.trim().to_string();
         if out.is_empty() {
             return None;
         }
-        if value.chars().count() > count {
+        if was_truncated {
             out.push_str("\n…[truncated]");
         }
         Some(out)
@@ -1794,15 +1817,11 @@ impl SlackChannel {
         truncated.parse::<u64>().ok()
     }
 
-    fn jitter_ms_from_clock(max_jitter_ms: u64) -> u64 {
+    fn jitter_ms(max_jitter_ms: u64) -> u64 {
         if max_jitter_ms == 0 {
             return 0;
         }
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| u64::from(d.subsec_nanos()))
-            .unwrap_or(0);
-        nanos % (max_jitter_ms + 1)
+        rand::random::<u64>() % (max_jitter_ms + 1)
     }
 
     fn compute_exponential_backoff_delay(
@@ -1828,7 +1847,7 @@ impl SlackChannel {
     }
 
     fn compute_socket_mode_retry_delay(attempt: u32) -> Duration {
-        let jitter_ms = Self::jitter_ms_from_clock(SLACK_SOCKET_MODE_MAX_JITTER_MS);
+        let jitter_ms = Self::jitter_ms(SLACK_SOCKET_MODE_MAX_JITTER_MS);
         Self::compute_exponential_backoff_delay(
             SLACK_SOCKET_MODE_INITIAL_BACKOFF_SECS,
             attempt,
@@ -1917,7 +1936,7 @@ impl SlackChannel {
 
                 let retry_after_secs = Self::parse_retry_after_secs(&headers)
                     .unwrap_or(SLACK_HISTORY_DEFAULT_RETRY_AFTER_SECS);
-                let jitter_ms = Self::jitter_ms_from_clock(SLACK_HISTORY_MAX_JITTER_MS);
+                let jitter_ms = Self::jitter_ms(SLACK_HISTORY_MAX_JITTER_MS);
                 let wait = Self::compute_retry_delay(retry_after_secs, attempt, jitter_ms);
                 total_wait += wait;
                 let next_retry_at = Self::next_retry_timestamp(wait);
