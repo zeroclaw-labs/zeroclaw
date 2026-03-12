@@ -88,11 +88,11 @@ Construit par des étudiants et membres des communautés Harvard, MIT et Sundai.
 
 Utilisez ce tableau pour les avis importants (changements incompatibles, avis de sécurité, fenêtres de maintenance et bloqueurs de version).
 
-| Date (UTC) | Niveau      | Avis                                                                                                                                                                                                                                                                                                                                                                                                              | Action                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| ---------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2026-02-19 | _Critique_  | Nous ne sommes **pas affiliés** à `openagen/zeroclaw` ou `zeroclaw.org`. Le domaine `zeroclaw.org` pointe actuellement vers le fork `openagen/zeroclaw`, et ce domaine/dépôt usurpe l'identité de notre site web/projet officiel.                                                                                                                                                                                 | Ne faites pas confiance aux informations, binaires, levées de fonds ou annonces provenant de ces sources. Utilisez uniquement [ce dépôt](https://github.com/zeroclaw-labs/zeroclaw) et nos comptes sociaux vérifiés.                                                                                                                                                                                                                                                                                                                                                          |
-| 2026-02-21 | _Important_ | Notre site officiel est désormais en ligne : [zeroclawlabs.ai](https://zeroclawlabs.ai). Merci pour votre patience pendant cette attente. Nous constatons toujours des tentatives d'usurpation : ne participez à aucune activité d'investissement/financement au nom de ZeroClaw si elle n'est pas publiée via nos canaux officiels.                                                                                                                   | Utilisez [ce dépôt](https://github.com/zeroclaw-labs/zeroclaw) comme source unique de vérité. Suivez [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Facebook (groupe)](https://www.facebook.com/groups/zeroclaw), et [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/) pour les mises à jour officielles. |
-| 2026-02-19 | _Important_ | Anthropic a mis à jour les conditions d'utilisation de l'authentification et des identifiants le 2026-02-19. L'authentification OAuth (Free, Pro, Max) est exclusivement destinée à Claude Code et Claude.ai ; l'utilisation de tokens OAuth de Claude Free/Pro/Max dans tout autre produit, outil ou service (y compris Agent SDK) n'est pas autorisée et peut violer les Conditions d'utilisation grand public. | Veuillez temporairement éviter les intégrations OAuth de Claude Code pour prévenir toute perte potentielle. Clause originale : [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).                                                                                                                                                                                                                                                                                                                      |
+| Date (UTC) | Niveau      | Avis                                                                                                                                                                                                                                                                                                                                                                                                              | Action                                                                                                                                                                                                                                                                                                                            |
+| ---------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2026-02-19 | _Critique_  | Nous ne sommes **pas affiliés** à `openagen/zeroclaw` ou `zeroclaw.org`. Le domaine `zeroclaw.org` pointe actuellement vers le fork `openagen/zeroclaw`, et ce domaine/dépôt usurpe l'identité de notre site web/projet officiel.                                                                                                                                                                                 | Ne faites pas confiance aux informations, binaires, levées de fonds ou annonces provenant de ces sources. Utilisez uniquement [ce dépôt](https://github.com/zeroclaw-labs/zeroclaw) et nos comptes sociaux vérifiés.                                                                                                              |
+| 2026-02-21 | _Important_ | Notre site officiel est désormais en ligne : [zeroclawlabs.ai](https://zeroclawlabs.ai). Merci pour votre patience pendant cette attente. Nous constatons toujours des tentatives d'usurpation : ne participez à aucune activité d'investissement/financement au nom de ZeroClaw si elle n'est pas publiée via nos canaux officiels.                                                                              | Utilisez [ce dépôt](https://github.com/zeroclaw-labs/zeroclaw) comme source unique de vérité. Suivez [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Facebook (groupe)](https://www.facebook.com/groups/zeroclaw), et [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/) pour les mises à jour officielles. |
+| 2026-02-19 | _Important_ | Anthropic a mis à jour les conditions d'utilisation de l'authentification et des identifiants le 2026-02-19. L'authentification OAuth (Free, Pro, Max) est exclusivement destinée à Claude Code et Claude.ai ; l'utilisation de tokens OAuth de Claude Free/Pro/Max dans tout autre produit, outil ou service (y compris Agent SDK) n'est pas autorisée et peut violer les Conditions d'utilisation grand public. | Veuillez temporairement éviter les intégrations OAuth de Claude Code pour prévenir toute perte potentielle. Clause originale : [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).                                                                       |
 
 ### ✨ Fonctionnalités
 
@@ -153,25 +153,25 @@ Exemple d'échantillon (macOS arm64, mesuré le 18 février 2026) :
 
 1. **Visual Studio Build Tools** (fournit le linker MSVC et le Windows SDK) :
 
-    ```powershell
-    winget install Microsoft.VisualStudio.2022.BuildTools
-    ```
+   ```powershell
+   winget install Microsoft.VisualStudio.2022.BuildTools
+   ```
 
-    Pendant l'installation (ou via le Visual Studio Installer), sélectionnez la charge de travail **"Développement Desktop en C++"**.
+   Pendant l'installation (ou via le Visual Studio Installer), sélectionnez la charge de travail **"Développement Desktop en C++"**.
 
 2. **Toolchain Rust :**
 
-    ```powershell
-    winget install Rustlang.Rustup
-    ```
+   ```powershell
+   winget install Rustlang.Rustup
+   ```
 
-    Après l'installation, ouvrez un nouveau terminal et exécutez `rustup default stable` pour vous assurer que la toolchain stable est active.
+   Après l'installation, ouvrez un nouveau terminal et exécutez `rustup default stable` pour vous assurer que la toolchain stable est active.
 
 3. **Vérifiez** que les deux fonctionnent :
-    ```powershell
-    rustc --version
-    cargo --version
-    ```
+   ```powershell
+   rustc --version
+   cargo --version
+   ```
 
 ### Windows — Optionnel
 
@@ -185,30 +185,30 @@ Exemple d'échantillon (macOS arm64, mesuré le 18 février 2026) :
 ### Linux / macOS — Requis
 
 1. **Outils de build essentiels :**
-    - **Linux (Debian/Ubuntu) :** `sudo apt install build-essential pkg-config`
-    - **Linux (Fedora/RHEL) :** `sudo dnf group install development-tools && sudo dnf install pkg-config`
-    - **macOS :** Installez les Outils de Ligne de Commande Xcode : `xcode-select --install`
+   - **Linux (Debian/Ubuntu) :** `sudo apt install build-essential pkg-config`
+   - **Linux (Fedora/RHEL) :** `sudo dnf group install development-tools && sudo dnf install pkg-config`
+   - **macOS :** Installez les Outils de Ligne de Commande Xcode : `xcode-select --install`
 
 2. **Toolchain Rust :**
 
-    ```bash
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-    ```
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   ```
 
-    Voir [rustup.rs](https://rustup.rs) pour les détails.
+   Voir [rustup.rs](https://rustup.rs) pour les détails.
 
 3. **Vérifiez :**
-    ```bash
-    rustc --version
-    cargo --version
-    ```
+   ```bash
+   rustc --version
+   cargo --version
+   ```
 
 ### Linux / macOS — Optionnel
 
 - **Docker** — requis seulement si vous utilisez le [runtime sandboxé Docker](#support-runtime-actuel) (`runtime.kind = "docker"`).
-    - **Linux (Debian/Ubuntu) :** voir [docs.docker.com](https://docs.docker.com/engine/install/ubuntu/)
-    - **Linux (Fedora/RHEL) :** voir [docs.docker.com](https://docs.docker.com/engine/install/fedora/)
-    - **macOS :** installez Docker Desktop via [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/)
+  - **Linux (Debian/Ubuntu) :** voir [docs.docker.com](https://docs.docker.com/engine/install/ubuntu/)
+  - **Linux (Fedora/RHEL) :** voir [docs.docker.com](https://docs.docker.com/engine/install/fedora/)
+  - **macOS :** installez Docker Desktop via [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/)
 
 </details>
 
@@ -866,7 +866,7 @@ ZeroClaw est sous double licence pour une ouverture maximale et la protection de
 
 | Licence                      | Cas d'utilisation                                            |
 | ---------------------------- | ------------------------------------------------------------ |
-| [MIT](LICENSE-MIT)               | Open-source, recherche, académique, usage personnel          |
+| [MIT](LICENSE-MIT)           | Open-source, recherche, académique, usage personnel          |
 | [Apache 2.0](LICENSE-APACHE) | Protection de brevet, institutionnel, déploiement commercial |
 
 Vous pouvez choisir l'une ou l'autre licence. **Les contributeurs accordent automatiquement des droits sous les deux** — voir [CLA.md](docs/contributing/cla.md) pour l'accord de contributeur complet.
