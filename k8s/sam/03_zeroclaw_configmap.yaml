@@ -43,9 +43,38 @@ data:
       max_cost_per_day_cents = 500
       require_approval_for_medium_risk = false
       block_high_risk_commands = false
-      non_cli_excluded_tools = []
+      non_cli_excluded_tools = [
+          # Admin/config tools — not needed for a multipurpose agent
+          "model_routing_config",
+          "web_access_config",
+          "web_search_config",
+          "proxy_config",
+          "channel_ack_config",
+          "manage_auth_profile",
+          "manage_outbound_queue",
+          "check_provider_quota",
+          "estimate_quota_cost",
+          "switch_provider",
+          "openclaw_migration",
+          "schedule",
+          # Serena duplicates of native zeroclaw tools
+          "serena__execute_shell_command",
+          "serena__search_for_pattern",
+          "serena__read_file",
+          "serena__find_file",
+          "serena__list_dir",
+          "serena__create_text_file",
+          # Serena lifecycle/admin tools
+          "serena__check_onboarding_performed",
+          "serena__onboarding",
+          "serena__initial_instructions",
+          "serena__prepare_for_new_conversation",
+          "serena__get_current_config",
+          "serena__switch_modes",
+          "serena__activate_project",
+      ]
       non_cli_natural_language_approval_mode = "direct"
-      shell_env_passthrough = ["ACP_AUTH_TOKEN", "ACP_BASE_URL", "ACP_CWD"]
+      shell_env_passthrough = ["ACP_AUTH_TOKEN", "ACP_BASE_URL", "ACP_CWD", "SPEAKR_API_TOKEN"]
 
       [research]
       trigger = "never"
