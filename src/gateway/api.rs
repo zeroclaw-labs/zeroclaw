@@ -1055,6 +1055,7 @@ mod tests {
             from_address: "agent@example.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
+            default_subject: "ZeroClaw Message".to_string(),
         });
         cfg.model_routes = vec![crate::config::schema::ModelRouteConfig {
             hint: "reasoning".to_string(),
@@ -1188,6 +1189,7 @@ mod tests {
             from_address: "agent@example.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
+            default_subject: "ZeroClaw Message".to_string(),
         });
         current.model_routes = vec![
             crate::config::schema::ModelRouteConfig {

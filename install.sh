@@ -751,7 +751,7 @@ MSG
   fi
 
   "$CONTAINER_CLI" run --rm -it \
-    "${container_run_namespace_args[@]}" \
+    "${container_run_namespace_args[@]+"${container_run_namespace_args[@]}"}" \
     "${container_run_user_args[@]}" \
     -e HOME=/zeroclaw-data \
     -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
