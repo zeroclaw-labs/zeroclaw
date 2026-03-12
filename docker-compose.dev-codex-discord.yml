@@ -170,7 +170,7 @@ services:
       - cargo-target:/app/target
 
     ports:
-      - "42617:42617"
+      - "127.0.0.1:42617:42617"
 
 volumes:
   cargo-registry:

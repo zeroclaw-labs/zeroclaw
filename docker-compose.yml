@@ -25,8 +25,8 @@ services:
       # Options: openrouter, openai, anthropic, ollama
       - PROVIDER=${PROVIDER:-openrouter}
       
-      # Allow public bind inside Docker (required for container networking)
-      - ZEROCLAW_ALLOW_PUBLIC_BIND=true
+      # Keep public bind disabled by default.
+      - ZEROCLAW_ALLOW_PUBLIC_BIND=false
       # Default gateway port inside container
       - ZEROCLAW_GATEWAY_PORT=${ZEROCLAW_GATEWAY_PORT:-42617}
       
@@ -39,7 +39,7 @@ services:
       
     ports:
       # Gateway API port (override HOST_PORT if 42617 is taken)
-      - "${HOST_PORT:-42617}:${ZEROCLAW_GATEWAY_PORT:-42617}"
+      - "127.0.0.1:${HOST_PORT:-42617}:${ZEROCLAW_GATEWAY_PORT:-42617}"
     
     # Resource limits
     deploy:

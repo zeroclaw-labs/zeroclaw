@@ -102,6 +102,23 @@ struct ChannelNotifyObserver {
     tools_used: AtomicBool,
 }
 
+fn truncate_for_display(input: &str, max_chars: usize) -> String {
+    let mut iter = input.chars();
+    let mut output = String::new();
+    for _ in 0..max_chars {
+        if let Some(ch) = iter.next() {
+            output.push(ch);
+        } else {
+            return output;
+        }
+    }
+
+    if iter.next().is_some() {
+        output.push('…');
+    }
+    output
+}
+
 impl Observer for ChannelNotifyObserver {
     fn record_event(&self, event: &ObserverEvent) {
         if let ObserverEvent::ToolCallStart { tool, arguments } = event {
@@ -110,28 +127,20 @@ impl Observer for ChannelNotifyObserver {
                 Some(args) if !args.is_empty() => {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
                         if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
-                            format!(": `{}`", if cmd.len() > 200 { &cmd[..200] } else { cmd })
+                            format!(": `{}`", truncate_for_display(cmd, 200))
                         } else if let Some(q) = v.get("query").and_then(|c| c.as_str()) {
-                            format!(": {}", if q.len() > 200 { &q[..200] } else { q })
+                            format!(": {}", truncate_for_display(q, 200))
                         } else if let Some(p) = v.get("path").and_then(|c| c.as_str()) {
                             format!(": {p}")
                         } else if let Some(u) = v.get("url").and_then(|c| c.as_str()) {
                             format!(": {u}")
                         } else {
                             let s = args.to_string();
-                            if s.len() > 120 {
-                                format!(": {}…", &s[..120])
-                            } else {
-                                format!(": {s}")
-                            }
+                            format!(": {}", truncate_for_display(&s, 120))
                         }
                     } else {
                         let s = args.to_string();
-                        if s.len() > 120 {
-                            format!(": {}…", &s[..120])
-                        } else {
-                            format!(": {s}")
-                        }
+                        format!(": {}", truncate_for_display(&s, 120))
                     }
                 }
                 _ => String::new(),
@@ -168,6 +177,8 @@ const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
+const FACEBOOK_SHORTCUT_MEMORY_KEY: &str = "shortcut_facebook_page_post";
+const FACEBOOK_SHORTCUT_MEMORY_CONTENT: &str = "When the user asks to publish to Facebook (with or without image), call facebook_page_post directly in one step. Prefer image_path or image_url for images. Do not use shell/glob_search/file tools unless explicitly requested.";
 const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
 /// Default timeout for processing a single channel message (LLM + tools).
 /// Used as fallback when not configured in channels_config.message_timeout_secs.
@@ -946,6 +957,68 @@ fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
     content.chars().count() > MEMORY_CONTEXT_MAX_CHARS
 }
 
+fn is_facebook_publish_intent(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    let mentions_target =
+        lower.contains("facebook") || lower.contains(" fb ") || lower.contains("fb page");
+    let mentions_action = ["post", "publish", "caption", "upload", "image", "photo"]
+        .iter()
+        .any(|token| lower.contains(token));
+    mentions_target && mentions_action
+}
+
+fn has_explicit_non_facebook_tool_request(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    [
+        "use shell",
+        "run shell",
+        "run command",
+        "terminal",
+        "glob_search",
+        "search files",
+        "find files",
+        "file_read",
+        "file_write",
+    ]
+    .iter()
+    .any(|token| lower.contains(token))
+}
+
+fn build_facebook_shortcut_exclusions(
+    tools_registry: &[Box<dyn Tool>],
+    excluded_tools: &[String],
+) -> Vec<String> {
+    let mut out = excluded_tools.to_vec();
+    for tool in tools_registry {
+        if tool.name() == "facebook_page_post" {
+            continue;
+        }
+        if !out.iter().any(|excluded| excluded == tool.name()) {
+            out.push(tool.name().to_string());
+        }
+    }
+    out
+}
+
+fn facebook_publish_tool_succeeded(history: &[ChatMessage], start_index: usize) -> bool {
+    let mut saw_facebook_tool = false;
+    let mut saw_success_output = false;
+
+    for msg in history.iter().skip(start_index) {
+        if msg.content.contains("facebook_page_post") {
+            saw_facebook_tool = true;
+        }
+
+        if msg.content
+            .contains("Facebook page post created successfully")
+        {
+            saw_success_output = true;
+        }
+    }
+
+    saw_facebook_tool && saw_success_output
+}
+
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     [
@@ -1694,6 +1767,23 @@ async fn process_channel_message(
     let history_key = conversation_history_key(&msg);
     let route = get_route_selection(ctx.as_ref(), &history_key);
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
+    let facebook_intent = is_facebook_publish_intent(&msg.content);
+    let facebook_policy_active =
+        facebook_intent && !has_explicit_non_facebook_tool_request(&msg.content);
+    let facebook_shortcut_hint = if facebook_intent {
+        match ctx.memory.get(FACEBOOK_SHORTCUT_MEMORY_KEY).await {
+            Ok(Some(entry)) if !entry.content.trim().is_empty() => Some(entry.content),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    tracing::debug!(
+        channel = %msg.channel,
+        facebook_intent,
+        facebook_policy_active,
+        "Channel policy evaluation"
+    );
     let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
         Ok(provider) => provider,
         Err(err) => {
@@ -1748,6 +1838,18 @@ async fn process_channel_message(
         .cloned()
         .unwrap_or_default();
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
+
+    if let Some(hint) = &facebook_shortcut_hint {
+        if let Some(last_turn) = prior_turns.last_mut() {
+            if last_turn.role == "user" {
+                last_turn.content = format!(
+                    "[Facebook shortcut]\n{}\n\n{}",
+                    hint.trim(),
+                    last_turn.content
+                );
+            }
+        }
+    }
 
     // Only enrich with memory context when there is no prior conversation
     // history. Follow-up turns already include context from previous messages.
@@ -1894,6 +1996,16 @@ async fn process_channel_message(
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
+    let effective_excluded_tools = if msg.channel == "cli" {
+        Vec::new()
+    } else if facebook_policy_active {
+        build_facebook_shortcut_exclusions(
+            ctx.tools_registry.as_ref(),
+            ctx.non_cli_excluded_tools.as_ref(),
+        )
+    } else {
+        ctx.non_cli_excluded_tools.as_ref().clone()
+    };
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
@@ -1914,11 +2026,7 @@ async fn process_channel_message(
                 Some(cancellation_token.clone()),
                 delta_tx,
                 ctx.hooks.as_deref(),
-                if msg.channel == "cli" {
-                    &[]
-                } else {
-                    ctx.non_cli_excluded_tools.as_ref()
-                },
+                &effective_excluded_tools,
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -2076,6 +2184,24 @@ async fn process_channel_message(
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
+
+            if facebook_policy_active
+                && facebook_publish_tool_succeeded(&history, history_len_before_tools)
+            {
+                if let Err(error) = ctx
+                    .memory
+                    .store(
+                        FACEBOOK_SHORTCUT_MEMORY_KEY,
+                        FACEBOOK_SHORTCUT_MEMORY_CONTENT,
+                        crate::memory::MemoryCategory::Core,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::debug!("Failed to persist facebook shortcut memory: {error}");
+                }
+            }
+
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
@@ -3650,6 +3776,48 @@ mod tests {
         assert_eq!(normalized[2].role, "user");
         assert!(normalized[1].content.contains("assistant part 1"));
         assert!(normalized[1].content.contains("assistant part 2"));
+    }
+
+    #[test]
+    fn facebook_intent_detector_matches_publish_requests() {
+        assert!(is_facebook_publish_intent(
+            "Write a Facebook post with this product image"
+        ));
+        assert!(is_facebook_publish_intent(
+            "Please publish this to our FB page"
+        ));
+        assert!(!is_facebook_publish_intent(
+            "Post this message to Discord only"
+        ));
+    }
+
+    #[test]
+    fn facebook_explicit_non_shortcut_detector_matches_shell_requests() {
+        assert!(has_explicit_non_facebook_tool_request(
+            "use shell and glob_search to find the latest image before posting"
+        ));
+        assert!(!has_explicit_non_facebook_tool_request(
+            "write a facebook caption and publish it"
+        ));
+    }
+
+    #[test]
+    fn facebook_publish_success_detector_requires_tool_and_success_text() {
+        let history = vec![
+            ChatMessage::assistant(
+                r#"{"tool_calls":[{"id":"1","name":"facebook_page_post","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"1","content":"Facebook page post created successfully with id: 123"}"#),
+        ];
+        assert!(facebook_publish_tool_succeeded(&history, 0));
+
+        let no_success = vec![
+            ChatMessage::assistant(
+                r#"{"tool_calls":[{"id":"1","name":"facebook_page_post","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"1","content":"Facebook Graph API returned status 400"}"#),
+        ];
+        assert!(!facebook_publish_tool_succeeded(&no_success, 0));
     }
 
     /// Verify that an orphan user turn followed by a failure-marker assistant

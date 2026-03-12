@@ -196,6 +196,7 @@ impl Tool for FacebookPagePostTool {
     fn description(&self) -> &str {
         "Create a post on a Facebook Page. Credentials are read from env vars \
         (preferred) or workspace .env: app_id, app_secret, page_id, access_token. \
+        Supports text/link posts and single-image posts (image_url or image_path). \
         Optional API base override: FACEBOOK_GRAPH_API_BASE."
     }
 
@@ -210,6 +211,14 @@ impl Tool for FacebookPagePostTool {
                 "link": {
                     "type": "string",
                     "description": "Optional HTTPS/HTTP URL to include with the post"
+                },
+                "image_url": {
+                    "type": "string",
+                    "description": "Optional HTTPS/HTTP image URL. If set, post is published as a page photo with message as caption."
+                },
+                "image_path": {
+                    "type": "string",
+                    "description": "Optional local image path (workspace-relative recommended). If set, image is uploaded as a page photo with message as caption."
                 },
                 "published": {
                     "type": "boolean",
@@ -264,6 +273,49 @@ impl Tool for FacebookPagePostTool {
             None => None,
         };
 
+        let image_url = match args.get("image_url").and_then(|value| value.as_str()) {
+            Some(value) => {
+                let value = value.trim();
+                if value.is_empty() {
+                    None
+                } else if value.starts_with("https://") || value.starts_with("http://") {
+                    Some(value.to_string())
+                } else {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(
+                            "Invalid 'image_url': must start with http:// or https://".into(),
+                        ),
+                    });
+                }
+            }
+            None => None,
+        };
+
+        let image_path = args
+            .get("image_path")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+
+        if image_url.is_some() && image_path.is_some() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Use only one of 'image_url' or 'image_path'".into()),
+            });
+        }
+
+        if (image_url.is_some() || image_path.is_some()) && link.is_some() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Do not combine 'link' with 'image_url'/'image_path'".into()),
+            });
+        }
+
         let published = args
             .get("published")
             .and_then(|value| value.as_bool())
@@ -273,25 +325,81 @@ impl Tool for FacebookPagePostTool {
         let graph_api_base = self.get_graph_api_base().await?;
         let appsecret_proof = Self::compute_appsecret_proof(&app_secret, &access_token)?;
 
-        let endpoint = format!("{graph_api_base}/{page_id}/feed");
-        let mut form_data = vec![
-            ("message".to_string(), message),
-            ("access_token".to_string(), access_token),
-            ("appsecret_proof".to_string(), appsecret_proof),
-        ];
-        if let Some(link) = link {
-            form_data.push(("link".to_string(), link));
-        }
-        if !published {
-            form_data.push(("published".to_string(), "false".to_string()));
-        }
-
         let client = crate::config::build_runtime_proxy_client_with_timeouts(
             "tool.facebook_page_post",
             FACEBOOK_REQUEST_TIMEOUT_SECS,
             10,
         );
-        let response = client.post(endpoint).form(&form_data).send().await?;
+        let response = if let Some(image_url) = image_url {
+            let endpoint = format!("{graph_api_base}/{page_id}/photos");
+            let mut form_data = vec![
+                ("caption".to_string(), message),
+                ("url".to_string(), image_url),
+                ("access_token".to_string(), access_token),
+                ("appsecret_proof".to_string(), appsecret_proof),
+            ];
+            if !published {
+                form_data.push(("published".to_string(), "false".to_string()));
+            }
+            client.post(endpoint).form(&form_data).send().await?
+        } else if let Some(image_path) = image_path {
+            if !self.security.is_path_allowed(&image_path) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Path not allowed by security policy: {image_path}")),
+                });
+            }
+
+            let full_image_path = self.workspace_dir.join(&image_path);
+            let image_bytes = match tokio::fs::read(&full_image_path).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Failed to read image_path '{}': {}",
+                            full_image_path.display(),
+                            error
+                        )),
+                    })
+                }
+            };
+
+            let filename = full_image_path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("image.bin")
+                .to_string();
+
+            let form = reqwest::multipart::Form::new()
+                .text("caption", message)
+                .text("access_token", access_token)
+                .text("appsecret_proof", appsecret_proof)
+                .text("published", if published { "true" } else { "false" })
+                .part(
+                    "source",
+                    reqwest::multipart::Part::bytes(image_bytes).file_name(filename),
+                );
+
+            let endpoint = format!("{graph_api_base}/{page_id}/photos");
+            client.post(endpoint).multipart(form).send().await?
+        } else {
+            let endpoint = format!("{graph_api_base}/{page_id}/feed");
+            let mut form_data = vec![
+                ("message".to_string(), message),
+                ("access_token".to_string(), access_token),
+                ("appsecret_proof".to_string(), appsecret_proof),
+            ];
+            if let Some(link) = link {
+                form_data.push(("link".to_string(), link));
+            }
+            if !published {
+                form_data.push(("published".to_string(), "false".to_string()));
+            }
+            client.post(endpoint).form(&form_data).send().await?
+        };
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
 
@@ -530,5 +638,50 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("http:// or https://"));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_invalid_image_url() {
+        let tool = FacebookPagePostTool::new(
+            test_security(AutonomyLevel::Full, 100),
+            PathBuf::from("/tmp"),
+        );
+
+        let result = tool
+            .execute(json!({"message":"hello","image_url":"file:///tmp/test.png"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("http:// or https://"));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_both_image_inputs() {
+        let tool = FacebookPagePostTool::new(
+            test_security(AutonomyLevel::Full, 100),
+            PathBuf::from("/tmp"),
+        );
+
+        let result = tool
+            .execute(json!({"message":"hello","image_url":"https://example.com/a.png","image_path":"incoming/a.png"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Use only one"));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_link_and_image_combination() {
+        let tool = FacebookPagePostTool::new(
+            test_security(AutonomyLevel::Full, 100),
+            PathBuf::from("/tmp"),
+        );
+
+        let result = tool
+            .execute(json!({"message":"hello","link":"https://example.com","image_url":"https://example.com/a.png"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Do not combine 'link'"));
     }
 }
