@@ -357,12 +357,20 @@ impl HookHandler for WebhookAuditHook {
             "args": args_value,
         });
 
+        let (formatted, content_type) = self.config.format.format_payload(payload);
+
         let client = self.client.clone();
         let url = self.config.url.clone();
 
         // Fire-and-forget — never block the agent loop.
         tokio::spawn(async move {
-            match client.post(&url).json(&payload).send().await {
+            match client
+                .post(&url)
+                .header("Content-Type", content_type)
+                .json(&formatted)
+                .send()
+                .await
+            {
                 Ok(resp) => {
                     if !resp.status().is_success() {
                         tracing::error!(
