@@ -188,7 +188,7 @@ Examples:
         #[arg(long)]
         model: Option<String>,
 
-        /// Temperature override (0.0 - 2.0). Defaults to config.default_temperature when omitted.
+        /// Temperature (0.0 - 2.0, defaults to config default_temperature)
         #[arg(short, long, value_parser = parse_temperature)]
         temperature: Option<f64>,
 
@@ -819,10 +819,6 @@ async fn main() -> Result<()> {
             temperature,
             peripheral,
         } => {
-            // Implement temperature fallback logic:
-            // 1. Use --temperature if provided
-            // 2. Use config.default_temperature if --temperature not provided
-            // 3. Use hardcoded 0.7 if config.default_temperature not set (from Config::default())
             let final_temperature = temperature.unwrap_or(config.default_temperature);
 
             agent::run(
