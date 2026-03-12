@@ -549,20 +549,25 @@ fn build_channel_system_prompt(
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
-    // Refresh the stale datetime in the cached system prompt
+    // Refresh the cached date section so prompt caching is stable across turns
+    // while still keeping the current day available in the system prompt.
     {
         let now = chrono::Local::now();
         let fresh = format!(
-            "## Current Date & Time\n\n{} ({})\n",
-            now.format("%Y-%m-%d %H:%M:%S"),
-            now.format("%Z"),
+            "## Current Date\n\n{} ({})\n",
+            now.format("%Y-%m-%d"),
+            now.format("%:z"),
         );
-        if let Some(start) = prompt.find("## Current Date & Time\n\n") {
+        let headings = ["## Current Date\n\n", "## Current Date & Time\n\n"];
+        if let Some((start, heading)) = headings
+            .iter()
+            .find_map(|heading| prompt.find(heading).map(|start| (start, *heading)))
+        {
             // Find the end of this section (next "## " heading or end of string)
-            let rest = &prompt[start + 24..]; // skip past "## Current Date & Time\n\n"
+            let rest = &prompt[start + heading.len()..];
             let section_end = rest
                 .find("\n## ")
-                .map(|i| start + 24 + i)
+                .map(|i| start + heading.len() + i)
                 .unwrap_or(prompt.len());
             prompt.replace_range(start..section_end, fresh.trim_end());
         }
@@ -2014,8 +2019,17 @@ async fn process_channel_message(
         .get(&history_key)
         .is_some_and(|turns| !turns.is_empty());
 
+    // Inject per-message timestamp so the LLM always knows the current time,
+    // even when the system prompt is cached or prior turns are replayed.
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+    let timestamped_content = format!("[{now}] {}", msg.content);
+
     // Preserve user turn before the LLM call so interrupted requests keep context.
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+    append_sender_turn(
+        ctx.as_ref(),
+        &history_key,
+        ChatMessage::user(&timestamped_content),
+    );
 
     // Build history from per-sender conversation cache.
     let prior_turns_raw = ctx
@@ -2084,7 +2098,7 @@ async fn process_channel_message(
         .await;
         if let Some(last_turn) = prior_turns.last_mut() {
             if last_turn.role == "user" && !memory_context.is_empty() {
-                last_turn.content = format!("{memory_context}{}", msg.content);
+                last_turn.content = format!("{memory_context}{timestamped_content}");
             }
         }
     }
@@ -2552,7 +2566,7 @@ async fn process_channel_message(
                     .downcast_ref::<providers::ProviderCapabilityError>()
                     .is_some_and(|capability| capability.capability.eq_ignore_ascii_case("vision"));
                 let rolled_back = should_rollback_user_turn
-                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &msg.content);
+                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
 
                 if !rolled_back {
                     // Close the orphan user turn so subsequent messages don't
@@ -2759,7 +2773,7 @@ fn load_openclaw_bootstrap_files(
 /// 3. Skills — full skill instructions and tool metadata
 /// 4. Workspace — working directory
 /// 5. Bootstrap files — AGENTS, SOUL, TOOLS, IDENTITY, USER, BOOTSTRAP, MEMORY
-/// 6. Date & Time — timezone for cache stability
+/// 6. Date — timezone offset for cache stability
 /// 7. Runtime — host, OS, model
 ///
 /// When `identity_config` is set to AIEOS format, the bootstrap files section
@@ -2927,13 +2941,13 @@ pub fn build_system_prompt_with_mode(
         load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
     }
 
-    // ── 6. Date & Time ──────────────────────────────────────────
+    // ── 6. Date ────────────────────────────────────────────────
     let now = chrono::Local::now();
     let _ = writeln!(
         prompt,
-        "## Current Date & Time\n\n{} ({})\n",
-        now.format("%Y-%m-%d %H:%M:%S"),
-        now.format("%Z")
+        "## Current Date\n\n{} ({})\n",
+        now.format("%Y-%m-%d"),
+        now.format("%:z")
     );
 
     // ── 7. Runtime ──────────────────────────────────────────────
@@ -6727,11 +6741,22 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt.contains("## Project Context"),
             "missing Project Context"
         );
-        assert!(
-            prompt.contains("## Current Date & Time"),
-            "missing Date/Time"
-        );
+        assert!(prompt.contains("## Current Date"), "missing Date");
         assert!(prompt.contains("## Runtime"), "missing Runtime section");
+    }
+
+    #[test]
+    fn build_channel_system_prompt_rewrites_datetime_section_to_date_only() {
+        let prompt = build_channel_system_prompt(
+            "Base\n\n## Current Date & Time\n\n2026-03-01 10:11:12 (CST)\n\n## Runtime\n\nHost: h",
+            "telegram",
+            "chat-1",
+        );
+
+        assert!(prompt.contains("## Current Date\n\n"));
+        assert!(!prompt.contains("## Current Date & Time\n\n"));
+        assert!(!prompt.contains("10:11:12"));
+        assert!(prompt.contains("## Runtime"));
     }
 
     #[test]
@@ -7353,9 +7378,13 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(calls[1][1].0, "user");
         assert_eq!(calls[1][2].0, "assistant");
         assert_eq!(calls[1][3].0, "user");
-        assert!(calls[1][1].1.contains("hello"));
+        assert!(calls[0][1].1.starts_with('['));
+        assert!(calls[0][1].1.contains("] hello"));
+        assert!(calls[1][1].1.starts_with('['));
+        assert!(calls[1][1].1.contains("] hello"));
         assert!(calls[1][2].1.contains("response-1"));
-        assert!(calls[1][3].1.contains("follow up"));
+        assert!(calls[1][3].1.starts_with('['));
+        assert!(calls[1][3].1.contains("] follow up"));
     }
 
     #[tokio::test]
@@ -7442,7 +7471,8 @@ BTC is currently around $65,000 based on latest tool output."#
             .get("test-channel_alice")
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
-        assert_eq!(turns[0].content, "hello");
+        assert!(turns[0].content.starts_with('['));
+        assert!(turns[0].content.contains("] hello"));
         assert!(!turns[0].content.contains("[Memory context]"));
     }
 
@@ -8200,7 +8230,8 @@ This is an example JSON object for profile settings."#;
             .expect("history should exist for sender");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
-        assert_eq!(turns[0].content, "What is WAL?");
+        assert!(turns[0].content.starts_with('['));
+        assert!(turns[0].content.contains("] What is WAL?"));
         assert_eq!(turns[1].role, "assistant");
         assert_eq!(turns[1].content, "ok");
         assert!(
