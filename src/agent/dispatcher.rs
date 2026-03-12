@@ -297,7 +297,10 @@ mod tests {
         let (text, calls) = dispatcher.parse_response(&response);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
-        assert!(!text.contains("<think>"), "think tags should be stripped from text");
+        assert!(
+            !text.contains("<think>"),
+            "think tags should be stripped from text"
+        );
     }
 
     #[test]
