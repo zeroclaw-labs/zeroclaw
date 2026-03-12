@@ -221,7 +221,7 @@ Voorbeeld monster (macOS arm64, gemeten op 18 februari 2026):
 Het `bootstrap.sh` script installeert Rust, kloont ZeroClaw, compileert het, en stelt je initiële ontwikkelomgeving in:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/bootstrap.sh | bash
 ```
 
 Dit zal:

@@ -38,6 +38,7 @@ credential is not reused for fallback providers.
 | `kimi-code` | `kimi_coding`, `kimi_for_coding` | No | `KIMI_CODE_API_KEY`, `MOONSHOT_API_KEY` |
 | `synthetic` | — | No | `SYNTHETIC_API_KEY` |
 | `opencode` | `opencode-zen` | No | `OPENCODE_API_KEY` |
+| `opencode-go` | — | No | `OPENCODE_GO_API_KEY` |
 | `zai` | `z.ai` | No | `ZAI_API_KEY` |
 | `glm` | `zhipu` | No | `GLM_API_KEY` |
 | `minimax` | `minimax-intl`, `minimax-io`, `minimax-global`, `minimax-cn`, `minimaxi`, `minimax-oauth`, `minimax-oauth-cn`, `minimax-portal`, `minimax-portal-cn` | No | `MINIMAX_OAUTH_TOKEN`, `MINIMAX_API_KEY` |

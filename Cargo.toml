@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "zeroclaw"
-version = "0.1.7"
+version = "0.1.9"
 edition = "2021"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
@@ -188,6 +188,7 @@ default = []
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
+channel-feishu = ["channel-lark"]  # Alias for Feishu users (Lark and Feishu are the same platform)
 memory-postgres = ["dep:postgres"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 peripheral-rpi = ["rppal"]
