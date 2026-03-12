@@ -207,13 +207,12 @@ impl CliSessionManager {
                     "Session '{session_id}' crashed (exit: {status}). \
                      Restarted as '{new_id}'. Please retry the prompt."
                 );
-            } else {
-                sessions.remove(session_id);
-                bail!(
-                    "Session '{session_id}' for CLI '{cli}' exited with status {status} \
-                     and restart_on_crash is disabled"
-                );
             }
+            sessions.remove(session_id);
+            bail!(
+                "Session '{session_id}' for CLI '{cli}' exited with status {status} \
+                 and restart_on_crash is disabled"
+            );
         }
 
         let stdin = session.child.stdin.as_mut().ok_or_else(|| {
