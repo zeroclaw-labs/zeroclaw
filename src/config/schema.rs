@@ -2103,7 +2103,7 @@ impl Default for DataRetentionConfig {
 /// To revert, remove the `[google_workspace]` section from the config file (or
 /// set `enabled = false`). No data migration is required; the tool simply stops
 /// being registered.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct GoogleWorkspaceConfig {
     /// Enable the `google_workspace` tool. Default: `false`.
     #[serde(default)]
