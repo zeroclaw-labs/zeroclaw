@@ -140,6 +140,10 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
+        /// Reinitialize from scratch (backup and reset all configuration)
+        #[arg(long)]
+        reinit: bool,
+
         /// Reconfigure channels only (fast repair flow)
         #[arg(long)]
         channels_only: bool,
@@ -690,6 +694,7 @@ async fn main() -> Result<()> {
     if let Commands::Onboard {
         interactive,
         force,
+        reinit,
         channels_only,
         api_key,
         provider,
@@ -699,6 +704,7 @@ async fn main() -> Result<()> {
     {
         let interactive = *interactive;
         let force = *force;
+        let reinit = *reinit;
         let channels_only = *channels_only;
         let api_key = api_key.clone();
         let provider = provider.clone();
@@ -708,6 +714,12 @@ async fn main() -> Result<()> {
         if interactive && channels_only {
             bail!("Use either --interactive or --channels-only, not both");
         }
+        if reinit && channels_only {
+            bail!("Use either --reinit or --channels-only, not both");
+        }
+        if reinit && !interactive {
+            bail!("--reinit requires --interactive mode");
+        }
         if channels_only
             && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
         {
@@ -716,10 +728,52 @@ async fn main() -> Result<()> {
         if channels_only && force {
             bail!("--channels-only does not accept --force");
         }
+
+        // Handle --reinit: backup and reset configuration
+        if reinit {
+            let (zeroclaw_dir, _) =
+                crate::config::schema::resolve_runtime_dirs_for_onboarding().await?;
+
+            if zeroclaw_dir.exists() {
+                let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
+                let backup_dir = format!("{}.backup.{}", zeroclaw_dir.display(), timestamp);
+
+                println!("⚠️  Reinitializing ZeroClaw configuration...");
+                println!("   Current config directory: {}", zeroclaw_dir.display());
+                println!(
+                    "   This will back up your existing config to: {}",
+                    backup_dir
+                );
+                println!();
+                print!("Continue? [y/N] ");
+                std::io::stdout()
+                    .flush()
+                    .context("Failed to flush stdout")?;
+
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if !answer.trim().eq_ignore_ascii_case("y") {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+                println!();
+
+                // Rename existing directory as backup
+                tokio::fs::rename(&zeroclaw_dir, &backup_dir)
+                    .await
+                    .with_context(|| {
+                        format!("Failed to backup existing config to {}", backup_dir)
+                    })?;
+
+                println!("   Backup created successfully.");
+                println!("   Starting fresh initialization...\n");
+            }
+        }
+
         let config = if channels_only {
-            onboard::run_channels_repair_wizard().await
+            Box::pin(onboard::run_channels_repair_wizard()).await
         } else if interactive {
-            onboard::run_wizard(force).await
+            Box::pin(onboard::run_wizard(force)).await
         } else {
             onboard::run_quick_setup(
                 api_key.as_deref(),
@@ -795,8 +849,24 @@ async fn main() -> Result<()> {
                     match shutdown_gateway(&host, port).await {
                         Ok(()) => {
                             info!("   ✓ Existing gateway on {addr} shut down gracefully");
-                            // Small delay to allow port to be released
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            // Poll until the port is free (connection refused) or timeout
+                            let deadline =
+                                tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+                            loop {
+                                match tokio::net::TcpStream::connect(&addr).await {
+                                    Err(_) => break, // port is free
+                                    Ok(_) if tokio::time::Instant::now() >= deadline => {
+                                        warn!(
+                                            "   Timed out waiting for port {port} to be released"
+                                        );
+                                        break;
+                                    }
+                                    Ok(_) => {
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(50))
+                                            .await;
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             info!("   No existing gateway to shut down: {e}");
