@@ -1312,6 +1312,13 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
 ///
 /// Also supports JSON with `tool_calls` array from OpenAI-format responses.
 fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
+    // Strip `<think>...</think>` blocks before parsing.  Qwen and other
+    // reasoning models embed chain-of-thought inline in the response text;
+    // these tags can interfere with `<tool_call>` extraction and must be
+    // removed first.
+    let cleaned = strip_think_tags(response);
+    let response = cleaned.as_str();
+
     let mut text_parts = Vec::new();
     let mut calls = Vec::new();
     let mut remaining = response;
@@ -1694,6 +1701,53 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     (text_parts.join("\n"), calls)
 }
 
+/// Remove `<think>...</think>` blocks from model output.
+/// Qwen and other reasoning models embed chain-of-thought inline in the
+/// response text using `<think>` tags.  These must be removed before parsing
+/// tool-call tags or displaying output.
+fn strip_think_tags(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        if let Some(start) = rest.find("<think>") {
+            result.push_str(&rest[..start]);
+            if let Some(end) = rest[start..].find("</think>") {
+                rest = &rest[start + end + "</think>".len()..];
+            } else {
+                // Unclosed tag: drop the rest to avoid leaking partial reasoning.
+                break;
+            }
+        } else {
+            result.push_str(rest);
+            break;
+        }
+    }
+    result.trim().to_string()
+}
+
+/// Strip prompt-guided tool artifacts from visible output while preserving
+/// raw model text in history for future turns.
+fn strip_tool_result_blocks(text: &str) -> String {
+    static TOOL_RESULT_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)<tool_result[^>]*>.*?</tool_result>").unwrap());
+    static THINKING_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)<thinking>.*?</thinking>").unwrap());
+    static THINK_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)<think>.*?</think>").unwrap());
+    static TOOL_RESULTS_PREFIX_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^\[Tool results\]\s*\n?").unwrap());
+    static EXCESS_BLANK_LINES_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
+
+    let result = TOOL_RESULT_RE.replace_all(text, "");
+    let result = THINKING_RE.replace_all(&result, "");
+    let result = THINK_RE.replace_all(&result, "");
+    let result = TOOL_RESULTS_PREFIX_RE.replace_all(&result, "");
+    let result = EXCESS_BLANK_LINES_RE.replace_all(result.trim(), "\n\n");
+
+    result.trim().to_string()
+}
+
 fn detect_tool_call_parse_issue(response: &str, parsed_calls: &[ParsedToolCall]) -> Option<String> {
     if !parsed_calls.is_empty() {
         return None;
@@ -1836,6 +1890,18 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
     parts.join("\n")
 }
 
+fn resolve_display_text(response_text: &str, parsed_text: &str, has_tool_calls: bool) -> String {
+    if has_tool_calls {
+        return parsed_text.to_string();
+    }
+
+    if parsed_text.is_empty() {
+        response_text.to_string()
+    } else {
+        parsed_text.to_string()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ParsedToolCall {
     name: String,
@@ -1902,8 +1968,17 @@ async fn execute_one_tool(
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<ToolExecutionOutcome> {
+    let args_summary = {
+        let raw = call_arguments.to_string();
+        if raw.len() > 300 {
+            format!("{}…", &raw[..300])
+        } else {
+            raw
+        }
+    };
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
+        arguments: Some(args_summary),
     });
     let start = Instant::now();
 
@@ -2315,11 +2390,9 @@ pub(crate) async fn run_tool_call_loop(
                 }
             };
 
-        let display_text = if parsed_text.is_empty() {
-            response_text.clone()
-        } else {
-            parsed_text
-        };
+        let display_text =
+            resolve_display_text(&response_text, &parsed_text, !tool_calls.is_empty());
+        let display_text = strip_tool_result_blocks(&display_text);
 
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -4059,6 +4132,32 @@ mod tests {
     }
 
     #[test]
+    fn resolve_display_text_hides_raw_payload_for_tool_only_turns() {
+        let display = resolve_display_text(
+            "<tool_call>{\"name\":\"memory_store\"}</tool_call>",
+            "",
+            true,
+        );
+        assert!(display.is_empty());
+    }
+
+    #[test]
+    fn resolve_display_text_keeps_plain_text_for_tool_turns() {
+        let display = resolve_display_text(
+            "<tool_call>{\"name\":\"shell\"}</tool_call>",
+            "Let me check that.",
+            true,
+        );
+        assert_eq!(display, "Let me check that.");
+    }
+
+    #[test]
+    fn resolve_display_text_uses_response_text_for_final_turns() {
+        let display = resolve_display_text("Final answer", "", false);
+        assert_eq!(display, "Final answer");
+    }
+
+    #[test]
     fn parse_tool_calls_extracts_single_call() {
         let response = r#"Let me check that.
 <tool_call>
@@ -4773,6 +4872,122 @@ Done."#;
         let (text, calls) = parse_tool_calls(response);
         assert!(text.contains("Done."));
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_removes_single_block() {
+        let input = r#"<tool_result name="memory_recall" status="ok">
+{"matches":["hello"]}
+</tool_result>
+Here is my answer."#;
+        assert_eq!(strip_tool_result_blocks(input), "Here is my answer.");
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_removes_multiple_blocks() {
+        let input = r#"<tool_result name="memory_recall" status="ok">
+{"matches":[]}
+</tool_result>
+<tool_result name="shell" status="ok">
+done
+</tool_result>
+Final answer."#;
+        assert_eq!(strip_tool_result_blocks(input), "Final answer.");
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_removes_prefix() {
+        let input =
+            "[Tool results]\n<tool_result name=\"shell\" status=\"ok\">\nok\n</tool_result>\nDone.";
+        assert_eq!(strip_tool_result_blocks(input), "Done.");
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_removes_thinking() {
+        let input = "<thinking>\nLet me think...\n</thinking>\nHere is the answer.";
+        assert_eq!(strip_tool_result_blocks(input), "Here is the answer.");
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_removes_think_tags() {
+        let input = "<think>\nLet me reason...\n</think>\nHere is the answer.";
+        assert_eq!(strip_tool_result_blocks(input), "Here is the answer.");
+    }
+
+    #[test]
+    fn strip_think_tags_removes_single_block() {
+        assert_eq!(strip_think_tags("<think>reasoning</think>Hello"), "Hello");
+    }
+
+    #[test]
+    fn strip_think_tags_removes_multiple_blocks() {
+        assert_eq!(strip_think_tags("<think>a</think>X<think>b</think>Y"), "XY");
+    }
+
+    #[test]
+    fn strip_think_tags_handles_unclosed_block() {
+        assert_eq!(strip_think_tags("visible<think>hidden"), "visible");
+    }
+
+    #[test]
+    fn strip_think_tags_preserves_text_without_tags() {
+        assert_eq!(strip_think_tags("plain text"), "plain text");
+    }
+
+    #[test]
+    fn parse_tool_calls_strips_think_before_tool_call() {
+        // Qwen regression: <think> tags before <tool_call> tags should be
+        // stripped, allowing the tool call to be parsed correctly.
+        let response = "<think>I need to list files to understand the project</think>\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>";
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(
+            calls.len(),
+            1,
+            "should parse tool call after stripping think tags"
+        );
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "ls"
+        );
+        assert!(text.is_empty(), "think content should not appear as text");
+    }
+
+    #[test]
+    fn parse_tool_calls_strips_think_only_returns_empty() {
+        // When response is only <think> tags with no tool calls, should
+        // return empty text and no calls.
+        let response = "<think>Just thinking, no action needed</think>";
+        let (text, calls) = parse_tool_calls(response);
+        assert!(calls.is_empty());
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_qwen_think_with_multiple_tool_calls() {
+        let response = "<think>I need to check two things</think>\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>";
+        let (_, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "date"
+        );
+        assert_eq!(
+            calls[1].arguments.get("command").unwrap().as_str().unwrap(),
+            "pwd"
+        );
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_preserves_clean_text() {
+        let input = "Hello, this is a normal response.";
+        assert_eq!(strip_tool_result_blocks(input), input);
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_returns_empty_for_only_tags() {
+        let input = "<tool_result name=\"memory_recall\" status=\"ok\">\n{}\n</tool_result>";
+        assert_eq!(strip_tool_result_blocks(input), "");
     }
 
     #[test]
