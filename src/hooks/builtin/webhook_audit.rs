@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,19 +9,130 @@ use crate::config::schema::WebhookAuditConfig;
 use crate::hooks::traits::{HookHandler, HookResult};
 use crate::tools::traits::ToolResult;
 
+/// Validate a webhook URL against SSRF attacks.
+///
+/// Rejects URLs with:
+/// - Non-HTTPS schemes (HTTP is allowed for localhost in debug builds only)
+/// - Loopback addresses (127.0.0.0/8, ::1)
+/// - Link-local addresses (169.254.0.0/16, fe80::/10)
+/// - RFC1918 private addresses (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+fn validate_webhook_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid webhook URL: {e}"))?;
+
+    let scheme = parsed.scheme();
+    let host_str = parsed.host_str().unwrap_or("");
+
+    // Scheme check: require https, allow http only for localhost in debug builds.
+    let is_localhost = host_str == "localhost" || host_str == "127.0.0.1" || host_str == "::1";
+
+    if scheme != "https" {
+        if scheme == "http" && is_localhost && cfg!(debug_assertions) {
+            // Allow http://localhost in dev/debug builds.
+        } else {
+            return Err(format!(
+                "webhook URL must use https:// scheme (got {scheme}://)"
+            ));
+        }
+    }
+
+    // Resolve the host to check for private/loopback/link-local IPs.
+    if let Some(host) = parsed.host_str() {
+        // Strip brackets from IPv6 literals.
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = bare.parse::<IpAddr>() {
+            reject_private_ip(ip)?;
+        } else {
+            // Domain name — check for well-known loopback domains.
+            if bare == "localhost" && !(cfg!(debug_assertions) && scheme == "http") {
+                return Err("webhook URL must not target localhost".to_string());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn reject_private_ip(addr: IpAddr) -> Result<(), String> {
+    match addr {
+        IpAddr::V4(ip) => {
+            if ip.is_loopback() {
+                return Err(format!(
+                    "webhook URL must not target loopback address ({ip})"
+                ));
+            }
+            let octets = ip.octets();
+            // 10.0.0.0/8
+            if octets[0] == 10 {
+                return Err(format!(
+                    "webhook URL must not target private address ({ip})"
+                ));
+            }
+            // 172.16.0.0/12
+            if octets[0] == 172 && (octets[1] & 0xf0) == 16 {
+                return Err(format!(
+                    "webhook URL must not target private address ({ip})"
+                ));
+            }
+            // 192.168.0.0/16
+            if octets[0] == 192 && octets[1] == 168 {
+                return Err(format!(
+                    "webhook URL must not target private address ({ip})"
+                ));
+            }
+            // 169.254.0.0/16 (link-local)
+            if octets[0] == 169 && octets[1] == 254 {
+                return Err(format!(
+                    "webhook URL must not target link-local address ({ip})"
+                ));
+            }
+        }
+        IpAddr::V6(ip) => {
+            if ip.is_loopback() {
+                return Err(format!(
+                    "webhook URL must not target loopback address ({ip})"
+                ));
+            }
+            let segments = ip.segments();
+            // fe80::/10 (link-local)
+            if (segments[0] & 0xffc0) == 0xfe80 {
+                return Err(format!(
+                    "webhook URL must not target link-local address ({ip})"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Sends an HTTP POST with a JSON audit payload for matching tool calls.
 pub struct WebhookAuditHook {
     config: WebhookAuditConfig,
     client: reqwest::Client,
-    pending_args: Arc<Mutex<HashMap<String, Value>>>,
+    pending_args: Arc<Mutex<HashMap<String, Vec<Value>>>>,
 }
 
 impl WebhookAuditHook {
     pub fn new(config: WebhookAuditConfig) -> Self {
+        // Warn if enabled but no URL configured.
+        if config.enabled && config.url.is_empty() {
+            tracing::warn!(
+                hook = "webhook-audit",
+                "webhook-audit hook is enabled but no URL is configured — audit events will be dropped"
+            );
+        }
+
+        // Validate URL against SSRF if one is provided.
+        if !config.url.is_empty() {
+            if let Err(e) = validate_webhook_url(&config.url) {
+                tracing::error!(hook = "webhook-audit", error = %e, "webhook URL validation failed");
+                panic!("webhook-audit: {e}");
+            }
+        }
+
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
-            .unwrap_or_default();
+            .expect("failed to build webhook HTTP client");
         Self {
             config,
             client,
@@ -101,6 +213,9 @@ fn matches_any_pattern(patterns: &[String], tool: &str) -> bool {
 }
 
 /// Truncate serialised args to `max_bytes`. If 0, no truncation.
+///
+/// Uses byte-oriented slicing with char-boundary alignment to avoid
+/// mixing byte length comparisons with char-count truncation.
 #[allow(clippy::cast_possible_truncation)]
 fn truncate_args(args: Value, max_bytes: u64) -> Value {
     if max_bytes == 0 {
@@ -110,11 +225,14 @@ fn truncate_args(args: Value, max_bytes: u64) -> Value {
         Ok(s) => s,
         Err(_) => return args,
     };
-    if (serialised.len() as u64) <= max_bytes {
+    if serialised.len() <= max_bytes as usize {
         args
     } else {
-        let truncated: String = serialised.chars().take(max_bytes as usize).collect();
-        Value::String(format!("{}...[truncated]", truncated))
+        let mut end = max_bytes as usize;
+        while end > 0 && !serialised.is_char_boundary(end) {
+            end -= 1;
+        }
+        Value::String(format!("{}...[truncated]", &serialised[..end]))
     }
 }
 
@@ -134,7 +252,9 @@ impl HookHandler for WebhookAuditHook {
             self.pending_args
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(name.clone(), args.clone());
+                .entry(name.clone())
+                .or_default()
+                .push(args.clone());
         }
         HookResult::Continue((name, args))
     }
@@ -150,13 +270,23 @@ impl HookHandler for WebhookAuditHook {
             return;
         }
 
-        // Pop captured args (if any) and optionally truncate.
+        // Pop the first captured args entry for this tool (FIFO) and optionally truncate.
         let args_value: Value = if self.config.include_args {
-            let raw = self
-                .pending_args
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(tool);
+            let raw = {
+                let mut map = self.pending_args.lock().unwrap_or_else(|e| e.into_inner());
+                let entry = map.get_mut(tool).and_then(|v| {
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v.remove(0))
+                    }
+                });
+                // Clean up empty entries.
+                if map.get(tool).is_some_and(|v| v.is_empty()) {
+                    map.remove(tool);
+                }
+                entry
+            };
             match raw {
                 Some(a) => truncate_args(a, self.config.max_args_bytes),
                 None => Value::Null,
@@ -183,13 +313,25 @@ impl HookHandler for WebhookAuditHook {
 
         // Fire-and-forget — never block the agent loop.
         tokio::spawn(async move {
-            if let Err(e) = client.post(&url).json(&payload).send().await {
-                tracing::warn!(
-                    hook = "webhook-audit",
-                    url = %url,
-                    error = %e,
-                    "failed to POST audit payload"
-                );
+            match client.post(&url).json(&payload).send().await {
+                Ok(resp) => {
+                    if !resp.status().is_success() {
+                        tracing::error!(
+                            hook = "webhook-audit",
+                            url = %url,
+                            status = %resp.status(),
+                            "webhook endpoint returned non-success status"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        hook = "webhook-audit",
+                        url = %url,
+                        error = %e,
+                        "failed to POST audit payload"
+                    );
+                }
             }
         });
     }
@@ -259,9 +401,11 @@ mod tests {
     // ── before_tool_call tests ────────────────────────────────────
 
     fn make_hook(patterns: Vec<&str>, include_args: bool) -> WebhookAuditHook {
+        // Use https URL for tests to pass URL validation; localhost with http
+        // is only allowed in debug builds, but use https to be safe.
         WebhookAuditHook::new(WebhookAuditConfig {
             enabled: true,
-            url: "http://localhost:9999/audit".to_string(),
+            url: "https://audit.example.com/webhook".to_string(),
             tool_patterns: patterns.into_iter().map(String::from).collect(),
             include_args,
             max_args_bytes: 4096,
@@ -276,7 +420,22 @@ mod tests {
         assert!(!result.is_cancel());
 
         let pending = hook.pending_args.lock().unwrap();
-        assert_eq!(pending.get("Bash"), Some(&args));
+        assert_eq!(pending.get("Bash"), Some(&vec![args]));
+    }
+
+    #[tokio::test]
+    async fn before_tool_call_concurrent_same_tool_no_data_loss() {
+        let hook = make_hook(vec!["Bash"], true);
+        let args1 = serde_json::json!({"command": "ls"});
+        let args2 = serde_json::json!({"command": "pwd"});
+        hook.before_tool_call("Bash".into(), args1.clone()).await;
+        hook.before_tool_call("Bash".into(), args2.clone()).await;
+
+        let pending = hook.pending_args.lock().unwrap();
+        let bash_args = pending.get("Bash").unwrap();
+        assert_eq!(bash_args.len(), 2);
+        assert_eq!(bash_args[0], args1);
+        assert_eq!(bash_args[1], args2);
     }
 
     #[tokio::test]
@@ -346,6 +505,7 @@ mod tests {
 
     #[tokio::test]
     async fn on_after_tool_call_skips_empty_url() {
+        // Empty URL + enabled triggers a warning, but should not panic.
         let hook = WebhookAuditHook::new(WebhookAuditConfig {
             enabled: true,
             url: String::new(),
@@ -361,5 +521,47 @@ mod tests {
         // Should return immediately without spawning any HTTP request.
         hook.on_after_tool_call("Bash", &result, Duration::from_millis(5))
             .await;
+    }
+
+    // ── URL validation tests ─────────────────────────────────────
+
+    #[test]
+    fn validate_url_rejects_loopback_ipv4() {
+        assert!(validate_webhook_url("https://127.0.0.1/hook").is_err());
+        assert!(validate_webhook_url("https://127.0.0.100/hook").is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_loopback_ipv6() {
+        assert!(validate_webhook_url("https://[::1]/hook").is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_private_rfc1918() {
+        assert!(validate_webhook_url("https://10.0.0.1/hook").is_err());
+        assert!(validate_webhook_url("https://172.16.5.1/hook").is_err());
+        assert!(validate_webhook_url("https://192.168.1.1/hook").is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_link_local() {
+        assert!(validate_webhook_url("https://169.254.1.1/hook").is_err());
+        assert!(validate_webhook_url("https://[fe80::1]/hook").is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_http_non_localhost() {
+        assert!(validate_webhook_url("http://example.com/hook").is_err());
+    }
+
+    #[test]
+    fn validate_url_accepts_https_public() {
+        assert!(validate_webhook_url("https://audit.example.com/webhook").is_ok());
+        assert!(validate_webhook_url("https://8.8.8.8/hook").is_ok());
+    }
+
+    #[test]
+    fn validate_url_rejects_non_http_scheme() {
+        assert!(validate_webhook_url("ftp://example.com/hook").is_err());
     }
 }
