@@ -424,6 +424,9 @@ pub struct TranscriptionConfig {
     /// Optional language hint (ISO-639-1, e.g. "en", "ru").
     #[serde(default)]
     pub language: Option<String>,
+    /// Optional initial prompt to bias Whisper-compatible transcription.
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
     /// Maximum voice duration in seconds (messages longer than this are skipped).
     #[serde(default = "default_transcription_max_duration_secs")]
     pub max_duration_secs: u64,
@@ -436,6 +439,7 @@ impl Default for TranscriptionConfig {
             api_url: default_transcription_api_url(),
             model: default_transcription_model(),
             language: None,
+            initial_prompt: None,
             max_duration_secs: default_transcription_max_duration_secs(),
         }
     }
@@ -8205,6 +8209,7 @@ default_model = "legacy-model"
         assert!(tc.api_url.contains("groq.com"));
         assert_eq!(tc.model, "whisper-large-v3-turbo");
         assert!(tc.language.is_none());
+        assert!(tc.initial_prompt.is_none());
         assert_eq!(tc.max_duration_secs, 120);
     }
 
@@ -8213,12 +8218,17 @@ default_model = "legacy-model"
         let mut config = Config::default();
         config.transcription.enabled = true;
         config.transcription.language = Some("en".into());
+        config.transcription.initial_prompt = Some("customer support call".into());
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
 
         assert!(parsed.transcription.enabled);
         assert_eq!(parsed.transcription.language.as_deref(), Some("en"));
+        assert_eq!(
+            parsed.transcription.initial_prompt.as_deref(),
+            Some("customer support call")
+        );
         assert_eq!(parsed.transcription.model, "whisper-large-v3-turbo");
     }
 
