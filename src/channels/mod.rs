@@ -74,8 +74,8 @@ use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_cre
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
-use crate::observability::{self, runtime_trace, Observer};
 use crate::observability::traits::{ObserverEvent, ObserverMetric};
+use crate::observability::{self, runtime_trace, Observer};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
@@ -102,34 +102,39 @@ struct ChannelNotifyObserver {
 
 impl Observer for ChannelNotifyObserver {
     fn record_event(&self, event: &ObserverEvent) {
-        match event {
-            ObserverEvent::ToolCallStart { tool, arguments } => {
-                self.tools_used.store(true, Ordering::Relaxed);
-                let detail = match arguments {
-                    Some(args) if !args.is_empty() => {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
-                            if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
-                                format!(": `{}`", if cmd.len() > 200 { &cmd[..200] } else { cmd })
-                            } else if let Some(q) = v.get("query").and_then(|c| c.as_str()) {
-                                format!(": {}", if q.len() > 200 { &q[..200] } else { q })
-                            } else if let Some(p) = v.get("path").and_then(|c| c.as_str()) {
-                                format!(": {p}")
-                            } else if let Some(u) = v.get("url").and_then(|c| c.as_str()) {
-                                format!(": {u}")
-                            } else {
-                                let s = args.to_string();
-                                if s.len() > 120 { format!(": {}…", &s[..120]) } else { format!(": {s}") }
-                            }
+        if let ObserverEvent::ToolCallStart { tool, arguments } = event {
+            self.tools_used.store(true, Ordering::Relaxed);
+            let detail = match arguments {
+                Some(args) if !args.is_empty() => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+                        if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+                            format!(": `{}`", if cmd.len() > 200 { &cmd[..200] } else { cmd })
+                        } else if let Some(q) = v.get("query").and_then(|c| c.as_str()) {
+                            format!(": {}", if q.len() > 200 { &q[..200] } else { q })
+                        } else if let Some(p) = v.get("path").and_then(|c| c.as_str()) {
+                            format!(": {p}")
+                        } else if let Some(u) = v.get("url").and_then(|c| c.as_str()) {
+                            format!(": {u}")
                         } else {
                             let s = args.to_string();
-                            if s.len() > 120 { format!(": {}…", &s[..120]) } else { format!(": {s}") }
+                            if s.len() > 120 {
+                                format!(": {}…", &s[..120])
+                            } else {
+                                format!(": {s}")
+                            }
+                        }
+                    } else {
+                        let s = args.to_string();
+                        if s.len() > 120 {
+                            format!(": {}…", &s[..120])
+                        } else {
+                            format!(": {s}")
                         }
                     }
-                    _ => String::new(),
-                };
-                let _ = self.tx.send(format!("\u{1F527} `{tool}`{detail}"));
-            }
-            _ => {}
+                }
+                _ => String::new(),
+            };
+            let _ = self.tx.send(format!("\u{1F527} `{tool}`{detail}"));
         }
         self.inner.record_event(event);
     }
@@ -1857,7 +1862,11 @@ async fn process_channel_message(
     let notify_channel = target_channel.clone();
     let notify_reply_target = msg.reply_target.clone();
     let notify_thread_root = msg.id.clone();
-    let notify_task = if msg.channel != "cli" {
+    let notify_task = if msg.channel == "cli" {
+        Some(tokio::spawn(async move {
+            while notify_rx.recv().await.is_some() {}
+        }))
+    } else {
         Some(tokio::spawn(async move {
             let thread_ts = Some(notify_thread_root);
             while let Some(text) = notify_rx.recv().await {
@@ -1870,10 +1879,6 @@ async fn process_channel_message(
                         .await;
                 }
             }
-        }))
-    } else {
-        Some(tokio::spawn(async move {
-            while notify_rx.recv().await.is_some() {}
         }))
     };
 
@@ -4310,7 +4315,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert!(sent_messages.len() >= 1);
+        assert!(!sent_messages.is_empty());
         let reply = sent_messages.last().unwrap();
         assert!(reply.starts_with("chat-42:"));
         assert!(reply.contains("BTC is currently around"));
@@ -4371,7 +4376,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert!(sent_messages.len() >= 1);
+        assert!(!sent_messages.is_empty());
         let reply = sent_messages.last().unwrap();
         assert!(reply.contains("BTC is currently around"));
 
@@ -4506,7 +4511,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert!(sent_messages.len() >= 1);
+        assert!(!sent_messages.is_empty());
         let reply = sent_messages.last().unwrap();
         assert!(reply.starts_with("chat-84:"));
         assert!(reply.contains("alias-tag flow resolved"));
@@ -4897,7 +4902,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert!(sent_messages.len() >= 1);
+        assert!(!sent_messages.is_empty());
         let reply = sent_messages.last().unwrap();
         assert!(reply.starts_with("chat-iter-success:"));
         assert!(reply.contains("Completed after 11 tool iterations."));
@@ -4959,7 +4964,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert!(sent_messages.len() >= 1);
+        assert!(!sent_messages.is_empty());
         let reply = sent_messages.last().unwrap();
         assert!(reply.starts_with("chat-iter-fail:"));
         assert!(reply.contains("⚠️ Error: Agent exceeded maximum tool iterations (3)"));

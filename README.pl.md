@@ -221,7 +221,7 @@ Przykładowa próbka (macOS arm64, zmierzone 18 lutego 2026):
 Skrypt `bootstrap.sh` instaluje Rust, klonuje ZeroClaw, kompiluje go i konfiguruje twoje początkowe środowisko deweloperskie:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/bootstrap.sh | bash
 ```
 
 To:
