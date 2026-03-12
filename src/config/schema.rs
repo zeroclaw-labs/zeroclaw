@@ -5702,14 +5702,18 @@ tool_dispatcher = "xml"
         );
 
         let feishu = stored.channels_config.feishu.as_ref().unwrap();
-        assert!(crate::security::SecretStore::is_encrypted(&feishu.app_secret));
+        assert!(crate::security::SecretStore::is_encrypted(
+            &feishu.app_secret
+        ));
         assert_eq!(store.decrypt(&feishu.app_secret).unwrap(), "feishu-secret");
         assert!(feishu
             .encrypt_key
             .as_deref()
             .is_some_and(crate::security::SecretStore::is_encrypted));
         assert_eq!(
-            store.decrypt(feishu.encrypt_key.as_deref().unwrap()).unwrap(),
+            store
+                .decrypt(feishu.encrypt_key.as_deref().unwrap())
+                .unwrap(),
             "feishu-encrypt"
         );
         assert!(feishu
