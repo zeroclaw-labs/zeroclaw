@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::ErrorKind;
 use std::net::ToSocketAddrs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -790,16 +790,7 @@ impl BrowserTool {
         self.validate_output_path(key, trimmed)?;
 
         tokio::fs::create_dir_all(&self.security.workspace_dir).await?;
-        let workspace_root = tokio::fs::canonicalize(&self.security.workspace_dir)
-            .await
-            .unwrap_or_else(|_| self.security.workspace_dir.clone());
-
-        let raw_path = Path::new(trimmed);
-        let output_path = if raw_path.is_absolute() {
-            raw_path.to_path_buf()
-        } else {
-            workspace_root.join(raw_path)
-        };
+        let output_path = self.security.resolve_input_path(trimmed);
 
         let parent = output_path
             .parent()
@@ -2554,6 +2545,7 @@ fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[cfg(unix)]
     fn symlink_dir(src: &Path, dst: &Path) {

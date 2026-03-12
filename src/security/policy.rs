@@ -773,6 +773,23 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
 }
 
 impl SecurityPolicy {
+    fn workspace_root(&self) -> PathBuf {
+        self.workspace_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace_dir.clone())
+    }
+
+    fn allowed_root_matches_input(&self, path: &Path) -> bool {
+        self.allowed_roots.iter().any(|root| {
+            let root = if root.is_absolute() {
+                root.clone()
+            } else {
+                self.workspace_root().join(root)
+            };
+            path.starts_with(root)
+        })
+    }
+
     /// Apply configured redirect policy to a shell command before validation/execution.
     pub fn apply_shell_redirect_policy(&self, command: &str) -> String {
         match self.shell_redirect_policy {
@@ -1162,21 +1179,35 @@ impl SecurityPolicy {
 
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
+        let matches_allowed_root =
+            expanded_path.is_absolute() && self.allowed_root_matches_input(&expanded_path);
 
         // Block absolute paths when workspace_only is set
-        if self.workspace_only && expanded_path.is_absolute() {
+        if self.workspace_only && expanded_path.is_absolute() && !matches_allowed_root {
             return false;
         }
 
         // Block forbidden paths using path-component-aware matching
-        for forbidden in &self.forbidden_paths {
-            let forbidden_path = expand_user_path(forbidden);
-            if expanded_path.starts_with(forbidden_path) {
-                return false;
+        if !matches_allowed_root {
+            for forbidden in &self.forbidden_paths {
+                let forbidden_path = expand_user_path(forbidden);
+                if expanded_path.starts_with(forbidden_path) {
+                    return false;
+                }
             }
         }
 
         true
+    }
+
+    /// Resolve a direct tool path input into an absolute or workspace-anchored candidate path.
+    pub fn resolve_input_path(&self, path: &str) -> PathBuf {
+        let expanded = expand_user_path(path);
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            self.workspace_root().join(expanded)
+        }
     }
 
     /// Validate that a resolved path is inside the workspace or an allowed root.
@@ -2651,6 +2682,66 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn workspace_only_true_allows_direct_absolute_path_within_allowed_root() {
+        let root = std::env::temp_dir().join("zeroclaw_test_direct_absolute_allowed_root");
+        let workspace = root.join("workspace");
+        let extra = root.join("extra_root");
+        let extra_file = extra.join("data.txt");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(&extra_file, "test").unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace,
+            workspace_only: true,
+            allowed_roots: vec![extra],
+            ..SecurityPolicy::default()
+        };
+
+        assert!(
+            policy.is_path_allowed(extra_file.to_string_lossy().as_ref()),
+            "absolute paths under allowed_roots should pass pre-validation"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn workspace_only_true_allows_direct_tilde_path_within_allowed_root() {
+        let Some(home) = home_dir() else {
+            return;
+        };
+
+        let extra = tempfile::Builder::new()
+            .prefix("zeroclaw_test_tilde_allowed_root_")
+            .tempdir_in(&home)
+            .unwrap();
+        let extra_file = extra.path().join("notes.txt");
+        std::fs::write(&extra_file, "tilde").unwrap();
+
+        let rel = extra
+            .path()
+            .strip_prefix(&home)
+            .expect("temp dir in home should strip home prefix");
+        let tilde_dir = rel.to_string_lossy();
+        let tilde_file = format!("~/{tilde_dir}/notes.txt");
+
+        let policy = SecurityPolicy {
+            workspace_dir: home.join("workspace"),
+            workspace_only: true,
+            allowed_roots: vec![extra.path().to_path_buf()],
+            ..SecurityPolicy::default()
+        };
+
+        assert!(
+            policy.is_path_allowed(&tilde_file),
+            "tilde paths under allowed_roots should pass pre-validation"
+        );
     }
 
     #[test]

@@ -82,7 +82,7 @@ impl Tool for FileReadTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        let full_path = self.security.resolve_input_path(path);
 
         // Resolve path before reading to block symlink escapes.
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
@@ -492,6 +492,81 @@ mod tests {
         assert!(result.output.contains("outside"));
 
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_outside_workspace_allowed_when_in_allowed_roots() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_read_direct_allowed_root");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        let outside_file = outside.join("notes.txt");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        tokio::fs::write(&outside_file, "outside").await.unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            workspace_only: true,
+            allowed_roots: vec![outside.clone()],
+            ..SecurityPolicy::default()
+        });
+        let tool = FileReadTool::new(security);
+
+        let result = tool
+            .execute(json!({"path": outside_file.to_string_lossy().to_string()}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.error.is_none());
+        assert!(result.output.contains("outside"));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_tilde_path_allowed_when_in_allowed_roots() {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let workspace = std::env::temp_dir().join("zeroclaw_test_file_read_tilde_workspace");
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+        let outside = tempfile::Builder::new()
+            .prefix("zeroclaw_test_file_read_tilde_")
+            .tempdir_in(&home)
+            .unwrap();
+        let outside_file = outside.path().join("notes.txt");
+        tokio::fs::write(&outside_file, "tilde outside")
+            .await
+            .unwrap();
+
+        let rel = outside
+            .path()
+            .strip_prefix(&home)
+            .expect("temp dir in home should strip home prefix");
+        let tilde_path = format!("~/{}/notes.txt", rel.to_string_lossy());
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.clone(),
+            workspace_only: true,
+            allowed_roots: vec![outside.path().to_path_buf()],
+            ..SecurityPolicy::default()
+        });
+        let tool = FileReadTool::new(security);
+
+        let result = tool.execute(json!({"path": tilde_path})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.error.is_none());
+        assert!(result.output.contains("tilde outside"));
+
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
     }
 
     #[tokio::test]

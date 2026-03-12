@@ -3,7 +3,7 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Maximum file size we will read and base64-encode (5 MB).
@@ -125,12 +125,7 @@ impl ImageInfoTool {
             ));
         }
 
-        let raw_path = Path::new(path_str);
-        let candidate = if raw_path.is_absolute() {
-            raw_path.to_path_buf()
-        } else {
-            self.security.workspace_dir.join(raw_path)
-        };
+        let candidate = self.security.resolve_input_path(path_str);
 
         let resolved = candidate
             .canonicalize()
