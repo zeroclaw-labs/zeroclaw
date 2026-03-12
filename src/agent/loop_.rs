@@ -3494,9 +3494,7 @@ pub async fn run(
 
             // ── Backpressure admission check ──
             if let Some(ref bp) = backpressure {
-                if let Err(shed) =
-                    bp.admit(crate::agent::backpressure::Priority::Normal)
-                {
+                if let Err(shed) = bp.admit(crate::agent::backpressure::Priority::Normal) {
                     eprintln!("\nBackpressure: {shed}\n");
                     continue;
                 }

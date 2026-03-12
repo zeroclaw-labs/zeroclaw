@@ -86,8 +86,8 @@ impl TokenBucketRateLimiter {
             !config.window.is_zero(),
             "RateLimiterConfig.window must be non-zero (zero window fails open)"
         );
-        let refill_rate = config.requests_per_window as f64 / config.window.as_secs_f64();
-        let capacity = (config.requests_per_window + config.burst) as f64;
+        let refill_rate = f64::from(config.requests_per_window) / config.window.as_secs_f64();
+        let capacity = f64::from(config.requests_per_window + config.burst);
         Self {
             config,
             refill_rate,
@@ -254,7 +254,6 @@ mod tests {
 
         assert!(limiter.check("user_a").is_err());
     }
-
 
     #[test]
     #[should_panic(expected = "window must be non-zero")]

@@ -232,8 +232,8 @@ use super::traits::{
     ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions, StreamResult,
     ToolsPayload,
 };
-use crate::tools::ToolSpec;
 use super::Provider;
+use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use futures_util::stream;
 use std::sync::Arc;
@@ -331,21 +331,16 @@ impl Provider for CircuitBreakerProvider {
 
     fn stream_chat_with_system(
         &self,
-        _system_prompt: Option<&str>,
-        _message: &str,
-        _model: &str,
-        _temperature: f64,
-        _options: StreamOptions,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         // Circuit breaker does not wrap streaming calls (they have their own
         // error handling). Delegate directly.
-        self.inner.stream_chat_with_system(
-            _system_prompt,
-            _message,
-            _model,
-            _temperature,
-            _options,
-        )
+        self.inner
+            .stream_chat_with_system(system_prompt, message, model, temperature, options)
     }
 }
 

@@ -33,10 +33,10 @@ pub mod firejail;
 pub mod landlock;
 pub mod leak_detector;
 pub mod otp;
-pub mod rate_limiter;
 pub mod pairing;
 pub mod policy;
 pub mod prompt_guard;
+pub mod rate_limiter;
 pub mod secrets;
 pub mod traits;
 
