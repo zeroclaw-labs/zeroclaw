@@ -323,6 +323,10 @@ pub struct Config {
     /// Secure inter-node transport configuration (`[node_transport]`).
     #[serde(default)]
     pub node_transport: NodeTransportConfig,
+
+    /// Claude Code tool configuration (`[claude_code]`).
+    #[serde(default)]
+    pub claude_code: ClaudeCodeConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -1990,6 +1994,60 @@ impl Default for DataRetentionConfig {
             retention_days: default_retention_days(),
             dry_run: false,
             categories: Vec::new(),
+        }
+    }
+}
+
+// ── Claude Code ─────────────────────────────────────────────────
+
+/// Claude Code CLI tool configuration (`[claude_code]` section).
+///
+/// Delegates coding tasks to the `claude -p` CLI. Authentication uses the
+/// binary's own OAuth session (Max subscription) by default — no API key
+/// needed unless `env_passthrough` includes `ANTHROPIC_API_KEY`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ClaudeCodeConfig {
+    /// Enable the `claude_code` tool
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum execution time in seconds (coding tasks can be long)
+    #[serde(default = "default_claude_code_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Claude Code tools the subprocess is allowed to use
+    #[serde(default = "default_claude_code_allowed_tools")]
+    pub allowed_tools: Vec<String>,
+    /// Optional system prompt appended to Claude Code invocations
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// Maximum output size in bytes (2MB default)
+    #[serde(default = "default_claude_code_max_output_bytes")]
+    pub max_output_bytes: usize,
+    /// Extra env vars passed to the claude subprocess (e.g. ANTHROPIC_API_KEY for API-key billing)
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+}
+
+fn default_claude_code_timeout_secs() -> u64 {
+    600
+}
+
+fn default_claude_code_allowed_tools() -> Vec<String> {
+    vec!["Read".into(), "Edit".into(), "Bash".into(), "Write".into()]
+}
+
+fn default_claude_code_max_output_bytes() -> usize {
+    2_097_152
+}
+
+impl Default for ClaudeCodeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: default_claude_code_timeout_secs(),
+            allowed_tools: default_claude_code_allowed_tools(),
+            system_prompt: None,
+            max_output_bytes: default_claude_code_max_output_bytes(),
+            env_passthrough: Vec::new(),
         }
     }
 }
@@ -5276,6 +5334,7 @@ impl Default for Config {
             workspace: WorkspaceConfig::default(),
             notion: NotionConfig::default(),
             node_transport: NodeTransportConfig::default(),
+            claude_code: ClaudeCodeConfig::default(),
         }
     }
 }
@@ -7580,6 +7639,7 @@ default_temperature = 0.7
             workspace: WorkspaceConfig::default(),
             notion: NotionConfig::default(),
             node_transport: NodeTransportConfig::default(),
+            claude_code: ClaudeCodeConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -7883,6 +7943,7 @@ tool_dispatcher = "xml"
             workspace: WorkspaceConfig::default(),
             notion: NotionConfig::default(),
             node_transport: NodeTransportConfig::default(),
+            claude_code: ClaudeCodeConfig::default(),
         };
 
         config.save().await.unwrap();

@@ -90,6 +90,15 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Node.js and Claude Code CLI for claude_code tool support.
+# Auth: run `claude login` once in the container (persists in /zeroclaw-data/.claude/).
+# The release (distroless) stage intentionally omits this — use the dev image
+# or build a custom image if you need Claude Code in production.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y nodejs && \
+    npm install -g @anthropic-ai/claude-code && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /zeroclaw-data /zeroclaw-data
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 

@@ -1,0 +1,56 @@
+name: Docker Dev Image
+
+on:
+  push:
+    branches: [master, feat/**]
+
+concurrency:
+  group: docker-dev-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  docker:
+    name: Build & Push Dev Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          sha_short="${GITHUB_SHA::7}"
+          branch="${GITHUB_REF_NAME//\//-}"
+          echo "sha_tag=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev-${sha_short}" >> "$GITHUB_OUTPUT"
+          echo "branch_tag=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev-${branch}" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push dev image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: dev
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.sha_tag }}
+            ${{ steps.tags.outputs.branch_tag }}
+            ${{ steps.tags.outputs.latest_tag }}
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -19,6 +19,7 @@ pub mod backup_tool;
 pub mod browser;
 pub mod browser_delegate;
 pub mod browser_open;
+pub mod claude_code;
 pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
@@ -79,6 +80,7 @@ pub use browser::{BrowserTool, ComputerUseConfig};
 #[allow(unused_imports)]
 pub use browser_delegate::{BrowserDelegateConfig, BrowserDelegateTool};
 pub use browser_open::BrowserOpenTool;
+pub use claude_code::ClaudeCodeTool;
 pub use cloud_ops::CloudOpsTool;
 pub use cloud_patterns::CloudPatternsTool;
 pub use composio::ComposioTool;
@@ -275,7 +277,7 @@ pub fn all_tools_with_runtime(
 ) -> (Vec<Box<dyn Tool>>, Option<DelegateParentToolsHandle>) {
     let has_shell_access = runtime.has_shell_access();
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new(security.clone(), runtime)),
+        Arc::new(ShellTool::new(security.clone(), runtime.clone())),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
@@ -431,6 +433,15 @@ pub fn all_tools_with_runtime(
     if root_config.cloud_ops.enabled {
         tool_arcs.push(Arc::new(CloudOpsTool::new(root_config.cloud_ops.clone())));
         tool_arcs.push(Arc::new(CloudPatternsTool::new()));
+    }
+
+    // Claude Code delegation tool
+    if root_config.claude_code.enabled {
+        tool_arcs.push(Arc::new(ClaudeCodeTool::new(
+            security.clone(),
+            runtime.clone(),
+            root_config.claude_code.clone(),
+        )));
     }
 
     // PDF extraction (feature-gated at compile time via rag-pdf)
