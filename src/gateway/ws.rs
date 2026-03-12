@@ -3,11 +3,15 @@
 //! Protocol:
 //! ```text
 //! Client -> Server: {"type":"message","content":"Hello"}
-//! Server -> Client: {"type":"chunk","content":"Hi! "}
-//! Server -> Client: {"type":"tool_call","name":"shell","args":{...}}
-//! Server -> Client: {"type":"tool_result","name":"shell","output":"..."}
-//! Server -> Client: {"type":"done","full_response":"..."}
+//! Server -> Client: {"type":"thinking"}
+//! Server -> Client: {"type":"done","full_response":"Hi! I ran node --version..."}
+//! Server -> Client: {"type":"error","message":"..."}
 //! ```
+//!
+//! The handler uses [`crate::agent::loop_::process_message`] to execute the full
+//! agent loop including tool calls. This means WebSocket clients get the same
+//! agentic behaviour as CLI `zeroclaw agent -m "..."` — tool execution, memory,
+//! security policies, and multi-turn tool loops all apply.
 
 use super::AppState;
 use axum::{
@@ -146,7 +150,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<S
             continue;
         }
 
-        // Process message with the LLM provider
+        // Broadcast agent_start event
         let provider_label = state
             .config
             .lock()
@@ -154,59 +158,51 @@ async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<S
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
 
-        // Broadcast agent_start event
         let _ = state.event_tx.send(serde_json::json!({
             "type": "agent_start",
             "provider": provider_label,
             "model": state.model,
         }));
 
-        // Simple single-turn chat (no streaming for now — use provider.chat_with_system)
-        let system_prompt = {
-            let config_guard = state.config.lock();
-            crate::channels::build_system_prompt(
-                &config_guard.workspace_dir,
-                &state.model,
-                &[],
-                &[],
-                Some(&config_guard.identity),
-                None,
-            )
-        };
+        // Send "thinking" event so clients can show a loading state
+        let _ = sender
+            .send(Message::Text(
+                serde_json::json!({"type": "thinking"}).to_string().into(),
+            ))
+            .await;
 
-        let messages = vec![
-            crate::providers::ChatMessage::system(system_prompt),
-            crate::providers::ChatMessage::user(&content),
-        ];
-
-        let multimodal_config = state.config.lock().multimodal.clone();
-        let prepared =
-            match crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config)
-                .await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    let err = serde_json::json!({
-                        "type": "error",
-                        "message": format!("Multimodal prep failed: {e}")
-                    });
-                    let _ = sender.send(Message::Text(err.to_string().into())).await;
-                    continue;
-                }
-            };
-
-        match state
-            .provider
-            .chat_with_history(&prepared.messages, &state.model, state.temperature)
-            .await
-        {
+        // Run the full agent loop with tool execution via process_message.
+        // This gives WebSocket clients the same agentic behaviour as
+        // `zeroclaw agent -m "..."` — tool calls, memory, security policies,
+        // and multi-turn tool loops all apply.
+        let config = state.config.lock().clone();
+        match crate::agent::loop_::process_message(config, &content).await {
             Ok(response) => {
-                // Send the full response as a done message
                 let done = serde_json::json!({
                     "type": "done",
                     "full_response": response,
                 });
                 let _ = sender.send(Message::Text(done.to_string().into())).await;
+
+                // Auto-save to memory if enabled
+                if state.auto_save && content.len() >= 20 {
+                    let _ = state
+                        .mem
+                        .store(
+                            &format!("ws_user_{}", uuid::Uuid::new_v4()),
+                            &content,
+                            crate::memory::MemoryCategory::Conversation,
+                        )
+                        .await;
+                    let _ = state
+                        .mem
+                        .store(
+                            &format!("ws_assistant_{}", uuid::Uuid::new_v4()),
+                            &response,
+                            crate::memory::MemoryCategory::Conversation,
+                        )
+                        .await;
+                }
 
                 // Broadcast agent_end event
                 let _ = state.event_tx.send(serde_json::json!({
