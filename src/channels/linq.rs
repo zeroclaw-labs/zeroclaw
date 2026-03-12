@@ -61,24 +61,35 @@ impl LinqChannel {
 
     /// Parse an incoming webhook payload from Linq and extract messages.
     ///
-    /// Linq webhook envelope:
+    /// Supports both the legacy format (2025-01-01) and the current format (2026-02-03).
+    ///
+    /// Legacy format:
     /// ```json
     /// {
     ///   "api_version": "v3",
     ///   "event_type": "message.received",
-    ///   "event_id": "...",
-    ///   "created_at": "...",
-    ///   "trace_id": "...",
     ///   "data": {
     ///     "chat_id": "...",
     ///     "from": "+1...",
-    ///     "recipient_phone": "+1...",
     ///     "is_from_me": false,
-    ///     "service": "iMessage",
     ///     "message": {
-    ///       "id": "...",
     ///       "parts": [{ "type": "text", "value": "..." }]
     ///     }
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// Current format (2026-02-03):
+    /// ```json
+    /// {
+    ///   "api_version": "v3",
+    ///   "webhook_version": "2026-02-03",
+    ///   "event_type": "message.received",
+    ///   "data": {
+    ///     "chat": { "id": "..." },
+    ///     "direction": "inbound",
+    ///     "sender_handle": { "handle": "+1...", "is_me": false },
+    ///     "parts": [{ "type": "text", "value": "..." }]
     ///   }
     /// }
     /// ```
@@ -99,18 +110,36 @@ impl LinqChannel {
             return messages;
         };
 
+        // Determine if using new format (2026-02-03) or legacy format (2025-01-01)
+        let is_new_format = data.get("sender_handle").is_some();
+
         // Skip messages sent by the bot itself
-        if data
-            .get("is_from_me")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
+        let is_from_me = if is_new_format {
+            data.get("sender_handle")
+                .and_then(|sh| sh.get("is_me"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        } else {
+            data.get("is_from_me")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        };
+
+        if is_from_me {
             tracing::debug!("Linq: skipping is_from_me message");
             return messages;
         }
 
         // Get sender phone number
-        let Some(from) = data.get("from").and_then(|f| f.as_str()) else {
+        let from = if is_new_format {
+            data.get("sender_handle")
+                .and_then(|sh| sh.get("handle"))
+                .and_then(|f| f.as_str())
+        } else {
+            data.get("from").and_then(|f| f.as_str())
+        };
+
+        let Some(from) = from else {
             return messages;
         };
 
@@ -132,18 +161,31 @@ impl LinqChannel {
         }
 
         // Get chat_id for reply routing
-        let chat_id = data
-            .get("chat_id")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        // Extract text from message parts
-        let Some(message) = data.get("message") else {
-            return messages;
+        let chat_id = if is_new_format {
+            data.get("chat")
+                .and_then(|c| c.get("id"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            data.get("chat_id")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string()
         };
 
-        let Some(parts) = message.get("parts").and_then(|p| p.as_array()) else {
+        // Extract text from message parts
+        // New format: parts is at data.parts
+        // Legacy format: parts is at data.message.parts
+        let parts = if is_new_format {
+            data.get("parts").and_then(|p| p.as_array())
+        } else {
+            data.get("message")
+                .and_then(|m| m.get("parts"))
+                .and_then(|p| p.as_array())
+        };
+
+        let Some(parts) = parts else {
             return messages;
         };
 
@@ -789,5 +831,104 @@ mod tests {
     fn linq_phone_number_accessor() {
         let ch = make_channel();
         assert_eq!(ch.phone_number(), "+15551234567");
+    }
+
+    // Tests for new webhook format (2026-02-03)
+
+    #[test]
+    fn linq_parse_new_format_v2026_02_03() {
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        // New format uses sender_handle.handle, chat.id, sender_handle.is_me, and data.parts (not nested)
+        let payload = serde_json::json!({
+            "api_version": "v3",
+            "webhook_version": "2026-02-03",
+            "event_type": "message.received",
+            "event_id": "evt-123",
+            "created_at": "2026-03-10T12:00:00Z",
+            "data": {
+                "chat": {
+                    "id": "e51e2420-2b09-400c-8477-685b162640ef"
+                },
+                "direction": "inbound",
+                "id": "7a37fcec-c989-4c04-ba09-11f74a323ebd",
+                "parts": [
+                    { "type": "text", "value": "Hello from new format!" }
+                ],
+                "sender_handle": {
+                    "handle": "+1234567890",
+                    "is_me": false
+                }
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].sender, "+1234567890");
+        assert_eq!(msgs[0].content, "Hello from new format!");
+        assert_eq!(msgs[0].reply_target, "e51e2420-2b09-400c-8477-685b162640ef");
+    }
+
+    #[test]
+    fn linq_parse_new_format_skip_is_me() {
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "chat": { "id": "chat-789" },
+                "sender_handle": {
+                    "handle": "+1234567890",
+                    "is_me": true
+                },
+                "parts": [{ "type": "text", "value": "My own message" }]
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty(), "is_me messages should be skipped in new format");
+    }
+
+    #[test]
+    fn linq_parse_new_format_media() {
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "chat": { "id": "chat-789" },
+                "sender_handle": {
+                    "handle": "+1234567890",
+                    "is_me": false
+                },
+                "parts": [
+                    { "type": "media", "url": "https://example.com/image.jpg", "mime_type": "image/jpeg" }
+                ]
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[IMAGE:https://example.com/image.jpg]");
+    }
+
+    #[test]
+    fn linq_parse_new_format_fallback_to_legacy() {
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        // When sender_handle is not present, should fall back to legacy format
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "chat_id": "legacy-chat-123",
+                "from": "+9876543210",
+                "is_from_me": false,
+                "message": {
+                    "parts": [{ "type": "text", "value": "Legacy format works!" }]
+                }
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].sender, "+9876543210");
+        assert_eq!(msgs[0].content, "Legacy format works!");
+        assert_eq!(msgs[0].reply_target, "legacy-chat-123");
     }
 }
