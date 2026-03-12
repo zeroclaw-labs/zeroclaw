@@ -365,6 +365,18 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             },
         },
         IntegrationEntry {
+            name: "OpenCode Go",
+            description: "Subsidized Code-focused AI models",
+            category: IntegrationCategory::AiModel,
+            status_fn: |c| {
+                if c.default_provider.as_deref() == Some("opencode-go") {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
             name: "Z.AI",
             description: "Z.AI inference",
             category: IntegrationCategory::AiModel,
