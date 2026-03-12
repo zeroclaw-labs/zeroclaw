@@ -59,9 +59,52 @@ impl LinqChannel {
         Some(format!("[IMAGE:{source}]"))
     }
 
+    fn sender_is_from_me(data: &serde_json::Value) -> bool {
+        data.get("is_from_me")
+            .and_then(|value| value.as_bool())
+            .or_else(|| {
+                data.get("sender_handle")
+                    .and_then(|value| value.get("is_me"))
+                    .and_then(|value| value.as_bool())
+            })
+            .unwrap_or_else(|| {
+                matches!(
+                    data.get("direction").and_then(|value| value.as_str()),
+                    Some("outbound")
+                )
+            })
+    }
+
+    fn sender_handle<'a>(data: &'a serde_json::Value) -> Option<&'a str> {
+        data.get("from")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                data.get("sender_handle")
+                    .and_then(|value| value.get("handle"))
+                    .and_then(|value| value.as_str())
+            })
+    }
+
+    fn chat_id(data: &serde_json::Value) -> Option<&str> {
+        data.get("chat_id")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                data.get("chat")
+                    .and_then(|value| value.get("id"))
+                    .and_then(|value| value.as_str())
+            })
+    }
+
+    fn message_parts(data: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+        data.get("message")
+            .and_then(|value| value.get("parts"))
+            .and_then(|value| value.as_array())
+            .or_else(|| data.get("parts").and_then(|value| value.as_array()))
+    }
+
     /// Parse an incoming webhook payload from Linq and extract messages.
     ///
-    /// Linq webhook envelope:
+    /// Linq webhook envelope (legacy 2025-01-01 shape):
     /// ```json
     /// {
     ///   "api_version": "v3",
@@ -82,6 +125,11 @@ impl LinqChannel {
     ///   }
     /// }
     /// ```
+    ///
+    /// Also accepts the current 2026-02-03 payload shape where `chat_id`,
+    /// `from`, `is_from_me`, and `message.parts` moved under:
+    /// `data.chat.id`, `data.sender_handle.handle`, `data.sender_handle.is_me`,
+    /// and `data.parts`.
     pub fn parse_webhook_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
         let mut messages = Vec::new();
 
@@ -100,17 +148,13 @@ impl LinqChannel {
         };
 
         // Skip messages sent by the bot itself
-        if data
-            .get("is_from_me")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
+        if Self::sender_is_from_me(data) {
             tracing::debug!("Linq: skipping is_from_me message");
             return messages;
         }
 
         // Get sender phone number
-        let Some(from) = data.get("from").and_then(|f| f.as_str()) else {
+        let Some(from) = Self::sender_handle(data) else {
             return messages;
         };
 
@@ -132,18 +176,10 @@ impl LinqChannel {
         }
 
         // Get chat_id for reply routing
-        let chat_id = data
-            .get("chat_id")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
+        let chat_id = Self::chat_id(data).unwrap_or("").to_string();
 
         // Extract text from message parts
-        let Some(message) = data.get("message") else {
-            return messages;
-        };
-
-        let Some(parts) = message.get("parts").and_then(|p| p.as_array()) else {
+        let Some(parts) = Self::message_parts(data) else {
             return messages;
         };
 
@@ -467,6 +503,42 @@ mod tests {
     }
 
     #[test]
+    fn linq_parse_latest_webhook_shape() {
+        let ch = LinqChannel::new(
+            "tok".into(),
+            "+15551234567".into(),
+            vec!["+1234567890".into()],
+        );
+        let payload = serde_json::json!({
+            "api_version": "v3",
+            "webhook_version": "2026-02-03",
+            "event_type": "message.received",
+            "created_at": "2026-02-03T12:00:00Z",
+            "data": {
+                "chat": {
+                    "id": "chat-2026"
+                },
+                "direction": "inbound",
+                "id": "msg-2026",
+                "parts": [{
+                    "type": "text",
+                    "value": "Hello from the latest payload"
+                }],
+                "sender_handle": {
+                    "handle": "1234567890",
+                    "is_me": false
+                }
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].sender, "+1234567890");
+        assert_eq!(msgs[0].content, "Hello from the latest payload");
+        assert_eq!(msgs[0].reply_target, "chat-2026");
+    }
+
+    #[test]
     fn linq_parse_skip_is_from_me() {
         let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
         let payload = serde_json::json!({
@@ -484,6 +556,34 @@ mod tests {
 
         let msgs = ch.parse_webhook_payload(&payload);
         assert!(msgs.is_empty(), "is_from_me messages should be skipped");
+    }
+
+    #[test]
+    fn linq_parse_skip_latest_outbound_message() {
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "chat": {
+                    "id": "chat-789"
+                },
+                "direction": "outbound",
+                "parts": [{
+                    "type": "text",
+                    "value": "My own message"
+                }],
+                "sender_handle": {
+                    "handle": "+1234567890",
+                    "is_me": true
+                }
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(
+            msgs.is_empty(),
+            "latest outbound messages from the bot should be skipped"
+        );
     }
 
     #[test]
