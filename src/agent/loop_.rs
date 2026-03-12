@@ -2876,6 +2876,7 @@ pub async fn run(
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
+        api_path: config.api_path.clone(),
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
@@ -3334,6 +3335,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
+        api_path: config.api_path.clone(),
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,

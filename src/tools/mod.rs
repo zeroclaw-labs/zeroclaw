@@ -332,6 +332,7 @@ pub fn all_tools_with_runtime(
             crate::providers::ProviderRuntimeOptions {
                 auth_profile_override: None,
                 provider_api_url: root_config.api_url.clone(),
+                api_path: root_config.api_path.clone(),
                 zeroclaw_dir: root_config
                     .config_path
                     .parent()
