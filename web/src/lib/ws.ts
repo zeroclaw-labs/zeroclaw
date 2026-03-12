@@ -1,6 +1,19 @@
 import type { WsMessage } from '../types/api';
 import { getToken } from './auth';
 
+/** Generate a UUID v4, with fallback for older browsers */
+export function generateUUID(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return generateUUID();
+  }
+  // Fallback for older browsers (e.g., Safari < 15.4, older mobile browsers)
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
 export type WsMessageHandler = (msg: WsMessage) => void;
 export type WsOpenHandler = () => void;
 export type WsCloseHandler = (ev: CloseEvent) => void;
@@ -26,7 +39,7 @@ const SESSION_STORAGE_KEY = 'zeroclaw_session_id';
 function getOrCreateSessionId(): string {
   let id = sessionStorage.getItem(SESSION_STORAGE_KEY);
   if (!id) {
-    id = crypto.randomUUID();
+    id = generateUUID();
     sessionStorage.setItem(SESSION_STORAGE_KEY, id);
   }
   return id;
