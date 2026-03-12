@@ -40,12 +40,12 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod knowledge_tool;
 pub mod mcp_client;
 pub mod mcp_deferred;
 pub mod mcp_protocol;
 pub mod mcp_tool;
 pub mod mcp_transport;
-pub mod knowledge_tool;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
@@ -87,10 +87,10 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+pub use knowledge_tool::KnowledgeTool;
 pub use mcp_client::McpRegistry;
 pub use mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
 pub use mcp_tool::McpToolWrapper;
-pub use knowledge_tool::KnowledgeTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
@@ -361,7 +361,7 @@ pub fn all_tools_with_runtime(
     // Knowledge graph tool
     if root_config.knowledge.enabled {
         let db_path_str = root_config.knowledge.db_path.replace(
-            "~",
+            '~',
             &directories::UserDirs::new()
                 .map(|u| u.home_dir().to_string_lossy().to_string())
                 .unwrap_or_else(|| ".".to_string()),

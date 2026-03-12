@@ -130,7 +130,7 @@ impl KnowledgeTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing 'content' for capture"))?;
 
-        let node_type = NodeType::from_str(node_type_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let node_type = NodeType::parse(node_type_str).map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let tags: Vec<String> = args
             .get("tags")
@@ -187,7 +187,7 @@ impl KnowledgeTool {
             .and_then(|v| v.as_str());
 
         // Parse the node_type filter once so it applies in all code paths.
-        let parsed_filter_type = filter_type.and_then(|ft| NodeType::from_str(ft).ok());
+        let parsed_filter_type = filter_type.and_then(|ft| NodeType::parse(ft).ok());
 
         let results = if query.is_empty() && !filter_tags.is_empty() {
             // Tag-only search -- apply node_type and project filters consistently.
@@ -254,7 +254,7 @@ impl KnowledgeTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing 'relation' for relate"))?;
 
-        let relation = Relation::from_str(relation_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let relation = Relation::parse(relation_str).map_err(|e| anyhow::anyhow!("{e}"))?;
 
         match self.graph.add_edge(from_id, to_id, relation) {
             Ok(()) => Ok(ToolResult {

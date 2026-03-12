@@ -1547,6 +1547,7 @@ impl Default for WebSearchConfig {
 // ── Knowledge ───────────────────────────────────────────────────
 
 /// Knowledge graph configuration for capturing and reusing expertise.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct KnowledgeConfig {
     /// Enable the knowledge graph tool. Default: false.
@@ -5280,6 +5281,8 @@ impl Config {
         // MCP
         if self.mcp.enabled {
             validate_mcp_config(&self.mcp)?;
+        }
+
         // Knowledge graph
         if self.knowledge.enabled {
             if self.knowledge.max_nodes == 0 {
@@ -5292,11 +5295,6 @@ impl Config {
 
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
-
-        // MCP servers
-        if self.mcp.enabled {
-            validate_mcp_config(&self.mcp)?;
-        }
 
         Ok(())
     }

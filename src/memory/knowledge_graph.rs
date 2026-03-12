@@ -38,7 +38,7 @@ impl NodeType {
         }
     }
 
-    pub fn from_str(s: &str) -> anyhow::Result<Self> {
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
         match s {
             "pattern" => Ok(Self::Pattern),
             "decision" => Ok(Self::Decision),
@@ -72,7 +72,7 @@ impl Relation {
         }
     }
 
-    pub fn from_str(s: &str) -> anyhow::Result<Self> {
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
         match s {
             "uses" => Ok(Self::Uses),
             "replaces" => Ok(Self::Replaces),
@@ -377,7 +377,7 @@ impl KnowledgeGraph {
         while let Some(row) = rows.next()? {
             let node = row_to_node(row)?;
             let relation_str: String = row.get(8)?;
-            let relation = Relation::from_str(&relation_str)?;
+            let relation = Relation::parse(&relation_str)?;
             results.push((node, relation));
         }
         Ok(results)
@@ -543,7 +543,7 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> anyhow::Result<KnowledgeNode> {
 
     Ok(KnowledgeNode {
         id,
-        node_type: NodeType::from_str(&node_type_str)?,
+        node_type: NodeType::parse(&node_type_str)?,
         title,
         content,
         tags,
@@ -805,7 +805,7 @@ mod tests {
             NodeType::Expert,
             NodeType::Technology,
         ] {
-            assert_eq!(&NodeType::from_str(nt.as_str()).unwrap(), nt);
+            assert_eq!(&NodeType::parse(nt.as_str()).unwrap(), nt);
         }
     }
 
@@ -818,7 +818,7 @@ mod tests {
             Relation::AuthoredBy,
             Relation::AppliesTo,
         ] {
-            assert_eq!(&Relation::from_str(r.as_str()).unwrap(), r);
+            assert_eq!(&Relation::parse(r.as_str()).unwrap(), r);
         }
     }
 }
