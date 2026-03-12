@@ -495,6 +495,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_read_direct_allowed_root_path_works_when_workspace_only_enabled() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_read_direct_allowed_root");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        let outside_file = outside.join("notes.txt");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        tokio::fs::write(&outside_file, "outside").await.unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            workspace_only: true,
+            allowed_roots: vec![outside.clone()],
+            forbidden_paths: vec!["/tmp".into()],
+            ..SecurityPolicy::default()
+        });
+        let tool = FileReadTool::new(security);
+
+        let result = tool
+            .execute(json!({"path": outside_file.to_string_lossy().to_string()}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.error.is_none());
+        assert!(result.output.contains("outside"));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
     async fn file_read_nonexistent_consumes_rate_limit_budget() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_probe");
         let _ = tokio::fs::remove_dir_all(&dir).await;

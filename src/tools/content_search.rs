@@ -9,10 +9,10 @@ const MAX_RESULTS: usize = 1000;
 const MAX_OUTPUT_BYTES: usize = 1_048_576; // 1 MB
 const TIMEOUT_SECS: u64 = 30;
 
-/// Search file contents by regex pattern within the workspace.
+/// Search file contents by regex pattern within the workspace or allowed roots.
 ///
 /// Uses ripgrep (`rg`) when available, falling back to `grep -rn -E`.
-/// All searches are confined to the workspace directory by security policy.
+/// All searches are confined to the workspace directory or explicit allowed roots.
 pub struct ContentSearchTool {
     security: Arc<SecurityPolicy>,
     has_rg: bool,
@@ -37,7 +37,7 @@ impl Tool for ContentSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search file contents by regex pattern within the workspace. \
+        "Search file contents by regex pattern within the workspace or allowed roots. \
          Supports ripgrep (rg) with grep fallback. \
          Output modes: 'content' (matching lines with context), \
          'files_with_matches' (file paths only), 'count' (match counts per file). \
@@ -54,7 +54,7 @@ impl Tool for ContentSearchTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory to search in, relative to workspace root. Defaults to '.'",
+                    "description": "Directory to search in. Relative paths are resolved from the workspace root; absolute paths are allowed when they stay within the workspace or allowed_roots.",
                     "default": "."
                 },
                 "output_mode": {
@@ -171,14 +171,6 @@ impl Tool for ContentSearchTool {
         }
 
         // --- Path security checks ---
-        if std::path::Path::new(search_path).is_absolute() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Absolute paths are not allowed. Use a relative path.".into()),
-            });
-        }
-
         if search_path.contains("../") || search_path.contains("..\\") || search_path == ".." {
             return Ok(ToolResult {
                 success: false,
@@ -207,8 +199,12 @@ impl Tool for ContentSearchTool {
         }
 
         // --- Resolve search directory ---
-        let workspace = &self.security.workspace_dir;
-        let resolved_path = workspace.join(search_path);
+        let requested_path = std::path::Path::new(search_path);
+        let resolved_path = if requested_path.is_absolute() {
+            requested_path.to_path_buf()
+        } else {
+            self.security.workspace_dir.join(requested_path)
+        };
 
         let resolved_canon = match std::fs::canonicalize(&resolved_path) {
             Ok(p) => p,
@@ -225,9 +221,10 @@ impl Tool for ContentSearchTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Resolved path for '{search_path}' is outside the allowed workspace."
-                )),
+                error: Some(
+                    self.security
+                        .resolved_path_violation_message(&resolved_canon),
+                ),
             });
         }
 
@@ -880,7 +877,7 @@ mod tests {
     // --- Security tests ---
 
     #[tokio::test]
-    async fn content_search_rejects_absolute_path() {
+    async fn content_search_blocks_unallowlisted_absolute_path() {
         let tool = ContentSearchTool::new(test_security(std::env::temp_dir()));
         let result = tool
             .execute(json!({"pattern": "test", "path": "/etc"}))
@@ -888,7 +885,34 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("Absolute paths"));
+        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn content_search_allows_direct_absolute_path_in_allowed_root() {
+        let root = TempDir::new().unwrap();
+        let workspace = root.path().join("workspace");
+        let allowed = root.path().join("allowed");
+
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::write(allowed.join("notes.txt"), "needle here\n").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            allowed_roots: vec![allowed.clone()],
+            forbidden_paths: vec!["/tmp".into()],
+            ..SecurityPolicy::default()
+        });
+        let tool = ContentSearchTool::new(security);
+        let result = tool
+            .execute(json!({"pattern": "needle", "path": allowed.to_string_lossy().to_string()}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("notes.txt"));
     }
 
     #[tokio::test]
