@@ -4283,6 +4283,23 @@ impl Config {
                     "config.channels_config.nostr.private_key",
                 )?;
             }
+            if let Some(ref mut fs) = config.channels_config.feishu {
+                decrypt_secret(
+                    &store,
+                    &mut fs.app_secret,
+                    "config.channels_config.feishu.app_secret",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut fs.encrypt_key,
+                    "config.channels_config.feishu.encrypt_key",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut fs.verification_token,
+                    "config.channels_config.feishu.verification_token",
+                )?;
+            }
 
             config.apply_env_overrides();
             config.validate()?;
@@ -4931,6 +4948,23 @@ impl Config {
                 &store,
                 &mut ns.private_key,
                 "config.channels_config.nostr.private_key",
+            )?;
+        }
+        if let Some(ref mut fs) = config_to_save.channels_config.feishu {
+            encrypt_secret(
+                &store,
+                &mut fs.app_secret,
+                "config.channels_config.feishu.app_secret",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut fs.encrypt_key,
+                "config.channels_config.feishu.encrypt_key",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut fs.verification_token,
+                "config.channels_config.feishu.verification_token",
             )?;
         }
 
@@ -5591,6 +5625,15 @@ tool_dispatcher = "xml"
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
+        config.channels_config.feishu = Some(FeishuConfig {
+            app_id: "cli_feishu_123".into(),
+            app_secret: "feishu-secret".into(),
+            encrypt_key: Some("feishu-encrypt".into()),
+            verification_token: Some("feishu-verify".into()),
+            allowed_users: vec!["*".into()],
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+        });
 
         config.agents.insert(
             "worker".into(),
@@ -5656,6 +5699,28 @@ tool_dispatcher = "xml"
         assert_eq!(
             store.decrypt(storage_db_url).unwrap(),
             "postgres://user:pw@host/db"
+        );
+
+        let feishu = stored.channels_config.feishu.as_ref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(&feishu.app_secret));
+        assert_eq!(store.decrypt(&feishu.app_secret).unwrap(), "feishu-secret");
+        assert!(feishu
+            .encrypt_key
+            .as_deref()
+            .is_some_and(crate::security::SecretStore::is_encrypted));
+        assert_eq!(
+            store.decrypt(feishu.encrypt_key.as_deref().unwrap()).unwrap(),
+            "feishu-encrypt"
+        );
+        assert!(feishu
+            .verification_token
+            .as_deref()
+            .is_some_and(crate::security::SecretStore::is_encrypted));
+        assert_eq!(
+            store
+                .decrypt(feishu.verification_token.as_deref().unwrap())
+                .unwrap(),
+            "feishu-verify"
         );
 
         let _ = fs::remove_dir_all(&dir).await;
@@ -7019,6 +7084,49 @@ default_model = "legacy-model"
         assert_eq!(config.default_model.as_deref(), Some("legacy-model"));
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    async fn load_or_init_decrypts_feishu_channel_secrets() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_home.join(".zeroclaw");
+        let config_path = config_dir.join("config.toml");
+
+        fs::create_dir_all(&config_dir).await.unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+
+        let mut config = Config::default();
+        config.config_path = config_path.clone();
+        config.workspace_dir = config_dir.join("workspace");
+        config.secrets.encrypt = true;
+        config.channels_config.feishu = Some(FeishuConfig {
+            app_id: "cli_feishu_123".into(),
+            app_secret: "feishu-secret".into(),
+            encrypt_key: Some("feishu-encrypt".into()),
+            verification_token: Some("feishu-verify".into()),
+            allowed_users: vec!["*".into()],
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+        });
+        config.save().await.unwrap();
+
+        let loaded = Config::load_or_init().await.unwrap();
+        let feishu = loaded.channels_config.feishu.as_ref().unwrap();
+        assert_eq!(feishu.app_secret, "feishu-secret");
+        assert_eq!(feishu.encrypt_key.as_deref(), Some("feishu-encrypt"));
+        assert_eq!(feishu.verification_token.as_deref(), Some("feishu-verify"));
+
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
         } else {
