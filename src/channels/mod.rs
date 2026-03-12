@@ -2627,13 +2627,17 @@ pub fn autonomy_constraints_prompt(
 
     match autonomy.level {
         crate::security::AutonomyLevel::ReadOnly => {
-            prompt.push_str("- Do not attempt write operations, mutations, or side-effecting commands.\n");
+            prompt.push_str(
+                "- Do not attempt write operations, mutations, or side-effecting commands.\n",
+            );
         }
         crate::security::AutonomyLevel::Supervised => {
             prompt.push_str("- Risky actions may require approval; ask or wait for approval instead of pretending the action already happened.\n");
         }
         crate::security::AutonomyLevel::Full => {
-            prompt.push_str("- You may act autonomously, but still stay within command/path/rate limits.\n");
+            prompt.push_str(
+                "- You may act autonomously, but still stay within command/path/rate limits.\n",
+            );
         }
     }
 
