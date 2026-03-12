@@ -256,22 +256,49 @@ export interface AuthRegisterResponse {
   user_id: string;
 }
 
+export interface UserDevice {
+  device_id: string;
+  device_name: string;
+  platform: string;
+  last_seen_at: string | null;
+  is_online: boolean;
+}
+
 export interface AuthLoginResponse {
   status: string;
   token: string;
   user_id: string;
   username: string;
-  devices: unknown[];
+  email: string;
+  devices: UserDevice[];
+}
+
+export interface EmailVerificationResponse {
+  status: string;
+  expires_in_seconds: number;
+}
+
+export interface EmailVerifyCodeResponse {
+  status: string;
+  token: string;
+}
+
+export interface DevicePairResponse {
+  status: string;
+  token: string;
+  device_id: string;
+  device_name: string;
 }
 
 export async function authRegister(
   username: string,
   password: string,
+  email?: string,
 ): Promise<AuthRegisterResponse> {
   const response = await fetch(resolveUrl('/api/auth/register'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ username, password, email }),
   });
 
   if (!response.ok) {
@@ -305,7 +332,7 @@ export async function authLogin(
   }
 
   const data = (await response.json()) as AuthLoginResponse;
-  setToken(data.token);
+  // Don't set token yet - wait for device selection + pairing + email verification
   return data;
 }
 
@@ -320,6 +347,102 @@ export async function authLogout(): Promise<void> {
   clearToken();
 }
 
+// Remote device login (pairing code + credentials -> email verification)
+// Uses POST /api/remote/login which validates user+password+device+pairing_code
+// and triggers email verification if configured.
+export interface RemoteLoginResponse {
+  status: string;
+  user_id: string;
+  device_id: string;
+  device_name: string;
+  requires_email_verification: boolean;
+  email_hint?: string;
+  token?: string;
+}
+
+export async function remoteLogin(
+  username: string,
+  password: string,
+  deviceId: string,
+  pairingCode: string,
+): Promise<RemoteLoginResponse> {
+  const response = await fetch(resolveUrl('/api/remote/login'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      username,
+      password,
+      device_id: deviceId,
+      pairing_code: pairingCode,
+    }),
+  });
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || `Remote login failed (${response.status})`);
+  }
+
+  const data = (await response.json()) as RemoteLoginResponse;
+  // If email verification is NOT required, token is returned directly
+  if (data.token && !data.requires_email_verification) {
+    setToken(data.token);
+  }
+  return data;
+}
+
+// Verify email code for remote device access
+// Uses POST /api/remote/verify-email
+export async function verifyRemoteEmail(
+  userId: string,
+  code: string,
+): Promise<EmailVerifyCodeResponse> {
+  const response = await fetch(resolveUrl('/api/remote/verify-email'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: userId, code }),
+  });
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || `Email verification failed (${response.status})`);
+  }
+
+  const data = (await response.json()) as EmailVerifyCodeResponse;
+  setToken(data.token);
+  return data;
+}
+
+// Get user devices list
+// Uses GET /api/auth/devices (requires auth token from initial login)
+export async function getUserDevices(loginToken: string): Promise<UserDevice[]> {
+  const response = await fetch(resolveUrl('/api/auth/devices'), {
+    headers: { Authorization: `Bearer ${loginToken}` },
+  });
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to get devices (${response.status})`);
+  }
+
+  const data = await response.json();
+  return (data.devices || data || []) as UserDevice[];
+}
+
+// Get remote devices list (alternative endpoint for web flow)
+export async function getRemoteDevices(loginToken: string): Promise<UserDevice[]> {
+  const response = await fetch(resolveUrl('/api/remote/devices'), {
+    headers: { Authorization: `Bearer ${loginToken}` },
+  });
+
+  if (!response.ok) {
+    // Fallback to /api/auth/devices if /api/remote/devices fails
+    return getUserDevices(loginToken);
+  }
+
+  const data = await response.json();
+  return (data.devices || data || []) as UserDevice[];
+}
+
 // Kakao OAuth
 export interface KakaoAuthResponse {
   status: string;
@@ -327,6 +450,8 @@ export interface KakaoAuthResponse {
   user_id: string;
   username: string;
   kakao_id: string;
+  email: string;
+  devices: UserDevice[];
 }
 
 export async function authKakaoCallback(code: string): Promise<KakaoAuthResponse> {
@@ -341,7 +466,5 @@ export async function authKakaoCallback(code: string): Promise<KakaoAuthResponse
     throw new Error(data.error || `Kakao login failed (${response.status})`);
   }
 
-  const data = (await response.json()) as KakaoAuthResponse;
-  setToken(data.token);
-  return data;
+  return response.json() as Promise<KakaoAuthResponse>;
 }

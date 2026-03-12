@@ -10,6 +10,10 @@ export default function Header() {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [lang, setLang] = useState<"ko" | "en">("ko");
 
+  // Hide header on full-screen chat page
+  const isFullScreenRoute = pathname === "/chat" || pathname.startsWith("/chat/");
+  if (isFullScreenRoute) return null;
+
   useEffect(() => {
     const handleScroll = () => {
       setIsScrolled(window.scrollY > 20);
