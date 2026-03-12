@@ -5,7 +5,6 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { isAuthenticated, setToken } from '@/lib/auth';
 import {
-  authRegister,
   authLogin,
   remoteLogin,
   verifyRemoteEmail,
@@ -16,7 +15,6 @@ import {
 
 type AuthStep =
   | 'login'
-  | 'register'
   | 'device-select'
   | 'pairing-code'
   | 'email-verify';
@@ -46,14 +44,13 @@ function AuthPageInner() {
 
   const [step, setStep] = useState<AuthStep>('login');
 
-  // Login/Register fields
+  // Login fields
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
-  const [email, setEmail] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [successMessage, setSuccessMessage] = useState('');
+  const [showAppGuideModal, setShowAppGuideModal] = useState(false);
 
   // Post-login state
   const [loginToken, setLoginToken] = useState('');
@@ -130,47 +127,21 @@ function AuthPageInner() {
         setStep('device-select');
       }
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Login failed');
+      const errMsg = err instanceof Error ? err.message : 'Login failed';
+      // Show app guide modal for user-not-found / auth failures
+      if (
+        errMsg.toLowerCase().includes('not found') ||
+        errMsg.toLowerCase().includes('invalid') ||
+        errMsg.toLowerCase().includes('unauthorized') ||
+        errMsg.toLowerCase().includes('failed')
+      ) {
+        setShowAppGuideModal(true);
+      }
+      setError(errMsg);
     } finally {
       setLoading(false);
     }
   }, [username, password, router, redirectTo]);
-
-  const handleRegister = useCallback(async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoading(true);
-    setError('');
-    setSuccessMessage('');
-
-    if (password !== confirmPassword) {
-      setError('Passwords do not match');
-      setLoading(false);
-      return;
-    }
-
-    if (password.length < 8) {
-      setError('Password must be at least 8 characters');
-      setLoading(false);
-      return;
-    }
-
-    if (!email || !email.includes('@')) {
-      setError('Please enter a valid email address');
-      setLoading(false);
-      return;
-    }
-
-    try {
-      await authRegister(username, password, email);
-      setSuccessMessage('Registration successful! Please log in.');
-      setStep('login');
-      setConfirmPassword('');
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Registration failed');
-    } finally {
-      setLoading(false);
-    }
-  }, [username, password, confirmPassword, email]);
 
   const handleDeviceSelect = useCallback(() => {
     if (!selectedDeviceId) {
@@ -283,8 +254,6 @@ function AuthPageInner() {
       setPairingCode('');
     } else if (step === 'device-select') {
       setStep('login');
-    } else if (step === 'register') {
-      setStep('login');
     }
   };
 
@@ -307,7 +276,6 @@ function AuthPageInner() {
           <h1 className="text-2xl font-bold text-dark-50">MoA</h1>
           <p className="text-dark-400 text-sm mt-1">
             {step === 'login' && 'Sign in to your account'}
-            {step === 'register' && 'Create your account'}
             {step === 'device-select' && 'Select your device'}
             {step === 'pairing-code' && `Enter pairing code for ${selectedDeviceName || 'device'}`}
             {step === 'email-verify' && 'Enter email verification code'}
@@ -327,7 +295,7 @@ function AuthPageInner() {
         )}
 
         {/* Back button for multi-step */}
-        {step !== 'login' && step !== 'register' && (
+        {step !== 'login' && (
           <button
             type="button"
             onClick={handleBack}
@@ -340,148 +308,61 @@ function AuthPageInner() {
           </button>
         )}
 
-        {/* Step: Login / Register tabs */}
-        {(step === 'login' || step === 'register') && (
-          <>
-            <div className="flex rounded-lg bg-dark-800 p-1 mb-6">
-              <button
-                type="button"
-                onClick={() => { setStep('login'); setError(''); }}
-                className={`flex-1 py-2 text-sm font-medium rounded-md transition-colors ${step === 'login' ? 'bg-primary-500 text-white' : 'text-dark-400 hover:text-white'}`}
-              >
-                Login
-              </button>
-              <button
-                type="button"
-                onClick={() => { setStep('register'); setError(''); }}
-                className={`flex-1 py-2 text-sm font-medium rounded-md transition-colors ${step === 'register' ? 'bg-primary-500 text-white' : 'text-dark-400 hover:text-white'}`}
-              >
-                Sign Up
-              </button>
+        {/* Step: Login */}
+        {step === 'login' && (
+          <form onSubmit={handleLogin} className="space-y-4">
+            <div>
+              <label htmlFor="login-username" className="block text-sm font-medium text-dark-300 mb-1">Username</label>
+              <input
+                id="login-username"
+                type="text"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                className="w-full px-4 py-3 bg-dark-800 border border-dark-700 rounded-lg text-dark-100 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500/30 transition-all"
+                placeholder="Enter username"
+                autoFocus
+                required
+              />
             </div>
+            <div>
+              <label htmlFor="login-password" className="block text-sm font-medium text-dark-300 mb-1">Password</label>
+              <input
+                id="login-password"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="w-full px-4 py-3 bg-dark-800 border border-dark-700 rounded-lg text-dark-100 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500/30 transition-all"
+                placeholder="Enter password"
+                required
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={loading}
+              className="w-full py-3 bg-primary-500 hover:bg-primary-600 disabled:bg-dark-700 disabled:text-dark-500 text-white rounded-lg font-medium transition-colors"
+            >
+              {loading ? 'Logging in...' : 'Log In'}
+            </button>
 
-            {step === 'login' && (
-              <form onSubmit={handleLogin} className="space-y-4">
-                <div>
-                  <label htmlFor="login-username" className="block text-sm font-medium text-dark-300 mb-1">Username</label>
-                  <input
-                    id="login-username"
-                    type="text"
-                    value={username}
-                    onChange={(e) => setUsername(e.target.value)}
-                    className="w-full px-4 py-3 bg-dark-800 border border-dark-700 rounded-lg text-dark-100 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500/30 transition-all"
-                    placeholder="Enter username"
-                    autoFocus
-                    required
-                  />
-                </div>
-                <div>
-                  <label htmlFor="login-password" className="block text-sm font-medium text-dark-300 mb-1">Password</label>
-                  <input
-                    id="login-password"
-                    type="password"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    className="w-full px-4 py-3 bg-dark-800 border border-dark-700 rounded-lg text-dark-100 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500/30 transition-all"
-                    placeholder="Enter password"
-                    required
-                  />
+            {KAKAO_REST_KEY && (
+              <>
+                <div className="relative my-4">
+                  <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-dark-700" /></div>
+                  <div className="relative flex justify-center text-sm"><span className="px-3 bg-dark-900 text-dark-500">or</span></div>
                 </div>
                 <button
-                  type="submit"
-                  disabled={loading}
-                  className="w-full py-3 bg-primary-500 hover:bg-primary-600 disabled:bg-dark-700 disabled:text-dark-500 text-white rounded-lg font-medium transition-colors"
+                  type="button"
+                  onClick={handleKakaoLogin}
+                  className="w-full py-3 bg-[#FEE500] hover:bg-[#F5DC00] text-[#000000D9] rounded-lg font-medium transition-colors flex items-center justify-center gap-2"
                 >
-                  {loading ? 'Logging in...' : 'Log In'}
+                  <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+                    <path d="M9 0.5C4.03 0.5 0 3.72 0 7.71C0 10.25 1.56 12.5 3.93 13.82L2.93 17.18C2.87 17.4 2.95 17.48 3.14 17.36L7.07 14.83C7.69 14.92 8.33 14.97 9 14.97C13.97 14.97 18 11.7 18 7.71C18 3.72 13.97 0.5 9 0.5Z" fill="#000000D9"/>
+                  </svg>
+                  Kakao Login
                 </button>
-
-                {KAKAO_REST_KEY && (
-                  <>
-                    <div className="relative my-4">
-                      <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-dark-700" /></div>
-                      <div className="relative flex justify-center text-sm"><span className="px-3 bg-dark-900 text-dark-500">or</span></div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={handleKakaoLogin}
-                      className="w-full py-3 bg-[#FEE500] hover:bg-[#F5DC00] text-[#000000D9] rounded-lg font-medium transition-colors flex items-center justify-center gap-2"
-                    >
-                      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
-                        <path d="M9 0.5C4.03 0.5 0 3.72 0 7.71C0 10.25 1.56 12.5 3.93 13.82L2.93 17.18C2.87 17.4 2.95 17.48 3.14 17.36L7.07 14.83C7.69 14.92 8.33 14.97 9 14.97C13.97 14.97 18 11.7 18 7.71C18 3.72 13.97 0.5 9 0.5Z" fill="#000000D9"/>
-                      </svg>
-                      Kakao Login
-                    </button>
-                  </>
-                )}
-              </form>
+              </>
             )}
-
-            {step === 'register' && (
-              <form onSubmit={handleRegister} className="space-y-4">
-                <div>
-                  <label htmlFor="reg-username" className="block text-sm font-medium text-dark-300 mb-1">Username</label>
-                  <input
-                    id="reg-username"
-                    type="text"
-                    value={username}
-                    onChange={(e) => setUsername(e.target.value)}
-                    className="w-full px-4 py-3 bg-dark-800 border border-dark-700 rounded-lg text-dark-100 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500/30 transition-all"
-                    placeholder="Choose a username"
-                    autoFocus
-                    required
-                  />
-                </div>
-                <div>
-                  <label htmlFor="reg-email" className="block text-sm font-medium text-dark-300 mb-1">
-                    Email <span className="text-red-400">*</span>
-                  </label>
-                  <input
-                    id="reg-email"
-                    type="email"
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    className="w-full px-4 py-3 bg-dark-800 border border-dark-700 rounded-lg text-dark-100 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500/30 transition-all"
-                    placeholder="your@email.com"
-                    required
-                  />
-                  <p className="text-xs text-dark-500 mt-1">Used for email verification during web chat login</p>
-                </div>
-                <div>
-                  <label htmlFor="reg-password" className="block text-sm font-medium text-dark-300 mb-1">Password</label>
-                  <input
-                    id="reg-password"
-                    type="password"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    className="w-full px-4 py-3 bg-dark-800 border border-dark-700 rounded-lg text-dark-100 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500/30 transition-all"
-                    placeholder="At least 8 characters"
-                    minLength={8}
-                    required
-                  />
-                </div>
-                <div>
-                  <label htmlFor="reg-confirm" className="block text-sm font-medium text-dark-300 mb-1">Confirm Password</label>
-                  <input
-                    id="reg-confirm"
-                    type="password"
-                    value={confirmPassword}
-                    onChange={(e) => setConfirmPassword(e.target.value)}
-                    className="w-full px-4 py-3 bg-dark-800 border border-dark-700 rounded-lg text-dark-100 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500/30 transition-all"
-                    placeholder="Re-enter password"
-                    minLength={8}
-                    required
-                  />
-                </div>
-                <button
-                  type="submit"
-                  disabled={loading}
-                  className="w-full py-3 bg-primary-500 hover:bg-primary-600 disabled:bg-dark-700 disabled:text-dark-500 text-white rounded-lg font-medium transition-colors"
-                >
-                  {loading ? 'Creating account...' : 'Create Account'}
-                </button>
-              </form>
-            )}
-          </>
+          </form>
         )}
 
         {/* Step: Device Selection */}
@@ -650,6 +531,46 @@ function AuthPageInner() {
           </Link>
         </div>
       </div>
+
+      {/* App Guide Modal */}
+      {showAppGuideModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-dark-950/80 backdrop-blur-sm animate-fade-in">
+          <div className="w-full max-w-md mx-4 rounded-2xl border border-dark-700 bg-dark-900 p-6 shadow-2xl">
+            <div className="text-center mb-6">
+              <div className="flex h-14 w-14 mx-auto items-center justify-center rounded-2xl bg-yellow-500/10 border border-yellow-500/20 mb-4">
+                <svg className="h-7 w-7 text-yellow-400" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+                </svg>
+              </div>
+              <h3 className="text-lg font-semibold text-dark-50 mb-2">
+                {"회원정보를 찾을 수 없습니다"}
+              </h3>
+              <p className="text-sm text-dark-400 leading-relaxed">
+                {"먼저 MoA 앱을 다운로드 받아 설치한 후 회원가입을 해주신 후에 로그인이 가능합니다."}
+              </p>
+            </div>
+
+            <div className="flex flex-col gap-3">
+              <Link
+                href="/download"
+                className="w-full py-3 bg-primary-500 hover:bg-primary-600 text-white rounded-lg font-medium transition-colors text-center text-sm flex items-center justify-center gap-2"
+              >
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+                </svg>
+                {"MoA 앱 다운로드"}
+              </Link>
+              <button
+                type="button"
+                onClick={() => { setShowAppGuideModal(false); setError(''); }}
+                className="w-full py-3 border border-dark-600 bg-dark-800 text-dark-200 hover:border-dark-500 hover:bg-dark-700 rounded-lg font-medium transition-colors text-sm"
+              >
+                {"닫기"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
