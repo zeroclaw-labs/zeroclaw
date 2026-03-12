@@ -261,7 +261,7 @@ export default function HomePage() {
 
             {/* CTA Buttons */}
             <div className="mt-10 flex flex-col items-center justify-center gap-4 sm:flex-row animate-fade-in-up">
-              <Link href="/chat" className="btn-primary px-8 py-3.5 text-base glow-primary">
+              <Link href="/auth?redirect=/chat" className="btn-primary px-8 py-3.5 text-base glow-primary">
                 {"\uC6F9\uC5D0\uC11C \uBC14\uB85C \uC2DC\uC791"}
                 <svg className="ml-2 h-4 w-4" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" />
@@ -642,7 +642,7 @@ export default function HomePage() {
                 {"\uB610\uB294 \uCE74\uCE74\uC624\uD1A1\uC73C\uB85C \uBC14\uB85C \uB300\uD654\uB97C \uC2DC\uC791\uD558\uC138\uC694. \uC571 \uC124\uCE58\uAC00 \uD544\uC694 \uC5C6\uC2B5\uB2C8\uB2E4."}
               </p>
               <div className="mt-8 flex flex-col items-center justify-center gap-4 sm:flex-row">
-                <Link href="/chat" className="btn-primary px-8 py-3.5 text-base glow-primary">
+                <Link href="/auth?redirect=/chat" className="btn-primary px-8 py-3.5 text-base glow-primary">
                   {"\uC6F9\uC5D0\uC11C \uCC44\uD305 \uC2DC\uC791"}
                   <svg className="ml-2 h-4 w-4" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" />
