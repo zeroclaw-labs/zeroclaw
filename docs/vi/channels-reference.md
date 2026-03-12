@@ -142,12 +142,14 @@ stream_mode = "off"               # tùy chọn: off | partial
 draft_update_interval_ms = 1000   # tùy chọn: giới hạn tần suất chỉnh sửa khi streaming một phần
 mention_only = false              # tùy chọn: yêu cầu @mention trong nhóm
 interrupt_on_new_message = false  # tùy chọn: hủy yêu cầu đang xử lý cùng người gửi cùng chat
+ack_reaction = true               # tùy chọn: gửi emoji phản hồi ngẫu nhiên khi nhận tin nhắn
 ```
 
 Lưu ý về Telegram:
 
 - `interrupt_on_new_message = true` giữ lại các lượt người dùng bị gián đoạn trong lịch sử hội thoại, sau đó khởi động lại việc tạo nội dung với tin nhắn mới nhất.
 - Phạm vi gián đoạn rất chặt chẽ: cùng người gửi trong cùng chat. Tin nhắn từ các chat khác nhau được xử lý độc lập.
+- `ack_reaction = false` tắt phản hồi emoji ngẫu nhiên mà bot thêm vào để xác nhận đã nhận tin nhắn.
 
 ### 4.2 Discord
 

@@ -83,6 +83,7 @@ Operational note for container users:
 | `tool_dispatcher` | `auto` | Tool dispatch strategy |
 | `tool_call_dedup_exempt` | `[]` | Tool names exempt from within-turn duplicate-call suppression |
 | `tool_filter_groups` | `[]` | Per-turn MCP tool schema filter groups (see below) |
+| `show_tool_calls` | `true` | Send live 🔧 tool-call notifications as threaded messages in non-CLI channels |
 
 Notes:
 
@@ -91,6 +92,7 @@ Notes:
 - In CLI, gateway, and channel tool loops, multiple independent tool calls are executed concurrently by default when the pending calls do not require approval gating; result order remains stable.
 - `parallel_tools` applies to the `Agent::turn()` API surface. It does not gate the runtime loop used by CLI, gateway, or channel handlers.
 - `tool_call_dedup_exempt` accepts an array of exact tool names. Tools listed here are allowed to be called multiple times with identical arguments in the same turn, bypassing the dedup check. Example: `tool_call_dedup_exempt = ["browser"]`.
+- `show_tool_calls = false` suppresses the live 🔧 tool-call notification messages that are sent as threaded replies in Telegram, Discord, Slack, and other non-CLI channels. CLI output is never affected.
 
 ### `tool_filter_groups`
 

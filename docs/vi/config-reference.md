@@ -71,6 +71,7 @@ Lưu ý cho người dùng container:
 | `parallel_tools` | `false` | Bật thực thi tool song song trong một lượt |
 | `tool_dispatcher` | `auto` | Chiến lược dispatch tool |
 | `tool_call_dedup_exempt` | `[]` | Tên tool được miễn kiểm tra trùng lặp trong cùng một lượt |
+| `show_tool_calls` | `true` | Gửi thông báo 🔧 tool-call trực tiếp dạng tin nhắn thread trong các kênh không phải CLI |
 
 Lưu ý:
 
@@ -79,6 +80,7 @@ Lưu ý:
 - Trong vòng lặp tool của CLI, gateway và channel, các lời gọi tool độc lập được thực thi đồng thời mặc định khi không cần phê duyệt; thứ tự kết quả giữ ổn định.
 - `parallel_tools` áp dụng cho API `Agent::turn()`. Không ảnh hưởng đến vòng lặp runtime của CLI, gateway hay channel.
 - `tool_call_dedup_exempt` nhận mảng tên tool chính xác. Các tool trong danh sách được phép gọi nhiều lần với cùng tham số trong một lượt. Ví dụ: `tool_call_dedup_exempt = ["browser"]`.
+- `show_tool_calls = false` tắt thông báo 🔧 tool-call trực tiếp gửi dạng reply thread trong Telegram, Discord, Slack và các kênh không phải CLI. CLI không bị ảnh hưởng.
 
 ## `[agents.<name>]`
 
