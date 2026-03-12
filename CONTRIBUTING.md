@@ -2,6 +2,21 @@
 
 Thanks for your interest in contributing to ZeroClaw! This guide will help you get started.
 
+## Branching Model
+
+> **Important — `master` is the default branch.**
+>
+> ZeroClaw uses **`master`** as its single source-of-truth branch. The `main` branch has been removed.
+>
+> Previously, some documentation and scripts referenced a `main` branch, which caused 404 errors and contributor confusion (see [#2929](https://github.com/zeroclaw-labs/zeroclaw/issues/2929), [#3061](https://github.com/zeroclaw-labs/zeroclaw/issues/3061), [#3194](https://github.com/zeroclaw-labs/zeroclaw/pull/3194)). As of March 2026, all references have been corrected and the `main` branch deleted.
+>
+> **How contributors should work:**
+> 1. Fork the repository
+> 2. Create a `feat/*` or `fix/*` branch from `master`
+> 3. Open a PR targeting `master`
+>
+> Do **not** create or push to a `main` branch.
+
 ## First-Time Contributors
 
 Welcome — contributions of all sizes are valued. If this is your first contribution, here is how to get started:
@@ -15,7 +30,7 @@ Welcome — contributions of all sizes are valued. If this is your first contrib
 
 3. **Follow the fork → branch → change → test → PR workflow:**
    - Fork the repository and clone your fork
-   - Create a feature branch (`git checkout -b fix/my-change`)
+   - Create a feature branch (`git checkout -b feat/my-change` or `git checkout -b fix/my-change`)
    - Make your changes and run `cargo fmt && cargo clippy && cargo test`
    - Open a PR against `master` using the PR template
 
@@ -544,3 +559,4 @@ Recommended scope keys in commit titles:
 ## License
 
 By contributing, you agree that your contributions will be licensed under the MIT License.
+# Contributing Guide Update

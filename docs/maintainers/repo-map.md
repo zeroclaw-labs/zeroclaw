@@ -43,7 +43,7 @@ zeroclaw/
 ├── crates/robot-kit/     # Separate crate for hardware robot kit
 ├── tests/                # Integration/E2E tests
 ├── benches/              # Benchmarks (agent loop)
-├── examples/             # Extension examples (custom provider/channel/tool/memory)
+├── docs/contributing/extension-examples.md  # Extension examples (custom provider/channel/tool/memory)
 ├── firmware/             # Embedded firmware for Arduino, ESP32, Nucleo boards
 ├── web/                  # Web UI (Vite + TypeScript)
 ├── python/               # Python SDK / tools bridge
@@ -197,7 +197,7 @@ Sandboxing: `bubblewrap.rs`, `firejail.rs`, `landlock.rs`, `docker.rs`, `detect.
 | `crates/robot-kit/` | Separate Rust crate for hardware robot kit functionality |
 | `tests/` | Integration and E2E tests (agent loop, config persistence, channel routing, provider resolution, webhook security) |
 | `benches/` | Performance benchmarks (`agent_benchmarks.rs`) |
-| `examples/` | Extension examples: `custom_channel.rs`, `custom_memory.rs`, `custom_provider.rs`, `custom_tool.rs` |
+| `docs/contributing/extension-examples.md` | Extension examples for custom providers, channels, tools, and memory backends |
 | `firmware/` | Embedded firmware: `arduino/`, `esp32/`, `esp32-ui/`, `nucleo/`, `uno-q-bridge/` |
 | `web/` | Web UI frontend (Vite + TypeScript) |
 | `python/` | Python SDK / tools bridge with its own tests |

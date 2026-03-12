@@ -221,7 +221,7 @@ Halimbawa ng sample (macOS arm64, nasukat noong Pebrero 18, 2026):
 Ang `bootstrap.sh` script ay nag-i-install ng Rust, nagi-clone ng ZeroClaw, nagi-compile, at nagse-set up ng iyong paunang development environment:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/bootstrap.sh | bash
 ```
 
 Ito ay:
