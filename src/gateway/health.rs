@@ -84,10 +84,6 @@ pub async fn handle_readiness(State(_state): State<AppState>) -> impl IntoRespon
                 has_error = true;
                 "unhealthy"
             }
-            "starting" => {
-                has_degraded = true;
-                "degraded"
-            }
             _ => {
                 has_degraded = true;
                 "degraded"
@@ -109,9 +105,7 @@ pub async fn handle_readiness(State(_state): State<AppState>) -> impl IntoRespon
     } else {
         "ok"
     };
-    let status_code = if has_error {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else if has_degraded {
+    let status_code = if has_error || has_degraded {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK

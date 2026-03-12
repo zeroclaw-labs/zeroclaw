@@ -4,6 +4,7 @@
 //! with Prometheus text format export. No heavy dependencies required.
 
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -125,29 +126,33 @@ impl MetricsRegistry {
         let mut buf = String::with_capacity(1024);
 
         // Uptime gauge
-        buf.push_str(&format!(
-            "# HELP {prefix}_uptime_seconds Process uptime in seconds\n",
+        let _ = writeln!(
+            buf,
+            "# HELP {prefix}_uptime_seconds Process uptime in seconds",
             prefix = self.prefix,
-        ));
-        buf.push_str(&format!(
-            "# TYPE {prefix}_uptime_seconds gauge\n",
+        );
+        let _ = writeln!(
+            buf,
+            "# TYPE {prefix}_uptime_seconds gauge",
             prefix = self.prefix,
-        ));
-        buf.push_str(&format!(
-            "{prefix}_uptime_seconds {value}\n",
+        );
+        let _ = writeln!(
+            buf,
+            "{prefix}_uptime_seconds {value}",
             prefix = self.prefix,
             value = self.uptime_secs(),
-        ));
+        );
 
         for (name, metric) in &self.metrics {
             let full_name = format!("{}_{}", self.prefix, name);
             let value = metric.value.load(Ordering::Relaxed);
-            buf.push_str(&format!("# HELP {full_name} {help}\n", help = metric.help));
-            buf.push_str(&format!(
-                "# TYPE {full_name} {ty}\n",
+            let _ = writeln!(buf, "# HELP {full_name} {help}", help = metric.help);
+            let _ = writeln!(
+                buf,
+                "# TYPE {full_name} {ty}",
                 ty = metric.metric_type.as_str()
-            ));
-            buf.push_str(&format!("{full_name} {value}\n"));
+            );
+            let _ = writeln!(buf, "{full_name} {value}");
         }
 
         buf
