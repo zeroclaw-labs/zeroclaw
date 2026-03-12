@@ -283,6 +283,10 @@ pub struct DelegateAgentConfig {
     /// Maximum tool-call iterations in agentic mode.
     #[serde(default = "default_max_tool_iterations")]
     pub max_iterations: usize,
+    /// Optional skills directory path (relative to workspace root) for scoped skill loading.
+    /// When unset or empty, the sub-agent falls back to the default workspace `skills/` directory.
+    #[serde(default)]
+    pub skills_directory: Option<String>,
 }
 
 /// Valid temperature range for all paths (config, CLI, env override).
@@ -6052,6 +6056,7 @@ tool_dispatcher = "xml"
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                skills_directory: None,
             },
         );
 

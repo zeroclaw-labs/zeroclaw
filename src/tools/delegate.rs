@@ -1,5 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::agent::loop_::run_tool_call_loop;
+use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::DelegateAgentConfig;
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
@@ -8,6 +9,7 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,6 +35,8 @@ pub struct DelegateTool {
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
+    /// Workspace directory inherited from the root agent context.
+    workspace_dir: PathBuf,
 }
 
 impl DelegateTool {
@@ -63,6 +67,7 @@ impl DelegateTool {
             depth: 0,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
+            workspace_dir: PathBuf::new(),
         }
     }
 
@@ -99,6 +104,7 @@ impl DelegateTool {
             depth,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
+            workspace_dir: PathBuf::new(),
         }
     }
 
@@ -111,6 +117,12 @@ impl DelegateTool {
     /// Attach multimodal configuration for sub-agent tool loops.
     pub fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
         self.multimodal_config = config;
+        self
+    }
+
+    /// Attach the workspace directory for system prompt enrichment.
+    pub fn with_workspace_dir(mut self, workspace_dir: PathBuf) -> Self {
+        self.workspace_dir = workspace_dir;
         self
     }
 }
@@ -288,11 +300,16 @@ impl Tool for DelegateTool {
                 .await;
         }
 
+        // Build enriched system prompt for non-agentic sub-agent.
+        let enriched_system_prompt =
+            self.build_enriched_system_prompt(agent_config, &[], &self.workspace_dir);
+        let system_prompt_ref = enriched_system_prompt.as_deref();
+
         // Wrap the provider call in a timeout to prevent indefinite blocking
         let result = tokio::time::timeout(
             Duration::from_secs(DELEGATE_TIMEOUT_SECS),
             provider.chat_with_system(
-                agent_config.system_prompt.as_deref(),
+                system_prompt_ref,
                 &full_prompt,
                 &agent_config.model,
                 temperature,
@@ -340,6 +357,77 @@ impl Tool for DelegateTool {
 }
 
 impl DelegateTool {
+    /// Build an enriched system prompt for a sub-agent by composing structured
+    /// operational sections (tools, skills, workspace, datetime, shell policy)
+    /// with the operator-configured `system_prompt` string.
+    fn build_enriched_system_prompt(
+        &self,
+        agent_config: &DelegateAgentConfig,
+        sub_tools: &[Box<dyn Tool>],
+        workspace_dir: &Path,
+    ) -> Option<String> {
+        // Resolve skills directory: scoped if configured, otherwise workspace default.
+        let skills_dir = agent_config
+            .skills_directory
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|dir| workspace_dir.join(dir))
+            .unwrap_or_else(|| crate::skills::skills_dir(workspace_dir));
+        let skills = crate::skills::load_skills_from_directory(&skills_dir);
+
+        // Determine shell policy instructions when the `shell` tool is in the
+        // effective tool list.
+        let has_shell = sub_tools.iter().any(|t| t.name() == "shell");
+        let shell_policy = if has_shell {
+            "## Shell Policy\n\n\
+             - Prefer non-destructive commands. Use `trash` over `rm` where possible.\n\
+             - Do not run commands that exfiltrate data or modify system-critical paths.\n\
+             - Avoid interactive commands that block on stdin.\n\
+             - Quote paths that may contain spaces."
+                .to_string()
+        } else {
+            String::new()
+        };
+
+        // Build structured operational context using SystemPromptBuilder sections.
+        let ctx = PromptContext {
+            workspace_dir,
+            model_name: &agent_config.model,
+            tools: sub_tools,
+            skills: &skills,
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+        };
+
+        let builder = SystemPromptBuilder::default()
+            .add_section(Box::new(crate::agent::prompt::ToolsSection))
+            .add_section(Box::new(crate::agent::prompt::SafetySection))
+            .add_section(Box::new(crate::agent::prompt::SkillsSection))
+            .add_section(Box::new(crate::agent::prompt::WorkspaceSection))
+            .add_section(Box::new(crate::agent::prompt::DateTimeSection));
+
+        let mut enriched = builder.build(&ctx).unwrap_or_default();
+
+        if !shell_policy.is_empty() {
+            enriched.push_str(&shell_policy);
+            enriched.push_str("\n\n");
+        }
+
+        // Append the operator-configured system_prompt as the identity/role block.
+        if let Some(operator_prompt) = agent_config.system_prompt.as_ref() {
+            enriched.push_str(operator_prompt);
+            enriched.push('\n');
+        }
+
+        let trimmed = enriched.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+
     async fn execute_agentic(
         &self,
         agent_name: &str,
@@ -384,8 +472,12 @@ impl DelegateTool {
             });
         }
 
+        // Build enriched system prompt with tools, skills, workspace, datetime context.
+        let enriched_system_prompt =
+            self.build_enriched_system_prompt(agent_config, &sub_tools, &self.workspace_dir);
+
         let mut history = Vec::new();
-        if let Some(system_prompt) = agent_config.system_prompt.as_ref() {
+        if let Some(system_prompt) = enriched_system_prompt.as_ref() {
             history.push(ChatMessage::system(system_prompt.clone()));
         }
         history.push(ChatMessage::user(full_prompt.to_string()));
@@ -519,6 +611,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                skills_directory: None,
             },
         );
         agents.insert(
@@ -533,6 +626,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                skills_directory: None,
             },
         );
         agents
@@ -686,6 +780,7 @@ mod tests {
             agentic: true,
             allowed_tools,
             max_iterations,
+            skills_directory: None,
         }
     }
 
@@ -794,6 +889,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                skills_directory: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -900,6 +996,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                skills_directory: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -935,6 +1032,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                skills_directory: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1098,5 +1196,227 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("provider boom"));
+    }
+
+    #[test]
+    fn enriched_prompt_includes_tools_workspace_datetime() {
+        let config = DelegateAgentConfig {
+            provider: "openrouter".to_string(),
+            model: "test-model".to_string(),
+            system_prompt: Some("You are a code reviewer.".to_string()),
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: true,
+            allowed_tools: vec!["echo_tool".to_string()],
+            max_iterations: 10,
+            skills_directory: None,
+        };
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_enrich_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+
+        let prompt = tool
+            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .unwrap();
+
+        assert!(prompt.contains("## Tools"), "should contain tools section");
+        assert!(prompt.contains("echo_tool"), "should list allowed tools");
+        assert!(
+            prompt.contains("## Workspace"),
+            "should contain workspace section"
+        );
+        assert!(
+            prompt.contains(&workspace.display().to_string()),
+            "should contain workspace path"
+        );
+        assert!(
+            prompt.contains("## Current Date & Time"),
+            "should contain datetime section"
+        );
+        assert!(
+            prompt.contains("You are a code reviewer."),
+            "should append operator system_prompt"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn enriched_prompt_includes_shell_policy_when_shell_present() {
+        let config = DelegateAgentConfig {
+            provider: "openrouter".to_string(),
+            model: "test-model".to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: true,
+            allowed_tools: vec!["shell".to_string()],
+            max_iterations: 10,
+            skills_directory: None,
+        };
+
+        struct MockShellTool;
+        #[async_trait]
+        impl Tool for MockShellTool {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                "Execute shell commands"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: String::new(),
+                    error: None,
+                })
+            }
+        }
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockShellTool)];
+        let workspace = std::env::temp_dir();
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.to_path_buf());
+
+        let prompt = tool
+            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .unwrap();
+
+        assert!(
+            prompt.contains("## Shell Policy"),
+            "should contain shell policy when shell tool is present"
+        );
+    }
+
+    #[test]
+    fn enriched_prompt_omits_shell_policy_without_shell_tool() {
+        let config = DelegateAgentConfig {
+            provider: "openrouter".to_string(),
+            model: "test-model".to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: true,
+            allowed_tools: vec!["echo_tool".to_string()],
+            max_iterations: 10,
+            skills_directory: None,
+        };
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+        let workspace = std::env::temp_dir();
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.to_path_buf());
+
+        let prompt = tool
+            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .unwrap();
+
+        assert!(
+            !prompt.contains("## Shell Policy"),
+            "should not contain shell policy when shell tool is absent"
+        );
+    }
+
+    #[test]
+    fn enriched_prompt_loads_skills_from_scoped_directory() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_skills_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let scoped_skills_dir = workspace.join("skills/code-review");
+        std::fs::create_dir_all(scoped_skills_dir.join("lint-check")).unwrap();
+        std::fs::write(
+            scoped_skills_dir.join("lint-check/SKILL.toml"),
+            "[skill]\nname = \"lint-check\"\ndescription = \"Run lint checks\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+
+        let config = DelegateAgentConfig {
+            provider: "openrouter".to_string(),
+            model: "test-model".to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: true,
+            allowed_tools: vec!["echo_tool".to_string()],
+            max_iterations: 10,
+            skills_directory: Some("skills/code-review".to_string()),
+        };
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+
+        let prompt = tool
+            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .unwrap();
+
+        assert!(
+            prompt.contains("lint-check"),
+            "should contain skills from scoped directory"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn enriched_prompt_falls_back_to_default_skills_dir() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_fallback_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let default_skills_dir = workspace.join("skills");
+        std::fs::create_dir_all(default_skills_dir.join("deploy")).unwrap();
+        std::fs::write(
+            default_skills_dir.join("deploy/SKILL.toml"),
+            "[skill]\nname = \"deploy\"\ndescription = \"Deploy safely\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+
+        let config = DelegateAgentConfig {
+            provider: "openrouter".to_string(),
+            model: "test-model".to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: true,
+            allowed_tools: vec!["echo_tool".to_string()],
+            max_iterations: 10,
+            skills_directory: None,
+        };
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+
+        let prompt = tool
+            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .unwrap();
+
+        assert!(
+            prompt.contains("deploy"),
+            "should contain skills from default workspace skills/ directory"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }

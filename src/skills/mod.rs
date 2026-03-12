@@ -107,7 +107,7 @@ fn load_workspace_skills(workspace_dir: &Path) -> Vec<Skill> {
     load_skills_from_directory(&skills_dir)
 }
 
-fn load_skills_from_directory(skills_dir: &Path) -> Vec<Skill> {
+pub fn load_skills_from_directory(skills_dir: &Path) -> Vec<Skill> {
     if !skills_dir.exists() {
         return Vec::new();
     }
