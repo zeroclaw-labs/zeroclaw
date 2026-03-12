@@ -38,8 +38,8 @@ struct FailedAttemptState {
 /// Bearer tokens are stored as SHA-256 hashes to prevent plaintext exposure
 /// in config files. When a new token is generated, the plaintext is returned
 /// to the client once, and only the hash is retained.
-    #[derive(Debug, Clone)]
-    pub struct PairingGuard {
+#[derive(Debug, Clone)]
+pub struct PairingGuard {
     /// Whether pairing is required at all.
     require_pairing: bool,
     /// One-time pairing code (generated on startup, consumed on first pair).
