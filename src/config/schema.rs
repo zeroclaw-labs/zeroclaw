@@ -8256,8 +8256,7 @@ require_otp_to_resume = true
         // Simulate a full load: deserialize then decrypt (mirrors load_or_init logic)
         let mut loaded: Config = toml::from_str(&raw_toml).unwrap();
         loaded.config_path = dir.join("config.toml");
-        let load_store =
-            crate::security::SecretStore::new(&dir, loaded.secrets.encrypt);
+        let load_store = crate::security::SecretStore::new(&dir, loaded.secrets.encrypt);
         if let Some(ref mut tg) = loaded.channels_config.telegram {
             decrypt_secret(
                 &load_store,
