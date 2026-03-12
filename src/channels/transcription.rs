@@ -239,7 +239,7 @@ mod tests {
     fn transcription_form_fields_skip_blank_optional_values() {
         let config = TranscriptionConfig {
             language: Some("   ".into()),
-            initial_prompt: Some("".into()),
+            initial_prompt: Some(String::new()),
             ..TranscriptionConfig::default()
         };
 
