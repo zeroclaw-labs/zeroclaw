@@ -3,6 +3,8 @@ import { Send, Bot, User, AlertCircle, Copy, Check } from 'lucide-react';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
 
+const AGENT_DRAFT_STORAGE_KEY = 'zeroclaw_agent_chat_draft';
+
 interface ChatMessage {
   id: string;
   role: 'user' | 'agent';
@@ -12,7 +14,12 @@ interface ChatMessage {
 
 export default function AgentChat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [input, setInput] = useState('');
+  const [input, setInput] = useState(() => {
+    if (typeof window === 'undefined') {
+      return '';
+    }
+    return window.sessionStorage.getItem(AGENT_DRAFT_STORAGE_KEY) ?? '';
+  });
   const [typing, setTyping] = useState(false);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -116,6 +123,25 @@ export default function AgentChat() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, typing]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    if (input) {
+      window.sessionStorage.setItem(AGENT_DRAFT_STORAGE_KEY, input);
+    } else {
+      window.sessionStorage.removeItem(AGENT_DRAFT_STORAGE_KEY);
+    }
+  }, [input]);
+
+  useEffect(() => {
+    if (!inputRef.current || !input) {
+      return;
+    }
+    inputRef.current.style.height = 'auto';
+    inputRef.current.style.height = `${Math.min(inputRef.current.scrollHeight, 200)}px`;
+  }, [input]);
 
   const handleSend = () => {
     const trimmed = input.trim();
