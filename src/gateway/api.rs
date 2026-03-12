@@ -257,7 +257,13 @@ pub async fn handle_api_cron_add(
         tz: None,
     };
 
-    match crate::cron::add_shell_job(&config, body.name, schedule, &body.command) {
+    match crate::cron::add_shell_job_with_approval(
+        &config,
+        body.name,
+        schedule,
+        &body.command,
+        false,
+    ) {
         Ok(job) => Json(serde_json::json!({
             "status": "ok",
             "job": {
