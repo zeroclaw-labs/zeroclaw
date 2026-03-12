@@ -60,7 +60,7 @@ Harvard, MIT ve Sundai.Club topluluklarının öğrencileri ve üyeleri tarafın
 
 <p align="center">
   <a href="#hızlı-başlangıç">Hızlı Başlangıç</a> |
-  <a href="bootstrap.sh">Tek Tıklama Kurulumu</a> |
+  <a href="install.sh">Tek Tıklama Kurulumu</a> |
   <a href="docs/README.md">Dokümantasyon Merkezi</a> |
   <a href="docs/SUMMARY.md">Dokümantasyon İçindekiler</a>
 </p>
@@ -218,10 +218,10 @@ ls -lh target/release/zeroclaw
 
 ### Seçenek 1: Otomatik kurulum (önerilen)
 
-`bootstrap.sh` betiği Rust'u yükler, ZeroClaw'ı klonlar, derler ve ilk geliştirme ortamınızı ayarlar:
+`install.sh` betiği Rust'u yükler, ZeroClaw'ı klonlar, derler ve ilk geliştirme ortamınızı ayarlar:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
 Bu işlem:

@@ -60,7 +60,7 @@
 
 <p align="center" dir="rtl">
   <a href="#البدء-السريع">البدء السريع</a> |
-  <a href="bootstrap.sh">الإعداد بنقرة واحدة</a> |
+  <a href="install.sh">الإعداد بنقرة واحدة</a> |
   <a href="docs/README.md">مركز التوثيق</a> |
   <a href="docs/SUMMARY.md">فهرس التوثيق</a>
 </p>
@@ -218,10 +218,10 @@ ls -lh target/release/zeroclaw
 
 ### الخيار 1: الإعداد الآلي (موصى به)
 
-يقوم نص `bootstrap.sh` بتثبيت Rust ونسخ ZeroClaw وتجميعه وإعداد بيئة التطوير الأولية الخاصة بك:
+يقوم نص `install.sh` بتثبيت Rust ونسخ ZeroClaw وتجميعه وإعداد بيئة التطوير الأولية الخاصة بك:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
 سيقوم هذا بـ:

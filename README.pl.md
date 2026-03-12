@@ -60,7 +60,7 @@ Zbudowany przez studentów i członków społeczności Harvard, MIT i Sundai.Clu
 
 <p align="center">
   <a href="#szybki-start">Szybki Start</a> |
-  <a href="bootstrap.sh">Konfiguracja Jednym Kliknięciem</a> |
+  <a href="install.sh">Konfiguracja Jednym Kliknięciem</a> |
   <a href="docs/README.md">Centrum Dokumentacji</a> |
   <a href="docs/SUMMARY.md">Spis Treści Dokumentacji</a>
 </p>
@@ -218,10 +218,10 @@ Przykładowa próbka (macOS arm64, zmierzone 18 lutego 2026):
 
 ### Opcja 1: Automatyczna konfiguracja (zalecana)
 
-Skrypt `bootstrap.sh` instaluje Rust, klonuje ZeroClaw, kompiluje go i konfiguruje twoje początkowe środowisko deweloperskie:
+Skrypt `install.sh` instaluje Rust, klonuje ZeroClaw, kompiluje go i konfiguruje twoje początkowe środowisko deweloperskie:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
 To:

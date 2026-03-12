@@ -60,7 +60,7 @@ Binuo ng mga mag-aaral at miyembro ng Harvard, MIT, at Sundai.Club na komunidad.
 
 <p align="center">
   <a href="#mabilis-na-pagsisimula">Mabilis na Pagsisimula</a> |
-  <a href="bootstrap.sh">One-Click na Setup</a> |
+  <a href="install.sh">One-Click na Setup</a> |
   <a href="docs/README.md">Hub ng Dokumentasyon</a> |
   <a href="docs/SUMMARY.md">Talaan ng Nilalaman</a>
 </p>
@@ -218,10 +218,10 @@ Halimbawa ng sample (macOS arm64, nasukat noong Pebrero 18, 2026):
 
 ### Option 1: Automated setup (inirerekomenda)
 
-Ang `bootstrap.sh` script ay nag-i-install ng Rust, nagi-clone ng ZeroClaw, nagi-compile, at nagse-set up ng iyong paunang development environment:
+Ang `install.sh` script ay nag-i-install ng Rust, nagi-clone ng ZeroClaw, nagi-compile, at nagse-set up ng iyong paunang development environment:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
 Ito ay:

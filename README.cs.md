@@ -60,7 +60,7 @@ Postaveno studenty a členy komunit Harvard, MIT a Sundai.Club.
 
 <p align="center">
   <a href="#rychlý-start">Rychlý Start</a> |
-  <a href="bootstrap.sh">Jedno-klikové nastavení</a> |
+  <a href="install.sh">Jedno-klikové nastavení</a> |
   <a href="docs/README.md">Dokumentační Centrum</a> |
   <a href="docs/SUMMARY.md">Obsah Dokumentace</a>
 </p>
@@ -218,10 +218,10 @@ Ukázková vzorka (macOS arm64, měřeno 18. února 2026):
 
 ### Možnost 1: Automatické nastavení (doporučeno)
 
-Skript `bootstrap.sh` nainstaluje Rust, naklonuje ZeroClaw, zkompiluje ho a nastaví vaše počáteční vývojové prostředí:
+Skript `install.sh` nainstaluje Rust, naklonuje ZeroClaw, zkompiluje ho a nastaví vaše počáteční vývojové prostředí:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
 Toto:

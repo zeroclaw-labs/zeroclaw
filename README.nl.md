@@ -60,7 +60,7 @@ Gebouwd door studenten en leden van de Harvard, MIT en Sundai.Club gemeenschappe
 
 <p align="center">
   <a href="#snelle-start">Snelle Start</a> |
-  <a href="bootstrap.sh">One-Click Setup</a> |
+  <a href="install.sh">One-Click Setup</a> |
   <a href="docs/README.md">Documentatie Hub</a> |
   <a href="docs/SUMMARY.md">Documentatie Inhoudsopgave</a>
 </p>
@@ -218,10 +218,10 @@ Voorbeeld monster (macOS arm64, gemeten op 18 februari 2026):
 
 ### Optie 1: Geautomatiseerde setup (aanbevolen)
 
-Het `bootstrap.sh` script installeert Rust, kloont ZeroClaw, compileert het, en stelt je initiële ontwikkelomgeving in:
+Het `install.sh` script installeert Rust, kloont ZeroClaw, compileert het, en stelt je initiële ontwikkelomgeving in:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
 Dit zal:
