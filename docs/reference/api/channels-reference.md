@@ -156,12 +156,14 @@ stream_mode = "off"               # optional: off | partial
 draft_update_interval_ms = 1000   # optional: edit throttle for partial streaming
 mention_only = false              # optional: require @mention in groups
 interrupt_on_new_message = false  # optional: cancel in-flight same-sender same-chat request
+ack_reaction = true               # optional: send random emoji reaction on message receipt
 ```
 
 Telegram notes:
 
 - `interrupt_on_new_message = true` preserves interrupted user turns in conversation history, then restarts generation on the newest message.
 - Interruption scope is strict: same sender in the same chat. Messages from different chats are processed independently.
+- `ack_reaction = false` disables the automatic random emoji reaction the bot adds to acknowledge receipt of each incoming message.
 
 ### 4.2 Discord
 
