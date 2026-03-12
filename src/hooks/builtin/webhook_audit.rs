@@ -340,6 +340,7 @@ impl HookHandler for WebhookAuditHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::schema::PayloadFormat;
 
     // ── Glob matching tests ──────────────────────────────────────
 
@@ -409,6 +410,7 @@ mod tests {
             tool_patterns: patterns.into_iter().map(String::from).collect(),
             include_args,
             max_args_bytes: 4096,
+            format: PayloadFormat::default(),
         })
     }
 
@@ -512,6 +514,7 @@ mod tests {
             tool_patterns: vec!["Bash".to_string()],
             include_args: false,
             max_args_bytes: 4096,
+            format: PayloadFormat::default(),
         });
         let result = ToolResult {
             success: true,

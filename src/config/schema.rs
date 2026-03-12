@@ -2157,6 +2157,20 @@ pub struct BuiltinHooksConfig {
     pub webhook_audit: WebhookAuditConfig,
 }
 
+/// Payload serialisation format for the webhook-audit hook.
+///
+/// Controls how the audit JSON is shaped before POSTing to the target URL.
+/// New variants can be added to support additional webhook consumers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum PayloadFormat {
+    /// Send the raw structured JSON object (default).
+    #[default]
+    Json,
+    /// Wrap audit data as Slack mrkdwn inside `{"text": "..."}`.
+    Slack,
+}
+
 /// Configuration for the webhook-audit builtin hook.
 ///
 /// Sends an HTTP POST with a JSON body to an external endpoint each time
@@ -2184,6 +2198,12 @@ pub struct WebhookAuditConfig {
     /// Default: `4096`.
     #[serde(default = "default_max_args_bytes")]
     pub max_args_bytes: u64,
+    /// Payload format for the webhook body.
+    ///
+    /// `"json"` (default) sends the raw structured audit object.
+    /// `"slack"` wraps the data as Slack mrkdwn inside `{"text": "..."}`.
+    #[serde(default)]
+    pub format: PayloadFormat,
 }
 
 fn default_max_args_bytes() -> u64 {
@@ -2198,6 +2218,7 @@ impl Default for WebhookAuditConfig {
             tool_patterns: Vec::new(),
             include_args: false,
             max_args_bytes: default_max_args_bytes(),
+            format: PayloadFormat::default(),
         }
     }
 }
@@ -8422,5 +8443,28 @@ require_otp_to_resume = true
             .validate()
             .expect_err("expected ttl validation failure");
         assert!(err.to_string().contains("token_ttl_secs"));
+    }
+
+    #[test]
+    async fn webhook_audit_format_defaults_to_json() {
+        let toml_str = r#"
+            enabled = true
+            url = "https://example.com/hook"
+            tool_patterns = ["Bash"]
+        "#;
+        let config: WebhookAuditConfig = toml::from_str(toml_str).unwrap();
+        assert!(matches!(config.format, PayloadFormat::Json));
+    }
+
+    #[test]
+    async fn webhook_audit_format_parses_slack() {
+        let toml_str = r#"
+            enabled = true
+            url = "https://hooks.slack.com/test"
+            tool_patterns = ["Bash"]
+            format = "slack"
+        "#;
+        let config: WebhookAuditConfig = toml::from_str(toml_str).unwrap();
+        assert!(matches!(config.format, PayloadFormat::Slack));
     }
 }
