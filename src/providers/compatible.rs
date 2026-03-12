@@ -11,10 +11,11 @@ use crate::providers::traits::{
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 use reqwest::{
-    header::{HeaderMap, HeaderValue, USER_AGENT},
+    header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT},
     Client,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// A provider that speaks the OpenAI-compatible chat completions API.
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
@@ -37,6 +38,7 @@ pub struct OpenAiCompatibleProvider {
     /// Whether this provider supports OpenAI-style native tool calling.
     /// When false, tools are injected into the system prompt as text.
     native_tool_calling: bool,
+    default_headers: HashMap<String, String>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -170,7 +172,13 @@ impl OpenAiCompatibleProvider {
             user_agent: user_agent.map(ToString::to_string),
             merge_system_into_user,
             native_tool_calling: !merge_system_into_user,
+            default_headers: HashMap::new(),
         }
+    }
+
+    pub fn with_default_headers(mut self, headers: HashMap<String, String>) -> Self {
+        self.default_headers = headers;
+        self
     }
 
     /// Collect all `system` role messages, concatenate their content,
@@ -205,10 +213,31 @@ impl OpenAiCompatibleProvider {
     }
 
     fn http_client(&self) -> Client {
-        if let Some(ua) = self.user_agent.as_deref() {
+        if self.user_agent.is_some() || !self.default_headers.is_empty() {
             let mut headers = HeaderMap::new();
-            if let Ok(value) = HeaderValue::from_str(ua) {
-                headers.insert(USER_AGENT, value);
+            if let Some(ua) = self.user_agent.as_deref() {
+                if let Ok(value) = HeaderValue::from_str(ua) {
+                    headers.insert(USER_AGENT, value);
+                }
+            }
+
+            for (name, value) in &self.default_headers {
+                match (
+                    HeaderName::from_bytes(name.as_bytes()),
+                    HeaderValue::from_str(value),
+                ) {
+                    (Ok(header_name), Ok(header_value)) => {
+                        headers.insert(header_name, header_value);
+                    }
+                    (Err(error), _) => {
+                        tracing::warn!("Ignoring invalid default header name '{name}': {error}");
+                    }
+                    (_, Err(error)) => {
+                        tracing::warn!(
+                            "Ignoring invalid default header value for '{name}': {error}"
+                        );
+                    }
+                }
             }
 
             let builder = Client::builder()
@@ -219,7 +248,9 @@ impl OpenAiCompatibleProvider {
                 crate::config::apply_runtime_proxy_to_builder(builder, "provider.compatible");
 
             return builder.build().unwrap_or_else(|error| {
-                tracing::warn!("Failed to build proxied timeout client with user-agent: {error}");
+                tracing::warn!(
+                    "Failed to build proxied timeout client with default headers: {error}"
+                );
                 Client::new()
             });
         }
@@ -1704,9 +1735,43 @@ impl Provider for OpenAiCompatibleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
         OpenAiCompatibleProvider::new(name, url, key, AuthStyle::Bearer)
+    }
+
+    #[tokio::test]
+    async fn http_client_includes_default_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/headers"))
+            .and(header("HTTP-Referer", "https://example.com/app"))
+            .and(header("X-App-Name", "ZeroClaw"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider =
+            make_provider("test", &server.uri(), None).with_default_headers(HashMap::from([
+                (
+                    "HTTP-Referer".to_string(),
+                    "https://example.com/app".to_string(),
+                ),
+                ("X-App-Name".to_string(), "ZeroClaw".to_string()),
+            ]));
+
+        let response = provider
+            .http_client()
+            .get(format!("{}/headers", server.uri()))
+            .send()
+            .await
+            .unwrap();
+
+        assert!(response.status().is_success());
     }
 
     #[test]

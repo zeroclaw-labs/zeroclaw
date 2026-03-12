@@ -1,5 +1,5 @@
 use crate::config::traits::ChannelConfig;
-use crate::providers::{is_glm_alias, is_zai_alias};
+use crate::providers::{is_glm_alias, is_zai_alias, ProviderRuntimeOptions};
 use crate::security::{AutonomyLevel, DomainMatcher};
 use anyhow::{Context, Result};
 use directories::UserDirs;
@@ -242,6 +242,9 @@ pub struct ModelProviderConfig {
     /// If true, load OpenAI auth material (OPENAI_API_KEY or ~/.codex/auth.json).
     #[serde(default)]
     pub requires_openai_auth: bool,
+    /// Optional extra HTTP headers to send for this provider profile.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
     /// Azure OpenAI resource name (e.g. "my-resource" in https://my-resource.openai.azure.com).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azure_openai_resource: Option<String>,
@@ -4595,6 +4598,54 @@ impl Config {
             .map(|(name, profile)| (name.clone(), profile.clone()))
     }
 
+    fn active_model_provider_profile(&self) -> Option<&ModelProviderConfig> {
+        let current_provider = self
+            .default_provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        let current_api_url = self
+            .api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.trim_end_matches('/'));
+
+        self.model_providers
+            .iter()
+            .find_map(|(profile_key, profile)| {
+                let key_matches = profile_key.eq_ignore_ascii_case(current_provider);
+                let name_matches = profile
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| value.eq_ignore_ascii_case(current_provider));
+                let base_url_matches =
+                    match (current_api_url, profile.base_url.as_deref().map(str::trim)) {
+                        (Some(current), Some(base_url)) => {
+                            current.eq_ignore_ascii_case(base_url.trim_end_matches('/'))
+                        }
+                        _ => false,
+                    };
+
+                (key_matches || name_matches || base_url_matches).then_some(profile)
+            })
+    }
+
+    pub fn provider_runtime_options(&self) -> ProviderRuntimeOptions {
+        ProviderRuntimeOptions {
+            auth_profile_override: None,
+            provider_api_url: self.api_url.clone(),
+            zeroclaw_dir: self.config_path.parent().map(PathBuf::from),
+            secrets_encrypt: self.secrets.encrypt,
+            reasoning_enabled: self.runtime.reasoning_enabled,
+            default_headers: self
+                .active_model_provider_profile()
+                .map(|profile| profile.headers.clone())
+                .unwrap_or_default(),
+        }
+    }
+
     fn apply_named_model_provider_profile(&mut self) {
         let Some(current_provider) = self.default_provider.clone() else {
             return;
@@ -4799,6 +4850,23 @@ impl Config {
                         "model_providers.{profile_name}.wire_api must be one of: responses, chat_completions"
                     );
                 }
+            }
+
+            for (header_name, header_value) in &profile.headers {
+                let trimmed_name = header_name.trim();
+                if trimmed_name.is_empty() {
+                    anyhow::bail!(
+                        "model_providers.{profile_name}.headers contains an empty header name"
+                    );
+                }
+                reqwest::header::HeaderName::from_bytes(trimmed_name.as_bytes()).with_context(
+                    || format!("model_providers.{profile_name}.headers.{trimmed_name} is not a valid header name"),
+                )?;
+                reqwest::header::HeaderValue::from_str(header_value).with_context(|| {
+                    format!(
+                        "model_providers.{profile_name}.headers.{trimmed_name} is not a valid header value"
+                    )
+                })?;
             }
         }
 
@@ -6994,6 +7062,49 @@ requires_openai_auth = true
             .expect("profile should exist");
         assert_eq!(profile.wire_api.as_deref(), Some("responses"));
         assert!(profile.requires_openai_auth);
+        assert!(profile.headers.is_empty());
+    }
+
+    #[test]
+    async fn provider_runtime_options_include_active_profile_headers() {
+        let mut config = Config::default();
+        config.default_provider = Some("sub2api".to_string());
+        config.api_url = Some("https://api.tonsof.blue/v1/".to_string());
+        config.model_providers.insert(
+            "sub2api".to_string(),
+            ModelProviderConfig {
+                name: Some("custom:https://api.tonsof.blue/v1".to_string()),
+                base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                wire_api: None,
+                requires_openai_auth: false,
+                headers: HashMap::from([
+                    (
+                        "HTTP-Referer".to_string(),
+                        "https://example.com".to_string(),
+                    ),
+                    ("X-App-Name".to_string(), "ZeroClaw".to_string()),
+                ]),
+                azure_openai_resource: None,
+                azure_openai_deployment: None,
+                azure_openai_api_version: None,
+            },
+        );
+
+        let options = config.provider_runtime_options();
+        assert_eq!(
+            options
+                .default_headers
+                .get("HTTP-Referer")
+                .map(String::as_str),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            options
+                .default_headers
+                .get("X-App-Name")
+                .map(String::as_str),
+            Some("ZeroClaw")
+        );
     }
 
     #[test]
@@ -7150,6 +7261,7 @@ requires_openai_auth = true
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
                     wire_api: None,
                     requires_openai_auth: false,
+                    headers: HashMap::new(),
                     azure_openai_resource: None,
                     azure_openai_deployment: None,
                     azure_openai_api_version: None,
@@ -7181,6 +7293,7 @@ requires_openai_auth = true
                     base_url: Some("https://api.tonsof.blue".to_string()),
                     wire_api: Some("responses".to_string()),
                     requires_openai_auth: true,
+                    headers: HashMap::new(),
                     azure_openai_resource: None,
                     azure_openai_deployment: None,
                     azure_openai_api_version: None,
@@ -7246,6 +7359,7 @@ requires_openai_auth = true
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
                     wire_api: Some("ws".to_string()),
                     requires_openai_auth: false,
+                    headers: HashMap::new(),
                     azure_openai_resource: None,
                     azure_openai_deployment: None,
                     azure_openai_api_version: None,
@@ -7258,6 +7372,31 @@ requires_openai_auth = true
         assert!(error
             .to_string()
             .contains("wire_api must be one of: responses, chat_completions"));
+    }
+
+    #[test]
+    async fn validate_rejects_invalid_model_provider_header_name() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some("sub2api".to_string()),
+            model_providers: HashMap::from([(
+                "sub2api".to_string(),
+                ModelProviderConfig {
+                    name: Some("sub2api".to_string()),
+                    base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    wire_api: None,
+                    requires_openai_auth: false,
+                    headers: HashMap::from([("Bad Header".to_string(), "value".to_string())]),
+                    azure_openai_resource: None,
+                    azure_openai_deployment: None,
+                    azure_openai_api_version: None,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        let error = config.validate().expect_err("expected validation failure");
+        assert!(error.to_string().contains("not a valid header name"));
     }
 
     #[test]

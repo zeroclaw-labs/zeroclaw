@@ -3211,13 +3211,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
-    let provider_runtime_options = providers::ProviderRuntimeOptions {
-        auth_profile_override: None,
-        provider_api_url: config.api_url.clone(),
-        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
-        secrets_encrypt: config.secrets.encrypt,
-        reasoning_enabled: config.runtime.reasoning_enabled,
-    };
+    let provider_runtime_options = config.provider_runtime_options();
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(
             &provider_name,

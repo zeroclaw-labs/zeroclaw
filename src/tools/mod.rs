@@ -329,16 +329,7 @@ pub fn all_tools_with_runtime(
             delegate_agents,
             delegate_fallback_credential,
             security.clone(),
-            crate::providers::ProviderRuntimeOptions {
-                auth_profile_override: None,
-                provider_api_url: root_config.api_url.clone(),
-                zeroclaw_dir: root_config
-                    .config_path
-                    .parent()
-                    .map(std::path::PathBuf::from),
-                secrets_encrypt: root_config.secrets.encrypt,
-                reasoning_enabled: root_config.runtime.reasoning_enabled,
-            },
+            root_config.provider_runtime_options(),
         )
         .with_parent_tools(parent_tools)
         .with_multimodal_config(root_config.multimodal.clone());
