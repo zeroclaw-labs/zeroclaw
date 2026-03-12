@@ -265,6 +265,7 @@ pub struct Config {
 ///
 /// When enabled, each client engagement gets an isolated workspace with
 /// separate memory, audit, secrets, and tool restrictions.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkspaceConfig {
     /// Enable workspace isolation. Default: false.

@@ -8,6 +8,7 @@ use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
+use std::fmt::Write;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -80,7 +81,7 @@ impl Tool for WorkspaceTool {
                     } else {
                         ""
                     };
-                    output.push_str(&format!("  - {ws_name}{marker}\n"));
+                    let _ = writeln!(output, "  - {ws_name}{marker}");
                 }
                 Ok(ToolResult {
                     success: true,
@@ -169,29 +170,34 @@ impl Tool for WorkspaceTool {
                         Some(profile) => {
                             let is_active = mgr.active_name() == Some(ws_name);
                             let mut output = format!("Workspace: {}\n", profile.name);
-                            output.push_str(&format!(
-                                "  Status: {}\n",
+                            let _ = writeln!(
+                                output,
+                                "  Status: {}",
                                 if is_active { "active" } else { "inactive" }
-                            ));
-                            output.push_str(&format!(
-                                "  Memory namespace: {}\n",
+                            );
+                            let _ = writeln!(
+                                output,
+                                "  Memory namespace: {}",
                                 profile.effective_memory_namespace()
-                            ));
-                            output.push_str(&format!(
-                                "  Audit namespace: {}\n",
+                            );
+                            let _ = writeln!(
+                                output,
+                                "  Audit namespace: {}",
                                 profile.effective_audit_namespace()
-                            ));
+                            );
                             if !profile.allowed_domains.is_empty() {
-                                output.push_str(&format!(
-                                    "  Allowed domains: {}\n",
+                                let _ = writeln!(
+                                    output,
+                                    "  Allowed domains: {}",
                                     profile.allowed_domains.join(", ")
-                                ));
+                                );
                             }
                             if !profile.tool_restrictions.is_empty() {
-                                output.push_str(&format!(
-                                    "  Restricted tools: {}\n",
+                                let _ = writeln!(
+                                    output,
+                                    "  Restricted tools: {}",
                                     profile.tool_restrictions.join(", ")
-                                ));
+                                );
                             }
                             Ok(ToolResult {
                                 success: true,
