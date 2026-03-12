@@ -70,6 +70,7 @@ pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
 #[allow(unused_imports)]
 pub use tts::{TtsManager, TtsProvider};
+#[allow(unused_imports)]
 pub use voice_loop::{should_reply_as_audio, VoiceLoopConfig};
 pub use wati::WatiChannel;
 pub use wecom::WeComChannel;
