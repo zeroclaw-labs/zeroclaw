@@ -582,23 +582,24 @@ restart_on_crash = false
             max_sessions: 1,
             ..Default::default()
         };
-        let _manager = CliSessionManager::new(config);
+        #[allow(unused_variables)]
+        let manager = CliSessionManager::new(config);
 
         #[cfg(unix)]
         {
-            let id1 = _manager
+            let id1 = manager
                 .get_or_create("limit-cli", "cat", &[])
                 .await
                 .unwrap();
             // The second call for the same CLI should return the existing session,
             // not fail, because get_or_create reuses existing sessions.
-            let id2 = _manager
+            let id2 = manager
                 .get_or_create("limit-cli", "cat", &[])
                 .await
                 .unwrap();
             assert_eq!(id1, id2);
 
-            _manager.kill_all().await.unwrap();
+            manager.kill_all().await.unwrap();
         }
     }
 }
