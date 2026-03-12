@@ -75,6 +75,7 @@ mod tests {
             allowed_users: vec![],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            mention_only: false,
         };
 
         let nextcloud_talk = NextcloudTalkConfig {

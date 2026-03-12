@@ -7207,6 +7207,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            mention_only: false,
         });
         assert!(has_launchable_channels(&channels));
     }
