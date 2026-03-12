@@ -1966,6 +1966,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         &[],
+        &crate::config::PacingConfig::default(),
     )
     .await
 }
@@ -2165,6 +2166,7 @@ pub(crate) async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    pacing: &crate::config::PacingConfig,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2180,6 +2182,14 @@ pub(crate) async fn run_tool_call_loop(
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
+    let loop_started_at = Instant::now();
+    let loop_ignore_tools: HashSet<&str> = pacing
+        .loop_ignore_tools
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let mut consecutive_identical_outputs: usize = 0;
+    let mut last_tool_output_hash: Option<u64> = None;
 
     for iteration in 0..max_iterations {
         if cancellation_token
@@ -2257,13 +2267,43 @@ pub(crate) async fn run_tool_call_loop(
             temperature,
         );
 
-        let chat_result = if let Some(token) = cancellation_token.as_ref() {
-            tokio::select! {
-                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                result = chat_future => result,
+        // Wrap the LLM call with an optional per-step timeout from pacing config.
+        // This catches a truly hung model response without terminating the overall
+        // task loop (the per-message budget handles that separately).
+        let chat_result = match pacing.step_timeout_secs {
+            Some(step_secs) if step_secs > 0 => {
+                let step_timeout = Duration::from_secs(step_secs);
+                if let Some(token) = cancellation_token.as_ref() {
+                    tokio::select! {
+                        () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                        result = tokio::time::timeout(step_timeout, chat_future) => {
+                            match result {
+                                Ok(inner) => inner,
+                                Err(_) => anyhow::bail!(
+                                    "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
+                                ),
+                            }
+                        },
+                    }
+                } else {
+                    match tokio::time::timeout(step_timeout, chat_future).await {
+                        Ok(inner) => inner,
+                        Err(_) => anyhow::bail!(
+                            "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
+                        ),
+                    }
+                }
             }
-        } else {
-            chat_future.await
+            _ => {
+                if let Some(token) = cancellation_token.as_ref() {
+                    tokio::select! {
+                        () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                        result = chat_future => result,
+                    }
+                } else {
+                    chat_future.await
+                }
+            }
         };
 
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
@@ -2707,13 +2747,66 @@ pub(crate) async fn run_tool_call_loop(
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
+        // Collect tool results and build per-tool output for loop detection.
+        // Only non-ignored tool outputs contribute to the identical-output hash.
+        let mut detection_relevant_output = String::new();
         for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
+            if !loop_ignore_tools.contains(tool_name.as_str()) {
+                detection_relevant_output.push_str(&outcome.output);
+            }
             individual_results.push((tool_call_id, outcome.output.clone()));
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
                 tool_name, outcome.output
             );
+        }
+
+        // ── Time-gated loop detection ──────────────────────────
+        // When pacing.loop_detection_min_elapsed_secs is set, identical-output
+        // loop detection activates after the task has been running that long.
+        // This avoids false-positive aborts on long-running browser/research
+        // workflows while keeping aggressive protection for quick tasks.
+        // When not configured, identical-output detection is disabled (preserving
+        // existing behavior where only max_iterations prevents runaway loops).
+        let loop_detection_active = match pacing.loop_detection_min_elapsed_secs {
+            Some(min_secs) => loop_started_at.elapsed() >= Duration::from_secs(min_secs),
+            None => false, // disabled when not configured (backwards compatible)
+        };
+
+        if loop_detection_active && !detection_relevant_output.is_empty() {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            detection_relevant_output.hash(&mut hasher);
+            let current_hash = hasher.finish();
+
+            if last_tool_output_hash == Some(current_hash) {
+                consecutive_identical_outputs += 1;
+            } else {
+                consecutive_identical_outputs = 0;
+                last_tool_output_hash = Some(current_hash);
+            }
+
+            // Bail if we see 3+ consecutive identical tool outputs (clear runaway).
+            if consecutive_identical_outputs >= 3 {
+                runtime_trace::record_event(
+                    "tool_loop_identical_output_abort",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some("identical tool output detected 3 consecutive times"),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "consecutive_identical": consecutive_identical_outputs,
+                    }),
+                );
+                anyhow::bail!(
+                    "Agent loop aborted: identical tool output detected {} consecutive times",
+                    consecutive_identical_outputs
+                );
+            }
         }
 
         // Add assistant message with tool calls + tool results to history.
@@ -3117,6 +3210,7 @@ pub async fn run(
             None,
             None,
             &[],
+            &config.pacing,
         )
         .await?;
         final_output = response.clone();
@@ -3239,6 +3333,7 @@ pub async fn run(
                 None,
                 None,
                 &[],
+                &config.pacing,
             )
             .await
             {
@@ -3783,6 +3878,7 @@ mod tests {
             None,
             None,
             &[],
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3829,6 +3925,7 @@ mod tests {
             None,
             None,
             &[],
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3869,6 +3966,7 @@ mod tests {
             None,
             None,
             &[],
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -3995,6 +4093,7 @@ mod tests {
             None,
             None,
             &[],
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("parallel execution should complete");
@@ -4064,6 +4163,7 @@ mod tests {
             None,
             None,
             &[],
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4120,6 +4220,7 @@ mod tests {
             None,
             None,
             &[],
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("native fallback id flow should complete");

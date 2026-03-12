@@ -200,8 +200,20 @@ fn channel_message_timeout_budget_secs(
     message_timeout_secs: u64,
     max_tool_iterations: usize,
 ) -> u64 {
+    channel_message_timeout_budget_secs_with_cap(
+        message_timeout_secs,
+        max_tool_iterations,
+        CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP,
+    )
+}
+
+fn channel_message_timeout_budget_secs_with_cap(
+    message_timeout_secs: u64,
+    max_tool_iterations: usize,
+    scale_cap: u64,
+) -> u64 {
     let iterations = max_tool_iterations.max(1) as u64;
-    let scale = iterations.min(CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP);
+    let scale = iterations.min(scale_cap);
     message_timeout_secs.saturating_mul(scale)
 }
 
@@ -291,6 +303,7 @@ struct ChannelRuntimeContext {
     hooks: Option<Arc<crate::hooks::HookRunner>>,
     non_cli_excluded_tools: Arc<Vec<String>>,
     model_routes: Arc<Vec<crate::config::ModelRouteConfig>>,
+    pacing: crate::config::PacingConfig,
 }
 
 #[derive(Clone)]
@@ -1892,8 +1905,15 @@ async fn process_channel_message(
         Cancelled,
     }
 
-    let timeout_budget_secs =
-        channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
+    let scale_cap = ctx
+        .pacing
+        .message_timeout_scale_max
+        .unwrap_or(CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP);
+    let timeout_budget_secs = channel_message_timeout_budget_secs_with_cap(
+        ctx.message_timeout_secs,
+        ctx.max_tool_iterations,
+        scale_cap,
+    );
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
@@ -1919,6 +1939,7 @@ async fn process_channel_message(
                 } else {
                     ctx.non_cli_excluded_tools.as_ref()
                 },
+                &ctx.pacing,
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -3515,6 +3536,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         },
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
         model_routes: Arc::new(config.model_routes.clone()),
+        pacing: config.pacing.clone(),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3587,6 +3609,49 @@ mod tests {
         // Large iteration counts are capped to avoid runaway waits.
         assert_eq!(
             channel_message_timeout_budget_secs(300, 10),
+            300 * CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
+        );
+    }
+
+    #[test]
+    fn channel_message_timeout_budget_with_custom_scale_cap() {
+        assert_eq!(
+            channel_message_timeout_budget_secs_with_cap(300, 8, 8),
+            300 * 8
+        );
+        assert_eq!(
+            channel_message_timeout_budget_secs_with_cap(300, 20, 8),
+            300 * 8
+        );
+        assert_eq!(
+            channel_message_timeout_budget_secs_with_cap(300, 10, 1),
+            300
+        );
+    }
+
+    #[test]
+    fn pacing_config_defaults_preserve_existing_behavior() {
+        let pacing = crate::config::PacingConfig::default();
+        assert!(pacing.step_timeout_secs.is_none());
+        assert!(pacing.loop_detection_min_elapsed_secs.is_none());
+        assert!(pacing.loop_ignore_tools.is_empty());
+        assert!(pacing.message_timeout_scale_max.is_none());
+    }
+
+    #[test]
+    fn pacing_message_timeout_scale_max_overrides_default_cap() {
+        // Custom cap of 8 scales budget proportionally
+        assert_eq!(
+            channel_message_timeout_budget_secs_with_cap(300, 10, 8),
+            300 * 8
+        );
+        // Default cap produces the standard behavior
+        assert_eq!(
+            channel_message_timeout_budget_secs_with_cap(
+                300,
+                10,
+                CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
+            ),
             300 * CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
         );
     }
@@ -3729,6 +3794,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -3779,6 +3845,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -3832,6 +3899,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4308,6 +4376,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -4369,6 +4438,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -4444,6 +4514,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -4504,6 +4575,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -4574,6 +4646,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -4664,6 +4737,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -4736,6 +4810,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -4823,6 +4898,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -4895,6 +4971,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -4957,6 +5034,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -5130,6 +5208,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -5211,6 +5290,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5304,6 +5384,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5379,6 +5460,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -5439,6 +5521,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -5956,6 +6039,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -6042,6 +6126,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -6128,6 +6213,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
@@ -6678,6 +6764,7 @@ This is an example JSON object for profile settings."#;
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -6745,6 +6832,7 @@ This is an example JSON object for profile settings."#;
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            pacing: crate::config::PacingConfig::default(),
         });
 
         process_channel_message(
