@@ -429,7 +429,7 @@ mod tests {
             "message": {
                 "actorType": "users",
                 "actorId": "user_a",
-                "timestamp": 1735701200123u64,
+                "timestamp": 1_735_701_200_123_u64,
                 "message": "hello"
             }
         });

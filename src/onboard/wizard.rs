@@ -1,6 +1,8 @@
+#[cfg(feature = "channel-nostr")]
+use crate::config::schema::{default_nostr_relays, NostrConfig};
 use crate::config::schema::{
-    default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig,
-    NextcloudTalkConfig, NostrConfig, QQConfig, SignalConfig, StreamMode, WhatsAppConfig,
+    DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, NextcloudTalkConfig, QQConfig,
+    SignalConfig, StreamMode, WhatsAppConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
@@ -169,6 +171,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
+        tts: crate::config::TtsConfig::default(),
     };
 
     println!(
@@ -521,6 +524,7 @@ async fn run_quick_setup_with_home(
         hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
+        tts: crate::config::TtsConfig::default(),
     };
 
     config.save().await?;
@@ -710,7 +714,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "qwen-code" => "qwen3-coder-plus".into(),
         "ollama" => "llama3.2".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
-        "sglang" | "vllm" | "osaurus" => "default".into(),
+        "sglang" | "vllm" | "osaurus" | "opencode-go" => "default".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
@@ -1162,6 +1166,7 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "zai"
             | "qwen"
             | "nvidia"
+            | "opencode-go"
     )
 }
 
@@ -1193,6 +1198,7 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
             "sglang" => Some("http://localhost:30000/v1/models"),
             "vllm" => Some("http://localhost:8000/v1/models"),
             "osaurus" => Some("http://localhost:1337/v1/models"),
+            "opencode-go" => Some("https://opencode.ai/zen/go/v1/models"),
             _ => None,
         },
     }
@@ -2005,7 +2011,7 @@ fn resolve_interactive_onboarding_mode(
             "  Existing config found at {}. Select setup mode",
             config_path.display()
         ))
-        .items(&options)
+        .items(options)
         .default(1)
         .interact()?;
 
@@ -2194,6 +2200,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             ("zai-cn", "Z.AI — China coding endpoint (open.bigmodel.cn)"),
             ("synthetic", "Synthetic — Synthetic AI models"),
             ("opencode", "OpenCode Zen — code-focused AI"),
+            ("opencode-go", "OpenCode Go — Subsidized code-focused AI"),
             ("cohere", "Cohere — Command R+ & embeddings"),
         ],
         4 => local_provider_choices(),
@@ -2878,6 +2885,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "zai" => "ZAI_API_KEY",
         "synthetic" => "SYNTHETIC_API_KEY",
         "opencode" | "opencode-zen" => "OPENCODE_API_KEY",
+        "opencode-go" => "OPENCODE_GO_API_KEY",
         "vercel" | "vercel-ai" => "VERCEL_API_KEY",
         "cloudflare" | "cloudflare-ai" => "CLOUDFLARE_API_KEY",
         "bedrock" | "aws-bedrock" => "AWS_ACCESS_KEY_ID",
@@ -3336,6 +3344,7 @@ enum ChannelMenuChoice {
     QqOfficial,
     Lark,
     Feishu,
+    #[cfg(feature = "channel-nostr")]
     Nostr,
     Done,
 }
@@ -3356,6 +3365,7 @@ const CHANNEL_MENU_CHOICES: &[ChannelMenuChoice] = &[
     ChannelMenuChoice::QqOfficial,
     ChannelMenuChoice::Lark,
     ChannelMenuChoice::Feishu,
+    #[cfg(feature = "channel-nostr")]
     ChannelMenuChoice::Nostr,
     ChannelMenuChoice::Done,
 ];
@@ -3499,6 +3509,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         "— Feishu Bot"
                     }
                 ),
+                #[cfg(feature = "channel-nostr")]
                 ChannelMenuChoice::Nostr => format!(
                     "Nostr {}",
                     if config.nostr.is_some() {
@@ -4944,6 +4955,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     port,
                 });
             }
+            #[cfg(feature = "channel-nostr")]
             ChannelMenuChoice::Nostr => {
                 // ── Nostr ──
                 println!();
@@ -5815,7 +5827,7 @@ mod tests {
         apply_provider_update(
             &mut config,
             "anthropic".to_string(),
-            "".to_string(),
+            String::new(),
             "claude-sonnet-4-5-20250929".to_string(),
             None,
         );
@@ -7050,6 +7062,7 @@ mod tests {
         assert_eq!(provider_env_var("nvidia-nim"), "NVIDIA_API_KEY"); // alias
         assert_eq!(provider_env_var("build.nvidia.com"), "NVIDIA_API_KEY"); // alias
         assert_eq!(provider_env_var("astrai"), "ASTRAI_API_KEY");
+        assert_eq!(provider_env_var("opencode-go"), "OPENCODE_GO_API_KEY");
     }
 
     #[test]
