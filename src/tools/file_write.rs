@@ -503,12 +503,10 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .unwrap_or_default()
-                .contains("runtime config/state file")
-        );
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("runtime config/state file"));
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }

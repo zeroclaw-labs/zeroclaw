@@ -983,7 +983,11 @@ impl SecurityPolicy {
 
     fn runtime_config_dir(&self) -> Option<PathBuf> {
         let parent = self.workspace_dir.parent()?;
-        Some(parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf()))
+        Some(
+            parent
+                .canonicalize()
+                .unwrap_or_else(|_| parent.to_path_buf()),
+        )
     }
 
     pub fn is_runtime_config_path(&self, resolved: &Path) -> bool {
@@ -2382,9 +2386,7 @@ mod tests {
         assert!(policy.is_runtime_config_path(&config_dir.join("config.toml.bak")));
         assert!(policy.is_runtime_config_path(&config_dir.join(".config.toml.tmp-1234")));
         assert!(policy.is_runtime_config_path(&config_dir.join("active_workspace.toml")));
-        assert!(policy.is_runtime_config_path(
-            &config_dir.join(".active_workspace.toml.tmp-1234")
-        ));
+        assert!(policy.is_runtime_config_path(&config_dir.join(".active_workspace.toml.tmp-1234")));
     }
 
     #[test]
