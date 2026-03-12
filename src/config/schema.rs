@@ -198,11 +198,22 @@ pub struct Config {
 
     /// Browser delegation configuration (`[browser_delegate]`).
     ///
-    /// Defaults:
-    /// - `enabled = false`
-    /// - `cli_binary` uses the runtime default browser CLI (`"claude"`)
-    /// - `task_timeout_secs = 120`
-    /// - `max_concurrent_tasks = 2`
+    /// Delegates browser-based tasks to a browser-capable CLI subprocess (e.g.
+    /// Claude Code with `claude-in-chrome` MCP tools). Useful for interacting
+    /// with corporate web apps (Teams, Outlook, Jira, Confluence) that lack
+    /// direct API access. A persistent Chrome profile can be configured so SSO
+    /// sessions survive across invocations.
+    ///
+    /// Fields:
+    /// - `enabled` (`bool`, default `false`) — enable the browser delegation tool.
+    /// - `cli_binary` (`String`, default `"claude"`) — CLI binary to spawn for browser tasks.
+    /// - `chrome_profile_dir` (`String`, default `""`) — Chrome user-data directory for
+    ///   persistent SSO sessions. When empty, a fresh profile is used each invocation.
+    /// - `allowed_domains` (`Vec<String>`, default `[]`) — allowlist of domains the browser
+    ///   may navigate to. Empty means all non-blocked domains are permitted.
+    /// - `blocked_domains` (`Vec<String>`, default `[]`) — denylist of domains. Blocked
+    ///   domains take precedence over allowed domains.
+    /// - `task_timeout_secs` (`u64`, default `120`) — per-task timeout in seconds.
     ///
     /// Compatibility: additive and disabled by default; existing configs remain valid when omitted.
     /// Rollback/migration: remove `[browser_delegate]` or keep `enabled = false` to disable.

@@ -40,9 +40,6 @@ pub struct BrowserDelegateConfig {
     /// Task timeout in seconds.
     #[serde(default = "default_browser_task_timeout")]
     pub task_timeout_secs: u64,
-    /// Maximum concurrent browser tasks.
-    #[serde(default = "default_max_browser_tasks")]
-    pub max_concurrent_tasks: usize,
 }
 
 /// Default CLI binary for browser delegation.
@@ -55,11 +52,6 @@ fn default_browser_task_timeout() -> u64 {
     120
 }
 
-/// Default maximum concurrent browser tasks.
-fn default_max_browser_tasks() -> usize {
-    2
-}
-
 impl Default for BrowserDelegateConfig {
     fn default() -> Self {
         Self {
@@ -69,7 +61,6 @@ impl Default for BrowserDelegateConfig {
             allowed_domains: Vec::new(),
             blocked_domains: Vec::new(),
             task_timeout_secs: default_browser_task_timeout(),
-            max_concurrent_tasks: default_max_browser_tasks(),
         }
     }
 }
@@ -434,7 +425,6 @@ mod tests {
         assert!(cfg.allowed_domains.is_empty());
         assert!(cfg.blocked_domains.is_empty());
         assert_eq!(cfg.task_timeout_secs, 120);
-        assert_eq!(cfg.max_concurrent_tasks, 2);
     }
 
     #[test]
@@ -446,7 +436,6 @@ mod tests {
             allowed_domains: vec!["example.com".into()],
             blocked_domains: vec!["evil.com".into()],
             task_timeout_secs: 60,
-            max_concurrent_tasks: 4,
         };
         let toml_str = toml::to_string(&cfg).unwrap();
         let parsed: BrowserDelegateConfig = toml::from_str(&toml_str).unwrap();
@@ -456,7 +445,6 @@ mod tests {
         assert_eq!(parsed.allowed_domains, vec!["example.com"]);
         assert_eq!(parsed.blocked_domains, vec!["evil.com"]);
         assert_eq!(parsed.task_timeout_secs, 60);
-        assert_eq!(parsed.max_concurrent_tasks, 4);
     }
 
     // ── URL validation ──────────────────────────────────────────────
