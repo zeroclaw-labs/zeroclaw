@@ -1553,7 +1553,12 @@ impl OpenAiCompatibleProvider {
             );
         }
 
-        let tools = tools.filter(|items| !items.is_empty());
+        let url = self.responses_url();
+        let mut merged_tools = tools.unwrap_or_default();
+        if super::responses_endpoint_supports_codex_mcp(&url) {
+            merged_tools.extend(super::load_codex_mcp_tools());
+        }
+        let tools = (!merged_tools.is_empty()).then_some(merged_tools);
         let request = ResponsesRequest {
             model: model.to_string(),
             input,
@@ -1563,8 +1568,6 @@ impl OpenAiCompatibleProvider {
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
-
-        let url = self.responses_url();
 
         let response = self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
@@ -2701,11 +2704,47 @@ impl Provider for OpenAiCompatibleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::{load_codex_mcp_tools, responses_endpoint_supports_codex_mcp};
     use std::error::Error as StdError;
     use std::fmt;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::tempdir;
 
     fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
         OpenAiCompatibleProvider::new(name, url, key, AuthStyle::Bearer)
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let original = std::env::var(key).ok();
+            match value {
+                Some(next) => std::env::set_var(key, next),
+                None => std::env::remove_var(key),
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(original) = self.original.as_deref() {
+                std::env::set_var(self.key, original);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock poisoned")
     }
 
     #[derive(Debug)]
@@ -3722,6 +3761,74 @@ mod tests {
         assert!(json.contains("\"tools\""));
         assert!(json.contains("get_weather"));
         assert!(json.contains("\"tool_choice\":\"auto\""));
+    }
+
+    #[test]
+    fn responses_request_serializes_with_function_and_forwarded_codex_mcp_tools() {
+        let _env_lock = env_lock();
+        let temp = tempdir().expect("tempdir should be created");
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[mcp_servers.github]
+url = "https://mcp.example.com"
+allowed_tools = ["search"]
+"#,
+        )
+        .expect("codex config should be written");
+        let config_path_string = config_path.to_string_lossy().into_owned();
+        let _config_guard = EnvGuard::set("ZEROCLAW_CODEX_CONFIG_PATH", Some(&config_path_string));
+
+        let provider = OpenAiCompatibleProvider::new_custom_with_mode(
+            "Custom",
+            "https://api.openai.com/v1",
+            Some("test-key"),
+            AuthStyle::Bearer,
+            true,
+            CompatibleApiMode::OpenAiResponses,
+            None,
+        );
+        let url = provider.responses_url();
+        let mut merged_tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather for a location",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"}
+                    }
+                }
+            }
+        })];
+        if responses_endpoint_supports_codex_mcp(&url) {
+            merged_tools.extend(load_codex_mcp_tools());
+        }
+
+        let request = ResponsesRequest {
+            model: "gpt-5.4".to_string(),
+            input: vec![ResponsesInput {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            instructions: Some("system".to_string()),
+            max_output_tokens: None,
+            stream: Some(false),
+            tools: Some(merged_tools),
+            tool_choice: Some("auto".to_string()),
+        };
+
+        let json = serde_json::to_value(&request).expect("request should serialize");
+        let tools = json["tools"].as_array().expect("tools should serialize");
+        assert_eq!(tools.len(), 2);
+        assert!(tools.iter().any(|tool| tool["type"] == "function"));
+        assert!(tools.iter().any(|tool| {
+            tool["type"] == "mcp"
+                && tool["server_label"] == "github"
+                && tool["server_url"] == "https://mcp.example.com"
+        }));
     }
 
     #[test]

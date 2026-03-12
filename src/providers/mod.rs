@@ -41,6 +41,9 @@ use crate::auth::AuthService;
 use compatible::{AuthStyle, CompatibleApiMode, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
 use serde::Deserialize;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 
 const MAX_API_ERROR_CHARS: usize = 200;
@@ -76,6 +79,145 @@ const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 const VERCEL_AI_GATEWAY_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
 const LITELLM_BASE_URL: &str = "http://localhost:4000/v1";
+const CODEX_CONFIG_PATH_ENV: &str = "ZEROCLAW_CODEX_CONFIG_PATH";
+
+#[derive(Debug, Deserialize, Default)]
+struct CodexConfigFile {
+    #[serde(default)]
+    mcp_servers: HashMap<String, CodexMcpServerEntry>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CodexMcpServerEntry {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    server_url: Option<String>,
+    #[serde(default)]
+    connector_id: Option<String>,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    #[serde(default)]
+    allowed_tools: Vec<String>,
+    #[serde(default)]
+    require_approval: Option<String>,
+    #[serde(default)]
+    server_description: Option<String>,
+    #[serde(default)]
+    defer_loading: Option<bool>,
+}
+
+fn codex_config_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var(CODEX_CONFIG_PATH_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(PathBuf::from(path));
+    }
+
+    directories::UserDirs::new().map(|dirs| dirs.home_dir().join(".codex").join("config.toml"))
+}
+
+pub(crate) fn responses_endpoint_supports_codex_mcp(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+
+    matches!(
+        parsed.host_str().map(|host| host.to_ascii_lowercase()),
+        Some(host) if host == "api.openai.com" || host == "chatgpt.com"
+    )
+}
+
+fn codex_mcp_tool_from_entry(name: &str, entry: CodexMcpServerEntry) -> Option<Value> {
+    let server_label = name.trim();
+    if server_label.is_empty() {
+        return None;
+    }
+
+    let connector_id = entry
+        .connector_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let server_url = entry
+        .server_url
+        .as_deref()
+        .or(entry.url.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    if connector_id.is_none() && server_url.is_none() {
+        return None;
+    }
+
+    let mut tool = json!({
+        "type": "mcp",
+        "server_label": server_label,
+    });
+
+    if let Some(connector_id) = connector_id {
+        tool["connector_id"] = Value::String(connector_id);
+    }
+    if let Some(server_url) = server_url {
+        tool["server_url"] = Value::String(server_url);
+    }
+    if !entry.headers.is_empty() {
+        tool["headers"] = serde_json::to_value(entry.headers).ok()?;
+    }
+    if !entry.allowed_tools.is_empty() {
+        tool["allowed_tools"] = serde_json::to_value(entry.allowed_tools).ok()?;
+    }
+    if let Some(require_approval) = entry
+        .require_approval
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        tool["require_approval"] = Value::String(require_approval.to_string());
+    }
+    if let Some(server_description) = entry
+        .server_description
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        tool["server_description"] = Value::String(server_description.to_string());
+    }
+    if let Some(defer_loading) = entry.defer_loading {
+        tool["defer_loading"] = Value::Bool(defer_loading);
+    }
+
+    Some(tool)
+}
+
+pub(crate) fn load_codex_mcp_tools_from_path(path: &Path) -> Vec<Value> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(parsed) = toml::from_str::<CodexConfigFile>(&raw) else {
+        tracing::warn!(
+            config_path = %path.display(),
+            "failed to parse Codex config while loading MCP servers"
+        );
+        return Vec::new();
+    };
+
+    parsed
+        .mcp_servers
+        .into_iter()
+        .filter_map(|(name, entry)| codex_mcp_tool_from_entry(&name, entry))
+        .collect()
+}
+
+pub(crate) fn load_codex_mcp_tools() -> Vec<Value> {
+    codex_config_path()
+        .map(|path| load_codex_mcp_tools_from_path(&path))
+        .unwrap_or_default()
+}
 
 pub(crate) fn is_minimax_intl_alias(name: &str) -> bool {
     matches!(
@@ -1900,6 +2042,79 @@ mod tests {
     fn resolve_provider_credential_prefers_explicit_argument() {
         let resolved = resolve_provider_credential("openrouter", Some("  explicit-key  "));
         assert_eq!(resolved, Some("explicit-key".to_string()));
+    }
+
+    #[test]
+    fn load_codex_mcp_tools_from_path_parses_remote_servers() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "zeroclaw-codex-mcp-{}-{}",
+            std::process::id(),
+            "remote"
+        ));
+        std::fs::create_dir_all(&temp_root).expect("temp codex dir");
+        let config_path = temp_root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[mcp_servers.github]
+url = "https://mcp.example.com"
+allowed_tools = ["search", "fetch"]
+require_approval = "never"
+server_description = "GitHub MCP"
+defer_loading = true
+
+[mcp_servers.github.headers]
+Authorization = "Bearer test-token"
+"#,
+        )
+        .expect("write codex config");
+
+        let tools = load_codex_mcp_tools_from_path(&config_path);
+        assert_eq!(tools.len(), 1);
+        let tool = &tools[0];
+        assert_eq!(tool["type"], "mcp");
+        assert_eq!(tool["server_label"], "github");
+        assert_eq!(tool["server_url"], "https://mcp.example.com");
+        assert_eq!(tool["allowed_tools"], json!(["search", "fetch"]));
+        assert_eq!(tool["require_approval"], "never");
+        assert_eq!(tool["server_description"], "GitHub MCP");
+        assert_eq!(tool["defer_loading"], true);
+        assert_eq!(tool["headers"]["Authorization"], "Bearer test-token");
+    }
+
+    #[test]
+    fn load_codex_mcp_tools_from_path_skips_entries_without_remote_target() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "zeroclaw-codex-mcp-{}-{}",
+            std::process::id(),
+            "invalid"
+        ));
+        std::fs::create_dir_all(&temp_root).expect("temp codex dir");
+        let config_path = temp_root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[mcp_servers.local_stdio]
+command = "npx"
+"#,
+        )
+        .expect("write codex config");
+
+        let tools = load_codex_mcp_tools_from_path(&config_path);
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn responses_endpoint_supports_codex_mcp_matches_openai_hosts() {
+        assert!(responses_endpoint_supports_codex_mcp(
+            "https://api.openai.com/v1/responses"
+        ));
+        assert!(responses_endpoint_supports_codex_mcp(
+            "https://chatgpt.com/backend-api/codex/responses"
+        ));
+        assert!(!responses_endpoint_supports_codex_mcp(
+            "https://api.tonsof.blue/v1/responses"
+        ));
     }
 
     #[test]

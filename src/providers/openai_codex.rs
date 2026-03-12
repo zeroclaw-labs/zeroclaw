@@ -37,6 +37,8 @@ struct ResponsesRequest {
     include: Vec<String>,
     tool_choice: String,
     parallel_tool_calls: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,7 +118,6 @@ impl OpenAiCodexProvider {
                 .unwrap_or_else(|_| Client::new()),
         })
     }
-
 }
 
 fn default_zeroclaw_dir() -> PathBuf {
@@ -589,6 +590,11 @@ impl OpenAiCodexProvider {
             })?)
         };
         let normalized_model = normalize_model_id(model);
+        let mcp_tools = if super::responses_endpoint_supports_codex_mcp(&self.responses_url) {
+            super::load_codex_mcp_tools()
+        } else {
+            Vec::new()
+        };
 
         let request = ResponsesRequest {
             model: normalized_model.to_string(),
@@ -606,6 +612,7 @@ impl OpenAiCodexProvider {
             include: vec!["reasoning.encrypted_content".to_string()],
             tool_choice: "auto".to_string(),
             parallel_tool_calls: true,
+            tools: mcp_tools,
         };
 
         let bearer_token = if use_gateway_api_key_auth {
@@ -697,7 +704,9 @@ impl Provider for OpenAiCodexProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::{load_codex_mcp_tools, responses_endpoint_supports_codex_mcp};
     use std::sync::{Mutex, OnceLock};
+    use tempfile::tempdir;
 
     struct EnvGuard {
         key: &'static str,
@@ -1093,5 +1102,66 @@ data: [DONE]
 
         assert!(!caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn responses_request_serializes_forwarded_codex_mcp_tools() {
+        let _env_lock = env_lock();
+        let temp = tempdir().expect("tempdir should be created");
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[mcp_servers.github]
+server_url = "https://mcp.example.com"
+allowed_tools = ["search"]
+require_approval = "never"
+"#,
+        )
+        .expect("codex config should be written");
+        let config_path_string = config_path.to_string_lossy().into_owned();
+        let _config_guard = EnvGuard::set("ZEROCLAW_CODEX_CONFIG_PATH", Some(&config_path_string));
+
+        let tools = if responses_endpoint_supports_codex_mcp(DEFAULT_CODEX_RESPONSES_URL) {
+            load_codex_mcp_tools()
+        } else {
+            Vec::new()
+        };
+
+        let request = ResponsesRequest {
+            model: "gpt-5.4".to_string(),
+            input: vec![ResponsesInput {
+                role: "user".to_string(),
+                content: vec![ResponsesInputContent {
+                    kind: "input_text".to_string(),
+                    text: Some("hello".to_string()),
+                    image_url: None,
+                }],
+            }],
+            instructions: "system".to_string(),
+            store: false,
+            stream: true,
+            text: ResponsesTextOptions {
+                verbosity: "medium".to_string(),
+            },
+            reasoning: ResponsesReasoningOptions {
+                effort: "high".to_string(),
+                summary: "auto".to_string(),
+            },
+            include: vec!["reasoning.encrypted_content".to_string()],
+            tool_choice: "auto".to_string(),
+            parallel_tool_calls: true,
+            tools,
+        };
+
+        let json = serde_json::to_value(&request).expect("request should serialize");
+        assert_eq!(json["tools"][0]["type"], "mcp");
+        assert_eq!(json["tools"][0]["server_label"], "github");
+        assert_eq!(json["tools"][0]["server_url"], "https://mcp.example.com");
+        assert_eq!(
+            json["tools"][0]["allowed_tools"],
+            serde_json::json!(["search"])
+        );
+        assert_eq!(json["tools"][0]["require_approval"], "never");
     }
 }
