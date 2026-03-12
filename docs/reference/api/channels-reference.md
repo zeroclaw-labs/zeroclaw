@@ -119,6 +119,7 @@ If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.fe
 | Feishu | websocket (default) or webhook | Webhook mode only |
 | DingTalk | stream mode | No |
 | QQ | bot gateway | No |
+| WeCom | websocket (long connection) | No |
 | Linq | webhook (`/linq`) | Yes (public HTTPS callback) |
 | iMessage | local integration | No |
 | Nostr | relay websocket (NIP-04 / NIP-17) | No |
@@ -387,7 +388,25 @@ app_secret = "qq-app-secret"
 allowed_users = ["*"]
 ```
 
-### 4.16 Nextcloud Talk
+### 4.16 WeCom
+
+```toml
+[channels_config.wecom]
+bot_id = "wecom-bot-id"
+secret = "wecom-long-connection-secret"
+stream_mode = "partial"  # optional: off | partial
+file_retention_days = 7  # optional
+max_file_size_mb = 20    # optional
+history_max_turns = 50   # optional
+```
+
+Notes:
+
+- Uses the WeCom AI bot WebSocket long-connection API, so no public webhook endpoint is required.
+- `stream_mode = "partial"` keeps progressive draft replies enabled; `off` waits and sends only the final reply.
+- Proactive announcements require the WeCom channel process to stay connected (`zeroclaw channel start` or daemon mode).
+
+### 4.17 Nextcloud Talk
 
 ```toml
 [channels_config.nextcloud_talk]
@@ -405,7 +424,7 @@ Notes:
 - `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides config secret.
 - See [nextcloud-talk-setup.md](../../setup-guides/nextcloud-talk-setup.md) for a full runbook.
 
-### 4.16 Linq
+### 4.18 Linq
 
 ```toml
 [channels_config.linq]
@@ -424,7 +443,7 @@ Notes:
 - `ZEROCLAW_LINQ_SIGNING_SECRET` overrides config secret.
 - `allowed_senders` uses E.164 phone number format (e.g. `+1234567890`).
 
-### 4.17 iMessage
+### 4.19 iMessage
 
 ```toml
 [channels_config.imessage]
@@ -479,7 +498,7 @@ RUST_LOG=info zeroclaw daemon 2>&1 | tee /tmp/zeroclaw.log
 Then filter channel/gateway events:
 
 ```bash
-rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|Nostr|Webhook|Channel" /tmp/zeroclaw.log
+rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|WeCom|iMessage|Nostr|Webhook|Channel" /tmp/zeroclaw.log
 ```
 
 ### 7.2 Keyword table
@@ -499,6 +518,7 @@ rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|D
 | Lark / Feishu | `Lark: WS connected` / `Lark event callback server listening on` | `Lark WS: ignoring ... (not in allowed_users)` / `Lark: ignoring message from unauthorized user:` | `Lark: ping failed, reconnecting` / `Lark: heartbeat timeout, reconnecting` / `Lark: WS read error:` |
 | DingTalk | `DingTalk: connected and listening for messages...` | `DingTalk: ignoring message from unauthorized user:` | `DingTalk WebSocket error:` / `DingTalk: message channel closed` |
 | QQ | `QQ: connected and identified` | `QQ: ignoring C2C message from unauthorized user:` / `QQ: ignoring group message from unauthorized user:` | `QQ: received Reconnect (op 7)` / `QQ: received Invalid Session (op 9)` / `QQ: message channel closed` |
+| WeCom | `[wecom] WebSocket connected` / `[wecom] subscribe succeeded` | (conversation scope comes from WeCom callback session metadata) | `[wecom] WebSocket connect failed:` / `[wecom] subscribe rejected:` / `[wecom] disconnected_event, triggering reconnect` |
 | Nextcloud Talk (gateway) | `POST /nextcloud-talk — Nextcloud Talk bot webhook` | `Nextcloud Talk webhook signature verification failed` / `Nextcloud Talk: ignoring message from unauthorized actor:` | `Nextcloud Talk send failed:` / `LLM error for Nextcloud Talk message:` |
 | iMessage | `iMessage channel listening (AppleScript bridge)...` | (contact allowlist enforced by `allowed_contacts`) | `iMessage poll error:` |
 | Nostr | `Nostr channel listening as npub1...` | `Nostr: ignoring NIP-04 message from unauthorized pubkey:` / `Nostr: ignoring NIP-17 message from unauthorized pubkey:` | `Failed to decrypt NIP-04 message:` / `Failed to unwrap NIP-17 gift wrap:` / `Nostr relay pool shut down` |

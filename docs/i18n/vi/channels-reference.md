@@ -108,6 +108,7 @@ Nếu `[channels_config.matrix]` có mặt nhưng binary được build mà khô
 | Lark/Feishu | websocket (mặc định) hoặc webhook | Chỉ ở chế độ Webhook |
 | DingTalk | stream mode | Không |
 | QQ | bot gateway | Không |
+| WeCom | websocket (kết nối dài) | Không |
 | iMessage | tích hợp cục bộ | Không |
 
 ---
@@ -336,7 +337,25 @@ app_secret = "qq-app-secret"
 allowed_users = ["*"]
 ```
 
-### 4.14 iMessage
+### 4.14 WeCom
+
+```toml
+[channels_config.wecom]
+bot_id = "wecom-bot-id"
+secret = "wecom-long-connection-secret"
+stream_mode = "partial"  # tùy chọn: off | partial
+file_retention_days = 7  # tùy chọn
+max_file_size_mb = 20    # tùy chọn
+history_max_turns = 50   # tùy chọn
+```
+
+Lưu ý:
+
+- WeCom dùng API WebSocket kết nối dài của AI bot nên không cần endpoint webhook công khai.
+- `stream_mode = "partial"` giữ cơ chế phản hồi nháp theo tiến trình; `off` sẽ chỉ gửi câu trả lời cuối cùng.
+- Khi `zeroclaw channel start` hoặc `zeroclaw daemon` giữ kết nối đang hoạt động, các thông báo chủ động từ scheduler có thể được gửi qua phiên WeCom hiện tại.
+
+### 4.15 iMessage
 
 ```toml
 [channels_config.imessage]
@@ -391,7 +410,7 @@ RUST_LOG=info zeroclaw daemon 2>&1 | tee /tmp/zeroclaw.log
 Sau đó lọc các sự kiện channel/gateway:
 
 ```bash
-rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|Webhook|Channel" /tmp/zeroclaw.log
+rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|WeCom|iMessage|Webhook|Channel" /tmp/zeroclaw.log
 ```
 
 ### 7.2 Bảng từ khóa
@@ -411,6 +430,7 @@ rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|D
 | Lark / Feishu | `Lark: WS connected` / `Lark event callback server listening on` | `Lark WS: ignoring ... (not in allowed_users)` / `Lark: ignoring message from unauthorized user:` | `Lark: ping failed, reconnecting` / `Lark: heartbeat timeout, reconnecting` / `Lark: WS read error:` |
 | DingTalk | `DingTalk: connected and listening for messages...` | `DingTalk: ignoring message from unauthorized user:` | `DingTalk WebSocket error:` / `DingTalk: message channel closed` |
 | QQ | `QQ: connected and identified` | `QQ: ignoring C2C message from unauthorized user:` / `QQ: ignoring group message from unauthorized user:` | `QQ: received Reconnect (op 7)` / `QQ: received Invalid Session (op 9)` / `QQ: message channel closed` |
+| WeCom | `[wecom] WebSocket connected` / `[wecom] subscribe succeeded` | (phạm vi hội thoại đến từ metadata phiên trong callback WeCom) | `[wecom] WebSocket connect failed:` / `[wecom] subscribe rejected:` / `[wecom] disconnected_event, triggering reconnect` |
 | iMessage | `iMessage channel listening (AppleScript bridge)...` | (allowlist liên hệ được thực thi bởi `allowed_contacts`) | `iMessage poll error:` |
 
 ### 7.3 Từ khóa của runtime supervisor
