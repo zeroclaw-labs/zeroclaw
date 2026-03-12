@@ -1044,6 +1044,7 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            mention_only: false,
         });
         cfg.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
             imap_host: "imap.example.com".to_string(),
@@ -1178,6 +1179,7 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            mention_only: false,
         });
         current.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
             imap_host: "imap.example.com".to_string(),
