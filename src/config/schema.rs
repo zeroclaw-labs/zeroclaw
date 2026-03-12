@@ -5028,8 +5028,7 @@ impl Config {
         #[cfg(unix)]
         {
             use std::{fs::Permissions, os::unix::fs::PermissionsExt};
-            if let Err(err) =
-                fs::set_permissions(&config_path, Permissions::from_mode(0o600)).await
+            if let Err(err) = fs::set_permissions(&config_path, Permissions::from_mode(0o600)).await
             {
                 tracing::warn!(
                     "Failed to harden config permissions to 0600 at {}: {}",
