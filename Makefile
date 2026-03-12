@@ -32,7 +32,7 @@ dev: env
 	docker compose --env-file "$(ENV_FILE)" -f "$(COMPOSE_FILE)" up --build --force-recreate
 
 up: env
-	docker compose --env-file "$(ENV_FILE)" -f "$(COMPOSE_FILE)" up -d --build --force-recreate
+	docker compose --env-file "$(ENV_FILE)" -f "$(COMPOSE_FILE)" up -d --force-recreate
 
 down: env
 	docker compose --env-file "$(ENV_FILE)" -f "$(COMPOSE_FILE)" down
