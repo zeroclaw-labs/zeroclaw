@@ -590,7 +590,9 @@ impl Channel for WhatsAppWebChannel {
                             ),
                         }
                     }
-                    tracing::info!("WhatsApp Web: session files removed, restarting for QR pairing");
+                    tracing::info!(
+                        "WhatsApp Web: session files removed, restarting for QR pairing"
+                    );
                 } else {
                     tracing::warn!(
                         "WhatsApp Web: bot stopped without LoggedOut; reconnecting with existing session"
@@ -872,7 +874,10 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn compute_retry_delay_zero_attempt() {
         // Edge case: attempt 0 should still produce BASE (saturating_sub clamps).
-        assert_eq!(WhatsAppWebChannel::compute_retry_delay(0), WhatsAppWebChannel::BASE_DELAY_SECS);
+        assert_eq!(
+            WhatsAppWebChannel::compute_retry_delay(0),
+            WhatsAppWebChannel::BASE_DELAY_SECS
+        );
     }
 
     #[test]
@@ -934,10 +939,13 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn session_file_paths_includes_wal_and_shm() {
         let paths = WhatsAppWebChannel::session_file_paths("/tmp/test.db");
-        assert_eq!(paths, [
-            "/tmp/test.db".to_string(),
-            "/tmp/test.db-wal".to_string(),
-            "/tmp/test.db-shm".to_string(),
-        ]);
+        assert_eq!(
+            paths,
+            [
+                "/tmp/test.db".to_string(),
+                "/tmp/test.db-wal".to_string(),
+                "/tmp/test.db-shm".to_string(),
+            ]
+        );
     }
 }

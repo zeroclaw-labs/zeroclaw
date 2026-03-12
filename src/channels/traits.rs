@@ -144,20 +144,12 @@ pub trait Channel: Send + Sync {
     }
 
     /// Pin a message in the channel.
-    async fn pin_message(
-        &self,
-        _channel_id: &str,
-        _message_id: &str,
-    ) -> anyhow::Result<()> {
+    async fn pin_message(&self, _channel_id: &str, _message_id: &str) -> anyhow::Result<()> {
         Ok(())
     }
 
     /// Unpin a previously pinned message.
-    async fn unpin_message(
-        &self,
-        _channel_id: &str,
-        _message_id: &str,
-    ) -> anyhow::Result<()> {
+    async fn unpin_message(&self, _channel_id: &str, _message_id: &str) -> anyhow::Result<()> {
         Ok(())
     }
 }
