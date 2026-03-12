@@ -221,7 +221,7 @@ ls -lh target/release/zeroclaw
 `bootstrap.sh` 스크립트는 Rust를 설치하고, ZeroClaw를 클론하고, 컴파일하고, 초기 개발 환경을 설정합니다:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/bootstrap.sh | bash
 ```
 
 이 작업은 다음을 수행합니다:
