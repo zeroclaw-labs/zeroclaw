@@ -1,0 +1,233 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zeroclaw-skills
+  namespace: ai-agents
+data:
+  daily-meeting-summary.md: |
+    ---
+    name: daily-meeting-summary
+    version: 1.0.0
+    description: Fetches and summarizes daily meeting recordings from Speakr (meetings.coffee-anon.com)
+    always: true
+    ---
+
+    # Daily Meeting Summary
+
+    Speakr (https://meetings.coffee-anon.com) is Dan's self-hosted meeting transcription app.
+    It records audio, transcribes with WhisperX, diarizes speakers, and generates LLM summaries.
+    Your job is to fetch the pre-generated summaries and compile a daily digest.
+
+    ## Authentication
+
+    Use the `SPEAKR_API_TOKEN` environment variable:
+
+    ```
+    curl -s -H "Authorization: Bearer $SPEAKR_API_TOKEN" <url>
+    ```
+
+    ## CRITICAL — Context Size Safety
+
+    The Speakr API returns FULL recording objects including raw transcriptions, which can be
+    600K+ characters per recording. You MUST pipe all API responses through the jq filter below
+    to strip heavy fields. Failure to do this WILL exceed your context window and crash the request.
+
+    **Always use this pattern:**
+    ```
+    curl -s -H "Authorization: Bearer $SPEAKR_API_TOKEN" "<url>" | python3 -c "
+    import sys, json
+    data = json.load(sys.stdin)
+    recs = data.get('recordings', [data] if 'id' in data else [])
+    for r in recs:
+        for key in ['transcription', 'transcription_text', 'summary_html', 'notes_html',
+                     'audio_available', 'audio_deleted_at', 'can_delete', 'can_edit',
+                     'deletion_exempt', 'file_size', 'mime_type', 'original_filename',
+                     'processing_time_seconds', 'transcription_duration_seconds',
+                     'is_highlighted', 'is_inbox', 'is_owner', 'is_shared', 'has_group_tags',
+                     'user_id', 'completed_at', 'created_at']:
+            r.pop(key, None)
+    print(json.dumps(recs, indent=2))
+    "
+    ```
+
+    **Never fetch a raw recording without this filter. Never use `GET /api/recordings/<id>` without it.**
+
+    ## Bootstrap — Cron Setup
+
+    On first load, check if a `speakr-daily-summary` cron job exists via `cron_list`.
+    If not, create it with `cron_add`:
+
+    - **name**: `speakr-daily-summary`
+    - **schedule**: cron `0 12,17 * * 1-5` (noon and 5pm MT, weekdays)
+    - **timezone**: `America/Edmonton`
+    - **job_type**: `agent`
+    - **session_target**: `isolated`
+    - **prompt**: Use the Cron Job Prompt below verbatim.
+
+    ## Cron Job Prompt
+
+    Use this as the `prompt` field when creating the cron job:
+
+    ```
+    Fetch today's completed meeting recordings from Speakr and write a daily digest.
+
+    Step 1 — Fetch and filter recordings (CRITICAL: always strip transcription to avoid context overflow):
+      curl -s -H "Authorization: Bearer $SPEAKR_API_TOKEN" "https://meetings.coffee-anon.com/api/recordings?q=date:today&per_page=100" | python3 -c "
+      import sys, json
+      data = json.load(sys.stdin)
+      recs = data.get('recordings', [])
+      drop = ['transcription','transcription_text','summary_html','notes_html','audio_available',
+              'audio_deleted_at','can_delete','can_edit','deletion_exempt','file_size','mime_type',
+              'original_filename','processing_time_seconds','transcription_duration_seconds',
+              'is_highlighted','is_inbox','is_owner','is_shared','has_group_tags','user_id',
+              'completed_at','created_at']
+      for r in recs:
+          for k in drop: r.pop(k, None)
+      print(json.dumps([r for r in recs if r.get('status')=='COMPLETED'], indent=2))
+      "
+
+    Step 2 — For each completed recording in the filtered output, extract:
+      - title, participants, meeting_date
+      - summary (already LLM-generated markdown — use as-is, do not re-summarize)
+      - events (action items and calendar events extracted from transcript)
+      - tags
+      - notes (if present — these are Dan's private annotations)
+
+    If a recording has no summary yet, note it as "Summary pending" with just the title and participants.
+
+    Step 3 — Write the digest to: /data/workspace/memory/meetings-YYYY-MM-DD.md (using today's date)
+
+    Format:
+      # Meetings — YYYY-MM-DD
+
+      ## [Meeting Title]
+      **Participants:** [names]
+      **Time:** [meeting_date formatted as HH:MM]
+      **Tags:** [tag names, comma-separated]
+
+      ### Summary
+      [paste the summary field as-is]
+
+      ### Action Items
+      [list events: title, attendees, date, description]
+
+      ### Notes
+      [Dan's notes if present, otherwise omit this section]
+
+      ---
+      [repeat for each meeting]
+
+      ## Daily Overview
+      - **Total meetings:** N
+      - **Key decisions:** [1-2 sentence synthesis across all meetings]
+      - **Upcoming action items:** [consolidated list of events across all meetings, sorted by date]
+
+    If there are no completed recordings today, write a short note: "No completed meeting recordings for today."
+
+    Step 4 — Store a memory: Use memory_store with key "meetings_digest_YYYY-MM-DD" and category "daily" containing a 2-3 sentence summary of the day's meetings for quick recall.
+    ```
+
+    ## On-Demand Usage
+
+    When Dan asks about meetings (e.g., "what meetings did I have today?", "summarize my meetings",
+    "any action items from this morning?"):
+
+    1. **Check the memory file first**: Read `/data/workspace/memory/meetings-YYYY-MM-DD.md`
+       - If it exists, use it to answer. This is the fast path.
+    2. **If the file doesn't exist or is stale**: Run the fetch manually using the same
+       curl-with-filter pattern from the Cron Job Prompt above. NEVER fetch raw API data.
+    3. **For past dates**: Fetch with `q=date:YYYY-MM-DD` or check `meetings-YYYY-MM-DD.md`.
+
+    ## API Quick Reference
+
+    | Endpoint | Purpose |
+    |----------|---------|
+    | `GET /api/recordings?q=date:today&per_page=100` | Today's recordings |
+    | `GET /api/recordings?q=date:yesterday` | Yesterday's recordings |
+    | `GET /api/recordings?q=date:YYYY-MM-DD` | Specific date |
+    | `GET /api/recordings?q=date:thisweek` | This week |
+    | `GET /api/recordings?q=date_from:X&date_to:Y` | Date range |
+
+    **Always pipe through the python filter above.** Base URL: `https://meetings.coffee-anon.com`
+
+    ## Filtered Response Shape (after stripping)
+
+    ```json
+    [{
+      "id": 123,
+      "title": "Q1 Planning Session",
+      "participants": "Dan, Tiffany, Sarah",
+      "meeting_date": "2026-03-12T14:00:00",
+      "status": "COMPLETED",
+      "summary": "## Key Discussion Points\n- ...",
+      "notes": "User's private notes (markdown)",
+      "tags": [{"name": "Client Meeting"}],
+      "events": [{
+        "title": "Demo Prep",
+        "start_datetime": "2026-03-15T14:00:00",
+        "attendees": ["Dan", "Sarah"],
+        "description": "Prepare product demo"
+      }]
+    }]
+    ```
+
+    The `summary` field is already a concise LLM summary — use it directly. Do not re-process
+    raw transcriptions. The `events` field contains extracted action items — high value for the digest.
+
+    ## Deep Dive — Chunked Full Transcription
+
+    When Dan asks you to look at the full transcript of a specific recording (e.g., "what exactly
+    did Sarah say about the timeline?", "pull up the full transcript of the 2pm meeting"),
+    use this file-first pattern to avoid context overflow:
+
+    **Step 1 — Download transcription to disk:**
+    ```
+    curl -s -H "Authorization: Bearer $SPEAKR_API_TOKEN" \
+      "https://meetings.coffee-anon.com/api/recordings/RECORDING_ID" \
+      | python3 -c "
+    import sys, json
+    r = json.load(sys.stdin)
+    t = r.get('transcription', [])
+    out = f\"\"\"# Transcript: {r.get('title','Untitled')}
+    # Participants: {r.get('participants','Unknown')}
+    # Date: {r.get('meeting_date','Unknown')}
+    # Segments: {len(t) if isinstance(t,list) else 'plain-text'}
+    # Duration: {t[-1]['end'] if isinstance(t,list) and t else 'unknown'}s
+    ---
+    \"\"\"
+    if isinstance(t, list):
+        for seg in t:
+            speaker = seg.get('speaker','?')
+            text = seg.get('text', seg.get('sentence',''))
+            start = seg.get('start', seg.get('start_time',0))
+            out += f'[{int(start//60):02d}:{int(start%60):02d}] {speaker}: {text}\n'
+    else:
+        out += str(t)
+    with open('/data/workspace/memory/transcript-' + str(r.get('id','unknown')) + '.md','w') as f:
+        f.write(out)
+    print(f'Wrote {len(out):,} chars to transcript-{r.get(\"id\",\"unknown\")}.md')
+    print(f'Segments: {len(t) if isinstance(t,list) else \"plain-text\"}')
+    "
+    ```
+
+    **Step 2 — Read in chunks using file_read with offset/limit:**
+    - First read the header (first 10 lines) to get metadata
+    - Then read ~200 lines at a time using offset/limit
+    - Typical meetings have 200-2000 segments, ~1 line each
+
+    **Step 3 — Clean up when done:**
+    - Delete the transcript file after answering Dan's question
+    - These files can be large (100K-1M+ chars) — don't leave them around
+
+    **Example flow:**
+    1. Dan: "What did Sarah say about the rollout timeline in the 2pm meeting?"
+    2. You: fetch recording list (filtered) → find the 2pm recording ID
+    3. You: download transcript to `transcript-549.md`
+    4. You: read header → see it's 1,200 segments, 58 minutes
+    5. You: search the file for "rollout" or "timeline" using content_search
+    6. You: read the surrounding ~50 lines for context
+    7. You: answer Dan's question
+    8. You: delete `transcript-549.md`
+
+    **Never load a full transcript into a single shell command output or tool result.**
+    Always write to file first, then read chunks.
