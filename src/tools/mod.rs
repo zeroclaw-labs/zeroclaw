@@ -124,10 +124,10 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 #[cfg(feature = "hardware")]
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
-pub use image_generation::{ImageGenerationTool, ImageGenerationParams, ImageGenerationResponse, ImageData};
+pub use image_generation::ImageGenerationTool;
 pub use image_info::ImageInfoTool;
-pub use speech_synthesis::{SpeechSynthesisTool, SpeechSynthesisParams, SpeechSynthesisResponse};
-pub use video_analysis::{VideoAnalysisTool, VideoAnalysisParams, VideoAnalysisResponse, FrameData, VideoMetadata};
+pub use speech_synthesis::SpeechSynthesisTool;
+pub use video_analysis::VideoAnalysisTool;
 pub use mcp_client::McpRegistry;
 pub use mcp_tool::McpToolWrapper;
 pub use memory_forget::MemoryForgetTool;
@@ -614,6 +614,20 @@ pub fn all_tools_with_runtime(
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
+
+    // Multimedia generation tools
+    if root_config.multimodal.generation.enabled {
+        tool_arcs.push(Arc::new(ImageGenerationTool::new(
+            root_config.multimodal.generation.clone(),
+            workspace_dir.to_path_buf(),
+        )));
+        tool_arcs.push(Arc::new(SpeechSynthesisTool::new(
+            root_config.multimodal.generation.clone(),
+        )));
+        tool_arcs.push(Arc::new(VideoAnalysisTool::new(
+            root_config.multimodal.generation.clone(),
+        )));
+    }
 
     if let Some(key) = composio_key {
         if !key.is_empty() {

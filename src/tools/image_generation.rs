@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use super::traits::{Tool, ToolResult};
 use crate::config::schema::MultimodalGenerationConfig;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Image generation tool name
 pub const TOOL_NAME: &str = "image_generation";
@@ -80,12 +81,13 @@ pub struct ImageData {
 /// Image Generation Tool
 pub struct ImageGenerationTool {
     config: MultimodalGenerationConfig,
+    workspace_dir: PathBuf,
 }
 
 impl ImageGenerationTool {
     /// Create a new image generation tool instance
-    pub fn new(config: MultimodalGenerationConfig) -> Self {
-        Self { config }
+    pub fn new(config: MultimodalGenerationConfig, workspace_dir: PathBuf) -> Self {
+        Self { config, workspace_dir }
     }
 
     /// Generate images using the configured or specified provider
@@ -149,10 +151,15 @@ impl ImageGenerationTool {
                 "size": size
             })),
             "gemini" => Ok(serde_json::json!({
-                "model": model,
-                "prompt": params.prompt,
-                "number_of_images": n,
-                "aspect_ratio": self.size_to_aspect_ratio(size)
+                "contents": [
+                    {
+                        "parts": [
+                            {
+                                "text": params.prompt
+                            }
+                        ]
+                    }
+                ]
             })),
             _ => Ok(serde_json::json!({
                 "model": model,
@@ -173,6 +180,36 @@ impl ImageGenerationTool {
         }
     }
 
+    /// Get API key for image generation
+    fn get_api_key(&self, provider: &str) -> Option<String> {
+        // Priority: config.api_key > ZEROCLAW_API_KEY
+        if let Some(ref key) = self.config.api_key {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+
+        if let Ok(key) = std::env::var("ZEROCLAW_API_KEY") {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+
+        // Provider specific environment variables
+        match provider {
+            "openai" => std::env::var("OPENAI_API_KEY").ok(),
+            "gemini" => std::env::var("GEMINI_API_KEY")
+                .ok()
+                .or_else(|| std::env::var("GOOGLE_API_KEY").ok()),
+            "anthropic" | "claude" => std::env::var("ANTHROPIC_API_KEY").ok(),
+            _ => None,
+        }
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    }
+
     /// Call the provider API
     async fn call_provider(
         &self,
@@ -182,23 +219,16 @@ impl ImageGenerationTool {
     ) -> anyhow::Result<ImageGenerationResponse> {
         // Get API key from config or environment
         let api_key = self
-            .config
-            .api_key
-            .clone()
-            .or_else(|| std::env::var("ZEROCLAW_API_KEY").ok())
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok());
-
-        if api_key.is_none() {
-            anyhow::bail!("No API key configured for image generation");
-        }
+            .get_api_key(provider)
+            .ok_or_else(|| anyhow::anyhow!("No API key configured for image generation (provider: {})", provider))?;
 
         // Build request URL based on provider
         let url = match provider {
             "openai" => "https://api.openai.com/v1/images/generations".to_string(),
             "anthropic" => "https://api.anthropic.com/v1/images/generations".to_string(),
             "gemini" => format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/{}:predict",
-                model
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+                model, api_key
             ),
             _ => return Err(anyhow::anyhow!("Unsupported image generation provider: {}", provider)),
         };
@@ -208,16 +238,21 @@ impl ImageGenerationTool {
         let mut request = client.post(url);
 
         // Add authentication and headers
-        request = request.header("Authorization", format!("Bearer {}", api_key.unwrap()));
+        match provider {
+            "gemini" => {
+                // Gemini uses API key in URL query param, already added above
+            }
+            _ => {
+                request = request.header("Authorization", format!("Bearer {}", api_key));
+            }
+        }
+
         request = request.header("Content-Type", "application/json");
 
         // Provider-specific headers
         match provider {
             "anthropic" => {
                 request = request.header("anthropic-version", "2023-06-01");
-            }
-            "gemini" => {
-                // Gemini uses API key in URL query param
             }
             _ => {}
         }
@@ -280,7 +315,7 @@ impl ImageGenerationTool {
                             .get("b64_json")
                             .and_then(|b| b.as_str())
                             .map(|s| s.to_string());
-                        let revised = item
+                        let _revised = item
                             .get("revised_prompt")
                             .and_then(|r| r.as_str())
                             .map(|s| s.to_string());
@@ -293,6 +328,41 @@ impl ImageGenerationTool {
                         }
                     })
                     .collect();
+
+                Ok(images)
+            }
+            "gemini" => {
+                // Gemini generateContent returns images in candidates[0].content.parts[i].inlineData
+                let candidates = response
+                    .get("candidates")
+                    .and_then(|c| c.as_array())
+                    .ok_or_else(|| anyhow::anyhow!("Invalid Gemini response: missing candidates. Body: {}", response))?;
+
+                let candidate = candidates.first().ok_or_else(|| anyhow::anyhow!("Gemini response: empty candidates"))?;
+                let parts = candidate
+                    .get("content")
+                    .and_then(|c| c.get("parts"))
+                    .and_then(|p| p.as_array())
+                    .ok_or_else(|| anyhow::anyhow!("Gemini response: missing parts"))?;
+
+                let mut images = Vec::new();
+                for part in parts {
+                    if let Some(inline_data) = part.get("inlineData") {
+                        let mime_type = inline_data.get("mimeType").and_then(|m| m.as_str()).unwrap_or("image/png");
+                        let data = inline_data.get("data").and_then(|d| d.as_str()).ok_or_else(|| anyhow::anyhow!("Gemini part missing image data"))?;
+                        
+                        images.push(ImageData {
+                            url: None,
+                            b64_json: Some(data.to_string()),
+                            format: mime_type.split('/').last().unwrap_or("png").to_string(),
+                            seed: None,
+                        });
+                    }
+                }
+
+                if images.is_empty() {
+                    anyhow::bail!("Gemini response contained no images in parts");
+                }
 
                 Ok(images)
             }
@@ -396,11 +466,59 @@ impl Tool for ImageGenerationTool {
         }
 
         match self.generate(params).await {
-            Ok(response) => Ok(ToolResult {
-                success: true,
-                output: serde_json::to_string(&response).unwrap_or_default(),
-                error: None,
-            }),
+            Ok(response) => {
+                let mut output = format!(
+                    "Successfully generated {} image(s) using {} (model: {}).
+
+",
+                    response.images.len(),
+                    response.provider,
+                    response.model
+                );
+
+                // Create images directory if it doesn't exist
+                let images_dir = self.workspace_dir.join("generated_images");
+                std::fs::create_dir_all(&images_dir).ok();
+
+                for (i, img) in response.images.iter().enumerate() {
+                    if let Some(ref b64_data) = img.b64_json {
+                        // Decode base64 from provider response to binary bytes
+                        use base64::Engine;
+                        let image_bytes = base64::engine::general_purpose::STANDARD
+                            .decode(b64_data)
+                            .map_err(|e| anyhow::anyhow!("Failed to decode image data: {}", e))?;
+                        
+                        // Generate unique filename
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis();
+                        let filename = format!("image_{}_{}.{}", timestamp, i, img.format);
+                        let file_path = images_dir.join(&filename);
+                        
+                        // Write binary bytes to file
+                        std::fs::write(&file_path, &image_bytes)
+                            .map_err(|e| anyhow::anyhow!("Failed to write image file: {}", e))?;
+                        
+                        // Return file path as [IMAGE:/path/to/file]
+                        output.push_str(&format!("[IMAGE:{}]
+", file_path.display()));
+                    } else if let Some(ref url) = img.url {
+                        output.push_str(&format!("[IMAGE:{}]
+", url));
+                    }
+                    if let Some(ref revised) = response.revised_prompt {
+                        output.push_str(&format!("Revised prompt {}: {}
+", i + 1, revised));
+                    }
+                }
+
+                Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -421,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_size_to_aspect_ratio() {
-        let tool = ImageGenerationTool::new(MultimodalGenerationConfig::default());
+        let tool = ImageGenerationTool::new(MultimodalGenerationConfig::default(), std::env::temp_dir());
         
         assert_eq!(tool.size_to_aspect_ratio("1024x1024"), "1:1");
         assert_eq!(tool.size_to_aspect_ratio("1792x1024"), "16:9");

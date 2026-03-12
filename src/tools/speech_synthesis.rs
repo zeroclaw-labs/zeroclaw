@@ -203,7 +203,7 @@ impl SpeechSynthesisTool {
         provider: &str,
         model: &str,
         voice: &str,
-        format: &str,
+        _format: &str,
         payload: serde_json::Value,
     ) -> anyhow::Result<String> {
         // Get API key from config or environment

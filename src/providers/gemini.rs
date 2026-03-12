@@ -208,6 +208,18 @@ struct ResponsePart {
     /// Thinking models (e.g. gemini-3-pro-preview) mark reasoning parts with `thought: true`.
     #[serde(default)]
     thought: bool,
+    /// Image data returned by generateContent with image models (e.g. banana models).
+    #[serde(default, rename = "inlineData")]
+    inline_data: Option<InlineDataResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InlineDataResponse {
+    /// MIME type of the image (e.g., "image/png", "image/jpeg").
+    #[serde(default, rename = "mimeType")]
+    mime_type: Option<String>,
+    /// Base64-encoded image data.
+    data: String,
 }
 
 impl CandidateContent {

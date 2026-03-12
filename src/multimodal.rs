@@ -95,7 +95,13 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
 pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
     messages
         .iter()
-        .filter(|m| m.role == "user")
+        .filter(|m| {
+            // Ignore tool results - they contain generated images that should not be
+            // sent back to the LLM as vision input. Tool results are identified
+            // by their content starting with "[Tool results]" (prompt mode) or
+            // by having role="tool" (native mode).
+            m.role == "user" && !m.content.starts_with("[Tool results]")
+        })
         .map(|m| parse_image_markers(&m.content).1.len())
         .sum()
 }
@@ -638,6 +644,7 @@ fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::schema::MultimodalGenerationConfig;
 
     #[test]
     fn parse_image_markers_extracts_multiple_markers() {
@@ -699,6 +706,7 @@ mod tests {
             max_images: 1,
             max_image_size_mb: 5,
             allow_remote_fetch: false,
+            generation: MultimodalGenerationConfig::default(),
         };
 
         let error = prepare_messages_for_provider(&messages, &config)
@@ -741,6 +749,7 @@ mod tests {
             max_images: 4,
             max_image_size_mb: 1,
             allow_remote_fetch: false,
+            generation: MultimodalGenerationConfig::default(),
         };
 
         let error = prepare_messages_for_provider(&messages, &config)

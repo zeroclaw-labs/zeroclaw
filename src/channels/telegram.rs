@@ -4,6 +4,7 @@ use crate::config::{AckReactionConfig, Config, StreamMode};
 use crate::security::pairing::PairingGuard;
 use anyhow::Context;
 use async_trait::async_trait;
+use base64::Engine as _;
 use directories::UserDirs;
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
@@ -421,28 +422,41 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
         let close = open + 1 + close_rel;
         let marker = &message[open + 1..close];
 
-        let parsed = marker.split_once(':').and_then(|(kind, target)| {
-            let kind = TelegramAttachmentKind::from_marker(kind)?;
-            let target = target.trim();
-            if target.is_empty() {
-                return None;
-            }
-            Some(TelegramAttachment {
+        // Parse "KIND:target" where target can contain colons (e.g., data: URIs)
+        // Find the first ':' to split KIND from target
+        let Some(first_colon) = marker.find(':') else {
+            // No colon at all — keep as text
+            cleaned.push_str(&message[open..=close]);
+            cursor = close + 1;
+            continue;
+        };
+
+        let kind_str = &marker[..first_colon];
+        let target = marker[first_colon + 1..].trim();
+
+        // Skip empty targets
+        if target.is_empty() {
+            cleaned.push_str(&message[open..=close]);
+            cursor = close + 1;
+            continue;
+        }
+
+        let Some(kind) = TelegramAttachmentKind::from_marker(kind_str) else {
+            // Unknown kind — keep as text
+            cleaned.push_str(&message[open..=close]);
+            cursor = close + 1;
+            continue;
+        };
+
+        // Skip duplicate targets — LLMs sometimes emit repeated markers in one reply.
+        if !attachments
+            .iter()
+            .any(|a: &TelegramAttachment| a.target == target)
+        {
+            attachments.push(TelegramAttachment {
                 kind,
                 target: target.to_string(),
-            })
-        });
-
-        if let Some(attachment) = parsed {
-            // Skip duplicate targets — LLMs sometimes emit repeated markers in one reply.
-            if !attachments
-                .iter()
-                .any(|a: &TelegramAttachment| a.target == attachment.target)
-            {
-                attachments.push(attachment);
-            }
-        } else {
-            cleaned.push_str(&message[open..=close]);
+            });
         }
 
         cursor = close + 1;
@@ -2430,6 +2444,44 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     ) -> anyhow::Result<()> {
         let target = attachment.target.trim();
 
+        // Handle data: URI markers (memory-to-memory transfer)
+        if target.starts_with("data:") {
+            if let Some(comma_idx) = target.find(',') {
+                let header = &target[..comma_idx];
+                let payload = &target[comma_idx + 1..];
+
+                if header.contains(";base64") {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(payload.trim())
+                        .map_err(|e| anyhow::anyhow!("Failed to decode base64 attachment: {e}"))?;
+
+                    let mime = header
+                        .trim_start_matches("data:")
+                        .split(';')
+                        .next()
+                        .unwrap_or("application/octet-stream");
+                    let ext = mime.split('/').last().unwrap_or("bin");
+                    let filename = format!("generated_{}.{}", uuid::Uuid::new_v4(), ext);
+
+                    return match attachment.kind {
+                        TelegramAttachmentKind::Image => {
+                            self.send_photo_bytes(chat_id, thread_id, bytes, &filename, None)
+                                .await
+                        }
+                        TelegramAttachmentKind::Audio | TelegramAttachmentKind::Voice => {
+                            self.send_audio_bytes(chat_id, thread_id, bytes, &filename, None)
+                                .await
+                        }
+                        _ => {
+                            self.send_document_bytes(chat_id, thread_id, bytes, &filename, None)
+                                .await
+                        }
+                    };
+                }
+            }
+            anyhow::bail!("Unsupported data URI format in marker");
+        }
+
         if is_http_url(target) {
             let result = match attachment.kind {
                 TelegramAttachmentKind::Image => {
@@ -2678,6 +2730,19 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .unwrap_or("video.mp4");
 
         let file_bytes = tokio::fs::read(file_path).await?;
+        self.send_video_bytes(chat_id, thread_id, file_bytes, file_name, caption)
+            .await
+    }
+
+    /// Send a video from bytes to a Telegram chat
+    pub async fn send_video_bytes(
+        &self,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        file_bytes: Vec<u8>,
+        file_name: &str,
+        caption: Option<&str>,
+    ) -> anyhow::Result<()> {
         let part = Part::bytes(file_bytes).file_name(file_name.to_string());
 
         let mut form = Form::new()
@@ -2723,6 +2788,19 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .unwrap_or("audio.mp3");
 
         let file_bytes = tokio::fs::read(file_path).await?;
+        self.send_audio_bytes(chat_id, thread_id, file_bytes, file_name, caption)
+            .await
+    }
+
+    /// Send an audio file from bytes to a Telegram chat
+    pub async fn send_audio_bytes(
+        &self,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        file_bytes: Vec<u8>,
+        file_name: &str,
+        caption: Option<&str>,
+    ) -> anyhow::Result<()> {
         let part = Part::bytes(file_bytes).file_name(file_name.to_string());
 
         let mut form = Form::new()
@@ -2768,6 +2846,19 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .unwrap_or("voice.ogg");
 
         let file_bytes = tokio::fs::read(file_path).await?;
+        self.send_voice_bytes(chat_id, thread_id, file_bytes, file_name, caption)
+            .await
+    }
+
+    /// Send a voice message from bytes to a Telegram chat
+    pub async fn send_voice_bytes(
+        &self,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        file_bytes: Vec<u8>,
+        file_name: &str,
+        caption: Option<&str>,
+    ) -> anyhow::Result<()> {
         let part = Part::bytes(file_bytes).file_name(file_name.to_string());
 
         let mut form = Form::new()

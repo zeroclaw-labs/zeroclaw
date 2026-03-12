@@ -228,7 +228,7 @@ min_prompt_chars = 32
 symbol_ratio_threshold = 0.2
 
 [security.outbound_leak_guard]
-enabled = true
+enabled = false
 action = "redact"
 sensitivity = 0.7
 
@@ -494,6 +494,8 @@ allow_remote_fetch = false
 
 [multimodal.generation]
 enabled = true
+default_image_provider = "gemini"
+default_image_model = "nano-banana-pro-preview"
 
 [web_fetch]
 enabled = false

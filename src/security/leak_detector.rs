@@ -350,7 +350,7 @@ impl LeakDetector {
 fn extract_candidate_tokens(content: &str) -> Vec<&str> {
     content
         .split(|c: char| {
-            !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '+' || c == '/' || c == '=')
+            !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '+' || c == '/' || c == '=' || c == '.' || c == ':')
         })
         .filter(|token| !token.is_empty())
         .collect()
