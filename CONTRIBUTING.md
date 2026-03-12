@@ -151,15 +151,23 @@ git diff --cached | grep -iE '(api[_-]?key|secret|token|password|bearer|sk-)'
 git status --short | grep -E '\.env$'
 ```
 
-### Optional Local Secret Scanning
+### Local Secret Scanning
 
-For extra guardrails, install one of:
+The repository hooks enforce secret scanning on both commit and push:
+
+- `.githooks/pre-commit` scans staged changes
+- `.githooks/pre-push` scans commits being pushed
+
+Primary engine: `gitleaks` (if installed).  
+Fallback engine: built-in regex scanner (`scripts/ci/secrets_guard.sh`) so checks still run without `gitleaks`.
+
+Recommended extra tools:
 
 - **gitleaks**: [GitHub - gitleaks/gitleaks](https://github.com/gitleaks/gitleaks)
 - **truffleHog**: [GitHub - trufflesecurity/trufflehog](https://github.com/trufflesecurity/trufflehog)
 - **git-secrets**: [GitHub - awslabs/git-secrets](https://github.com/awslabs/git-secrets)
 
-This repo includes `.githooks/pre-commit` to run `gitleaks protect --staged --redact` when gitleaks is installed.
+This repo includes `.githooks/pre-commit` and `.githooks/pre-push` wired to `scripts/ci/secrets_guard.sh`.
 
 Enable hooks with:
 
@@ -167,7 +175,12 @@ Enable hooks with:
 git config core.hooksPath .githooks
 ```
 
-If gitleaks is not installed, the pre-commit hook prints a warning and continues.
+Emergency bypass (not recommended):
+
+```bash
+ZEROCLAW_SKIP_SECRET_SCAN=1 git commit ...
+ZEROCLAW_SKIP_SECRET_SCAN=1 git push ...
+```
 
 ### What Must Never Be Committed
 

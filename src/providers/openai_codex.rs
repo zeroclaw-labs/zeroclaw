@@ -5,6 +5,7 @@ use crate::providers::traits::{ChatMessage, Provider, ProviderCapabilities};
 use crate::providers::ProviderRuntimeOptions;
 use async_trait::async_trait;
 use reqwest::Client;
+use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -473,8 +474,52 @@ fn extract_stream_error_message(event: &Value) -> Option<String> {
     None
 }
 
+fn response_header(headers: &HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
+        .to_string()
+}
+
+fn summarize_response_metadata(status: reqwest::StatusCode, headers: &HeaderMap) -> String {
+    format!(
+        "status={} content-type={} content-encoding={} transfer-encoding={} content-length={} x-request-id={} cf-ray={}",
+        status.as_u16(),
+        response_header(headers, "content-type"),
+        response_header(headers, "content-encoding"),
+        response_header(headers, "transfer-encoding"),
+        response_header(headers, "content-length"),
+        response_header(headers, "x-request-id"),
+        response_header(headers, "cf-ray")
+    )
+}
+
+fn summarize_json_shape(body: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(body).ok()?;
+    match parsed {
+        Value::Object(map) => {
+            let mut keys: Vec<String> = map.keys().cloned().collect();
+            keys.sort_unstable();
+            keys.truncate(8);
+            Some(format!("top-level object keys=[{}]", keys.join(",")))
+        }
+        Value::Array(items) => Some(format!("top-level array len={}", items.len())),
+        Value::String(_) => Some("top-level string".to_string()),
+        Value::Number(_) => Some("top-level number".to_string()),
+        Value::Bool(_) => Some("top-level bool".to_string()),
+        Value::Null => Some("top-level null".to_string()),
+    }
+}
+
 async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<String> {
-    let body = response.text().await?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let metadata = summarize_response_metadata(status, &headers);
+    let raw_bytes = response.bytes().await.map_err(|err| {
+        anyhow::anyhow!("OpenAI Codex read body failed ({metadata}): {err}")
+    })?;
+    let body = String::from_utf8_lossy(&raw_bytes).to_string();
 
     if let Some(text) = parse_sse_text(&body)? {
         return Ok(text);
@@ -484,18 +529,20 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<St
     let looks_like_sse = body_trimmed.starts_with("event:") || body_trimmed.starts_with("data:");
     if looks_like_sse {
         return Err(anyhow::anyhow!(
-            "No response from OpenAI Codex stream payload: {}",
+            "No response from OpenAI Codex stream payload ({metadata}): {}",
             super::sanitize_api_error(&body)
         ));
     }
 
     let parsed: ResponsesResponse = serde_json::from_str(&body).map_err(|err| {
+        let shape = summarize_json_shape(&body).unwrap_or_else(|| "non-JSON payload".to_string());
         anyhow::anyhow!(
-            "OpenAI Codex JSON parse failed: {err}. Payload: {}",
+            "OpenAI Codex JSON parse failed ({metadata}; {shape}): {err}. Payload: {}",
             super::sanitize_api_error(&body)
         )
     })?;
-    extract_responses_text(&parsed).ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex"))
+    extract_responses_text(&parsed)
+        .ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex ({metadata})"))
 }
 
 impl OpenAiCodexProvider {
@@ -882,6 +929,21 @@ data: [DONE]
 "#;
 
         assert_eq!(parse_sse_text(payload).unwrap().as_deref(), Some("Done"));
+    }
+
+    #[test]
+    fn summarize_json_shape_reports_top_level_object_keys() {
+        let shape = summarize_json_shape(r#"{"error":{"message":"nope"},"type":"error"}"#).unwrap();
+        assert_eq!(shape, "top-level object keys=[error,type]");
+    }
+
+    #[test]
+    fn summarize_json_shape_sorts_before_truncating() {
+        let shape = summarize_json_shape(
+            r#"{"z":"1","y":"1","x":"1","w":"1","v":"1","u":"1","t":"1","s":"1","a":"1","b":"1"}"#,
+        )
+        .unwrap();
+        assert_eq!(shape, "top-level object keys=[a,b,s,t,u,v,w,x]");
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub mod delegate;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
+pub mod facebook_page_post;
 pub mod git_operations;
 pub mod glob_search;
 #[cfg(feature = "hardware")]
@@ -69,6 +70,7 @@ pub use delegate::DelegateTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use facebook_page_post::FacebookPagePostTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
 #[cfg(feature = "hardware")]
@@ -232,6 +234,10 @@ pub fn all_tools_with_runtime(
         )),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
         Arc::new(GitOperationsTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+        )),
+        Arc::new(FacebookPagePostTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
@@ -406,6 +412,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
         assert!(names.contains(&"schedule"));
+        assert!(names.contains(&"facebook_page_post"));
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
@@ -448,6 +455,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
         assert!(names.contains(&"content_search"));
+        assert!(names.contains(&"facebook_page_post"));
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));

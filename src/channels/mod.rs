@@ -3158,6 +3158,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         "pushover",
         "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",
     ));
+    tool_descs.push((
+        "facebook_page_post",
+        "Create a post on a Facebook Page. Requires env credentials: app_id, app_secret, page_id, and access_token.",
+    ));
     if !config.agents.is_empty() {
         tool_descs.push((
             "delegate",

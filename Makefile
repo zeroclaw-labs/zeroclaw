@@ -4,7 +4,9 @@ ENV_TEMPLATE := .env.codex-discord.example
 SERVICE := zeroclaw-dev
 AUTH_FILE := .zeroclaw/auth-profiles.json
 
-.PHONY: env auth dev down logs logs-debug ps traces
+.PHONY: env auth dev down logs logs-debug ps traces tests
+
+TEST_ARGS ?= --locked --verbose
 
 env:
 	@if [ ! -f "$(ENV_FILE)" ]; then \
@@ -46,3 +48,7 @@ traces: env
 
 ps: env
 	docker compose --env-file "$(ENV_FILE)" -f "$(COMPOSE_FILE)" ps
+
+tests: env
+	docker compose --env-file "$(ENV_FILE)" -f "$(COMPOSE_FILE)" run --rm --no-deps "$(SERVICE)" \
+		/bin/bash -c 'if [ -n "$${ZEROCLAW_CARGO_FEATURES:-}" ]; then cargo test --features "$${ZEROCLAW_CARGO_FEATURES}" $(TEST_ARGS); else cargo test $(TEST_ARGS); fi'

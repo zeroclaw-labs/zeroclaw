@@ -37,6 +37,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.whatsapp",
     "tool.browser",
     "tool.composio",
+    "tool.facebook_page_post",
     "tool.http_request",
     "tool.pushover",
     "memory.embeddings",

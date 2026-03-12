@@ -28,9 +28,13 @@ services:
       ZEROCLAW_GATEWAY_PORT: "42617"
       RUST_LOG: ${RUST_LOG:-info}
       ZEROCLAW_CARGO_FEATURES: ${ZEROCLAW_CARGO_FEATURES:-rag-pdf}
+      ZEROCLAW_OBSERVABILITY_BACKEND: ${ZEROCLAW_OBSERVABILITY_BACKEND:-log}
+      ZEROCLAW_OTEL_ENDPOINT: ${ZEROCLAW_OTEL_ENDPOINT:-http://localhost:4318}
+      ZEROCLAW_OTEL_SERVICE_NAME: ${ZEROCLAW_OTEL_SERVICE_NAME:-zeroclaw-dev-codex-discord}
       ZEROCLAW_RUNTIME_TRACE_MODE: ${ZEROCLAW_RUNTIME_TRACE_MODE:-rolling}
       ZEROCLAW_RUNTIME_TRACE_PATH: ${ZEROCLAW_RUNTIME_TRACE_PATH:-state/runtime-trace.jsonl}
       ZEROCLAW_RUNTIME_TRACE_MAX_ENTRIES: ${ZEROCLAW_RUNTIME_TRACE_MAX_ENTRIES:-2000}
+      ZEROCLAW_ALLOW_DIAGNOSTIC_SHELL_COMMANDS: ${ZEROCLAW_ALLOW_DIAGNOSTIC_SHELL_COMMANDS:-false}
       DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:?set DISCORD_BOT_TOKEN in .env}
       DISCORD_MENTION_ONLY: ${DISCORD_MENTION_ONLY:-false}
       DISCORD_LISTEN_TO_BOTS: ${DISCORD_LISTEN_TO_BOTS:-false}
@@ -77,16 +81,65 @@ services:
           ''|*[!0-9]*) runtime_trace_max_entries="2000" ;;
         esac
 
+        allow_diagnostic_shell_commands="$$(printf '%s' "${ZEROCLAW_ALLOW_DIAGNOSTIC_SHELL_COMMANDS:-false}" | tr '[:upper:]' '[:lower:]')"
+        case "$${allow_diagnostic_shell_commands}" in
+          true|false) ;;
+          *) allow_diagnostic_shell_commands="false" ;;
+        esac
+
+        allowed_commands='"git", "npm", "cargo", "ls", "cat", "grep", "find", "echo", "pwd", "wc", "head", "tail", "date", "curl"'
+        if [ "$${allow_diagnostic_shell_commands}" = "true" ]; then
+          allowed_commands="$${allowed_commands}, \"env\", \"printenv\""
+        fi
+
+        observability_backend="$$(printf '%s' "${ZEROCLAW_OBSERVABILITY_BACKEND:-log}" | tr '[:upper:]' '[:lower:]')"
+        case "$${observability_backend}" in
+          none|noop|log|prometheus|otel|opentelemetry|otlp) ;;
+          *) observability_backend="log" ;;
+        esac
+
+        otel_endpoint="${ZEROCLAW_OTEL_ENDPOINT:-http://localhost:4318}"
+        otel_service_name="${ZEROCLAW_OTEL_SERVICE_NAME:-zeroclaw-dev-codex-discord}"
+
         printf '%s\n' \
           'default_provider = "openai-codex"' \
           'default_model = "gpt-5.3-codex"' \
           'default_temperature = 0.2' \
           '' \
           '[observability]' \
-          'backend = "none"' \
+          "backend = \"$${observability_backend}\"" \
           "runtime_trace_mode = \"$${runtime_trace_mode}\"" \
           "runtime_trace_path = \"$${runtime_trace_path}\"" \
           "runtime_trace_max_entries = $${runtime_trace_max_entries}" \
+          > /app/.zeroclaw/config.toml
+
+        case "$${observability_backend}" in
+          otel|opentelemetry|otlp)
+            printf '%s\n' \
+              "otel_endpoint = \"$${otel_endpoint}\"" \
+              "otel_service_name = \"$${otel_service_name}\"" \
+              >> /app/.zeroclaw/config.toml
+            ;;
+        esac
+
+        printf '%s\n' \
+          '' \
+          '[autonomy]' \
+          'level = "supervised"' \
+          'workspace_only = true' \
+          "allowed_commands = [$${allowed_commands}]" \
+          'forbidden_paths = ["/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/boot", "/dev", "/proc", "/sys", "/var", "/tmp", "~/.ssh", "~/.gnupg", "~/.aws", "~/.config"]' \
+          'max_actions_per_hour = 20' \
+          'max_cost_per_day_cents = 500' \
+          '' \
+          '[http_request]' \
+          'enabled = true' \
+          'allowed_domains = ["graph.facebook.com", "graph-video.facebook.com"]' \
+          '' \
+          '[web_fetch]' \
+          'enabled = true' \
+          'allowed_domains = ["graph.facebook.com", "graph-video.facebook.com"]' \
+          'blocked_domains = []' \
           '' \
           '[gateway]' \
           'port = 42617' \
@@ -101,7 +154,7 @@ services:
           'allowed_users = ["*"]' \
           "listen_to_bots = $${discord_listen_to_bots}" \
           "mention_only = $${discord_mention_only}" \
-          > /app/.zeroclaw/config.toml
+          >> /app/.zeroclaw/config.toml
 
         exec zeroclaw daemon
 

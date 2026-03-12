@@ -6,6 +6,40 @@
 
 set -euo pipefail
 
+zero_sha="0000000000000000000000000000000000000000"
+ranges=()
+while read -r local_ref local_sha remote_ref remote_sha; do
+    # deleted branch/tag on local side
+    if [ "${local_sha:-}" = "$zero_sha" ]; then
+        continue
+    fi
+
+    if [ -z "${local_sha:-}" ]; then
+        continue
+    fi
+
+    if [ "${remote_sha:-$zero_sha}" = "$zero_sha" ]; then
+        # New remote ref: scan commits not present on any remote-tracking branch.
+        while IFS= read -r commit_sha; do
+            [ -n "$commit_sha" ] && ranges+=("$commit_sha")
+        done < <(git rev-list "$local_sha" --not --remotes)
+    else
+        ranges+=("${remote_sha}..${local_sha}")
+    fi
+done
+
+if [ ${#ranges[@]} -gt 0 ]; then
+    echo "==> pre-push: running secret scan..."
+    for range in "${ranges[@]}"; do
+        ./scripts/ci/secrets_guard.sh --mode range --range "$range" || {
+            echo "FAIL: secret scan failed for range $range."
+            exit 1
+        }
+    done
+else
+    echo "==> pre-push: no refs to scan (skipping secret scan range step)."
+fi
+
 echo "==> pre-push: running rust quality gate..."
 ./scripts/ci/rust_quality_gate.sh || {
     echo "FAIL: rust quality gate failed."
