@@ -189,7 +189,7 @@ pub fn detect_language_hint(text: &str) -> Option<&'static str> {
         }
     }
 
-    let total = sample.len();
+    let total = sample.chars().count();
     if cjk * 2 > total {
         return Some("zh");
     }
