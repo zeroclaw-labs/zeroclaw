@@ -623,7 +623,8 @@ mod tests {
                 "action": "draft_update",
                 "project_name": "ZeroClaw",
                 "audience": "internal",
-                "tone": "casual"
+                "tone": "casual",
+                "highlights": "Core loop stabilized"
             }))
             .await
             .unwrap();
