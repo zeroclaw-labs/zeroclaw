@@ -8,6 +8,7 @@ use super::report_templates;
 use super::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
+use std::fmt::Write as _;
 use std::collections::HashMap;
 
 /// Project intelligence tool for consulting project management.
@@ -241,11 +242,12 @@ impl ProjectIntelTool {
             "{greeting}\n\nHere is an update on {project_name}.\n\n**Highlights:**\n{highlights}"
         );
         if !concerns.is_empty() {
-            body.push_str(&format!("\n\n**Items requiring attention:**\n{concerns}"));
+            let _ = write!(body, "\n\n**Items requiring attention:**\n{concerns}");
         }
-        body.push_str(&format!(
+        let _ = write!(
+            body,
             "\n\nPlease do not hesitate to reach out with any questions.\n\n{closing}"
-        ));
+        );
 
         Ok(ToolResult {
             success: true,

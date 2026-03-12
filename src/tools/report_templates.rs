@@ -4,6 +4,7 @@
 //! and milestone reports with multi-language support (EN, DE, FR, IT).
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 /// Supported report output formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,12 +46,12 @@ impl ReportTemplate {
             let body = substitute(&section.body, vars);
             match self.format {
                 ReportFormat::Markdown => {
-                    out.push_str(&format!("## {heading}\n\n{body}\n\n"));
+                    let _ = write!(out, "## {heading}\n\n{body}\n\n");
                 }
                 ReportFormat::Html => {
                     let heading = escape_html(&heading);
                     let body = escape_html(&body);
-                    out.push_str(&format!("<h2>{heading}</h2>\n<p>{body}</p>\n"));
+                    let _ = write!(out, "<h2>{heading}</h2>\n<p>{body}</p>\n");
                 }
             }
         }
