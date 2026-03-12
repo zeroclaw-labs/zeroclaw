@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 pub struct OpenRouterProvider {
     credential: Option<String>,
+    reasoning_enabled: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,6 +69,9 @@ struct NativeChatRequest {
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    /// Include reasoning content in the response for models that support it
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include_reasoning: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,6 +153,14 @@ impl OpenRouterProvider {
     pub fn new(credential: Option<&str>) -> Self {
         Self {
             credential: credential.map(ToString::to_string),
+            reasoning_enabled: None,
+        }
+    }
+
+    pub fn new_with_reasoning(credential: Option<&str>, reasoning_enabled: Option<bool>) -> Self {
+        Self {
+            credential: credential.map(ToString::to_string),
+            reasoning_enabled,
         }
     }
 
@@ -443,6 +455,7 @@ impl Provider for OpenRouterProvider {
             temperature,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
+            include_reasoning: self.reasoning_enabled,
         };
 
         let response = self
@@ -534,6 +547,7 @@ impl Provider for OpenRouterProvider {
             temperature,
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
+            include_reasoning: self.reasoning_enabled,
         };
 
         let response = self
