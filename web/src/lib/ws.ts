@@ -26,7 +26,7 @@ const SESSION_STORAGE_KEY = 'zeroclaw_session_id';
 function getOrCreateSessionId(): string {
   let id = sessionStorage.getItem(SESSION_STORAGE_KEY);
   if (!id) {
-    id = crypto.randomUUID();
+    id = crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
     sessionStorage.setItem(SESSION_STORAGE_KEY, id);
   }
   return id;
