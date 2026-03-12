@@ -677,6 +677,7 @@ pub struct ProviderRuntimeOptions {
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
+    pub reasoning_effort: Option<String>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -687,6 +688,7 @@ impl Default for ProviderRuntimeOptions {
             zeroclaw_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: None,
+            reasoning_effort: None,
         }
     }
 }

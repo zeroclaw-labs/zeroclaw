@@ -2332,6 +2332,11 @@ pub struct RuntimeConfig {
     /// - `Some(false)`: disable reasoning/thinking when supported
     #[serde(default)]
     pub reasoning_enabled: Option<bool>,
+
+    /// Optional reasoning effort override for providers that expose granular controls.
+    /// Currently consumed by the OpenAI Codex responses API.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Docker runtime configuration (`[runtime.docker]` section).
@@ -2406,6 +2411,7 @@ impl Default for RuntimeConfig {
             kind: default_runtime_kind(),
             docker: DockerRuntimeConfig::default(),
             reasoning_enabled: None,
+            reasoning_effort: None,
         }
     }
 }
@@ -5909,6 +5915,19 @@ reasoning_enabled = false
 
         let parsed: Config = toml::from_str(raw).unwrap();
         assert_eq!(parsed.runtime.reasoning_enabled, Some(false));
+    }
+
+    #[test]
+    async fn runtime_reasoning_effort_deserializes() {
+        let raw = r#"
+default_temperature = 0.7
+
+[runtime]
+reasoning_effort = "high"
+"#;
+
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.runtime.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]
