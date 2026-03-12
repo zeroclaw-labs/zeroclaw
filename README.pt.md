@@ -221,7 +221,7 @@ Exemplo de amostra (macOS arm64, medido em 18 de fevereiro de 2026):
 O script `bootstrap.sh` instala Rust, clona ZeroClaw, compila, e configura seu ambiente de desenvolvimento inicial:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/bootstrap.sh | bash
 ```
 
 Isso vai:

@@ -221,7 +221,7 @@ impl Observer for PrometheusObserver {
                         .inc_by(*output);
                 }
             }
-            ObserverEvent::ToolCallStart { tool: _ }
+            ObserverEvent::ToolCallStart { .. }
             | ObserverEvent::TurnComplete
             | ObserverEvent::LlmRequest { .. } => {}
             ObserverEvent::ToolCall {
