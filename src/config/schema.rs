@@ -5734,7 +5734,7 @@ default_temperature = 0.7
             config_path: PathBuf::from("/tmp/test/config.toml"),
             api_key: Some("sk-test-key".into()),
             api_url: None,
-        api_path: None,
+            api_path: None,
             default_provider: Some("openrouter".into()),
             default_model: Some("gpt-4o".into()),
             model_providers: HashMap::new(),
@@ -5975,7 +5975,7 @@ tool_dispatcher = "xml"
             config_path: config_path.clone(),
             api_key: Some("sk-roundtrip".into()),
             api_url: None,
-        api_path: None,
+            api_path: None,
             default_provider: Some("openrouter".into()),
             default_model: Some("test-model".into()),
             model_providers: HashMap::new(),
@@ -7219,7 +7219,7 @@ requires_openai_auth = true
             default_provider: Some("ollama".to_string()),
             default_model: Some("glm-5:cloud".to_string()),
             api_url: None,
-        api_path: None,
+            api_path: None,
             api_key: Some("ollama-key".to_string()),
             ..Config::default()
         };
