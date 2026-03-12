@@ -208,10 +208,10 @@ export default function ChatWidget({
               {"\uC11C\uBC84 \uC5F0\uACB0"} Connect to Server
             </h2>
             <p className="mt-2 text-sm text-dark-400">
-              {"\uCC44\uD305\uC744 \uC2DC\uC791\uD558\uB824\uBA74 ZeroClaw \uC11C\uBC84\uC5D0 \uC5F0\uACB0\uD558\uC138\uC694."}
+              {"\uCC44\uD305\uC744 \uC2DC\uC791\uD558\uB824\uBA74 MoA \uC11C\uBC84\uC5D0 \uC5F0\uACB0\uD558\uC138\uC694."}
             </p>
             <p className="mt-1 text-xs text-dark-500">
-              Connect to your ZeroClaw server to start chatting.
+              Connect to your MoA server to start chatting.
             </p>
           </div>
 
@@ -418,10 +418,10 @@ export default function ChatWidget({
       <div className="flex items-center justify-between border-b border-dark-800/50 px-4 py-3">
         <div className="flex items-center gap-3">
           <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary-500/10 border border-primary-500/20">
-            <span className="text-sm font-bold text-primary-400">Z</span>
+            <span className="text-sm font-bold text-primary-400">M</span>
           </div>
           <div>
-            <h2 className="text-sm font-semibold text-dark-100">ZeroClaw Chat</h2>
+            <h2 className="text-sm font-semibold text-dark-100">MoA Chat</h2>
             <div className="flex items-center gap-1.5">
               <div
                 className={`h-1.5 w-1.5 rounded-full ${

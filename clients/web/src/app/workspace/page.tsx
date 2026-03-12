@@ -279,9 +279,9 @@ function WelcomeScreen() {
         </div>
 
         <h2 className="text-2xl font-bold text-dark-100 mb-2">
-          ZeroClaw Agent Workspace
+          MoA Agent Workspace
         </h2>
-        <p className="text-xs text-dark-500 mb-6">ZeroClaw - Domain Specialist Agent Orchestrator</p>
+        <p className="text-xs text-dark-500 mb-6">MoA - Domain Specialist Agent Orchestrator</p>
         <p className="text-sm text-dark-400 mb-8 leading-relaxed">
           상단 카테고리에서 도메인을 선택하고, 원하는 서브 에이전트를 클릭하세요.
           <br />
@@ -295,7 +295,7 @@ function WelcomeScreen() {
           {/* ZeroClaw Orchestrator */}
           <div className="rounded-lg border border-primary-500/30 bg-primary-500/5 p-3 mb-3">
             <div className="text-center">
-              <span className="text-xs font-bold text-primary-300">ZeroClaw Orchestrator</span>
+              <span className="text-xs font-bold text-primary-300">MoA Orchestrator</span>
               <p className="text-[10px] text-dark-500 mt-0.5">목표 설정 / 리소스 배분 / 우선순위 결정</p>
             </div>
           </div>
@@ -357,7 +357,7 @@ function WelcomeScreen() {
         </div>
 
         <p className="text-[10px] text-dark-600">
-          각 도메인의 서브 에이전트는 ZeroClaw가 관리하며, 적절한 LLM과 Tool을 자동 또는 수동으로 선택합니다.
+          각 도메인의 서브 에이전트는 MoA가 관리하며, 적절한 LLM과 Tool을 자동 또는 수동으로 선택합니다.
         </p>
       </div>
     </div>

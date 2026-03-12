@@ -301,10 +301,10 @@ function AuthPageInner() {
         <div className="text-center mb-8">
           <Link href="/" className="inline-flex items-center gap-2 group mb-4">
             <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-primary-500/10 border border-primary-500/20 transition-all group-hover:bg-primary-500/20">
-              <span className="text-2xl font-bold text-primary-400">Z</span>
+              <span className="text-2xl font-bold text-primary-400">M</span>
             </div>
           </Link>
-          <h1 className="text-2xl font-bold text-dark-50">ZeroClaw</h1>
+          <h1 className="text-2xl font-bold text-dark-50">MoA</h1>
           <p className="text-dark-400 text-sm mt-1">
             {step === 'login' && 'Sign in to your account'}
             {step === 'register' && 'Create your account'}

@@ -50,10 +50,10 @@ export default function Header() {
         {/* Logo */}
         <Link href="/" className="flex items-center gap-2 group">
           <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary-500/10 border border-primary-500/20 transition-all group-hover:bg-primary-500/20 group-hover:border-primary-500/30">
-            <span className="text-lg font-bold text-primary-400">Z</span>
+            <span className="text-lg font-bold text-primary-400">M</span>
           </div>
           <span className="text-lg font-bold text-dark-50 tracking-tight">
-            Zero<span className="text-primary-400">Claw</span>
+            Mo<span className="text-primary-400">A</span>
           </span>
         </Link>
 

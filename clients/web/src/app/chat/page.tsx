@@ -163,10 +163,10 @@ export default function ChatPage() {
             <ArrowLeft className="h-4 w-4" />
           </Link>
           <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary-500/10 border border-primary-500/20">
-            <span className="text-sm font-bold text-primary-400">Z</span>
+            <span className="text-sm font-bold text-primary-400">M</span>
           </div>
           <div>
-            <h2 className="text-sm font-semibold text-dark-100">ZeroClaw Agent</h2>
+            <h2 className="text-sm font-semibold text-dark-100">MoA Agent</h2>
             <div className="flex items-center gap-1.5">
               <div className={`h-1.5 w-1.5 rounded-full ${connected ? 'bg-green-400' : 'bg-red-400'}`} />
               <span className="text-xs text-dark-400">
@@ -207,7 +207,7 @@ export default function ChatPage() {
             <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-primary-500/10 border border-primary-500/20 mb-4">
               <Bot className="h-8 w-8 text-primary-400" />
             </div>
-            <p className="text-lg font-semibold text-dark-200">ZeroClaw Agent</p>
+            <p className="text-lg font-semibold text-dark-200">MoA Agent</p>
             <p className="text-sm mt-1 text-dark-400">Send a message to start the conversation</p>
           </div>
         )}

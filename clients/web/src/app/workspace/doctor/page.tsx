@@ -154,7 +154,7 @@ export default function DoctorPage() {
         <div className="flex flex-col items-center justify-center py-16 text-gray-500">
           <Stethoscope className="h-12 w-12 text-gray-600 mb-4" />
           <p className="text-lg font-medium">System Diagnostics</p>
-          <p className="text-sm mt-1">Click &quot;Run Diagnostics&quot; to check your ZeroClaw installation.</p>
+          <p className="text-sm mt-1">Click &quot;Run Diagnostics&quot; to check your MoA installation.</p>
         </div>
       )}
     </div>

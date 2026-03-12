@@ -97,7 +97,7 @@ export default function MyPage() {
               <h3 className="text-sm font-semibold text-dark-200 mb-4">연결된 서비스 Connected Services</h3>
               <div className="space-y-3">
                 {[
-                  { name: "ZeroClaw Server", status: "connected", detail: "localhost:3000" },
+                  { name: "MoA Server", status: "connected", detail: "localhost:3000" },
                   { name: "Google Calendar", status: "disconnected", detail: "" },
                   { name: "Notion", status: "disconnected", detail: "" },
                   { name: "Figma", status: "disconnected", detail: "" },

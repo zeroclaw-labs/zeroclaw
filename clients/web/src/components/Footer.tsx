@@ -9,14 +9,14 @@ export default function Footer() {
           <div className="sm:col-span-2 lg:col-span-1">
             <Link href="/" className="flex items-center gap-2">
               <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary-500/10 border border-primary-500/20">
-                <span className="text-base font-bold text-primary-400">Z</span>
+                <span className="text-base font-bold text-primary-400">M</span>
               </div>
               <span className="text-base font-bold text-dark-50 tracking-tight">
-                Zero<span className="text-primary-400">Claw</span>
+                Mo<span className="text-primary-400">A</span>
               </span>
             </Link>
             <p className="mt-3 text-sm text-dark-400 leading-relaxed max-w-xs">
-              ZeroClaw {"\uB7F0\uD0C0\uC784 \uAE30\uBC18\uC758 \uC790\uC728 AI \uC5D0\uC774\uC804\uD2B8"}
+              MoA {"\uB7F0\uD0C0\uC784 \uAE30\uBC18\uC758 \uC790\uC728 AI \uC5D0\uC774\uC804\uD2B8"}
             </p>
           </div>
 
@@ -125,7 +125,7 @@ export default function Footer() {
         {/* Bottom bar */}
         <div className="mt-10 flex flex-col items-center justify-between gap-4 border-t border-dark-800/50 pt-8 sm:flex-row">
           <p className="text-xs text-dark-500">
-            &copy; {new Date().getFullYear()} ZeroClaw. All rights reserved.
+            &copy; {new Date().getFullYear()} MoA. All rights reserved.
           </p>
           <p className="text-xs text-dark-600">
             Built with{" "}
@@ -135,7 +135,7 @@ export default function Footer() {
               rel="noopener noreferrer"
               className="text-primary-500/60 hover:text-primary-400 transition-colors"
             >
-              ZeroClaw
+              MoA
             </a>
           </p>
         </div>

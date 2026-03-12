@@ -22,21 +22,21 @@ const keyAdvantages = [
   },
   {
     icon: "\uD83D\uDCF1",
-    title: "\uCD5C\uC18C 1\uB300\uBA74 OK",
-    titleEn: "One Device Is All You Need",
+    title: "\uC5EC\uB7EC \uB514\uBC14\uC774\uC2A4\uC5D0 \uC124\uCE58 \uAC00\uB2A5",
+    titleEn: "Install on Multiple Devices",
     description:
-      "\uB178\uD2B8\uBD81 1\uB300\uC5D0\uB9CC \uC124\uCE58\uD574\uB3C4 \uD734\uB300\uD3F0, \uD0DC\uBE14\uB9BF \uB4F1 \uB2E4\uB978 \uAE30\uAE30\uC5D0\uC11C \uC6F9 \uBE0C\uB77C\uC6B0\uC800\uB85C \uC811\uC18D\uD558\uC5EC \uC124\uCE58 \uC5C6\uC774 \uC0AC\uC6A9 \uAC00\uB2A5. \uBB3C\uB860 \uC5EC\uB7EC \uB300\uC5D0 \uC124\uCE58\uD574\uB3C4 \uB429\uB2C8\uB2E4.",
+      "\uD734\uB300\uD3F0, \uB178\uD2B8\uBD81 \uB4F1 \uC5EC\uB7EC \uB514\uBC14\uC774\uC2A4\uC5D0 \uC124\uCE58\uAC00\uB2A5. \uCD94\uAC00\uC801\uC778 \uCEF4\uD4E8\uD130 \uAD6C\uB9E4\uC5C6\uC774 \uAE30\uC874 \uB514\uBC14\uC774\uC2A4\uC5D0 \uBC14\uB85C \uC124\uCE58 \uAC00\uB2A5. \uC5B4\uB5A4 \uB514\uBC14\uC774\uC2A4\uC5D0\uB4E0 MoA\uC571\uC744 1\uAC1C\uB9CC \uC124\uCE58\uD574\uB3C4 \uC571\uC744 \uC124\uCE58\uD558\uC9C0 \uC54A\uC740 \uB514\uBC14\uC774\uC2A4\uC5D0\uC11C \uC6F9\uCC44\uD305\uC73C\uB85C \uC6D0\uACA9 \uC811\uC18D \uAC00\uB2A5. \uACF5\uC6A9PC\uC758 \uC6F9\uBE0C\uB77C\uC6B0\uC800\uC5D0\uC11C\uB3C4 \uBCF4\uC548\uC744 \uC720\uC9C0\uD55C \uCC44 \uC6F9\uC73C\uB85C \uC6D0\uACA9\uC811\uC18D \uAC00\uB2A5.",
     descriptionEn:
-      "Install on just one laptop \u2014 access from any phone or tablet via web browser. No extra installs needed.",
+      "Install on phones, laptops, and more. No extra hardware needed. Even with just one device running MoA, access remotely via secure web chat from any other device, including public PCs.",
   },
   {
     icon: "\uD83D\uDD04",
-    title: "\uC2E4\uC2DC\uAC04 \uB3D9\uAE30\uD654",
-    titleEn: "Real-Time Sync",
+    title: "\uC7A5\uAE30\uAE30\uC5B5\uC758 \uC2E4\uC2DC\uAC04 \uB3D9\uAE30\uD654",
+    titleEn: "Real-Time Long-Term Memory Sync",
     description:
-      "\uB178\uD2B8\uBD81, \uD734\uB300\uD3F0, \uD0DC\uBE14\uB9BF \uC0AC\uC774\uC5D0\uC11C AI\uC758 \uC7A5\uAE30 \uAE30\uC5B5\uACFC \uB300\uD654 \uB0B4\uC6A9\uC774 \uC2E4\uC2DC\uAC04\uC73C\uB85C \uB3D9\uAE30\uD654\uB429\uB2C8\uB2E4. Cloudflare, Tailscale, ngrok \uD130\uB110 \uC9C0\uC6D0.",
+      "\uB178\uD2B8\uBD81, \uD734\uB300\uD3F0, \uD0DC\uBE14\uB9BF\uC5D0 \uAC01\uAC01 \uC124\uCE58\uB41C MoA\uC571\uC758 \uC7A5\uAE30\uAE30\uC5B5\uC774 \uC2E4\uC2DC\uAC04\uC73C\uB85C \uC2F1\uD06C\uB429\uB2C8\uB2E4. \uB178\uD2B8\uBD81\uACFC \uD734\uB300\uD3F0, \uD0DC\uBE14\uB9BF \uB4F1 \uB098\uC758 \uBAA8\uB4E0 \uB514\uBC14\uC774\uC2A4\uC5D0\uC11C \uB0B4\uAC00 MoA\uB97C \uD1B5\uD574\uC11C \uD55C \uC791\uC5C5\uACFC \uD589\uB3D9\uC744 \uBAA8\uB450 \uAE30\uC5B5\uD558\uB294 \uBCF8\uACA9\uC801\uC778 AI\uBE44\uC11C\uAC00 \uD0C4\uC0DD\uD588\uC2B5\uB2C8\uB2E4.",
     descriptionEn:
-      "Memory, conversations, and settings sync across all your devices in real-time via encrypted tunnels.",
+      "Long-term memory syncs in real-time across all MoA apps on your laptop, phone, and tablet. A true AI assistant that remembers everything you've done across all your devices.",
   },
   {
     icon: "\uD83C\uDFAF",
@@ -238,7 +238,7 @@ export default function HomePage() {
             <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-primary-500/20 bg-primary-500/5 px-4 py-1.5 animate-fade-in">
               <div className="h-1.5 w-1.5 rounded-full bg-primary-400 animate-pulse" />
               <span className="text-xs font-medium text-primary-300">
-                Powered by ZeroClaw Runtime &middot; 100% Rust
+                Powered by MoA Runtime &middot; 100% Rust
               </span>
             </div>
 
@@ -246,7 +246,7 @@ export default function HomePage() {
             <h1 className="text-3xl font-extrabold tracking-tight sm:text-5xl lg:text-6xl animate-fade-in-up">
               <span className="text-dark-200">{"\uD074\uB85C\uB4DC\uBD07(OpenClaw)\uC758 \uD55C\uACC4\uB97C \uB118\uC5B4,"}</span>
               <br />
-              <span className="text-gradient text-4xl sm:text-6xl lg:text-7xl">ZeroClaw</span>
+              <span className="text-gradient text-4xl sm:text-6xl lg:text-7xl">MoA</span>
               <span className="text-dark-50 text-4xl sm:text-6xl lg:text-7xl">{"\uAC00 \uC654\uC2B5\uB2C8\uB2E4"}</span>
             </h1>
 
@@ -255,7 +255,7 @@ export default function HomePage() {
               {"\uC804 \uC138\uACC4 15\uB9CC\uBA85\uC774 \uC5F4\uAD11\uD55C \uD074\uB85C\uB4DC\uBD07! \uC124\uCE58\uAC00 \uC5B4\uB835\uACE0 \uBCF4\uC548\uC774 \uCDE8\uC57D\uD574\uC11C \uD3EC\uAE30\uD558\uC168\uB098\uC694?"}
               <br />
               <span className="text-primary-400 font-semibold">
-                {"ZeroClaw\uB294 \uBCF4\uC548, \uC124\uCE58, \uC131\uB2A5, \uD65C\uC6A9\uC131 \uBAA8\uB4E0 \uBA74\uC5D0\uC11C \uC644\uC804\uD788 \uB2E4\uB985\uB2C8\uB2E4."}
+                {"MoA\uB294 \uBCF4\uC548, \uC124\uCE58, \uC131\uB2A5, \uD65C\uC6A9\uC131 \uBAA8\uB4E0 \uBA74\uC5D0\uC11C \uC644\uC804\uD788 \uB2E4\uB985\uB2C8\uB2E4."}
               </span>
             </p>
 
@@ -301,11 +301,11 @@ export default function HomePage() {
         <div className="relative mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
           <div className="text-center mb-16">
             <h2 className="text-3xl font-bold text-dark-50 sm:text-4xl">
-              {"ZeroClaw\uB9CC\uC758 6\uB300 \uD575\uC2EC \uAC15\uC810"}
-              <span className="text-dark-500 ml-3 text-xl font-normal">Why ZeroClaw?</span>
+              {"MoA\uB9CC\uC758 6\uB300 \uD575\uC2EC \uAC15\uC810"}
+              <span className="text-dark-500 ml-3 text-xl font-normal">Why MoA?</span>
             </h2>
             <p className="mt-4 text-dark-400 max-w-2xl mx-auto">
-              {"\uD074\uB85C\uB4DC\uBD07\uC744 \uD3EC\uAE30\uD588\uB358 \uC774\uC720\uB4E4, ZeroClaw\uAC00 \uBAA8\uB450 \uD574\uACB0\uD588\uC2B5\uB2C8\uB2E4."}
+              {"\uD074\uB85C\uB4DC\uBD07\uC744 \uD3EC\uAE30\uD588\uB358 \uC774\uC720\uB4E4, MoA\uAC00 \uBAA8\uB450 \uD574\uACB0\uD588\uC2B5\uB2C8\uB2E4."}
             </p>
           </div>
 
@@ -334,7 +334,7 @@ export default function HomePage() {
         <div className="mx-auto max-w-4xl px-4 sm:px-6 lg:px-8">
           <div className="text-center mb-12">
             <h2 className="text-3xl font-bold text-dark-50 sm:text-4xl">
-              {"ZeroClaw vs \uD074\uB85C\uB4DC\uBD07"}
+              {"MoA vs \uD074\uB85C\uB4DC\uBD07"}
               <span className="text-dark-500 ml-3 text-xl font-normal">Comparison</span>
             </h2>
             <p className="mt-4 text-dark-400">
@@ -352,7 +352,7 @@ export default function HomePage() {
                 <span className="text-xs font-semibold text-dark-500">{"\uD074\uB85C\uB4DC\uBD07"} (OpenClaw)</span>
               </div>
               <div className="px-4 py-3 sm:px-6 text-center">
-                <span className="text-xs font-bold text-primary-400">ZeroClaw</span>
+                <span className="text-xs font-bold text-primary-400">MoA</span>
               </div>
             </div>
 
@@ -419,9 +419,9 @@ export default function HomePage() {
         <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
           <div className="grid grid-cols-1 gap-12 lg:grid-cols-2 items-center">
             <div>
-              <h2 className="text-3xl font-bold text-dark-50 sm:text-4xl">ZeroClaw Runtime</h2>
+              <h2 className="text-3xl font-bold text-dark-50 sm:text-4xl">MoA Runtime</h2>
               <p className="mt-4 text-dark-400 leading-relaxed">
-                {"\uACE0\uC131\uB2A5 Rust \uB7F0\uD0C0\uC784 \uC704\uC5D0 \uAD6C\uCD95\uB41C ZeroClaw\uB294 \uBE60\uB978 \uC18D\uB3C4, \uB0AE\uC740 \uBA54\uBAA8\uB9AC, \uADF8\uB9AC\uACE0 \uAD70\uC0AC \uAE09 \uBCF4\uC548\uC744 \uB3D9\uC2DC\uC5D0 \uC81C\uACF5\uD569\uB2C8\uB2E4."}
+                {"\uACE0\uC131\uB2A5 Rust \uB7F0\uD0C0\uC784 \uC704\uC5D0 \uAD6C\uCD95\uB41C MoA\uB294 \uBE60\uB978 \uC18D\uB3C4, \uB0AE\uC740 \uBA54\uBAA8\uB9AC, \uADF8\uB9AC\uACE0 \uAD70\uC0AC \uAE09 \uBCF4\uC548\uC744 \uB3D9\uC2DC\uC5D0 \uC81C\uACF5\uD569\uB2C8\uB2E4."}
               </p>
               <p className="mt-2 text-sm text-dark-500">
                 Built on Rust: speed, minimal memory, and military-grade security in one binary.
@@ -510,7 +510,7 @@ export default function HomePage() {
                 <div className="flex items-center justify-center py-2">
                   <div className="w-full rounded-xl border border-dark-600 bg-dark-800 px-4 py-3">
                     <div className="text-center">
-                      <div className="text-sm font-bold text-gradient">ZeroClaw Core</div>
+                      <div className="text-sm font-bold text-gradient">MoA Core</div>
                       <div className="text-[10px] text-dark-500 mt-0.5">
                         Agent Loop | ChaCha20 + AES-256 | Pairing Auth | Rate Limiter
                       </div>
@@ -636,7 +636,7 @@ export default function HomePage() {
                 {"\uC9C0\uAE08 \uBC14\uB85C \uC2DC\uC791\uD558\uC138\uC694"}
               </h2>
               <p className="mt-4 text-dark-300 max-w-lg mx-auto text-lg">
-                {"\uBCC4\uB3C4\uC758 \uC124\uCE58 \uC5C6\uC774 \uC6F9 \uBE0C\uB77C\uC6B0\uC800\uC5D0\uC11C \uBC14\uB85C ZeroClaw\uB97C \uCCB4\uD5D8\uD574\uBCF4\uC138\uC694."}
+                {"\uBCC4\uB3C4\uC758 \uC124\uCE58 \uC5C6\uC774 \uC6F9 \uBE0C\uB77C\uC6B0\uC800\uC5D0\uC11C \uBC14\uB85C MoA\uB97C \uCCB4\uD5D8\uD574\uBCF4\uC138\uC694."}
               </p>
               <p className="mt-2 text-dark-400 max-w-md mx-auto text-sm">
                 {"\uB610\uB294 \uCE74\uCE74\uC624\uD1A1\uC73C\uB85C \uBC14\uB85C \uB300\uD654\uB97C \uC2DC\uC791\uD558\uC138\uC694. \uC571 \uC124\uCE58\uAC00 \uD544\uC694 \uC5C6\uC2B5\uB2C8\uB2E4."}
