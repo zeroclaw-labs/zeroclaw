@@ -340,7 +340,7 @@ impl TamperEvidentLog {
                 cef_escape(&e.action),
                 cef_escape(&e.actor),
                 cef_escape(&e.result_summary),
-                e.compliance_tags.join(";"),
+                cef_escape_ext(&e.compliance_tags.join(";")),
             );
         }
         Ok(out)
@@ -351,9 +351,21 @@ impl TamperEvidentLog {
         if self.max_size_bytes == 0 {
             return Ok(());
         }
-        if let Ok(metadata) = std::fs::metadata(&self.log_path) {
-            if metadata.len() >= self.max_size_bytes {
-                self.rotate()?;
+        match std::fs::metadata(&self.log_path) {
+            Ok(metadata) => {
+                if metadata.len() >= self.max_size_bytes {
+                    self.rotate()?;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File doesn't exist yet — nothing to rotate.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read audit log metadata at {}: {}",
+                    self.log_path.display(),
+                    e
+                );
             }
         }
         Ok(())
@@ -367,7 +379,11 @@ impl TamperEvidentLog {
         for i in (1..10).rev() {
             let old = format!("{}.{}.log", self.log_path.display(), i);
             let new = format!("{}.{}.log", self.log_path.display(), i + 1);
-            let _ = std::fs::rename(&old, &new);
+            if let Err(e) = std::fs::rename(&old, &new) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!("Failed to rotate audit log {} -> {}: {}", old, new, e);
+                }
+            }
         }
         let rotated = format!("{}.1.log", self.log_path.display());
         std::fs::rename(&self.log_path, &rotated)?;
@@ -388,6 +404,17 @@ fn csv_escape(s: &str) -> String {
 /// Escape a value for CEF output (pipe and backslash).
 fn cef_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('|', "\\|")
+}
+
+/// Escape a value for CEF extension fields.
+///
+/// Extension values use `=` as key-value delimiter and newlines as record
+/// separators. Both must be escaped to prevent injection/parsing issues.
+fn cef_escape_ext(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('=', "\\=")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 #[cfg(test)]

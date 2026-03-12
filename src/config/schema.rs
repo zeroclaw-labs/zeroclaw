@@ -5345,6 +5345,25 @@ impl Config {
             if self.security.compliance.audit_retention_days == 0 {
                 anyhow::bail!("security.compliance.audit_retention_days must be greater than 0");
             }
+            // Validate data_residency_region format when present.
+            if let Some(ref region) = self.security.compliance.data_residency_region {
+                let trimmed = region.trim();
+                if trimmed.is_empty() {
+                    anyhow::bail!(
+                        "security.compliance.data_residency_region must not be empty/whitespace when set"
+                    );
+                }
+                // Expect ISO 3166-1 alpha-2 style: 2-3 uppercase ASCII letters.
+                if !(2..=3).contains(&trimmed.len())
+                    || !trimmed.chars().all(|c| c.is_ascii_uppercase())
+                {
+                    anyhow::bail!(
+                        "security.compliance.data_residency_region '{}' is not a valid \
+                         ISO 3166-1 alpha-2/alpha-3 code (expected 2-3 uppercase letters)",
+                        trimmed
+                    );
+                }
+            }
             let known_frameworks = ["FINMA", "DORA", "GDPR", "SOC2", "ISO27001"];
             for (i, fw) in self.security.compliance.frameworks.iter().enumerate() {
                 let trimmed = fw.trim();

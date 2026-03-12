@@ -23,6 +23,9 @@ const MAX_ACTOR_DISPLAY_LEN: usize = 32;
 /// Maximum byte length for the result_summary field in report output.
 const MAX_SUMMARY_DISPLAY_LEN: usize = 120;
 
+/// Maximum byte length for the action field in report output.
+const MAX_ACTION_DISPLAY_LEN: usize = 256;
+
 /// Maximum total byte length of a generated report before truncation.
 const MAX_REPORT_SIZE: usize = 256 * 1024; // 256 KiB
 
@@ -212,6 +215,7 @@ impl ComplianceTool {
         report.push_str("\n## Tagged Entries Summary\n\n");
         for entry in tagged.iter().take(MAX_REPORT_ENTRIES) {
             let action = sanitize_control_chars(&entry.action);
+            let action = redact_field(&action, MAX_ACTION_DISPLAY_LEN);
             let actor = sanitize_control_chars(&entry.actor);
             let summary = sanitize_control_chars(&entry.result_summary);
             let actor = redact_field(&actor, MAX_ACTOR_DISPLAY_LEN);
