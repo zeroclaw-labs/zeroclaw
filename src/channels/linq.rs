@@ -75,7 +75,7 @@ impl LinqChannel {
             })
     }
 
-    fn sender_handle<'a>(data: &'a serde_json::Value) -> Option<&'a str> {
+    fn sender_handle(data: &serde_json::Value) -> Option<&str> {
         data.get("from")
             .and_then(|value| value.as_str())
             .or_else(|| {
