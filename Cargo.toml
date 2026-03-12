@@ -225,6 +225,11 @@ inherits = "release"
 codegen-units = 8    # Parallel codegen for faster builds on powerful machines (16GB+ RAM recommended)
                      # Use: cargo build --profile release-fast
 
+[profile.ci]
+inherits = "release"
+lto = "thin"         # Much faster than fat LTO; still catches release-mode issues
+codegen-units = 16   # Full parallelism for CI runners
+
 [profile.dist]
 inherits = "release"
 opt-level = "z"
