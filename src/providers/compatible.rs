@@ -1755,15 +1755,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = make_provider("test", &server.uri(), None).with_default_headers(
-            HashMap::from([
+        let provider =
+            make_provider("test", &server.uri(), None).with_default_headers(HashMap::from([
                 (
                     "HTTP-Referer".to_string(),
                     "https://example.com/app".to_string(),
                 ),
                 ("X-App-Name".to_string(), "ZeroClaw".to_string()),
-            ]),
-        );
+            ]));
 
         let response = provider
             .http_client()
