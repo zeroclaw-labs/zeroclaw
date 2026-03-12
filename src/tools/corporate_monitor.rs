@@ -154,7 +154,6 @@ pub struct JiraUpdate {
 fn priority_rank(priority: &str) -> u8 {
     match priority.to_lowercase().as_str() {
         "low" => 1,
-        "normal" => 2,
         "urgent" | "high" | "critical" => 3,
         _ => 2,
     }
