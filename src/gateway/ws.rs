@@ -55,8 +55,7 @@ pub async fn handle_ws_chat(
         .and_then(|v| v.to_str().ok())
         .map_or(false, |protos| {
             protos.split(',').any(|p| p.trim() == WS_PROTOCOL)
-        })
-    {
+        }) {
         ws.protocols([WS_PROTOCOL])
     } else {
         ws
