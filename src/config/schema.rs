@@ -942,6 +942,10 @@ pub struct AgentConfig {
     /// Default: `[]` (no filtering — all tools included).
     #[serde(default)]
     pub tool_filter_groups: Vec<ToolFilterGroup>,
+    /// When true (default), send live tool-call notifications (e.g. 🔧 `tool_name`)
+    /// as threaded messages in non-CLI channels. Set to false to suppress them.
+    #[serde(default = "default_true")]
+    pub show_tool_calls: bool,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -971,6 +975,7 @@ impl Default for AgentConfig {
             tool_dispatcher: default_agent_tool_dispatcher(),
             tool_call_dedup_exempt: Vec::new(),
             tool_filter_groups: Vec::new(),
+            show_tool_calls: true,
         }
     }
 }
