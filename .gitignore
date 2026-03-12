@@ -35,5 +35,9 @@ credentials.json
 # Skill eval workspaces (test outputs, transcripts, grading)
 .claude/skills/*-workspace/
 
+# Local state backups
+.local-state-backups/
+*.local-state-backup/
+
 # Coverage artifacts
 lcov.info

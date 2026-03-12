@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "zeroclaw"
-version = "0.1.7"
+version = "0.1.9"
 edition = "2021"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
@@ -85,6 +85,9 @@ rand = "0.10"
 # serde-big-array for wa-rs storage (large array serialization)
 serde-big-array = { version = "0.5", optional = true }
 
+# Portable atomic fallbacks for 32-bit targets (no native 64-bit atomics)
+portable-atomic = { version = "1", optional = true }
+
 # Fast mutexes that don't poison on panic
 parking_lot = "0.12"
 
@@ -117,7 +120,7 @@ which = "8.0"
 # WebSocket client channels (Discord/Lark/DingTalk/Nostr)
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
-nostr-sdk = { version = "0.44", default-features = false, features = ["nip04", "nip59"] }
+nostr-sdk = { version = "0.44", default-features = false, features = ["nip04", "nip59"], optional = true }
 regex = "1.10"
 hostname = "0.4.2"
 rustls = "0.23"
@@ -184,10 +187,12 @@ landlock = { version = "0.4", optional = true }
 libc = "0.2"
 
 [features]
-default = []
+default = ["channel-nostr"]
+channel-nostr = ["dep:nostr-sdk"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
+channel-feishu = ["channel-lark"]  # Alias for Feishu users (Lark and Feishu are the same platform)
 memory-postgres = ["dep:postgres"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 peripheral-rpi = ["rppal"]

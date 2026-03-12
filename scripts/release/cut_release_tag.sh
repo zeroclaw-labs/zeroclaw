@@ -53,9 +53,9 @@ echo "Fetching origin/master and tags..."
 git fetch --quiet origin master --tags
 
 HEAD_SHA="$(git rev-parse HEAD)"
-MAIN_SHA="$(git rev-parse origin/master)"
-if [[ "$HEAD_SHA" != "$MAIN_SHA" ]]; then
-  echo "error: HEAD ($HEAD_SHA) is not origin/master ($MAIN_SHA)." >&2
+MASTER_SHA="$(git rev-parse origin/master)"
+if [[ "$HEAD_SHA" != "$MASTER_SHA" ]]; then
+  echo "error: HEAD ($HEAD_SHA) is not origin/master ($MASTER_SHA)." >&2
   echo "hint: checkout/update master before cutting a release tag." >&2
   exit 1
 fi

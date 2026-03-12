@@ -101,7 +101,7 @@ Examples:
   ./install.sh --docker
 
   # Remote one-liner
-  curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 
 Environment:
   ZEROCLAW_CONTAINER_CLI     Container CLI command (default: docker; auto-fallback: podman)
@@ -751,7 +751,7 @@ MSG
   fi
 
   "$CONTAINER_CLI" run --rm -it \
-    "${container_run_namespace_args[@]}" \
+    "${container_run_namespace_args[@]+"${container_run_namespace_args[@]}"}" \
     "${container_run_user_args[@]}" \
     -e HOME=/zeroclaw-data \
     -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
