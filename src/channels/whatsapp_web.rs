@@ -554,7 +554,10 @@ impl Channel for WhatsAppWebChannel {
             };
 
             *self.client.lock() = None;
-            if let Some(handle) = self.bot_handle.lock().take() {
+            // Take handle out and drop the lock before awaiting so the future stays Send
+            // (parking_lot::MutexGuard is not Send; holding it across .await would make the future !Send).
+            let handle = self.bot_handle.lock().take();
+            if let Some(handle) = handle {
                 handle.abort();
                 // Await the aborted task so background I/O finishes before
                 // we delete session files.
