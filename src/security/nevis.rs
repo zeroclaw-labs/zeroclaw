@@ -85,6 +85,16 @@ impl std::fmt::Debug for NevisAuthProvider {
     }
 }
 
+// Safety: All fields are Send + Sync. The doc comment promises concurrent use,
+// so enforce it at compile time to prevent regressions.
+#[allow(clippy::used_underscore_items)]
+const _: () = {
+    fn _assert_send_sync<T: Send + Sync>() {}
+    fn _assert() {
+        _assert_send_sync::<NevisAuthProvider>();
+    }
+};
+
 impl NevisAuthProvider {
     /// Create a new Nevis auth provider from config values.
     ///

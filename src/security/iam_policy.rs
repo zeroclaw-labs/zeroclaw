@@ -135,7 +135,7 @@ impl IamPolicy {
                 if compiled.all_tools
                     || compiled.allowed_tools.iter().any(|t| t == &normalized_tool)
                 {
-                    tracing::trace!(
+                    tracing::info!(
                         user_id = %crate::security::redact(&identity.user_id),
                         role = %key,
                         tool = %normalized_tool,
@@ -150,7 +150,7 @@ impl IamPolicy {
             "no role grants access to tool '{normalized_tool}' for user '{}'",
             crate::security::redact(&identity.user_id)
         );
-        tracing::debug!(
+        tracing::info!(
             user_id = %crate::security::redact(&identity.user_id),
             tool = %normalized_tool,
             "IAM policy: tool access DENIED"
@@ -181,7 +181,7 @@ impl IamPolicy {
                         .iter()
                         .any(|w| w == &normalized_ws)
                 {
-                    tracing::trace!(
+                    tracing::info!(
                         user_id = %crate::security::redact(&identity.user_id),
                         role = %key,
                         workspace = %normalized_ws,
@@ -196,7 +196,7 @@ impl IamPolicy {
             "no role grants access to workspace '{normalized_ws}' for user '{}'",
             crate::security::redact(&identity.user_id)
         );
-        tracing::debug!(
+        tracing::info!(
             user_id = %crate::security::redact(&identity.user_id),
             workspace = %normalized_ws,
             "IAM policy: workspace access DENIED"
@@ -413,6 +413,27 @@ mod tests {
             }
             PolicyDecision::Allow => panic!("expected deny"),
         }
+    }
+
+    #[test]
+    fn duplicate_normalized_roles_are_rejected() {
+        let mappings = vec![
+            RoleMapping {
+                nevis_role: "admin".into(),
+                zeroclaw_permissions: vec!["all".into()],
+                workspace_access: vec!["all".into()],
+            },
+            RoleMapping {
+                nevis_role: " ADMIN ".into(),
+                zeroclaw_permissions: vec!["file_read".into()],
+                workspace_access: vec![],
+            },
+        ];
+        let err = IamPolicy::from_mappings(&mappings).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate role mapping"),
+            "Expected duplicate role error, got: {err}"
+        );
     }
 
     #[test]
