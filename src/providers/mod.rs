@@ -839,6 +839,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
         "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
+        "opencode-go" => vec!["OPENCODE_GO_API_KEY"],
         "vercel" | "vercel-ai" => vec!["VERCEL_API_KEY"],
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
         "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
@@ -880,6 +881,55 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
     }
 
     None
+}
+
+/// Check whether an API key's prefix matches the selected provider.
+///
+/// Returns `Some("likely_provider")` when the key clearly belongs to a
+/// *different* provider (cross-provider mismatch).  Returns `None` when
+/// everything looks fine or the format is unrecognised.
+fn check_api_key_prefix(provider_name: &str, key: &str) -> Option<&'static str> {
+    // Identify which provider the key likely belongs to (longest prefix first).
+    let likely_provider = if key.starts_with("sk-ant-") {
+        Some("anthropic")
+    } else if key.starts_with("sk-or-") {
+        Some("openrouter")
+    } else if key.starts_with("sk-") {
+        Some("openai")
+    } else if key.starts_with("gsk_") {
+        Some("groq")
+    } else if key.starts_with("pplx-") {
+        Some("perplexity")
+    } else if key.starts_with("xai-") {
+        Some("xai")
+    } else if key.starts_with("nvapi-") {
+        Some("nvidia")
+    } else if key.starts_with("KEY-") {
+        Some("telnyx")
+    } else {
+        None
+    };
+
+    let expected = likely_provider?;
+
+    // Only flag mismatch for providers where we know the key format.
+    let matches = match provider_name {
+        "anthropic" => expected == "anthropic",
+        "openrouter" => expected == "openrouter",
+        "openai" => expected == "openai",
+        "groq" => expected == "groq",
+        "perplexity" => expected == "perplexity",
+        "xai" | "grok" => expected == "xai",
+        "nvidia" | "nvidia-nim" | "build.nvidia.com" => expected == "nvidia",
+        "telnyx" => expected == "telnyx",
+        _ => return None, // Unknown format provider — skip
+    };
+
+    if matches {
+        None
+    } else {
+        Some(expected)
+    }
 }
 
 fn parse_custom_provider_url(
@@ -954,6 +1004,23 @@ fn create_provider_with_url_and_options(
     .map(|v| String::from_utf8(v.into_bytes()).unwrap_or_default());
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
+
+    // Pre-flight: catch obvious API-key / provider mismatches early.
+    if let Some(key_value) = key {
+        let is_custom = name.starts_with("custom:") || name.starts_with("anthropic-custom:");
+        let has_custom_url = api_url.map(str::trim).filter(|u| !u.is_empty()).is_some();
+        if !is_custom && !has_custom_url {
+            if let Some(likely_provider) = check_api_key_prefix(name, key_value) {
+                let visible = &key_value[..key_value.len().min(8)];
+                anyhow::bail!(
+                    "API key prefix mismatch: key \"{visible}...\" looks like a \
+                     {likely_provider} key, but provider \"{name}\" is selected. \
+                     Set the correct provider-specific env var or use `-p {likely_provider}`."
+                );
+            }
+        }
+    }
+
     match name {
         "openai-codex" | "openai_codex" | "codex" => {
             let mut codex_options = options.clone();
@@ -1032,6 +1099,9 @@ fn create_provider_with_url_and_options(
         ))),
         "opencode" | "opencode-zen" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "OpenCode Zen", "https://opencode.ai/zen/v1", key, AuthStyle::Bearer,
+        ))),
+        "opencode-go" => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "OpenCode Go", "https://opencode.ai/zen/go/v1", key, AuthStyle::Bearer,
         ))),
         name if zai_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Z.AI",
@@ -1540,6 +1610,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "opencode",
             display_name: "OpenCode Zen",
             aliases: &["opencode-zen"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "opencode-go",
+            display_name: "OpenCode Go",
+            aliases: &[],
             local: false,
         },
         ProviderInfo {
@@ -2076,6 +2152,22 @@ mod tests {
     }
 
     #[test]
+    fn factory_opencode_go() {
+        assert!(create_provider("opencode-go", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn resolve_provider_credential_opencode_go_env() {
+        let _env_lock = env_lock();
+        let _provider_guard = EnvGuard::set("OPENCODE_GO_API_KEY", Some("go-test-key"));
+        let _generic_guard = EnvGuard::set("API_KEY", None);
+        let _zeroclaw_guard = EnvGuard::set("ZEROCLAW_API_KEY", None);
+
+        let resolved = resolve_provider_credential("opencode-go", None);
+        assert_eq!(resolved.as_deref(), Some("go-test-key"));
+    }
+
+    #[test]
     fn factory_zai() {
         assert!(create_provider("zai", Some("key")).is_ok());
         assert!(create_provider("z.ai", Some("key")).is_ok());
@@ -2597,6 +2689,7 @@ mod tests {
             "kimi-code",
             "synthetic",
             "opencode",
+            "opencode-go",
             "zai",
             "zai-cn",
             "glm",
@@ -2899,5 +2992,50 @@ mod tests {
 
         let provider = create_resilient_provider("ollama", None, None, &reliability);
         assert!(provider.is_ok());
+    }
+
+    // ── API key prefix pre-flight ───────────────────────────
+
+    #[test]
+    fn api_key_prefix_cross_provider_mismatch() {
+        // Anthropic key used with openrouter
+        assert_eq!(
+            check_api_key_prefix("openrouter", "sk-ant-api03-xyz"),
+            Some("anthropic")
+        );
+        // OpenRouter key used with anthropic
+        assert_eq!(
+            check_api_key_prefix("anthropic", "sk-or-v1-xyz"),
+            Some("openrouter")
+        );
+        // Anthropic key used with openai
+        assert_eq!(
+            check_api_key_prefix("openai", "sk-ant-xyz"),
+            Some("anthropic")
+        );
+        // Groq key used with openai
+        assert_eq!(check_api_key_prefix("openai", "gsk_xyz"), Some("groq"));
+    }
+
+    #[test]
+    fn api_key_prefix_correct_match() {
+        assert_eq!(check_api_key_prefix("anthropic", "sk-ant-api03-xyz"), None);
+        assert_eq!(check_api_key_prefix("openrouter", "sk-or-v1-xyz"), None);
+        assert_eq!(check_api_key_prefix("openai", "sk-proj-xyz"), None);
+        assert_eq!(check_api_key_prefix("groq", "gsk_xyz"), None);
+    }
+
+    #[test]
+    fn api_key_prefix_unknown_provider_skips() {
+        // Providers without known key formats should never flag a mismatch.
+        assert_eq!(check_api_key_prefix("deepseek", "sk-ant-xyz"), None);
+        assert_eq!(check_api_key_prefix("ollama", "anything"), None);
+    }
+
+    #[test]
+    fn api_key_prefix_unknown_key_format_skips() {
+        // Keys without a recognisable prefix should never flag a mismatch.
+        assert_eq!(check_api_key_prefix("openai", "my-custom-key-123"), None);
+        assert_eq!(check_api_key_prefix("anthropic", "some-random-key"), None);
     }
 }
