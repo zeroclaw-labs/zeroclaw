@@ -1939,6 +1939,7 @@ pub(crate) async fn agent_turn(
     silent: bool,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    tool_rag_index: Option<&crate::tools::tool_rag::ToolRagIndex>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -1957,6 +1958,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         &[],
+        tool_rag_index,
     )
     .await
 }
@@ -2156,6 +2158,7 @@ pub(crate) async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    tool_rag_index: Option<&crate::tools::tool_rag::ToolRagIndex>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2163,11 +2166,27 @@ pub(crate) async fn run_tool_call_loop(
         max_tool_iterations
     };
 
-    let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
-        .iter()
-        .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
-        .map(|tool| tool.spec())
-        .collect();
+    let tool_specs: Vec<crate::tools::ToolSpec> = if let Some(rag_index) = tool_rag_index {
+        let user_msg = history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        let selected_names = rag_index.select_tools(user_msg).await.unwrap_or_default();
+        tools_registry
+            .iter()
+            .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
+            .filter(|tool| selected_names.contains(tool.name()))
+            .map(|tool| tool.spec())
+            .collect()
+    } else {
+        tools_registry
+            .iter()
+            .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
+            .map(|tool| tool.spec())
+            .collect()
+    };
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -3108,6 +3127,7 @@ pub async fn run(
             None,
             None,
             &[],
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -3230,6 +3250,7 @@ pub async fn run(
                 None,
                 None,
                 &[],
+                None,
             )
             .await
             {
@@ -3461,6 +3482,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         true,
         &config.multimodal,
         config.agent.max_tool_iterations,
+        None,
     )
     .await
 }
@@ -3774,6 +3796,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3820,6 +3843,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3860,6 +3884,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -3986,6 +4011,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -4055,6 +4081,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4111,6 +4138,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("native fallback id flow should complete");

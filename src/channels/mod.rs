@@ -291,6 +291,7 @@ struct ChannelRuntimeContext {
     hooks: Option<Arc<crate::hooks::HookRunner>>,
     non_cli_excluded_tools: Arc<Vec<String>>,
     model_routes: Arc<Vec<crate::config::ModelRouteConfig>>,
+    tool_rag_index: Option<Arc<crate::tools::tool_rag::ToolRagIndex>>,
 }
 
 #[derive(Clone)]
@@ -1919,6 +1920,7 @@ async fn process_channel_message(
                 } else {
                     ctx.non_cli_excluded_tools.as_ref()
                 },
+                ctx.tool_rag_index.as_deref(),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -3475,6 +3477,38 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .as_ref()
         .is_some_and(|tg| tg.interrupt_on_new_message);
 
+    // ── Tools RAG: dynamic tool injection ────────────────────────────────────
+    let tool_rag_index: Option<Arc<crate::tools::tool_rag::ToolRagIndex>> = if matches!(
+        config.agent.tools_injection_mode,
+        crate::config::schema::ToolsInjectionMode::Rag
+    ) {
+        let index = crate::tools::tool_rag::ToolRagIndex::new(
+            Arc::clone(&mem),
+            config.agent.tools_rag_core_set.clone(),
+            config.agent.tools_rag_top_k,
+            config.agent.tools_rag_threshold,
+            config.agent.tools_rag_enable_discovery,
+            config.agent.tools_rag_cache_window,
+        );
+        match index
+            .register_tools(tools_registry.as_ref(), provider.as_ref(), &model)
+            .await
+        {
+            Ok(report) => {
+                println!(
+                    "  🔧 Tools RAG: registered {} new, {} skipped (total {})",
+                    report.registered, report.skipped, report.total
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Tools RAG registration failed: {e}; falling back to full mode");
+            }
+        }
+        Some(Arc::new(index))
+    } else {
+        None
+    };
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
@@ -3515,6 +3549,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         },
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
         model_routes: Arc::new(config.model_routes.clone()),
+        tool_rag_index,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3729,6 +3764,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -3779,6 +3815,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -3832,6 +3869,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4308,6 +4346,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -4369,6 +4408,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -4444,6 +4484,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -4504,6 +4545,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -4574,6 +4616,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -4664,6 +4707,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -4736,6 +4780,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -4823,6 +4868,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -4895,6 +4941,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -4957,6 +5004,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -5130,6 +5178,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -5211,6 +5260,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5304,6 +5354,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5379,6 +5430,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -5439,6 +5491,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -5956,6 +6009,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -6042,6 +6096,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -6128,6 +6183,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         process_channel_message(
@@ -6678,6 +6734,7 @@ This is an example JSON object for profile settings."#;
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -6745,6 +6802,7 @@ This is an example JSON object for profile settings."#;
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            tool_rag_index: None,
         });
 
         process_channel_message(
