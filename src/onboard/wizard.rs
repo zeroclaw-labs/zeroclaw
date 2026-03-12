@@ -1,3 +1,4 @@
+use crate::channels::voice_loop::VoiceLoopConfig;
 #[cfg(feature = "channel-nostr")]
 use crate::config::schema::{default_nostr_relays, NostrConfig};
 use crate::config::schema::{
@@ -3650,7 +3651,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     draft_update_interval_ms: 1000,
                     interrupt_on_new_message: false,
                     mention_only: false,
-                    voice_loop: Default::default(),
+                    voice_loop: VoiceLoopConfig::default(),
                 });
             }
             ChannelMenuChoice::Discord => {
@@ -4209,7 +4210,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         pair_code: (!pair_code.trim().is_empty())
                             .then(|| pair_code.trim().to_string()),
                         allowed_numbers,
-                        voice_loop: Default::default(),
+                        voice_loop: VoiceLoopConfig::default(),
                     });
 
                     println!(
@@ -4311,7 +4312,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     pair_phone: None,
                     pair_code: None,
                     allowed_numbers,
-                    voice_loop: Default::default(),
+                    voice_loop: VoiceLoopConfig::default(),
                 });
             }
             ChannelMenuChoice::Linq => {

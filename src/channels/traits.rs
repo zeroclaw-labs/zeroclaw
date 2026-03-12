@@ -188,6 +188,7 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
+                is_voice: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -204,6 +205,7 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
+            is_voice: None,
         };
 
         let cloned = message.clone();

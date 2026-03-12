@@ -75,7 +75,7 @@ pub fn should_reply_as_audio(
 /// Placeholder for TTS synthesis — returns `None` until TTS module is integrated.
 ///
 /// This will be wired to `TtsManager` once the TTS PR lands.
-pub async fn synthesize_response(
+pub fn synthesize_response(
     text: &str,
     _config: &VoiceLoopConfig,
 ) -> anyhow::Result<Option<Vec<u8>>> {
@@ -180,10 +180,10 @@ mod tests {
         assert!(!should_reply_as_audio(&msg, &config, "hello!"));
     }
 
-    #[tokio::test]
-    async fn synthesize_response_returns_none() {
+    #[test]
+    fn synthesize_response_returns_none() {
         let config = VoiceLoopConfig::default();
-        let result = synthesize_response("test text", &config).await.unwrap();
+        let result = synthesize_response("test text", &config).unwrap();
         assert!(result.is_none());
     }
 

@@ -509,7 +509,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
-            voice_loop: Default::default(),
+            voice_loop: crate::channels::voice_loop::VoiceLoopConfig::default(),
         });
         assert!(has_supervised_channels(&config));
     }
@@ -623,7 +623,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
-            voice_loop: Default::default(),
+            voice_loop: crate::channels::voice_loop::VoiceLoopConfig::default(),
         });
 
         let target = resolve_heartbeat_delivery(&config).unwrap();
