@@ -363,6 +363,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_write_direct_allowed_root_path_works_when_workspace_only_enabled() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_write_direct_allowed_root");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        let outside_file = outside.join("notes.txt");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            workspace_only: true,
+            allowed_roots: vec![outside.clone()],
+            forbidden_paths: vec!["/tmp".into()],
+            ..SecurityPolicy::default()
+        });
+        let tool = FileWriteTool::new(security);
+
+        let result = tool
+            .execute(
+                json!({"path": outside_file.to_string_lossy().to_string(), "content": "outside"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(
+            tokio::fs::read_to_string(&outside_file).await.unwrap(),
+            "outside"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
     async fn file_write_blocks_readonly_mode() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_write_readonly");
         let _ = tokio::fs::remove_dir_all(&dir).await;

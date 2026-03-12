@@ -892,6 +892,22 @@ impl SecurityPolicy {
     // forbidden-prefix match. Each layer addresses a distinct escape
     // technique; together they enforce workspace confinement.
 
+    fn canonical_root_for_compare(path: &Path) -> PathBuf {
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    fn is_direct_path_allowlisted(&self, path: &Path) -> bool {
+        let workspace_root = Self::canonical_root_for_compare(&self.workspace_dir);
+        if path.starts_with(&workspace_root) {
+            return true;
+        }
+
+        self.allowed_roots.iter().any(|root| {
+            let canonical_root = Self::canonical_root_for_compare(root);
+            path.starts_with(&canonical_root)
+        })
+    }
+
     /// Check if a file path is allowed (no path traversal, within workspace)
     pub fn is_path_allowed(&self, path: &str) -> bool {
         // Block null bytes (can truncate paths in C-backed syscalls)
@@ -922,9 +938,16 @@ impl SecurityPolicy {
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
 
-        // Block absolute paths when workspace_only is set
-        if self.workspace_only && expanded_path.is_absolute() {
-            return false;
+        if expanded_path.is_absolute() {
+            if self.is_direct_path_allowlisted(&expanded_path) {
+                return true;
+            }
+
+            // Block absolute paths when workspace_only is set unless they are
+            // explicitly allowlisted via the workspace root or allowed_roots.
+            if self.workspace_only {
+                return false;
+            }
         }
 
         // Block forbidden paths using path-component-aware matching
@@ -1382,6 +1405,24 @@ mod tests {
         assert!(!p.is_path_allowed("/etc/passwd"));
         assert!(!p.is_path_allowed("/root/.ssh/id_rsa"));
         assert!(!p.is_path_allowed("/tmp/file.txt"));
+    }
+
+    #[test]
+    fn allowed_roots_allow_direct_absolute_paths_when_workspace_only() {
+        let root = std::env::temp_dir().join("zeroclaw_test_direct_allowed_roots");
+        let workspace = root.join("workspace");
+        let allowed = root.join("allowed");
+        let target = allowed.join("notes.txt");
+
+        let p = SecurityPolicy {
+            workspace_dir: workspace,
+            workspace_only: true,
+            allowed_roots: vec![allowed.clone()],
+            forbidden_paths: vec!["/tmp".into()],
+            ..SecurityPolicy::default()
+        };
+
+        assert!(p.is_path_allowed(&target.to_string_lossy()));
     }
 
     #[test]
