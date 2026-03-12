@@ -4611,25 +4611,27 @@ impl Config {
             .filter(|value| !value.is_empty())
             .map(|value| value.trim_end_matches('/'));
 
-        self.model_providers.iter().find_map(|(profile_key, profile)| {
-            let key_matches = profile_key.eq_ignore_ascii_case(current_provider);
-            let name_matches = profile
-                .name
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| value.eq_ignore_ascii_case(current_provider));
-            let base_url_matches = match (
-                current_api_url,
-                profile.base_url.as_deref().map(str::trim),
-            ) {
-                (Some(current), Some(base_url)) => current.eq_ignore_ascii_case(
-                    base_url.trim_end_matches('/'),
-                ),
-                _ => false,
-            };
+        self.model_providers
+            .iter()
+            .find_map(|(profile_key, profile)| {
+                let key_matches = profile_key.eq_ignore_ascii_case(current_provider);
+                let name_matches = profile
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| value.eq_ignore_ascii_case(current_provider));
+                let base_url_matches = match (
+                    current_api_url,
+                    profile.base_url.as_deref().map(str::trim),
+                ) {
+                    (Some(current), Some(base_url)) => {
+                        current.eq_ignore_ascii_case(base_url.trim_end_matches('/'))
+                    }
+                    _ => false,
+                };
 
-            (key_matches || name_matches || base_url_matches).then_some(profile)
-        })
+                (key_matches || name_matches || base_url_matches).then_some(profile)
+            })
     }
 
     pub fn provider_runtime_options(&self) -> ProviderRuntimeOptions {
@@ -7078,7 +7080,10 @@ requires_openai_auth = true
                 wire_api: None,
                 requires_openai_auth: false,
                 headers: HashMap::from([
-                    ("HTTP-Referer".to_string(), "https://example.com".to_string()),
+                    (
+                        "HTTP-Referer".to_string(),
+                        "https://example.com".to_string(),
+                    ),
                     ("X-App-Name".to_string(), "ZeroClaw".to_string()),
                 ]),
                 azure_openai_resource: None,
@@ -7089,11 +7094,17 @@ requires_openai_auth = true
 
         let options = config.provider_runtime_options();
         assert_eq!(
-            options.default_headers.get("HTTP-Referer").map(String::as_str),
+            options
+                .default_headers
+                .get("HTTP-Referer")
+                .map(String::as_str),
             Some("https://example.com")
         );
         assert_eq!(
-            options.default_headers.get("X-App-Name").map(String::as_str),
+            options
+                .default_headers
+                .get("X-App-Name")
+                .map(String::as_str),
             Some("ZeroClaw")
         );
     }

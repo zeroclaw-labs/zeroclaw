@@ -233,7 +233,9 @@ impl OpenAiCompatibleProvider {
                         tracing::warn!("Ignoring invalid default header name '{name}': {error}");
                     }
                     (_, Err(error)) => {
-                        tracing::warn!("Ignoring invalid default header value for '{name}': {error}");
+                        tracing::warn!(
+                            "Ignoring invalid default header value for '{name}': {error}"
+                        );
                     }
                 }
             }
@@ -246,7 +248,9 @@ impl OpenAiCompatibleProvider {
                 crate::config::apply_runtime_proxy_to_builder(builder, "provider.compatible");
 
             return builder.build().unwrap_or_else(|error| {
-                tracing::warn!("Failed to build proxied timeout client with default headers: {error}");
+                tracing::warn!(
+                    "Failed to build proxied timeout client with default headers: {error}"
+                );
                 Client::new()
             });
         }
@@ -1741,7 +1745,10 @@ mod tests {
     fn http_client_includes_default_headers() {
         let provider = make_provider("test", "https://example.com", None).with_default_headers(
             HashMap::from([
-                ("HTTP-Referer".to_string(), "https://example.com/app".to_string()),
+                (
+                    "HTTP-Referer".to_string(),
+                    "https://example.com/app".to_string(),
+                ),
                 ("X-App-Name".to_string(), "ZeroClaw".to_string()),
             ]),
         );
@@ -1753,11 +1760,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            request.headers().get("HTTP-Referer").and_then(|v| v.to_str().ok()),
+            request
+                .headers()
+                .get("HTTP-Referer")
+                .and_then(|v| v.to_str().ok()),
             Some("https://example.com/app")
         );
         assert_eq!(
-            request.headers().get("X-App-Name").and_then(|v| v.to_str().ok()),
+            request
+                .headers()
+                .get("X-App-Name")
+                .and_then(|v| v.to_str().ok()),
             Some("ZeroClaw")
         );
     }
