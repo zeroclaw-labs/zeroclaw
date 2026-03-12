@@ -3733,11 +3733,11 @@ mod tests {
 
         assert!(compact_sender_history(&ctx, &sender));
 
-        let histories = ctx
+        let locked_histories = ctx
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let kept = histories
+        let kept = locked_histories
             .get(&sender)
             .expect("sender history should remain");
         assert_eq!(kept.len(), CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
@@ -3836,11 +3836,11 @@ mod tests {
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
 
-        let histories = ctx
+        let locked_histories = ctx
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let turns = histories
+        let turns = locked_histories
             .get(&sender)
             .expect("sender history should remain");
         assert_eq!(turns.len(), 2);
@@ -4841,10 +4841,10 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         {
-            let mut store = runtime_config_store()
+            let mut cleanup_store = runtime_config_store()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            store.remove(&config_path);
+            cleanup_store.remove(&config_path);
         }
 
         assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 1);
