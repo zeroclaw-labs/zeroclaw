@@ -4174,16 +4174,16 @@ pub struct CloudOpsConfig {
     /// Default cloud provider for analysis context. Default: "aws".
     #[serde(default = "default_cloud_ops_cloud")]
     pub default_cloud: String,
-    /// Supported cloud providers. Default: ["aws", "azure", "gcp"].
+    /// Supported cloud providers. Default: [`aws`, `azure`, `gcp`].
     #[serde(default = "default_cloud_ops_supported_clouds")]
     pub supported_clouds: Vec<String>,
-    /// Supported IaC tools for review. Default: ["terraform"].
+    /// Supported IaC tools for review. Default: [`terraform`].
     #[serde(default = "default_cloud_ops_iac_tools")]
     pub iac_tools: Vec<String>,
     /// Monthly USD threshold to flag cost items. Default: 100.0.
     #[serde(default = "default_cloud_ops_cost_threshold")]
     pub cost_threshold_monthly_usd: f64,
-    /// Well-Architected Frameworks to check against. Default: ["aws-waf"].
+    /// Well-Architected Frameworks to check against. Default: [`aws-waf`].
     #[serde(default = "default_cloud_ops_waf")]
     pub well_architected_frameworks: Vec<String>,
 }
@@ -4370,7 +4370,7 @@ pub struct ConversationalAiConfig {
     /// Default language for conversations (BCP-47 tag). Default: "en".
     #[serde(default = "default_conversational_ai_language")]
     pub default_language: String,
-    /// Supported languages for conversations. Default: ["en", "de", "fr", "it"].
+    /// Supported languages for conversations. Default: [`en`, `de`, `fr`, `it`].
     #[serde(default = "default_conversational_ai_supported_languages")]
     pub supported_languages: Vec<String>,
     /// Automatically detect user language from message content. Default: true.
