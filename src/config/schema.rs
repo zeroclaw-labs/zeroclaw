@@ -4620,15 +4620,13 @@ impl Config {
                     .as_deref()
                     .map(str::trim)
                     .is_some_and(|value| value.eq_ignore_ascii_case(current_provider));
-                let base_url_matches = match (
-                    current_api_url,
-                    profile.base_url.as_deref().map(str::trim),
-                ) {
-                    (Some(current), Some(base_url)) => {
-                        current.eq_ignore_ascii_case(base_url.trim_end_matches('/'))
-                    }
-                    _ => false,
-                };
+                let base_url_matches =
+                    match (current_api_url, profile.base_url.as_deref().map(str::trim)) {
+                        (Some(current), Some(base_url)) => {
+                            current.eq_ignore_ascii_case(base_url.trim_end_matches('/'))
+                        }
+                        _ => false,
+                    };
 
                 (key_matches || name_matches || base_url_matches).then_some(profile)
             })
