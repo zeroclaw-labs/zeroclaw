@@ -561,11 +561,12 @@ impl Channel for WhatsAppWebChannel {
                 let _ = handle.await;
             }
 
-            // Drop bot/device/backend so the SQLite connection is closed
+            // Drop bot/device so the SQLite connection is closed
             // before we remove session files (releases WAL/SHM locks).
+            // `backend` was moved into the builder, so dropping `bot`
+            // releases the last Arc reference to the storage backend.
             drop(bot);
             drop(device);
-            drop(backend);
 
             if should_reconnect {
                 let (attempts, exceeded) = Self::record_retry(&retry_count);
