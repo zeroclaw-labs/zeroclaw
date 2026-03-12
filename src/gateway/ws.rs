@@ -114,14 +114,19 @@ async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<S
         // Simple single-turn chat (no streaming for now — use provider.chat_with_system)
         let system_prompt = {
             let config_guard = state.config.lock();
-            crate::channels::build_system_prompt(
+            let mut prompt = crate::channels::build_system_prompt(
                 &config_guard.workspace_dir,
                 &state.model,
                 &[],
                 &[],
                 Some(&config_guard.identity),
                 None,
-            )
+            );
+            prompt.push_str(&crate::channels::autonomy_constraints_prompt(
+                &config_guard.autonomy,
+                &config_guard.workspace_dir,
+            ));
+            prompt
         };
 
         let messages = vec![
