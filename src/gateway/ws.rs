@@ -15,20 +15,26 @@ use axum::{
         ws::{Message, WebSocket},
         Query, State, WebSocketUpgrade,
     },
+    http::HeaderMap,
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 
+/// The sub-protocol we support for the chat WebSocket.
+const WS_PROTOCOL: &str = "zeroclaw.v1";
+
 #[derive(Deserialize)]
 pub struct WsQuery {
     pub token: Option<String>,
+    pub session_id: Option<String>,
 }
 
 /// GET /ws/chat — WebSocket upgrade for agent chat
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
     Query(params): Query<WsQuery>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     // Auth via query param (browser WebSocket limitation)
@@ -43,11 +49,24 @@ pub async fn handle_ws_chat(
         }
     }
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    // Echo Sec-WebSocket-Protocol if the client requests our sub-protocol.
+    let ws = if headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |protos| {
+            protos.split(',').any(|p| p.trim() == WS_PROTOCOL)
+        }) {
+        ws.protocols([WS_PROTOCOL])
+    } else {
+        ws
+    };
+
+    let session_id = params.session_id.clone();
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id))
         .into_response()
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<String>) {
     let (mut sender, mut receiver) = socket.split();
 
     while let Some(msg) = receiver.next().await {
