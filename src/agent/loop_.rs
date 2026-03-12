@@ -63,8 +63,17 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
                 .map(|m| m.as_str())
                 .unwrap_or("");
 
-            // Preserve first 4 chars for context, then redact
-            let prefix = if val.len() > 4 { &val[..4] } else { "" };
+            // Preserve first 4 chars for context, then redact.
+            // Use char_indices to find the byte offset of the 4th character
+            // so we never slice in the middle of a multi-byte UTF-8 sequence.
+            let prefix = if val.len() > 4 {
+                val.char_indices()
+                    .nth(4)
+                    .map(|(byte_idx, _)| &val[..byte_idx])
+                    .unwrap_or(val)
+            } else {
+                ""
+            };
 
             if full_match.contains(':') {
                 if full_match.contains('"') {
@@ -5465,6 +5474,20 @@ Let me check the result."#;
         assert_eq!(
             result, input,
             "non-sensitive text should pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn scrub_credentials_multibyte_chars_no_panic() {
+        // Regression test for #3024: byte index 4 is not a char boundary
+        // when the captured value contains multi-byte UTF-8 characters.
+        // The regex only matches quoted values for non-ASCII content, since
+        // capture group 4 is restricted to [a-zA-Z0-9_\-\.].
+        let input = "password=\"\u{4f60}\u{7684}WiFi\u{5bc6}\u{7801}ab\"";
+        let result = scrub_credentials(input);
+        assert!(
+            result.contains("[REDACTED]"),
+            "multi-byte quoted value should be redacted without panic, got: {result}"
         );
     }
 
