@@ -2438,7 +2438,7 @@ pub fn build_system_prompt_with_mode(
     let mut prompt = String::with_capacity(8192);
 
     // ── 1. Tooling ──────────────────────────────────────────────
-    if !tools.is_empty() {
+    if !tools.is_empty() && !native_tools {
         prompt.push_str("## Tools\n\n");
         prompt.push_str("You have access to the following tools:\n\n");
         for (name, desc) in tools {
@@ -5496,6 +5496,32 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("**shell**"));
         assert!(prompt.contains("Run commands"));
         assert!(prompt.contains("**memory_recall**"));
+    }
+
+    #[test]
+    fn prompt_skips_tools_summary_when_native_tools_enabled() {
+        let ws = make_workspace();
+        let tools = vec![
+            ("shell", "Run commands"),
+            ("memory_recall", "Search memory"),
+        ];
+        let prompt = build_system_prompt_with_mode(
+            ws.path(),
+            "gpt-4o",
+            &tools,
+            &[],
+            None,
+            None,
+            true,
+            crate::config::SkillsPromptInjectionMode::Full,
+        );
+
+        assert!(
+            !prompt.contains("## Tools"),
+            "native tools mode should skip the duplicate tools summary"
+        );
+        assert!(prompt.contains("## Safety"));
+        assert!(prompt.contains("## Workspace"));
     }
 
     #[test]
