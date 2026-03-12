@@ -81,6 +81,7 @@ Last refreshed: **February 18, 2026**.
 - [ci-map.md](contributing/ci-map.md)
 - [actions-source-policy.md](contributing/actions-source-policy.md)
 - [extension-examples.md](contributing/extension-examples.md)
+- [testing.md](contributing/testing.md)
 
 ### 7) Project Status & Snapshot
 

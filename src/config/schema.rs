@@ -4263,11 +4263,7 @@ impl Config {
 
             // Decrypt TTS provider API keys
             if let Some(ref mut openai) = config.tts.openai {
-                decrypt_optional_secret(
-                    &store,
-                    &mut openai.api_key,
-                    "config.tts.openai.api_key",
-                )?;
+                decrypt_optional_secret(&store, &mut openai.api_key, "config.tts.openai.api_key")?;
             }
             if let Some(ref mut elevenlabs) = config.tts.elevenlabs {
                 decrypt_optional_secret(
@@ -4277,11 +4273,7 @@ impl Config {
                 )?;
             }
             if let Some(ref mut google) = config.tts.google {
-                decrypt_optional_secret(
-                    &store,
-                    &mut google.api_key,
-                    "config.tts.google.api_key",
-                )?;
+                decrypt_optional_secret(&store, &mut google.api_key, "config.tts.google.api_key")?;
             }
 
             if let Some(ref mut ns) = config.channels_config.nostr {
@@ -4290,6 +4282,192 @@ impl Config {
                     &mut ns.private_key,
                     "config.channels_config.nostr.private_key",
                 )?;
+            }
+
+            // Decrypt channel secrets
+            if let Some(ref mut tg) = config.channels_config.telegram {
+                decrypt_secret(
+                    &store,
+                    &mut tg.bot_token,
+                    "config.channels_config.telegram.bot_token",
+                )?;
+            }
+            if let Some(ref mut dc) = config.channels_config.discord {
+                decrypt_secret(
+                    &store,
+                    &mut dc.bot_token,
+                    "config.channels_config.discord.bot_token",
+                )?;
+            }
+            if let Some(ref mut sl) = config.channels_config.slack {
+                decrypt_secret(
+                    &store,
+                    &mut sl.bot_token,
+                    "config.channels_config.slack.bot_token",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut sl.app_token,
+                    "config.channels_config.slack.app_token",
+                )?;
+            }
+            if let Some(ref mut mm) = config.channels_config.mattermost {
+                decrypt_secret(
+                    &store,
+                    &mut mm.bot_token,
+                    "config.channels_config.mattermost.bot_token",
+                )?;
+            }
+            if let Some(ref mut mx) = config.channels_config.matrix {
+                decrypt_secret(
+                    &store,
+                    &mut mx.access_token,
+                    "config.channels_config.matrix.access_token",
+                )?;
+            }
+            if let Some(ref mut wa) = config.channels_config.whatsapp {
+                decrypt_optional_secret(
+                    &store,
+                    &mut wa.access_token,
+                    "config.channels_config.whatsapp.access_token",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut wa.app_secret,
+                    "config.channels_config.whatsapp.app_secret",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut wa.verify_token,
+                    "config.channels_config.whatsapp.verify_token",
+                )?;
+            }
+            if let Some(ref mut lq) = config.channels_config.linq {
+                decrypt_secret(
+                    &store,
+                    &mut lq.api_token,
+                    "config.channels_config.linq.api_token",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut lq.signing_secret,
+                    "config.channels_config.linq.signing_secret",
+                )?;
+            }
+            if let Some(ref mut wt) = config.channels_config.wati {
+                decrypt_secret(
+                    &store,
+                    &mut wt.api_token,
+                    "config.channels_config.wati.api_token",
+                )?;
+            }
+            if let Some(ref mut nc) = config.channels_config.nextcloud_talk {
+                decrypt_secret(
+                    &store,
+                    &mut nc.app_token,
+                    "config.channels_config.nextcloud_talk.app_token",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut nc.webhook_secret,
+                    "config.channels_config.nextcloud_talk.webhook_secret",
+                )?;
+            }
+            if let Some(ref mut em) = config.channels_config.email {
+                decrypt_secret(
+                    &store,
+                    &mut em.password,
+                    "config.channels_config.email.password",
+                )?;
+            }
+            if let Some(ref mut irc) = config.channels_config.irc {
+                decrypt_optional_secret(
+                    &store,
+                    &mut irc.server_password,
+                    "config.channels_config.irc.server_password",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut irc.nickserv_password,
+                    "config.channels_config.irc.nickserv_password",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut irc.sasl_password,
+                    "config.channels_config.irc.sasl_password",
+                )?;
+            }
+            if let Some(ref mut lk) = config.channels_config.lark {
+                decrypt_secret(
+                    &store,
+                    &mut lk.app_secret,
+                    "config.channels_config.lark.app_secret",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut lk.encrypt_key,
+                    "config.channels_config.lark.encrypt_key",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut lk.verification_token,
+                    "config.channels_config.lark.verification_token",
+                )?;
+            }
+            if let Some(ref mut fs) = config.channels_config.feishu {
+                decrypt_secret(
+                    &store,
+                    &mut fs.app_secret,
+                    "config.channels_config.feishu.app_secret",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut fs.encrypt_key,
+                    "config.channels_config.feishu.encrypt_key",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut fs.verification_token,
+                    "config.channels_config.feishu.verification_token",
+                )?;
+            }
+            if let Some(ref mut dt) = config.channels_config.dingtalk {
+                decrypt_secret(
+                    &store,
+                    &mut dt.client_secret,
+                    "config.channels_config.dingtalk.client_secret",
+                )?;
+            }
+            if let Some(ref mut qq) = config.channels_config.qq {
+                decrypt_secret(
+                    &store,
+                    &mut qq.app_secret,
+                    "config.channels_config.qq.app_secret",
+                )?;
+            }
+            if let Some(ref mut wh) = config.channels_config.webhook {
+                decrypt_optional_secret(
+                    &store,
+                    &mut wh.secret,
+                    "config.channels_config.webhook.secret",
+                )?;
+            }
+            if let Some(ref mut ct) = config.channels_config.clawdtalk {
+                decrypt_secret(
+                    &store,
+                    &mut ct.api_key,
+                    "config.channels_config.clawdtalk.api_key",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut ct.webhook_secret,
+                    "config.channels_config.clawdtalk.webhook_secret",
+                )?;
+            }
+
+            // Decrypt gateway paired tokens
+            for token in &mut config.gateway.paired_tokens {
+                decrypt_secret(&store, token, "config.gateway.paired_tokens[]")?;
             }
 
             config.apply_env_overrides();
@@ -4921,11 +5099,7 @@ impl Config {
 
         // Encrypt TTS provider API keys
         if let Some(ref mut openai) = config_to_save.tts.openai {
-            encrypt_optional_secret(
-                &store,
-                &mut openai.api_key,
-                "config.tts.openai.api_key",
-            )?;
+            encrypt_optional_secret(&store, &mut openai.api_key, "config.tts.openai.api_key")?;
         }
         if let Some(ref mut elevenlabs) = config_to_save.tts.elevenlabs {
             encrypt_optional_secret(
@@ -4935,11 +5109,7 @@ impl Config {
             )?;
         }
         if let Some(ref mut google) = config_to_save.tts.google {
-            encrypt_optional_secret(
-                &store,
-                &mut google.api_key,
-                "config.tts.google.api_key",
-            )?;
+            encrypt_optional_secret(&store, &mut google.api_key, "config.tts.google.api_key")?;
         }
 
         if let Some(ref mut ns) = config_to_save.channels_config.nostr {
@@ -4948,6 +5118,192 @@ impl Config {
                 &mut ns.private_key,
                 "config.channels_config.nostr.private_key",
             )?;
+        }
+
+        // Encrypt channel secrets
+        if let Some(ref mut tg) = config_to_save.channels_config.telegram {
+            encrypt_secret(
+                &store,
+                &mut tg.bot_token,
+                "config.channels_config.telegram.bot_token",
+            )?;
+        }
+        if let Some(ref mut dc) = config_to_save.channels_config.discord {
+            encrypt_secret(
+                &store,
+                &mut dc.bot_token,
+                "config.channels_config.discord.bot_token",
+            )?;
+        }
+        if let Some(ref mut sl) = config_to_save.channels_config.slack {
+            encrypt_secret(
+                &store,
+                &mut sl.bot_token,
+                "config.channels_config.slack.bot_token",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut sl.app_token,
+                "config.channels_config.slack.app_token",
+            )?;
+        }
+        if let Some(ref mut mm) = config_to_save.channels_config.mattermost {
+            encrypt_secret(
+                &store,
+                &mut mm.bot_token,
+                "config.channels_config.mattermost.bot_token",
+            )?;
+        }
+        if let Some(ref mut mx) = config_to_save.channels_config.matrix {
+            encrypt_secret(
+                &store,
+                &mut mx.access_token,
+                "config.channels_config.matrix.access_token",
+            )?;
+        }
+        if let Some(ref mut wa) = config_to_save.channels_config.whatsapp {
+            encrypt_optional_secret(
+                &store,
+                &mut wa.access_token,
+                "config.channels_config.whatsapp.access_token",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut wa.app_secret,
+                "config.channels_config.whatsapp.app_secret",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut wa.verify_token,
+                "config.channels_config.whatsapp.verify_token",
+            )?;
+        }
+        if let Some(ref mut lq) = config_to_save.channels_config.linq {
+            encrypt_secret(
+                &store,
+                &mut lq.api_token,
+                "config.channels_config.linq.api_token",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut lq.signing_secret,
+                "config.channels_config.linq.signing_secret",
+            )?;
+        }
+        if let Some(ref mut wt) = config_to_save.channels_config.wati {
+            encrypt_secret(
+                &store,
+                &mut wt.api_token,
+                "config.channels_config.wati.api_token",
+            )?;
+        }
+        if let Some(ref mut nc) = config_to_save.channels_config.nextcloud_talk {
+            encrypt_secret(
+                &store,
+                &mut nc.app_token,
+                "config.channels_config.nextcloud_talk.app_token",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut nc.webhook_secret,
+                "config.channels_config.nextcloud_talk.webhook_secret",
+            )?;
+        }
+        if let Some(ref mut em) = config_to_save.channels_config.email {
+            encrypt_secret(
+                &store,
+                &mut em.password,
+                "config.channels_config.email.password",
+            )?;
+        }
+        if let Some(ref mut irc) = config_to_save.channels_config.irc {
+            encrypt_optional_secret(
+                &store,
+                &mut irc.server_password,
+                "config.channels_config.irc.server_password",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut irc.nickserv_password,
+                "config.channels_config.irc.nickserv_password",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut irc.sasl_password,
+                "config.channels_config.irc.sasl_password",
+            )?;
+        }
+        if let Some(ref mut lk) = config_to_save.channels_config.lark {
+            encrypt_secret(
+                &store,
+                &mut lk.app_secret,
+                "config.channels_config.lark.app_secret",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut lk.encrypt_key,
+                "config.channels_config.lark.encrypt_key",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut lk.verification_token,
+                "config.channels_config.lark.verification_token",
+            )?;
+        }
+        if let Some(ref mut fs) = config_to_save.channels_config.feishu {
+            encrypt_secret(
+                &store,
+                &mut fs.app_secret,
+                "config.channels_config.feishu.app_secret",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut fs.encrypt_key,
+                "config.channels_config.feishu.encrypt_key",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut fs.verification_token,
+                "config.channels_config.feishu.verification_token",
+            )?;
+        }
+        if let Some(ref mut dt) = config_to_save.channels_config.dingtalk {
+            encrypt_secret(
+                &store,
+                &mut dt.client_secret,
+                "config.channels_config.dingtalk.client_secret",
+            )?;
+        }
+        if let Some(ref mut qq) = config_to_save.channels_config.qq {
+            encrypt_secret(
+                &store,
+                &mut qq.app_secret,
+                "config.channels_config.qq.app_secret",
+            )?;
+        }
+        if let Some(ref mut wh) = config_to_save.channels_config.webhook {
+            encrypt_optional_secret(
+                &store,
+                &mut wh.secret,
+                "config.channels_config.webhook.secret",
+            )?;
+        }
+        if let Some(ref mut ct) = config_to_save.channels_config.clawdtalk {
+            encrypt_secret(
+                &store,
+                &mut ct.api_key,
+                "config.channels_config.clawdtalk.api_key",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut ct.webhook_secret,
+                "config.channels_config.clawdtalk.webhook_secret",
+            )?;
+        }
+
+        // Encrypt gateway paired tokens
+        for token in &mut config_to_save.gateway.paired_tokens {
+            encrypt_secret(&store, token, "config.gateway.paired_tokens[]")?;
         }
 
         let toml_str =
@@ -7849,6 +8205,73 @@ require_otp_to_resume = true
 
         let err = config.validate().expect_err("expected invalid domain glob");
         assert!(err.to_string().contains("gated_domains"));
+    }
+
+    #[tokio::test]
+    async fn channel_secret_telegram_bot_token_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_tg_bot_token_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let plaintext_token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11";
+
+        let mut config = Config::default();
+        config.workspace_dir = dir.join("workspace");
+        config.config_path = dir.join("config.toml");
+        config.channels_config.telegram = Some(TelegramConfig {
+            bot_token: plaintext_token.into(),
+            allowed_users: vec!["user1".into()],
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+
+        // Save (triggers encryption)
+        config.save().await.unwrap();
+
+        // Read raw TOML and verify plaintext token is NOT present
+        let raw_toml = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        assert!(
+            !raw_toml.contains(plaintext_token),
+            "Saved TOML must not contain the plaintext bot_token"
+        );
+
+        // Parse stored TOML and verify the value is encrypted
+        let stored: Config = toml::from_str(&raw_toml).unwrap();
+        let stored_token = &stored.channels_config.telegram.as_ref().unwrap().bot_token;
+        assert!(
+            crate::security::SecretStore::is_encrypted(stored_token),
+            "Stored bot_token must be marked as encrypted"
+        );
+
+        // Decrypt and verify it matches the original plaintext
+        let store = crate::security::SecretStore::new(&dir, true);
+        assert_eq!(store.decrypt(stored_token).unwrap(), plaintext_token);
+
+        // Simulate a full load: deserialize then decrypt (mirrors load_or_init logic)
+        let mut loaded: Config = toml::from_str(&raw_toml).unwrap();
+        loaded.config_path = dir.join("config.toml");
+        let load_store = crate::security::SecretStore::new(&dir, loaded.secrets.encrypt);
+        if let Some(ref mut tg) = loaded.channels_config.telegram {
+            decrypt_secret(
+                &load_store,
+                &mut tg.bot_token,
+                "config.channels_config.telegram.bot_token",
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            loaded.channels_config.telegram.as_ref().unwrap().bot_token,
+            plaintext_token,
+            "Loaded bot_token must match the original plaintext after decryption"
+        );
+
+        let _ = fs::remove_dir_all(&dir).await;
     }
 
     #[test]

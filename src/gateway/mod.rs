@@ -310,6 +310,8 @@ pub struct AppState {
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// SSE broadcast channel for real-time events
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    /// Shutdown signal sender for graceful shutdown
+    pub shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -622,6 +624,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             event_tx.clone(),
         ));
 
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
     let state = AppState {
         config: config_state,
         provider,
@@ -645,6 +649,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         tools_registry,
         cost_tracker,
         event_tx,
+        shutdown_tx,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -678,6 +683,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cron/{id}", delete(api::handle_api_cron_delete))
         .route("/api/integrations", get(api::handle_api_integrations))
         .route(
+            "/api/integrations/settings",
+            get(api::handle_api_integrations_settings),
+        )
+        .route(
             "/api/doctor",
             get(api::handle_api_doctor).post(api::handle_api_doctor),
         )
@@ -704,11 +713,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback));
 
-    // Run the server
+    // Run the server with graceful shutdown
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown_rx.changed().await;
+        tracing::info!("🦀 ZeroClaw Gateway shutting down...");
+    })
     .await?;
 
     Ok(())
@@ -1533,29 +1546,44 @@ struct AdminResponse {
     message: String,
 }
 
-/// POST /admin/shutdown — graceful shutdown from CLI
-async fn handle_admin_shutdown(State(_state): State<AppState>) -> impl IntoResponse {
+/// Reject requests that do not originate from a loopback address.
+fn require_localhost(peer: &SocketAddr) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if peer.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Admin endpoints are restricted to localhost"
+            })),
+        ))
+    }
+}
+
+/// POST /admin/shutdown — graceful shutdown from CLI (localhost only)
+async fn handle_admin_shutdown(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
     tracing::info!("🔌 Admin shutdown request received — initiating graceful shutdown");
 
-    // The server will shut down when this response is sent
-    // In a real implementation, we might use a shutdown channel
     let body = AdminResponse {
         success: true,
         message: "Gateway shutdown initiated".to_string(),
     };
 
-    // Spawn a task to gracefully exit after responding
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        tracing::info!("🦀 ZeroClaw Gateway shutting down...");
-        std::process::exit(0);
-    });
+    let _ = state.shutdown_tx.send(true);
 
-    (StatusCode::OK, Json(body))
+    Ok((StatusCode::OK, Json(body)))
 }
 
-/// GET /admin/paircode — fetch current pairing code
-async fn handle_admin_paircode(State(state): State<AppState>) -> impl IntoResponse {
+/// GET /admin/paircode — fetch current pairing code (localhost only)
+async fn handle_admin_paircode(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
     let code = state.pairing.pairing_code();
 
     let body = if let Some(c) = code {
@@ -1578,11 +1606,15 @@ async fn handle_admin_paircode(State(state): State<AppState>) -> impl IntoRespon
         })
     };
 
-    (StatusCode::OK, Json(body))
+    Ok((StatusCode::OK, Json(body)))
 }
 
-/// POST /admin/paircode/new — generate a new pairing code
-async fn handle_admin_paircode_new(State(state): State<AppState>) -> impl IntoResponse {
+/// POST /admin/paircode/new — generate a new pairing code (localhost only)
+async fn handle_admin_paircode_new(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
     match state.pairing.generate_new_pairing_code() {
         Some(code) => {
             tracing::info!("🔐 New pairing code generated via admin endpoint");
@@ -1592,7 +1624,7 @@ async fn handle_admin_paircode_new(State(state): State<AppState>) -> impl IntoRe
                 "pairing_code": code,
                 "message": "New pairing code generated — use this one-time code to pair"
             });
-            (StatusCode::OK, Json(body))
+            Ok((StatusCode::OK, Json(body)))
         }
         None => {
             let body = serde_json::json!({
@@ -1601,7 +1633,7 @@ async fn handle_admin_paircode_new(State(state): State<AppState>) -> impl IntoRe
                 "pairing_code": null,
                 "message": "Pairing is disabled for this gateway"
             });
-            (StatusCode::BAD_REQUEST, Json(body))
+            Ok((StatusCode::BAD_REQUEST, Json(body)))
         }
     }
 }
@@ -1688,6 +1720,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1737,6 +1770,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1903,16 +1937,24 @@ mod tests {
             .await
             .unwrap();
 
-        let saved = tokio::fs::read_to_string(config_path).await.unwrap();
-        let parsed: Config = toml::from_str(&saved).unwrap();
-        assert_eq!(parsed.gateway.paired_tokens.len(), 1);
-        let persisted = &parsed.gateway.paired_tokens[0];
-        assert_eq!(persisted.len(), 64);
-        assert!(persisted.chars().all(|c| c.is_ascii_hexdigit()));
+        // In-memory tokens should remain as plaintext 64-char hex hashes.
+        let plaintext = {
+            let in_memory = shared_config.lock();
+            assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
+            in_memory.gateway.paired_tokens[0].clone()
+        };
+        assert_eq!(plaintext.len(), 64);
+        assert!(plaintext.chars().all(|c: char| c.is_ascii_hexdigit()));
 
-        let in_memory = shared_config.lock();
-        assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
-        assert_eq!(&in_memory.gateway.paired_tokens[0], persisted);
+        // On disk, the token should be encrypted (secrets.encrypt defaults to true).
+        let saved = tokio::fs::read_to_string(config_path).await.unwrap();
+        let raw_parsed: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(raw_parsed.gateway.paired_tokens.len(), 1);
+        let on_disk = &raw_parsed.gateway.paired_tokens[0];
+        assert!(
+            crate::security::SecretStore::is_encrypted(on_disk),
+            "paired_token should be encrypted on disk"
+        );
     }
 
     #[test]
@@ -2103,6 +2145,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
         };
 
         let mut headers = HeaderMap::new();
@@ -2167,6 +2210,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
         };
 
         let headers = HeaderMap::new();
@@ -2243,6 +2287,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
         };
 
         let response = handle_webhook(
@@ -2291,6 +2336,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
         };
 
         let mut headers = HeaderMap::new();
@@ -2344,6 +2390,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
         };
 
         let mut headers = HeaderMap::new();
@@ -2402,6 +2449,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2456,6 +2504,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
         };
 
         let mut headers = HeaderMap::new();
@@ -2861,5 +2910,34 @@ mod tests {
 
         // Should be allowed again
         assert!(limiter.allow("burst-ip"));
+    }
+
+    #[test]
+    fn require_localhost_accepts_ipv4_loopback() {
+        let peer = SocketAddr::from(([127, 0, 0, 1], 12345));
+        assert!(require_localhost(&peer).is_ok());
+    }
+
+    #[test]
+    fn require_localhost_accepts_ipv6_loopback() {
+        let peer = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 12345));
+        assert!(require_localhost(&peer).is_ok());
+    }
+
+    #[test]
+    fn require_localhost_rejects_non_loopback_ipv4() {
+        let peer = SocketAddr::from(([192, 168, 1, 100], 12345));
+        let err = require_localhost(&peer).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn require_localhost_rejects_non_loopback_ipv6() {
+        let peer = SocketAddr::from((
+            std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            12345,
+        ));
+        let err = require_localhost(&peer).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 }
