@@ -864,7 +864,6 @@ pub struct GoogleSttConfig {
     pub language_code: String,
 }
 
-
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentConfig {

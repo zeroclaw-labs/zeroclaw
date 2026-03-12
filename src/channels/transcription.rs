@@ -491,7 +491,7 @@ impl TranscriptionProvider for GoogleSttProvider {
         {
             Some("flac") => "FLAC",
             Some("wav") => "LINEAR16",
-            Some("ogg") | Some("opus") => "OGG_OPUS",
+            Some("ogg" | "opus") => "OGG_OPUS",
             Some("mp3") => "MP3",
             Some("webm") => "WEBM_OPUS",
             Some(ext) => bail!("Google STT does not support '.{ext}' input"),
