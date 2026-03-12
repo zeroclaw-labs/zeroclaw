@@ -50,8 +50,11 @@ pub mod hardware_memory_map;
 #[cfg(feature = "hardware")]
 pub mod hardware_memory_read;
 pub mod http_request;
+pub mod image_generation;
 pub mod image_info;
 pub mod mcp_client;
+pub mod speech_synthesis;
+pub mod video_analysis;
 pub mod mcp_protocol;
 pub mod mcp_tool;
 pub mod mcp_transport;
@@ -121,7 +124,10 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 #[cfg(feature = "hardware")]
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
+pub use image_generation::{ImageGenerationTool, ImageGenerationParams, ImageGenerationResponse, ImageData};
 pub use image_info::ImageInfoTool;
+pub use speech_synthesis::{SpeechSynthesisTool, SpeechSynthesisParams, SpeechSynthesisResponse};
+pub use video_analysis::{VideoAnalysisTool, VideoAnalysisParams, VideoAnalysisResponse, FrameData, VideoMetadata};
 pub use mcp_client::McpRegistry;
 pub use mcp_tool::McpToolWrapper;
 pub use memory_forget::MemoryForgetTool;

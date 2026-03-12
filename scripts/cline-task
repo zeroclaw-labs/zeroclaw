@@ -1,0 +1,90 @@
+#!/bin/bash
+
+# Script pour exécuter une commande cline spécifique avec une chaîne en argument,
+# un répertoire de travail optionnel et un timeout optionnel.
+
+show_help() {
+  echo "Usage: $0 \"commande cline\" [repertoire] [timeout]"
+  echo ""
+  echo "Arguments:"
+  echo "  \"commande cline\"  La commande ou les instructions à envoyer à cline (obligatoire)."
+  echo "  repertoire        Le chemin du répertoire où exécuter la commande (optionnel)."
+  echo "  timeout            Timeout en secondes pour la commande (optionnel, défaut: 120)."
+  echo ""
+  echo "Exemples:"
+  echo "  $0 \"expliques ce que fait ce projet en 10 lignes\""
+  echo "  $0 \"ajoute un test unitaire\" ./tests"
+  echo "  $0 \"corrige le bug\" ./src 300"
+}
+
+# Vérifiez si au moins un argument a été fourni
+if [ -z "$1" ]; then
+  show_help
+  exit 1
+fi
+
+INPUT_STRING="$1"
+TARGET_DIR="$2"
+TIMEOUT="$3"
+
+# Si un répertoire est spécifié, on se déplace dedans
+if [ -n "$TARGET_DIR" ]; then
+  if [ -d "$TARGET_DIR" ]; then
+    echo "Changement de répertoire vers: $TARGET_DIR"
+    cd "$TARGET_DIR" || exit 1
+  else
+    echo "Erreur: Le répertoire '$TARGET_DIR' n'existe pas."
+    exit 1
+  fi
+fi
+
+# Construire la commande cline
+CLINE_CMD="cline -y \"$INPUT_STRING\""
+
+# Fonction pour exécuter avec timeout compatible macOS
+run_with_timeout() {
+  local timeout_val=$1
+  local cmd=$2
+  
+  # Essayer d'abord timeout (Linux) puis gtimeout (macOS via homebrew) puis perl
+  if command -v timeout &> /dev/null; then
+    timeout "$timeout_val" bash -c "$cmd" 2>&1
+  elif command -v gtimeout &> /dev/null; then
+    gtimeout "$timeout_val" bash -c "$cmd" 2>&1
+  else
+    # Alternative avec perl (disponible sur macOS)
+    perl -e "alarm $timeout_val; exec @ARGV" bash -c "$cmd" 2>&1
+  fi
+}
+
+# Exécutez la commande cline
+echo "Exécution de cline: $INPUT_STRING"
+if [ -n "$TIMEOUT" ]; then
+  echo "Timeout: ${TIMEOUT}s"
+  OUTPUT=$(run_with_timeout "$TIMEOUT" "$CLINE_CMD")
+  EXIT_CODE=$?
+  
+  # Si le processus a expiré (timeout retourne 124 ou 255 avec perl)
+  if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 255 ]; then
+    echo "Erreur: La commande a expiré après ${TIMEOUT} secondes"
+    exit 124
+  fi
+else
+  # Timeout par défaut de 120 secondes
+  TIMEOUT=120
+  echo "Timeout par défaut: ${TIMEOUT}s"
+  OUTPUT=$(run_with_timeout "$TIMEOUT" "$CLINE_CMD")
+  EXIT_CODE=$?
+  
+  # Si le processus a expiré
+  if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 255 ]; then
+    echo "Erreur: La commande a expiré après ${TIMEOUT} secondes"
+    exit 124
+  fi
+fi
+
+# Afficher le résultat
+echo "Output: $OUTPUT"
+
+# Retourner le code de sortie
+exit $EXIT_CODE

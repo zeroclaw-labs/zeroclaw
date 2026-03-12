@@ -1338,6 +1338,9 @@ pub struct MultimodalConfig {
     /// Allow fetching remote image URLs (http/https). Disabled by default.
     #[serde(default)]
     pub allow_remote_fetch: bool,
+    /// Multimedia generation configuration (image generation, TTS, video analysis).
+    #[serde(default)]
+    pub generation: MultimodalGenerationConfig,
 }
 
 fn default_multimodal_max_images() -> usize {
@@ -1346,6 +1349,52 @@ fn default_multimodal_max_images() -> usize {
 
 fn default_multimodal_max_image_size_mb() -> usize {
     5
+}
+
+/// Multimedia generation configuration (`[multimodal.generation]` section).
+///
+/// Controls AI-powered multimedia output capabilities: image generation, speech synthesis, and video analysis.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MultimodalGenerationConfig {
+    /// Enable multimedia generation tools (image generation, TTS, video analysis).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Default provider for image generation (e.g., "openai", "gemini").
+    #[serde(default)]
+    pub default_image_provider: Option<String>,
+    /// Default model for image generation.
+    #[serde(default)]
+    pub default_image_model: Option<String>,
+    /// Default provider for speech synthesis (TTS).
+    #[serde(default)]
+    pub default_tts_provider: Option<String>,
+    /// Default model for speech synthesis (TTS).
+    #[serde(default)]
+    pub default_tts_model: Option<String>,
+    /// Default voice for TTS (e.g., "alloy", "echo", "fable").
+    #[serde(default)]
+    pub default_voice: Option<String>,
+    /// Maximum image size in pixels (width x height, e.g., "1024x1024").
+    #[serde(default)]
+    pub default_image_size: Option<String>,
+    /// API key for image generation provider (optional, falls back to ZEROCLAW_API_KEY).
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+impl Default for MultimodalGenerationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_image_provider: None,
+            default_image_model: None,
+            default_tts_provider: None,
+            default_tts_model: None,
+            default_voice: None,
+            default_image_size: None,
+            api_key: None,
+        }
+    }
 }
 
 impl MultimodalConfig {
@@ -1363,6 +1412,7 @@ impl Default for MultimodalConfig {
             max_images: default_multimodal_max_images(),
             max_image_size_mb: default_multimodal_max_image_size_mb(),
             allow_remote_fetch: false,
+            generation: MultimodalGenerationConfig::default(),
         }
     }
 }

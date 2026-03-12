@@ -164,25 +164,25 @@ It's not necessary to modify input parsing in `multimodal.rs` if we only handle 
 To ensure a safe and context-aware implementation, the plan is broken down into specific tasks:
 
 ### Phase 1: Configuration (Config & Schema)
-- [x] **Task 1.1**: Extend `MultimodalConfig` in `src/config/schema.rs` to add the `generation` sub-section (`enabled`, `default_image_provider`, `default_image_model`, `default_tts_provider`, `default_tts_model`, `default_voice`).
-- [x] **Task 1.2**: Update `src/config/mod.rs` if necessary to export new structs and add basic unit tests to ensure default config loads correctly.
+- [ ] **Task 1.1**: Extend `MultimodalConfig` in `src/config/schema.rs` to add the `generation` sub-section (`enabled`, `default_image_provider`, `default_image_model`, `default_tts_provider`, `default_tts_model`, `default_voice`).
+- [ ] **Task 1.2**: Update `src/config/mod.rs` if necessary to export new structs and add basic unit tests to ensure default config loads correctly.
 
 ### Phase 2: Image Generation Tool
-- [x] **Task 2.1**: Create the file `src/tools/image_generate.rs`.
-- [x] **Task 2.2**: Implement the `ImageGenerateTool` struct adhering to the `Tool` trait.
-- [x] **Task 2.3**: Implement internal HTTP logic (using `reqwest`) to call OpenAI (DALL-E) or Gemini based on config.
-- [x] **Task 2.4**: Save the downloaded image to the secure temporary workspace and return the `[IMAGE:/path/to/image.png]` tag.
-- [x] **Task 2.5**: Register the tool in `src/tools/mod.rs` (and where tools are instantiated, e.g., `src/agent/mod.rs` or `crates/zeroclaw-core`).
+- [ ] **Task 2.1**: Create the file `src/tools/image_generate.rs`.
+- [ ] **Task 2.2**: Implement the `ImageGenerateTool` struct adhering to the `Tool` trait.
+- [ ] **Task 2.3**: Implement internal HTTP logic (using `reqwest`) to call OpenAI (DALL-E) or Gemini based on config.
+- [ ] **Task 2.4**: Save the downloaded image to the secure temporary workspace and return the `[IMAGE:/path/to/image.png]` tag.
+- [ ] **Task 2.5**: Register the tool in `src/tools/mod.rs` (and where tools are instantiated, e.g., `src/agent/mod.rs` or `crates/zeroclaw-core`).
 
 ### Phase 3: Speech Synthesis Tool (TTS)
-- [x] **Task 3.1**: Create the file `src/tools/synthesize_speech.rs`.
-- [x] **Task 3.2**: Implement the `SynthesizeSpeechTool` struct adhering to the `Tool` trait.
-- [x] **Task 3.3**: Implement internal HTTP logic to call OpenAI TTS or Gemini TTS.
-- [x] **Task 3.4**: Save the audio to the workspace and return the `[AUDIO:/path/to/audio.mp3]` tag.
-- [x] **Task 3.5**: Register the tool in `src/tools/mod.rs`.
+- [ ] **Task 3.1**: Create the file `src/tools/synthesize_speech.rs`.
+- [ ] **Task 3.2**: Implement the `SynthesizeSpeechTool` struct adhering to the `Tool` trait.
+- [ ] **Task 3.3**: Implement internal HTTP logic to call OpenAI TTS or Gemini TTS.
+- [ ] **Task 3.4**: Save the audio to the workspace and return the `[AUDIO:/path/to/audio.mp3]` tag.
+- [ ] **Task 3.5**: Register the tool in `src/tools/mod.rs`.
 
 ### Phase 4: Video Analysis Tool (Experimental)
-- [x] **Task 4.1**: Create `src/tools/video_analyze.rs` (logic for Google File API upload + prompt).
+- [ ] **Task 4.1**: Create `src/tools/video_analyze.rs` (logic for Google File API upload + prompt).
 
 ## Risks and Mitigations (Security & Costs)
 
