@@ -4032,7 +4032,7 @@ pub(crate) fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf
 ///
 /// This mirrors the same precedence used by `Config::load_or_init()`:
 /// `ZEROCLAW_CONFIG_DIR` > `ZEROCLAW_WORKSPACE` > active workspace marker > defaults.
-pub(crate) async fn resolve_runtime_dirs_for_onboarding() -> Result<(PathBuf, PathBuf)> {
+pub async fn resolve_runtime_dirs_for_onboarding() -> Result<(PathBuf, PathBuf)> {
     let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
     let (config_dir, workspace_dir, _) =
         resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
@@ -4201,10 +4201,13 @@ fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
 
 fn normalize_wire_api(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "responses" => Some("responses"),
-        "chat_completions" | "chat-completions" | "chat" | "chatcompletions" => {
-            Some("chat_completions")
-        }
+        "responses" | "openai-responses" | "open-ai-responses" => Some("responses"),
+        "chat_completions"
+        | "chat-completions"
+        | "chat"
+        | "chatcompletions"
+        | "openai-chat-completions"
+        | "open-ai-chat-completions" => Some("chat_completions"),
         _ => None,
     }
 }
@@ -8307,8 +8310,7 @@ require_otp_to_resume = true
         // Simulate a full load: deserialize then decrypt (mirrors load_or_init logic)
         let mut loaded: Config = toml::from_str(&raw_toml).unwrap();
         loaded.config_path = dir.join("config.toml");
-        let load_store =
-            crate::security::SecretStore::new(&dir, loaded.secrets.encrypt);
+        let load_store = crate::security::SecretStore::new(&dir, loaded.secrets.encrypt);
         if let Some(ref mut tg) = loaded.channels_config.telegram {
             decrypt_secret(
                 &load_store,

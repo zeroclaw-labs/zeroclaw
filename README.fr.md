@@ -219,7 +219,7 @@ Exemple d'échantillon (macOS arm64, mesuré le 18 février 2026) :
 Le script `install.sh` installe Rust, clone ZeroClaw, le compile, et configure votre environnement de développement initial :
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
 Ceci va :

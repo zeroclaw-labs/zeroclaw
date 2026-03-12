@@ -4916,18 +4916,12 @@ Final answer."#;
 
     #[test]
     fn strip_think_tags_removes_single_block() {
-        assert_eq!(
-            strip_think_tags("<think>reasoning</think>Hello"),
-            "Hello"
-        );
+        assert_eq!(strip_think_tags("<think>reasoning</think>Hello"), "Hello");
     }
 
     #[test]
     fn strip_think_tags_removes_multiple_blocks() {
-        assert_eq!(
-            strip_think_tags("<think>a</think>X<think>b</think>Y"),
-            "XY"
-        );
+        assert_eq!(strip_think_tags("<think>a</think>X<think>b</think>Y"), "XY");
     }
 
     #[test]
@@ -4946,7 +4940,11 @@ Final answer."#;
         // stripped, allowing the tool call to be parsed correctly.
         let response = "<think>I need to list files to understand the project</think>\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>";
         let (text, calls) = parse_tool_calls(response);
-        assert_eq!(calls.len(), 1, "should parse tool call after stripping think tags");
+        assert_eq!(
+            calls.len(),
+            1,
+            "should parse tool call after stripping think tags"
+        );
         assert_eq!(calls[0].name, "shell");
         assert_eq!(
             calls[0].arguments.get("command").unwrap().as_str().unwrap(),
@@ -4970,8 +4968,14 @@ Final answer."#;
         let response = "<think>I need to check two things</think>\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>";
         let (_, calls) = parse_tool_calls(response);
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "date");
-        assert_eq!(calls[1].arguments.get("command").unwrap().as_str().unwrap(), "pwd");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "date"
+        );
+        assert_eq!(
+            calls[1].arguments.get("command").unwrap().as_str().unwrap(),
+            "pwd"
+        );
     }
 
     #[test]
