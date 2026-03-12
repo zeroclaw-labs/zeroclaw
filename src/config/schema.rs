@@ -5308,9 +5308,6 @@ impl Config {
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
 
-        // MCP servers
-        if self.mcp.enabled {
-            validate_mcp_config(&self.mcp)?;
         // Notion
         if self.notion.enabled {
             if self.notion.database_id.trim().is_empty() {
@@ -5964,7 +5961,6 @@ impl Config {
                 "config.notion.api_key",
             )?;
         }
-
 
         let toml_str =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;

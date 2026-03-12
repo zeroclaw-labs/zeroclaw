@@ -3395,7 +3395,11 @@ fn collect_configured_channels(
         } else {
             config.notion.api_key.trim().to_string()
         };
-        if !notion_api_key.trim().is_empty() {
+        if notion_api_key.trim().is_empty() {
+            tracing::warn!(
+                "Notion channel enabled but no API key found (set notion.api_key or NOTION_API_KEY env var)"
+            );
+        } else {
             channels.push(ConfiguredChannel {
                 display_name: "Notion",
                 channel: Arc::new(NotionChannel::new(
@@ -3409,10 +3413,6 @@ fn collect_configured_channels(
                     config.notion.recover_stale,
                 )),
             });
-        } else {
-            tracing::warn!(
-                "Notion channel enabled but no API key found (set notion.api_key or NOTION_API_KEY env var)"
-            );
         }
     }
 

@@ -348,12 +348,12 @@ pub fn all_tools_with_runtime(
         } else {
             root_config.notion.api_key.trim().to_string()
         };
-        if !notion_api_key.trim().is_empty() {
-            tool_arcs.push(Arc::new(NotionTool::new(notion_api_key, security.clone())));
-        } else {
+        if notion_api_key.trim().is_empty() {
             tracing::warn!(
                 "Notion tool enabled but no API key found (set notion.api_key or NOTION_API_KEY env var)"
             );
+        } else {
+            tool_arcs.push(Arc::new(NotionTool::new(notion_api_key, security.clone())));
         }
     }
 
