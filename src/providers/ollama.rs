@@ -938,9 +938,7 @@ mod tests {
     #[test]
     fn normalize_response_text_strips_think_tags() {
         assert_eq!(
-            OllamaProvider::normalize_response_text(
-                "<think>reasoning</think> hello".to_string()
-            ),
+            OllamaProvider::normalize_response_text("<think>reasoning</think> hello".to_string()),
             Some("hello".to_string())
         );
     }
@@ -1178,7 +1176,10 @@ mod tests {
     #[test]
     fn strip_think_tags_preserves_text_without_tags() {
         let input = "plain text response";
-        assert_eq!(OllamaProvider::strip_think_tags(input), "plain text response");
+        assert_eq!(
+            OllamaProvider::strip_think_tags(input),
+            "plain text response"
+        );
     }
 
     #[test]
@@ -1207,7 +1208,9 @@ mod tests {
     fn effective_content_falls_back_to_thinking_field() {
         let result = OllamaProvider::effective_content(
             "",
-            Some("<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}</tool_call>"),
+            Some(
+                "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}</tool_call>",
+            ),
         );
         assert!(result.is_some());
         assert!(result.unwrap().contains("<tool_call>"));
@@ -1220,15 +1223,13 @@ mod tests {
         assert!(OllamaProvider::effective_content(
             "<think>only thinking</think>",
             Some("<think>also only thinking</think>")
-        ).is_none());
+        )
+        .is_none());
     }
 
     #[test]
     fn effective_content_prefers_content_over_thinking() {
-        let result = OllamaProvider::effective_content(
-            "content text",
-            Some("thinking text"),
-        );
+        let result = OllamaProvider::effective_content("content text", Some("thinking text"));
         assert_eq!(result, Some("content text".to_string()));
     }
 
