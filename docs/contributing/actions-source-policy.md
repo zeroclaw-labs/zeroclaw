@@ -37,6 +37,15 @@ Equivalent allowlist patterns:
 | Release Beta | `.github/workflows/release-beta-on-push.yml` | Push to `master` |
 | Release Stable | `.github/workflows/release-stable-manual.yml` | Manual `workflow_dispatch` |
 
+### musl Cross-Compilation Dependencies (aarch64-unknown-linux-musl job only)
+
+| Source | Package | Version | Purpose |
+|--------|---------|---------|---------|
+| PyPI | ziglang | 0.15.2 | Zig toolchain for musl cross-compilation |
+| crates.io | cargo-zigbuild | 0.22.1 | Cargo subcommand wrapping Zig linker |
+
+Both are pinned to exact versions in the workflow matrix.
+
 ## Change Control
 
 Record each policy change with:
