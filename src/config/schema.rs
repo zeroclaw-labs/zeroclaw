@@ -3957,7 +3957,7 @@ pub struct ConversationalAiConfig {
     #[serde(default = "default_conversational_ai_language")]
     pub default_language: String,
 
-    /// Supported languages for conversations. Default: ["en", "de", "fr", "it"].
+    /// Supported languages for conversations. Default: `["en", "de", "fr", "it"]`.
     #[serde(default = "default_conversational_ai_supported_languages")]
     pub supported_languages: Vec<String>,
 

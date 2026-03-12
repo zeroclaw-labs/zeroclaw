@@ -9,10 +9,11 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// Escalation status for a conversation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EscalationStatus {
     /// No escalation needed or requested.
+    #[default]
     None,
     /// Escalation has been requested but not yet fulfilled.
     Pending,
@@ -20,12 +21,6 @@ pub enum EscalationStatus {
     Active,
     /// Conversation was returned from human agent back to the bot.
     Resumed,
-}
-
-impl Default for EscalationStatus {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Detected intent from a user message.
