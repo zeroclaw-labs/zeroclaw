@@ -4118,6 +4118,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     room_id,
                     allowed_users,
                     password,
+                    max_media_download_mb: None,
                 });
             }
             ChannelMenuChoice::Signal => {

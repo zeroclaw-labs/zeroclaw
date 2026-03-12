@@ -33,8 +33,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, OnceCell, RwLock};
 
-/// Maximum media download size (50 MB).
-const MATRIX_MAX_MEDIA_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
+/// Default maximum media download size (50 MB).
+const DEFAULT_MAX_MEDIA_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
 
 /// Filename for persisted session credentials (access_token + device_id).
 const MATRIX_SESSION_FILE: &str = "session.json";
@@ -67,6 +67,7 @@ pub struct MatrixChannel {
     transcription: Option<crate::config::TranscriptionConfig>,
     voice_transcriptions: Arc<Mutex<std::collections::HashMap<String, String>>>,
     password: Option<String>,
+    max_media_bytes: usize,
 }
 
 impl std::fmt::Debug for MatrixChannel {
@@ -323,13 +324,13 @@ async fn download_and_save_matrix_media(
     filename: &str,
     save_dir: &Path,
     size_hint: Option<u64>,
+    max_bytes: usize,
 ) -> anyhow::Result<PathBuf> {
     // Pre-download size check using event metadata (avoids buffering large payloads).
     if let Some(size) = size_hint {
-        if size as usize > MATRIX_MAX_MEDIA_DOWNLOAD_BYTES {
+        if size as usize > max_bytes {
             anyhow::bail!(
-                "Matrix media metadata size exceeds limit ({size} bytes > {} bytes); skipping download",
-                MATRIX_MAX_MEDIA_DOWNLOAD_BYTES,
+                "Matrix media metadata size exceeds limit ({size} bytes > {max_bytes} bytes); skipping download",
             );
         }
     }
@@ -342,11 +343,10 @@ async fn download_and_save_matrix_media(
     let data = client.media().get_media_content(&request, false).await?;
 
     // Post-download safety net (metadata can be spoofed).
-    if data.len() > MATRIX_MAX_MEDIA_DOWNLOAD_BYTES {
+    if data.len() > max_bytes {
         anyhow::bail!(
-            "Matrix media exceeds size limit ({} bytes > {} bytes)",
+            "Matrix media exceeds size limit ({} bytes > {max_bytes} bytes)",
             data.len(),
-            MATRIX_MAX_MEDIA_DOWNLOAD_BYTES,
         );
     }
 
@@ -372,6 +372,7 @@ impl MatrixChannel {
             .filter(|entry| !entry.is_empty())
     }
 
+    /// Create a new Matrix channel with minimal configuration.
     pub fn new(
         homeserver: String,
         access_token: Option<String>,
@@ -381,6 +382,7 @@ impl MatrixChannel {
         Self::new_with_session_hint(homeserver, access_token, room_id, allowed_users, None, None)
     }
 
+    /// Create a new Matrix channel with optional session owner and device ID hints.
     pub fn new_with_session_hint(
         homeserver: String,
         access_token: Option<String>,
@@ -400,6 +402,7 @@ impl MatrixChannel {
         )
     }
 
+    /// Create a new Matrix channel with session hints and an optional workspace directory for media storage.
     pub fn new_with_session_hint_and_zeroclaw_dir(
         homeserver: String,
         access_token: Option<String>,
@@ -436,18 +439,31 @@ impl MatrixChannel {
             transcription: None,
             voice_transcriptions: Arc::new(Mutex::new(std::collections::HashMap::new())),
             password: None,
+            max_media_bytes: DEFAULT_MAX_MEDIA_DOWNLOAD_BYTES,
         }
     }
 
+    /// Set optional password for automatic login and cross-signing bootstrap.
     pub fn with_password(mut self, password: Option<String>) -> Self {
         self.password = password;
         self
     }
 
+    /// Enable audio transcription with the given configuration.
     pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
         if config.enabled {
             self.transcription = Some(config);
         }
+        self
+    }
+
+    /// Set maximum media download size in megabytes. `0` means no limit.
+    pub fn with_max_media_download_mb(mut self, mb: Option<u32>) -> Self {
+        self.max_media_bytes = match mb {
+            Some(0) => usize::MAX,
+            Some(v) => v as usize * 1024 * 1024,
+            None => DEFAULT_MAX_MEDIA_DOWNLOAD_BYTES,
+        };
         self
     }
 
@@ -1468,6 +1484,7 @@ impl Channel for MatrixChannel {
         let media_save_dir_for_handler = self.media_save_dir();
         let transcription_for_handler = self.transcription.clone();
         let voice_cache_for_handler = Arc::clone(&self.voice_transcriptions);
+        let max_media_bytes_for_handler = self.max_media_bytes;
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
@@ -1481,6 +1498,7 @@ impl Channel for MatrixChannel {
             let media_save_dir = media_save_dir_for_handler.clone();
             let transcription_config = transcription_for_handler.clone();
             let voice_cache = Arc::clone(&voice_cache_for_handler);
+            let max_media_bytes = max_media_bytes_for_handler;
 
             async move {
                 if false
@@ -1529,7 +1547,7 @@ impl Channel for MatrixChannel {
                         let source = content.source.clone();
                         let size_hint = content.info.as_ref().and_then(|i| i.size.map(u64::from));
                         let sdk_client = room.client();
-                        match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir, size_hint).await {
+                        match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir, size_hint, max_media_bytes).await {
                             Ok(local_path) => {
                                 if is_image_extension(&local_path) {
                                     format!("[IMAGE:{}]", local_path.display())
@@ -1552,7 +1570,7 @@ impl Channel for MatrixChannel {
                         let source = content.source.clone();
                         let size_hint = content.info.as_ref().and_then(|i| i.size.map(u64::from));
                         let sdk_client = room.client();
-                        match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir, size_hint).await {
+                        match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir, size_hint, max_media_bytes).await {
                             Ok(local_path) => {
                                 format!("[Document: {}] {}", filename, local_path.display())
                             }
@@ -1570,7 +1588,7 @@ impl Channel for MatrixChannel {
 
                         // Pre-download size check for audio.
                         if let Some(size) = size_hint {
-                            if size as usize > MATRIX_MAX_MEDIA_DOWNLOAD_BYTES {
+                            if size as usize > max_media_bytes {
                                 tracing::warn!("Matrix audio exceeds size limit ({size} bytes); skipping");
                                 return;
                             }
@@ -1601,7 +1619,7 @@ impl Channel for MatrixChannel {
                                                 tracing::warn!("Matrix audio received but no zeroclaw_dir configured for media storage");
                                                 return;
                                             };
-                                            match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir, size_hint).await {
+                                            match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir, size_hint, max_media_bytes).await {
                                                 Ok(local_path) => {
                                                     format!("[Document: {}] {}", filename, local_path.display())
                                                 }
@@ -1624,7 +1642,7 @@ impl Channel for MatrixChannel {
                                 tracing::warn!("Matrix audio received but no zeroclaw_dir configured for media storage");
                                 return;
                             };
-                            match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir, size_hint).await {
+                            match download_and_save_matrix_media(&sdk_client, &source, &filename, save_dir, size_hint, max_media_bytes).await {
                                 Ok(local_path) => {
                                     format!("[Document: {}] {}", filename, local_path.display())
                                 }
@@ -2623,5 +2641,44 @@ mod tests {
         };
         let ch = make_channel().with_transcription(config);
         assert!(ch.transcription.is_none());
+    }
+
+    #[test]
+    fn with_password_stores_value() {
+        let ch = make_channel().with_password(Some("hunter2".into()));
+        assert_eq!(ch.password.as_deref(), Some("hunter2"));
+    }
+
+    #[test]
+    fn with_password_none_clears() {
+        let ch = make_channel()
+            .with_password(Some("hunter2".into()))
+            .with_password(None);
+        assert!(ch.password.is_none());
+    }
+
+    #[test]
+    fn default_max_media_download_size_is_50mb() {
+        assert_eq!(DEFAULT_MAX_MEDIA_DOWNLOAD_BYTES, 50 * 1024 * 1024);
+        let ch = make_channel();
+        assert_eq!(ch.max_media_bytes, DEFAULT_MAX_MEDIA_DOWNLOAD_BYTES);
+    }
+
+    #[test]
+    fn with_max_media_download_mb_custom() {
+        let ch = make_channel().with_max_media_download_mb(Some(100));
+        assert_eq!(ch.max_media_bytes, 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn with_max_media_download_mb_zero_means_no_limit() {
+        let ch = make_channel().with_max_media_download_mb(Some(0));
+        assert_eq!(ch.max_media_bytes, usize::MAX);
+    }
+
+    #[test]
+    fn with_max_media_download_mb_none_uses_default() {
+        let ch = make_channel().with_max_media_download_mb(None);
+        assert_eq!(ch.max_media_bytes, DEFAULT_MAX_MEDIA_DOWNLOAD_BYTES);
     }
 }

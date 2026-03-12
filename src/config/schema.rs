@@ -3148,6 +3148,10 @@ pub struct MatrixConfig {
     /// - Bootstrap cross-signing so the device is marked as "verified by its owner".
     #[serde(default)]
     pub password: Option<String>,
+    /// Maximum media download size in megabytes. Set to 0 for no limit.
+    /// Defaults to 50 MB when omitted.
+    #[serde(default)]
+    pub max_media_download_mb: Option<u32>,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -5278,13 +5282,6 @@ impl Config {
                 "config.channels_config.mattermost.bot_token",
             )?;
         }
-        if let Some(ref mut mx) = config_to_save.channels_config.matrix {
-            encrypt_optional_secret(
-                &store,
-                &mut mx.access_token,
-                "config.channels_config.matrix.access_token",
-            )?;
-        }
         if let Some(ref mut wa) = config_to_save.channels_config.whatsapp {
             encrypt_optional_secret(
                 &store,
@@ -6290,6 +6287,7 @@ tool_dispatcher = "xml"
             room_id: "!room123:matrix.org".into(),
             allowed_users: vec!["@user:matrix.org".into()],
             password: None,
+            max_media_download_mb: None,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -6311,6 +6309,7 @@ tool_dispatcher = "xml"
             room_id: "!abc:synapse.local".into(),
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
             password: None,
+            max_media_download_mb: None,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -6401,6 +6400,7 @@ allowed_users = ["@ops:matrix.org"]
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
                 password: None,
+                max_media_download_mb: None,
             }),
             signal: None,
             whatsapp: None,
@@ -8431,5 +8431,74 @@ require_otp_to_resume = true
             .validate()
             .expect_err("expected ttl validation failure");
         assert!(err.to_string().contains("token_ttl_secs"));
+    }
+
+    #[test]
+    async fn validate_matrix_password_requires_user_id() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            channels_config: ChannelsConfig {
+                matrix: Some(MatrixConfig {
+                    homeserver: "https://matrix.org".into(),
+                    access_token: None,
+                    user_id: None,
+                    device_id: None,
+                    room_id: "!room:matrix.org".into(),
+                    allowed_users: vec!["@u:m".into()],
+                    password: Some("secret".into()),
+                    max_media_download_mb: None,
+                }),
+                ..ChannelsConfig::default()
+            },
+            ..Config::default()
+        };
+        let err = config.validate().expect_err("expected validation to fail");
+        assert!(err
+            .to_string()
+            .contains("user_id is required when password is set"));
+    }
+
+    #[test]
+    async fn validate_matrix_password_with_user_id_ok() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            channels_config: ChannelsConfig {
+                matrix: Some(MatrixConfig {
+                    homeserver: "https://matrix.org".into(),
+                    access_token: None,
+                    user_id: Some("@bot:matrix.org".into()),
+                    device_id: None,
+                    room_id: "!room:matrix.org".into(),
+                    allowed_users: vec!["@u:m".into()],
+                    password: Some("secret".into()),
+                    max_media_download_mb: None,
+                }),
+                ..ChannelsConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    async fn validate_matrix_access_token_only_ok() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            channels_config: ChannelsConfig {
+                matrix: Some(MatrixConfig {
+                    homeserver: "https://matrix.org".into(),
+                    access_token: Some("syt_tok".into()),
+                    user_id: None,
+                    device_id: None,
+                    room_id: "!room:matrix.org".into(),
+                    allowed_users: vec!["@u:m".into()],
+                    password: None,
+                    max_media_download_mb: None,
+                }),
+                ..ChannelsConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
     }
 }

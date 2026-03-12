@@ -2962,6 +2962,7 @@ fn collect_configured_channels(
                     config.config_path.parent().map(|path| path.to_path_buf()),
                 )
                 .with_password(mx.password.clone())
+                .with_max_media_download_mb(mx.max_media_download_mb)
                 .with_transcription(config.transcription.clone()),
             ),
         });

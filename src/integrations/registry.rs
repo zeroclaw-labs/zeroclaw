@@ -866,6 +866,7 @@ mod tests {
             room_id: "!r:m".into(),
             allowed_users: vec![],
             password: None,
+            max_media_download_mb: None,
         });
         let entries = all_integrations();
         let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();
