@@ -574,7 +574,10 @@ impl OpenAiCodexProvider {
                 verbosity: "medium".to_string(),
             },
             reasoning: ResponsesReasoningOptions {
-                effort: resolve_reasoning_effort(self.reasoning_effort.as_deref(), normalized_model),
+                effort: resolve_reasoning_effort(
+                    self.reasoning_effort.as_deref(),
+                    normalized_model,
+                ),
                 summary: "auto".to_string(),
             },
             include: vec!["reasoning.encrypted_content".to_string()],
@@ -1038,6 +1041,7 @@ data: [DONE]
             secrets_encrypt: false,
             auth_profile_override: None,
             reasoning_enabled: None,
+            reasoning_effort: None,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");
