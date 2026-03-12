@@ -325,6 +325,35 @@ pub async fn handle_api_integrations(
     Json(serde_json::json!({"integrations": integrations})).into_response()
 }
 
+/// GET /api/integrations/settings — return per-integration settings (enabled + category)
+pub async fn handle_api_integrations_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let entries = crate::integrations::registry::all_integrations();
+
+    let mut settings = serde_json::Map::new();
+    for entry in &entries {
+        let status = (entry.status_fn)(&config);
+        let enabled = matches!(status, crate::integrations::IntegrationStatus::Active);
+        settings.insert(
+            entry.name.to_string(),
+            serde_json::json!({
+                "enabled": enabled,
+                "category": entry.category,
+                "status": status,
+            }),
+        );
+    }
+
+    Json(serde_json::json!({"settings": settings})).into_response()
+}
+
 /// POST /api/doctor — run diagnostics
 pub async fn handle_api_doctor(
     State(state): State<AppState>,
@@ -776,6 +805,7 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     if let Some(qq) = masked.channels_config.qq.as_mut() {
         mask_required_secret(&mut qq.app_secret);
     }
+    #[cfg(feature = "channel-nostr")]
     if let Some(nostr) = masked.channels_config.nostr.as_mut() {
         mask_required_secret(&mut nostr.private_key);
     }
@@ -953,6 +983,7 @@ fn restore_masked_sensitive_fields(
     ) {
         restore_required_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
     }
+    #[cfg(feature = "channel-nostr")]
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.nostr.as_mut(),
         current.channels_config.nostr.as_ref(),
@@ -1026,6 +1057,7 @@ mod tests {
             from_address: "agent@example.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
+            default_subject: "ZeroClaw Message".to_string(),
         });
         cfg.model_routes = vec![crate::config::schema::ModelRouteConfig {
             hint: "reasoning".to_string(),
@@ -1159,6 +1191,7 @@ mod tests {
             from_address: "agent@example.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
+            default_subject: "ZeroClaw Message".to_string(),
         });
         current.model_routes = vec![
             crate::config::schema::ModelRouteConfig {
