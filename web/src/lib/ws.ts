@@ -66,11 +66,16 @@ export class WebSocketClient {
     const token = getToken();
     const sessionId = getOrCreateSessionId();
     const params = new URLSearchParams();
-    if (token) params.set('token', token);
     params.set('session_id', sessionId);
     const url = `${this.baseUrl}/ws/chat?${params.toString()}`;
 
-    this.ws = new WebSocket(url, ['zeroclaw.v1']);
+    // Build protocols array with authentication token if available
+    const protocols = ['zeroclaw.v1'];
+    if (token) {
+      protocols.push(`bearer.${token}`);
+    }
+
+    this.ws = new WebSocket(url, protocols);
 
     this.ws.onopen = () => {
       this.currentDelay = this.reconnectDelay;
