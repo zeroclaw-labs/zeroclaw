@@ -8,8 +8,8 @@ use super::report_templates;
 use super::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
-use std::fmt::Write as _;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 /// Project intelligence tool for consulting project management.
 ///
