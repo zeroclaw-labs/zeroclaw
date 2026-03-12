@@ -20,6 +20,18 @@ export interface WebSocketClientOptions {
 const DEFAULT_RECONNECT_DELAY = 1000;
 const MAX_RECONNECT_DELAY = 30000;
 
+const SESSION_STORAGE_KEY = 'zeroclaw_session_id';
+
+/** Return a stable session ID, persisted in sessionStorage across reconnects. */
+function getOrCreateSessionId(): string {
+  let id = sessionStorage.getItem(SESSION_STORAGE_KEY);
+  if (!id) {
+    id = crypto.randomUUID();
+    sessionStorage.setItem(SESSION_STORAGE_KEY, id);
+  }
+  return id;
+}
+
 export class WebSocketClient {
   private ws: WebSocket | null = null;
   private currentDelay: number;
@@ -52,9 +64,13 @@ export class WebSocketClient {
     this.clearReconnectTimer();
 
     const token = getToken();
-    const url = `${this.baseUrl}/ws/chat${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+    const sessionId = getOrCreateSessionId();
+    const params = new URLSearchParams();
+    if (token) params.set('token', token);
+    params.set('session_id', sessionId);
+    const url = `${this.baseUrl}/ws/chat?${params.toString()}`;
 
-    this.ws = new WebSocket(url);
+    this.ws = new WebSocket(url, ['zeroclaw.v1']);
 
     this.ws.onopen = () => {
       this.currentDelay = this.reconnectDelay;
