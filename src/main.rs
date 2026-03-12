@@ -774,17 +774,20 @@ async fn main() -> Result<()> {
             model,
             temperature,
             peripheral,
-        } => agent::run(
-            config,
-            message,
-            provider,
-            model,
-            temperature.unwrap_or(config.default_temperature),
-            peripheral,
-            true,
-        )
-        .await
-        .map(|_| ()),
+        } => {
+            let final_temperature = temperature.unwrap_or(config.default_temperature);
+            agent::run(
+                config,
+                message,
+                provider,
+                model,
+                final_temperature,
+                peripheral,
+                true,
+            )
+            .await
+            .map(|_| ())
+        }
 
         Commands::Gateway { port, host } => {
             let port = port.unwrap_or(config.gateway.port);
