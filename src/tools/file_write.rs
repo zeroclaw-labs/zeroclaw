@@ -384,12 +384,17 @@ mod tests {
         let tool = FileWriteTool::new(security);
 
         let result = tool
-            .execute(json!({"path": outside_file.to_string_lossy().to_string(), "content": "outside"}))
+            .execute(
+                json!({"path": outside_file.to_string_lossy().to_string(), "content": "outside"}),
+            )
             .await
             .unwrap();
 
         assert!(result.success);
-        assert_eq!(tokio::fs::read_to_string(&outside_file).await.unwrap(), "outside");
+        assert_eq!(
+            tokio::fs::read_to_string(&outside_file).await.unwrap(),
+            "outside"
+        );
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }

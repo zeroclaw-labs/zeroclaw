@@ -155,7 +155,9 @@ impl Tool for GlobSearchTool {
         results.sort();
 
         let output = if results.is_empty() {
-            format!("No files matching pattern '{pattern}' found in the workspace or allowed roots.")
+            format!(
+                "No files matching pattern '{pattern}' found in the workspace or allowed roots."
+            )
         } else {
             use std::fmt::Write;
             let mut buf = results.join("\n");

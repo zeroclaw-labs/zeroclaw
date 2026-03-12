@@ -525,7 +525,10 @@ mod tests {
             .unwrap();
 
         assert!(result.success);
-        assert_eq!(tokio::fs::read_to_string(&outside_file).await.unwrap(), "after");
+        assert_eq!(
+            tokio::fs::read_to_string(&outside_file).await.unwrap(),
+            "after"
+        );
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
