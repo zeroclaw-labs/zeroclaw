@@ -50,6 +50,11 @@ Commands:
   lint-strict   Run rustfmt + full clippy warnings gate (container only)
   lint-delta    Run strict lint delta gate on changed Rust lines (container only)
   test          Run cargo test (container only)
+  test-component  Run component tests only
+  test-integration Run integration tests only
+  test-system     Run system tests only
+  test-live       Run live tests (requires credentials)
+  test-manual     Run manual test scripts (dockerignore, etc.)
   build         Run release build smoke check (container only)
   audit         Run cargo audit (container only)
   deny          Run cargo deny check (container only)
@@ -90,6 +95,26 @@ case "$1" in
     run_in_ci "cargo test --locked --verbose"
     ;;
 
+  test-component)
+    run_in_ci "cargo test --test component --locked --verbose"
+    ;;
+
+  test-integration)
+    run_in_ci "cargo test --test integration --locked --verbose"
+    ;;
+
+  test-system)
+    run_in_ci "cargo test --test system --locked --verbose"
+    ;;
+
+  test-live)
+    run_in_ci "cargo test --test live -- --ignored --verbose"
+    ;;
+
+  test-manual)
+    run_in_ci "bash tests/manual/test_dockerignore.sh"
+    ;;
+
   build)
     run_in_ci "cargo build --release --locked --verbose"
     ;;
@@ -115,6 +140,7 @@ case "$1" in
   all)
     run_in_ci "./scripts/ci/rust_quality_gate.sh"
     run_in_ci "cargo test --locked --verbose"
+    run_in_ci "bash tests/manual/test_dockerignore.sh"
     run_in_ci "cargo build --release --locked --verbose"
     run_in_ci "cargo deny check licenses sources"
     run_in_ci "cargo audit"

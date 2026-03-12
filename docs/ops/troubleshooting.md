@@ -218,7 +218,7 @@ journalctl --user -u zeroclaw.service -f
 ## Installer URL
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
 ## Still Stuck?
