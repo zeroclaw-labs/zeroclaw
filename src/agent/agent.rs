@@ -771,7 +771,10 @@ mod tests {
         config.runtime.reasoning_enabled = Some(false);
 
         let options = provider_runtime_options_from_config(&config);
-        assert_eq!(options.provider_api_url.as_deref(), Some("https://ollama.example.com"));
+        assert_eq!(
+            options.provider_api_url.as_deref(),
+            Some("https://ollama.example.com")
+        );
         assert_eq!(options.reasoning_enabled, Some(false));
         assert!(options.secrets_encrypt);
     }
