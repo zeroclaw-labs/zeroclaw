@@ -1957,6 +1957,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         &[],
+        &[],
     )
     .await
 }
@@ -2156,6 +2157,7 @@ pub(crate) async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    dedup_exempt_tools: &[String],
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2565,7 +2567,8 @@ pub(crate) async fn run_tool_call_loop(
             }
 
             let signature = tool_call_signature(&tool_name, &tool_args);
-            if !seen_tool_signatures.insert(signature) {
+            let dedup_exempt = dedup_exempt_tools.iter().any(|e| e == &tool_name);
+            if !dedup_exempt && !seen_tool_signatures.insert(signature) {
                 let duplicate = format!(
                     "Skipped duplicate tool call '{tool_name}' with identical arguments in this turn."
                 );
@@ -3108,6 +3111,7 @@ pub async fn run(
             None,
             None,
             &[],
+            &config.agent.tool_call_dedup_exempt,
         )
         .await?;
         final_output = response.clone();
@@ -3230,6 +3234,7 @@ pub async fn run(
                 None,
                 None,
                 &[],
+                &config.agent.tool_call_dedup_exempt,
             )
             .await
             {
@@ -3774,6 +3779,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3820,6 +3826,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3859,6 +3866,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             &[],
         )
         .await
@@ -3986,6 +3994,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
         )
         .await
         .expect("parallel execution should complete");
@@ -4055,6 +4064,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4072,6 +4082,142 @@ mod tests {
             .expect("prompt-mode tool result payload should be present");
         assert!(tool_results.content.contains("counted:A"));
         assert!(tool_results.content.contains("Skipped duplicate tool call"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_dedup_exempt_allows_repeated_calls() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+        let exempt = vec!["count_tool".to_string()];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &exempt,
+        )
+        .await
+        .expect("loop should finish with exempt tool executing twice");
+
+        assert_eq!(result, "done");
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            2,
+            "exempt tool should execute both duplicate calls"
+        );
+
+        let tool_results = history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("prompt-mode tool result payload should be present");
+        assert!(
+            !tool_results.content.contains("Skipped duplicate tool call"),
+            "exempt tool calls should not be suppressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_dedup_exempt_only_affects_listed_tools() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"other_tool","arguments":{"value":"B"}}
+</tool_call>
+<tool_call>
+{"name":"other_tool","arguments":{"value":"B"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let count_invocations = Arc::new(AtomicUsize::new(0));
+        let other_invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(CountingTool::new(
+                "count_tool",
+                Arc::clone(&count_invocations),
+            )),
+            Box::new(CountingTool::new(
+                "other_tool",
+                Arc::clone(&other_invocations),
+            )),
+        ];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+        let exempt = vec!["count_tool".to_string()];
+
+        let _result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &exempt,
+        )
+        .await
+        .expect("loop should complete");
+
+        assert_eq!(
+            count_invocations.load(Ordering::SeqCst),
+            2,
+            "exempt tool should execute both calls"
+        );
+        assert_eq!(
+            other_invocations.load(Ordering::SeqCst),
+            1,
+            "non-exempt tool should still be deduped"
+        );
     }
 
     #[tokio::test]
@@ -4110,6 +4256,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             &[],
         )
         .await

@@ -604,6 +604,9 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
+    #[serde(default)]
+    pub tool_call_dedup_exempt: Vec<String>,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -626,6 +629,7 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            tool_call_dedup_exempt: Vec::new(),
         }
     }
 }
