@@ -2396,8 +2396,9 @@ mod tests {
             workspace_dir: workspace.clone(),
             ..SecurityPolicy::default()
         };
+        let nested_dir = workspace.join("notes");
 
         assert!(!policy.is_runtime_config_path(&workspace.join("notes.txt")));
-        assert!(!policy.is_runtime_config_path(&workspace.join("config.toml")));
+        assert!(!policy.is_runtime_config_path(&nested_dir.join("config.toml")));
     }
 }
