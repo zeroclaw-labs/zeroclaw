@@ -997,6 +997,9 @@ impl SecurityPolicy {
         if !resolved.starts_with(&config_dir) {
             return false;
         }
+        if resolved.parent() != Some(config_dir.as_path()) {
+            return false;
+        }
 
         let Some(file_name) = resolved.file_name().and_then(|value| value.to_str()) else {
             return false;
