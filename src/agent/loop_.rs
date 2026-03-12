@@ -2461,10 +2461,16 @@ pub(crate) async fn run_tool_call_loop(
             return Ok(display_text);
         }
 
-        // Print any text the LLM produced alongside tool calls (unless silent)
-        if !silent && !display_text.is_empty() {
-            print!("{display_text}");
-            let _ = std::io::stdout().flush();
+        // Relay any text the LLM produced alongside tool calls so streaming
+        // channels can surface intermediate explanations before tool results.
+        if !display_text.is_empty() {
+            if let Some(ref tx) = on_delta {
+                let _ = tx.send(display_text.clone()).await;
+            }
+            if !silent {
+                print!("{display_text}");
+                let _ = std::io::stdout().flush();
+            }
         }
 
         // Execute tool calls and build results. `individual_results` tracks per-call output so
@@ -4081,6 +4087,78 @@ mod tests {
             .expect("prompt-mode tool result payload should be present");
         assert!(tool_results.content.contains("counted:A"));
         assert!(tool_results.content.contains("Skipped duplicate tool call"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_relays_tool_call_text_via_on_delta() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"Let me check that first.
+<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>"#,
+            "Final answer",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+        )
+        .await
+        .expect("loop should relay tool-call text through on_delta");
+
+        let mut deltas = Vec::new();
+        while let Some(delta) = rx.recv().await {
+            deltas.push(delta);
+        }
+
+        let explanation_idx = deltas
+            .iter()
+            .position(|delta| delta == "Let me check that first.")
+            .expect("intermediate explanation should be relayed to on_delta");
+        let clear_idx = deltas
+            .iter()
+            .position(|delta| delta == DRAFT_CLEAR_SENTINEL)
+            .expect("final answer streaming should clear prior draft state");
+
+        assert!(
+            deltas
+                .iter()
+                .any(|delta| delta.starts_with("\u{1f4ac} Got 1 tool call(s)")),
+            "tool-call progress line should still be relayed"
+        );
+        assert!(
+            explanation_idx < clear_idx,
+            "intermediate explanation should arrive before final answer streaming"
+        );
+        assert_eq!(result, "Final answer");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
