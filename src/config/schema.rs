@@ -5299,6 +5299,8 @@ impl Config {
         // MCP
         if self.mcp.enabled {
             validate_mcp_config(&self.mcp)?;
+        }
+
         // Security ops
         let severity = self
             .security_ops

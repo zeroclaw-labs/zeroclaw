@@ -100,12 +100,11 @@ impl SecurityOpsTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required 'playbook' parameter"))?;
 
-        let step_index = usize::try_from(
-            args.get("step").and_then(|v| v.as_u64()).ok_or_else(|| {
+        let step_index =
+            usize::try_from(args.get("step").and_then(|v| v.as_u64()).ok_or_else(|| {
                 anyhow::anyhow!("Missing required 'step' parameter (0-based index)")
-            })?,
-        )
-        .map_err(|_| anyhow::anyhow!("'step' parameter value too large for this platform"))?;
+            })?)
+            .map_err(|_| anyhow::anyhow!("'step' parameter value too large for this platform"))?;
 
         let alert_severity = args
             .get("alert_severity")
