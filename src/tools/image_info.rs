@@ -427,7 +427,7 @@ mod tests {
     #[tokio::test]
     async fn execute_real_file() {
         // Create a minimal valid PNG
-        let dir = std::env::temp_dir().join("zeroclaw_image_info_test");
+        let dir = std::env::temp_dir().join("lightwave_image_info_test");
         let _ = tokio::fs::create_dir_all(&dir).await;
         let png_path = dir.join("test.png");
 
@@ -466,7 +466,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_with_base64() {
-        let dir = std::env::temp_dir().join("zeroclaw_image_info_b64");
+        let dir = std::env::temp_dir().join("lightwave_image_info_b64");
         let _ = tokio::fs::create_dir_all(&dir).await;
         let png_path = dir.join("test_b64.png");
 

@@ -280,44 +280,14 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
     context
 }
 
-/// Build hardware datasheet context from RAG when peripherals are enabled.
-/// Includes pin-alias lookup (e.g. "red_led" → 13) when query matches, plus retrieved chunks.
+/// Hardware RAG removed — Augusta doesn't use datasheet retrieval.
+#[allow(dead_code)]
 fn build_hardware_context(
-    rag: &crate::rag::HardwareRag,
-    user_msg: &str,
-    boards: &[String],
-    chunk_limit: usize,
+    _user_msg: &str,
+    _boards: &[String],
+    _chunk_limit: usize,
 ) -> String {
-    if rag.is_empty() || boards.is_empty() {
-        return String::new();
-    }
-
-    let mut context = String::new();
-
-    // Pin aliases: when user says "red led", inject "red_led: 13" for matching boards
-    let pin_ctx = rag.pin_alias_context(user_msg, boards);
-    if !pin_ctx.is_empty() {
-        context.push_str(&pin_ctx);
-    }
-
-    let chunks = rag.retrieve(user_msg, boards, chunk_limit);
-    if chunks.is_empty() && pin_ctx.is_empty() {
-        return String::new();
-    }
-
-    if !chunks.is_empty() {
-        context.push_str("[Hardware documentation]\n");
-    }
-    for chunk in chunks {
-        let board_tag = chunk.board.as_deref().unwrap_or("generic");
-        let _ = writeln!(
-            context,
-            "--- {} ({}) ---\n{}\n",
-            chunk.source, board_tag, chunk.content
-        );
-    }
-    context.push('\n');
-    context
+    String::new()
 }
 
 /// Find a tool by name in the registry.
@@ -964,7 +934,7 @@ fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 /// ```text
 /// <FunctionCall>
 /// file_read
-/// <code>path>/Users/kylelampa/Documents/zeroclaw/README.md</code>
+/// <code>path>/Users/kylelampa/Documents/augusta/README.md</code>
 /// </FunctionCall>
 /// ```
 fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
@@ -1012,7 +982,7 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 }
 
 /// Parse GLM-style tool calls from response text.
-/// Map tool name aliases from various LLM providers to ZeroClaw tool names.
+/// Map tool name aliases from various LLM providers to Augusta tool names.
 /// This handles variations like "fileread" -> "file_read", "bash" -> "shell", etc.
 fn map_tool_name_alias(tool_name: &str) -> &str {
     match tool_name {
@@ -1122,7 +1092,7 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
 ///
 /// When a model emits a shortened call like `shell>uname -a` (without an
 /// explicit `/param_name`), we need to infer which parameter the value maps
-/// to. This function encodes the mapping for known ZeroClaw tools.
+/// to. This function encodes the mapping for known Augusta tools.
 fn default_param_for_tool(tool: &str) -> &'static str {
     match tool {
         "shell" | "bash" | "sh" | "exec" | "command" | "cmd" => "command",
@@ -1697,7 +1667,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // (e.g., in emails, files, or web pages) could include JSON that mimics a
     // tool call. Tool calls MUST be explicitly wrapped in either:
     // 1. OpenAI-style JSON with a "tool_calls" array
-    // 2. ZeroClaw tool-call tags (<tool_call>, <toolcall>, <tool-call>)
+    // 2. Augusta tool-call tags (<tool_call>, <toolcall>, <tool-call>)
     // 3. Markdown code blocks with tool_call/toolcall/tool-call language
     // 4. Explicit GLM line-based call formats (e.g. `shell/command>...`)
     // This ensures only the LLM's intentional tool calls are executed.
@@ -2868,7 +2838,7 @@ pub async fn run(
     );
 
     let peripheral_tools: Vec<Box<dyn Tool>> =
-        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
+        Vec::<Box<dyn crate::tools::Tool>>::new();
     if !peripheral_tools.is_empty() {
         tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
         tools_registry.extend(peripheral_tools);
@@ -2888,7 +2858,7 @@ pub async fn run(
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
-        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        augusta_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
         provider_timeout_secs: Some(config.provider_timeout_secs),
@@ -2910,14 +2880,14 @@ pub async fn run(
     });
 
     // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
-    let hardware_rag: Option<crate::rag::HardwareRag> = config
+    let hardware_rag: Option<String> = config
         .peripherals
         .datasheet_dir
         .as_ref()
         .filter(|d| !d.trim().is_empty())
-        .map(|dir| crate::rag::HardwareRag::load(&config.workspace_dir, dir.trim()))
+        .map(|dir| String::load(&config.workspace_dir, dir.trim()))
         .and_then(Result::ok)
-        .filter(|r: &crate::rag::HardwareRag| !r.is_empty());
+        .filter(|r: &String| !r.is_empty());
     if let Some(ref rag) = hardware_rag {
         tracing::info!(chunks = rag.len(), "Hardware RAG loaded");
     }
@@ -3020,7 +2990,7 @@ pub async fn run(
         ));
         tool_descs.push((
             "arduino_upload",
-            "Upload agent-generated Arduino sketch. Use when: user asks for 'make a heart', 'blink pattern', or custom LED behavior on Arduino. You write the full .ino code; ZeroClaw compiles and uploads it. Pin 13 = built-in LED on Uno.",
+            "Upload agent-generated Arduino sketch. Use when: user asks for 'make a heart', 'blink pattern', or custom LED behavior on Arduino. You write the full .ino code; Augusta compiles and uploads it. Pin 13 = built-in LED on Uno.",
         ));
         tool_descs.push((
             "hardware_memory_map",
@@ -3045,7 +3015,7 @@ pub async fn run(
         None
     };
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+    let mut system_prompt = crate::agent::prompt::build_system_prompt(
         &config.workspace_dir,
         model_name,
         &tool_descs,
@@ -3128,7 +3098,7 @@ pub async fn run(
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
-        println!("🦀 ZeroClaw Interactive Mode");
+        println!("🦀 Augusta Interactive Mode");
         println!("Type /help for commands.\n");
         let cli = crate::channels::CliChannel::new();
 
@@ -3349,7 +3319,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config,
     );
     let peripheral_tools: Vec<Box<dyn Tool>> =
-        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
+        Vec::<Box<dyn crate::tools::Tool>>::new();
     tools_registry.extend(peripheral_tools);
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
@@ -3360,7 +3330,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
-        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        augusta_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
         provider_timeout_secs: Some(config.provider_timeout_secs),
@@ -3375,14 +3345,14 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &provider_runtime_options,
     )?;
 
-    let hardware_rag: Option<crate::rag::HardwareRag> = config
+    let hardware_rag: Option<String> = config
         .peripherals
         .datasheet_dir
         .as_ref()
         .filter(|d| !d.trim().is_empty())
-        .map(|dir| crate::rag::HardwareRag::load(&config.workspace_dir, dir.trim()))
+        .map(|dir| String::load(&config.workspace_dir, dir.trim()))
         .and_then(Result::ok)
-        .filter(|r: &crate::rag::HardwareRag| !r.is_empty());
+        .filter(|r: &String| !r.is_empty());
     let board_names: Vec<String> = config
         .peripherals
         .boards
@@ -3419,7 +3389,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ));
         tool_descs.push((
             "arduino_upload",
-            "Upload Arduino sketch. Use for 'make a heart', custom patterns. You write full .ino code; ZeroClaw uploads it.",
+            "Upload Arduino sketch. Use for 'make a heart', custom patterns. You write full .ino code; Augusta uploads it.",
         ));
         tool_descs.push((
             "hardware_memory_map",
@@ -3444,7 +3414,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         None
     };
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+    let mut system_prompt = crate::agent::prompt::build_system_prompt(
         &config.workspace_dir,
         &model_name,
         &tool_descs,
@@ -5704,20 +5674,20 @@ Let me check the result."#;
         assert_eq!(history[1].content, "new msg");
     }
 
-    /// When `build_system_prompt_with_mode` is called with `native_tools = true`,
+    /// When `crate::agent::prompt::build_system_prompt_with_mode` is called with `native_tools = true`,
     /// the output must contain ZERO XML protocol artifacts. In the native path
     /// `build_tool_instructions` is never called, so the system prompt alone
     /// must be clean of XML tool-call protocol.
     #[test]
     fn native_tools_system_prompt_contains_zero_xml() {
-        use crate::channels::build_system_prompt_with_mode;
+        use crate::agent::prompt::build_system_prompt;
 
         let tool_summaries: Vec<(&str, &str)> = vec![
             ("shell", "Execute shell commands"),
             ("file_read", "Read files"),
         ];
 
-        let system_prompt = build_system_prompt_with_mode(
+        let system_prompt = crate::agent::prompt::build_system_prompt_with_mode(
             std::path::Path::new("/tmp"),
             "test-model",
             &tool_summaries,

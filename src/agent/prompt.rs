@@ -206,6 +206,68 @@ impl PromptSection for DateTimeSection {
     }
 }
 
+/// Build a system prompt with the given tool summaries and configuration.
+/// This is the main entry point for system prompt construction.
+#[allow(clippy::too_many_arguments)]
+pub fn build_system_prompt(
+    workspace_dir: &Path,
+    model_name: &str,
+    tool_summaries: &[(&str, &str)],
+    skills: &[Skill],
+    identity_config: Option<&crate::config::IdentityConfig>,
+    _bootstrap_max_chars: Option<usize>,
+    _native_tools: bool,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+) -> String {
+    let tools: Vec<Box<dyn Tool>> = Vec::new();
+    let ctx = PromptContext {
+        workspace_dir,
+        model_name,
+        tools: &tools,
+        skills,
+        skills_prompt_mode,
+        identity_config,
+        dispatcher_instructions: "",
+    };
+
+    let builder = SystemPromptBuilder::with_defaults();
+    let mut prompt = builder.build(&ctx).unwrap_or_default();
+
+    // Append tool summaries
+    if !tool_summaries.is_empty() {
+        prompt.push_str("## Available Tools\n\n");
+        for (name, desc) in tool_summaries {
+            let _ = writeln!(prompt, "- **{name}**: {desc}");
+        }
+        prompt.push_str("\n\n");
+    }
+
+    prompt
+}
+
+/// Alias for backward compatibility
+pub fn build_system_prompt_with_mode(
+    workspace_dir: &Path,
+    model_name: &str,
+    tool_summaries: &[(&str, &str)],
+    skills: &[Skill],
+    identity_config: Option<&crate::config::IdentityConfig>,
+    bootstrap_max_chars: Option<usize>,
+    native_tools: bool,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+) -> String {
+    build_system_prompt(
+        workspace_dir,
+        model_name,
+        tool_summaries,
+        skills,
+        identity_config,
+        bootstrap_max_chars,
+        native_tools,
+        skills_prompt_mode,
+    )
+}
+
 fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &str) {
     let path = workspace_dir.join(filename);
     match std::fs::read_to_string(&path) {
@@ -277,7 +339,7 @@ mod tests {
     #[test]
     fn identity_section_with_aieos_includes_workspace_files() {
         let workspace =
-            std::env::temp_dir().join(format!("zeroclaw_prompt_test_{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("lightwave_prompt_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(
             workspace.join("AGENTS.md"),

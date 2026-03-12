@@ -32,32 +32,32 @@ impl LucidMemory {
     const DEFAULT_FAILURE_COOLDOWN_MS: u64 = 15_000;
 
     pub fn new(workspace_dir: &Path, local: SqliteMemory) -> Self {
-        let lucid_cmd = std::env::var("ZEROCLAW_LUCID_CMD")
+        let lucid_cmd = std::env::var("LIGHTWAVE_LUCID_CMD")
             .unwrap_or_else(|_| Self::DEFAULT_LUCID_CMD.to_string());
 
-        let token_budget = std::env::var("ZEROCLAW_LUCID_BUDGET")
+        let token_budget = std::env::var("LIGHTWAVE_LUCID_BUDGET")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(Self::DEFAULT_TOKEN_BUDGET);
 
         let recall_timeout = Self::read_env_duration_ms(
-            "ZEROCLAW_LUCID_RECALL_TIMEOUT_MS",
+            "LIGHTWAVE_LUCID_RECALL_TIMEOUT_MS",
             Self::DEFAULT_RECALL_TIMEOUT_MS,
             20,
         );
         let store_timeout = Self::read_env_duration_ms(
-            "ZEROCLAW_LUCID_STORE_TIMEOUT_MS",
+            "LIGHTWAVE_LUCID_STORE_TIMEOUT_MS",
             Self::DEFAULT_STORE_TIMEOUT_MS,
             50,
         );
         let local_hit_threshold = Self::read_env_usize(
-            "ZEROCLAW_LUCID_LOCAL_HIT_THRESHOLD",
+            "LIGHTWAVE_LUCID_LOCAL_HIT_THRESHOLD",
             Self::DEFAULT_LOCAL_HIT_THRESHOLD,
             1,
         );
         let failure_cooldown = Self::read_env_duration_ms(
-            "ZEROCLAW_LUCID_FAILURE_COOLDOWN_MS",
+            "LIGHTWAVE_LUCID_FAILURE_COOLDOWN_MS",
             Self::DEFAULT_FAILURE_COOLDOWN_MS,
             100,
         );

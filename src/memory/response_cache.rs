@@ -161,7 +161,7 @@ impl ResponseCache {
         Ok((count as usize, hits as u64, tokens_saved as u64))
     }
 
-    /// Wipe the entire cache (useful for `zeroclaw cache clear`).
+    /// Wipe the entire cache (useful for `augusta cache clear`).
     pub fn clear(&self) -> Result<usize> {
         let conn = self.conn.lock();
 

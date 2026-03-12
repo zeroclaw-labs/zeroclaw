@@ -433,7 +433,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn shell_does_not_leak_api_key() {
         let _g1 = EnvGuard::set("API_KEY", "sk-test-secret-12345");
-        let _g2 = EnvGuard::set("ZEROCLAW_API_KEY", "sk-test-secret-67890");
+        let _g2 = EnvGuard::set("LIGHTWAVE_API_KEY", "sk-test-secret-67890");
 
         let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
         let result = tool
@@ -447,7 +447,7 @@ mod tests {
         );
         assert!(
             !result.output.contains("sk-test-secret-67890"),
-            "ZEROCLAW_API_KEY leaked to shell command output"
+            "LIGHTWAVE_API_KEY leaked to shell command output"
         );
     }
 
@@ -487,9 +487,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn shell_allows_configured_env_passthrough() {
-        let _guard = EnvGuard::set("ZEROCLAW_TEST_PASSTHROUGH", "db://unit-test");
+        let _guard = EnvGuard::set("LIGHTWAVE_TEST_PASSTHROUGH", "db://unit-test");
         let tool = ShellTool::new(
-            test_security_with_env_passthrough(&["ZEROCLAW_TEST_PASSTHROUGH"]),
+            test_security_with_env_passthrough(&["LIGHTWAVE_TEST_PASSTHROUGH"]),
             test_runtime(),
         );
 
@@ -500,7 +500,7 @@ mod tests {
         assert!(result.success);
         assert!(result
             .output
-            .contains("ZEROCLAW_TEST_PASSTHROUGH=db://unit-test"));
+            .contains("LIGHTWAVE_TEST_PASSTHROUGH=db://unit-test"));
     }
 
     #[test]
@@ -532,7 +532,7 @@ mod tests {
 
         let tool = ShellTool::new(security.clone(), test_runtime());
         let denied = tool
-            .execute(json!({"command": "touch zeroclaw_shell_approval_test"}))
+            .execute(json!({"command": "touch lightwave_shell_approval_test"}))
             .await
             .expect("unapproved command should return a result");
         assert!(!denied.success);
@@ -544,7 +544,7 @@ mod tests {
 
         let allowed = tool
             .execute(json!({
-                "command": "touch zeroclaw_shell_approval_test",
+                "command": "touch lightwave_shell_approval_test",
                 "approved": true
             }))
             .await
@@ -552,7 +552,7 @@ mod tests {
         assert!(allowed.success);
 
         let _ =
-            tokio::fs::remove_file(std::env::temp_dir().join("zeroclaw_shell_approval_test")).await;
+            tokio::fs::remove_file(std::env::temp_dir().join("lightwave_shell_approval_test")).await;
     }
 
     // ── §5.2 Shell timeout enforcement tests ─────────────────
