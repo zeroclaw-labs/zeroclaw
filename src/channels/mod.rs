@@ -291,6 +291,7 @@ struct ChannelRuntimeContext {
     hooks: Option<Arc<crate::hooks::HookRunner>>,
     non_cli_excluded_tools: Arc<Vec<String>>,
     tool_call_dedup_exempt: Arc<Vec<String>>,
+    show_tool_calls: bool,
     model_routes: Arc<Vec<crate::config::ModelRouteConfig>>,
 }
 
@@ -1873,7 +1874,7 @@ async fn process_channel_message(
     let notify_channel = target_channel.clone();
     let notify_reply_target = msg.reply_target.clone();
     let notify_thread_root = msg.id.clone();
-    let notify_task = if msg.channel == "cli" {
+    let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls {
         Some(tokio::spawn(async move {
             while notify_rx.recv().await.is_some() {}
         }))
@@ -3605,6 +3606,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         },
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
         tool_call_dedup_exempt: Arc::new(config.agent.tool_call_dedup_exempt.clone()),
+        show_tool_calls: config.agent.show_tool_calls,
         model_routes: Arc::new(config.model_routes.clone()),
     });
 
@@ -3836,6 +3838,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         };
 
@@ -3887,6 +3890,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         };
 
@@ -3941,6 +3945,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         };
 
@@ -4556,6 +4561,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         });
 
@@ -4617,6 +4623,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         });
 
@@ -4688,6 +4695,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         });
 
@@ -4779,6 +4787,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         });
 
@@ -4852,6 +4861,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         });
 
@@ -4940,6 +4950,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         });
 
@@ -5013,6 +5024,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         });
 
@@ -5076,6 +5088,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         });
 
@@ -5250,6 +5263,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         });
 
@@ -5332,6 +5346,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         });
 
@@ -5426,6 +5441,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         });
 
@@ -5502,6 +5518,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         });
 
@@ -5563,6 +5580,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         });
 
@@ -6122,6 +6140,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         });
 
@@ -6209,6 +6228,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         });
 
@@ -6296,6 +6316,7 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         });
 
@@ -6847,6 +6868,7 @@ This is an example JSON object for profile settings."#;
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         });
 
@@ -6915,6 +6937,7 @@ This is an example JSON object for profile settings."#;
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
+            show_tool_calls: true,
             model_routes: Arc::new(Vec::new()),
         });
 

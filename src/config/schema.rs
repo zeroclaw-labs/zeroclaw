@@ -621,6 +621,10 @@ pub struct AgentConfig {
     /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
     #[serde(default)]
     pub tool_call_dedup_exempt: Vec<String>,
+    /// When true (default), send live tool-call notifications (e.g. 🔧 `tool_name`)
+    /// as threaded messages in non-CLI channels. Set to false to suppress them.
+    #[serde(default = "default_true")]
+    pub show_tool_calls: bool,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -644,6 +648,7 @@ impl Default for AgentConfig {
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             tool_call_dedup_exempt: Vec::new(),
+            show_tool_calls: true,
         }
     }
 }
