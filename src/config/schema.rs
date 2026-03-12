@@ -165,6 +165,9 @@ pub struct Config {
     pub security: SecurityConfig,
 
     #[serde(default)]
+    pub nvidia: NvidiaConfig,
+
+    #[serde(default)]
     pub cosmic_brain: CosmicBrainConfig,
 
     #[serde(default)]
@@ -2983,6 +2986,16 @@ impl Default for LifeConfig {
     }
 }
 
+// ── NVIDIA ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NvidiaConfig {
+    pub triton_url: Option<String>,
+    pub tensorrt_url: Option<String>,
+    pub enable_gpu_metrics: bool,
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -3031,6 +3044,7 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             skillforge: SkillForgeConfig::default(),
             security: SecurityConfig::default(),
+            nvidia: NvidiaConfig::default(),
             cosmic_brain: CosmicBrainConfig::default(),
             consciousness: ConsciousnessConfig::default(),
             cognitive: CognitiveConfig::default(),
@@ -3872,6 +3886,7 @@ default_temperature = 0.7
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             security: SecurityConfig::default(),
+            nvidia: NvidiaConfig::default(),
             cosmic_brain: CosmicBrainConfig::default(),
             consciousness: ConsciousnessConfig::default(),
             cognitive: CognitiveConfig::default(),
@@ -4023,6 +4038,7 @@ tool_dispatcher = "xml"
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             security: SecurityConfig::default(),
+            nvidia: NvidiaConfig::default(),
             cosmic_brain: CosmicBrainConfig::default(),
             consciousness: ConsciousnessConfig::default(),
             cognitive: CognitiveConfig::default(),

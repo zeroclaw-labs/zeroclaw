@@ -472,3 +472,377 @@ impl ControlStore {
         Ok(entries)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_store() -> (ControlStore, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let store = ControlStore::open(tmp.path()).unwrap();
+        (store, tmp)
+    }
+
+    fn sample_bot(id: &str) -> Bot {
+        Bot {
+            id: id.to_string(),
+            name: format!("bot_{id}"),
+            host: "127.0.0.1".to_string(),
+            port: 3000,
+            status: "online".to_string(),
+            version: "0.2.0".to_string(),
+            last_heartbeat: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            channels: "[]".to_string(),
+            provider: "openrouter".to_string(),
+            memory_backend: "sqlite".to_string(),
+            uptime_secs: 100,
+            registered_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        }
+    }
+
+    fn sample_command(id: &str, bot_id: &str) -> Command {
+        Command {
+            id: id.to_string(),
+            bot_id: bot_id.to_string(),
+            kind: "restart".to_string(),
+            payload: "{}".to_string(),
+            status: "pending".to_string(),
+            created_by: "admin".to_string(),
+            created_at: String::new(),
+            acked_at: None,
+            result: None,
+            requires_approval: false,
+        }
+    }
+
+    fn sample_approval(id: &str, command_id: &str) -> Approval {
+        Approval {
+            id: id.to_string(),
+            command_id: command_id.to_string(),
+            status: "pending".to_string(),
+            reviewer: "admin".to_string(),
+            reviewed_at: None,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn open_creates_tables() {
+        let (store, _tmp) = test_store();
+        let bots = store.list_bots().unwrap();
+        assert!(bots.is_empty());
+    }
+
+    #[test]
+    fn upsert_and_get_bot_roundtrip() {
+        let (store, _tmp) = test_store();
+        let bot = sample_bot("b1");
+        store.upsert_bot(&bot).unwrap();
+
+        let fetched = store.get_bot("b1").unwrap().unwrap();
+        assert_eq!(fetched.id, "b1");
+        assert_eq!(fetched.name, "bot_b1");
+        assert_eq!(fetched.port, 3000);
+    }
+
+    #[test]
+    fn upsert_bot_updates_existing() {
+        let (store, _tmp) = test_store();
+        let mut bot = sample_bot("b1");
+        store.upsert_bot(&bot).unwrap();
+
+        bot.status = "offline".to_string();
+        bot.uptime_secs = 999;
+        store.upsert_bot(&bot).unwrap();
+
+        let fetched = store.get_bot("b1").unwrap().unwrap();
+        assert_eq!(fetched.status, "offline");
+        assert_eq!(fetched.uptime_secs, 999);
+
+        assert_eq!(store.list_bots().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn list_bots_ordered_by_name() {
+        let (store, _tmp) = test_store();
+        let mut b2 = sample_bot("b2");
+        b2.name = "zulu".to_string();
+        let mut b1 = sample_bot("b1");
+        b1.name = "alpha".to_string();
+        store.upsert_bot(&b2).unwrap();
+        store.upsert_bot(&b1).unwrap();
+
+        let bots = store.list_bots().unwrap();
+        assert_eq!(bots[0].name, "alpha");
+        assert_eq!(bots[1].name, "zulu");
+    }
+
+    #[test]
+    fn get_bot_missing_returns_none() {
+        let (store, _tmp) = test_store();
+        assert!(store.get_bot("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_bot_removes_entry() {
+        let (store, _tmp) = test_store();
+        store.upsert_bot(&sample_bot("b1")).unwrap();
+        assert!(store.delete_bot("b1").unwrap());
+        assert!(store.get_bot("b1").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_bot_nonexistent_returns_false() {
+        let (store, _tmp) = test_store();
+        assert!(!store.delete_bot("nope").unwrap());
+    }
+
+    #[test]
+    fn insert_and_list_events() {
+        let (store, _tmp) = test_store();
+        let id1 = store.insert_event("b1", "started", "{}").unwrap();
+        let id2 = store
+            .insert_event("b1", "error", r#"{"msg":"oops"}"#)
+            .unwrap();
+        assert!(id2 > id1);
+
+        let events = store.list_events(Some("b1"), 10).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "error");
+    }
+
+    #[test]
+    fn list_events_filters_by_bot() {
+        let (store, _tmp) = test_store();
+        store.insert_event("b1", "start", "{}").unwrap();
+        store.insert_event("b2", "start", "{}").unwrap();
+
+        let b1_events = store.list_events(Some("b1"), 10).unwrap();
+        assert_eq!(b1_events.len(), 1);
+
+        let all_events = store.list_events(None, 10).unwrap();
+        assert_eq!(all_events.len(), 2);
+    }
+
+    #[test]
+    fn list_events_respects_limit() {
+        let (store, _tmp) = test_store();
+        for i in 0..5 {
+            store.insert_event("b1", &format!("ev{i}"), "{}").unwrap();
+        }
+        let events = store.list_events(None, 2).unwrap();
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn insert_and_list_commands() {
+        let (store, _tmp) = test_store();
+        let cmd = sample_command("c1", "b1");
+        store.insert_command(&cmd).unwrap();
+
+        let cmds = store.list_commands(Some("b1"), None, 10).unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].kind, "restart");
+    }
+
+    #[test]
+    fn list_commands_filters_by_status() {
+        let (store, _tmp) = test_store();
+        store.insert_command(&sample_command("c1", "b1")).unwrap();
+        store
+            .insert_command(&Command {
+                status: "acked".to_string(),
+                ..sample_command("c2", "b1")
+            })
+            .unwrap();
+
+        let pending = store.list_commands(None, Some("pending"), 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "c1");
+
+        let acked = store.list_commands(None, Some("acked"), 10).unwrap();
+        assert_eq!(acked.len(), 1);
+        assert_eq!(acked[0].id, "c2");
+    }
+
+    #[test]
+    fn list_commands_combined_filters() {
+        let (store, _tmp) = test_store();
+        store.insert_command(&sample_command("c1", "b1")).unwrap();
+        store.insert_command(&sample_command("c2", "b2")).unwrap();
+
+        let result = store
+            .list_commands(Some("b1"), Some("pending"), 10)
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "c1");
+    }
+
+    #[test]
+    fn update_command_status_sets_acked_at() {
+        let (store, _tmp) = test_store();
+        store.insert_command(&sample_command("c1", "b1")).unwrap();
+
+        assert!(store
+            .update_command_status("c1", "acked", Some("ok"))
+            .unwrap());
+        let cmds = store.list_commands(None, None, 10).unwrap();
+        assert_eq!(cmds[0].status, "acked");
+        assert!(cmds[0].acked_at.is_some());
+        assert_eq!(cmds[0].result.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn update_command_status_nonexistent_returns_false() {
+        let (store, _tmp) = test_store();
+        assert!(!store.update_command_status("nope", "acked", None).unwrap());
+    }
+
+    #[test]
+    fn get_pending_commands_returns_approved_only() {
+        let (store, _tmp) = test_store();
+        store.insert_command(&sample_command("c1", "b1")).unwrap();
+        store
+            .insert_command(&Command {
+                status: "approved".to_string(),
+                ..sample_command("c2", "b1")
+            })
+            .unwrap();
+
+        let pending = store.get_pending_commands("b1").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "c2");
+    }
+
+    #[test]
+    fn insert_and_list_approvals() {
+        let (store, _tmp) = test_store();
+        store.insert_command(&sample_command("c1", "b1")).unwrap();
+        store.insert_approval(&sample_approval("a1", "c1")).unwrap();
+
+        let approvals = store.list_approvals(None, 10).unwrap();
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].command_id, "c1");
+    }
+
+    #[test]
+    fn list_approvals_filters_by_status() {
+        let (store, _tmp) = test_store();
+        store.insert_command(&sample_command("c1", "b1")).unwrap();
+        store.insert_command(&sample_command("c2", "b1")).unwrap();
+        store.insert_approval(&sample_approval("a1", "c1")).unwrap();
+        store
+            .insert_approval(&Approval {
+                status: "approved".to_string(),
+                ..sample_approval("a2", "c2")
+            })
+            .unwrap();
+
+        let pending = store.list_approvals(Some("pending"), 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "a1");
+    }
+
+    #[test]
+    fn update_approval_approved_cascades_to_command() {
+        let (store, _tmp) = test_store();
+        store
+            .insert_command(&Command {
+                status: "pending_approval".to_string(),
+                ..sample_command("c1", "b1")
+            })
+            .unwrap();
+        store.insert_approval(&sample_approval("a1", "c1")).unwrap();
+
+        assert!(store
+            .update_approval("c1", "approved", "reviewer1", Some("lgtm"))
+            .unwrap());
+
+        let cmds = store.list_commands(None, Some("approved"), 10).unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].id, "c1");
+    }
+
+    #[test]
+    fn update_approval_rejected_cascades_to_command() {
+        let (store, _tmp) = test_store();
+        store
+            .insert_command(&Command {
+                status: "pending_approval".to_string(),
+                ..sample_command("c1", "b1")
+            })
+            .unwrap();
+        store.insert_approval(&sample_approval("a1", "c1")).unwrap();
+
+        assert!(store
+            .update_approval("c1", "rejected", "reviewer1", Some("nope"))
+            .unwrap());
+
+        let cmds = store.list_commands(None, Some("rejected"), 10).unwrap();
+        assert_eq!(cmds.len(), 1);
+    }
+
+    #[test]
+    fn audit_and_list_audit() {
+        let (store, _tmp) = test_store();
+        store
+            .audit("admin", "delete_bot", "b1", "removed stale bot")
+            .unwrap();
+        store
+            .audit("system", "heartbeat_timeout", "b2", "")
+            .unwrap();
+
+        let entries = store.list_audit(10).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].action, "heartbeat_timeout");
+        assert_eq!(entries[1].action, "delete_bot");
+    }
+
+    #[test]
+    fn list_audit_respects_limit() {
+        let (store, _tmp) = test_store();
+        for i in 0..5 {
+            store.audit("a", &format!("act{i}"), "t", "").unwrap();
+        }
+        assert_eq!(store.list_audit(2).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn mark_stale_bots_transitions_to_offline() {
+        let (store, _tmp) = test_store();
+        let old_ts = (chrono::Utc::now() - chrono::Duration::seconds(120))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let mut bot = sample_bot("stale1");
+        bot.last_heartbeat = old_ts;
+        store.upsert_bot(&bot).unwrap();
+
+        let fresh = sample_bot("fresh1");
+        store.upsert_bot(&fresh).unwrap();
+
+        let stale_ids = store.mark_stale_bots(60).unwrap();
+        assert_eq!(stale_ids, vec!["stale1"]);
+
+        let stale = store.get_bot("stale1").unwrap().unwrap();
+        assert_eq!(stale.status, "offline");
+
+        let still_online = store.get_bot("fresh1").unwrap().unwrap();
+        assert_eq!(still_online.status, "online");
+    }
+
+    #[test]
+    fn mark_stale_bots_ignores_already_offline() {
+        let (store, _tmp) = test_store();
+        let old_ts = (chrono::Utc::now() - chrono::Duration::seconds(120))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let mut bot = sample_bot("b1");
+        bot.status = "offline".to_string();
+        bot.last_heartbeat = old_ts;
+        store.upsert_bot(&bot).unwrap();
+
+        let stale_ids = store.mark_stale_bots(60).unwrap();
+        assert!(stale_ids.is_empty());
+    }
+}

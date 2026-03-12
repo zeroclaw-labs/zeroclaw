@@ -69,6 +69,7 @@ pub mod providers;
 pub mod quantum;
 pub mod rag;
 pub mod runtime;
+pub mod sce;
 pub mod security;
 pub mod service;
 pub mod skillforge;

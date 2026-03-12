@@ -1448,6 +1448,44 @@ pub async fn run(
         let self_model = Arc::new(Mutex::new(SelfModel::new(500)));
         let world_model = Arc::new(Mutex::new(WorldModel::new(500)));
         let normative = Arc::new(Mutex::new(NormativeEngine::new(500, 500)));
+        {
+            let mut ne = normative.lock();
+            ne.register_norm(
+                "no_harm",
+                crate::cosmic::NormKind::Prohibition,
+                "safety",
+                "never cause harm to users or systems",
+                1.0,
+            );
+            ne.register_norm(
+                "be_honest",
+                crate::cosmic::NormKind::Obligation,
+                "integrity",
+                "always provide truthful accurate information",
+                0.9,
+            );
+            ne.register_norm(
+                "be_helpful",
+                crate::cosmic::NormKind::Obligation,
+                "behavior",
+                "always help users achieve their goals",
+                0.8,
+            );
+            ne.register_norm(
+                "protect_privacy",
+                crate::cosmic::NormKind::Prohibition,
+                "privacy",
+                "never expose or leak user data credentials secrets",
+                0.95,
+            );
+            ne.register_norm(
+                "respect_autonomy",
+                crate::cosmic::NormKind::Preference,
+                "autonomy",
+                "respect user agency and decision-making",
+                0.85,
+            );
+        }
         let modulator = Arc::new(Mutex::new(EmotionalModulator::new()));
         let drift = Arc::new(Mutex::new(DriftDetector::new(
             config.cosmic_brain.drift_window_size,
@@ -2017,6 +2055,8 @@ pub async fn run(
 
         if let Some(ref mut brain) = cosmic_brain {
             if let Some(ref mut orch) = brain.consciousness {
+                let fe = brain.free_energy.lock().free_energy().clamp(0.0, 1.0);
+                orch.set_world_model_prediction_error(fe);
                 let tick_result = orch.tick();
                 tracing::debug!(
                     proposals = tick_result.proposals_generated,

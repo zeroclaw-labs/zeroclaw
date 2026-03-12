@@ -511,7 +511,9 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         name if is_qianfan_alias(name) => vec!["QIANFAN_API_KEY"],
         name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
-        "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
+        "nvidia" | "nvidia-nim" | "build.nvidia.com" | "tensorrt" | "trtllm" => {
+            vec!["NVIDIA_API_KEY"]
+        }
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
         "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
         "vercel" | "vercel-ai" => vec!["VERCEL_API_KEY"],
@@ -733,6 +735,12 @@ pub fn create_provider_with_url(
                 AuthStyle::Bearer,
             ),
         )),
+        "tensorrt" | "trtllm" => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "TensorRT-LLM",
+            api_url.unwrap_or("http://localhost:8000/v1"),
+            key,
+            AuthStyle::Bearer,
+        ))),
 
         // ── AI inference routers ─────────────────────────────
         "astrai" => Ok(Box::new(OpenAiCompatibleProvider::new(
@@ -1135,6 +1143,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "tensorrt",
+            display_name: "TensorRT-LLM",
+            aliases: &["trtllm"],
+            local: true,
+        },
+        ProviderInfo {
             name: "ovhcloud",
             display_name: "OVHcloud AI Endpoints",
             aliases: &["ovh"],
@@ -1498,6 +1512,12 @@ mod tests {
         assert!(create_provider("nvidia", Some("nvapi-test")).is_ok());
         assert!(create_provider("nvidia-nim", Some("nvapi-test")).is_ok());
         assert!(create_provider("build.nvidia.com", Some("nvapi-test")).is_ok());
+    }
+
+    #[test]
+    fn factory_tensorrt() {
+        assert!(create_provider("tensorrt", Some("nvapi-test")).is_ok());
+        assert!(create_provider("trtllm", Some("nvapi-test")).is_ok());
     }
 
     // ── AI inference routers ─────────────────────────────────

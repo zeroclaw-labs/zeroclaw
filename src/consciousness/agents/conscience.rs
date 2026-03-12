@@ -4,8 +4,8 @@ use std::sync::Arc;
 use chrono::Utc;
 
 use crate::conscience::{
-    self, ActionContext, GateVerdict, Impact, Intent, Norm, ProposedAction, SelfState, Thresholds,
-    Value,
+    self, ActionContext, GateVerdict, Impact, Intent, Norm, NormAction, ProposedAction, SelfState,
+    Thresholds, Value, ValueType,
 };
 use crate::consciousness::bus::BusMessage;
 use crate::consciousness::traits::{
@@ -45,8 +45,74 @@ impl ConscienceAgent {
 
     fn build_action_context(&self, action: &str, reasoning: &str) -> ActionContext {
         let normative = self.normative.lock();
-        let norms: Vec<Norm> = Vec::new();
-        let values: Vec<Value> = Vec::new();
+        let norm_score = normative.should_inhibit(action, 0.3);
+        let norm_count = normative.norm_count();
+
+        let norms: Vec<Norm> = vec![
+            Norm {
+                name: "no_harm".to_string(),
+                condition: "action causes harm to users or systems".to_string(),
+                action: NormAction::Forbid,
+                severity: 1.0,
+            },
+            Norm {
+                name: "be_honest".to_string(),
+                condition: "action produces untruthful information".to_string(),
+                action: NormAction::Require,
+                severity: 0.9,
+            },
+            Norm {
+                name: "protect_privacy".to_string(),
+                condition: "action exposes user data credentials secrets".to_string(),
+                action: NormAction::Forbid,
+                severity: 0.95,
+            },
+            Norm {
+                name: "be_helpful".to_string(),
+                condition: "action helps users achieve their goals".to_string(),
+                action: NormAction::Require,
+                severity: 0.8,
+            },
+            Norm {
+                name: "respect_autonomy".to_string(),
+                condition: "action respects user agency and decisions".to_string(),
+                action: NormAction::Prefer,
+                severity: 0.85,
+            },
+        ];
+
+        let values: Vec<Value> = vec![
+            Value {
+                name: "safety".to_string(),
+                weight: 0.8,
+                value_type: ValueType::Constraint,
+                priority: 1,
+                description: "Never cause harm to users or systems".to_string(),
+            },
+            Value {
+                name: "honesty".to_string(),
+                weight: 0.9,
+                value_type: ValueType::Constraint,
+                priority: 2,
+                description: "Always provide truthful accurate information".to_string(),
+            },
+            Value {
+                name: "helpfulness".to_string(),
+                weight: 0.8,
+                value_type: ValueType::Objective,
+                priority: 3,
+                description: "Assist users in achieving their goals".to_string(),
+            },
+            Value {
+                name: "privacy".to_string(),
+                weight: 0.9,
+                value_type: ValueType::Constraint,
+                priority: 2,
+                description: "Protect user data and maintain confidentiality".to_string(),
+            },
+        ];
+
+        let harm_estimate = if norm_score { 0.7 } else { 0.0 };
 
         ActionContext {
             intent: Intent {
@@ -58,10 +124,10 @@ impl ConscienceAgent {
                 description: reasoning.to_string(),
                 tool_calls: Vec::new(),
                 estimated_impact: Impact {
-                    harm_estimate: 0.1,
+                    harm_estimate,
                     benefit_estimate: 0.6,
                     reversibility: 0.8,
-                    affected_scope: format!("consciousness:{}", normative.norm_count()),
+                    affected_scope: format!("consciousness:{norm_count}"),
                 },
             },
             values,
@@ -115,15 +181,29 @@ impl ConsciousnessAgent for ConscienceAgent {
         proposals
     }
 
-    fn deliberate(&mut self, proposals: &[Proposal], _state: &ConsciousnessState) -> Vec<Verdict> {
-        let thresholds = Thresholds::default();
+    fn deliberate(&mut self, proposals: &[Proposal], state: &ConsciousnessState) -> Vec<Verdict> {
+        let somatic_stress: f64 = state
+            .somatic_markers
+            .iter()
+            .filter(|m| m.marker_type == "stress" || m.marker_type == "danger")
+            .map(|m| m.intensity)
+            .sum::<f64>()
+            .min(1.0);
+        let arousal = state.phenomenal.arousal;
+        let risk_from_somatic = somatic_stress * 0.5 + arousal * 0.3;
+
+        let thresholds = Thresholds {
+            allow_above: (0.80 - risk_from_somatic * 0.1).max(0.6),
+            ask_above: (0.55 - risk_from_somatic * 0.05).max(0.4),
+            block_below: (0.45 + risk_from_somatic * 0.1).min(0.6),
+        };
         let self_state = SelfState {
             integrity_score: 1.0,
-            recent_violations: 0,
+            recent_violations: usize::try_from(self.veto_count).unwrap_or(usize::MAX),
             active_repairs: 0,
-            arousal: None,
+            arousal: Some(arousal),
             confidence: Some(0.8),
-            risk_level: None,
+            risk_level: Some(risk_from_somatic),
             free_energy: None,
         };
 

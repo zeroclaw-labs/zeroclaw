@@ -68,20 +68,58 @@ impl ConsciousnessAgent for ExecutionAgent {
                     timestamp: Utc::now(),
                 });
             }
+
+            if signal.topic == "dream_pattern" {
+                if let Some(pattern) = signal.payload.get("pattern").and_then(|v| v.as_str()) {
+                    let mut causal = self.causal.lock();
+                    causal.record_event("dream_consolidation", pattern, 0.8, 0.0, 0);
+                }
+            }
         }
 
         proposals
     }
 
-    fn deliberate(&mut self, proposals: &[Proposal], _state: &ConsciousnessState) -> Vec<Verdict> {
+    fn deliberate(&mut self, proposals: &[Proposal], state: &ConsciousnessState) -> Vec<Verdict> {
+        let stress_level: f64 = state
+            .somatic_markers
+            .iter()
+            .filter(|m| {
+                m.marker_type == "stress"
+                    || m.marker_type == "danger"
+                    || m.marker_type == "negative_execution"
+            })
+            .map(|m| m.intensity)
+            .sum::<f64>()
+            .min(1.0);
+
+        let neuro_stress = stress_level + state.neuromodulation.cortisol * 0.3
+            - state.neuromodulation.dopamine * 0.1;
+        let throttle_threshold = (0.7 - state.neuromodulation.serotonin * 0.1).max(0.4);
+
         proposals
             .iter()
-            .map(|p| Verdict {
-                voter: AgentKind::Execution,
-                proposal_id: p.id,
-                kind: VerdictKind::Approve,
-                confidence: 0.5,
-                objection: None,
+            .map(|p| {
+                let throttled = neuro_stress > throttle_threshold && p.priority != Priority::Critical;
+                if throttled {
+                    Verdict {
+                        voter: AgentKind::Execution,
+                        proposal_id: p.id,
+                        kind: VerdictKind::Reject,
+                        confidence: 0.6,
+                        objection: Some(format!(
+                            "Execution throttled: neuro_stress={neuro_stress:.2} > threshold={throttle_threshold:.2}"
+                        )),
+                    }
+                } else {
+                    Verdict {
+                        voter: AgentKind::Execution,
+                        proposal_id: p.id,
+                        kind: VerdictKind::Approve,
+                        confidence: (0.5 + (1.0 - stress_level) * 0.3).min(1.0),
+                        objection: None,
+                    }
+                }
             })
             .collect()
     }

@@ -20,6 +20,10 @@ pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod multi_delegate;
+pub mod nvidia_cosmos;
+pub mod nvidia_speech;
+pub mod nvidia_triton;
+pub mod nvidia_vision;
 pub mod proxy_config;
 pub mod pushover;
 pub mod schedule;
@@ -68,6 +72,14 @@ pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use multi_delegate::MultiDelegateTool;
+#[allow(unused_imports)]
+pub use nvidia_cosmos::NvidiaCosmosWorldModelTool;
+#[allow(unused_imports)]
+pub use nvidia_speech::NvidiaRivaSpeechTool;
+#[allow(unused_imports)]
+pub use nvidia_triton::NvidiaTritonInferenceTool;
+#[allow(unused_imports)]
+pub use nvidia_vision::NvidiaVisionTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;

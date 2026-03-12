@@ -927,1345 +927,762 @@ pub async fn handle_admin_tunnel(
     }
 }
 
-const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
+const DASHBOARD_HTML: &str = r##"
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ZeroClaw Admin</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<script>
-tailwind.config = {
-  theme: {
-    extend: {
-      colors: {
-        zc: {
-          bg: '#06060b',
-          surface: '#0c0c14',
-          card: '#11111b',
-          border: '#1a1a2e',
-          accent: '#3b82f6',
-          green: '#22c55e',
-          amber: '#f59e0b',
-          red: '#ef4444',
-          purple: '#a855f7',
-          cyan: '#06b6d4',
-          pink: '#ec4899',
-          lime: '#84cc16',
-        }
-      }
-    }
-  }
-}
-</script>
+<title>ZeroClaw Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
-body { font-family: 'Inter', -apple-system, sans-serif; }
-code, .mono { font-family: 'JetBrains Mono', monospace; }
-.pulse { animation: pulse 2s infinite; }
-@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-.nav-active { background: rgba(59, 130, 246, 0.12); color: #3b82f6; border-color: #3b82f6; }
-.card { transition: all 0.15s ease; }
-.card:hover { border-color: rgba(59, 130, 246, 0.4); }
-.enabled-bar { border-left: 3px solid #22c55e; }
-.available-bar { border-left: 3px solid #374151; }
-.active-bar { border-left: 3px solid #3b82f6; }
-.fade-in { animation: fadeIn 0.2s ease; }
-@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
-.badge { font-size: 10px; letter-spacing: 0.05em; }
-.scroll-area { max-height: calc(100vh - 140px); overflow-y: auto; }
-.scroll-area::-webkit-scrollbar { width: 4px; }
-.scroll-area::-webkit-scrollbar-track { background: transparent; }
-.scroll-area::-webkit-scrollbar-thumb { background: #1a1a2e; border-radius: 2px; }
-.toast { position: fixed; top: 1rem; right: 1rem; z-index: 9999; padding: 0.75rem 1rem; border-radius: 0.75rem; font-size: 0.8rem; font-weight: 500; animation: slideIn 0.2s ease; }
-.toast-ok { background: rgba(34,197,94,0.15); border: 1px solid rgba(34,197,94,0.3); color: #22c55e; }
-.toast-err { background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.3); color: #ef4444; }
-.toast-warn { background: rgba(245,158,11,0.15); border: 1px solid rgba(245,158,11,0.3); color: #f59e0b; }
-@keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
-.modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 9000; display: flex; align-items: center; justify-content: center; }
-.modal-box { background: #11111b; border: 1px solid #1a1a2e; border-radius: 1rem; padding: 1.5rem; min-width: 20rem; max-width: 32rem; max-height: 80vh; overflow-y: auto; }
-.admin-input { background: #06060b; border: 1px solid #1a1a2e; border-radius: 0.5rem; padding: 0.5rem 0.75rem; font-size: 0.8rem; color: #e5e7eb; width: 100%; outline: none; }
-.admin-input:focus { border-color: #3b82f6; }
-.admin-btn { background: rgba(59,130,246,0.15); color: #3b82f6; border: 1px solid rgba(59,130,246,0.3); padding: 0.5rem 1rem; border-radius: 0.5rem; font-size: 0.8rem; font-weight: 500; cursor: pointer; }
-.admin-btn:hover { background: rgba(59,130,246,0.25); }
-.admin-btn-red { background: rgba(239,68,68,0.15); color: #ef4444; border: 1px solid rgba(239,68,68,0.3); }
-.admin-btn-red:hover { background: rgba(239,68,68,0.25); }
-.radio-card { cursor: pointer; transition: all 0.15s ease; }
-.radio-card:hover { border-color: rgba(59,130,246,0.4); }
-.radio-card.selected { border-color: #3b82f6; background: rgba(59,130,246,0.05); }
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+--bg:#0a1222;--surface:#111827;--surface-muted:#1e293b;--border:#1e3a5f;
+--text:#e2e8f0;--text-muted:#94a3b8;--accent:#3b82f6;--success:#22c55e;
+--warning:#eab308;--danger:#ef4444;--sidebar-w:260px;--radius:8px;
+--shadow:0 1px 3px rgba(0,0,0,.3),0 1px 2px rgba(0,0,0,.2);
+--shadow-lg:0 10px 15px -3px rgba(0,0,0,.4),0 4px 6px rgba(0,0,0,.3);
+}
+html{font-size:14px;scroll-behavior:smooth}
+body{font-family:'IBM Plex Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
+h1,h2,h3,h4,h5,h6{font-family:'Sora',sans-serif;font-weight:600}
+code,pre,.mono{font-family:'JetBrains Mono',monospace}
+a{color:var(--accent);text-decoration:none}
+
+@keyframes fadeInUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+@keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
+.fade-in-up{animation:fadeInUp .6s ease both}
+.pulse{animation:pulse 2s ease-in-out infinite}
+.shimmer{background:linear-gradient(90deg,var(--surface-muted) 25%,var(--border) 50%,var(--surface-muted) 75%);background-size:200% 100%;animation:shimmer 1.5s infinite}
+.surface-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);transition:transform .2s,box-shadow .2s}
+.surface-card:hover{transform:translateY(-2px);box-shadow:var(--shadow-lg)}
+.surface-panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:1.25rem}
+
+.sidebar{position:fixed;top:0;left:0;width:var(--sidebar-w);height:100vh;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;z-index:100;transition:transform .3s}
+.sidebar-brand{padding:1.25rem 1rem;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:.75rem}
+.sidebar-brand svg{width:32px;height:32px;flex-shrink:0}
+.sidebar-brand .brand-text{font-family:'Sora',sans-serif;font-size:1.1rem;font-weight:700;color:var(--text)}
+.sidebar-brand .brand-sub{font-size:.7rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em}
+.sidebar-nav{flex:1;overflow-y:auto;padding:.5rem 0}
+.nav-group{margin-bottom:.25rem}
+.nav-group-label{padding:.5rem 1rem .25rem;font-size:.65rem;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--text-muted);cursor:pointer;display:flex;align-items:center;justify-content:space-between;user-select:none}
+.nav-group-label:hover{color:var(--text)}
+.nav-group-label .chevron{transition:transform .2s;font-size:.6rem}
+.nav-group.collapsed .nav-group-items{display:none}
+.nav-group.collapsed .chevron{transform:rotate(-90deg)}
+.nav-item{display:flex;align-items:center;gap:.6rem;padding:.45rem 1rem .45rem 1.25rem;cursor:pointer;color:var(--text-muted);transition:all .15s;font-size:.85rem;border-left:3px solid transparent}
+.nav-item:hover{background:rgba(59,130,246,.08);color:var(--text)}
+.nav-item.active{color:var(--accent);background:rgba(59,130,246,.12);border-left-color:var(--accent);font-weight:500}
+.nav-item svg{width:16px;height:16px;flex-shrink:0;opacity:.7}
+.nav-item.active svg{opacity:1}
+
+.main{margin-left:var(--sidebar-w);min-height:100vh;padding:1.5rem 2rem 3rem}
+.page-header{margin-bottom:1.5rem}
+.page-header h1{font-size:1.5rem;margin-bottom:.25rem}
+.page-header p{color:var(--text-muted);font-size:.85rem}
+
+.hamburger{display:none;position:fixed;top:.75rem;left:.75rem;z-index:200;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:.5rem;cursor:pointer;color:var(--text)}
+.hamburger svg{width:20px;height:20px}
+.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:90}
+
+@media(max-width:768px){
+  .sidebar{transform:translateX(-100%)}
+  .sidebar.open{transform:translateX(0)}
+  .overlay.open{display:block}
+  .hamburger{display:block}
+  .main{margin-left:0;padding:1rem 1rem 2rem;padding-top:3rem}
+}
+
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin-bottom:1.5rem}
+.kpi-card{padding:1.25rem;display:flex;justify-content:space-between;align-items:flex-start}
+.kpi-label{font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;color:var(--text-muted);font-weight:600;margin-bottom:.35rem}
+.kpi-value{font-family:'Sora',sans-serif;font-size:1.75rem;font-weight:700;line-height:1.1}
+.kpi-sub{font-size:.75rem;color:var(--text-muted);margin-top:.25rem}
+.kpi-icon{width:42px;height:42px;border-radius:10px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.kpi-icon svg{width:20px;height:20px}
+
+.info-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1rem;margin-bottom:1.5rem}
+.info-block{padding:1rem 1.25rem}
+.info-block h3{font-size:.85rem;margin-bottom:.75rem;display:flex;align-items:center;gap:.5rem}
+.info-row{display:flex;justify-content:space-between;padding:.35rem 0;border-bottom:1px solid rgba(30,58,95,.4);font-size:.8rem}
+.info-row:last-child{border-bottom:none}
+.info-row .label{color:var(--text-muted)}
+.info-row .value{font-weight:500;text-align:right}
+
+.data-table{width:100%;border-collapse:collapse}
+.data-table th{text-align:left;padding:.6rem .75rem;font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);border-bottom:1px solid var(--border);font-weight:600}
+.data-table td{padding:.55rem .75rem;border-bottom:1px solid rgba(30,58,95,.3);font-size:.8rem}
+.data-table tr:hover td{background:rgba(59,130,246,.04)}
+
+.badge{display:inline-block;padding:.15rem .5rem;border-radius:4px;font-size:.65rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.badge-success{background:rgba(34,197,94,.15);color:var(--success)}
+.badge-warning{background:rgba(234,179,8,.15);color:var(--warning)}
+.badge-danger{background:rgba(239,68,68,.15);color:var(--danger)}
+.badge-accent{background:rgba(59,130,246,.15);color:var(--accent)}
+.badge-muted{background:var(--surface-muted);color:var(--text-muted)}
+
+.status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:.4rem}
+.status-dot.online{background:var(--success)}
+.status-dot.offline{background:var(--danger)}
+.status-dot.live{background:var(--success);animation:pulse 2s infinite}
+
+.cards-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:1rem}
+.item-card{padding:1rem 1.25rem}
+.item-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:.5rem}
+.item-name{font-weight:600;font-size:.9rem}
+.item-hint{color:var(--text-muted);font-size:.78rem;line-height:1.4}
+
+.btn{padding:.4rem .85rem;border-radius:6px;font-size:.78rem;font-weight:500;cursor:pointer;border:1px solid var(--border);background:var(--surface-muted);color:var(--text);transition:all .15s;font-family:inherit}
+.btn:hover{background:var(--border)}
+.btn-primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn-primary:hover{background:#2563eb}
+.btn-danger{background:var(--danger);border-color:var(--danger);color:#fff}
+.btn-danger:hover{background:#dc2626}
+.btn-sm{padding:.25rem .6rem;font-size:.7rem}
+
+.activity-item{display:flex;gap:.75rem;padding:.5rem 0;border-bottom:1px solid rgba(30,58,95,.3);font-size:.8rem}
+.activity-item:last-child{border-bottom:none}
+.activity-time{color:var(--text-muted);font-size:.7rem;white-space:nowrap;min-width:5rem;font-family:'JetBrains Mono',monospace}
+.activity-text{flex:1}
+
+.code-block{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:1rem;overflow-x:auto;font-family:'JetBrains Mono',monospace;font-size:.75rem;line-height:1.6;color:var(--text-muted);max-height:70vh;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
+
+.event-feed{max-height:70vh;overflow-y:auto}
+.event-item{padding:.5rem .75rem;border-bottom:1px solid rgba(30,58,95,.3);font-size:.8rem;font-family:'JetBrains Mono',monospace}
+.event-item:nth-child(odd){background:rgba(17,24,39,.5)}
+
+.consciousness-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:1rem}
+.coherence-bar{height:8px;background:var(--surface-muted);border-radius:4px;overflow:hidden;margin-top:.35rem}
+.coherence-fill{height:100%;border-radius:4px;transition:width .5s}
+
+.loading-placeholder{padding:2rem;text-align:center;color:var(--text-muted);font-size:.85rem}
+.empty-state{padding:3rem;text-align:center;color:var(--text-muted)}
+.empty-state svg{width:48px;height:48px;margin-bottom:1rem;opacity:.4}
+.empty-state p{font-size:.9rem}
 </style>
 </head>
-<body class="bg-zc-bg text-gray-300 min-h-screen flex">
+<body>
 
-<!-- SIDEBAR NAV -->
-<nav class="w-56 min-h-screen bg-zc-surface border-r border-zc-border flex flex-col shrink-0">
-  <div class="px-4 py-4 border-b border-zc-border">
-    <div class="flex items-center gap-2.5">
-      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-zc-accent to-zc-purple flex items-center justify-center">
-        <span class="text-white text-sm font-bold">Z</span>
-      </div>
-      <div>
-        <div class="text-sm font-semibold text-white tracking-tight">ZeroClaw</div>
-        <div class="text-[10px] text-gray-500">Admin Dashboard</div>
-      </div>
-    </div>
-  </div>
+<button class="hamburger" id="hamburger" aria-label="Toggle sidebar">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
+</button>
+<div class="overlay" id="overlay"></div>
 
-  <div class="flex-1 py-3 px-2 space-y-0.5">
-    <div class="px-2 py-1.5 text-[10px] text-gray-600 uppercase tracking-widest font-medium">System</div>
-    <button onclick="showSection('overview')" id="nav-overview" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2.5 text-gray-400 hover:text-gray-200 hover:bg-white/5 nav-active">
-      <span class="w-4 text-center text-xs">&#9632;</span> Overview
-    </button>
+<aside class="sidebar" id="sidebar">
+<div class="sidebar-brand">
+<svg viewBox="0 0 32 32" fill="none"><circle cx="16" cy="16" r="14" stroke="var(--accent)" stroke-width="2"/><path d="M10 12l6 4-6 4V12z" fill="var(--accent)"/><circle cx="22" cy="12" r="2" fill="var(--success)"/><circle cx="22" cy="20" r="2" fill="var(--warning)"/></svg>
+<div><div class="brand-text">ZeroClaw</div><div class="brand-sub">Mission Control</div></div>
+</div>
+<nav class="sidebar-nav" id="sidebarNav"></nav>
+</aside>
 
-    <div class="px-2 pt-3 pb-1.5 text-[10px] text-gray-600 uppercase tracking-widest font-medium">Traits</div>
-    <button onclick="showSection('providers')" id="nav-providers" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2.5 text-gray-400 hover:text-gray-200 hover:bg-white/5">
-      <span class="w-4 text-center text-xs">&#9883;</span> Providers <span id="nav-providers-count" class="ml-auto text-[10px] text-gray-600">0</span>
-    </button>
-    <button onclick="showSection('channels')" id="nav-channels" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2.5 text-gray-400 hover:text-gray-200 hover:bg-white/5">
-      <span class="w-4 text-center text-xs">&#9993;</span> Channels <span id="nav-channels-count" class="ml-auto text-[10px] text-gray-600">0/14</span>
-    </button>
-    <button onclick="showSection('tools')" id="nav-tools" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2.5 text-gray-400 hover:text-gray-200 hover:bg-white/5">
-      <span class="w-4 text-center text-xs">&#9881;</span> Tools <span id="nav-tools-count" class="ml-auto text-[10px] text-gray-600">37</span>
-    </button>
-    <button onclick="showSection('memory')" id="nav-memory" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2.5 text-gray-400 hover:text-gray-200 hover:bg-white/5">
-      <span class="w-4 text-center text-xs">&#9683;</span> Memory
-    </button>
-    <button onclick="showSection('observers')" id="nav-observers" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2.5 text-gray-400 hover:text-gray-200 hover:bg-white/5">
-      <span class="w-4 text-center text-xs">&#9673;</span> Observers
-    </button>
-    <button onclick="showSection('runtimes')" id="nav-runtimes" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2.5 text-gray-400 hover:text-gray-200 hover:bg-white/5">
-      <span class="w-4 text-center text-xs">&#9654;</span> Runtimes
-    </button>
-    <button onclick="showSection('security')" id="nav-security" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2.5 text-gray-400 hover:text-gray-200 hover:bg-white/5">
-      <span class="w-4 text-center text-xs">&#9888;</span> Security
-    </button>
-    <button onclick="showSection('tunnels')" id="nav-tunnels" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2.5 text-gray-400 hover:text-gray-200 hover:bg-white/5">
-      <span class="w-4 text-center text-xs">&#8644;</span> Tunnels
-    </button>
-
-    <div class="px-2 pt-3 pb-1.5 text-[10px] text-gray-600 uppercase tracking-widest font-medium">Data</div>
-    <button onclick="showSection('memories')" id="nav-memories" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2.5 text-gray-400 hover:text-gray-200 hover:bg-white/5">
-      <span class="w-4 text-center text-xs">&#128451;</span> Entries
-    </button>
-    <button onclick="showSection('config')" id="nav-config" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2.5 text-gray-400 hover:text-gray-200 hover:bg-white/5">
-      <span class="w-4 text-center text-xs">&#128196;</span> Config
-    </button>
-    <button onclick="showSection('metrics')" id="nav-metrics" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2.5 text-gray-400 hover:text-gray-200 hover:bg-white/5">
-      <span class="w-4 text-center text-xs">&#128200;</span> Metrics
-    </button>
-
-    <div class="px-2 pt-3 pb-1.5 text-[10px] text-gray-600 uppercase tracking-widest font-medium">Control Plane</div>
-    <button onclick="showSection('bots')" id="nav-bots" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2.5 text-gray-400 hover:text-gray-200 hover:bg-white/5">
-      <span class="w-4 text-center text-xs">&#9741;</span> Bots <span id="nav-bots-count" class="ml-auto text-[10px] text-gray-600">0</span>
-    </button>
-    <button onclick="showSection('commands')" id="nav-commands" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2.5 text-gray-400 hover:text-gray-200 hover:bg-white/5">
-      <span class="w-4 text-center text-xs">&#9655;</span> Commands
-    </button>
-    <button onclick="showSection('approvals')" id="nav-approvals" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2.5 text-gray-400 hover:text-gray-200 hover:bg-white/5">
-      <span class="w-4 text-center text-xs">&#9745;</span> Approvals <span id="nav-approvals-count" class="ml-auto text-[10px] text-zc-amber hidden">0</span>
-    </button>
-    <button onclick="showSection('audit')" id="nav-audit" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2.5 text-gray-400 hover:text-gray-200 hover:bg-white/5">
-      <span class="w-4 text-center text-xs">&#128220;</span> Audit
-    </button>
-    <button onclick="showSection('events')" id="nav-events" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2.5 text-gray-400 hover:text-gray-200 hover:bg-white/5">
-      <span class="w-4 text-center text-xs">&#9889;</span> Events
-    </button>
-  </div>
-
-  <div class="px-4 py-3 border-t border-zc-border">
-    <div class="flex items-center gap-2">
-      <span id="status-dot" class="w-2 h-2 rounded-full bg-zc-green pulse"></span>
-      <span id="status-text" class="text-[10px] text-gray-500">Connected</span>
-    </div>
-  </div>
-</nav>
-
-<!-- MAIN CONTENT -->
-<main class="flex-1 min-h-screen">
-  <div class="px-6 py-5 scroll-area">
-
-    <!-- OVERVIEW -->
-    <div id="section-overview">
-      <h1 class="text-lg font-semibold text-white mb-4">System Overview</h1>
-      <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
-        <div class="bg-zc-card border border-zc-border rounded-xl p-4">
-          <div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Provider</div>
-          <div id="ov-provider" class="text-base font-semibold text-white">-</div>
-          <div id="ov-model" class="text-[11px] text-gray-500 mt-0.5 mono truncate">-</div>
-        </div>
-        <div class="bg-zc-card border border-zc-border rounded-xl p-4">
-          <div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Channels</div>
-          <div id="ov-channels" class="text-base font-semibold text-white">0</div>
-          <div id="ov-channels-list" class="text-[11px] text-gray-500 mt-0.5 truncate">-</div>
-        </div>
-        <div class="bg-zc-card border border-zc-border rounded-xl p-4">
-          <div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Memory</div>
-          <div id="ov-memory" class="text-base font-semibold text-white">-</div>
-          <div id="ov-runtime" class="text-[11px] text-gray-500 mt-0.5">-</div>
-        </div>
-        <div class="bg-zc-card border border-zc-border rounded-xl p-4">
-          <div class="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Security</div>
-          <div id="ov-security" class="text-base font-semibold text-white">-</div>
-          <div id="ov-sandbox" class="text-[11px] text-gray-500 mt-0.5">-</div>
-        </div>
-      </div>
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">
-        <div class="bg-zc-card border border-zc-border rounded-xl p-4">
-          <h3 class="text-xs font-semibold text-white uppercase tracking-wider mb-3">Gateway</h3>
-          <div id="ov-gateway" class="text-sm space-y-1.5 text-gray-400"></div>
-        </div>
-        <div class="bg-zc-card border border-zc-border rounded-xl p-4">
-          <h3 class="text-xs font-semibold text-white uppercase tracking-wider mb-3">Agents</h3>
-          <div id="ov-agents" class="text-sm space-y-1.5 text-gray-400"></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- PROVIDERS -->
-    <div id="section-providers" class="hidden">
-      <div class="flex items-center justify-between mb-4">
-        <div>
-          <h1 class="text-lg font-semibold text-white">Providers</h1>
-          <p class="text-xs text-gray-500 mt-0.5"><span id="prov-enabled" class="text-zc-green font-medium">0</span> of 21 providers available</p>
-        </div>
-        <div class="flex gap-2">
-          <button onclick="showProviderModal()" class="admin-btn text-xs">Set Default</button>
-          <button onclick="filterItems('providers','all')" class="filter-btn-providers text-xs px-3 py-1.5 rounded-lg bg-zc-accent/15 text-zc-accent font-medium" data-f="all">All</button>
-          <button onclick="filterItems('providers','enabled')" class="filter-btn-providers text-xs px-3 py-1.5 rounded-lg bg-zc-card text-gray-400 border border-zc-border" data-f="enabled">Available</button>
-        </div>
-      </div>
-      <div id="providers-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3"></div>
-    </div>
-
-    <!-- CHANNELS -->
-    <div id="section-channels" class="hidden">
-      <div class="flex items-center justify-between mb-4">
-        <div>
-          <h1 class="text-lg font-semibold text-white">Channels</h1>
-          <p class="text-xs text-gray-500 mt-0.5"><span id="ch-enabled" class="text-zc-green font-medium">0</span> of 14 channels enabled</p>
-        </div>
-        <div class="flex gap-2">
-          <button onclick="showChannelModal()" class="admin-btn text-xs">Configure Channel</button>
-          <button onclick="filterItems('channels','all')" class="filter-btn-channels text-xs px-3 py-1.5 rounded-lg bg-zc-accent/15 text-zc-accent font-medium" data-f="all">All</button>
-          <button onclick="filterItems('channels','enabled')" class="filter-btn-channels text-xs px-3 py-1.5 rounded-lg bg-zc-card text-gray-400 border border-zc-border" data-f="enabled">Enabled</button>
-          <button onclick="filterItems('channels','disabled')" class="filter-btn-channels text-xs px-3 py-1.5 rounded-lg bg-zc-card text-gray-400 border border-zc-border" data-f="disabled">Available</button>
-        </div>
-      </div>
-      <div id="channels-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3"></div>
-    </div>
-
-    <!-- TOOLS -->
-    <div id="section-tools" class="hidden">
-      <div class="flex items-center justify-between mb-4">
-        <h1 class="text-lg font-semibold text-white">Tools <span class="text-sm text-gray-500 font-normal">(37 available)</span></h1>
-        <div class="flex gap-2">
-          <button onclick="filterItems('tools','all')" class="filter-btn-tools text-xs px-3 py-1.5 rounded-lg bg-zc-accent/15 text-zc-accent font-medium" data-f="all">All</button>
-          <button onclick="toolCatFilter('')" id="tool-cat-all" class="text-xs px-3 py-1.5 rounded-lg bg-zc-card text-gray-400 border border-zc-border">Categories</button>
-        </div>
-      </div>
-      <div id="tool-categories" class="flex flex-wrap gap-1.5 mb-4 hidden"></div>
-      <div id="tools-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3"></div>
-    </div>
-
-    <!-- MEMORY BACKEND -->
-    <div id="section-memory" class="hidden">
-      <div class="flex items-center justify-between mb-1">
-        <h1 class="text-lg font-semibold text-white">Memory Backend</h1>
-        <button onclick="showSelectModal('memory','backend',['sqlite','lucid','postgres','markdown','none'])" class="admin-btn text-xs">Switch Backend</button>
-      </div>
-      <p class="text-xs text-gray-500 mb-4">Active: <span id="mem-active" class="text-zc-green font-medium mono">-</span></p>
-      <div id="memory-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3"></div>
-    </div>
-
-    <!-- OBSERVERS -->
-    <div id="section-observers" class="hidden">
-      <div class="flex items-center justify-between mb-1">
-        <h1 class="text-lg font-semibold text-white">Observers</h1>
-        <button onclick="showSelectModal('observer','backend',['none','log','prometheus','otel'])" class="admin-btn text-xs">Switch Backend</button>
-      </div>
-      <p class="text-xs text-gray-500 mb-4">Active: <span id="obs-active" class="text-zc-green font-medium mono">-</span></p>
-      <div id="observers-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3"></div>
-    </div>
-
-    <!-- RUNTIMES -->
-    <div id="section-runtimes" class="hidden">
-      <div class="flex items-center justify-between mb-1">
-        <h1 class="text-lg font-semibold text-white">Runtime Adapters</h1>
-        <button onclick="showSelectModal('runtime','kind',['native','docker','wasm'])" class="admin-btn text-xs">Switch Runtime</button>
-      </div>
-      <p class="text-xs text-gray-500 mb-4">Active: <span id="rt-active" class="text-zc-green font-medium mono">-</span></p>
-      <div id="runtimes-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3"></div>
-    </div>
-
-    <!-- SECURITY -->
-    <div id="section-security" class="hidden">
-      <div class="flex items-center justify-between mb-4">
-        <h1 class="text-lg font-semibold text-white">Security & Autonomy</h1>
-        <button onclick="showSecurityModal()" class="admin-btn text-xs">Configure</button>
-      </div>
-      <div id="security-content"></div>
-    </div>
-
-    <!-- TUNNELS -->
-    <div id="section-tunnels" class="hidden">
-      <div class="flex items-center justify-between mb-1">
-        <h1 class="text-lg font-semibold text-white">Tunnels</h1>
-        <button onclick="showSelectModal('tunnel','provider',['none','cloudflare','tailscale','ngrok','custom'])" class="admin-btn text-xs">Switch Provider</button>
-      </div>
-      <p class="text-xs text-gray-500 mb-4">Active: <span id="tun-active" class="text-zc-green font-medium mono">-</span></p>
-      <div id="tunnels-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3"></div>
-    </div>
-
-    <!-- MEMORY ENTRIES -->
-    <div id="section-memories" class="hidden">
-      <div class="bg-zc-card border border-zc-border rounded-xl p-4">
-        <div class="flex items-center justify-between mb-3">
-          <h3 class="text-xs font-semibold text-white uppercase tracking-wider">Memory Entries (<span id="mem-count">0</span>)</h3>
-          <button onclick="loadMemories()" class="text-xs bg-zc-accent/15 text-zc-accent px-3 py-1.5 rounded-lg hover:bg-zc-accent/25 font-medium">Refresh</button>
-        </div>
-        <div id="memory-list" class="space-y-2 max-h-[600px] overflow-auto">Loading...</div>
-      </div>
-    </div>
-
-    <!-- CONFIG -->
-    <div id="section-config" class="hidden">
-      <div class="bg-zc-card border border-zc-border rounded-xl p-4">
-        <div class="flex items-center justify-between mb-3">
-          <h3 class="text-xs font-semibold text-white uppercase tracking-wider">Configuration (secrets redacted)</h3>
-          <button onclick="loadConfig()" class="text-xs bg-zc-accent/15 text-zc-accent px-3 py-1.5 rounded-lg hover:bg-zc-accent/25 font-medium">Refresh</button>
-        </div>
-        <pre id="config-json" class="text-xs overflow-auto max-h-[600px] text-gray-400 bg-zc-bg p-4 rounded-lg mono leading-relaxed">Loading...</pre>
-      </div>
-    </div>
-
-    <!-- METRICS -->
-    <div id="section-metrics" class="hidden">
-      <div class="bg-zc-card border border-zc-border rounded-xl p-4">
-        <div class="flex items-center justify-between mb-3">
-          <h3 class="text-xs font-semibold text-white uppercase tracking-wider">Prometheus Metrics</h3>
-          <button onclick="loadMetrics()" class="text-xs bg-zc-accent/15 text-zc-accent px-3 py-1.5 rounded-lg hover:bg-zc-accent/25 font-medium">Refresh</button>
-        </div>
-        <pre id="metrics-raw" class="text-xs overflow-auto max-h-[600px] text-gray-400 bg-zc-bg p-4 rounded-lg mono leading-relaxed">Loading...</pre>
-      </div>
-    </div>
-
-    <!-- BOTS -->
-    <div id="section-bots" class="hidden">
-      <div class="flex items-center justify-between mb-4">
-        <h1 class="text-lg font-semibold text-white">Bot Fleet</h1>
-        <button onclick="loadBots()" class="text-xs bg-zc-accent/15 text-zc-accent px-3 py-1.5 rounded-lg hover:bg-zc-accent/25 font-medium">Refresh</button>
-      </div>
-      <div id="bots-grid" class="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-3">
-        <div class="text-xs text-gray-500">Loading bots...</div>
-      </div>
-    </div>
-
-    <!-- BOT DETAIL (inline, toggled) -->
-    <div id="section-bot-detail" class="hidden">
-      <div class="flex items-center gap-3 mb-4">
-        <button onclick="showSection('bots')" class="text-xs text-gray-400 hover:text-white">&larr; Back</button>
-        <h1 class="text-lg font-semibold text-white" id="bot-detail-name">Bot Detail</h1>
-        <span id="bot-detail-status" class="badge px-2 py-0.5 rounded-full"></span>
-      </div>
-      <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
-        <div class="bg-zc-card border border-zc-border rounded-xl p-3">
-          <div class="text-[10px] text-gray-500 uppercase">Host</div>
-          <div id="bot-detail-host" class="text-sm text-white mono mt-1">-</div>
-        </div>
-        <div class="bg-zc-card border border-zc-border rounded-xl p-3">
-          <div class="text-[10px] text-gray-500 uppercase">Version</div>
-          <div id="bot-detail-version" class="text-sm text-white mono mt-1">-</div>
-        </div>
-        <div class="bg-zc-card border border-zc-border rounded-xl p-3">
-          <div class="text-[10px] text-gray-500 uppercase">Uptime</div>
-          <div id="bot-detail-uptime" class="text-sm text-white mono mt-1">-</div>
-        </div>
-        <div class="bg-zc-card border border-zc-border rounded-xl p-3">
-          <div class="text-[10px] text-gray-500 uppercase">Last Heartbeat</div>
-          <div id="bot-detail-hb" class="text-sm text-white mono mt-1">-</div>
-        </div>
-      </div>
-      <div class="flex gap-2 mb-4">
-        <button onclick="showCommandModalFor()" class="admin-btn">Send Command</button>
-        <button onclick="doDeleteBot()" class="admin-btn admin-btn-red">Remove Bot</button>
-      </div>
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div class="bg-zc-card border border-zc-border rounded-xl p-4">
-          <h3 class="text-xs font-semibold text-white uppercase tracking-wider mb-3">Recent Commands</h3>
-          <div id="bot-detail-commands" class="space-y-2 text-xs text-gray-400">Loading...</div>
-        </div>
-        <div class="bg-zc-card border border-zc-border rounded-xl p-4">
-          <h3 class="text-xs font-semibold text-white uppercase tracking-wider mb-3">Recent Events</h3>
-          <div id="bot-detail-events" class="space-y-2 text-xs text-gray-400">Loading...</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- COMMANDS -->
-    <div id="section-commands" class="hidden">
-      <div class="flex items-center justify-between mb-4">
-        <h1 class="text-lg font-semibold text-white">Commands</h1>
-        <div class="flex gap-2">
-          <button onclick="showCommandModal()" class="admin-btn">New Command</button>
-          <button onclick="loadCommands()" class="text-xs bg-zc-accent/15 text-zc-accent px-3 py-1.5 rounded-lg hover:bg-zc-accent/25 font-medium">Refresh</button>
-        </div>
-      </div>
-      <div class="bg-zc-card border border-zc-border rounded-xl overflow-hidden">
-        <table class="w-full text-xs">
-          <thead>
-            <tr class="border-b border-zc-border text-gray-500 text-left">
-              <th class="px-4 py-2.5 font-medium">ID</th>
-              <th class="px-4 py-2.5 font-medium">Bot</th>
-              <th class="px-4 py-2.5 font-medium">Kind</th>
-              <th class="px-4 py-2.5 font-medium">Status</th>
-              <th class="px-4 py-2.5 font-medium">Created</th>
-              <th class="px-4 py-2.5 font-medium">Result</th>
-            </tr>
-          </thead>
-          <tbody id="commands-tbody" class="text-gray-300"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- APPROVALS -->
-    <div id="section-approvals" class="hidden">
-      <div class="flex items-center justify-between mb-4">
-        <h1 class="text-lg font-semibold text-white">Approval Queue</h1>
-        <button onclick="loadApprovals()" class="text-xs bg-zc-accent/15 text-zc-accent px-3 py-1.5 rounded-lg hover:bg-zc-accent/25 font-medium">Refresh</button>
-      </div>
-      <div id="approvals-list" class="space-y-3">
-        <div class="text-xs text-gray-500">Loading approvals...</div>
-      </div>
-    </div>
-
-    <!-- AUDIT -->
-    <div id="section-audit" class="hidden">
-      <div class="flex items-center justify-between mb-4">
-        <h1 class="text-lg font-semibold text-white">Audit Log</h1>
-        <button onclick="loadAudit()" class="text-xs bg-zc-accent/15 text-zc-accent px-3 py-1.5 rounded-lg hover:bg-zc-accent/25 font-medium">Refresh</button>
-      </div>
-      <div class="bg-zc-card border border-zc-border rounded-xl overflow-hidden">
-        <table class="w-full text-xs">
-          <thead>
-            <tr class="border-b border-zc-border text-gray-500 text-left">
-              <th class="px-4 py-2.5 font-medium">Time</th>
-              <th class="px-4 py-2.5 font-medium">Actor</th>
-              <th class="px-4 py-2.5 font-medium">Action</th>
-              <th class="px-4 py-2.5 font-medium">Target</th>
-              <th class="px-4 py-2.5 font-medium">Detail</th>
-            </tr>
-          </thead>
-          <tbody id="audit-tbody" class="text-gray-300"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- EVENTS (Live) -->
-    <div id="section-events" class="hidden">
-      <div class="flex items-center justify-between mb-4">
-        <h1 class="text-lg font-semibold text-white">Live Events</h1>
-        <div class="flex items-center gap-3">
-          <span id="sse-status" class="text-[10px] text-gray-500">Disconnected</span>
-          <button onclick="toggleSSE()" id="sse-toggle" class="text-xs bg-zc-green/15 text-zc-green px-3 py-1.5 rounded-lg hover:bg-zc-green/25 font-medium">Connect</button>
-          <button onclick="loadEvents()" class="text-xs bg-zc-accent/15 text-zc-accent px-3 py-1.5 rounded-lg hover:bg-zc-accent/25 font-medium">History</button>
-        </div>
-      </div>
-      <div id="events-stream" class="space-y-1 max-h-[600px] overflow-y-auto bg-zc-card border border-zc-border rounded-xl p-4">
-        <div class="text-xs text-gray-500">Click Connect to start SSE stream...</div>
-      </div>
-    </div>
-
-  </div>
+<main class="main" id="main">
+<div id="content"></div>
 </main>
 
 <script>
-var BASE = window.location.origin;
-var SYS = null;
-var channelData = [];
-var currentSection = 'overview';
-var toolCat = '';
+/*
+ * ZeroClaw Dashboard - SPA Controller
+ * All data fetched from local API endpoints; all rendering uses
+ * textContent for user-controlled strings and sanitized template
+ * assembly for structural markup (no untrusted content in markup).
+ * API endpoints: /api/system, /api/channels, /api/status,
+ * /api/control/, /api/consciousness
+ */
+(function(){
+"use strict";
 
-var SECTIONS = ['overview','providers','channels','tools','memory','observers','runtimes','security','tunnels','memories','config','metrics','bots','bot-detail','commands','approvals','audit','events'];
-
-var CAT_COLORS = {
-  frontier: 'bg-zc-accent/15 text-zc-accent',
-  aggregator: 'bg-zc-purple/15 text-zc-purple',
-  inference: 'bg-zc-cyan/15 text-zc-cyan',
-  local: 'bg-zc-green/15 text-zc-green',
-  search: 'bg-zc-amber/15 text-zc-amber',
-  china: 'bg-zc-pink/15 text-zc-pink',
-  messaging: 'bg-zc-accent/15 text-zc-accent',
-  communication: 'bg-zc-cyan/15 text-zc-cyan',
-  integration: 'bg-zc-amber/15 text-zc-amber',
-  enterprise: 'bg-zc-purple/15 text-zc-purple',
-  system: 'bg-gray-700/40 text-gray-300',
-  browser: 'bg-zc-cyan/15 text-zc-cyan',
-  network: 'bg-zc-amber/15 text-zc-amber',
-  scheduling: 'bg-zc-purple/15 text-zc-purple',
-  wallet: 'bg-zc-green/15 text-zc-green',
-  hardware: 'bg-zc-red/15 text-zc-red',
-  agent: 'bg-zc-accent/15 text-zc-accent',
-  soul: 'bg-zc-pink/15 text-zc-pink',
-  media: 'bg-zc-lime/15 text-zc-lime',
-  memory: 'bg-zc-cyan/15 text-zc-cyan',
+var ICONS = {
+  overview:'<path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/>',
+  providers:'<path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>',
+  channels:'<path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/>',
+  tools:'<path d="M22.7 19l-9.1-9.1c.9-2.3.4-5-1.5-6.9-2-2-5-2.4-7.4-1.3L9 6 6 9 1.6 4.7C.4 7.1.9 10.1 2.9 12.1c1.9 1.9 4.6 2.4 6.9 1.5l9.1 9.1c.4.4 1 .4 1.4 0l2.3-2.3c.5-.4.5-1.1.1-1.4z"/>',
+  memory:'<path d="M15 9H9v6h6V9zm-2 4h-2v-2h2v2zm8-2V9h-2V7c0-1.1-.9-2-2-2h-2V3h-2v2h-2V3H9v2H7c-1.1 0-2 .9-2 2v2H3v2h2v2H3v2h2v2c0 1.1.9 2 2 2h2v2h2v-2h2v2h2v-2h2c1.1 0 2-.9 2-2v-2h2v-2h-2v-2h2zm-4 6H7V7h10v10z"/>',
+  observers:'<path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>',
+  runtimes:'<path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>',
+  security:'<path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z"/>',
+  tunnels:'<path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>',
+  config:'<path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.49.49 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>',
+  bots:'<path d="M12 2a2 2 0 012 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 017 7h1a1 1 0 011 1v3a1 1 0 01-1 1h-1.17A7 7 0 015.17 19H4a1 1 0 01-1-1v-3a1 1 0 011-1h1a7 7 0 017-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 012-2zM7.5 14a1.5 1.5 0 100 3 1.5 1.5 0 000-3zm9 0a1.5 1.5 0 100 3 1.5 1.5 0 000-3z"/>',
+  commands:'<path d="M20 19V7H4v12h16m0-16a2 2 0 012 2v14a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h16zM7 9l4 2.5L7 14V9zm5 6h6v2h-6v-2z"/>',
+  approvals:'<path d="M18 7l-1.41-1.41-6.34 6.34 1.41 1.41L18 7zm4.24-1.41L11.66 16.17 7.48 12l-1.41 1.41L11.66 19l12-12-1.42-1.41zM.41 13.41L6 19l1.41-1.41L1.83 12 .41 13.41z"/>',
+  audit:'<path d="M19 3h-4.18C14.4 1.84 13.3 1 12 1c-1.3 0-2.4.84-2.82 2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 0c.55 0 1 .45 1 1s-.45 1-1 1-1-.45-1-1 .45-1 1-1zm2 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"/>',
+  events:'<path d="M7.58 4.08L6.15 2.65C3.75 4.48 2.17 7.3 2.03 10.5h2c.15-2.65 1.51-4.97 3.55-6.42zm12.39 6.42h2c-.15-3.2-1.73-6.02-4.12-7.85l-1.42 1.43c2.02 1.45 3.39 3.77 3.54 6.42zM18 11c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2v-5zm-6 11c.14 0 .27-.01.4-.04.65-.14 1.18-.58 1.44-1.18.1-.24.15-.5.15-.78h-4c.01 1.1.9 2 2.01 2z"/>',
+  consciousness:'<path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm-1-4h2v-2h-2v2zm1-12C9.79 4 8 5.79 8 8h2c0-1.1.9-2 2-2s2 .9 2 2c0 2-3 1.75-3 5h2c0-2.25 3-2.5 3-5 0-2.21-1.79-4-4-4z"/>',
+  peripherals:'<path d="M15 7.5V2H9v5.5l3 3 3-3zM7.5 9H2v6h5.5l3-3-3-3zM9 16.5V22h6v-5.5l-3-3-3 3zM16.5 9l-3 3 3 3H22V9h-5.5z"/>'
 };
 
-var CHANNEL_ICONS = {
-  telegram:'\u2708\uFE0F', discord:'\uD83C\uDFAE', slack:'\uD83D\uDCAC', mattermost:'\uD83D\uDD17',
-  matrix:'\uD83C\uDF10', whatsapp:'\uD83D\uDCF1', signal:'\uD83D\uDD12', email:'\u2709\uFE0F',
-  irc:'\uD83D\uDCBB', webhook:'\u26A1', imessage:'\uD83D\uDCE8', lark:'\uD83D\uDC26',
-  dingtalk:'\uD83D\uDD14', qq:'\uD83D\uDC27'
+var NAV_GROUPS = [
+  { name:'System', items:[
+    { id: 'overview', label:'Overview', icon:'overview', group:'System' },
+    { id: 'providers', label:'Providers', icon:'providers', group:'System' },
+    { id: 'channels', label:'Channels', icon:'channels', group:'System' },
+    { id: 'tools', label:'Tools', icon:'tools', group:'System' }
+  ]},
+  { name:'Services', items:[
+    { id: 'memory', label:'Memory', icon:'memory', group:'Services' },
+    { id: 'observers', label:'Observers', icon:'observers', group:'Services' },
+    { id: 'runtimes', label:'Runtimes', icon:'runtimes', group:'Services' }
+  ]},
+  { name:'Infrastructure', items:[
+    { id: 'security', label:'Security', icon:'security', group:'Infrastructure' },
+    { id: 'tunnels', label:'Tunnels', icon:'tunnels', group:'Infrastructure' },
+    { id: 'config', label:'Configuration', icon:'config', group:'Infrastructure' }
+  ]},
+  { name:'Control', items:[
+    { id: 'bots', label:'Bots', icon:'bots', group:'Control' },
+    { id: 'commands', label:'Commands', icon:'commands', group:'Control' },
+    { id: 'approvals', label:'Approvals', icon:'approvals', group:'Control' },
+    { id: 'audit', label:'Audit Log', icon:'audit', group:'Control' },
+    { id: 'events', label:'Events', icon:'events', group:'Control' }
+  ]},
+  { name:'Intelligence', items:[
+    { id: 'consciousness', label:'Consciousness', icon:'consciousness', group:'Intelligence' }
+  ]},
+  { name:'Settings', items:[
+    { id: 'peripherals', label:'Peripherals', icon:'peripherals', group:'Settings' }
+  ]}
+];
+
+var state = {
+  currentPage: 'overview',
+  cache: {},
+  eventSource: null,
+  refreshInterval: null,
+  events: []
 };
 
-function showSection(name) {
-  currentSection = name;
-  SECTIONS.forEach(function(s) {
-    var el = document.getElementById('section-' + s);
-    if (el) el.classList.toggle('hidden', s !== name);
-    var nav = document.getElementById('nav-' + s);
-    if (nav) {
-      if (s === name) nav.classList.add('nav-active');
-      else nav.classList.remove('nav-active');
-    }
-  });
-  if (name === 'memories') loadMemories();
-  if (name === 'config') loadConfig();
-  if (name === 'metrics') loadMetrics();
-  if (name === 'bots') loadBots();
-  if (name === 'commands') loadCommands();
-  if (name === 'approvals') loadApprovals();
-  if (name === 'audit') loadAudit();
-  if (name === 'events') loadEvents();
+function esc(s) {
+  if (s == null) return '';
+  var div = document.createElement('div');
+  div.textContent = String(s);
+  return div.innerHTML;
 }
 
-function setText(id, text) { var el = document.getElementById(id); if (el) el.textContent = text; }
+function fmtTime(ts) {
+  if (!ts) return '';
+  try { return new Date(ts).toLocaleString(); } catch(e) { return String(ts); }
+}
 
-function makeCard(opts) {
-  var d = document.createElement('div');
-  var barClass = opts.active ? 'active-bar' : (opts.enabled ? 'enabled-bar' : 'available-bar');
-  d.className = 'card bg-zc-card border border-zc-border rounded-xl p-4 fade-in ' + barClass;
+function setContent(el, html) {
+  el.innerHTML = html;
+}
 
-  var statusHtml = '';
-  if (opts.active) {
-    statusHtml = '<span class="w-2 h-2 rounded-full bg-zc-accent pulse"></span><span class="text-zc-accent text-[10px] font-medium uppercase tracking-wider">Active</span>';
-  } else if (opts.enabled) {
-    statusHtml = '<span class="w-2 h-2 rounded-full bg-zc-green pulse"></span><span class="text-zc-green text-[10px] font-medium uppercase tracking-wider">Ready</span>';
-  } else {
-    statusHtml = '<span class="w-2 h-2 rounded-full bg-gray-600"></span><span class="text-gray-500 text-[10px] font-medium uppercase tracking-wider">Not configured</span>';
+function svgIcon(name, size) {
+  size = size || 24;
+  return '<svg viewBox="0 0 24 24" width="' + size + '" height="' + size + '" fill="currentColor">' + (ICONS[name] || '') + '</svg>';
+}
+
+function buildNav() {
+  var nav = document.getElementById('sidebarNav');
+  var html = '';
+  NAV_GROUPS.forEach(function(g) {
+    html += '<div class="nav-group" data-group="' + g.name + '">';
+    html += '<div class="nav-group-label">' + esc(g.name) + '<span class="chevron">&#9660;</span></div>';
+    html += '<div class="nav-group-items">';
+    g.items.forEach(function(item) {
+      var iconSvg = '<svg viewBox="0 0 24 24" fill="currentColor">' + (ICONS[item.icon] || '') + '</svg>';
+      html += '<div class="nav-item' + (state.currentPage === item.id ? ' active' : '') + '" data-page="' + item.id + '">' + iconSvg + '<span>' + esc(item.label) + '</span></div>';
+    });
+    html += '</div></div>';
+  });
+  setContent(nav, html);
+
+  nav.querySelectorAll('.nav-group-label').forEach(function(label) {
+    label.addEventListener('click', function() {
+      label.parentElement.classList.toggle('collapsed');
+    });
+  });
+  nav.querySelectorAll('.nav-item').forEach(function(el) {
+    el.addEventListener('click', function() {
+      navigate(el.dataset.page);
+    });
+  });
+}
+
+function navigate(page) {
+  state.currentPage = page;
+  if (state.eventSource && page !== 'events') {
+    state.eventSource.close();
+    state.eventSource = null;
   }
-
-  var catHtml = opts.category ? '<span class="badge ' + (CAT_COLORS[opts.category] || 'bg-gray-800 text-gray-400') + ' px-1.5 py-0.5 rounded-full font-medium uppercase tracking-wider">' + opts.category + '</span>' : '';
-
-  var iconHtml = opts.icon ? '<span class="text-lg mr-1">' + opts.icon + '</span>' : '';
-
-  var envHtml = opts.env_var ? '<div class="mt-2"><span class="text-[10px] text-gray-600 uppercase tracking-wider">Env var</span><div class="mt-0.5"><span class="inline-block bg-zc-bg text-gray-400 text-[10px] px-1.5 py-0.5 rounded mono">' + opts.env_var + '</span></div></div>' : '';
-
-  var keysHtml = '';
-  if (opts.required_keys && opts.required_keys.length) {
-    keysHtml = '<div class="mt-2"><span class="text-[10px] text-gray-600 uppercase tracking-wider">Required</span><div class="mt-0.5 flex flex-wrap gap-1">' +
-      opts.required_keys.map(function(k) { return '<span class="inline-block bg-zc-bg text-gray-400 text-[10px] px-1.5 py-0.5 rounded mono">' + k + '</span>'; }).join('') +
-      '</div></div>';
+  if (state.refreshInterval) {
+    clearInterval(state.refreshInterval);
+    state.refreshInterval = null;
   }
-  if (opts.optional_keys && opts.optional_keys.length) {
-    var shown = opts.optional_keys.slice(0, 3);
-    var more = opts.optional_keys.length > 3 ? ' <span class="text-gray-600 text-[10px]">+' + (opts.optional_keys.length - 3) + '</span>' : '';
-    keysHtml += '<div class="mt-1.5"><span class="text-[10px] text-gray-600">Optional: </span>' +
-      shown.map(function(k) { return '<span class="inline-block bg-zc-bg text-gray-500 text-[10px] px-1.5 py-0.5 rounded mono">' + k + '</span>'; }).join(' ') + more + '</div>';
-  }
-
-  d.innerHTML =
-    '<div class="flex items-start justify-between mb-2">' +
-      '<div class="flex items-center gap-1.5">' + iconHtml +
-        '<div><div class="text-sm font-semibold text-white">' + opts.label + '</div>' + catHtml + '</div>' +
-      '</div>' +
-      '<div class="flex items-center gap-1.5">' + statusHtml + '</div>' +
-    '</div>' +
-    envHtml + keysHtml +
-    '<div class="text-[11px] text-gray-500 leading-relaxed mt-2 border-t border-zc-border pt-2">' + (opts.hint || '') + '</div>';
-
-  return d;
+  document.querySelectorAll('.nav-item').forEach(function(el) {
+    el.classList.toggle('active', el.dataset.page === page);
+  });
+  closeMobile();
+  renderPage();
 }
 
-function filterItems(section, mode) {
-  var btns = document.querySelectorAll('.filter-btn-' + section);
-  btns.forEach(function(b) {
-    if (b.getAttribute('data-f') === mode) {
-      b.className = 'filter-btn-' + section + ' text-xs px-3 py-1.5 rounded-lg bg-zc-accent/15 text-zc-accent font-medium';
-    } else {
-      b.className = 'filter-btn-' + section + ' text-xs px-3 py-1.5 rounded-lg bg-zc-card text-gray-400 border border-zc-border';
-    }
-  });
-
-  if (section === 'providers') renderProviders(mode);
-  if (section === 'channels') renderChannels(mode);
-  if (section === 'tools') renderTools(mode);
+function fetchJSON(url) {
+  return fetch(url).then(function(r) {
+    if (!r.ok) throw new Error(r.status);
+    return r.json();
+  }).catch(function() { return null; });
 }
 
-function renderProviders(filter) {
-  if (!SYS) return;
-  var grid = document.getElementById('providers-grid');
-  grid.innerHTML = '';
-  var items = SYS.providers.items;
-  var count = 0;
-  items.forEach(function(p) {
-    if (p.enabled) count++;
-    if (filter === 'enabled' && !p.enabled) return;
-    grid.appendChild(makeCard({
-      label: p.label,
-      category: p.category,
-      enabled: p.enabled,
-      active: SYS.providers.active === p.name,
-      env_var: p.env_var,
-      hint: p.hint,
-    }));
-  });
-  setText('prov-enabled', String(count));
-  setText('nav-providers-count', String(count));
+function statusDot(active) {
+  return '<span class="status-dot ' + (active ? 'online' : 'offline') + '"></span>';
 }
 
-function renderChannels(filter) {
-  if (!channelData.length) return;
-  var grid = document.getElementById('channels-grid');
-  grid.innerHTML = '';
-  var filtered = channelData.filter(function(ch) {
-    if (filter === 'enabled') return ch.enabled;
-    if (filter === 'disabled') return !ch.enabled;
-    return true;
-  });
-  if (!filtered.length) {
-    grid.innerHTML = '<div class="col-span-full text-sm text-gray-500 text-center py-8">No channels match.</div>';
-    return;
-  }
-  filtered.forEach(function(ch) {
-    grid.appendChild(makeCard({
-      label: ch.label,
-      category: ch.category,
-      enabled: ch.enabled,
-      icon: CHANNEL_ICONS[ch.name],
-      required_keys: ch.required_keys,
-      optional_keys: ch.optional_keys,
-      hint: ch.hint,
-    }));
-  });
+function badgeFor(val) {
+  if (val == null) return '<span class="badge badge-muted">unknown</span>';
+  var s = String(val).toLowerCase();
+  if (s === 'true' || s === 'enabled' || s === 'active' || s === 'online')
+    return '<span class="badge badge-success">' + esc(val) + '</span>';
+  if (s === 'false' || s === 'disabled' || s === 'offline')
+    return '<span class="badge badge-muted">' + esc(val) + '</span>';
+  return '<span class="badge badge-accent">' + esc(val) + '</span>';
 }
 
-function renderTools(filter) {
-  if (!SYS) return;
-  var grid = document.getElementById('tools-grid');
-  grid.innerHTML = '';
-  var items = SYS.tools.items;
-  items.forEach(function(t) {
-    if (toolCat && t.category !== toolCat) return;
-    grid.appendChild(makeCard({
-      label: t.name,
-      category: t.category,
-      enabled: true,
-      hint: t.hint,
-    }));
-  });
+function loadingBlock() {
+  return '<div class="loading-placeholder shimmer" style="height:120px;border-radius:8px"></div>';
 }
 
-function toolCatFilter(cat) {
-  toolCat = cat;
-  var catEl = document.getElementById('tool-categories');
-  if (!SYS) return;
-  if (!cat) {
-    catEl.classList.toggle('hidden');
-    if (!catEl.classList.contains('hidden')) {
-      catEl.innerHTML = '';
-      var cats = {};
-      SYS.tools.items.forEach(function(t) { cats[t.category] = (cats[t.category] || 0) + 1; });
-      Object.keys(cats).sort().forEach(function(c) {
-        var b = document.createElement('button');
-        b.className = 'text-[10px] px-2.5 py-1 rounded-lg border border-zc-border text-gray-400 hover:text-white hover:border-zc-accent';
-        b.textContent = c + ' (' + cats[c] + ')';
-        b.onclick = function() { toolCatFilter(c); };
-        catEl.appendChild(b);
+function emptyState(msg) {
+  return '<div class="empty-state"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z"/></svg><p>' + esc(msg) + '</p></div>';
+}
+
+function kpiCard(label, value, sub, color, iconHtml) {
+  return '<div class="surface-card kpi-card fade-in-up"><div><div class="kpi-label">' + esc(label) + '</div><div class="kpi-value">' + esc(String(value)) + '</div><div class="kpi-sub">' + esc(sub) + '</div></div><div class="kpi-icon" style="background:' + color + '20;color:' + color + '">' + iconHtml + '</div></div>';
+}
+
+function infoBlock(title, color, rows) {
+  var html = '<div class="surface-card info-block fade-in-up"><h3><span style="color:' + color + '">&#9679;</span> ' + esc(title) + '</h3>';
+  rows.forEach(function(r) {
+    html += '<div class="info-row"><span class="label">' + esc(r[0]) + '</span><span class="value">' + esc(String(r[1])) + '</span></div>';
+  });
+  return html + '</div>';
+}
+
+function renderOverview() {
+  var el = document.getElementById('content');
+  setContent(el, '<div class="page-header fade-in-up"><h1>Dashboard Overview</h1><p>Real-time system health and activity</p></div>' + loadingBlock());
+
+  Promise.all([
+    fetchJSON('/api/system'),
+    fetchJSON('/api/status'),
+    fetchJSON('/api/control/approvals'),
+    fetchJSON('/api/control/audit')
+  ]).then(function(results) {
+    var sys = results[0], status = results[1], approvals = results[2], audit = results[3];
+    state.cache.system = sys;
+    state.cache.status = status;
+
+    var channelsCount = (status && status.channels_count != null) ? status.channels_count : (sys && sys.channels ? sys.channels.count : '--');
+    var providersCount = sys && sys.providers ? sys.providers.count : '--';
+    var toolsCount = (status && status.tools_count != null) ? status.tools_count : (sys && sys.tools ? sys.tools.count : '--');
+    var memoryBackend = status && status.memory_backend ? status.memory_backend : (sys && sys.memory && sys.memory.items && sys.memory.items.length ? sys.memory.items[0].name : '--');
+
+    var html = '<div class="page-header fade-in-up"><h1>Dashboard Overview</h1><p>Real-time system health and activity</p></div>';
+
+    html += '<div class="kpi-grid">';
+    html += kpiCard('Active Channels', channelsCount, 'Connected streams', 'var(--accent)', svgIcon('channels', 20));
+    html += kpiCard('Providers', providersCount, 'AI backends', 'var(--success)', svgIcon('providers', 20));
+    html += kpiCard('Tools Count', toolsCount, 'Registered tools', 'var(--warning)', svgIcon('tools', 20));
+    html += kpiCard('Memory Backend', memoryBackend, 'Storage layer', '#a78bfa', svgIcon('memory', 20));
+    html += '</div>';
+
+    html += '<div class="info-grid">';
+    html += infoBlock('System Status', 'var(--accent)', [
+      ['Provider', sys && sys.provider ? sys.provider : '--'],
+      ['Model', sys && sys.model ? sys.model : '--'],
+      ['Temperature', sys && sys.temperature != null ? sys.temperature : '--'],
+      ['Auto-Save', status && status.auto_save != null ? String(status.auto_save) : '--']
+    ]);
+    html += infoBlock('Security', 'var(--warning)', [
+      ['Autonomy Level', sys && sys.security ? sys.security.autonomy_level || '--' : '--'],
+      ['Sandbox', sys && sys.security ? String(sys.security.sandbox_enabled || '--') : '--'],
+      ['Pairing', sys && sys.security ? sys.security.pairing || '--' : '--']
+    ]);
+    html += infoBlock('Gateway Health', 'var(--success)', [
+      ['Host', status && status.host ? status.host : '--'],
+      ['Port', status && status.port != null ? status.port : '--'],
+      ['Tunnels', sys && sys.tunnels ? sys.tunnels.count : '--']
+    ]);
+    html += '</div>';
+
+    html += '<div class="surface-panel fade-in-up" style="margin-bottom:1rem"><h3 style="margin-bottom:.75rem;font-size:.9rem">Pending Approvals</h3>';
+    if (approvals && approvals.length) {
+      html += '<table class="data-table"><thead><tr><th>ID</th><th>Action</th><th>Status</th><th>Time</th></tr></thead><tbody>';
+      approvals.forEach(function(a) {
+        html += '<tr><td class="mono">' + esc(a.id) + '</td><td>' + esc(a.action || a.description || '') + '</td><td>' + badgeFor(a.status) + '</td><td>' + esc(fmtTime(a.created_at || a.timestamp)) + '</td></tr>';
       });
-      var all = document.createElement('button');
-      all.className = 'text-[10px] px-2.5 py-1 rounded-lg bg-zc-accent/15 text-zc-accent font-medium';
-      all.textContent = 'Show all';
-      all.onclick = function() { toolCat = ''; renderTools('all'); };
-      catEl.appendChild(all);
+      html += '</tbody></table>';
+    } else {
+      html += '<div style="color:var(--text-muted);font-size:.8rem">No pending approvals</div>';
     }
-  } else {
-    renderTools('all');
-  }
+    html += '</div>';
+
+    html += '<div class="surface-panel fade-in-up"><h3 style="margin-bottom:.75rem;font-size:.9rem">Recent Activity</h3>';
+    if (audit && audit.length) {
+      audit.slice(0, 8).forEach(function(a) {
+        html += '<div class="activity-item"><span class="activity-time">' + esc(fmtTime(a.timestamp || a.created_at)) + '</span><span class="activity-text">' + esc(a.message || a.action || a.event || JSON.stringify(a)) + '</span></div>';
+      });
+    } else {
+      html += '<div style="color:var(--text-muted);font-size:.8rem">No recent activity</div>';
+    }
+    html += '</div>';
+
+    setContent(el, html);
+  });
+
+  state.refreshInterval = setInterval(function() {
+    if (state.currentPage === 'overview') renderOverview();
+  }, 15000);
 }
 
-function renderSingleSelect(gridId, items, activeKey) {
-  var grid = document.getElementById(gridId);
-  if (!grid) return;
-  grid.innerHTML = '';
-  items.forEach(function(item) {
-    grid.appendChild(makeCard({
-      label: item.label,
-      enabled: item.enabled || item.active,
-      active: item.enabled || item.active,
-      hint: item.hint,
-      required_keys: item.required_keys,
-      optional_keys: item.optional_keys,
-      env_var: item.env_var,
-    }));
+function renderChannels() {
+  var el = document.getElementById('content');
+  setContent(el, '<div class="page-header fade-in-up"><h1>Channels</h1><p>Communication channels and message streams</p></div>' + loadingBlock());
+  fetchJSON('/api/channels').then(function(data) {
+    var html = '<div class="page-header fade-in-up"><h1>Channels</h1><p>Communication channels and message streams</p></div>';
+    html += '<div class="surface-panel fade-in-up">';
+    var items = data ? (Array.isArray(data) ? data : (data.items || [])) : [];
+    if (items.length) {
+      html += '<table class="data-table"><thead><tr><th>Name</th><th>Category</th><th>Status</th><th>Hint</th></tr></thead><tbody>';
+      items.forEach(function(ch) {
+        var active = ch.enabled !== false && ch.status !== 'offline';
+        html += '<tr><td><strong>' + esc(ch.name) + '</strong></td><td>' + badgeFor(ch.category || ch.type) + '</td><td>' + statusDot(active) + (active ? 'Online' : 'Offline') + '</td><td style="color:var(--text-muted)">' + esc(ch.hint || ch.description || '') + '</td></tr>';
+      });
+      html += '</tbody></table>';
+    } else {
+      html += emptyState('No channels configured');
+    }
+    html += '</div>';
+    setContent(el, html);
+  });
+}
+
+function renderItemsPage(key, title, subtitle) {
+  var el = document.getElementById('content');
+  setContent(el, '<div class="page-header fade-in-up"><h1>' + esc(title) + '</h1><p>' + esc(subtitle) + '</p></div>' + loadingBlock());
+
+  var p = state.cache.system ? Promise.resolve(state.cache.system) : fetchJSON('/api/system');
+  p.then(function(sys) {
+    state.cache.system = sys;
+    var html = '<div class="page-header fade-in-up"><h1>' + esc(title) + '</h1><p>' + esc(subtitle) + '</p></div>';
+    var section = sys && sys[key];
+    var items = section ? (section.items || []) : [];
+    if (items.length) {
+      html += '<div class="cards-grid">';
+      items.forEach(function(item) {
+        var active = item.enabled !== false && item.active !== false;
+        html += '<div class="surface-card item-card fade-in-up"><div class="item-header"><span class="item-name">' + statusDot(active) + ' ' + esc(item.name) + '</span>' + badgeFor(item.category || item.type || '') + '</div><div class="item-hint">' + esc(item.hint || item.description || '') + '</div></div>';
+      });
+      html += '</div>';
+    } else {
+      html += '<div class="surface-panel">' + emptyState('No ' + title.toLowerCase() + ' registered') + '</div>';
+    }
+    setContent(el, html);
   });
 }
 
 function renderSecurity() {
-  if (!SYS) return;
-  var sec = SYS.security;
-  var el = document.getElementById('security-content');
-  el.innerHTML = '';
+  var el = document.getElementById('content');
+  setContent(el, '<div class="page-header fade-in-up"><h1>Security</h1><p>Autonomy levels, sandbox, and access control</p></div>' + loadingBlock());
 
-  var levels = document.createElement('div');
-  levels.className = 'grid grid-cols-1 md:grid-cols-3 gap-3 mb-4';
-  sec.levels.forEach(function(l) {
-    levels.appendChild(makeCard({
-      label: l.label,
-      enabled: l.active,
-      active: l.active,
-      hint: l.hint,
-    }));
+  var p = state.cache.system ? Promise.resolve(state.cache.system) : fetchJSON('/api/system');
+  p.then(function(sys) {
+    state.cache.system = sys;
+    var sec = sys && sys.security ? sys.security : {};
+    var html = '<div class="page-header fade-in-up"><h1>Security</h1><p>Autonomy levels, sandbox, and access control</p></div>';
+    html += '<div class="info-grid">';
+    html += infoBlock('Autonomy', 'var(--warning)', [
+      ['Level', sec.autonomy_level || '--'],
+      ['Mode', sec.mode || '--'],
+      ['Max Autonomy', sec.max_autonomy || '--']
+    ]);
+    html += infoBlock('Sandbox', 'var(--accent)', [
+      ['Enabled', sec.sandbox_enabled != null ? String(sec.sandbox_enabled) : '--'],
+      ['Type', sec.sandbox_type || '--'],
+      ['Isolation', sec.isolation || '--']
+    ]);
+    html += '</div>';
+    if (sec.auto_approve_list && sec.auto_approve_list.length) {
+      html += '<div class="surface-panel fade-in-up" style="margin-top:1rem"><h3 style="margin-bottom:.75rem;font-size:.9rem">Auto-Approve List</h3>';
+      html += '<div style="display:flex;flex-wrap:wrap;gap:.4rem">';
+      sec.auto_approve_list.forEach(function(a) {
+        html += '<span class="badge badge-accent">' + esc(a) + '</span>';
+      });
+      html += '</div></div>';
+    }
+    setContent(el, html);
   });
-  el.appendChild(levels);
-
-  var details = document.createElement('div');
-  details.className = 'bg-zc-card border border-zc-border rounded-xl p-4';
-  var wsOnly = sec.workspace_only ? 'Yes' : 'No';
-  var sandbox = sec.sandbox_enabled == null ? 'Auto' : (sec.sandbox_enabled ? 'Yes' : 'No');
-  var approved = sec.auto_approve && sec.auto_approve.length ? sec.auto_approve.join(', ') : 'None';
-  details.innerHTML =
-    '<h3 class="text-xs font-semibold text-white uppercase tracking-wider mb-3">Details</h3>' +
-    '<div class="grid grid-cols-2 gap-3 text-sm">' +
-      '<div><span class="text-gray-500">Workspace only:</span> <span class="text-white">' + wsOnly + '</span></div>' +
-      '<div><span class="text-gray-500">Sandbox:</span> <span class="text-white">' + sandbox + '</span></div>' +
-      '<div class="col-span-2"><span class="text-gray-500">Auto-approved tools:</span> <span class="text-white mono text-xs">' + approved + '</span></div>' +
-    '</div>';
-  el.appendChild(details);
 }
 
-async function loadSystem() {
-  try {
-    var r = await fetch(BASE + '/api/system');
-    SYS = await r.json();
-
-    setText('mem-active', SYS.memory.active);
-    setText('obs-active', SYS.observers.active);
-    setText('rt-active', SYS.runtimes.active);
-    setText('tun-active', SYS.tunnels.active);
-
-    renderProviders('all');
-    renderSingleSelect('memory-grid', SYS.memory.items);
-    renderSingleSelect('observers-grid', SYS.observers.items);
-    renderSingleSelect('runtimes-grid', SYS.runtimes.items);
-    renderSingleSelect('tunnels-grid', SYS.tunnels.items);
-    renderSecurity();
-    renderTools('all');
-  } catch(e) { console.error('System load error:', e); }
+function renderConfig() {
+  var el = document.getElementById('content');
+  setContent(el, '<div class="page-header fade-in-up"><h1>Configuration</h1><p>Current runtime configuration (read-only)</p></div>' + loadingBlock());
+  fetchJSON('/api/status').then(function(data) {
+    var html = '<div class="page-header fade-in-up"><h1>Configuration</h1><p>Current runtime configuration (read-only)</p></div>';
+    html += '<div class="surface-panel fade-in-up"><pre class="code-block">' + (data ? esc(JSON.stringify(data, null, 2)) : 'Unable to load configuration') + '</pre></div>';
+    setContent(el, html);
+  });
 }
 
-async function loadChannels() {
-  try {
-    var r = await fetch(BASE + '/api/channels');
-    var d = await r.json();
-    channelData = d.channels;
-    setText('ch-enabled', String(d.enabled));
-    setText('nav-channels-count', d.enabled + '/14');
-    renderChannels('all');
-  } catch(e) { console.error('Channels load error:', e); }
+function renderTablePage(endpoint, title, subtitle, columns) {
+  var el = document.getElementById('content');
+  setContent(el, '<div class="page-header fade-in-up"><h1>' + esc(title) + '</h1><p>' + esc(subtitle) + '</p></div>' + loadingBlock());
+  fetchJSON(endpoint).then(function(data) {
+    var items = data ? (Array.isArray(data) ? data : (data.items || [])) : [];
+    var html = '<div class="page-header fade-in-up"><h1>' + esc(title) + '</h1><p>' + esc(subtitle) + '</p></div>';
+    html += '<div class="surface-panel fade-in-up">';
+    if (items.length) {
+      html += '<table class="data-table"><thead><tr>';
+      columns.forEach(function(c) { html += '<th>' + esc(c.label) + '</th>'; });
+      html += '</tr></thead><tbody>';
+      items.forEach(function(item) {
+        html += '<tr>';
+        columns.forEach(function(c) {
+          var v = item[c.key];
+          if (c.type === 'badge') html += '<td>' + badgeFor(v) + '</td>';
+          else if (c.type === 'time') html += '<td>' + esc(fmtTime(v)) + '</td>';
+          else html += '<td>' + esc(v != null ? String(v) : '') + '</td>';
+        });
+        html += '</tr>';
+      });
+      html += '</tbody></table>';
+    } else {
+      html += emptyState('No ' + title.toLowerCase() + ' found');
+    }
+    html += '</div>';
+    setContent(el, html);
+  });
 }
 
-async function loadStatus() {
-  try {
-    var r = await fetch(BASE + '/api/status');
-    var d = await r.json();
-    setText('ov-provider', d.provider || 'none');
-    setText('ov-model', d.model || 'none');
-    setText('ov-channels', String(d.channels_count));
-    setText('ov-channels-list', d.channels.join(', ') || 'none');
-    setText('ov-memory', d.memory_backend);
-    setText('ov-runtime', 'Runtime: native');
-    setText('ov-security', d.security.autonomy_level);
-    setText('ov-sandbox', 'Sandbox: ' + (d.security.sandbox_enabled == null ? 'auto' : d.security.sandbox_enabled));
+function renderApprovals() {
+  var el = document.getElementById('content');
+  setContent(el, '<div class="page-header fade-in-up"><h1>Approvals</h1><p>Pending action approvals</p></div>' + loadingBlock());
+  fetchJSON('/api/control/approvals').then(function(data) {
+    var items = data ? (Array.isArray(data) ? data : (data.items || [])) : [];
+    var html = '<div class="page-header fade-in-up"><h1>Approvals</h1><p>Pending action approvals</p></div>';
+    html += '<div class="surface-panel fade-in-up">';
+    if (items.length) {
+      html += '<table class="data-table"><thead><tr><th>ID</th><th>Action</th><th>Status</th><th>Time</th><th>Actions</th></tr></thead><tbody>';
+      items.forEach(function(a) {
+        var safeId = esc(a.id);
+        html += '<tr><td class="mono">' + safeId + '</td><td>' + esc(a.action || a.description || '') + '</td><td>' + badgeFor(a.status) + '</td><td>' + esc(fmtTime(a.created_at || a.timestamp)) + '</td><td>';
+        if (!a.status || a.status === 'pending') {
+          html += '<button class="btn btn-primary btn-sm" data-approval-id="' + safeId + '" data-approval-action="approve">Approve</button> ';
+          html += '<button class="btn btn-danger btn-sm" data-approval-id="' + safeId + '" data-approval-action="reject">Reject</button>';
+        } else {
+          html += '<span style="color:var(--text-muted);font-size:.75rem">Resolved</span>';
+        }
+        html += '</td></tr>';
+      });
+      html += '</tbody></table>';
+    } else {
+      html += emptyState('No approvals pending');
+    }
+    html += '</div>';
+    setContent(el, html);
 
-    var gw = document.getElementById('ov-gateway');
-    gw.innerHTML = '';
-    [['Host', d.gateway.host + ':' + d.gateway.port], ['Pairing', d.gateway.require_pairing ? 'Required' : 'Disabled'],
-     ['Identity', d.identity.format]].forEach(function(p) {
-      var div = document.createElement('div');
-      div.innerHTML = '<span class="text-gray-500">' + p[0] + ':</span> ' + (p[1] || '-');
-      gw.appendChild(div);
+    el.querySelectorAll('[data-approval-id]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var id = btn.getAttribute('data-approval-id');
+        var action = btn.getAttribute('data-approval-action');
+        fetch('/api/control/approvals/' + encodeURIComponent(id), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: action })
+        }).then(function() { renderApprovals(); }).catch(function() {});
+      });
     });
+  });
+}
 
-    var ag = document.getElementById('ov-agents');
-    ag.innerHTML = '';
-    if (!d.agents.length) { ag.textContent = 'No delegate agents configured'; }
-    else { d.agents.forEach(function(a) {
+function renderAudit() {
+  var el = document.getElementById('content');
+  setContent(el, '<div class="page-header fade-in-up"><h1>Audit Log</h1><p>Chronological system event log</p></div>' + loadingBlock());
+  fetchJSON('/api/control/audit').then(function(data) {
+    var items = data ? (Array.isArray(data) ? data : (data.items || [])) : [];
+    var html = '<div class="page-header fade-in-up"><h1>Audit Log</h1><p>Chronological system event log</p></div>';
+    html += '<div class="surface-panel fade-in-up">';
+    if (items.length) {
+      items.forEach(function(a) {
+        html += '<div class="activity-item"><span class="activity-time">' + esc(fmtTime(a.timestamp || a.created_at)) + '</span><span class="activity-text">' + esc(a.message || a.action || a.event || JSON.stringify(a)) + '</span></div>';
+      });
+    } else {
+      html += emptyState('No audit entries');
+    }
+    html += '</div>';
+    setContent(el, html);
+  });
+}
+
+function renderEvents() {
+  var el = document.getElementById('content');
+  var html = '<div class="page-header fade-in-up"><h1>Events</h1><p>Live event stream via SSE</p></div>';
+  html += '<div class="surface-panel fade-in-up"><div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.75rem"><span class="status-dot live" id="sseStatus"></span><span style="font-size:.8rem" id="sseLabel">Connecting...</span></div>';
+  html += '<div class="event-feed" id="eventFeed"></div></div>';
+  setContent(el, html);
+
+  var feed = document.getElementById('eventFeed');
+  var statusEl = document.getElementById('sseStatus');
+  var labelEl = document.getElementById('sseLabel');
+
+  if (state.eventSource) state.eventSource.close();
+  try {
+    state.eventSource = new EventSource('/api/control/events/stream');
+    state.eventSource.onopen = function() {
+      statusEl.className = 'status-dot live';
+      labelEl.textContent = 'Connected';
+    };
+    state.eventSource.onmessage = function(e) {
       var div = document.createElement('div');
-      div.className = 'flex items-center gap-2';
-      div.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-zc-green"></span>' + a;
-      ag.appendChild(div);
-    }); }
+      div.className = 'event-item';
+      div.textContent = '[' + new Date().toLocaleTimeString() + '] ' + e.data;
+      feed.insertBefore(div, feed.firstChild);
+      if (feed.children.length > 200) feed.removeChild(feed.lastChild);
+    };
+    state.eventSource.onerror = function() {
+      statusEl.className = 'status-dot offline';
+      labelEl.textContent = 'Disconnected';
+    };
   } catch(e) {
-    document.getElementById('status-dot').className = 'w-2 h-2 rounded-full bg-zc-red';
-    setText('status-text', 'Disconnected');
+    statusEl.className = 'status-dot offline';
+    labelEl.textContent = 'SSE not available';
   }
 }
 
-async function loadConfig() {
-  try {
-    var r = await fetch(BASE + '/api/config');
-    var d = await r.json();
-    setText('config-json', JSON.stringify(d, null, 2));
-  } catch(e) { setText('config-json', 'Error: ' + e.message); }
-}
+function renderConsciousness() {
+  var el = document.getElementById('content');
+  setContent(el, '<div class="page-header fade-in-up"><h1>Consciousness</h1><p>Phenomenal state, coherence, and neural dynamics</p></div>' + loadingBlock());
 
-async function loadMemories() {
-  try {
-    var r = await fetch(BASE + '/api/memories');
-    var d = await r.json();
-    setText('mem-count', String(d.count));
-    var container = document.getElementById('memory-list');
-    container.textContent = '';
-    if (!d.entries.length) { container.textContent = 'No memories stored yet'; return; }
-    d.entries.forEach(function(e) {
-      var card = document.createElement('div');
-      card.className = 'bg-zc-bg p-3 rounded-lg border border-zc-border';
-      card.innerHTML =
-        '<div class="flex justify-between items-center mb-1">' +
-          '<span class="text-xs font-semibold text-zc-accent mono">' + e.key + '</span>' +
-          '<span class="text-[10px] text-gray-600 uppercase tracking-wider">' + e.category + '</span>' +
-        '</div>' +
-        '<div class="text-xs text-gray-400 leading-relaxed">' + e.content + '</div>' +
-        '<div class="text-[10px] text-gray-600 mt-1.5 mono">' + e.timestamp + '</div>';
-      container.appendChild(card);
-    });
-  } catch(e) { document.getElementById('memory-list').textContent = 'Error: ' + e.message; }
-}
+  Promise.all([
+    fetchJSON('/api/consciousness'),
+    fetchJSON('/api/consciousness/state'),
+    fetchJSON('/api/consciousness/brain_scan')
+  ]).then(function(results) {
+    var cdata = results[0], cstate = results[1], bscan = results[2];
+    var c = cdata || cstate || {};
+    var html = '<div class="page-header fade-in-up"><h1>Consciousness</h1><p>Phenomenal state, coherence, and neural dynamics</p></div>';
 
-async function loadMetrics() {
-  try {
-    var r = await fetch(BASE + '/api/metrics');
-    var text = await r.text();
-    setText('metrics-raw', text);
-  } catch(e) { setText('metrics-raw', 'Error: ' + e.message); }
-}
+    html += '<div class="consciousness-grid">';
 
-loadSystem();
-loadChannels();
-loadStatus();
-setInterval(loadStatus, 15000);
-
-var AUTH_TOKEN = localStorage.getItem('zc_token') || '';
-
-function toast(msg, type) {
-  var t = document.createElement('div');
-  t.className = 'toast toast-' + (type || 'ok');
-  t.textContent = msg;
-  document.body.appendChild(t);
-  setTimeout(function() { t.remove(); }, 4000);
-}
-
-async function adminPost(path, body) {
-  try {
-    var r = await fetch(BASE + '/api/admin/' + path, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + AUTH_TOKEN },
-      body: JSON.stringify(body),
-    });
-    var d = await r.json();
-    if (!r.ok) { toast(d.error || 'Error', 'err'); return null; }
-    if (d.restart_required) toast('Saved. Restart daemon to apply changes.', 'warn');
-    else toast('Saved successfully', 'ok');
-    loadSystem(); loadChannels(); loadStatus();
-    return d;
-  } catch(e) { toast('Network error: ' + e.message, 'err'); return null; }
-}
-
-function closeModal() {
-  var m = document.querySelector('.modal-bg');
-  if (m) m.remove();
-}
-
-function createModal(title, html) {
-  closeModal();
-  var bg = document.createElement('div');
-  bg.className = 'modal-bg';
-  bg.onclick = function(e) { if (e.target === bg) closeModal(); };
-  bg.innerHTML = '<div class="modal-box"><div class="flex items-center justify-between mb-4"><h2 class="text-base font-semibold text-white">' + title + '</h2><button onclick="closeModal()" class="text-gray-500 hover:text-white text-lg">&times;</button></div>' + html + '</div>';
-  document.body.appendChild(bg);
-}
-
-function showProviderModal() {
-  if (!SYS) return;
-  var options = SYS.providers.items.filter(function(p) { return p.enabled; }).map(function(p) { return p.name; });
-  var html = '<div class="space-y-3"><div><label class="text-xs text-gray-500 block mb-1">Provider</label><select id="m-provider" class="admin-input">' +
-    options.map(function(o) { return '<option value="' + o + '"' + (SYS.providers.active === o ? ' selected' : '') + '>' + o + '</option>'; }).join('') +
-    '</select></div>' +
-    '<div><label class="text-xs text-gray-500 block mb-1">Model (optional)</label><input id="m-model" class="admin-input" placeholder="e.g. gpt-4o"></div>' +
-    '<div class="flex gap-2 mt-4"><button onclick="doSetProvider()" class="admin-btn flex-1">Save</button><button onclick="closeModal()" class="admin-btn flex-1" style="opacity:0.5">Cancel</button></div></div>';
-  createModal('Set Default Provider', html);
-}
-
-function doSetProvider() {
-  var p = document.getElementById('m-provider').value;
-  var m = document.getElementById('m-model').value;
-  var body = { provider: p };
-  if (m) body.model = m;
-  adminPost('provider', body);
-  closeModal();
-}
-
-function showChannelModal(name) {
-  var channels = ['telegram','discord','slack','whatsapp','webhook','matrix','mattermost','signal','email','irc','imessage','lark'];
-  var html = '<div class="space-y-3"><div><label class="text-xs text-gray-500 block mb-1">Channel</label><select id="m-chan-name" class="admin-input" onchange="updateChannelFields()">' +
-    channels.map(function(c) { return '<option value="' + c + '"' + (name === c ? ' selected' : '') + '>' + c + '</option>'; }).join('') +
-    '</select></div>' +
-    '<div id="m-chan-fields"></div>' +
-    '<div class="flex gap-2 mt-4"><button onclick="doSetChannel()" class="admin-btn flex-1">Save</button><button onclick="doDeleteChannel()" class="admin-btn admin-btn-red flex-1">Remove</button><button onclick="closeModal()" class="admin-btn flex-1" style="opacity:0.5">Cancel</button></div></div>';
-  createModal('Configure Channel', html);
-  updateChannelFields();
-}
-
-var CHAN_FIELDS = {
-  telegram: [{k:'bot_token',l:'Bot Token',r:true},{k:'allowed_users',l:'Allowed Users (comma-sep)',r:false}],
-  discord: [{k:'bot_token',l:'Bot Token',r:true},{k:'allowed_users',l:'Allowed Users (comma-sep)',r:false}],
-  slack: [{k:'bot_token',l:'Bot Token',r:true},{k:'app_token',l:'App Token',r:true},{k:'allowed_users',l:'Allowed Users (comma-sep)',r:false}],
-  whatsapp: [{k:'phone_number_id',l:'Phone Number ID',r:true},{k:'access_token',l:'Access Token',r:true},{k:'verify_token',l:'Verify Token',r:false}],
-  webhook: [{k:'url',l:'Webhook URL',r:true},{k:'secret',l:'Secret',r:false}],
-  matrix: [{k:'homeserver_url',l:'Homeserver URL',r:true},{k:'access_token',l:'Access Token',r:true}],
-  mattermost: [{k:'url',l:'Server URL',r:true},{k:'token',l:'Bot Token',r:true}],
-  signal: [{k:'phone_number',l:'Phone Number',r:true},{k:'signal_cli_path',l:'Signal CLI Path',r:false}],
-  email: [{k:'imap_host',l:'IMAP Host',r:true},{k:'smtp_host',l:'SMTP Host',r:true},{k:'username',l:'Username',r:true},{k:'password',l:'Password',r:true}],
-  irc: [{k:'server',l:'Server',r:true},{k:'nickname',l:'Nickname',r:true},{k:'channels',l:'Channels (comma-sep)',r:true}],
-  imessage: [{k:'applescript_bridge',l:'AppleScript Bridge',r:false}],
-  lark: [{k:'app_id',l:'App ID',r:true},{k:'app_secret',l:'App Secret',r:true}],
-};
-
-function updateChannelFields() {
-  var name = document.getElementById('m-chan-name').value;
-  var fields = CHAN_FIELDS[name] || [];
-  var container = document.getElementById('m-chan-fields');
-  container.innerHTML = fields.map(function(f) {
-    return '<div class="mt-2"><label class="text-xs text-gray-500 block mb-1">' + f.l + (f.r ? ' *' : '') + '</label>' +
-      '<input id="m-cf-' + f.k + '" class="admin-input" placeholder="' + f.l + '"></div>';
-  }).join('');
-}
-
-function doSetChannel() {
-  var name = document.getElementById('m-chan-name').value;
-  var fields = CHAN_FIELDS[name] || [];
-  var body = {};
-  fields.forEach(function(f) {
-    var el = document.getElementById('m-cf-' + f.k);
-    if (el && el.value) body[f.k] = el.value;
-  });
-  adminPost('channel/' + name, body);
-  closeModal();
-}
-
-function doDeleteChannel() {
-  var name = document.getElementById('m-chan-name').value;
-  if (!confirm('Remove channel ' + name + '?')) return;
-  adminPost('channel/' + name + '/delete', {});
-  closeModal();
-}
-
-function showSelectModal(endpoint, key, options) {
-  var html = '<div class="space-y-2">' +
-    options.map(function(o) {
-      return '<div onclick="doSelect(\'' + endpoint + '\',\'' + key + '\',\'' + o + '\')" class="radio-card bg-zc-card border border-zc-border rounded-lg p-3 flex items-center gap-3">' +
-        '<span class="text-sm text-white font-medium">' + o + '</span></div>';
-    }).join('') +
-    '<div class="mt-3"><button onclick="closeModal()" class="admin-btn w-full" style="opacity:0.5">Cancel</button></div></div>';
-  createModal('Select ' + key.charAt(0).toUpperCase() + key.slice(1), html);
-}
-
-function doSelect(endpoint, key, value) {
-  var body = {};
-  body[key] = value;
-  adminPost(endpoint, body);
-  closeModal();
-}
-
-function showSecurityModal() {
-  if (!SYS) return;
-  var sec = SYS.security;
-  var curLevel = sec.levels.find(function(l) { return l.active; });
-  var curName = curLevel ? curLevel.label : 'Supervised';
-  var html = '<div class="space-y-3">' +
-    '<div><label class="text-xs text-gray-500 block mb-1">Autonomy Level</label><select id="m-sec-level" class="admin-input">' +
-      '<option value="readonly"' + (curName==='ReadOnly'?' selected':'') + '>ReadOnly</option>' +
-      '<option value="supervised"' + (curName==='Supervised'?' selected':'') + '>Supervised</option>' +
-      '<option value="full"' + (curName==='Full'?' selected':'') + '>Full</option>' +
-    '</select></div>' +
-    '<div><label class="text-xs text-gray-500 block mb-1">Workspace Only</label><select id="m-sec-ws" class="admin-input">' +
-      '<option value="true"' + (sec.workspace_only?' selected':'') + '>Yes</option>' +
-      '<option value="false"' + (!sec.workspace_only?' selected':'') + '>No</option>' +
-    '</select></div>' +
-    '<div><label class="text-xs text-gray-500 block mb-1">Auto-Approve Tools (comma-sep)</label>' +
-      '<input id="m-sec-approve" class="admin-input" value="' + (sec.auto_approve||[]).join(', ') + '"></div>' +
-    '<div class="flex gap-2 mt-4"><button onclick="doSetSecurity()" class="admin-btn flex-1">Save</button><button onclick="closeModal()" class="admin-btn flex-1" style="opacity:0.5">Cancel</button></div></div>';
-  createModal('Security Configuration', html);
-}
-
-function doSetSecurity() {
-  var level = document.getElementById('m-sec-level').value;
-  var ws = document.getElementById('m-sec-ws').value === 'true';
-  var approveStr = document.getElementById('m-sec-approve').value;
-  var approve = approveStr ? approveStr.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
-  adminPost('security', { level: level, workspace_only: ws, auto_approve: approve });
-  closeModal();
-}
-
-function showTokenModal() {
-  createModal('Set Auth Token', '<div class="space-y-3"><p class="text-xs text-gray-400">Enter your bearer token from pairing to enable admin actions.</p><input id="m-token" class="admin-input" type="password" placeholder="Bearer token" value="' + AUTH_TOKEN + '"><div class="flex gap-2 mt-4"><button onclick="doSetToken()" class="admin-btn flex-1">Save</button><button onclick="closeModal()" class="admin-btn flex-1" style="opacity:0.5">Cancel</button></div></div>');
-}
-
-function doSetToken() {
-  AUTH_TOKEN = document.getElementById('m-token').value;
-  localStorage.setItem('zc_token', AUTH_TOKEN);
-  toast('Token saved', 'ok');
-  closeModal();
-}
-
-var currentBotId = null;
-var sseSource = null;
-
-var CMD_STATUS_COLORS = {
-  pending: 'bg-zc-amber/15 text-zc-amber',
-  pending_approval: 'bg-zc-purple/15 text-zc-purple',
-  approved: 'bg-zc-accent/15 text-zc-accent',
-  acked: 'bg-zc-green/15 text-zc-green',
-  running: 'bg-zc-cyan/15 text-zc-cyan',
-  failed: 'bg-zc-red/15 text-zc-red',
-  rejected: 'bg-zc-red/15 text-zc-red',
-};
-
-var BOT_STATUS_COLORS = {
-  online: 'bg-zc-green/15 text-zc-green border-zc-green/30',
-  offline: 'bg-gray-700/40 text-gray-400 border-gray-600',
-  unknown: 'bg-zc-amber/15 text-zc-amber border-zc-amber/30',
-  degraded: 'bg-zc-red/15 text-zc-red border-zc-red/30',
-};
-
-function controlFetch(path) {
-  var headers = {'Content-Type':'application/json'};
-  if (AUTH_TOKEN) headers['Authorization'] = 'Bearer ' + AUTH_TOKEN;
-  return fetch(BASE + '/api/control/' + path, {headers:headers}).then(function(r){return r.json();});
-}
-
-function controlPost(path, body) {
-  var headers = {'Content-Type':'application/json'};
-  if (AUTH_TOKEN) headers['Authorization'] = 'Bearer ' + AUTH_TOKEN;
-  return fetch(BASE + '/api/control/' + path, {method:'POST',headers:headers,body:JSON.stringify(body)}).then(function(r){return r.json();});
-}
-
-function esc(s) { var d=document.createElement('span'); d.textContent=s; return d.innerHTML; }
-
-function loadBots() {
-  controlFetch('bots').then(function(data) {
-    var grid = document.getElementById('bots-grid');
-    if (!data.bots || !data.bots.length) { grid.textContent='No bots registered. Bots self-register via heartbeat.'; return; }
-    var el = document.getElementById('nav-bots-count');
-    if (el) el.textContent = data.bots.length;
-    grid.textContent = '';
-    data.bots.forEach(function(b) {
-      var sc = BOT_STATUS_COLORS[b.status] || BOT_STATUS_COLORS.unknown;
-      var uptimeStr = b.uptime_secs > 3600 ? Math.floor(b.uptime_secs/3600)+'h' : b.uptime_secs > 60 ? Math.floor(b.uptime_secs/60)+'m' : b.uptime_secs+'s';
-      var card = document.createElement('div');
-      card.className = 'card bg-zc-card border border-zc-border rounded-xl p-4 cursor-pointer fade-in';
-      card.onclick = function(){showBotDetail(b.id);};
-      card.innerHTML =
-        '<div class="flex items-start justify-between mb-2">' +
-          '<div><div class="text-sm font-semibold text-white">'+esc(b.name)+'</div><div class="text-[10px] text-gray-500 mono mt-0.5">'+esc(b.id.substring(0,8))+'...</div></div>' +
-          '<span class="badge '+sc+' px-2 py-0.5 rounded-full border font-medium uppercase">'+esc(b.status)+'</span>' +
-        '</div>' +
-        '<div class="grid grid-cols-2 gap-2 mt-3 text-[11px]">' +
-          '<div><span class="text-gray-500">Host</span><div class="text-gray-300 mono">'+esc(b.host+':'+b.port)+'</div></div>' +
-          '<div><span class="text-gray-500">Version</span><div class="text-gray-300 mono">'+esc(b.version)+'</div></div>' +
-          '<div><span class="text-gray-500">Uptime</span><div class="text-gray-300">'+esc(uptimeStr)+'</div></div>' +
-          '<div><span class="text-gray-500">Provider</span><div class="text-gray-300">'+esc(b.provider)+'</div></div>' +
-        '</div>';
-      grid.appendChild(card);
-    });
-  });
-}
-
-function showBotDetail(botId) {
-  currentBotId = botId;
-  controlFetch('bots/'+encodeURIComponent(botId)).then(function(data) {
-    var b = data.bot;
-    if (!b) { toast('Bot not found','err'); return; }
-    setText('bot-detail-name', b.name);
-    var sc = BOT_STATUS_COLORS[b.status] || BOT_STATUS_COLORS.unknown;
-    var statusEl = document.getElementById('bot-detail-status');
-    statusEl.className = 'badge px-2 py-0.5 rounded-full border font-medium uppercase ' + sc;
-    statusEl.textContent = b.status;
-    setText('bot-detail-host', b.host+':'+b.port);
-    setText('bot-detail-version', b.version);
-    var uptimeStr = b.uptime_secs > 3600 ? Math.floor(b.uptime_secs/3600)+'h '+Math.floor((b.uptime_secs%3600)/60)+'m' : Math.floor(b.uptime_secs/60)+'m';
-    setText('bot-detail-uptime', uptimeStr);
-    setText('bot-detail-hb', b.last_heartbeat || 'Never');
-
-    var cmdEl = document.getElementById('bot-detail-commands');
-    cmdEl.textContent = '';
-    if (data.commands && data.commands.length) {
-      data.commands.forEach(function(c) {
-        var cc = CMD_STATUS_COLORS[c.status] || '';
-        var row = document.createElement('div');
-        row.className = 'flex items-center justify-between py-1.5 border-b border-zc-border';
-        row.innerHTML = '<div><span class="text-white font-medium">'+esc(c.kind)+'</span> <span class="'+cc+' badge px-1.5 py-0.5 rounded-full">'+esc(c.status)+'</span></div><div class="text-gray-500 text-[10px]">'+esc(c.created_at)+'</div>';
-        cmdEl.appendChild(row);
-      });
-    } else { cmdEl.textContent = 'No commands'; }
-
-    var evtEl = document.getElementById('bot-detail-events');
-    evtEl.textContent = '';
-    if (data.events && data.events.length) {
-      data.events.forEach(function(e) {
-        var row = document.createElement('div');
-        row.className = 'flex items-center justify-between py-1.5 border-b border-zc-border';
-        row.innerHTML = '<span class="text-white">'+esc(e.kind)+'</span><span class="text-gray-500 text-[10px]">'+esc(e.timestamp)+'</span>';
-        evtEl.appendChild(row);
-      });
-    } else { evtEl.textContent = 'No events'; }
-
-    showSection('bot-detail');
-  });
-}
-
-function doDeleteBot() {
-  if (!currentBotId) return;
-  if (!confirm('Remove bot '+currentBotId+'?')) return;
-  controlPost('bots/'+encodeURIComponent(currentBotId)+'/delete', {}).then(function(d) {
-    if (d.ok) { toast('Bot removed','ok'); showSection('bots'); }
-    else toast(d.error||'Failed','err');
-  });
-}
-
-function showCommandModal() {
-  controlFetch('bots').then(function(data) {
-    var bots = (data.bots||[]);
-    var botOpts = bots.map(function(b){return '<option value="'+esc(b.id)+'">'+esc(b.name)+' ('+esc(b.id.substring(0,8))+')</option>';}).join('');
-    var kinds = ['reload_config','restart','stop','update_provider','update_channel','update_memory','update_security','run_agent','shell'];
-    var kindOpts = kinds.map(function(k){return '<option value="'+k+'">'+k+'</option>';}).join('');
-    var html = '<div class="space-y-3">' +
-      '<div><label class="text-xs text-gray-500 block mb-1">Target Bot</label><select id="m-cmd-bot" class="admin-input">'+botOpts+'</select></div>' +
-      '<div><label class="text-xs text-gray-500 block mb-1">Command Kind</label><select id="m-cmd-kind" class="admin-input">'+kindOpts+'</select></div>' +
-      '<div><label class="text-xs text-gray-500 block mb-1">Payload (JSON)</label><textarea id="m-cmd-payload" class="admin-input" rows="3" placeholder="{}">{}</textarea></div>' +
-      '<div class="flex gap-2 mt-4"><button onclick="doCreateCommand()" class="admin-btn flex-1">Send</button><button onclick="closeModal()" class="admin-btn flex-1" style="opacity:0.5">Cancel</button></div></div>';
-    createModal('New Command', html);
-  });
-}
-
-function showCommandModalFor() {
-  if (!currentBotId) return;
-  var kinds = ['reload_config','restart','stop','update_provider','update_channel','update_memory','update_security','run_agent','shell'];
-  var kindOpts = kinds.map(function(k){return '<option value="'+k+'">'+k+'</option>';}).join('');
-  var html = '<div class="space-y-3">' +
-    '<div><label class="text-xs text-gray-500 block mb-1">Command Kind</label><select id="m-cmd-kind" class="admin-input">'+kindOpts+'</select></div>' +
-    '<div><label class="text-xs text-gray-500 block mb-1">Payload (JSON)</label><textarea id="m-cmd-payload" class="admin-input" rows="3" placeholder="{}">{}</textarea></div>' +
-    '<div class="flex gap-2 mt-4"><button onclick="doCreateCommandFor()" class="admin-btn flex-1">Send</button><button onclick="closeModal()" class="admin-btn flex-1" style="opacity:0.5">Cancel</button></div></div>';
-  createModal('Command to Bot', html);
-}
-
-function doCreateCommand() {
-  var botId = document.getElementById('m-cmd-bot').value;
-  var kind = document.getElementById('m-cmd-kind').value;
-  var payload = document.getElementById('m-cmd-payload').value || '{}';
-  controlPost('commands/create', {bot_id:botId,kind:kind,payload:payload}).then(function(d) {
-    if (d.id) { toast('Command created: '+d.id.substring(0,8),'ok'); loadCommands(); }
-    else toast(d.error||'Failed','err');
-  });
-  closeModal();
-}
-
-function doCreateCommandFor() {
-  var kind = document.getElementById('m-cmd-kind').value;
-  var payload = document.getElementById('m-cmd-payload').value || '{}';
-  controlPost('commands/create', {bot_id:currentBotId,kind:kind,payload:payload}).then(function(d) {
-    if (d.id) { toast('Command created: '+d.id.substring(0,8),'ok'); }
-    else toast(d.error||'Failed','err');
-  });
-  closeModal();
-}
-
-function loadCommands() {
-  controlFetch('commands?limit=50').then(function(data) {
-    var tbody = document.getElementById('commands-tbody');
-    tbody.textContent = '';
-    if (!data.commands || !data.commands.length) {
-      var tr = document.createElement('tr');
-      var td = document.createElement('td');
-      td.colSpan = 6; td.className = 'px-4 py-3 text-gray-500'; td.textContent = 'No commands';
-      tr.appendChild(td); tbody.appendChild(tr); return;
+    var coherence = c.coherence != null ? c.coherence : (c.global_coherence != null ? c.global_coherence : null);
+    html += '<div class="surface-card fade-in-up" style="padding:1.25rem"><h3 style="font-size:.9rem;margin-bottom:.75rem">Coherence</h3>';
+    if (coherence != null) {
+      var pct = Math.round(Number(coherence) * 100);
+      var clr = pct > 70 ? 'var(--success)' : pct > 40 ? 'var(--warning)' : 'var(--danger)';
+      html += '<div style="font-size:2rem;font-weight:700;font-family:Sora;color:' + clr + '">' + esc(pct) + '%</div>';
+      html += '<div class="coherence-bar"><div class="coherence-fill" style="width:' + pct + '%;background:' + clr + '"></div></div>';
+    } else {
+      html += '<div style="color:var(--text-muted)">No coherence data</div>';
     }
-    data.commands.forEach(function(c) {
-      var cc = CMD_STATUS_COLORS[c.status] || '';
-      var res = c.result ? (c.result.length > 40 ? c.result.substring(0,40)+'...' : c.result) : '-';
-      var tr = document.createElement('tr');
-      tr.className = 'border-b border-zc-border hover:bg-white/[0.02]';
-      tr.innerHTML =
-        '<td class="px-4 py-2.5 mono text-gray-400">'+esc(c.id.substring(0,8))+'</td>' +
-        '<td class="px-4 py-2.5 mono text-gray-400">'+esc(c.bot_id.substring(0,8))+'</td>' +
-        '<td class="px-4 py-2.5 text-white font-medium">'+esc(c.kind)+'</td>' +
-        '<td class="px-4 py-2.5"><span class="badge '+cc+' px-2 py-0.5 rounded-full font-medium uppercase">'+esc(c.status)+'</span></td>' +
-        '<td class="px-4 py-2.5 text-gray-500">'+esc(c.created_at)+'</td>' +
-        '<td class="px-4 py-2.5 text-gray-400">'+esc(res)+'</td>';
-      tbody.appendChild(tr);
-    });
-  });
-}
+    html += '</div>';
 
-function loadApprovals() {
-  controlFetch('approvals?limit=50').then(function(data) {
-    var list = document.getElementById('approvals-list');
-    list.textContent = '';
-    if (!data.approvals || !data.approvals.length) { list.textContent = 'No pending approvals'; return; }
-    var pending = data.approvals.filter(function(a){return a.status==='pending';});
-    var countEl = document.getElementById('nav-approvals-count');
-    if (pending.length > 0) { countEl.textContent = pending.length; countEl.classList.remove('hidden'); }
-    else { countEl.classList.add('hidden'); }
-    data.approvals.forEach(function(a) {
-      var isPending = a.status === 'pending';
-      var statusColor = a.status === 'approved' ? 'text-zc-green' : a.status === 'rejected' ? 'text-zc-red' : 'text-zc-amber';
-      var card = document.createElement('div');
-      card.className = 'bg-zc-card border border-zc-border rounded-xl p-4 fade-in';
-      card.innerHTML =
-        '<div class="flex items-center justify-between">' +
-          '<div class="text-sm text-white font-medium">Command <span class="mono text-gray-400">'+esc(a.command_id.substring(0,8))+'</span></div>' +
-          '<span class="badge '+statusColor+' uppercase font-medium">'+esc(a.status)+'</span>' +
-        '</div>' +
-        '<div class="text-[11px] text-gray-500 mt-1">Reviewer: '+esc(a.reviewer||'none')+' | Reviewed: '+esc(a.reviewed_at||'pending')+'</div>' +
-        (a.reason ? '<div class="text-[11px] text-gray-400 mt-1">Reason: '+esc(a.reason)+'</div>' : '');
-      if (isPending) {
-        var actions = document.createElement('div');
-        actions.className = 'flex gap-2 mt-3';
-        var approveBtn = document.createElement('button');
-        approveBtn.className = 'admin-btn text-[11px] py-1';
-        approveBtn.textContent = 'Approve';
-        approveBtn.onclick = function(){doApprove(a.command_id);};
-        var rejectBtn = document.createElement('button');
-        rejectBtn.className = 'admin-btn admin-btn-red text-[11px] py-1';
-        rejectBtn.textContent = 'Reject';
-        rejectBtn.onclick = function(){doReject(a.command_id);};
-        actions.appendChild(approveBtn);
-        actions.appendChild(rejectBtn);
-        card.appendChild(actions);
+    html += '<div class="surface-card fade-in-up" style="padding:1.25rem"><h3 style="font-size:.9rem;margin-bottom:.75rem">Phenomenal State</h3>';
+    var phenomenal = c.phenomenal_state || c.state || null;
+    if (phenomenal) {
+      if (typeof phenomenal === 'object') {
+        Object.keys(phenomenal).forEach(function(k) {
+          html += '<div class="info-row"><span class="label">' + esc(k) + '</span><span class="value">' + esc(String(phenomenal[k])) + '</span></div>';
+        });
+      } else {
+        html += '<div style="font-size:1.1rem;font-weight:600">' + esc(String(phenomenal)) + '</div>';
       }
-      list.appendChild(card);
-    });
-  });
-}
-
-function doApprove(cmdId) {
-  controlPost('approvals/'+encodeURIComponent(cmdId), {action:'approve',reviewer:'admin'}).then(function(d) {
-    if (d.ok) { toast('Approved','ok'); loadApprovals(); }
-    else toast(d.error||'Failed','err');
-  });
-}
-
-function doReject(cmdId) {
-  var reason = prompt('Rejection reason (optional):');
-  controlPost('approvals/'+encodeURIComponent(cmdId), {action:'reject',reviewer:'admin',reason:reason||''}).then(function(d) {
-    if (d.ok) { toast('Rejected','ok'); loadApprovals(); }
-    else toast(d.error||'Failed','err');
-  });
-}
-
-function loadAudit() {
-  controlFetch('audit?limit=100').then(function(data) {
-    var tbody = document.getElementById('audit-tbody');
-    tbody.textContent = '';
-    if (!data.entries || !data.entries.length) {
-      var tr = document.createElement('tr');
-      var td = document.createElement('td');
-      td.colSpan = 5; td.className = 'px-4 py-3 text-gray-500'; td.textContent = 'No audit entries';
-      tr.appendChild(td); tbody.appendChild(tr); return;
+    } else {
+      html += '<div style="color:var(--text-muted)">No phenomenal state data</div>';
     }
-    data.entries.forEach(function(e) {
-      var tr = document.createElement('tr');
-      tr.className = 'border-b border-zc-border hover:bg-white/[0.02]';
-      tr.innerHTML =
-        '<td class="px-4 py-2.5 text-gray-500 mono text-[10px]">'+esc(e.timestamp)+'</td>' +
-        '<td class="px-4 py-2.5 text-white">'+esc(e.actor)+'</td>' +
-        '<td class="px-4 py-2.5"><span class="badge bg-zc-accent/15 text-zc-accent px-2 py-0.5 rounded-full">'+esc(e.action)+'</span></td>' +
-        '<td class="px-4 py-2.5 text-gray-400 mono">'+esc(e.target)+'</td>' +
-        '<td class="px-4 py-2.5 text-gray-500">'+esc(e.detail)+'</td>';
-      tbody.appendChild(tr);
-    });
+    html += '</div>';
+
+    html += '<div class="surface-card fade-in-up" style="padding:1.25rem"><h3 style="font-size:.9rem;margin-bottom:.75rem">Flow &amp; Wisdom</h3>';
+    html += '<div class="info-row"><span class="label">Flow State</span><span class="value">' + esc(c.flow_state || c.flow || '--') + '</span></div>';
+    html += '<div class="info-row"><span class="label">Wisdom Count</span><span class="value">' + esc(c.wisdom_count != null ? String(c.wisdom_count) : '--') + '</span></div>';
+    html += '<div class="info-row"><span class="label">Attention</span><span class="value">' + esc(c.attention || '--') + '</span></div>';
+    html += '</div>';
+
+    html += '<div class="surface-card fade-in-up" style="padding:1.25rem"><h3 style="font-size:.9rem;margin-bottom:.75rem">NCN Neuromodulatory</h3>';
+    var ncn = c.ncn || c.neuromodulatory || c.neurotransmitters || null;
+    if (ncn && typeof ncn === 'object') {
+      Object.keys(ncn).forEach(function(k) {
+        var val = Number(ncn[k]);
+        var npct = Math.round(val * 100);
+        html += '<div style="margin-bottom:.4rem"><div style="display:flex;justify-content:space-between;font-size:.75rem;margin-bottom:.15rem"><span>' + esc(k) + '</span><span>' + esc(npct) + '%</span></div>';
+        html += '<div class="coherence-bar"><div class="coherence-fill" style="width:' + npct + '%;background:var(--accent)"></div></div></div>';
+      });
+    } else {
+      html += '<div style="color:var(--text-muted)">No NCN data available</div>';
+    }
+    html += '</div>';
+
+    html += '<div class="surface-card fade-in-up" style="padding:1.25rem;grid-column:1/-1"><h3 style="font-size:.9rem;margin-bottom:.75rem">Brain Scan</h3>';
+    if (bscan) {
+      html += '<pre class="code-block">' + esc(JSON.stringify(bscan, null, 2)) + '</pre>';
+    } else {
+      html += '<div style="color:var(--text-muted)">No brain scan data available</div>';
+    }
+    html += '</div>';
+
+    html += '</div>';
+    setContent(el, html);
   });
 }
 
-function loadEvents() {
-  controlFetch('events?limit=50').then(function(data) {
-    var el = document.getElementById('events-stream');
-    el.textContent = '';
-    if (!data.events || !data.events.length) { el.textContent = 'No events yet'; return; }
-    data.events.forEach(function(e) {
-      var row = document.createElement('div');
-      row.className = 'flex items-center gap-3 py-1.5 border-b border-zc-border/50 text-xs fade-in';
-      row.innerHTML =
-        '<span class="text-gray-500 mono text-[10px] shrink-0">'+esc(e.timestamp)+'</span>' +
-        '<span class="text-gray-400 mono shrink-0">'+esc(e.bot_id.substring(0,8))+'</span>' +
-        '<span class="text-white font-medium">'+esc(e.kind)+'</span>' +
-        '<span class="text-gray-500 truncate">'+esc(e.payload)+'</span>';
-      el.appendChild(row);
-    });
-  });
+function renderPeripherals() {
+  var el = document.getElementById('content');
+  var html = '<div class="page-header fade-in-up"><h1>Peripherals</h1><p>Connected hardware peripherals</p></div>';
+  html += '<div class="surface-panel fade-in-up">' + emptyState('No peripherals connected') + '</div>';
+  setContent(el, html);
 }
 
-function toggleSSE() {
-  if (sseSource) {
-    sseSource.close(); sseSource = null;
-    document.getElementById('sse-status').textContent = 'Disconnected';
-    document.getElementById('sse-toggle').textContent = 'Connect';
-    document.getElementById('sse-toggle').className = 'text-xs bg-zc-green/15 text-zc-green px-3 py-1.5 rounded-lg hover:bg-zc-green/25 font-medium';
-    return;
+function renderPage() {
+  var page = state.currentPage;
+  switch (page) {
+    case 'overview': renderOverview(); break;
+    case 'channels': renderChannels(); break;
+    case 'providers': renderItemsPage('providers', 'Providers', 'AI model providers and backends'); break;
+    case 'tools': renderItemsPage('tools', 'Tools', 'Registered tool capabilities'); break;
+    case 'memory': renderItemsPage('memory', 'Memory', 'Memory backends and storage'); break;
+    case 'observers': renderItemsPage('observers', 'Observers', 'System observers and monitors'); break;
+    case 'runtimes': renderItemsPage('runtimes', 'Runtimes', 'Runtime adapters and engines'); break;
+    case 'tunnels': renderItemsPage('tunnels', 'Tunnels', 'Network tunnels and endpoints'); break;
+    case 'security': renderSecurity(); break;
+    case 'config': renderConfig(); break;
+    case 'bots': renderTablePage('/api/control/bots', 'Bots', 'Registered bot instances', [
+      { key: 'id', label: 'ID' }, { key: 'name', label: 'Name' }, { key: 'status', label: 'Status', type: 'badge' }, { key: 'created_at', label: 'Created', type: 'time' }
+    ]); break;
+    case 'commands': renderTablePage('/api/control/commands', 'Commands', 'Available control commands', [
+      { key: 'name', label: 'Name' }, { key: 'description', label: 'Description' }, { key: 'category', label: 'Category', type: 'badge' }
+    ]); break;
+    case 'approvals': renderApprovals(); break;
+    case 'audit': renderAudit(); break;
+    case 'events': renderEvents(); break;
+    case 'consciousness': renderConsciousness(); break;
+    case 'peripherals': renderPeripherals(); break;
+    default: renderOverview();
   }
-  var url = BASE + '/api/control/events/stream';
-  if (AUTH_TOKEN) url += '?token=' + encodeURIComponent(AUTH_TOKEN);
-  sseSource = new EventSource(url);
-  document.getElementById('sse-status').textContent = 'Connecting...';
-  sseSource.onopen = function() {
-    document.getElementById('sse-status').textContent = 'Connected';
-    document.getElementById('sse-toggle').textContent = 'Disconnect';
-    document.getElementById('sse-toggle').className = 'text-xs bg-zc-red/15 text-zc-red px-3 py-1.5 rounded-lg hover:bg-zc-red/25 font-medium';
-  };
-  sseSource.onmessage = function(ev) {
-    var el = document.getElementById('events-stream');
-    if (el.children.length === 0 || (el.children.length === 1 && el.firstChild.textContent === 'No events yet')) el.textContent = '';
-    var line = document.createElement('div');
-    line.className = 'flex items-center gap-3 py-1.5 border-b border-zc-border/50 text-xs fade-in';
-    var now = new Date().toISOString().substring(11,19);
-    var timeSpan = document.createElement('span');
-    timeSpan.className = 'text-gray-500 mono text-[10px] shrink-0';
-    timeSpan.textContent = now;
-    var msgSpan = document.createElement('span');
-    msgSpan.className = 'text-white';
-    msgSpan.textContent = ev.data;
-    line.appendChild(timeSpan);
-    line.appendChild(msgSpan);
-    el.insertBefore(line, el.firstChild);
-    if (el.children.length > 200) el.removeChild(el.lastChild);
-  };
-  sseSource.onerror = function() {
-    document.getElementById('sse-status').textContent = 'Error - retrying';
-  };
 }
-</script>
-<script>
-var oldNav = document.querySelector('nav .px-4.py-3.border-t');
-if (oldNav) {
-  var tokenBtn = document.createElement('button');
-  tokenBtn.className = 'text-[10px] text-gray-500 hover:text-zc-accent mt-1.5 block';
-  tokenBtn.textContent = 'Set Auth Token';
-  tokenBtn.onclick = showTokenModal;
-  oldNav.appendChild(tokenBtn);
+
+function closeMobile() {
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('overlay').classList.remove('open');
 }
+
+document.getElementById('hamburger').addEventListener('click', function() {
+  document.getElementById('sidebar').classList.toggle('open');
+  document.getElementById('overlay').classList.toggle('open');
+});
+document.getElementById('overlay').addEventListener('click', closeMobile);
+
+buildNav();
+renderPage();
+
+})();
 </script>
 </body>
-</html>"##;
+</html>
+</html>
+"##;
 
 const VALID_PROVIDERS: &[&str] = &[
     "openai",
@@ -2321,8 +1738,9 @@ mod tests {
 
     #[test]
     fn dashboard_html_is_valid_document() {
-        assert!(DASHBOARD_HTML.starts_with("<!DOCTYPE html>"));
-        assert!(DASHBOARD_HTML.ends_with("</html>"));
+        let html = DASHBOARD_HTML.trim();
+        assert!(html.starts_with("<!DOCTYPE html>"));
+        assert!(html.ends_with("</html>"));
         assert!(DASHBOARD_HTML.contains("<head>"));
         assert!(DASHBOARD_HTML.contains("</head>"));
         assert!(DASHBOARD_HTML.contains("<body"));
@@ -2332,7 +1750,7 @@ mod tests {
     #[test]
     fn dashboard_html_contains_zeroclaw_branding() {
         assert!(DASHBOARD_HTML.contains("ZeroClaw"));
-        assert!(DASHBOARD_HTML.contains("Admin Dashboard"));
+        assert!(DASHBOARD_HTML.contains("Dashboard"));
     }
 
     #[test]
@@ -2341,11 +1759,8 @@ mod tests {
             "/api/system",
             "/api/channels",
             "/api/status",
-            "/api/config",
-            "/api/memories",
-            "/api/metrics",
-            "/api/admin/",
             "/api/control/",
+            "/api/consciousness",
         ];
         for ep in &expected_endpoints {
             assert!(
@@ -2367,20 +1782,20 @@ mod tests {
             "runtimes",
             "security",
             "tunnels",
-            "memories",
             "config",
-            "metrics",
             "bots",
             "commands",
             "approvals",
             "audit",
             "events",
+            "consciousness",
+            "peripherals",
         ];
         for section in &nav_sections {
-            let section_id = format!("section-{section}");
+            let nav_id = format!("id: '{section}'");
             assert!(
-                DASHBOARD_HTML.contains(&section_id),
-                "Dashboard HTML missing section: {section_id}"
+                DASHBOARD_HTML.contains(&nav_id),
+                "Dashboard HTML missing nav section: {section}"
             );
         }
     }

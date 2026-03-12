@@ -20,6 +20,7 @@ pub struct StrategyAgent {
     priors: HashMap<String, f64>,
     min_edge: f64,
     ticks_since_prior_update: HashMap<String, u64>,
+    pending_tom_beliefs: Vec<crate::consciousness::traits::TheoryOfMindBelief>,
 }
 
 impl StrategyAgent {
@@ -37,6 +38,7 @@ impl StrategyAgent {
             priors: HashMap::new(),
             min_edge: 0.05,
             ticks_since_prior_update: HashMap::new(),
+            pending_tom_beliefs: Vec::new(),
         }
     }
 
@@ -81,6 +83,31 @@ impl StrategyAgent {
             return 0.0;
         }
         (edge / (1.0 - posterior)).clamp(0.0, 0.25)
+    }
+
+    fn wisdom_boost(state: &ConsciousnessState, action: &str) -> f64 {
+        let mut boost = 0.0_f64;
+        for entry in &state.wisdom_entries {
+            if entry.confidence >= 0.5 && action.contains(&entry.domain) {
+                boost += entry.confidence * 0.15;
+            }
+        }
+        boost.min(0.3)
+    }
+
+    fn somatic_risk_modifier(state: &ConsciousnessState) -> f64 {
+        let max_urgency = state
+            .homeostatic_drives
+            .iter()
+            .map(|d| d.urgency)
+            .fold(0.0_f64, f64::max);
+        let stress_markers = state
+            .somatic_markers
+            .iter()
+            .filter(|m| m.marker_type == "stress" || m.marker_type == "danger")
+            .map(|m| m.intensity)
+            .sum::<f64>();
+        (max_urgency * 0.3 + stress_markers * 0.2).min(0.5)
     }
 
     fn next_id(&mut self) -> u64 {
@@ -177,6 +204,7 @@ impl ConsciousnessAgent for StrategyAgent {
 
     fn deliberate(&mut self, proposals: &[Proposal], state: &ConsciousnessState) -> Vec<Verdict> {
         self.decay_stale_priors();
+        let somatic_penalty = Self::somatic_risk_modifier(state);
 
         proposals
             .iter()
@@ -187,15 +215,49 @@ impl ConsciousnessAgent for StrategyAgent {
                 let domain = Self::domain_for_action(&p.action);
                 let raw_edge = self.compute_edge(&domain, p.confidence);
                 let friction = 1.0 - state.coherence;
-                let net_edge = raw_edge - friction * 0.1;
+                let wisdom_boost = Self::wisdom_boost(state, &p.action);
+                let neuro = &state.neuromodulation;
+                let dopamine_boost = (neuro.dopamine - 0.5) * 0.1;
+                let cortisol_drag = neuro.cortisol * 0.15;
+                let net_edge = raw_edge - friction * 0.1 + wisdom_boost - somatic_penalty + dopamine_boost - cortisol_drag;
+
+                let cf_risk = {
+                    let mut cf = self.counterfactual.lock();
+                    let scenario = Scenario {
+                        id: format!("delib_{}", p.id),
+                        action: p.action.clone(),
+                        context: std::collections::HashMap::new(),
+                        created_at: Utc::now(),
+                    };
+                    let result = cf.simulate(&scenario);
+                    if result.confidence > 0.0 {
+                        1.0 - result.confidence
+                    } else {
+                        0.0
+                    }
+                };
+                let adjusted_edge = net_edge - cf_risk * 0.2;
+
+                let calibration_factor = state
+                    .agent_calibration
+                    .iter()
+                    .find(|c| c.agent == p.source)
+                    .map(|c| {
+                        if c.total_predictions >= 5 {
+                            (1.0 - c.calibration_error).max(0.3)
+                        } else {
+                            1.0
+                        }
+                    })
+                    .unwrap_or(1.0);
 
                 let (kind, confidence) = if decision.score < 0.0 {
                     (VerdictKind::Reject, (decision.score.abs()).min(1.0))
-                } else if net_edge >= self.min_edge {
+                } else if adjusted_edge >= self.min_edge {
                     let posterior = self.get_prior(&domain);
-                    let kelly = Self::kelly_fraction(net_edge, posterior);
+                    let kelly = Self::kelly_fraction(adjusted_edge, posterior);
                     let base_conf = (decision.score.abs()).min(1.0);
-                    (VerdictKind::Approve, base_conf * (0.5 + kelly * 2.0).min(1.0))
+                    (VerdictKind::Approve, (base_conf * (0.5 + kelly * 2.0) * calibration_factor + wisdom_boost).min(1.0))
                 } else {
                     (
                         VerdictKind::Reject,
@@ -210,7 +272,7 @@ impl ConsciousnessAgent for StrategyAgent {
                     confidence,
                     objection: if kind == VerdictKind::Reject {
                         Some(format!(
-                            "net_edge={net_edge:.3} below min_edge={:.3} (policy={:.2}, friction={friction:.2})",
+                            "edge={adjusted_edge:.3} min={:.3} (policy={:.2}, wisdom={wisdom_boost:.2}, somatic={somatic_penalty:.2}, cf_risk={cf_risk:.2})",
                             self.min_edge, decision.score
                         ))
                     } else {
@@ -277,6 +339,28 @@ impl ConsciousnessAgent for StrategyAgent {
         }
 
         self.goals.truncate(5);
+
+        self.pending_tom_beliefs.clear();
+        for cal in &state.agent_calibration {
+            if cal.total_predictions >= 3 {
+                let belief = if cal.calibration_error < 0.2 {
+                    format!("{:?} is well-calibrated (error={:.2})", cal.agent, cal.calibration_error)
+                } else {
+                    format!("{:?} is poorly calibrated (error={:.2}), discount its predictions", cal.agent, cal.calibration_error)
+                };
+                self.pending_tom_beliefs.push(
+                    crate::consciousness::traits::TheoryOfMindBelief {
+                        about_agent: cal.agent,
+                        belief,
+                        confidence: (1.0 - cal.calibration_error).max(0.1),
+                    },
+                );
+            }
+        }
+    }
+
+    fn theory_of_mind_beliefs(&self) -> Vec<crate::consciousness::traits::TheoryOfMindBelief> {
+        self.pending_tom_beliefs.clone()
     }
 }
 

@@ -568,6 +568,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // Build router with middleware
     let app = Router::new()
+        .route("/", get(dashboard::handle_dashboard))
+        .route("/api/status", get(dashboard::handle_api_status))
+        .route("/api/channels", get(dashboard::handle_api_channels))
+        .route("/api/system", get(dashboard::handle_api_system))
+        .route("/api/control/bots", get(crate::control::handlers::handle_bots_list))
+        .route("/api/control/commands", get(crate::control::handlers::handle_commands_list))
+        .route("/api/control/approvals", get(crate::control::handlers::handle_approvals_list))
+        .route("/api/control/approvals/{id}", post(crate::control::handlers::handle_approval_action))
+        .route("/api/control/audit", get(crate::control::handlers::handle_audit_log))
+        .route("/api/control/events/stream", get(crate::control::handlers::handle_events_stream))
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))

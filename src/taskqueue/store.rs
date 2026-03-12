@@ -459,4 +459,104 @@ mod tests {
         assert_eq!(TaskPriority::new(11).value(), 10);
         assert_eq!(TaskPriority::new(5).value(), 5);
     }
+
+    #[test]
+    fn dequeue_twice_returns_different_items() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let a = new_task_item("task_a", TaskPriority::new(5), TaskSource::User, vec![]);
+        let b = new_task_item("task_b", TaskPriority::new(5), TaskSource::User, vec![]);
+        enqueue(&config, &a).unwrap();
+        enqueue(&config, &b).unwrap();
+
+        let first = dequeue(&config).unwrap().unwrap();
+        let second = dequeue(&config).unwrap().unwrap();
+        assert_ne!(first.id, second.id);
+
+        assert!(dequeue(&config).unwrap().is_none());
+    }
+
+    #[test]
+    fn dependency_unblocks_after_completion() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let blocker = new_task_item("blocker", TaskPriority::new(5), TaskSource::User, vec![]);
+        let dependent = new_task_item(
+            "dependent",
+            TaskPriority::new(10),
+            TaskSource::User,
+            vec![blocker.id.clone()],
+        );
+        enqueue(&config, &blocker).unwrap();
+        enqueue(&config, &dependent).unwrap();
+
+        let first = dequeue(&config).unwrap().unwrap();
+        assert_eq!(first.task, "blocker");
+
+        assert!(dequeue(&config).unwrap().is_none());
+
+        complete(&config, &blocker.id, "done").unwrap();
+        let second = dequeue(&config).unwrap().unwrap();
+        assert_eq!(second.task, "dependent");
+    }
+
+    #[test]
+    fn fail_already_completed_task() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let item = new_task_item("task", TaskPriority::new(5), TaskSource::User, vec![]);
+        enqueue(&config, &item).unwrap();
+        complete(&config, &item.id, "done").unwrap();
+
+        let failed = fail(&config, &item.id, "late failure").unwrap();
+        assert_eq!(failed.status, TaskStatus::Failed);
+    }
+
+    #[test]
+    fn list_all_returns_every_status() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let a = new_task_item("pending", TaskPriority::new(5), TaskSource::User, vec![]);
+        let b = new_task_item(
+            "to_complete",
+            TaskPriority::new(5),
+            TaskSource::User,
+            vec![],
+        );
+        let c = new_task_item("to_fail", TaskPriority::new(5), TaskSource::User, vec![]);
+        enqueue(&config, &a).unwrap();
+        enqueue(&config, &b).unwrap();
+        enqueue(&config, &c).unwrap();
+        complete(&config, &b.id, "ok").unwrap();
+        fail(&config, &c.id, "err").unwrap();
+
+        let all = list(&config, None).unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn task_source_parse_roundtrip() {
+        assert_eq!(TaskSource::parse("user"), TaskSource::User);
+        assert_eq!(TaskSource::parse("goal_proposer"), TaskSource::GoalProposer);
+        assert_eq!(TaskSource::parse("health_check"), TaskSource::HealthCheck);
+        assert_eq!(
+            TaskSource::parse("consolidation"),
+            TaskSource::Consolidation
+        );
+        assert_eq!(TaskSource::parse("unknown_garbage"), TaskSource::User);
+    }
+
+    #[test]
+    fn task_status_parse_roundtrip() {
+        assert_eq!(TaskStatus::parse("pending"), TaskStatus::Pending);
+        assert_eq!(TaskStatus::parse("processing"), TaskStatus::Processing);
+        assert_eq!(TaskStatus::parse("completed"), TaskStatus::Completed);
+        assert_eq!(TaskStatus::parse("failed"), TaskStatus::Failed);
+        assert_eq!(TaskStatus::parse("COMPLETED"), TaskStatus::Completed);
+        assert_eq!(TaskStatus::parse("invalid"), TaskStatus::Pending);
+    }
 }

@@ -51,6 +51,7 @@ Runtime resolution order is:
 | `copilot` | `github-copilot` | No | (use config/`API_KEY` fallback with GitHub token) |
 | `lmstudio` | `lm-studio` | Yes | (optional; local by default) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
+| `tensorrt` | `trtllm` | Yes | `NVIDIA_API_KEY` (optional for local) |
 
 ### Kimi Code Notes
 
@@ -72,6 +73,23 @@ Recommended starter model IDs (verified against NVIDIA API catalog on February 1
 - `deepseek-ai/deepseek-v3.2`
 - `nvidia/llama-3.3-nemotron-super-49b-v1.5`
 - `nvidia/llama-3.1-nemotron-ultra-253b-v1`
+
+### TensorRT-LLM Notes
+
+- Canonical provider ID: `tensorrt`
+- Aliases: `trtllm`
+- Default endpoint: `http://localhost:8000/v1` (local `trtllm-serve`)
+- Reuses `OpenAiCompatibleProvider` — same chat completions API
+- Start server: `trtllm-serve serve <model> --host 0.0.0.0 --port 8000`
+
+### NVIDIA Tools (registered in `tools/mod.rs`)
+
+| Tool | Description |
+|------|-------------|
+| `nvidia_triton` | Triton Inference Server (KServe v2 REST) — tensor-based model inference |
+| `nvidia_vision` | NVIDIA Vision API via NIM — image analysis and captioning |
+| `nvidia_cosmos` | NVIDIA Cosmos world foundation model — scenario simulation |
+| `nvidia_speech` | NVIDIA Riva Speech via NIM — text-to-speech synthesis |
 
 ## Custom Endpoints
 

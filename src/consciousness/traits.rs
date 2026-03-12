@@ -64,6 +64,7 @@ pub struct TemporalNarrative {
     pub past_intentions: Vec<String>,
     pub current_intention: String,
     pub future_intentions: Vec<String>,
+    pub synthesis: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -193,6 +194,17 @@ pub struct ConsciousnessState {
     pub veto_records: Vec<VetoRecord>,
     pub wisdom_entries: Vec<super::wisdom::WisdomEntry>,
     pub theory_of_mind_beliefs: Vec<TheoryOfMindBelief>,
+    pub agent_calibration: Vec<AgentCalibration>,
+    pub neuromodulation: super::neuromodulation::NeuromodulatorState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentCalibration {
+    pub agent: AgentKind,
+    pub brier_score: f64,
+    pub calibration_error: f64,
+    pub win_rate: f64,
+    pub total_predictions: u64,
 }
 
 impl Default for ConsciousnessState {
@@ -214,6 +226,8 @@ impl Default for ConsciousnessState {
             veto_records: Vec::new(),
             wisdom_entries: Vec::new(),
             theory_of_mind_beliefs: Vec::new(),
+            agent_calibration: Vec::new(),
+            neuromodulation: super::neuromodulation::NeuromodulatorState::default(),
         }
     }
 }

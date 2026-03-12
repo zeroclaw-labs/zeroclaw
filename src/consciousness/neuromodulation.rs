@@ -97,10 +97,35 @@ impl NeuromodulationEngine {
         veto_count: usize,
         tick: u64,
     ) {
+        self.update_with_prediction(
+            phenomenal,
+            coherence,
+            success_rate,
+            contradiction_count,
+            veto_count,
+            tick,
+            0.0,
+        );
+    }
+
+    pub fn update_with_prediction(
+        &mut self,
+        phenomenal: &PhenomenalState,
+        coherence: f64,
+        success_rate: f64,
+        contradiction_count: usize,
+        veto_count: usize,
+        tick: u64,
+        prediction_error: f64,
+    ) {
+        let pe = prediction_error.clamp(0.0, 1.0);
+        let prediction_accuracy = 1.0 - pe;
+
         let reward_signal = success_rate * 2.0 - 1.0;
         self.state.dopamine = (self.state.dopamine * (1.0 - self.decay_rate)
-            + reward_signal.max(0.0) * 0.3
-            + phenomenal.valence.max(0.0) * 0.2)
+            + reward_signal.max(0.0) * 0.25
+            + phenomenal.valence.max(0.0) * 0.15
+            + prediction_accuracy * 0.1)
             .clamp(0.0, 1.0);
 
         self.state.serotonin = (self.state.serotonin * (1.0 - self.decay_rate)
@@ -115,9 +140,10 @@ impl NeuromodulationEngine {
             .clamp(0.0, 1.0);
 
         self.state.cortisol = (self.state.cortisol * (1.0 - self.decay_rate * 0.5)
-            + threat_signal * 0.3
+            + threat_signal * 0.25
             + (1.0 - coherence) * 0.15
-            + reward_signal.min(0.0).abs() * 0.1)
+            + reward_signal.min(0.0).abs() * 0.05
+            + pe * 0.1)
             .clamp(0.0, 1.0);
 
         self.ncn.precision =
@@ -175,6 +201,34 @@ impl NeuromodulationEngine {
         (self.state.cortisol * 0.6 + self.state.norepinephrine * 0.3 - self.state.serotonin * 0.3)
             .clamp(0.0, 1.0)
     }
+
+    pub fn apply_gpu_metrics(&mut self, metrics: &GpuMetrics) {
+        let utilization = metrics.gpu_utilization.clamp(0.0, 1.0);
+        let mem_pressure = metrics.memory_utilization.clamp(0.0, 1.0);
+        let thermal = (metrics.temperature_celsius / 100.0).clamp(0.0, 1.0);
+
+        self.state.norepinephrine =
+            (self.state.norepinephrine + utilization * 0.1 + thermal * 0.05).clamp(0.0, 1.0);
+
+        self.state.cortisol =
+            (self.state.cortisol + mem_pressure * 0.08 + (thermal - 0.7).max(0.0) * 0.15)
+                .clamp(0.0, 1.0);
+
+        self.state.dopamine =
+            (self.state.dopamine + utilization * 0.05 - mem_pressure * 0.03).clamp(0.0, 1.0);
+
+        self.ncn.gain = (self.ncn.gain + utilization * 0.05).clamp(0.0, 1.0);
+        self.ncn.precision = (self.ncn.precision - thermal * 0.03).clamp(0.0, 1.0);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct GpuMetrics {
+    pub gpu_utilization: f64,
+    pub memory_utilization: f64,
+    pub temperature_celsius: f64,
+    pub power_watts: f64,
+    pub clock_mhz: f64,
 }
 
 #[cfg(test)]
@@ -239,5 +293,64 @@ mod tests {
             engine.update(&p, 0.5, 0.5, 0, 0, i);
         }
         assert_eq!(engine.history().len(), 5);
+    }
+
+    #[test]
+    fn low_prediction_error_increases_dopamine() {
+        let mut engine = NeuromodulationEngine::new(100);
+        let initial_dopamine = engine.state().dopamine;
+        let phenomenal = PhenomenalState {
+            attention: 0.7,
+            arousal: 0.5,
+            valence: 0.6,
+            ..Default::default()
+        };
+        engine.update_with_prediction(&phenomenal, 0.8, 0.8, 0, 0, 1, 0.05);
+        assert!(
+            engine.state().dopamine > initial_dopamine,
+            "dopamine {} should exceed initial {}",
+            engine.state().dopamine,
+            initial_dopamine
+        );
+    }
+
+    #[test]
+    fn high_prediction_error_increases_cortisol() {
+        let mut engine = NeuromodulationEngine::new(100);
+        let initial_cortisol = engine.state().cortisol;
+        let phenomenal = PhenomenalState::default();
+        engine.update_with_prediction(&phenomenal, 0.5, 0.5, 0, 0, 1, 0.9);
+        assert!(
+            engine.state().cortisol > initial_cortisol,
+            "cortisol {} should exceed initial {}",
+            engine.state().cortisol,
+            initial_cortisol
+        );
+    }
+
+    #[test]
+    fn gpu_metrics_affect_neuromodulators() {
+        let mut engine = NeuromodulationEngine::new(100);
+        let initial = *engine.state();
+        let metrics = GpuMetrics {
+            gpu_utilization: 0.9,
+            memory_utilization: 0.8,
+            temperature_celsius: 85.0,
+            power_watts: 300.0,
+            clock_mhz: 1800.0,
+        };
+        engine.apply_gpu_metrics(&metrics);
+        assert!(engine.state().norepinephrine > initial.norepinephrine);
+        assert!(engine.state().cortisol > initial.cortisol);
+    }
+
+    #[test]
+    fn legacy_update_still_works() {
+        let mut engine = NeuromodulationEngine::new(100);
+        let phenomenal = PhenomenalState::default();
+        engine.update(&phenomenal, 0.5, 0.5, 0, 0, 1);
+        let s = engine.state();
+        assert!(s.dopamine > 0.0 && s.dopamine <= 1.0);
+        assert!(s.cortisol >= 0.0 && s.cortisol <= 1.0);
     }
 }

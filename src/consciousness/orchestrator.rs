@@ -70,6 +70,7 @@ pub struct ConsciousnessOrchestrator {
     neuromodulation: NeuromodulationEngine,
     prediction_ledger: PredictionMarketLedger,
     last_tick_payload: Option<serde_json::Value>,
+    world_model_prediction_error: f64,
 }
 
 impl ConsciousnessOrchestrator {
@@ -100,6 +101,7 @@ impl ConsciousnessOrchestrator {
             neuromodulation: NeuromodulationEngine::new(500),
             prediction_ledger: PredictionMarketLedger::new(1000),
             last_tick_payload: None,
+            world_model_prediction_error: 0.0,
         }
     }
 
@@ -117,6 +119,10 @@ impl ConsciousnessOrchestrator {
 
     pub fn metacognition(&self) -> &MetacognitiveEngine {
         &self.metacognition
+    }
+
+    pub fn set_world_model_prediction_error(&mut self, error: f64) {
+        self.world_model_prediction_error = error.clamp(0.0, 1.0);
     }
 
     pub fn config(&self) -> &ConsciousnessConfig {
@@ -259,6 +265,19 @@ impl ConsciousnessOrchestrator {
             }
         }
 
+        self.state.agent_calibration = self
+            .prediction_ledger
+            .leaderboard()
+            .into_iter()
+            .map(|perf| super::traits::AgentCalibration {
+                agent: perf.agent,
+                brier_score: perf.avg_brier_score,
+                calibration_error: perf.calibration_error,
+                win_rate: perf.win_rate,
+                total_predictions: perf.total_predictions,
+            })
+            .collect();
+
         self.publish_outcomes_to_bus(&outcomes);
 
         self.phase_reflect(&outcomes);
@@ -277,29 +296,44 @@ impl ConsciousnessOrchestrator {
                 total_valence += ps.valence;
             }
             let n = agent_count as f64;
-            let mut total_qc = 0.0;
-            let mut total_es = 0.0;
-            let mut total_se = 0.0;
-            for agent in &self.agents {
-                let ps = agent.phenomenal_state();
-                total_qc += ps.quantum_coherence;
-                total_es += ps.entanglement_strength;
-                total_se += ps.superposition_entropy;
-            }
+            let valence_values: Vec<f64> = self.agents.iter().map(|a| a.phenomenal_state().valence).collect();
+            let valence_mean = total_valence / n;
+            let valence_variance = if n > 1.0 {
+                valence_values.iter().map(|v| (v - valence_mean).powi(2)).sum::<f64>() / n
+            } else {
+                0.0
+            };
+
+            let quantum_coherence = self.state.coherence;
+
+            let entanglement_strength = if n > 1.0 {
+                (1.0 - valence_variance.sqrt()).max(0.0)
+            } else {
+                0.0
+            };
+
+            let superposition_entropy = if outcomes.is_empty() {
+                0.5
+            } else {
+                let approve_rate = outcomes.iter().filter(|o| o.success).count() as f64 / outcomes.len() as f64;
+                let p = approve_rate.clamp(0.01, 0.99);
+                -(p * p.ln() + (1.0 - p) * (1.0 - p).ln()).min(1.0)
+            };
+
             PhenomenalState {
                 attention: total_attention / n,
                 arousal: total_arousal / n,
-                valence: total_valence / n,
-                quantum_coherence: total_qc / n,
-                entanglement_strength: total_es / n,
-                superposition_entropy: total_se / n,
+                valence: valence_mean,
+                quantum_coherence,
+                entanglement_strength,
+                superposition_entropy,
             }
         } else {
             PhenomenalState::default()
         };
         self.state.phenomenal = aggregate_phenomenal;
 
-        self.neuromodulation.update(
+        self.neuromodulation.update_with_prediction(
             &self.state.phenomenal,
             self.state.coherence,
             {
@@ -313,9 +347,12 @@ impl ConsciousnessOrchestrator {
             contradictions.len(),
             vetoed,
             self.state.tick_count,
+            self.world_model_prediction_error,
         );
         self.neuromodulation
             .modulate_phenomenal(&mut self.state.phenomenal);
+
+        self.state.neuromodulation = *self.neuromodulation.state();
 
         for agent in &mut self.agents {
             agent.update_phenomenal(&outcomes, &self.state);
@@ -370,7 +407,15 @@ impl ConsciousnessOrchestrator {
         if self.state.tick_count.is_multiple_of(10) {
             let all_patterns = self.dream.consolidate();
             self.wisdom.extract_wisdom(&all_patterns);
-            self.narrative_engine.synthesize();
+            self.state.narrative.synthesis = self.narrative_engine.synthesize();
+
+            for pattern in &all_patterns {
+                self.bus.send(BusMessage::broadcast(
+                    AgentKind::Chairman,
+                    "dream_pattern",
+                    serde_json::json!({ "pattern": pattern }),
+                ));
+            }
         }
 
         self.state.wisdom_entries = self.wisdom.entries().to_vec();
