@@ -208,7 +208,7 @@ Example sample (macOS arm64, measured on February 18, 2026):
 Or skip the steps above and install everything (system deps, Rust, ZeroClaw) in a single command:
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/install.sh | bash
+curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
 #### Compilation resource requirements
@@ -281,7 +281,7 @@ ZEROCLAW_CONTAINER_CLI=podman ./install.sh --docker
 Remote one-liner (review first in security-sensitive environments):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
 Details: [`docs/setup-guides/one-click-bootstrap.md`](docs/setup-guides/one-click-bootstrap.md) (toolchain mode may request `sudo` for system packages).
