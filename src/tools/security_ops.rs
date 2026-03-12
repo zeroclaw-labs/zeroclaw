@@ -60,11 +60,14 @@ impl SecurityOpsTool {
                 severity_level(severity) >= severity_level(&pb.severity_filter)
                     && (pb.name.contains(alert_type)
                         || alert_type.contains(&pb.name)
-                        || description.to_lowercase().contains(&pb.name.replace('_', " ")))
+                        || description
+                            .to_lowercase()
+                            .contains(&pb.name.replace('_', " ")))
             })
             .collect();
 
-        let playbook_names: Vec<&str> = matching_playbooks.iter().map(|p| p.name.as_str()).collect();
+        let playbook_names: Vec<&str> =
+            matching_playbooks.iter().map(|p| p.name.as_str()).collect();
 
         let output = json!({
             "classification": {
@@ -97,11 +100,12 @@ impl SecurityOpsTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required 'playbook' parameter"))?;
 
-        let step_index = args
-            .get("step")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("Missing required 'step' parameter (0-based index)"))?
-            as usize;
+        let step_index = usize::try_from(
+            args.get("step").and_then(|v| v.as_u64()).ok_or_else(|| {
+                anyhow::anyhow!("Missing required 'step' parameter (0-based index)")
+            })?,
+        )
+        .map_err(|_| anyhow::anyhow!("'step' parameter value too large for this platform"))?;
 
         let alert_severity = args
             .get("alert_severity")
@@ -298,6 +302,9 @@ impl SecurityOpsTool {
             0.0
         };
 
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let avg_resolution_secs_u64 = avg_resolution.max(0.0) as u64;
+
         let output = json!({
             "total_alerts": total,
             "resolved": resolved_count,
@@ -305,7 +312,7 @@ impl SecurityOpsTool {
             "by_severity": by_severity,
             "by_category": by_category,
             "avg_resolution_secs": avg_resolution,
-            "avg_resolution_human": format_duration_secs(avg_resolution as u64),
+            "avg_resolution_human": format_duration_secs(avg_resolution_secs_u64),
         });
 
         Ok(ToolResult {
@@ -638,10 +645,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_action_returns_error() {
         let tool = test_tool();
-        let result = tool
-            .execute(json!({"action": "bad_action"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"action": "bad_action"})).await.unwrap();
 
         assert!(!result.success);
         assert!(result.error.unwrap().contains("Unknown action"));

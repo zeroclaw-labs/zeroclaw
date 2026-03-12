@@ -5300,7 +5300,11 @@ impl Config {
         if self.mcp.enabled {
             validate_mcp_config(&self.mcp)?;
         // Security ops
-        let severity = self.security_ops.max_auto_severity.trim().to_ascii_lowercase();
+        let severity = self
+            .security_ops
+            .max_auto_severity
+            .trim()
+            .to_ascii_lowercase();
         if !["low", "medium", "high", "critical"].contains(&severity.as_str()) {
             anyhow::bail!(
                 "security_ops.max_auto_severity must be one of: low, medium, high, critical; got '{}'",

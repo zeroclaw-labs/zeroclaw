@@ -172,20 +172,19 @@ pub fn evaluate_step(
     // Enforce approval gates: steps that require approval must either be
     // auto-approved or wait for human approval. Never mark an unexecuted
     // approval-gated step as Completed.
-    if step.requires_approval {
-        if !require_approval
-            || !can_auto_approve(playbook, step_index, alert_severity, max_auto_severity)
-        {
-            return StepExecutionResult {
-                step_index,
-                action: step.action.clone(),
-                status: StepStatus::PendingApproval,
-                message: format!(
-                    "Step '{}' requires human approval (severity: {alert_severity})",
-                    step.description
-                ),
-            };
-        }
+    if step.requires_approval
+        && (!require_approval
+            || !can_auto_approve(playbook, step_index, alert_severity, max_auto_severity))
+    {
+        return StepExecutionResult {
+            step_index,
+            action: step.action.clone(),
+            status: StepStatus::PendingApproval,
+            message: format!(
+                "Step '{}' requires human approval (severity: {alert_severity})",
+                step.description
+            ),
+        };
     }
 
     // Step is approved (either doesn't require approval, or was auto-approved)
