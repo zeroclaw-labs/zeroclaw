@@ -1315,22 +1315,7 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &fallback_messages, model)
-                        .await
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
@@ -1427,22 +1412,7 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &effective_messages, model)
-                        .await
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
@@ -1650,28 +1620,7 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &effective_messages, model)
-                        .await
-                        .map(|text| ProviderChatResponse {
-                            text: Some(text),
-                            tool_calls: vec![],
-                            usage: None,
-                            reasoning_content: None,
-                        })
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
@@ -1864,9 +1813,37 @@ impl Provider for OpenAiCompatibleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::traits::ChatRequest;
+    use crate::tools::ToolSpec;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
 
     fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
         OpenAiCompatibleProvider::new(name, url, key, AuthStyle::Bearer)
+    }
+
+    async fn spawn_transport_error_server(
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let connection_count = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&connection_count);
+
+        let handle = tokio::spawn(async move {
+            while let Ok(Ok((stream, _))) =
+                tokio::time::timeout(Duration::from_millis(200), listener.accept()).await
+            {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        (format!("http://{addr}/v1"), connection_count, handle)
     }
 
     #[test]
@@ -2122,6 +2099,97 @@ mod tests {
         assert!(err
             .to_string()
             .contains("requires at least one non-system message"));
+    }
+
+    #[tokio::test]
+    async fn chat_with_system_transport_error_does_not_attempt_responses_fallback() {
+        let (base_url, connection_count, server) = spawn_transport_error_server().await;
+        let provider = make_provider("custom", &base_url, Some("test-key"));
+
+        let err = provider
+            .chat_with_system(Some("policy"), "hello", "gpt-test", 0.0)
+            .await
+            .expect_err("transport error should bubble up");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        server.abort();
+
+        assert!(
+            connection_count.load(Ordering::SeqCst) <= 1,
+            "transport errors should not trigger a second /responses attempt"
+        );
+        assert!(
+            !err.to_string().contains("responses fallback failed"),
+            "transport error should be reported directly"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_transport_error_does_not_attempt_responses_fallback() {
+        let (base_url, connection_count, server) = spawn_transport_error_server().await;
+        let provider = make_provider("custom", &base_url, Some("test-key"));
+
+        let err = provider
+            .chat_with_history(
+                &[ChatMessage::system("policy"), ChatMessage::user("hello")],
+                "gpt-test",
+                0.0,
+            )
+            .await
+            .expect_err("transport error should bubble up");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        server.abort();
+
+        assert!(
+            connection_count.load(Ordering::SeqCst) <= 1,
+            "transport errors should not trigger a second /responses attempt"
+        );
+        assert!(
+            !err.to_string().contains("responses fallback failed"),
+            "transport error should be reported directly"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_chat_transport_error_does_not_attempt_responses_fallback() {
+        let (base_url, connection_count, server) = spawn_transport_error_server().await;
+        let provider = make_provider("custom", &base_url, Some("test-key"));
+        let messages = [ChatMessage::user("hello")];
+        let tools = [ToolSpec {
+            name: "shell".to_string(),
+            description: "Run shell commands".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                }
+            }),
+        }];
+
+        let err = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                "gpt-test",
+                0.0,
+            )
+            .await
+            .expect_err("transport error should bubble up");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        server.abort();
+
+        assert!(
+            connection_count.load(Ordering::SeqCst) <= 1,
+            "transport errors should not trigger a second /responses attempt"
+        );
+        assert!(
+            !err.to_string().contains("responses fallback failed"),
+            "transport error should be reported directly"
+        );
     }
 
     #[test]
