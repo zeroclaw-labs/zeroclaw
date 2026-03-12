@@ -75,7 +75,7 @@ spec:
               readOnly: true
       containers:
         - name: zeroclaw
-          image: citizendaniel/zeroclaw-sam:v1.3.9
+          image: citizendaniel/zeroclaw-sam:v1.4.2
           imagePullPolicy: IfNotPresent
           command:
             - bash
@@ -154,7 +154,7 @@ spec:
               subPath: acp-client.py
               readOnly: true
         - name: serena
-          image: citizendaniel/zeroclaw-sam:v1.3.9
+          image: citizendaniel/zeroclaw-sam:v1.4.2
           imagePullPolicy: IfNotPresent
           command:
             - sh
@@ -194,8 +194,8 @@ spec:
             - name: zeroclaw-data
               mountPath: /data
         - name: signal-api-adapter
-          image: citizendaniel/signal-api-adapter:v1.2.1
-          imagePullPolicy: IfNotPresent
+          image: citizendaniel/signal-api-adapter:v1.3.0
+          imagePullPolicy: Always
           ports:
             - name: signal-adapt
               containerPort: 8686

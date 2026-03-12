@@ -86,6 +86,7 @@ data:
       allowed_from = ["*"]
       ignore_attachments = false
       ignore_stories = true
+      edit_messages = true
 
       [memory]
       backend = "sqlite"

@@ -43,6 +43,7 @@ data:
       ]
       max_actions_per_hour = 9999
       max_cost_per_day_cents = 500
+      allow_shell_redirections = true
       require_approval_for_medium_risk = false
       block_high_risk_commands = false
       non_cli_excluded_tools = []
@@ -96,6 +97,7 @@ data:
       [gateway.acp_server]
       enabled = true
       session_ttl_secs = 7200
+      max_concurrent_sessions = 1
 
       [composio]
       enabled = false

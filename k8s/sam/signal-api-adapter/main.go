@@ -632,11 +632,111 @@ func handleRPC(w http.ResponseWriter, r *http.Request) {
   }
 }
 
+// v2SendRequest is the REST v2 /v2/send request body format.
+type v2SendRequest struct {
+	Message       string   `json:"message"`
+	Number        string   `json:"number"`
+	Recipients    []string `json:"recipients"`
+	EditTimestamp *uint64  `json:"edit_timestamp,omitempty"`
+}
+
+// handleV2Send translates REST v2 /v2/send requests into JSON-RPC "send"
+// calls to the signal-cli daemon, supporting message editing via editTimestamp.
+func handleV2Send(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req v2SendRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.Number == "" || req.Message == "" || len(req.Recipients) == 0 {
+		http.Error(w, "missing required fields: number, message, recipients", http.StatusBadRequest)
+		return
+	}
+
+	// Build JSON-RPC params for signal-cli daemon's "send" method.
+	params := map[string]any{
+		"account":   req.Number,
+		"message":   req.Message,
+		"recipient": req.Recipients,
+	}
+	if req.EditTimestamp != nil {
+		params["editTimestamp"] = *req.EditTimestamp
+	}
+
+	paramsJSON, _ := json.Marshal(params)
+	rpcReq := rpcRequest{
+		JSONRPC: "2.0",
+		Method:  "send",
+		Params:  json.RawMessage(paramsJSON),
+		ID:      "v2send-" + fmt.Sprintf("%d", time.Now().UnixNano()),
+	}
+	buf, _ := json.Marshal(rpcReq)
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	resp, body, err := bridgeRequest(ctx, http.MethodPost, "/api/v1/rpc",
+		bytes.NewReader(buf), map[string]string{"Content-Type": "application/json"})
+	if err != nil {
+		log.Printf("v2/send rpc bridge error: %v", err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	if resp.StatusCode/100 != 2 {
+		log.Printf("v2/send rpc bridge status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write(body)
+		return
+	}
+
+	// Parse JSON-RPC response and extract result.timestamp for the v2 format.
+	var rpcResp rpcResponse
+	if err := json.Unmarshal(body, &rpcResp); err != nil {
+		log.Printf("v2/send rpc response unmarshal error: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"timestamp":""}`))
+		return
+	}
+	if rpcResp.Error != nil {
+		log.Printf("v2/send rpc error: code=%d msg=%s", rpcResp.Error.Code, rpcResp.Error.Message)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": rpcResp.Error.Message})
+		return
+	}
+
+	// Extract timestamp from result — signal-cli returns {"timestamp": 12345} as number.
+	var tsStr string
+	if resultMap, ok := rpcResp.Result.(map[string]any); ok {
+		if ts, ok := resultMap["timestamp"]; ok {
+			switch v := ts.(type) {
+			case float64:
+				tsStr = fmt.Sprintf("%.0f", v)
+			case string:
+				tsStr = v
+			case json.Number:
+				tsStr = v.String()
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"timestamp": tsStr})
+}
+
 func main() {
   mux := http.NewServeMux()
   mux.HandleFunc("/api/v1/check", handleCheck)
   mux.HandleFunc("/api/v1/events", handleEvents)
   mux.HandleFunc("/api/v1/rpc", handleRPC)
+  mux.HandleFunc("/v2/send", handleV2Send)
 
   server := &http.Server{
     Addr:              listenAddr,

@@ -458,6 +458,15 @@ data:
     The `wait` command blocks the shell call without consuming any LLM slots — you
     stay idle while the K8s agent works, then resume when the result arrives.
 
+    **CRITICAL: Include full context in every ACP message.** The K8s agent does NOT
+    have access to your memory, your conversation history, or your Serena memories.
+    It is a separate agent with its own context. Every `acp-client send` message
+    must be **self-contained** — include all relevant details, plans, file paths,
+    namespace names, and requirements directly in the prompt. Never say "use the
+    plan from memory" or "as we discussed" — the K8s agent has no idea what you
+    discussed. Think of each ACP message as a work order: everything the agent
+    needs to complete the task must be in that single message.
+
     **All commands:**
 
     | Command | Purpose |
