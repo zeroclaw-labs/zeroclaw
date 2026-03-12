@@ -1,0 +1,77 @@
+name: Cross-Platform Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  web:
+    name: Build Web Dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build web dashboard
+        run: cd web && npm ci && npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+          retention-days: 1
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [web]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross_compiler: gcc-aarch64-linux-gnu
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
+            linker: aarch64-linux-gnu-gcc
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.92.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        if: runner.os != 'Windows'
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: web-dist
+          path: web/dist/
+
+      - name: Install cross compiler
+        if: matrix.cross_compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ${{ matrix.cross_compiler }}
+
+      - name: Build release
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
+            export "${{ matrix.linker_env }}=${{ matrix.linker }}"
+          fi
+          cargo build --release --locked --target ${{ matrix.target }}

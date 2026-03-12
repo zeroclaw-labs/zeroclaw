@@ -151,4 +151,4 @@ Dùng **Rust ZeroClaw** cho triển khai biên (edge) trong sản phẩm. Dùng 
 
 ## Giấy phép
 
-MIT License — xem [LICENSE](../LICENSE)
+MIT License — xem [LICENSE](../LICENSE-MIT)

@@ -35,6 +35,7 @@ pub mod slack;
 pub mod telegram;
 pub mod traits;
 pub mod transcription;
+pub mod tts;
 pub mod wati;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
@@ -62,6 +63,8 @@ pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
+#[allow(unused_imports)]
+pub use tts::{TtsManager, TtsProvider};
 pub use wati::WatiChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
@@ -71,6 +74,7 @@ use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_cre
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
+use crate::observability::traits::{ObserverEvent, ObserverMetric};
 use crate::observability::{self, runtime_trace, Observer};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
@@ -87,6 +91,66 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
+
+/// Observer wrapper that forwards tool-call events to a channel sender
+/// for real-time threaded notifications.
+struct ChannelNotifyObserver {
+    inner: Arc<dyn Observer>,
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+    tools_used: AtomicBool,
+}
+
+impl Observer for ChannelNotifyObserver {
+    fn record_event(&self, event: &ObserverEvent) {
+        if let ObserverEvent::ToolCallStart { tool, arguments } = event {
+            self.tools_used.store(true, Ordering::Relaxed);
+            let detail = match arguments {
+                Some(args) if !args.is_empty() => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+                        if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+                            format!(": `{}`", if cmd.len() > 200 { &cmd[..200] } else { cmd })
+                        } else if let Some(q) = v.get("query").and_then(|c| c.as_str()) {
+                            format!(": {}", if q.len() > 200 { &q[..200] } else { q })
+                        } else if let Some(p) = v.get("path").and_then(|c| c.as_str()) {
+                            format!(": {p}")
+                        } else if let Some(u) = v.get("url").and_then(|c| c.as_str()) {
+                            format!(": {u}")
+                        } else {
+                            let s = args.to_string();
+                            if s.len() > 120 {
+                                format!(": {}…", &s[..120])
+                            } else {
+                                format!(": {s}")
+                            }
+                        }
+                    } else {
+                        let s = args.to_string();
+                        if s.len() > 120 {
+                            format!(": {}…", &s[..120])
+                        } else {
+                            format!(": {s}")
+                        }
+                    }
+                }
+                _ => String::new(),
+            };
+            let _ = self.tx.send(format!("\u{1F527} `{tool}`{detail}"));
+        }
+        self.inner.record_event(event);
+    }
+    fn record_metric(&self, metric: &ObserverMetric) {
+        self.inner.record_metric(metric);
+    }
+    fn flush(&self) {
+        self.inner.flush();
+    }
+    fn name(&self) -> &str {
+        "channel-notify"
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
 
 /// Per-sender conversation history for channel messages.
 type ConversationHistoryMap = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
@@ -224,6 +288,7 @@ struct ChannelRuntimeContext {
     multimodal: crate::config::MultimodalConfig,
     hooks: Option<Arc<crate::hooks::HookRunner>>,
     non_cli_excluded_tools: Arc<Vec<String>>,
+    model_routes: Arc<Vec<crate::config::ModelRouteConfig>>,
 }
 
 #[derive(Clone)]
@@ -397,6 +462,13 @@ fn strip_tool_call_tags(message: &str) -> String {
 
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     match channel_name {
+        "matrix" => Some(
+            "When responding on Matrix:\n\
+             - Use Markdown formatting (bold, italic, code blocks)\n\
+             - Be concise and direct\n\
+             - When you receive a [Voice message], the user spoke to you. Respond naturally as in conversation.\n\
+             - Your text reply will automatically be converted to audio and sent back as a voice message.\n",
+        ),
         "telegram" => Some(
             "When responding on Telegram:\n\
              - Include media markers for files or URLs that should be sent as attachments\n\
@@ -421,6 +493,25 @@ fn build_channel_system_prompt(
     reply_target: &str,
 ) -> String {
     let mut prompt = base_prompt.to_string();
+
+    // Refresh the stale datetime in the cached system prompt
+    {
+        let now = chrono::Local::now();
+        let fresh = format!(
+            "## Current Date & Time\n\n{} ({})\n",
+            now.format("%Y-%m-%d %H:%M:%S"),
+            now.format("%Z"),
+        );
+        if let Some(start) = prompt.find("## Current Date & Time\n\n") {
+            // Find the end of this section (next "## " heading or end of string)
+            let rest = &prompt[start + 24..]; // skip past "## Current Date & Time\n\n"
+            let section_end = rest
+                .find("\n## ")
+                .map(|i| start + 24 + i)
+                .unwrap_or(prompt.len());
+            prompt.replace_range(start..section_end, fresh.trim_end());
+        }
+    }
 
     if let Some(instructions) = channel_delivery_instructions(channel_name) {
         if prompt.is_empty() {
@@ -478,7 +569,7 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
 }
 
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
-    matches!(channel_name, "telegram" | "discord")
+    matches!(channel_name, "telegram" | "discord" | "matrix")
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
@@ -632,6 +723,28 @@ async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRu
     if let Some(zeroclaw_dir) = path.parent() {
         let store = crate::security::SecretStore::new(zeroclaw_dir, parsed.secrets.encrypt);
         decrypt_optional_secret_for_runtime_reload(&store, &mut parsed.api_key, "config.api_key")?;
+        // Decrypt TTS provider API keys for runtime reload
+        if let Some(ref mut openai) = parsed.tts.openai {
+            decrypt_optional_secret_for_runtime_reload(
+                &store,
+                &mut openai.api_key,
+                "config.tts.openai.api_key",
+            )?;
+        }
+        if let Some(ref mut elevenlabs) = parsed.tts.elevenlabs {
+            decrypt_optional_secret_for_runtime_reload(
+                &store,
+                &mut elevenlabs.api_key,
+                "config.tts.elevenlabs.api_key",
+            )?;
+        }
+        if let Some(ref mut google) = parsed.tts.google {
+            decrypt_optional_secret_for_runtime_reload(
+                &store,
+                &mut google.api_key,
+                "config.tts.google.api_key",
+            )?;
+        }
     }
 
     parsed.apply_env_overrides();
@@ -937,14 +1050,29 @@ async fn create_resilient_provider_nonblocking(
     .context("failed to join provider initialization task")?
 }
 
-fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &Path) -> String {
+fn build_models_help_response(
+    current: &ChannelRouteSelection,
+    workspace_dir: &Path,
+    model_routes: &[crate::config::ModelRouteConfig],
+) -> String {
     let mut response = String::new();
     let _ = writeln!(
         response,
         "Current provider: `{}`\nCurrent model: `{}`",
         current.provider, current.model
     );
-    response.push_str("\nSwitch model with `/model <model-id>`.\n");
+    response.push_str("\nSwitch model with `/model <model-id>` or `/model <hint>`.\n");
+
+    if !model_routes.is_empty() {
+        response.push_str("\nConfigured model routes:\n");
+        for route in model_routes {
+            let _ = writeln!(
+                response,
+                "  `{}` → {} ({})",
+                route.hint, route.model, route.provider
+            );
+        }
+    }
 
     let cached_models = load_cached_model_preview(workspace_dir, &current.provider);
     if cached_models.is_empty() {
@@ -1017,7 +1145,6 @@ async fn handle_runtime_command_if_needed(
                         if provider_name != current.provider {
                             current.provider = provider_name.clone();
                             set_route_selection(ctx, &sender_key, current.clone());
-                            clear_sender_history(ctx, &sender_key);
                         }
 
                         format!(
@@ -1038,20 +1165,27 @@ async fn handle_runtime_command_if_needed(
             }
         }
         ChannelRuntimeCommand::ShowModel => {
-            build_models_help_response(&current, ctx.workspace_dir.as_path())
+            build_models_help_response(&current, ctx.workspace_dir.as_path(), &ctx.model_routes)
         }
         ChannelRuntimeCommand::SetModel(raw_model) => {
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
                 "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
             } else {
-                current.model = model.clone();
+                // Resolve provider+model from model_routes (match by model name or hint)
+                if let Some(route) = ctx.model_routes.iter().find(|r| {
+                    r.model.eq_ignore_ascii_case(&model) || r.hint.eq_ignore_ascii_case(&model)
+                }) {
+                    current.provider = route.provider.clone();
+                    current.model = route.model.clone();
+                } else {
+                    current.model = model.clone();
+                }
                 set_route_selection(ctx, &sender_key, current.clone());
-                clear_sender_history(ctx, &sender_key);
 
                 format!(
-                    "Model switched to `{model}` for provider `{}` in this sender session.",
-                    current.provider
+                    "Model switched to `{}` (provider: `{}`). Context preserved.",
+                    current.model, current.provider
                 )
             }
         }
@@ -1295,9 +1429,7 @@ fn sanitize_tool_json_value(
         return None;
     }
 
-    let Some(object) = value.as_object() else {
-        return None;
-    };
+    let object = value.as_object()?;
 
     if let Some(tool_calls) = object.get("tool_calls").and_then(|value| value.as_array()) {
         if !tool_calls.is_empty()
@@ -1337,7 +1469,7 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
     let mut saw_tool_call_payload = false;
 
     while cursor < message.len() {
-        let Some(rel_start) = message[cursor..].find(|ch: char| ch == '{' || ch == '[') else {
+        let Some(rel_start) = message[cursor..].find(['{', '[']) else {
             cleaned.push_str(&message[cursor..]);
             break;
         };
@@ -1537,7 +1669,7 @@ async fn process_channel_message(
     );
 
     // ── Hook: on_message_received (modifying) ────────────
-    let msg = if let Some(hooks) = &ctx.hooks {
+    let mut msg = if let Some(hooks) = &ctx.hooks {
         match hooks.run_on_message_received(msg).await {
             crate::hooks::HookResult::Cancel(reason) => {
                 tracing::info!(%reason, "incoming message dropped by hook");
@@ -1719,6 +1851,37 @@ async fn process_channel_message(
         _ => None,
     };
 
+    // Wrap observer to forward tool events as live thread messages
+    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let notify_observer: Arc<ChannelNotifyObserver> = Arc::new(ChannelNotifyObserver {
+        inner: Arc::clone(&ctx.observer),
+        tx: notify_tx,
+        tools_used: AtomicBool::new(false),
+    });
+    let notify_observer_flag = Arc::clone(&notify_observer);
+    let notify_channel = target_channel.clone();
+    let notify_reply_target = msg.reply_target.clone();
+    let notify_thread_root = msg.id.clone();
+    let notify_task = if msg.channel == "cli" {
+        Some(tokio::spawn(async move {
+            while notify_rx.recv().await.is_some() {}
+        }))
+    } else {
+        Some(tokio::spawn(async move {
+            let thread_ts = Some(notify_thread_root);
+            while let Some(text) = notify_rx.recv().await {
+                if let Some(ref ch) = notify_channel {
+                    let _ = ch
+                        .send(
+                            &SendMessage::new(&text, &notify_reply_target)
+                                .in_thread(thread_ts.clone()),
+                        )
+                        .await;
+                }
+            }
+        }))
+    };
+
     // Record history length before tool loop so we can extract tool context after.
     let history_len_before_tools = history.len();
 
@@ -1737,7 +1900,7 @@ async fn process_channel_message(
                 active_provider.as_ref(),
                 &mut history,
                 ctx.tools_registry.as_ref(),
-                ctx.observer.as_ref(),
+                notify_observer.as_ref() as &dyn Observer,
                 route.provider.as_str(),
                 route.model.as_str(),
                 runtime_defaults.temperature,
@@ -1759,6 +1922,17 @@ async fn process_channel_message(
     };
 
     if let Some(handle) = draft_updater {
+        let _ = handle.await;
+    }
+
+    // Thread the final reply only if tools were used (multi-message response)
+    if notify_observer_flag.tools_used.load(Ordering::Relaxed) && msg.channel != "cli" {
+        msg.thread_ts = Some(msg.id.clone());
+    }
+    // Drop the notify sender so the forwarder task finishes
+    drop(notify_observer);
+    drop(notify_observer_flag);
+    if let Some(handle) = notify_task {
         let _ = handle.await;
     }
 
@@ -2682,7 +2856,7 @@ struct ConfiguredChannel {
 
 fn collect_configured_channels(
     config: &Config,
-    _matrix_skip_context: &str,
+    matrix_skip_context: &str,
 ) -> Vec<ConfiguredChannel> {
     let mut channels = Vec::new();
 
@@ -2718,11 +2892,16 @@ fn collect_configured_channels(
     if let Some(ref sl) = config.channels_config.slack {
         channels.push(ConfiguredChannel {
             display_name: "Slack",
-            channel: Arc::new(SlackChannel::new(
-                sl.bot_token.clone(),
-                sl.channel_id.clone(),
-                sl.allowed_users.clone(),
-            )),
+            channel: Arc::new(
+                SlackChannel::new(
+                    sl.bot_token.clone(),
+                    sl.app_token.clone(),
+                    sl.channel_id.clone(),
+                    Vec::new(),
+                    sl.allowed_users.clone(),
+                )
+                .with_workspace_dir(config.workspace_dir.clone()),
+            ),
         });
     }
 
@@ -2767,7 +2946,7 @@ fn collect_configured_channels(
     if config.channels_config.matrix.is_some() {
         tracing::warn!(
             "Matrix channel is configured but this build was compiled without `channel-matrix`; skipping Matrix {}.",
-            _matrix_skip_context
+            matrix_skip_context
         );
     }
 
@@ -3076,8 +3255,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
     ));
     let model = resolved_default_model(&config);
     let temperature = config.default_temperature;
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
         &config.memory,
+        &config.embedding_routes,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
@@ -3323,6 +3503,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             None
         },
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
+        model_routes: Arc::new(config.model_routes.clone()),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3536,6 +3717,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -3585,6 +3767,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -3637,6 +3820,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4112,6 +4296,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            model_routes: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4130,11 +4315,12 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-42:"));
-        assert!(sent_messages[0].contains("BTC is currently around"));
-        assert!(!sent_messages[0].contains("\"tool_calls\""));
-        assert!(!sent_messages[0].contains("mock_price"));
+        assert!(!sent_messages.is_empty());
+        let reply = sent_messages.last().unwrap();
+        assert!(reply.starts_with("chat-42:"));
+        assert!(reply.contains("BTC is currently around"));
+        assert!(!reply.contains("\"tool_calls\""));
+        assert!(!reply.contains("mock_price"));
     }
 
     #[tokio::test]
@@ -4171,6 +4357,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
+            model_routes: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4189,8 +4376,9 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].contains("BTC is currently around"));
+        assert!(!sent_messages.is_empty());
+        let reply = sent_messages.last().unwrap();
+        assert!(reply.contains("BTC is currently around"));
 
         let histories = runtime_ctx
             .conversation_histories
@@ -4244,6 +4432,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4303,6 +4492,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4321,11 +4511,12 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-84:"));
-        assert!(sent_messages[0].contains("alias-tag flow resolved"));
-        assert!(!sent_messages[0].contains("<toolcall>"));
-        assert!(!sent_messages[0].contains("mock_price"));
+        assert!(!sent_messages.is_empty());
+        let reply = sent_messages.last().unwrap();
+        assert!(reply.starts_with("chat-84:"));
+        assert!(reply.contains("alias-tag flow resolved"));
+        assert!(!reply.contains("<toolcall>"));
+        assert!(!reply.contains("mock_price"));
     }
 
     #[tokio::test]
@@ -4371,6 +4562,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4460,6 +4652,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4531,6 +4724,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4617,6 +4811,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4688,6 +4883,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4706,10 +4902,11 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-iter-success:"));
-        assert!(sent_messages[0].contains("Completed after 11 tool iterations."));
-        assert!(!sent_messages[0].contains("⚠️ Error:"));
+        assert!(!sent_messages.is_empty());
+        let reply = sent_messages.last().unwrap();
+        assert!(reply.starts_with("chat-iter-success:"));
+        assert!(reply.contains("Completed after 11 tool iterations."));
+        assert!(!reply.contains("⚠️ Error:"));
     }
 
     #[tokio::test]
@@ -4748,6 +4945,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4766,9 +4964,10 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-iter-fail:"));
-        assert!(sent_messages[0].contains("⚠️ Error: Agent exceeded maximum tool iterations (3)"));
+        assert!(!sent_messages.is_empty());
+        let reply = sent_messages.last().unwrap();
+        assert!(reply.starts_with("chat-iter-fail:"));
+        assert!(reply.contains("⚠️ Error: Agent exceeded maximum tool iterations (3)"));
     }
 
     struct NoopMemory;
@@ -4919,6 +5118,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -4999,6 +5199,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5091,6 +5292,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5165,6 +5367,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -5224,6 +5427,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -5740,6 +5944,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -5825,6 +6030,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -5910,6 +6116,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -6459,6 +6666,7 @@ This is an example JSON object for profile settings."#;
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -6525,6 +6733,7 @@ This is an example JSON object for profile settings."#;
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
         });
 
         process_channel_message(
