@@ -1736,14 +1736,26 @@ impl Provider for OpenAiCompatibleProvider {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
         OpenAiCompatibleProvider::new(name, url, key, AuthStyle::Bearer)
     }
 
-    #[test]
-    fn http_client_includes_default_headers() {
-        let provider = make_provider("test", "https://example.com", None).with_default_headers(
+    #[tokio::test]
+    async fn http_client_includes_default_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/headers"))
+            .and(header("HTTP-Referer", "https://example.com/app"))
+            .and(header("X-App-Name", "ZeroClaw"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = make_provider("test", &server.uri(), None).with_default_headers(
             HashMap::from([
                 (
                     "HTTP-Referer".to_string(),
@@ -1753,26 +1765,14 @@ mod tests {
             ]),
         );
 
-        let request = provider
+        let response = provider
             .http_client()
-            .post("https://example.com/chat/completions")
-            .build()
+            .get(format!("{}/headers", server.uri()))
+            .send()
+            .await
             .unwrap();
 
-        assert_eq!(
-            request
-                .headers()
-                .get("HTTP-Referer")
-                .and_then(|v| v.to_str().ok()),
-            Some("https://example.com/app")
-        );
-        assert_eq!(
-            request
-                .headers()
-                .get("X-App-Name")
-                .and_then(|v| v.to_str().ok()),
-            Some("ZeroClaw")
-        );
+        assert!(response.status().is_success());
     }
 
     #[test]
