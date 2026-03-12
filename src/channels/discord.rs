@@ -18,6 +18,8 @@ pub struct DiscordChannel {
     listen_to_bots: bool,
     mention_only: bool,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Per-channel proxy URL override.
+    proxy_url: Option<String>,
 }
 
 impl DiscordChannel {
@@ -35,11 +37,18 @@ impl DiscordChannel {
             listen_to_bots,
             mention_only,
             typing_handles: Mutex::new(HashMap::new()),
+            proxy_url: None,
         }
     }
 
+    /// Set a per-channel proxy URL that overrides the global proxy config.
+    pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
+        self.proxy_url = proxy_url;
+        self
+    }
+
     fn http_client(&self) -> reqwest::Client {
-        crate::config::build_runtime_proxy_client("channel.discord")
+        crate::config::build_channel_proxy_client("channel.discord", self.proxy_url.as_deref())
     }
 
     /// Check if a Discord user ID is in the allowlist.

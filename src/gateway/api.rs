@@ -1004,6 +1004,7 @@ mod tests {
             api_url: "https://live-mt-server.wati.io".to_string(),
             tenant_id: None,
             allowed_numbers: vec![],
+            proxy_url: None,
         });
         cfg.channels_config.feishu = Some(crate::config::schema::FeishuConfig {
             app_id: "cli_aabbcc".to_string(),
@@ -1013,6 +1014,7 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         });
         cfg.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
             imap_host: "imap.example.com".to_string(),
@@ -1137,6 +1139,7 @@ mod tests {
             api_url: "https://live-mt-server.wati.io".to_string(),
             tenant_id: None,
             allowed_numbers: vec![],
+            proxy_url: None,
         });
         current.channels_config.feishu = Some(crate::config::schema::FeishuConfig {
             app_id: "cli_current".to_string(),
@@ -1146,6 +1149,7 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         });
         current.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
             imap_host: "imap.example.com".to_string(),

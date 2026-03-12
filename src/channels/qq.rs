@@ -103,6 +103,8 @@ pub struct QQChannel {
     token_cache: Arc<RwLock<Option<(String, u64)>>>,
     /// Message deduplication set.
     dedup: Arc<RwLock<HashSet<String>>>,
+    /// Per-channel proxy URL override.
+    proxy_url: Option<String>,
 }
 
 impl QQChannel {
@@ -113,11 +115,18 @@ impl QQChannel {
             allowed_users,
             token_cache: Arc::new(RwLock::new(None)),
             dedup: Arc::new(RwLock::new(HashSet::new())),
+            proxy_url: None,
         }
     }
 
+    /// Set a per-channel proxy URL that overrides the global proxy config.
+    pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
+        self.proxy_url = proxy_url;
+        self
+    }
+
     fn http_client(&self) -> reqwest::Client {
-        crate::config::build_runtime_proxy_client("channel.qq")
+        crate::config::build_channel_proxy_client("channel.qq", self.proxy_url.as_deref())
     }
 
     fn is_user_allowed(&self, user_id: &str) -> bool {

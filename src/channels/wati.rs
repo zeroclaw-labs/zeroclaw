@@ -23,12 +23,22 @@ impl WatiChannel {
         tenant_id: Option<String>,
         allowed_numbers: Vec<String>,
     ) -> Self {
+        Self::new_with_proxy(api_token, api_url, tenant_id, allowed_numbers, None)
+    }
+
+    pub fn new_with_proxy(
+        api_token: String,
+        api_url: String,
+        tenant_id: Option<String>,
+        allowed_numbers: Vec<String>,
+        proxy_url: Option<String>,
+    ) -> Self {
         Self {
             api_token,
             api_url,
             tenant_id,
             allowed_numbers,
-            client: crate::config::build_runtime_proxy_client("channel.wati"),
+            client: crate::config::build_channel_proxy_client("channel.wati", proxy_url.as_deref()),
         }
     }
 

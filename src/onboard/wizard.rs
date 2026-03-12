@@ -3620,6 +3620,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     draft_update_interval_ms: 1000,
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    proxy_url: None,
                 });
             }
             ChannelMenuChoice::Discord => {
@@ -3719,6 +3720,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                     listen_to_bots: false,
                     mention_only: false,
+                    proxy_url: None,
                 });
             }
             ChannelMenuChoice::Slack => {
@@ -3846,6 +3848,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         Some(channel)
                     },
                     allowed_users,
+                    proxy_url: None,
                 });
             }
             ChannelMenuChoice::IMessage => {
@@ -4096,6 +4099,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_from,
                     ignore_attachments,
                     ignore_stories,
+                    proxy_url: None,
                 });
 
                 println!("  {} Signal configured", style("✅").green().bold());
@@ -4176,6 +4180,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         pair_code: (!pair_code.trim().is_empty())
                             .then(|| pair_code.trim().to_string()),
                         allowed_numbers,
+                        proxy_url: None,
                     });
 
                     println!(
@@ -4277,6 +4282,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     pair_phone: None,
                     pair_code: None,
                     allowed_numbers,
+                    proxy_url: None,
                 });
             }
             ChannelMenuChoice::Linq => {
@@ -4606,6 +4612,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         Some(webhook_secret.trim().to_string())
                     },
                     allowed_users,
+                    proxy_url: None,
                 });
 
                 println!("  {} Nextcloud Talk configured", style("✅").green().bold());
@@ -4678,6 +4685,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     client_id,
                     client_secret,
                     allowed_users,
+                    proxy_url: None,
                 });
             }
             ChannelMenuChoice::QqOfficial => {
@@ -4754,6 +4762,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     app_id,
                     app_secret,
                     allowed_users,
+                    proxy_url: None,
                 });
             }
             ChannelMenuChoice::Lark | ChannelMenuChoice::Feishu => {
@@ -4943,6 +4952,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     use_feishu: is_feishu,
                     receive_mode,
                     port,
+                    proxy_url: None,
                 });
             }
             ChannelMenuChoice::Nostr => {
@@ -7156,6 +7166,7 @@ mod tests {
             allowed_from: vec!["*".into()],
             ignore_attachments: false,
             ignore_stories: true,
+            proxy_url: None,
         });
         assert!(has_launchable_channels(&channels));
 
@@ -7167,6 +7178,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             thread_replies: Some(true),
             mention_only: Some(false),
+            proxy_url: None,
         });
         assert!(has_launchable_channels(&channels));
 
@@ -7175,6 +7187,7 @@ mod tests {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
+            proxy_url: None,
         });
         assert!(has_launchable_channels(&channels));
 
@@ -7184,6 +7197,7 @@ mod tests {
             app_token: "token".into(),
             webhook_secret: Some("secret".into()),
             allowed_users: vec!["*".into()],
+            proxy_url: None,
         });
         assert!(has_launchable_channels(&channels));
 
@@ -7196,6 +7210,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         });
         assert!(has_launchable_channels(&channels));
     }

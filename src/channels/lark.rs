@@ -304,6 +304,8 @@ pub struct LarkChannel {
     tenant_token: Arc<RwLock<Option<CachedTenantToken>>>,
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Per-channel proxy URL override.
+    proxy_url: Option<String>,
 }
 
 impl LarkChannel {
@@ -321,6 +323,7 @@ impl LarkChannel {
             verification_token,
             port,
             allowed_users,
+            mention_only,
             LarkPlatform::Lark,
         )
     }
@@ -331,6 +334,7 @@ impl LarkChannel {
         verification_token: String,
         port: Option<u16>,
         allowed_users: Vec<String>,
+        mention_only: bool,
         platform: LarkPlatform,
     ) -> Self {
         Self {
@@ -345,6 +349,7 @@ impl LarkChannel {
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
+            proxy_url: None,
         }
     }
 
@@ -363,13 +368,52 @@ impl LarkChannel {
             config.port,
             config.allowed_users.clone(),
             config.mention_only,
+            platform,
         );
         ch.receive_mode = config.receive_mode.clone();
+        ch.proxy_url = config.proxy_url.clone();
+        ch
+    }
+
+    /// Build from `LarkConfig` forcing `LarkPlatform::Lark`, ignoring the
+    /// legacy `use_feishu` flag.  Used by the channel factory when the config
+    /// section is explicitly `[channels_config.lark]`.
+    pub fn from_lark_config(config: &crate::config::schema::LarkConfig) -> Self {
+        let mut ch = Self::new_with_platform(
+            config.app_id.clone(),
+            config.app_secret.clone(),
+            config.verification_token.clone().unwrap_or_default(),
+            config.port,
+            config.allowed_users.clone(),
+            config.mention_only,
+            LarkPlatform::Lark,
+        );
+        ch.receive_mode = config.receive_mode.clone();
+        ch.proxy_url = config.proxy_url.clone();
+        ch
+    }
+
+    /// Build from `FeishuConfig` with `LarkPlatform::Feishu`.
+    pub fn from_feishu_config(config: &crate::config::schema::FeishuConfig) -> Self {
+        let mut ch = Self::new_with_platform(
+            config.app_id.clone(),
+            config.app_secret.clone(),
+            config.verification_token.clone().unwrap_or_default(),
+            config.port,
+            config.allowed_users.clone(),
+            false,
+            LarkPlatform::Feishu,
+        );
+        ch.receive_mode = config.receive_mode.clone();
+        ch.proxy_url = config.proxy_url.clone();
         ch
     }
 
     fn http_client(&self) -> reqwest::Client {
-        crate::config::build_runtime_proxy_client(self.platform.proxy_service_key())
+        crate::config::build_channel_proxy_client(
+            self.platform.proxy_service_key(),
+            self.proxy_url.as_deref(),
+        )
     }
 
     fn channel_name(&self) -> &'static str {
@@ -2002,6 +2046,7 @@ mod tests {
             use_feishu: false,
             receive_mode: LarkReceiveMode::default(),
             port: None,
+            proxy_url: None,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -2024,6 +2069,7 @@ mod tests {
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            proxy_url: None,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -2058,6 +2104,7 @@ mod tests {
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            proxy_url: None,
         };
 
         let ch = LarkChannel::from_config(&cfg);
@@ -2081,6 +2128,7 @@ mod tests {
             use_feishu: true,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            proxy_url: None,
         };
 
         let ch = LarkChannel::from_lark_config(&cfg);
@@ -2102,6 +2150,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            proxy_url: None,
         };
 
         let ch = LarkChannel::from_feishu_config(&cfg);
@@ -2274,6 +2323,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             receive_mode: crate::config::schema::LarkReceiveMode::Webhook,
             port: Some(9898),
+            proxy_url: None,
         };
         let ch_feishu = LarkChannel::from_feishu_config(&feishu_cfg);
         assert_eq!(
