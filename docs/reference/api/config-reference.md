@@ -81,6 +81,7 @@ Operational note for container users:
 | `max_history_messages` | `50` | Maximum conversation history messages retained per session |
 | `parallel_tools` | `false` | Enable parallel tool execution within a single iteration |
 | `tool_dispatcher` | `auto` | Tool dispatch strategy |
+| `tool_filter_groups` | `[]` | Per-turn MCP tool schema filtering groups (see below) |
 
 Notes:
 
@@ -88,6 +89,34 @@ Notes:
 - If a channel message exceeds this value, the runtime returns: `Agent exceeded maximum tool iterations (<value>)`.
 - In CLI, gateway, and channel tool loops, multiple independent tool calls are executed concurrently by default when the pending calls do not require approval gating; result order remains stable.
 - `parallel_tools` applies to the `Agent::turn()` API surface. It does not gate the runtime loop used by CLI, gateway, or channel handlers.
+
+### `tool_filter_groups`
+
+Reduces per-turn token overhead when many MCP tools are configured but only a subset is relevant for a given user message. When `tool_filter_groups` is empty (the default), all tools are included in every turn — no behavior change.
+
+Each entry is a `[[agent.tool_filter_groups]]` TOML table with:
+
+| Field | Default | Purpose |
+|---|---|---|
+| `mode` | `dynamic` | `"always"` — tools always included; `"dynamic"` — included only when a keyword matches |
+| `tools` | `[]` | Glob patterns matching MCP tool names (single `*` wildcard). Only tools prefixed `mcp_` are filtered; built-in tools always pass through. |
+| `keywords` | `[]` | Keywords that activate this group in `dynamic` mode (case-insensitive substring match against user message). Ignored when `mode = "always"`. |
+
+Example:
+
+```toml
+# Always include filesystem tools
+[[agent.tool_filter_groups]]
+mode = "always"
+tools = ["mcp_filesystem_*"]
+keywords = []
+
+# Include browser tools only when user mentions browsing
+[[agent.tool_filter_groups]]
+mode = "dynamic"
+tools = ["mcp_browser_*"]
+keywords = ["browse", "website", "url", "search"]
+```
 
 ## `[security.otp]`
 

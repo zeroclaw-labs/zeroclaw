@@ -70,6 +70,35 @@ Lưu ý cho người dùng container:
 | `max_history_messages` | `50` | Số tin nhắn lịch sử tối đa giữ lại mỗi phiên |
 | `parallel_tools` | `false` | Bật thực thi tool song song trong một lượt |
 | `tool_dispatcher` | `auto` | Chiến lược dispatch tool |
+| `tool_filter_groups` | `[]` | Các nhóm lọc schema tool MCP theo lượt (xem bên dưới) |
+
+### `tool_filter_groups`
+
+Giảm chi phí token mỗi lượt khi nhiều tool MCP được cấu hình nhưng chỉ một tập con liên quan đến tin nhắn người dùng hiện tại. Khi `tool_filter_groups` rỗng (mặc định), tất cả tool được bao gồm mỗi lượt — không thay đổi hành vi.
+
+Mỗi mục là một bảng TOML `[[agent.tool_filter_groups]]` với:
+
+| Trường | Mặc định | Mục đích |
+|---|---|---|
+| `mode` | `dynamic` | `"always"` — tool luôn được bao gồm; `"dynamic"` — chỉ bao gồm khi từ khóa khớp |
+| `tools` | `[]` | Mẫu glob khớp tên tool MCP (ký tự đại diện `*` đơn). Chỉ tool có tiền tố `mcp_` bị lọc; tool tích hợp luôn được cho qua. |
+| `keywords` | `[]` | Từ khóa kích hoạt nhóm này ở chế độ `dynamic` (khớp chuỗi con không phân biệt hoa thường với tin nhắn người dùng). Bị bỏ qua khi `mode = "always"`. |
+
+Ví dụ:
+
+```toml
+# Luôn bao gồm tool hệ thống tệp
+[[agent.tool_filter_groups]]
+mode = "always"
+tools = ["mcp_filesystem_*"]
+keywords = []
+
+# Bao gồm tool trình duyệt chỉ khi người dùng đề cập đến duyệt web
+[[agent.tool_filter_groups]]
+mode = "dynamic"
+tools = ["mcp_browser_*"]
+keywords = ["browse", "website", "url", "search"]
+```
 
 Lưu ý:
 
