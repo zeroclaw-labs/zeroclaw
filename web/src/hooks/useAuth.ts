@@ -26,6 +26,8 @@ export interface AuthState {
   isAuthenticated: boolean;
   /** True while the initial auth check is in progress. */
   loading: boolean;
+  /** Whether the server requires pairing (based on health endpoint). */
+  requiresPairing: boolean;
   /** Pair with the agent using a pairing code. Stores the token on success. */
   pair: (code: string) => Promise<void>;
   /** Clear the stored token and sign out. */
@@ -46,6 +48,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [token, setTokenState] = useState<string | null>(readToken);
   const [authenticated, setAuthenticated] = useState<boolean>(checkAuth);
   const [loading, setLoading] = useState<boolean>(!checkAuth());
+  const [requiresPairing, setRequiresPairing] = useState<boolean>(true);
 
   // On mount: check if server requires pairing at all
   useEffect(() => {
@@ -54,12 +57,14 @@ export function AuthProvider({ children }: AuthProviderProps) {
     getPublicHealth()
       .then((health) => {
         if (cancelled) return;
+        setRequiresPairing(health.require_pairing);
         if (!health.require_pairing) {
           setAuthenticated(true);
         }
       })
       .catch(() => {
         // health endpoint unreachable — fall back to showing pairing dialog
+        setRequiresPairing(true);
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -99,6 +104,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     token,
     isAuthenticated: authenticated,
     loading,
+    requiresPairing,
     pair,
     logout,
   };
