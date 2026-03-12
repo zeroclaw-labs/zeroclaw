@@ -255,6 +255,13 @@ pub struct Config {
     /// Dynamic node discovery configuration (`[nodes]`).
     #[serde(default)]
     pub nodes: NodesConfig,
+    /// Backup tool configuration (`[backup]`).
+    #[serde(default)]
+    pub backup: BackupConfig,
+
+    /// Data retention and purge configuration (`[data_retention]`).
+    #[serde(default)]
+    pub data_retention: DataRetentionConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -1537,6 +1544,71 @@ impl Default for WebSearchConfig {
             brave_api_key: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
+        }
+    }
+}
+
+// ── Backup ──────────────────────────────────────────────────────
+
+/// Backup tool configuration (`[backup]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BackupConfig {
+    /// Enable the `backup` tool.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Maximum number of backups to keep (oldest are pruned).
+    #[serde(default = "default_backup_max_keep")]
+    pub max_keep: usize,
+    /// Workspace subdirectories to include in backups.
+    #[serde(default = "default_backup_include_dirs")]
+    pub include_dirs: Vec<String>,
+}
+
+fn default_backup_max_keep() -> usize {
+    10
+}
+
+fn default_backup_include_dirs() -> Vec<String> {
+    vec![
+        "config".into(),
+        "memory".into(),
+        "audit".into(),
+        "knowledge".into(),
+    ]
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_keep: default_backup_max_keep(),
+            include_dirs: default_backup_include_dirs(),
+        }
+    }
+}
+
+// ── Data Retention ──────────────────────────────────────────────
+
+/// Data retention and purge configuration (`[data_retention]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DataRetentionConfig {
+    /// Enable the `data_management` tool.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Days of data to retain before purge eligibility.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u64,
+}
+
+fn default_retention_days() -> u64 {
+    90
+}
+
+impl Default for DataRetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            retention_days: default_retention_days(),
         }
     }
 }
@@ -4204,6 +4276,8 @@ impl Default for Config {
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            backup: BackupConfig::default(),
+            data_retention: DataRetentionConfig::default(),
         }
     }
 }
@@ -6310,6 +6384,8 @@ default_temperature = 0.7
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            backup: BackupConfig::default(),
+            data_retention: DataRetentionConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -6601,6 +6677,8 @@ tool_dispatcher = "xml"
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            backup: BackupConfig::default(),
+            data_retention: DataRetentionConfig::default(),
         };
 
         config.save().await.unwrap();
