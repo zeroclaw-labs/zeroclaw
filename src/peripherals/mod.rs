@@ -229,6 +229,7 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
 }
 
 #[cfg(not(feature = "hardware"))]
+#[allow(clippy::unused_async)]
 pub async fn create_peripheral_tools(_config: &PeripheralsConfig) -> Result<Vec<Box<dyn Tool>>> {
     Ok(Vec::new())
 }

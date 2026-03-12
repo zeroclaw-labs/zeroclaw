@@ -1,5 +1,6 @@
 /target
 firmware/*/target
+web/dist/
 *.db
 *.db-journal
 .DS_Store
@@ -33,3 +34,13 @@ credentials.json
 .bash_history
 playground/
 .zeroclaw/*
+
+# Skill eval workspaces (test outputs, transcripts, grading)
+.claude/skills/*-workspace/
+
+# Local state backups
+.local-state-backups/
+*.local-state-backup/
+
+# Coverage artifacts
+lcov.info

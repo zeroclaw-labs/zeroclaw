@@ -7,10 +7,10 @@ use anyhow::{Context, Result};
 use std::process::Command;
 
 /// ZeroClaw Arduino Uno base firmware (capabilities, gpio_read, gpio_write).
-const FIRMWARE_INO: &str = include_str!("../../firmware/zeroclaw-arduino/zeroclaw-arduino.ino");
+const FIRMWARE_INO: &str = include_str!("../../firmware/arduino/arduino.ino");
 
 const FQBN: &str = "arduino:avr:uno";
-const SKETCH_NAME: &str = "zeroclaw-arduino";
+const SKETCH_NAME: &str = "arduino";
 
 /// Check if arduino-cli is available.
 pub fn arduino_cli_available() -> bool {
