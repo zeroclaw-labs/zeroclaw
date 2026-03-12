@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::config::schema::WebhookAuditConfig;
+use crate::config::schema::{PayloadFormat, WebhookAuditConfig};
 use crate::hooks::traits::{HookHandler, HookResult};
 use crate::tools::traits::ToolResult;
 
@@ -141,6 +142,54 @@ impl WebhookAuditHook {
     }
 }
 
+// ── Payload formatting ───────────────────────────────────────────
+
+impl PayloadFormat {
+    /// Transform the raw audit payload into the shape expected by the target.
+    ///
+    /// Returns the formatted payload and the appropriate Content-Type header value.
+    pub fn format_payload(&self, payload: Value) -> (Value, &'static str) {
+        match self {
+            PayloadFormat::Json => (payload, "application/json"),
+            PayloadFormat::Slack => {
+                let text = Self::to_slack_mrkdwn(&payload);
+                (serde_json::json!({ "text": text }), "application/json")
+            }
+        }
+    }
+
+    /// Render the audit payload as a single Slack mrkdwn line.
+    ///
+    /// Format: `:wrench: `tool` · :white_check_mark:/:x: (Nms)`
+    /// Optional second line for args or error details.
+    fn to_slack_mrkdwn(payload: &Value) -> String {
+        let tool = payload["tool"].as_str().unwrap_or("unknown");
+        let success = payload["success"].as_bool().unwrap_or(false);
+        let duration_ms = payload["duration_ms"].as_u64().unwrap_or(0);
+
+        let status_emoji = if success { ":white_check_mark:" } else { ":x:" };
+
+        let mut text = format!(":wrench: `{tool}` · {status_emoji} ({duration_ms}ms)");
+
+        // Append error on failure.
+        if let Some(error) = payload["error"].as_str() {
+            let _ = write!(text, "\n> Error: {error}");
+        }
+
+        // Append args if present (not null).
+        if !payload["args"].is_null() {
+            let args_str = match payload["args"].as_str() {
+                Some(s) => s.to_string(),
+                None => serde_json::to_string(&payload["args"]).unwrap_or_default(),
+            };
+            if !args_str.is_empty() {
+                let _ = write!(text, "\n> `{args_str}`");
+            }
+        }
+
+        text
+    }
+}
 /// Simple glob matching: `*` matches any sequence of characters.
 fn glob_matches(pattern: &str, text: &str) -> bool {
     if pattern == "*" {
@@ -566,5 +615,89 @@ mod tests {
     #[test]
     fn validate_url_rejects_non_http_scheme() {
         assert!(validate_webhook_url("ftp://example.com/hook").is_err());
+    }
+
+    // ── PayloadFormat tests ──────────────────────────────────────
+
+    #[test]
+    fn format_payload_json_passthrough() {
+        let payload = serde_json::json!({
+            "event": "tool_call",
+            "tool": "shell",
+            "success": true,
+            "duration_ms": 42,
+            "error": null,
+            "args": null,
+        });
+        let (formatted, content_type) = PayloadFormat::Json.format_payload(payload.clone());
+        assert_eq!(formatted, payload);
+        assert_eq!(content_type, "application/json");
+    }
+
+    #[test]
+    fn format_payload_slack_success() {
+        let payload = serde_json::json!({
+            "event": "tool_call",
+            "timestamp": "2026-03-12T14:00:00Z",
+            "tool": "shell",
+            "success": true,
+            "duration_ms": 42,
+            "error": null,
+            "args": null,
+        });
+        let (formatted, content_type) = PayloadFormat::Slack.format_payload(payload);
+        assert_eq!(content_type, "application/json");
+
+        let text = formatted["text"].as_str().expect("should have text field");
+        assert!(
+            text.contains("`shell`"),
+            "should contain tool name in backticks"
+        );
+        assert!(text.contains("42ms"), "should contain duration");
+        assert!(
+            text.contains(":white_check_mark:"),
+            "should contain success emoji"
+        );
+        assert!(!text.contains(":x:"), "should not contain failure emoji");
+    }
+
+    #[test]
+    fn format_payload_slack_failure_with_error() {
+        let payload = serde_json::json!({
+            "event": "tool_call",
+            "timestamp": "2026-03-12T14:00:00Z",
+            "tool": "http_request",
+            "success": false,
+            "duration_ms": 1203,
+            "error": "connection timeout",
+            "args": null,
+        });
+        let (formatted, _) = PayloadFormat::Slack.format_payload(payload);
+
+        let text = formatted["text"].as_str().expect("should have text field");
+        assert!(text.contains("`http_request`"), "should contain tool name");
+        assert!(text.contains(":x:"), "should contain failure emoji");
+        assert!(text.contains("1203ms"), "should contain duration");
+        assert!(
+            text.contains("connection timeout"),
+            "should contain error message"
+        );
+    }
+
+    #[test]
+    fn format_payload_slack_with_args() {
+        let payload = serde_json::json!({
+            "event": "tool_call",
+            "timestamp": "2026-03-12T14:00:00Z",
+            "tool": "shell",
+            "success": true,
+            "duration_ms": 42,
+            "error": null,
+            "args": {"command": "ls -la"},
+        });
+        let (formatted, _) = PayloadFormat::Slack.format_payload(payload);
+
+        let text = formatted["text"].as_str().expect("should have text field");
+        assert!(text.contains("ls -la"), "should contain args content");
     }
 }
