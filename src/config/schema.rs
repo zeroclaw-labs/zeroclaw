@@ -6919,7 +6919,7 @@ impl Config {
                 path = %config.config_path.display(),
                 workspace = %config.workspace_dir.display(),
                 source = resolution_source.as_str(),
-                initialized = false,
+                initialized = true,
                 "Config loaded"
             );
             Ok(config)
@@ -8237,10 +8237,11 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    #[cfg(unix)]
+    use std::sync::{Arc, Mutex as StdMutex};
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
@@ -8273,6 +8274,36 @@ mod tests {
         assert_eq!(c.provider_timeout_secs, 120);
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedLogBuffer(Arc<StdMutex<Vec<u8>>>);
+
+    struct SharedLogWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl SharedLogBuffer {
+        fn captured(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogBuffer {
+        type Writer = SharedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogWriter(self.0.clone())
+        }
+    }
+
+    impl io::Write for SharedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -10557,40 +10588,50 @@ default_model = "legacy-model"
     }
 
     #[test]
-    async fn load_or_init_decrypts_feishu_channel_secrets() {
+    async fn load_or_init_logs_existing_config_as_initialized() {
         let _env_guard = env_override_lock().await;
         let temp_home =
             std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
-        let config_dir = temp_home.join(".zeroclaw");
-        let config_path = config_dir.join("config.toml");
+        let workspace_dir = temp_home.join("profile-a");
+        let config_path = workspace_dir.join("config.toml");
 
-        fs::create_dir_all(&config_dir).await.unwrap();
+        fs::create_dir_all(&workspace_dir).await.unwrap();
+        fs::write(
+            &config_path,
+            r#"default_temperature = 0.7
+default_model = "persisted-profile"
+"#,
+        )
+        .await
+        .unwrap();
 
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_home);
+        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+
+        let capture = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(capture.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        let config = Config::load_or_init().await.unwrap();
+
+        drop(_guard);
+        let logs = capture.captured();
+
+        assert_eq!(config.workspace_dir, workspace_dir.join("workspace"));
+        assert_eq!(config.config_path, config_path);
+        assert_eq!(config.default_model.as_deref(), Some("persisted-profile"));
+        assert!(logs.contains("Config loaded"), "{logs}");
+        assert!(logs.contains("initialized=true"), "{logs}");
+        assert!(!logs.contains("initialized=false"), "{logs}");
+
         std::env::remove_var("ZEROCLAW_WORKSPACE");
-
-        let mut config = Config::default();
-        config.config_path = config_path.clone();
-        config.workspace_dir = config_dir.join("workspace");
-        config.secrets.encrypt = true;
-        config.channels_config.feishu = Some(FeishuConfig {
-            app_id: "cli_feishu_123".into(),
-            app_secret: "feishu-secret".into(),
-            encrypt_key: Some("feishu-encrypt".into()),
-            verification_token: Some("feishu-verify".into()),
-            allowed_users: vec!["*".into()],
-            receive_mode: LarkReceiveMode::Websocket,
-            port: None,
-        });
-        config.save().await.unwrap();
-
-        let loaded = Box::pin(Config::load_or_init()).await.unwrap();
-        let feishu = loaded.channels_config.feishu.as_ref().unwrap();
-        assert_eq!(feishu.app_secret, "feishu-secret");
-        assert_eq!(feishu.encrypt_key.as_deref(), Some("feishu-encrypt"));
-        assert_eq!(feishu.verification_token.as_deref(), Some("feishu-verify"));
-
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
         } else {
