@@ -7,7 +7,7 @@ data:
   daily-meeting-summary.md: |
     ---
     name: daily-meeting-summary
-    version: 1.0.0
+    version: 1.1.0
     description: Fetches and summarizes daily meeting recordings from Speakr (meetings.coffee-anon.com)
     always: true
     ---
@@ -18,39 +18,42 @@ data:
     It records audio, transcribes with WhisperX, diarizes speakers, and generates LLM summaries.
     Your job is to fetch the pre-generated summaries and compile a daily digest.
 
-    ## Authentication
+    ## Environment Notes
 
-    Use the `SPEAKR_API_TOKEN` environment variable:
+    Your sandbox does not have `curl` installed. All HTTP requests use Python's `urllib` module,
+    which is available in the standard library. The examples below all use this approach.
 
-    ```
-    curl -s -H "Authorization: Bearer $SPEAKR_API_TOKEN" <url>
-    ```
-
-    ## CRITICAL — Context Size Safety
+    ## Fetching from Speakr — The Safe Pattern
 
     The Speakr API returns FULL recording objects including raw transcriptions, which can be
-    600K+ characters per recording. You MUST pipe all API responses through the jq filter below
-    to strip heavy fields. Failure to do this WILL exceed your context window and crash the request.
+    600K+ characters per recording. If you load that into your context, the request will exceed
+    your context window and fail. Every API call goes through this Python script, which fetches
+    the data and strips the heavy fields before printing:
 
-    **Always use this pattern:**
     ```
-    curl -s -H "Authorization: Bearer $SPEAKR_API_TOKEN" "<url>" | python3 -c "
-    import sys, json
-    data = json.load(sys.stdin)
+    python3 -c "
+    import json, os, urllib.request
+    token = os.environ['SPEAKR_API_TOKEN']
+    req = urllib.request.Request('https://meetings.coffee-anon.com/api/recordings?q=date:today&per_page=100',
+        headers={'Authorization': f'Bearer {token}'})
+    data = json.loads(urllib.request.urlopen(req).read())
     recs = data.get('recordings', [data] if 'id' in data else [])
+    drop = ['transcription','transcription_text','summary_html','notes_html','audio_available',
+            'audio_deleted_at','can_delete','can_edit','deletion_exempt','file_size','mime_type',
+            'original_filename','processing_time_seconds','transcription_duration_seconds',
+            'is_highlighted','is_inbox','is_owner','is_shared','has_group_tags','user_id',
+            'completed_at','created_at']
     for r in recs:
-        for key in ['transcription', 'transcription_text', 'summary_html', 'notes_html',
-                     'audio_available', 'audio_deleted_at', 'can_delete', 'can_edit',
-                     'deletion_exempt', 'file_size', 'mime_type', 'original_filename',
-                     'processing_time_seconds', 'transcription_duration_seconds',
-                     'is_highlighted', 'is_inbox', 'is_owner', 'is_shared', 'has_group_tags',
-                     'user_id', 'completed_at', 'created_at']:
-            r.pop(key, None)
+        for k in drop: r.pop(k, None)
     print(json.dumps(recs, indent=2))
     "
     ```
 
-    **Never fetch a raw recording without this filter. Never use `GET /api/recordings/<id>` without it.**
+    To fetch a single recording by ID, change the URL to
+    `https://meetings.coffee-anon.com/api/recordings/RECORDING_ID` — the same script works
+    because it handles both list and single-object responses.
+
+    Never print raw API output without stripping first.
 
     ## Bootstrap — Cron Setup
 
@@ -59,7 +62,7 @@ data:
 
     - **name**: `speakr-daily-summary`
     - **schedule**: cron `0 12,17 * * 1-5` (noon and 5pm MT, weekdays)
-    - **timezone**: `America/Edmonton`
+    - **timezone**: `America/Vancouver`
     - **job_type**: `agent`
     - **session_target**: `isolated`
     - **prompt**: Use the Cron Job Prompt below verbatim.
@@ -69,12 +72,22 @@ data:
     Use this as the `prompt` field when creating the cron job:
 
     ```
+    You are running inside an isolated cron session. Your job is to execute the steps below
+    directly using `shell` and other tools. You are already inside the cron job — execute the
+    work yourself rather than dispatching it again via cron_run, which would create an infinite
+    loop of sessions each trying to re-dispatch the same job.
+
     Fetch today's completed meeting recordings from Speakr and write a daily digest.
 
-    Step 1 — Fetch and filter recordings (CRITICAL: always strip transcription to avoid context overflow):
-      curl -s -H "Authorization: Bearer $SPEAKR_API_TOKEN" "https://meetings.coffee-anon.com/api/recordings?q=date:today&per_page=100" | python3 -c "
-      import sys, json
-      data = json.load(sys.stdin)
+    Step 1 — Fetch and filter recordings. The sandbox does not have curl, so use Python's urllib.
+    The filter strips transcription and other heavy fields that would blow past the context window:
+
+      python3 -c "
+      import json, os, urllib.request
+      token = os.environ['SPEAKR_API_TOKEN']
+      req = urllib.request.Request('https://meetings.coffee-anon.com/api/recordings?q=date:today&per_page=100',
+          headers={'Authorization': f'Bearer {token}'})
+      data = json.loads(urllib.request.urlopen(req).read())
       recs = data.get('recordings', [])
       drop = ['transcription','transcription_text','summary_html','notes_html','audio_available',
               'audio_deleted_at','can_delete','can_edit','deletion_exempt','file_size','mime_type',
@@ -134,8 +147,8 @@ data:
 
     1. **Check the memory file first**: Read `/data/workspace/memory/meetings-YYYY-MM-DD.md`
        - If it exists, use it to answer. This is the fast path.
-    2. **If the file doesn't exist or is stale**: Run the fetch manually using the same
-       curl-with-filter pattern from the Cron Job Prompt above. NEVER fetch raw API data.
+    2. **If the file doesn't exist or is stale**: Run the fetch manually using the safe Python
+       pattern from above. Never print raw API data without stripping.
     3. **For past dates**: Fetch with `q=date:YYYY-MM-DD` or check `meetings-YYYY-MM-DD.md`.
 
     ## API Quick Reference
@@ -148,7 +161,7 @@ data:
     | `GET /api/recordings?q=date:thisweek` | This week |
     | `GET /api/recordings?q=date_from:X&date_to:Y` | Date range |
 
-    **Always pipe through the python filter above.** Base URL: `https://meetings.coffee-anon.com`
+    Base URL: `https://meetings.coffee-anon.com`
 
     ## Filtered Response Shape (after stripping)
 
@@ -182,19 +195,21 @@ data:
 
     **Step 1 — Download transcription to disk:**
     ```
-    curl -s -H "Authorization: Bearer $SPEAKR_API_TOKEN" \
-      "https://meetings.coffee-anon.com/api/recordings/RECORDING_ID" \
-      | python3 -c "
-    import sys, json
-    r = json.load(sys.stdin)
+    python3 -c "
+    import json, os, urllib.request
+    rec_id = 'RECORDING_ID'
+    token = os.environ['SPEAKR_API_TOKEN']
+    req = urllib.request.Request(f'https://meetings.coffee-anon.com/api/recordings/{rec_id}',
+        headers={'Authorization': f'Bearer {token}'})
+    r = json.loads(urllib.request.urlopen(req).read())
     t = r.get('transcription', [])
-    out = f\"\"\"# Transcript: {r.get('title','Untitled')}
-    # Participants: {r.get('participants','Unknown')}
-    # Date: {r.get('meeting_date','Unknown')}
-    # Segments: {len(t) if isinstance(t,list) else 'plain-text'}
-    # Duration: {t[-1]['end'] if isinstance(t,list) and t else 'unknown'}s
-    ---
-    \"\"\"
+    out = f'# Transcript: {r.get(\"title\",\"Untitled\")}\n'
+    out += f'# Participants: {r.get(\"participants\",\"Unknown\")}\n'
+    out += f'# Date: {r.get(\"meeting_date\",\"Unknown\")}\n'
+    out += f'# Segments: {len(t) if isinstance(t,list) else \"plain-text\"}\n'
+    if isinstance(t, list) and t:
+        out += f'# Duration: {t[-1].get(\"end\",\"unknown\")}s\n'
+    out += '---\n'
     if isinstance(t, list):
         for seg in t:
             speaker = seg.get('speaker','?')
@@ -203,9 +218,10 @@ data:
             out += f'[{int(start//60):02d}:{int(start%60):02d}] {speaker}: {text}\n'
     else:
         out += str(t)
-    with open('/data/workspace/memory/transcript-' + str(r.get('id','unknown')) + '.md','w') as f:
+    path = f'/data/workspace/memory/transcript-{rec_id}.md'
+    with open(path,'w') as f:
         f.write(out)
-    print(f'Wrote {len(out):,} chars to transcript-{r.get(\"id\",\"unknown\")}.md')
+    print(f'Wrote {len(out):,} chars to {path}')
     print(f'Segments: {len(t) if isinstance(t,list) else \"plain-text\"}')
     "
     ```
@@ -229,5 +245,5 @@ data:
     7. You: answer Dan's question
     8. You: delete `transcript-549.md`
 
-    **Never load a full transcript into a single shell command output or tool result.**
+    Never load a full transcript into a single shell command output or tool result.
     Always write to file first, then read chunks.
