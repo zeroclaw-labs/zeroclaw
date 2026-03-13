@@ -336,7 +336,12 @@ pub struct TelegramChannel {
 }
 
 impl TelegramChannel {
-    pub fn new(bot_token: String, allowed_users: Vec<String>, mention_only: bool, ack_reaction: bool) -> Self {
+    pub fn new(
+        bot_token: String,
+        allowed_users: Vec<String>,
+        mention_only: bool,
+        ack_reaction: bool,
+    ) -> Self {
         let normalized_allowed = Self::normalize_allowed_users(allowed_users);
         let pairing = if normalized_allowed.is_empty() {
             let guard = PairingGuard::new(true, &[]);
@@ -2966,7 +2971,12 @@ mod tests {
 
     #[test]
     fn telegram_user_denied_when_none_of_identities_match() {
-        let ch = TelegramChannel::new("t".into(), vec!["alice".into(), "987654321".into()], false, true);
+        let ch = TelegramChannel::new(
+            "t".into(),
+            vec!["alice".into(), "987654321".into()],
+            false,
+            true,
+        );
         assert!(!ch.is_any_user_allowed(["unknown", "123456789"]));
     }
 
@@ -4068,16 +4078,16 @@ mod tests {
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;
 
-        let ch =
-            TelegramChannel::new("token".into(), vec!["*".into()], false, true).with_transcription(tc);
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false, true)
+            .with_transcription(tc);
         assert!(ch.transcription.is_some());
     }
 
     #[test]
     fn with_transcription_skips_when_disabled() {
         let tc = crate::config::TranscriptionConfig::default(); // enabled = false
-        let ch =
-            TelegramChannel::new("token".into(), vec!["*".into()], false, true).with_transcription(tc);
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false, true)
+            .with_transcription(tc);
         assert!(ch.transcription.is_none());
     }
 
@@ -4103,8 +4113,8 @@ mod tests {
         tc.enabled = true;
         tc.max_duration_secs = 5;
 
-        let ch =
-            TelegramChannel::new("token".into(), vec!["*".into()], false, true).with_transcription(tc);
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false, true)
+            .with_transcription(tc);
         let update = serde_json::json!({
             "message": {
                 "message_id": 2,
