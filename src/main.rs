@@ -140,6 +140,10 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
+        /// Reinitialize from scratch (backup and reset all configuration)
+        #[arg(long)]
+        reinit: bool,
+
         /// Reconfigure channels only (fast repair flow)
         #[arg(long)]
         channels_only: bool,
@@ -184,7 +188,7 @@ Examples:
         #[arg(long)]
         model: Option<String>,
 
-        /// Temperature override (0.0 - 2.0). Defaults to config.default_temperature when omitted.
+        /// Temperature (0.0 - 2.0, defaults to config default_temperature)
         #[arg(short, long, value_parser = parse_temperature)]
         temperature: Option<f64>,
 
@@ -320,7 +324,7 @@ Examples:
     #[command(long_about = "\
 Manage communication channels.
 
-Add, remove, list, and health-check channels that connect ZeroClaw \
+Add, remove, list, send, and health-check channels that connect ZeroClaw \
 to messaging platforms. Supported channel types: telegram, discord, \
 slack, whatsapp, matrix, imessage, email.
 
@@ -329,7 +333,8 @@ Examples:
   zeroclaw channel doctor
   zeroclaw channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
   zeroclaw channel remove my-bot
-  zeroclaw channel bind-telegram zeroclaw_user")]
+  zeroclaw channel bind-telegram zeroclaw_user
+  zeroclaw channel send 'Alert!' --channel-id telegram --recipient 123456789")]
     Channel {
         #[command(subcommand)]
         channel_command: ChannelCommands,
@@ -690,6 +695,7 @@ async fn main() -> Result<()> {
     if let Commands::Onboard {
         interactive,
         force,
+        reinit,
         channels_only,
         api_key,
         provider,
@@ -699,6 +705,7 @@ async fn main() -> Result<()> {
     {
         let interactive = *interactive;
         let force = *force;
+        let reinit = *reinit;
         let channels_only = *channels_only;
         let api_key = api_key.clone();
         let provider = provider.clone();
@@ -708,6 +715,12 @@ async fn main() -> Result<()> {
         if interactive && channels_only {
             bail!("Use either --interactive or --channels-only, not both");
         }
+        if reinit && channels_only {
+            bail!("Use either --reinit or --channels-only, not both");
+        }
+        if reinit && !interactive {
+            bail!("--reinit requires --interactive mode");
+        }
         if channels_only
             && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
         {
@@ -716,6 +729,48 @@ async fn main() -> Result<()> {
         if channels_only && force {
             bail!("--channels-only does not accept --force");
         }
+
+        // Handle --reinit: backup and reset configuration
+        if reinit {
+            let (zeroclaw_dir, _) =
+                crate::config::schema::resolve_runtime_dirs_for_onboarding().await?;
+
+            if zeroclaw_dir.exists() {
+                let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
+                let backup_dir = format!("{}.backup.{}", zeroclaw_dir.display(), timestamp);
+
+                println!("⚠️  Reinitializing ZeroClaw configuration...");
+                println!("   Current config directory: {}", zeroclaw_dir.display());
+                println!(
+                    "   This will back up your existing config to: {}",
+                    backup_dir
+                );
+                println!();
+                print!("Continue? [y/N] ");
+                std::io::stdout()
+                    .flush()
+                    .context("Failed to flush stdout")?;
+
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if !answer.trim().eq_ignore_ascii_case("y") {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+                println!();
+
+                // Rename existing directory as backup
+                tokio::fs::rename(&zeroclaw_dir, &backup_dir)
+                    .await
+                    .with_context(|| {
+                        format!("Failed to backup existing config to {}", backup_dir)
+                    })?;
+
+                println!("   Backup created successfully.");
+                println!("   Starting fresh initialization...\n");
+            }
+        }
+
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
         } else if interactive {
@@ -765,10 +820,6 @@ async fn main() -> Result<()> {
             temperature,
             peripheral,
         } => {
-            // Implement temperature fallback logic:
-            // 1. Use --temperature if provided
-            // 2. Use config.default_temperature if --temperature not provided
-            // 3. Use hardcoded 0.7 if config.default_temperature not set (from Config::default())
             let final_temperature = temperature.unwrap_or(config.default_temperature);
 
             agent::run(
