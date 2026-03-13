@@ -250,7 +250,9 @@ pub struct CronRunsQuery {
 }
 
 fn clamp_cron_runs_limit(limit: Option<usize>) -> usize {
-    limit.unwrap_or(DEFAULT_CRON_RUNS_LIMIT).clamp(1, MAX_CRON_RUNS_LIMIT)
+    limit
+        .unwrap_or(DEFAULT_CRON_RUNS_LIMIT)
+        .clamp(1, MAX_CRON_RUNS_LIMIT)
 }
 
 /// POST /api/cron — add a new cron job
