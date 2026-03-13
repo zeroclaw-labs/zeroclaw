@@ -8005,6 +8005,7 @@ dependencies = [
  "serde-big-array",
  "serde_ignored",
  "serde_json",
+ "sha1",
  "sha2",
  "shellexpand",
  "tempfile",
