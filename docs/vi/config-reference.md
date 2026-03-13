@@ -392,6 +392,7 @@ Ví dụ:
 
 - `[channels_config.telegram]`
 - `[channels_config.discord]`
+- `[channels_config.wecom]`
 - `[channels_config.whatsapp]`
 - `[channels_config.email]`
 
@@ -408,6 +409,26 @@ Lưu ý:
 - Khi `zeroclaw channel start` đang chạy, thay đổi `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url` và `reliability.*` được áp dụng nóng từ `config.toml` ở tin nhắn tiếp theo.
 
 Xem ma trận kênh và hành vi allowlist chi tiết tại [channels-reference.md](channels-reference.md).
+
+### `[channels_config.wecom]`
+
+| Khóa | Mặc định | Mục đích |
+|---|---|---|
+| `bot_id` | _bắt buộc_ | Bot ID của WeCom AI bot dùng để subscribe qua WebSocket |
+| `secret` | _bắt buộc_ | Secret cho kết nối dài của WeCom dùng khi subscribe |
+| `allowed_users` | `[]` | Các giá trị `userid` người gửi được phép; rỗng sẽ từ chối tất cả người dùng, `"*"` cho phép mọi người dùng |
+| `allowed_groups` | `[]` | Các giá trị `chatid` nhóm được phép; rỗng sẽ từ chối tất cả nhóm, `"*"` cho phép mọi nhóm |
+| `stream_mode` | `partial` | Chế độ stream nháp qua `aibot_respond_msg`; `off` sẽ tắt cập nhật nháp theo tiến trình |
+| `file_retention_days` | `7` | Số ngày giữ file đính kèm WeCom đã tải trong workspace cache |
+| `max_file_size_mb` | `20` | Kích thước file tối đa được tải xuống và giải mã |
+| `history_max_turns` | `50` | Số lượt hội thoại tối đa giữ lại cho mỗi phạm vi hội thoại WeCom |
+
+Lưu ý:
+
+- WeCom dùng API WebSocket kết nối dài nên không cần webhook callback công khai hay cấu hình mã hóa webhook.
+- Với tin nhắn nhóm, ZeroClaw cho phép nếu `userid` người gửi khớp `allowed_users` hoặc `chatid` nhóm khớp `allowed_groups`.
+- `stream_mode = "partial"` giữ phản hồi stream theo tiến trình; đặt `off` nếu chỉ muốn gửi câu trả lời cuối cùng.
+- Thông báo chủ động yêu cầu tiến trình channel WeCom phải đang kết nối (`zeroclaw channel start` hoặc chế độ daemon).
 
 ### `[channels_config.whatsapp]`
 

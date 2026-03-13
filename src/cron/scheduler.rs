@@ -1,5 +1,6 @@
 use crate::channels::{
-    Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
+    get_live_channel, Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel,
+    TelegramChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -365,6 +366,18 @@ pub(crate) async fn deliver_announcement(
                 mm.mention_only.unwrap_or(false),
             );
             channel.send(&SendMessage::new(output, target)).await?;
+        }
+        "wecom" => {
+            config
+                .channels_config
+                .wecom
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("wecom channel not configured"))?;
+            if let Some(live_channel) = get_live_channel("wecom") {
+                live_channel.send(&SendMessage::new(output, target)).await?;
+            } else {
+                anyhow::bail!("wecom channel is not connected");
+            }
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }

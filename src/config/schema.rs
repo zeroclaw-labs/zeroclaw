@@ -2834,6 +2834,8 @@ pub struct ChannelsConfig {
     pub dingtalk: Option<DingTalkConfig>,
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
+    /// WeCom AI bot channel configuration.
+    pub wecom: Option<WeComConfig>,
     #[cfg(feature = "channel-nostr")]
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
@@ -2920,6 +2922,10 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.qq.as_ref())),
                 self.qq.is_some()
             ),
+            (
+                Box::new(ConfigWrapper::new(self.wecom.as_ref())),
+                self.wecom.is_some()
+            ),
             #[cfg(feature = "channel-nostr")]
             (
                 Box::new(ConfigWrapper::new(self.nostr.as_ref())),
@@ -2968,6 +2974,7 @@ impl Default for ChannelsConfig {
             feishu: None,
             dingtalk: None,
             qq: None,
+            wecom: None,
             #[cfg(feature = "channel-nostr")]
             nostr: None,
             clawdtalk: None,
@@ -3796,6 +3803,59 @@ impl ChannelConfig for QQConfig {
     }
     fn desc() -> &'static str {
         "Tencent QQ Bot"
+    }
+}
+
+fn default_wecom_file_retention_days() -> u32 {
+    7
+}
+
+fn default_wecom_max_file_size_mb() -> u64 {
+    20
+}
+
+fn default_wecom_history_max_turns() -> usize {
+    50
+}
+
+fn default_wecom_stream_mode() -> StreamMode {
+    StreamMode::Partial
+}
+
+/// WeCom AI Bot channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WeComConfig {
+    /// Bot ID for WeCom WebSocket subscription.
+    pub bot_id: String,
+    /// Secret for WeCom WebSocket subscription authentication.
+    pub secret: String,
+    /// Allowed WeCom user IDs. Empty = deny all, "*" = allow all users.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Allowed WeCom group chat IDs. Empty = deny all groups, "*" = allow all groups.
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
+    /// File retention days for downloaded WeCom attachments under workspace cache.
+    #[serde(default = "default_wecom_file_retention_days")]
+    pub file_retention_days: u32,
+    /// Maximum accepted file size (MiB) for WeCom attachment download attempts.
+    #[serde(default = "default_wecom_max_file_size_mb")]
+    pub max_file_size_mb: u64,
+    /// Maximum retained turns per WeCom conversation scope.
+    #[serde(default = "default_wecom_history_max_turns")]
+    pub history_max_turns: usize,
+    /// Streaming mode for progressive draft delivery over the WeCom long connection.
+    #[serde(default = "default_wecom_stream_mode")]
+    pub stream_mode: StreamMode,
+}
+
+impl ChannelConfig for WeComConfig {
+    fn name() -> &'static str {
+        "WeCom"
+    }
+
+    fn desc() -> &'static str {
+        "WeCom AI Bot (WebSocket)"
     }
 }
 
@@ -5824,6 +5884,7 @@ default_temperature = 0.7
                 feishu: None,
                 dingtalk: None,
                 qq: None,
+                wecom: None,
                 #[cfg(feature = "channel-nostr")]
                 nostr: None,
                 clawdtalk: None,
@@ -6213,6 +6274,42 @@ tool_dispatcher = "xml"
     }
 
     #[test]
+    async fn wecom_config_serde() {
+        let wc = WeComConfig {
+            bot_id: "bot123".into(),
+            secret: "secret456".into(),
+            allowed_users: vec!["zeroclaw_user".into(), "*".into()],
+            allowed_groups: vec!["zeroclaw_group".into()],
+            file_retention_days: 14,
+            max_file_size_mb: 32,
+            history_max_turns: 80,
+            stream_mode: StreamMode::Partial,
+        };
+        let json = serde_json::to_string(&wc).unwrap();
+        let parsed: WeComConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.bot_id, "bot123");
+        assert_eq!(parsed.secret, "secret456");
+        assert_eq!(parsed.allowed_users, vec!["zeroclaw_user", "*"]);
+        assert_eq!(parsed.allowed_groups, vec!["zeroclaw_group"]);
+        assert_eq!(parsed.file_retention_days, 14);
+        assert_eq!(parsed.max_file_size_mb, 32);
+        assert_eq!(parsed.history_max_turns, 80);
+        assert_eq!(parsed.stream_mode, StreamMode::Partial);
+    }
+
+    #[test]
+    async fn wecom_config_defaults_stream_partial() {
+        let json = r#"{"bot_id":"bot123","secret":"secret456"}"#;
+        let parsed: WeComConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.allowed_users.is_empty());
+        assert!(parsed.allowed_groups.is_empty());
+        assert_eq!(parsed.file_retention_days, 7);
+        assert_eq!(parsed.max_file_size_mb, 20);
+        assert_eq!(parsed.history_max_turns, 50);
+        assert_eq!(parsed.stream_mode, StreamMode::Partial);
+    }
+
+    #[test]
     async fn discord_config_serde() {
         let dc = DiscordConfig {
             bot_token: "discord-token".into(),
@@ -6404,6 +6501,7 @@ allowed_users = ["@ops:matrix.org"]
             feishu: None,
             dingtalk: None,
             qq: None,
+            wecom: None,
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: 300,
@@ -6618,6 +6716,7 @@ channel_id = "C123"
             feishu: None,
             dingtalk: None,
             qq: None,
+            wecom: None,
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: 300,

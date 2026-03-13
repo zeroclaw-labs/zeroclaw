@@ -476,6 +476,7 @@ Examples:
 
 - `[channels_config.telegram]`
 - `[channels_config.discord]`
+- `[channels_config.wecom]`
 - `[channels_config.whatsapp]`
 - `[channels_config.linq]`
 - `[channels_config.nextcloud_talk]`
@@ -493,6 +494,26 @@ Notes:
 - Telegram-only interruption behavior is controlled with `channels_config.telegram.interrupt_on_new_message` (default `false`).
   When enabled, a newer message from the same sender in the same chat cancels the in-flight request and preserves interrupted user context.
 - While `zeroclaw channel start` is running, updates to `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
+
+### `[channels_config.wecom]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `bot_id` | _required_ | WeCom AI bot ID used for WebSocket subscription |
+| `secret` | _required_ | WeCom long-connection secret used during subscription |
+| `allowed_users` | `[]` | Allowed sender `userid` values; empty denies all users, `"*"` allows all users |
+| `allowed_groups` | `[]` | Allowed group `chatid` values; empty denies all groups, `"*"` allows all groups |
+| `stream_mode` | `partial` | Draft streaming mode over `aibot_respond_msg`; `off` disables progressive draft updates |
+| `file_retention_days` | `7` | Retention window for downloaded WeCom attachments under the workspace cache |
+| `max_file_size_mb` | `20` | Maximum attachment size to download and decrypt |
+| `history_max_turns` | `50` | Maximum retained turns per WeCom conversation scope |
+
+Notes:
+
+- WeCom uses the long-connection WebSocket API, so no public webhook callback or webhook encryption config is required.
+- For group chats, ZeroClaw authorizes either the sender `userid` via `allowed_users` or the group `chatid` via `allowed_groups`.
+- `stream_mode = "partial"` preserves progressive streaming replies; set `off` to send only the final reply.
+- Proactive announcements require the WeCom channel process to stay connected (`zeroclaw channel start` or daemon mode).
 
 ### `[channels_config.nostr]`
 
