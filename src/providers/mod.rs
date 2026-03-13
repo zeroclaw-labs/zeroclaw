@@ -1074,11 +1074,20 @@ fn create_provider_with_url_and_options(
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
         "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
-        "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
-            api_url,
-            key,
-            options.reasoning_enabled,
-        ))),
+        "ollama" => {
+
+                let env_url = std::env::var("ZEROCLAW_PROVIDER_URL").ok();
+
+                let api_url = env_url
+                    .as_deref()
+                    .or(api_url);
+
+                Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
+                    api_url,
+                    key,
+                    options.reasoning_enabled,
+                )))
+        },
         "gemini" | "google" | "google-gemini" => {
             let state_dir = options
                 .zeroclaw_dir
@@ -3103,5 +3112,23 @@ mod tests {
         };
         assert_eq!(options.extra_headers.len(), 1);
         assert_eq!(options.extra_headers.get("X-Title").unwrap(), "zeroclaw");
+    }
+
+    #[test]
+    fn env_provider_url_overrides_api_url() {
+        std::env::set_var("ZEROCLAW_PROVIDER_URL", "http://env-ollama:11434");
+
+        let options = ProviderRuntimeOptions::default();
+
+        let provider = create_provider_with_url_and_options(
+            "ollama",
+            Some("http://config-ollama:11434"),
+            None,
+            &options,
+        );
+
+        assert!(provider.is_ok());
+
+        std::env::remove_var("ZEROCLAW_PROVIDER_URL");
     }
 }
