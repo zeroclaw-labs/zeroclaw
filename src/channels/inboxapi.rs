@@ -123,6 +123,8 @@ pub struct InboxApiChannel {
     client: reqwest::Client,
     seen_messages: Arc<Mutex<HashSet<String>>>,
     tokens: Arc<RwLock<Option<TokenState>>>,
+    /// ISO 8601 timestamp cursor for incremental polling via `search_emails`.
+    last_poll_time: Arc<Mutex<Option<String>>>,
 }
 
 impl InboxApiChannel {
@@ -132,6 +134,7 @@ impl InboxApiChannel {
             client: reqwest::Client::new(),
             seen_messages: Arc::new(Mutex::new(HashSet::new())),
             tokens: Arc::new(RwLock::new(None)),
+            last_poll_time: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -624,12 +627,19 @@ impl InboxApiChannel {
         debug!("InboxAPI polling for emails...");
 
         let mut args = serde_json::json!({
-            "content_format": self.config.content_format
+            "content_format": self.config.content_format,
+            "limit": EMAIL_POLL_LIMIT,
         });
-        // Request only recent emails (limit)
-        args["limit"] = serde_json::json!(EMAIL_POLL_LIMIT);
 
-        let result = self.call_mcp_tool("get_emails", args, Some(&token)).await?;
+        // Use timestamp cursor for incremental polling
+        let since = self.last_poll_time.lock().await.clone();
+        if let Some(ref ts) = since {
+            args["since"] = serde_json::json!(ts);
+        }
+
+        let result = self
+            .call_mcp_tool("search_emails", args, Some(&token))
+            .await?;
 
         let content_text = match Self::extract_text_content(&result) {
             Some(text) => text,
@@ -665,6 +675,8 @@ impl InboxApiChannel {
                 .map(|r| format!(" (server reported: {})", r))
                 .unwrap_or_default()
         );
+
+        let mut latest_received_at: Option<String> = None;
 
         for email in email_array {
             let msg_id = email["id"]
@@ -705,10 +717,8 @@ impl InboxApiChannel {
                 .unwrap_or("");
             let content = format!("Subject: {}\n\n{}", subject, body);
 
-            let thread_ts = email["in_reply_to"]
-                .as_str()
-                .or_else(|| email["thread_id"].as_str())
-                .map(|s| s.to_string());
+            // Always set thread_ts to the email's own ID so replies use send_reply
+            let thread_ts = Some(msg_id.clone());
 
             let timestamp = email["received_at"]
                 .as_str()
@@ -720,6 +730,21 @@ impl InboxApiChannel {
                         .map(|d| d.as_secs())
                         .unwrap_or(0)
                 });
+
+            // Track latest timestamp for the since cursor
+            let received_at_str = email["date"]
+                .as_str()
+                .or_else(|| email["received_at"].as_str())
+                .map(|s| s.to_string());
+            if let Some(ref ts) = received_at_str {
+                match (&latest_received_at, ts.as_str()) {
+                    (None, _) => latest_received_at = Some(ts.clone()),
+                    (Some(prev), cur) if cur > prev.as_str() => {
+                        latest_received_at = Some(ts.clone());
+                    }
+                    _ => {}
+                }
+            }
 
             let msg = ChannelMessage {
                 id: msg_id,
@@ -734,6 +759,11 @@ impl InboxApiChannel {
             if tx.send(msg).await.is_err() {
                 return Ok(()); // Channel closed
             }
+        }
+
+        // Advance the since cursor for next poll
+        if let Some(ts) = latest_received_at {
+            *self.last_poll_time.lock().await = Some(ts);
         }
 
         Ok(())
@@ -1051,7 +1081,8 @@ mod tests {
         let subject = email["subject"].as_str().unwrap_or("(no subject)");
         let body = email["body"].as_str().unwrap_or("");
         let content = format!("Subject: {}\n\n{}", subject, body);
-        let thread_ts = email["in_reply_to"].as_str().map(|s| s.to_string());
+        // thread_ts is always the email's own ID so replies use send_reply
+        let thread_ts = Some(msg_id.clone());
 
         let msg = ChannelMessage {
             id: msg_id.clone(),
@@ -1067,7 +1098,7 @@ mod tests {
         assert_eq!(msg.sender, "sender@example.com");
         assert_eq!(msg.content, "Subject: Test\n\nHello");
         assert_eq!(msg.channel, "inboxapi");
-        assert_eq!(msg.thread_ts.as_deref(), Some("msg-parent"));
+        assert_eq!(msg.thread_ts.as_deref(), Some("msg-abc"));
     }
 
     // ── Credential serialization ────────────────────────────────────────
@@ -1243,5 +1274,97 @@ mod tests {
             .or_else(|| response.as_array());
         assert!(arr.is_some());
         assert_eq!(arr.unwrap().len(), 0);
+    }
+
+    // ── Timestamp cursor ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn last_poll_time_starts_none() {
+        let channel = InboxApiChannel::new(InboxApiConfig::default());
+        let cursor = channel.last_poll_time.lock().await;
+        assert!(cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn last_poll_time_advances_after_set() {
+        let channel = InboxApiChannel::new(InboxApiConfig::default());
+        *channel.last_poll_time.lock().await = Some("2026-03-14T00:00:00Z".to_string());
+        let cursor = channel.last_poll_time.lock().await.clone();
+        assert_eq!(cursor.as_deref(), Some("2026-03-14T00:00:00Z"));
+    }
+
+    // ── thread_ts always set to msg_id ─────────────────────────────────
+
+    #[test]
+    fn thread_ts_set_to_email_message_id() {
+        // When an email has no in_reply_to, thread_ts should still be Some(msg_id)
+        let email = serde_json::json!({
+            "id": "msg-new",
+            "from": "sender@example.com",
+            "subject": "Fresh email",
+            "body": "No parent thread"
+        });
+
+        let msg_id = email["id"].as_str().unwrap().to_string();
+        let thread_ts = Some(msg_id.clone());
+
+        assert_eq!(thread_ts.as_deref(), Some("msg-new"));
+    }
+
+    #[test]
+    fn thread_ts_ignores_in_reply_to_uses_own_id() {
+        // Even when in_reply_to exists, thread_ts is the email's own ID
+        let email = serde_json::json!({
+            "id": "msg-reply",
+            "from": "sender@example.com",
+            "subject": "Re: Original",
+            "body": "Reply body",
+            "in_reply_to": "msg-original"
+        });
+
+        let msg_id = email["id"].as_str().unwrap().to_string();
+        let thread_ts = Some(msg_id.clone());
+
+        assert_eq!(thread_ts.as_deref(), Some("msg-reply"));
+    }
+
+    // ── Timestamp cursor tracking logic ────────────────────────────────
+
+    #[test]
+    fn latest_received_at_tracks_max_timestamp() {
+        let emails = vec![
+            serde_json::json!({"date": "2026-03-14T10:00:00Z"}),
+            serde_json::json!({"date": "2026-03-14T12:00:00Z"}),
+            serde_json::json!({"date": "2026-03-14T11:00:00Z"}),
+        ];
+
+        let mut latest_received_at: Option<String> = None;
+        for email in &emails {
+            let received_at_str = email["date"]
+                .as_str()
+                .or_else(|| email["received_at"].as_str())
+                .map(|s| s.to_string());
+            if let Some(ref ts) = received_at_str {
+                match (&latest_received_at, ts.as_str()) {
+                    (None, _) => latest_received_at = Some(ts.clone()),
+                    (Some(prev), cur) if cur > prev.as_str() => {
+                        latest_received_at = Some(ts.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        assert_eq!(latest_received_at.as_deref(), Some("2026-03-14T12:00:00Z"));
+    }
+
+    #[test]
+    fn latest_received_at_falls_back_to_received_at() {
+        let email = serde_json::json!({"received_at": "2026-03-14T09:00:00Z"});
+        let ts = email["date"]
+            .as_str()
+            .or_else(|| email["received_at"].as_str())
+            .map(|s| s.to_string());
+        assert_eq!(ts.as_deref(), Some("2026-03-14T09:00:00Z"));
     }
 }
