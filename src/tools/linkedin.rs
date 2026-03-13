@@ -1,5 +1,6 @@
 use super::linkedin_client::LinkedInClient;
 use super::traits::{Tool, ToolResult};
+use crate::config::LinkedInContentConfig;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -9,18 +10,73 @@ use std::sync::Arc;
 pub struct LinkedInTool {
     security: Arc<SecurityPolicy>,
     workspace_dir: PathBuf,
+    api_version: String,
+    content_config: LinkedInContentConfig,
 }
 
 impl LinkedInTool {
-    pub fn new(security: Arc<SecurityPolicy>, workspace_dir: PathBuf) -> Self {
+    pub fn new(
+        security: Arc<SecurityPolicy>,
+        workspace_dir: PathBuf,
+        api_version: String,
+        content_config: LinkedInContentConfig,
+    ) -> Self {
         Self {
             security,
             workspace_dir,
+            api_version,
+            content_config,
         }
     }
 
     fn is_write_action(action: &str) -> bool {
         matches!(action, "create_post" | "comment" | "react" | "delete_post")
+    }
+
+    fn build_content_strategy_summary(&self) -> String {
+        let c = &self.content_config;
+        let mut parts = Vec::new();
+
+        if !c.persona.is_empty() {
+            parts.push(format!("## Persona\n{}", c.persona));
+        }
+
+        if !c.topics.is_empty() {
+            parts.push(format!("## Topics\n{}", c.topics.join(", ")));
+        }
+
+        if !c.rss_feeds.is_empty() {
+            let feeds: Vec<String> = c.rss_feeds.iter().map(|f| format!("- {f}")).collect();
+            parts.push(format!(
+                "## RSS Feeds (fetch titles only for inspiration)\n{}",
+                feeds.join("\n")
+            ));
+        }
+
+        if !c.github_users.is_empty() {
+            parts.push(format!(
+                "## GitHub Users (check public activity)\n{}",
+                c.github_users.join(", ")
+            ));
+        }
+
+        if !c.github_repos.is_empty() {
+            let repos: Vec<String> = c.github_repos.iter().map(|r| format!("- {r}")).collect();
+            parts.push(format!(
+                "## GitHub Repos (highlight project work)\n{}",
+                repos.join("\n")
+            ));
+        }
+
+        if !c.instructions.is_empty() {
+            parts.push(format!("## Posting Instructions\n{}", c.instructions));
+        }
+
+        if parts.is_empty() {
+            return "No content strategy configured. Add [linkedin.content] settings to config.toml with rss_feeds, github_repos, persona, topics, and instructions.".to_string();
+        }
+
+        parts.join("\n\n")
     }
 }
 
@@ -31,7 +87,7 @@ impl Tool for LinkedInTool {
     }
 
     fn description(&self) -> &str {
-        "Manage LinkedIn: create posts, list your posts, comment, react, delete posts, view engagement, and get profile info. Requires LINKEDIN_* credentials in .env file."
+        "Manage LinkedIn: create posts, list your posts, comment, react, delete posts, view engagement, get profile info, and read the configured content strategy. Requires LINKEDIN_* credentials in .env file."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -47,7 +103,8 @@ impl Tool for LinkedInTool {
                         "react",
                         "delete_post",
                         "get_engagement",
-                        "get_profile"
+                        "get_profile",
+                        "get_content_strategy"
                     ],
                     "description": "The LinkedIn action to perform"
                 },
@@ -110,9 +167,17 @@ impl Tool for LinkedInTool {
             });
         }
 
-        let client = LinkedInClient::new(self.workspace_dir.clone());
+        let client = LinkedInClient::new(self.workspace_dir.clone(), self.api_version.clone());
 
         match action {
+            "get_content_strategy" => {
+                let strategy = self.build_content_strategy_summary();
+                return Ok(ToolResult {
+                    success: true,
+                    output: strategy,
+                    error: None,
+                });
+            }
             "create_post" => {
                 let text = match args.get("text").and_then(|v| v.as_str()).map(str::trim) {
                     Some(t) if !t.is_empty() => t.to_string(),
@@ -314,7 +379,12 @@ mod tests {
     }
 
     fn make_tool(level: AutonomyLevel, max_actions: u32) -> LinkedInTool {
-        LinkedInTool::new(test_security(level, max_actions), PathBuf::from("/tmp"))
+        LinkedInTool::new(
+            test_security(level, max_actions),
+            PathBuf::from("/tmp"),
+            "202602".to_string(),
+            LinkedInContentConfig::default(),
+        )
     }
 
     #[test]
@@ -587,5 +657,67 @@ mod tests {
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("Unknown action"));
         assert!(result.error.as_ref().unwrap().contains("send_message"));
+    }
+
+    #[tokio::test]
+    async fn get_content_strategy_returns_config() {
+        let content = LinkedInContentConfig {
+            rss_feeds: vec!["https://medium.com/feed/tag/rust".into()],
+            github_users: vec!["rareba".into()],
+            github_repos: vec!["zeroclaw-labs/zeroclaw".into()],
+            topics: vec!["cybersecurity".into(), "Rust".into()],
+            persona: "Security engineer and Rust developer".into(),
+            instructions: "Write concise posts with hashtags".into(),
+        };
+        let tool = LinkedInTool::new(
+            test_security(AutonomyLevel::Full, 100),
+            PathBuf::from("/tmp"),
+            "202602".to_string(),
+            content,
+        );
+
+        let result = tool
+            .execute(json!({"action": "get_content_strategy"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Security engineer"));
+        assert!(result.output.contains("cybersecurity"));
+        assert!(result.output.contains("medium.com"));
+        assert!(result.output.contains("zeroclaw-labs/zeroclaw"));
+        assert!(result.output.contains("rareba"));
+        assert!(result.output.contains("Write concise posts"));
+    }
+
+    #[tokio::test]
+    async fn get_content_strategy_empty_config_shows_hint() {
+        let tool = make_tool(AutonomyLevel::Full, 100);
+
+        let result = tool
+            .execute(json!({"action": "get_content_strategy"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("No content strategy configured"));
+    }
+
+    #[tokio::test]
+    async fn get_content_strategy_not_rate_limited_as_write() {
+        // get_content_strategy is a read action and should work in read-only mode
+        let tool = make_tool(AutonomyLevel::ReadOnly, 100);
+
+        let result = tool
+            .execute(json!({"action": "get_content_strategy"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+    }
+
+    #[test]
+    fn parameters_schema_includes_get_content_strategy() {
+        let tool = make_tool(AutonomyLevel::Full, 100);
+        let schema = tool.parameters_schema();
+        let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
+        assert!(actions.contains(&json!("get_content_strategy")));
     }
 }

@@ -11,6 +11,7 @@ const LINKEDIN_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 pub struct LinkedInClient {
     workspace_dir: PathBuf,
+    api_version: String,
 }
 
 #[derive(Debug)]
@@ -45,8 +46,11 @@ pub struct EngagementSummary {
 }
 
 impl LinkedInClient {
-    pub fn new(workspace_dir: PathBuf) -> Self {
-        Self { workspace_dir }
+    pub fn new(workspace_dir: PathBuf, api_version: String) -> Self {
+        Self {
+            workspace_dir,
+            api_version,
+        }
     }
 
     fn parse_env_value(raw: &str) -> String {
@@ -131,14 +135,17 @@ impl LinkedInClient {
         )
     }
 
-    fn api_headers(token: &str) -> HeaderMap {
+    fn api_headers(&self, token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         let bearer = format!("Bearer {}", token);
         headers.insert(
             reqwest::header::AUTHORIZATION,
             HeaderValue::from_str(&bearer).expect("valid bearer token header"),
         );
-        headers.insert("LinkedIn-Version", HeaderValue::from_static("202402"));
+        headers.insert(
+            "LinkedIn-Version",
+            HeaderValue::from_str(&self.api_version).expect("valid api version header"),
+        );
         headers.insert(
             "X-Restli-Protocol-Version",
             HeaderValue::from_static("2.0.0"),
@@ -154,7 +161,7 @@ impl LinkedInClient {
         body: Option<serde_json::Value>,
     ) -> anyhow::Result<reqwest::Response> {
         let client = Self::client();
-        let headers = Self::api_headers(token);
+        let headers = self.api_headers(token);
 
         let mut req = client.request(method.clone(), url).headers(headers);
         if let Some(ref json_body) = body {
@@ -169,7 +176,7 @@ impl LinkedInClient {
             let new_token = self.refresh_token(&creds).await?;
             self.update_env_token(&new_token).await?;
 
-            let retry_headers = Self::api_headers(&new_token);
+            let retry_headers = self.api_headers(&new_token);
             let mut retry_req = Self::client().request(method, url).headers(retry_headers);
             if let Some(json_body) = body {
                 retry_req = retry_req.json(&json_body);
@@ -608,7 +615,7 @@ mod tests {
         )
         .unwrap();
 
-        let client = LinkedInClient::new(tmp.path().to_path_buf());
+        let client = LinkedInClient::new(tmp.path().to_path_buf(), "202602".to_string());
         let creds = client.get_credentials().await.unwrap();
 
         assert_eq!(creds.client_id, "cid123");
@@ -631,7 +638,7 @@ mod tests {
         )
         .unwrap();
 
-        let client = LinkedInClient::new(tmp.path().to_path_buf());
+        let client = LinkedInClient::new(tmp.path().to_path_buf(), "202602".to_string());
         let creds = client.get_credentials().await.unwrap();
 
         assert_eq!(creds.client_id, "cid_quoted");
@@ -653,7 +660,7 @@ mod tests {
         )
         .unwrap();
 
-        let client = LinkedInClient::new(tmp.path().to_path_buf());
+        let client = LinkedInClient::new(tmp.path().to_path_buf(), "202602".to_string());
         let creds = client.get_credentials().await.unwrap();
 
         assert_eq!(creds.client_id, "cid_sq");
@@ -673,7 +680,7 @@ mod tests {
         )
         .unwrap();
 
-        let client = LinkedInClient::new(tmp.path().to_path_buf());
+        let client = LinkedInClient::new(tmp.path().to_path_buf(), "202602".to_string());
         let creds = client.get_credentials().await.unwrap();
 
         assert_eq!(creds.client_id, "cid_exp");
@@ -698,7 +705,7 @@ mod tests {
         )
         .unwrap();
 
-        let client = LinkedInClient::new(tmp.path().to_path_buf());
+        let client = LinkedInClient::new(tmp.path().to_path_buf(), "202602".to_string());
         let creds = client.get_credentials().await.unwrap();
 
         assert_eq!(creds.client_id, "cid_c");
@@ -721,7 +728,7 @@ mod tests {
         )
         .unwrap();
 
-        let client = LinkedInClient::new(tmp.path().to_path_buf());
+        let client = LinkedInClient::new(tmp.path().to_path_buf(), "202602".to_string());
         let creds = client.get_credentials().await.unwrap();
 
         assert_eq!(creds.refresh_token.as_deref(), Some("refresh123"));
@@ -741,7 +748,7 @@ mod tests {
         )
         .unwrap();
 
-        let client = LinkedInClient::new(tmp.path().to_path_buf());
+        let client = LinkedInClient::new(tmp.path().to_path_buf(), "202602".to_string());
         let creds = client.get_credentials().await.unwrap();
 
         assert!(creds.refresh_token.is_none());
@@ -759,7 +766,7 @@ mod tests {
         )
         .unwrap();
 
-        let client = LinkedInClient::new(tmp.path().to_path_buf());
+        let client = LinkedInClient::new(tmp.path().to_path_buf(), "202602".to_string());
         let err = client.get_credentials().await.unwrap_err();
         assert!(err.to_string().contains("LINKEDIN_CLIENT_ID"));
     }
@@ -776,7 +783,7 @@ mod tests {
         )
         .unwrap();
 
-        let client = LinkedInClient::new(tmp.path().to_path_buf());
+        let client = LinkedInClient::new(tmp.path().to_path_buf(), "202602".to_string());
         let err = client.get_credentials().await.unwrap_err();
         assert!(err.to_string().contains("LINKEDIN_ACCESS_TOKEN"));
     }
@@ -793,7 +800,7 @@ mod tests {
         )
         .unwrap();
 
-        let client = LinkedInClient::new(tmp.path().to_path_buf());
+        let client = LinkedInClient::new(tmp.path().to_path_buf(), "202602".to_string());
         let err = client.get_credentials().await.unwrap_err();
         assert!(err.to_string().contains("LINKEDIN_PERSON_ID"));
     }
@@ -801,7 +808,7 @@ mod tests {
     #[tokio::test]
     async fn credentials_fail_no_env_file() {
         let tmp = TempDir::new().unwrap();
-        let client = LinkedInClient::new(tmp.path().to_path_buf());
+        let client = LinkedInClient::new(tmp.path().to_path_buf(), "202602".to_string());
         let err = client.get_credentials().await.unwrap_err();
         assert!(err.to_string().contains("Failed to read"));
     }
@@ -821,7 +828,7 @@ mod tests {
         )
         .unwrap();
 
-        let client = LinkedInClient::new(tmp.path().to_path_buf());
+        let client = LinkedInClient::new(tmp.path().to_path_buf(), "202602".to_string());
         client.update_env_token("new_token_value").await.unwrap();
 
         let updated = fs::read_to_string(&env_path).unwrap();
@@ -847,7 +854,7 @@ mod tests {
         )
         .unwrap();
 
-        let client = LinkedInClient::new(tmp.path().to_path_buf());
+        let client = LinkedInClient::new(tmp.path().to_path_buf(), "202602".to_string());
         client.update_env_token("refreshed_tok").await.unwrap();
 
         let updated = fs::read_to_string(&env_path).unwrap();
@@ -868,7 +875,7 @@ mod tests {
         )
         .unwrap();
 
-        let client = LinkedInClient::new(tmp.path().to_path_buf());
+        let client = LinkedInClient::new(tmp.path().to_path_buf(), "202602".to_string());
         client.update_env_token("new_sq").await.unwrap();
 
         let updated = fs::read_to_string(&env_path).unwrap();
@@ -886,7 +893,7 @@ mod tests {
         )
         .unwrap();
 
-        let client = LinkedInClient::new(tmp.path().to_path_buf());
+        let client = LinkedInClient::new(tmp.path().to_path_buf(), "202602".to_string());
         let err = client.update_env_token("tok").await.unwrap_err();
         assert!(err.to_string().contains("LINKEDIN_ACCESS_TOKEN not found"));
     }
@@ -918,14 +925,16 @@ mod tests {
 
     #[test]
     fn api_headers_contains_required_headers() {
-        let headers = LinkedInClient::api_headers("test_token");
+        let tmp = TempDir::new().unwrap();
+        let client = LinkedInClient::new(tmp.path().to_path_buf(), "202602".to_string());
+        let headers = client.api_headers("test_token");
         assert_eq!(
             headers.get("Authorization").unwrap().to_str().unwrap(),
             "Bearer test_token"
         );
         assert_eq!(
             headers.get("LinkedIn-Version").unwrap().to_str().unwrap(),
-            "202402"
+            "202602"
         );
         assert_eq!(
             headers

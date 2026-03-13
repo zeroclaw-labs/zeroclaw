@@ -354,6 +354,8 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(LinkedInTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),
+            root_config.linkedin.api_version.clone(),
+            root_config.linkedin.content.clone(),
         )));
     }
 
