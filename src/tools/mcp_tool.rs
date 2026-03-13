@@ -52,6 +52,18 @@ impl Tool for McpToolWrapper {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // Strip the `approved` field before forwarding to the MCP server.
+        // ZeroClaw's security model injects `approved: bool` into built-in tool
+        // calls for supervised-mode confirmation. MCP servers have no knowledge
+        // of this field and will reject calls that include it as an unexpected
+        // parameter. We strip it here so MCP servers always receive clean args.
+        let args = match args {
+            serde_json::Value::Object(mut map) => {
+                map.remove("approved");
+                serde_json::Value::Object(map)
+            }
+            other => other,
+        };
         match self.registry.call_tool(&self.prefixed_name, args).await {
             Ok(output) => Ok(ToolResult {
                 success: true,
@@ -170,5 +182,49 @@ mod tests {
             output: "hello".to_string(),
             error: None,
         };
+    }
+
+    // ── approved-field stripping ───────────────────────────────────────────
+    // ZeroClaw's security model injects `approved: bool` into built-in tool args.
+    // MCP servers are unaware of this field and reject calls that include it.
+    // execute() must strip it before forwarding.
+
+    #[tokio::test]
+    async fn execute_strips_approved_field_from_object_args() {
+        // The wrapper should remove `approved` before forwarding to the registry.
+        // We use an empty registry (returns "unknown MCP tool" error), but the key
+        // assertion is that the call does not fail due to an unexpected `approved` arg.
+        let registry = empty_registry().await;
+        let def = make_def("do_thing", Some("Do a thing"), json!({}));
+        let wrapper = McpToolWrapper::new("srv__do_thing".to_string(), def, registry);
+        // With `approved` present the call must not propagate an Err — non-fatal.
+        let result = wrapper
+            .execute(json!({ "approved": true, "param": "value" }))
+            .await
+            .expect("execute must be non-fatal even with approved field");
+        // The registry returns a non-fatal error (unknown tool), not a panic/Err.
+        assert!(!result.success);
+        // Crucially: error must not mention `approved` as the cause.
+        let err = result.error.unwrap_or_default();
+        assert!(
+            !err.to_lowercase().contains("approved"),
+            "approved field should have been stripped, but got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_handles_non_object_args_without_panic() {
+        // Non-object args (string, null, array) must pass through without panicking
+        // or returning an Err — the registry error path covers the failure case.
+        let registry = empty_registry().await;
+        let def = make_def("noop", None, json!({}));
+        let wrapper = McpToolWrapper::new("srv__noop".to_string(), def, registry);
+        for non_obj in [json!(null), json!("a string"), json!([1, 2, 3])] {
+            let result = wrapper
+                .execute(non_obj.clone())
+                .await
+                .expect("non-object args must not propagate Err");
+            assert!(!result.success, "expected non-fatal failure for {non_obj}");
+        }
     }
 }
