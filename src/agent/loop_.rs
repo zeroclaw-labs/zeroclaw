@@ -2620,21 +2620,23 @@ pub async fn run_tool_call_loop(
             progress_indices.push(progress_idx);
         }
 
-        let has_terminal = executable_calls.iter().any(|c| is_terminal_tool(&c.name));
+        let has_terminal = executable_calls
+            .iter()
+            .any(|c| is_terminal_tool(&c.name, tools_registry));
         let has_search = executable_calls
             .iter()
-            .any(|c| is_search_phase_tool(&c.name));
+            .any(|c| is_search_phase_tool(&c.name, tools_registry));
         let executed_outcomes = if has_terminal && has_search && executable_calls.len() > 1 {
             // Mixed batch: search tools must complete before submit_contacts runs.
             // Prevents the model from fabricating contacts before search results arrive.
             tracing::info!(
                 terminal = executable_calls
                     .iter()
-                    .filter(|c| is_terminal_tool(&c.name))
+                    .filter(|c| is_terminal_tool(&c.name, tools_registry))
                     .count(),
                 search = executable_calls
                     .iter()
-                    .filter(|c| is_search_phase_tool(&c.name))
+                    .filter(|c| is_search_phase_tool(&c.name, tools_registry))
                     .count(),
                 "tool.staged_execution mixed_batch=true",
             );
@@ -2760,7 +2762,7 @@ pub async fn run_tool_call_loop(
             .iter()
             .flatten()
             .find(|(name, _, outcome)| {
-                is_terminal_tool(name)
+                is_terminal_tool(name, tools_registry)
                     && outcome.success
                     && !outcome.output.trim().is_empty()
                     && outcome.output.trim() != "done"

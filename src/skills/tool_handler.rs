@@ -70,6 +70,8 @@ pub struct SkillToolHandler {
     tool_def: SkillTool,
     parameters: Vec<SkillToolParameter>,
     security: Arc<SecurityPolicy>,
+    tags: Vec<String>,
+    terminal: bool,
 }
 
 impl SkillToolHandler {
@@ -92,11 +94,15 @@ impl SkillToolHandler {
             );
         }
         let parameters = Self::extract_parameters(&tool_def)?;
+        let tags = tool_def.tags.clone();
+        let terminal = tool_def.terminal;
         Ok(Self {
             skill_name,
             tool_def,
             parameters,
             security,
+            tags,
+            terminal,
         })
     }
 
@@ -414,6 +420,14 @@ impl Tool for SkillToolHandler {
         self.generate_schema()
     }
 
+    fn tags(&self) -> &[String] {
+        &self.tags
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
@@ -608,6 +622,8 @@ mod tests {
             .iter()
             .cloned()
             .collect(),
+            tags: vec![],
+            terminal: false,
         };
 
         let security = Arc::new(SecurityPolicy::default());
@@ -635,6 +651,8 @@ mod tests {
             .iter()
             .cloned()
             .collect(),
+            tags: vec![],
+            terminal: false,
         };
 
         let security = Arc::new(SecurityPolicy::default());
@@ -666,6 +684,8 @@ mod tests {
             .iter()
             .cloned()
             .collect(),
+            tags: vec![],
+            terminal: false,
         };
 
         let security = Arc::new(SecurityPolicy::default());
@@ -692,6 +712,8 @@ mod tests {
                 .iter()
                 .cloned()
                 .collect(),
+            tags: vec![],
+            terminal: false,
         };
 
         let security = Arc::new(SecurityPolicy::default());
@@ -726,6 +748,8 @@ mod tests {
             .iter()
             .cloned()
             .collect(),
+        tags: vec![],
+        terminal: false,
         };
 
         let security = Arc::new(SecurityPolicy::default());
@@ -763,6 +787,8 @@ mod tests {
             .iter()
             .cloned()
             .collect(),
+        tags: vec![],
+        terminal: false,
         };
 
         let security = Arc::new(SecurityPolicy::default());
@@ -803,6 +829,8 @@ mod tests {
             .iter()
             .cloned()
             .collect(),
+            tags: vec![],
+            terminal: false,
         };
 
         let security = Arc::new(SecurityPolicy::default());
@@ -839,6 +867,8 @@ mod tests {
             .iter()
             .cloned()
             .collect(),
+        tags: vec![],
+        terminal: false,
         };
 
         let security = Arc::new(SecurityPolicy::default());
@@ -880,6 +910,8 @@ mod tests {
             .iter()
             .cloned()
             .collect(),
+        tags: vec![],
+        terminal: false,
         };
 
         let security = Arc::new(SecurityPolicy::default());
@@ -920,6 +952,8 @@ mod tests {
             .iter()
             .cloned()
             .collect(),
+            tags: vec![],
+            terminal: false,
         };
 
         let security = Arc::new(SecurityPolicy::default());

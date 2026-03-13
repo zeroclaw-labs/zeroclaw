@@ -3468,6 +3468,7 @@ mod tests {
             channel: "whatsapp".into(),
             timestamp: 1,
             thread_ts: None,
+            reply_to_message_id: None,
         };
 
         let key = whatsapp_memory_key(&msg);
@@ -3484,6 +3485,7 @@ mod tests {
             channel: "qq".into(),
             timestamp: 1,
             thread_ts: Some("msg-123".into()),
+            reply_to_message_id: None,
         };
 
         let key = qq_memory_key(&msg);

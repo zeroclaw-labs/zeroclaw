@@ -476,6 +476,8 @@ pub struct TelegramChannel {
     /// Whether to send emoji reaction acknowledgments to incoming messages.
     ack_enabled: bool,
     ack_reaction: Option<AckReactionConfig>,
+    /// Progress verbosity for draft streaming on this channel.
+    progress_mode: crate::config::ProgressMode,
 }
 
 impl TelegramChannel {
@@ -516,6 +518,7 @@ impl TelegramChannel {
             workspace_dir: None,
             ack_reaction: None,
             ack_enabled,
+            progress_mode: crate::config::ProgressMode::default(),
         }
     }
 
@@ -528,6 +531,12 @@ impl TelegramChannel {
     /// Configure ACK reaction policy.
     pub fn with_ack_reaction(mut self, ack_reaction: Option<AckReactionConfig>) -> Self {
         self.ack_reaction = ack_reaction;
+        self
+    }
+
+    /// Configure progress verbosity for draft streaming on this channel.
+    pub fn with_progress_mode(mut self, mode: crate::config::ProgressMode) -> Self {
+        self.progress_mode = mode;
         self
     }
 
@@ -891,6 +900,7 @@ impl TelegramChannel {
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
+            reply_to_message_id: None, // callback queries are not reply-able
         })
     }
 
@@ -1791,6 +1801,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
+            reply_to_message_id: Some(message_id.to_string()),
         })
     }
 
@@ -1939,6 +1950,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
+            reply_to_message_id: Some(message_id.to_string()),
         })
     }
 
@@ -2098,6 +2110,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
+            reply_to_message_id: Some(message_id.to_string()),
         })
     }
 
@@ -3023,6 +3036,48 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 impl Channel for TelegramChannel {
     fn name(&self) -> &str {
         "telegram"
+    }
+
+    fn progress_mode(&self) -> Option<crate::config::ProgressMode> {
+        Some(self.progress_mode)
+    }
+
+    fn format_incoming_content(&self, msg: &ChannelMessage) -> String {
+        // In group chats (negative chat_id), prefix with sender identity so the LLM
+        // knows who is speaking.
+        let chat_id = msg
+            .reply_target
+            .split_once(':')
+            .map_or(msg.reply_target.as_str(), |(chat_id, _)| chat_id);
+        if !chat_id.starts_with('-') {
+            return msg.content.clone();
+        }
+        let sender = msg.sender.trim();
+        if sender.is_empty() {
+            return msg.content.clone();
+        }
+        let prefix = format!("[sender: {sender}]");
+        if msg.content.trim_start().starts_with(prefix.as_str()) {
+            return msg.content.clone();
+        }
+        format!("{prefix} {}", msg.content)
+    }
+
+    fn delivery_instructions(&self) -> Option<&str> {
+        Some(
+            "When responding on Telegram:\n\
+             - Include media markers for files or URLs that should be sent as attachments\n\
+             - Use **bold** for key terms, section titles, and important info (renders as <b>)\n\
+             - Use *italic* for emphasis (renders as <i>)\n\
+             - Use `backticks` for inline code, commands, or technical terms\n\
+             - Use triple backticks for code blocks\n\
+             - Use emoji naturally to add personality — but don't overdo it\n\
+             - Be concise and direct. Skip filler phrases like 'Great question!' or 'Certainly!'\n\
+             - Structure longer answers with bold headers, not raw markdown ## headers\n\
+             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+        )
     }
 
     fn supports_draft_updates(&self) -> bool {
