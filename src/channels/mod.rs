@@ -15,6 +15,7 @@
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
 pub mod bluesky;
+pub mod bridge;
 pub mod clawdtalk;
 pub mod cli;
 pub mod dingtalk;
@@ -55,6 +56,7 @@ pub mod whatsapp_storage;
 pub mod whatsapp_web;
 
 pub use bluesky::BlueskyChannel;
+pub use bridge::BridgeChannel;
 pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
@@ -3277,6 +3279,13 @@ fn collect_configured_channels(
 ) -> Vec<ConfiguredChannel> {
     let _ = matrix_skip_context;
     let mut channels = Vec::new();
+
+    if let Some(ref bridge_cfg) = config.channels_config.bridge {
+        channels.push(ConfiguredChannel {
+            display_name: "Bridge",
+            channel: Arc::new(BridgeChannel::new(bridge_cfg.clone())),
+        });
+    }
 
     if let Some(ref tg) = config.channels_config.telegram {
         channels.push(ConfiguredChannel {
@@ -7764,6 +7773,19 @@ This is an example JSON object for profile settings."#;
         .await;
         let state = classify_health_result(&result);
         assert_eq!(state, ChannelHealthState::Timeout);
+    }
+
+    #[test]
+    fn collect_configured_channels_includes_bridge_when_configured() {
+        let mut config = Config::default();
+        config.channels_config.bridge = Some(crate::config::schema::BridgeConfig::default());
+
+        let channels = collect_configured_channels(&config, "test");
+
+        assert!(channels.iter().any(|entry| entry.display_name == "Bridge"));
+        assert!(channels
+            .iter()
+            .any(|entry| entry.channel.name() == "bridge"));
     }
 
     #[test]
