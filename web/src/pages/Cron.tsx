@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   Clock,
   Plus,
@@ -7,14 +7,132 @@ import {
   CheckCircle,
   XCircle,
   AlertCircle,
+  ChevronDown,
+  ChevronRight,
+  RefreshCw,
 } from 'lucide-react';
-import type { CronJob } from '@/types/api';
-import { getCronJobs, addCronJob, deleteCronJob } from '@/lib/api';
+import type { CronJob, CronRun } from '@/types/api';
+import { getCronJobs, addCronJob, deleteCronJob, getCronRuns } from '@/lib/api';
 
 function formatDate(iso: string | null): string {
   if (!iso) return '-';
   const d = new Date(iso);
   return d.toLocaleString();
+}
+
+function formatDuration(ms: number | null): string {
+  if (ms === null || ms === undefined) return '-';
+  if (ms < 1000) return `${ms}ms`;
+  const secs = ms / 1000;
+  if (secs < 60) return `${secs.toFixed(1)}s`;
+  return `${(secs / 60).toFixed(1)}m`;
+}
+
+function RunHistoryPanel({ jobId }: { jobId: string }) {
+  const [runs, setRuns] = useState<CronRun[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchRuns = useCallback(() => {
+    setLoading(true);
+    setError(null);
+    getCronRuns(jobId, 20)
+      .then(setRuns)
+      .catch((err) => setError(err.message))
+      .finally(() => setLoading(false));
+  }, [jobId]);
+
+  useEffect(() => {
+    fetchRuns();
+  }, [fetchRuns]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 px-4 py-3 text-gray-400 text-xs">
+        <div className="animate-spin rounded-full h-4 w-4 border border-blue-500 border-t-transparent" />
+        Loading run history...
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="px-4 py-3">
+        <div className="flex items-center justify-between">
+          <span className="text-xs text-red-400">
+            Failed to load run history: {error}
+          </span>
+          <button
+            onClick={fetchRuns}
+            className="text-gray-400 hover:text-white transition-colors"
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (runs.length === 0) {
+    return (
+      <div className="px-4 py-3 flex items-center justify-between">
+        <span className="text-xs text-gray-500">No runs recorded yet.</span>
+        <button
+          onClick={fetchRuns}
+          className="text-gray-400 hover:text-white transition-colors"
+        >
+          <RefreshCw className="h-3.5 w-3.5" />
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="px-4 py-3">
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-xs font-medium text-gray-400">
+          Recent Runs ({runs.length})
+        </span>
+        <button
+          onClick={fetchRuns}
+          className="text-gray-400 hover:text-white transition-colors"
+          title="Refresh runs"
+        >
+          <RefreshCw className="h-3.5 w-3.5" />
+        </button>
+      </div>
+      <div className="space-y-1.5 max-h-60 overflow-y-auto">
+        {runs.map((run) => (
+          <div
+            key={run.id}
+            className="bg-gray-800/60 rounded-lg px-3 py-2 text-xs"
+          >
+            <div className="flex items-center justify-between mb-1">
+              <div className="flex items-center gap-2">
+                {run.status === 'ok' ? (
+                  <CheckCircle className="h-3.5 w-3.5 text-green-400" />
+                ) : (
+                  <XCircle className="h-3.5 w-3.5 text-red-400" />
+                )}
+                <span className="text-gray-300 capitalize">{run.status}</span>
+              </div>
+              <span className="text-gray-500">
+                {formatDuration(run.duration_ms)}
+              </span>
+            </div>
+            <div className="flex items-center gap-3 text-gray-500">
+              <span>{formatDate(run.started_at)}</span>
+            </div>
+            {run.output && (
+              <pre className="mt-1.5 bg-gray-900/70 rounded p-2 text-gray-400 text-xs overflow-x-auto max-h-24 whitespace-pre-wrap break-words">
+                {run.output}
+              </pre>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 export default function Cron() {
@@ -23,6 +141,7 @@ export default function Cron() {
   const [error, setError] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [expandedJob, setExpandedJob] = useState<string | null>(null);
 
   // Form state
   const [formName, setFormName] = useState('');
@@ -250,68 +369,91 @@ export default function Cron() {
             </thead>
             <tbody>
               {jobs.map((job) => (
-                <tr
-                  key={job.id}
-                  className="border-b border-gray-800/50 hover:bg-gray-800/30 transition-colors"
-                >
-                  <td className="px-4 py-3 text-gray-400 font-mono text-xs">
-                    {job.id.slice(0, 8)}
-                  </td>
-                  <td className="px-4 py-3 text-white font-medium">
-                    {job.name ?? '-'}
-                  </td>
-                  <td className="px-4 py-3 text-gray-300 font-mono text-xs max-w-[200px] truncate">
-                    {job.command}
-                  </td>
-                  <td className="px-4 py-3 text-gray-400 text-xs">
-                    {formatDate(job.next_run)}
-                  </td>
-                  <td className="px-4 py-3">
-                    <div className="flex items-center gap-1.5">
-                      {statusIcon(job.last_status)}
-                      <span className="text-gray-300 text-xs capitalize">
-                        {job.last_status ?? '-'}
-                      </span>
-                    </div>
-                  </td>
-                  <td className="px-4 py-3">
-                    <span
-                      className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
-                        job.enabled
-                          ? 'bg-green-900/40 text-green-400 border border-green-700/50'
-                          : 'bg-gray-800 text-gray-500 border border-gray-700'
-                      }`}
-                    >
-                      {job.enabled ? 'Enabled' : 'Disabled'}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 text-right">
-                    {confirmDelete === job.id ? (
-                      <div className="flex items-center justify-end gap-2">
-                        <span className="text-xs text-red-400">Delete?</span>
-                        <button
-                          onClick={() => handleDelete(job.id)}
-                          className="text-red-400 hover:text-red-300 text-xs font-medium"
-                        >
-                          Yes
-                        </button>
-                        <button
-                          onClick={() => setConfirmDelete(null)}
-                          className="text-gray-400 hover:text-white text-xs font-medium"
-                        >
-                          No
-                        </button>
-                      </div>
-                    ) : (
+                <React.Fragment key={job.id}>
+                  <tr
+                    className="border-b border-gray-800/50 hover:bg-gray-800/30 transition-colors"
+                  >
+                    <td className="px-4 py-3 text-gray-400 font-mono text-xs">
                       <button
-                        onClick={() => setConfirmDelete(job.id)}
-                        className="text-gray-400 hover:text-red-400 transition-colors"
+                        onClick={() =>
+                          setExpandedJob((prev) =>
+                            prev === job.id ? null : job.id,
+                          )
+                        }
+                        className="flex items-center gap-1 text-gray-400 hover:text-white transition-colors"
+                        title="Toggle run history"
                       >
-                        <Trash2 className="h-4 w-4" />
+                        {expandedJob === job.id ? (
+                          <ChevronDown className="h-3.5 w-3.5" />
+                        ) : (
+                          <ChevronRight className="h-3.5 w-3.5" />
+                        )}
+                        {job.id.slice(0, 8)}
                       </button>
-                    )}
-                  </td>
-                </tr>
+                    </td>
+                    <td className="px-4 py-3 text-white font-medium">
+                      {job.name ?? '-'}
+                    </td>
+                    <td className="px-4 py-3 text-gray-300 font-mono text-xs max-w-[200px] truncate">
+                      {job.command}
+                    </td>
+                    <td className="px-4 py-3 text-gray-400 text-xs">
+                      {formatDate(job.next_run)}
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-1.5">
+                        {statusIcon(job.last_status)}
+                        <span className="text-gray-300 text-xs capitalize">
+                          {job.last_status ?? '-'}
+                        </span>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3">
+                      <span
+                        className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
+                          job.enabled
+                            ? 'bg-green-900/40 text-green-400 border border-green-700/50'
+                            : 'bg-gray-800 text-gray-500 border border-gray-700'
+                        }`}
+                      >
+                        {job.enabled ? 'Enabled' : 'Disabled'}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      {confirmDelete === job.id ? (
+                        <div className="flex items-center justify-end gap-2">
+                          <span className="text-xs text-red-400">Delete?</span>
+                          <button
+                            onClick={() => handleDelete(job.id)}
+                            className="text-red-400 hover:text-red-300 text-xs font-medium"
+                          >
+                            Yes
+                          </button>
+                          <button
+                            onClick={() => setConfirmDelete(null)}
+                            className="text-gray-400 hover:text-white text-xs font-medium"
+                          >
+                            No
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => setConfirmDelete(job.id)}
+                          className="text-gray-400 hover:text-red-400 transition-colors"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                  {expandedJob === job.id && (
+                    <tr className="bg-gray-900/50">
+                      <td colSpan={7}>
+                        <RunHistoryPanel jobId={job.id} />
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
               ))}
             </tbody>
           </table>
