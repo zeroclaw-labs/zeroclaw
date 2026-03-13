@@ -2233,11 +2233,64 @@ impl Default for KnowledgeConfig {
 ///
 /// When enabled, the `linkedin` tool is registered in the agent tool surface.
 /// Requires `LINKEDIN_*` credentials in the workspace `.env` file.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LinkedInConfig {
-    /// Enable the LinkedIn tool
+    /// Enable the LinkedIn tool.
     #[serde(default)]
     pub enabled: bool,
+
+    /// LinkedIn REST API version header (YYYYMM format).
+    #[serde(default = "default_linkedin_api_version")]
+    pub api_version: String,
+
+    /// Content strategy for automated posting.
+    #[serde(default)]
+    pub content: LinkedInContentConfig,
+}
+
+impl Default for LinkedInConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_version: default_linkedin_api_version(),
+            content: LinkedInContentConfig::default(),
+        }
+    }
+}
+
+fn default_linkedin_api_version() -> String {
+    "202602".to_string()
+}
+
+/// Content strategy configuration for LinkedIn auto-posting (`[linkedin.content]`).
+///
+/// The agent reads this via the `linkedin get_content_strategy` action to know
+/// what feeds to check, which repos to highlight, and how to write posts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct LinkedInContentConfig {
+    /// RSS feed URLs to monitor for topic inspiration (titles only).
+    #[serde(default)]
+    pub rss_feeds: Vec<String>,
+
+    /// GitHub usernames whose public activity to reference.
+    #[serde(default)]
+    pub github_users: Vec<String>,
+
+    /// GitHub repositories to highlight (format: `owner/repo`).
+    #[serde(default)]
+    pub github_repos: Vec<String>,
+
+    /// Topics of expertise and interest for post themes.
+    #[serde(default)]
+    pub topics: Vec<String>,
+
+    /// Professional persona description (name, role, expertise).
+    #[serde(default)]
+    pub persona: String,
+
+    /// Freeform posting instructions for the AI agent.
+    #[serde(default)]
+    pub instructions: String,
 }
 
 // ── Proxy ───────────────────────────────────────────────────────
