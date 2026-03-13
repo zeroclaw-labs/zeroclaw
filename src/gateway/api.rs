@@ -241,6 +241,18 @@ pub async fn handle_api_cron_list(
     }
 }
 
+const DEFAULT_CRON_RUNS_LIMIT: usize = 20;
+const MAX_CRON_RUNS_LIMIT: usize = 100;
+
+#[derive(Debug, Deserialize)]
+pub struct CronRunsQuery {
+    pub limit: Option<usize>,
+}
+
+fn clamp_cron_runs_limit(limit: Option<usize>) -> usize {
+    limit.unwrap_or(DEFAULT_CRON_RUNS_LIMIT).clamp(1, MAX_CRON_RUNS_LIMIT)
+}
+
 /// POST /api/cron — add a new cron job
 pub async fn handle_api_cron_add(
     State(state): State<AppState>,
@@ -271,6 +283,29 @@ pub async fn handle_api_cron_add(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to add cron job: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/cron/:id/runs — list recent cron run history
+pub async fn handle_api_cron_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<CronRunsQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let limit = clamp_cron_runs_limit(params.limit);
+    match crate::cron::list_runs(&config, &id, limit) {
+        Ok(runs) => Json(serde_json::json!({ "runs": runs, "limit": limit })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to list cron runs: {e}")})),
         )
             .into_response(),
     }
@@ -988,6 +1023,14 @@ fn hydrate_config_for_save(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_cron_runs_limit_uses_bounds() {
+        assert_eq!(clamp_cron_runs_limit(None), DEFAULT_CRON_RUNS_LIMIT);
+        assert_eq!(clamp_cron_runs_limit(Some(0)), 1);
+        assert_eq!(clamp_cron_runs_limit(Some(5)), 5);
+        assert_eq!(clamp_cron_runs_limit(Some(500)), MAX_CRON_RUNS_LIMIT);
+    }
 
     #[test]
     fn masking_keeps_toml_valid_and_preserves_api_keys_type() {
