@@ -28,6 +28,7 @@ use crate::config::ObservabilityConfig;
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     match config.backend.as_str() {
         "log" => Box::new(LogObserver::new()),
+        "verbose" => Box::new(VerboseObserver::new()),
         "prometheus" => {
             #[cfg(feature = "observability-prometheus")]
             {
@@ -110,6 +111,15 @@ mod tests {
             ..ObservabilityConfig::default()
         };
         assert_eq!(create_observer(&cfg).name(), "log");
+    }
+
+    #[test]
+    fn factory_verbose_returns_verbose() {
+        let cfg = ObservabilityConfig {
+            backend: "verbose".into(),
+            ..ObservabilityConfig::default()
+        };
+        assert_eq!(create_observer(&cfg).name(), "verbose");
     }
 
     #[test]

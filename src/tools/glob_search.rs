@@ -57,8 +57,10 @@ impl Tool for GlobSearchTool {
             });
         }
 
-        // Security: reject absolute paths
-        if pattern.starts_with('/') || pattern.starts_with('\\') {
+        // Security: reject absolute paths unless under an explicit allowed root.
+        if (pattern.starts_with('/') || pattern.starts_with('\\'))
+            && !self.security.is_under_allowed_root(pattern)
+        {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -84,9 +86,13 @@ impl Tool for GlobSearchTool {
             });
         }
 
-        // Build full pattern anchored to workspace
-        let workspace = &self.security.workspace_dir;
-        let full_pattern = workspace.join(pattern).to_string_lossy().to_string();
+        // Build full pattern: use resolve_tool_path to handle tilde expansion
+        // and absolute paths correctly.
+        let full_pattern = self
+            .security
+            .resolve_tool_path(pattern)
+            .to_string_lossy()
+            .to_string();
 
         let entries = match glob::glob(&full_pattern) {
             Ok(paths) => paths,
@@ -99,6 +105,7 @@ impl Tool for GlobSearchTool {
             }
         };
 
+        let workspace = &self.security.workspace_dir;
         let workspace_canon = match std::fs::canonicalize(workspace) {
             Ok(p) => p,
             Err(e) => {
