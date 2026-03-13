@@ -2,20 +2,41 @@
 
 Thanks for your interest in contributing to ZeroClaw! This guide will help you get started.
 
+---
+
+## ⚠️ Branch Migration Notice (March 2026)
+
+**`master` is the ONLY default branch. The `main` branch no longer exists.**
+
+If you have an existing fork or local clone that tracks `main`, you **must** update it:
+
+```bash
+# Update your local clone to track master
+git checkout master
+git branch -D main 2>/dev/null          # delete local main if it exists
+git remote set-head origin master
+git fetch origin --prune                 # remove stale remote refs
+
+# If your fork still has a main branch, delete it
+git push origin --delete main 2>/dev/null
+```
+
+All PRs must target **`master`**. PRs targeting `main` will be rejected.
+
+**Background:** ZeroClaw previously used `main` in some documentation and scripts, which caused 404 errors, broken CI refs, and contributor confusion (see [#2929](https://github.com/zeroclaw-labs/zeroclaw/issues/2929), [#3061](https://github.com/zeroclaw-labs/zeroclaw/issues/3061), [#3194](https://github.com/zeroclaw-labs/zeroclaw/pull/3194)). As of March 2026, all references have been corrected, stale branches cleaned up, and the `main` branch permanently deleted.
+
+---
+
 ## Branching Model
 
-> **Important — `master` is the default branch.**
->
-> ZeroClaw uses **`master`** as its single source-of-truth branch. The `main` branch has been removed.
->
-> Previously, some documentation and scripts referenced a `main` branch, which caused 404 errors and contributor confusion (see [#2929](https://github.com/zeroclaw-labs/zeroclaw/issues/2929), [#3061](https://github.com/zeroclaw-labs/zeroclaw/issues/3061), [#3194](https://github.com/zeroclaw-labs/zeroclaw/pull/3194)). As of March 2026, all references have been corrected and the `main` branch deleted.
+> **`master`** is the single source-of-truth branch.
 >
 > **How contributors should work:**
 > 1. Fork the repository
 > 2. Create a `feat/*` or `fix/*` branch from `master`
 > 3. Open a PR targeting `master`
 >
-> Do **not** create or push to a `main` branch.
+> Do **not** create or push to a `main` branch. There is no `main` branch — it will not work.
 
 ## First-Time Contributors
 
@@ -559,4 +580,3 @@ Recommended scope keys in commit titles:
 ## License
 
 By contributing, you agree that your contributions will be licensed under the MIT License.
-# Contributing Guide Update

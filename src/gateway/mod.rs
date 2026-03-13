@@ -748,15 +748,25 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8"
 
 /// GET /metrics — Prometheus text exposition format
 async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let body = if let Some(prom) = state
-        .observer
-        .as_ref()
-        .as_any()
-        .downcast_ref::<crate::observability::PrometheusObserver>()
-    {
-        prom.encode()
-    } else {
-        String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
+    let body = {
+        #[cfg(feature = "metrics")]
+        {
+            if let Some(prom) = state
+                .observer
+                .as_ref()
+                .as_any()
+                .downcast_ref::<crate::observability::PrometheusObserver>()
+            {
+                prom.encode()
+            } else {
+                String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
+            }
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            let _ = &state;
+            String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
+        }
     };
 
     (
@@ -1739,6 +1749,7 @@ mod tests {
         assert!(text.contains("Prometheus backend not enabled"));
     }
 
+    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn metrics_endpoint_renders_prometheus_output() {
         let prom = Arc::new(crate::observability::PrometheusObserver::new());

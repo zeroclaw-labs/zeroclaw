@@ -173,6 +173,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
         tts: crate::config::TtsConfig::default(),
+        mcp: crate::config::McpConfig::default(),
     };
 
     println!(
@@ -526,6 +527,7 @@ async fn run_quick_setup_with_home(
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
         tts: crate::config::TtsConfig::default(),
+        mcp: crate::config::McpConfig::default(),
     };
 
     config.save().await?;
