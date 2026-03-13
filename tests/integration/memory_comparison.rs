@@ -6,7 +6,9 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 // We test both backends through the public memory module
-use zeroclaw::memory::{markdown::MarkdownMemory, sqlite::SqliteMemory, Memory, MemoryCategory};
+use lightwave_sys::memory::{
+    markdown::MarkdownMemory, sqlite::SqliteMemory, Memory, MemoryCategory,
+};
 
 // ── Helpers ────────────────────────────────────────────────────
 

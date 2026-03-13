@@ -2839,8 +2839,7 @@ pub async fn run(
         &config,
     );
 
-    let peripheral_tools: Vec<Box<dyn Tool>> =
-        Vec::<Box<dyn crate::tools::Tool>>::new();
+    let peripheral_tools: Vec<Box<dyn Tool>> = Vec::<Box<dyn crate::tools::Tool>>::new();
     if !peripheral_tools.is_empty() {
         tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
         tools_registry.extend(peripheral_tools);
@@ -3310,8 +3309,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.api_key.as_deref(),
         &config,
     );
-    let peripheral_tools: Vec<Box<dyn Tool>> =
-        Vec::<Box<dyn crate::tools::Tool>>::new();
+    let peripheral_tools: Vec<Box<dyn Tool>> = Vec::<Box<dyn crate::tools::Tool>>::new();
     tools_registry.extend(peripheral_tools);
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
@@ -5662,8 +5660,6 @@ Let me check the result."#;
     /// must be clean of XML tool-call protocol.
     #[test]
     fn native_tools_system_prompt_contains_zero_xml() {
-        use crate::agent::prompt::build_system_prompt;
-
         let tool_summaries: Vec<(&str, &str)> = vec![
             ("shell", "Execute shell commands"),
             ("file_read", "Read files"),

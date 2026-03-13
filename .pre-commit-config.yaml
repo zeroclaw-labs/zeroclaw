@@ -1,0 +1,25 @@
+# Rust-specific pre-commit hooks for LightWave Augusta
+# Runs: cargo fmt --check, cargo clippy, cargo test --lib
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test --lib
+        language: system
+        types: [rust]
+        pass_filenames: false

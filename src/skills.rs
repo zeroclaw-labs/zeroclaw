@@ -54,16 +54,19 @@ pub fn skills_to_prompt_with_mode(
         return String::new();
     }
 
+    use std::fmt::Write;
+
     let compact = matches!(mode, SkillsPromptInjectionMode::Compact);
     let mut out = String::from("<available_skills>\n");
 
     for skill in skills {
         out.push_str("<skill>\n");
-        out.push_str(&format!("<name>{}</name>\n", xml_escape(&skill.name)));
-        out.push_str(&format!(
-            "<description>{}</description>\n",
+        let _ = writeln!(out, "<name>{}</name>", xml_escape(&skill.name));
+        let _ = writeln!(
+            out,
+            "<description>{}</description>",
             xml_escape(&skill.description)
-        ));
+        );
 
         if let Some(ref loc) = skill.location {
             // Make location relative to workspace
@@ -71,26 +74,24 @@ pub fn skills_to_prompt_with_mode(
                 .strip_prefix(workspace)
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| loc.clone());
-            out.push_str(&format!("<location>{}</location>\n", xml_escape(&rel)));
+            let _ = writeln!(out, "<location>{}</location>", xml_escape(&rel));
         }
 
         if !compact {
             for prompt in &skill.prompts {
-                out.push_str(&format!(
-                    "<instruction>{}</instruction>\n",
-                    xml_escape(prompt)
-                ));
+                let _ = writeln!(out, "<instruction>{}</instruction>", xml_escape(prompt));
             }
             if !skill.tools.is_empty() {
                 out.push_str("<tools>\n");
                 for tool in &skill.tools {
                     out.push_str("<tool>\n");
-                    out.push_str(&format!("<name>{}</name>\n", xml_escape(&tool.name)));
-                    out.push_str(&format!(
-                        "<description>{}</description>\n",
+                    let _ = writeln!(out, "<name>{}</name>", xml_escape(&tool.name));
+                    let _ = writeln!(
+                        out,
+                        "<description>{}</description>",
                         xml_escape(&tool.description)
-                    ));
-                    out.push_str(&format!("<kind>{}</kind>\n", xml_escape(&tool.kind)));
+                    );
+                    let _ = writeln!(out, "<kind>{}</kind>", xml_escape(&tool.kind));
                     out.push_str("</tool>\n");
                 }
                 out.push_str("</tools>\n");

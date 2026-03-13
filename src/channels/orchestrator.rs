@@ -122,7 +122,9 @@ impl Channel for OrchestratorChannel {
         #[cfg(not(feature = "orchestrator"))]
         {
             let _ = message;
-            tracing::warn!("Orchestrator channel send called but 'orchestrator' feature not enabled");
+            tracing::warn!(
+                "Orchestrator channel send called but 'orchestrator' feature not enabled"
+            );
         }
 
         Ok(())
@@ -211,7 +213,9 @@ impl Channel for OrchestratorChannel {
         #[cfg(not(feature = "orchestrator"))]
         {
             let _ = tx;
-            tracing::warn!("Orchestrator channel listen called but 'orchestrator' feature not enabled");
+            tracing::warn!(
+                "Orchestrator channel listen called but 'orchestrator' feature not enabled"
+            );
         }
 
         Ok(())
@@ -245,4 +249,91 @@ fn parse_stream_entries(entries: &[redis::Value]) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orchestrator_channel_default_streams() {
+        let ch = OrchestratorChannel::new(
+            "redis://localhost:6379".to_string(),
+            None,
+            Some("test-node".to_string()),
+        );
+        assert_eq!(ch.name(), "orchestrator");
+        assert_eq!(ch.tasks_stream, "augusta:tasks");
+        assert_eq!(ch.results_stream, "augusta:results");
+        assert_eq!(ch.consumer_group, "augusta-test-node");
+        assert_eq!(ch.consumer_name, "test-node");
+    }
+
+    #[test]
+    fn orchestrator_channel_custom_prefix() {
+        let ch = OrchestratorChannel::new(
+            "redis://localhost:6379".to_string(),
+            Some("myprefix".to_string()),
+            Some("node1".to_string()),
+        );
+        assert_eq!(ch.tasks_stream, "myprefix:tasks");
+        assert_eq!(ch.results_stream, "myprefix:results");
+        assert_eq!(ch.consumer_group, "augusta-node1");
+    }
+
+    #[test]
+    fn orchestrator_task_deserialize_minimal() {
+        let json = r#"{
+            "run_id": "abc-123",
+            "agent_type": "v_devops",
+            "prompt": "check disk space"
+        }"#;
+        let task: OrchestratorTask = serde_json::from_str(json).unwrap();
+        assert_eq!(task.run_id, "abc-123");
+        assert_eq!(task.agent_type, "v_devops");
+        assert_eq!(task.prompt, "check disk space");
+        assert_eq!(task.timeout_ms, 30_000); // default
+        assert!(task.tools_allowed.is_empty());
+        assert!(task.context.is_null());
+    }
+
+    #[test]
+    fn orchestrator_task_deserialize_full() {
+        let json = r#"{
+            "run_id": "run-456",
+            "agent_type": "infrastructure_ops_auditor",
+            "prompt": "audit nginx config",
+            "context": {"skills": ["shell"]},
+            "tools_allowed": ["shell", "file_read"],
+            "timeout_ms": 60000
+        }"#;
+        let task: OrchestratorTask = serde_json::from_str(json).unwrap();
+        assert_eq!(task.run_id, "run-456");
+        assert_eq!(task.tools_allowed, vec!["shell", "file_read"]);
+        assert_eq!(task.timeout_ms, 60000);
+        assert_eq!(task.context["skills"][0], "shell");
+    }
+
+    #[test]
+    fn orchestrator_result_roundtrip() {
+        let result = OrchestratorResult {
+            run_id: "run-789".to_string(),
+            status: "completed".to_string(),
+            output: "All good".to_string(),
+            tool_results: vec![serde_json::json!({"tool": "shell", "ok": true})],
+            evidence: vec![],
+            duration_ms: 1500,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: OrchestratorResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.run_id, "run-789");
+        assert_eq!(deserialized.status, "completed");
+        assert_eq!(deserialized.duration_ms, 1500);
+        assert_eq!(deserialized.tool_results.len(), 1);
+    }
+
+    #[test]
+    fn default_timeout_is_30s() {
+        assert_eq!(default_timeout(), 30_000);
+    }
 }

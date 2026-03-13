@@ -97,15 +97,12 @@ pub fn battery_info() -> Result<BatteryInfo> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    let level = stdout
-        .lines()
-        .find(|l| l.contains('%'))
-        .and_then(|l| {
-            l.split('\t')
-                .nth(1)
-                .and_then(|s| s.split('%').next())
-                .and_then(|s| s.trim().parse::<f64>().ok())
-        });
+    let level = stdout.lines().find(|l| l.contains('%')).and_then(|l| {
+        l.split('\t')
+            .nth(1)
+            .and_then(|s| s.split('%').next())
+            .and_then(|s| s.trim().parse::<f64>().ok())
+    });
 
     let charging = stdout.contains("charging") && !stdout.contains("discharging");
     let on_battery = stdout.contains("Battery Power");
@@ -124,4 +121,66 @@ pub fn battery_info() -> Result<BatteryInfo> {
         charging: false,
         on_battery: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_info_serializes() {
+        let info = SystemInfo {
+            hostname: "test-host".to_string(),
+            os_version: "15.0".to_string(),
+            cpu_model: "Apple M2".to_string(),
+            cpu_cores: 8,
+            memory_gb: 16.0,
+            uptime_secs: 3600,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["hostname"], "test-host");
+        assert_eq!(json["cpu_cores"], 8);
+        assert_eq!(json["memory_gb"], 16.0);
+    }
+
+    #[test]
+    fn battery_info_serializes() {
+        let info = BatteryInfo {
+            level: Some(85.0),
+            charging: true,
+            on_battery: false,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["level"], 85.0);
+        assert_eq!(json["charging"], true);
+        assert_eq!(json["on_battery"], false);
+    }
+
+    #[test]
+    fn battery_info_null_level() {
+        let info = BatteryInfo {
+            level: None,
+            charging: false,
+            on_battery: false,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert!(json["level"].is_null());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn system_info_returns_real_data() {
+        let info = system_info().unwrap();
+        assert!(!info.hostname.is_empty());
+        assert!(info.cpu_cores > 0);
+        assert!(info.memory_gb > 0.0);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn battery_info_succeeds() {
+        let info = battery_info().unwrap();
+        // On desktops level may be None, just verify no panic
+        let _ = info.level;
+    }
 }

@@ -68,10 +68,75 @@ impl PermissionStatus {
             missing.push("Accessibility (System Settings → Privacy & Security → Accessibility)");
         }
         if !self.screen_capture {
-            missing.push(
-                "Screen Recording (System Settings → Privacy & Security → Screen Recording)",
-            );
+            missing
+                .push("Screen Recording (System Settings → Privacy & Security → Screen Recording)");
         }
         missing
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_granted_when_both_true() {
+        let status = PermissionStatus {
+            accessibility: true,
+            screen_capture: true,
+        };
+        assert!(status.all_granted());
+        assert!(status.missing_permissions().is_empty());
+    }
+
+    #[test]
+    fn not_all_granted_when_accessibility_false() {
+        let status = PermissionStatus {
+            accessibility: false,
+            screen_capture: true,
+        };
+        assert!(!status.all_granted());
+        assert_eq!(status.missing_permissions().len(), 1);
+        assert!(status.missing_permissions()[0].contains("Accessibility"));
+    }
+
+    #[test]
+    fn not_all_granted_when_screen_capture_false() {
+        let status = PermissionStatus {
+            accessibility: true,
+            screen_capture: false,
+        };
+        assert!(!status.all_granted());
+        assert_eq!(status.missing_permissions().len(), 1);
+        assert!(status.missing_permissions()[0].contains("Screen Recording"));
+    }
+
+    #[test]
+    fn missing_both_returns_two() {
+        let status = PermissionStatus {
+            accessibility: false,
+            screen_capture: false,
+        };
+        assert!(!status.all_granted());
+        assert_eq!(status.missing_permissions().len(), 2);
+    }
+
+    #[test]
+    fn permission_status_serializes() {
+        let status = PermissionStatus {
+            accessibility: true,
+            screen_capture: false,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["accessibility"], true);
+        assert_eq!(json["screen_capture"], false);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn check_permissions_returns_status() {
+        let status = check_permissions();
+        // Just verify it runs without panicking — actual values depend on system config
+        let _ = status.all_granted();
     }
 }

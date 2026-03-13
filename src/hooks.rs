@@ -1,5 +1,6 @@
 //! Hook stubs for Augusta.
 //! Augusta does not support lifecycle hooks — these are no-ops.
+//! The async signatures are required for API compatibility with the agent loop.
 
 use crate::providers::ChatMessage;
 use crate::tools::ToolResult;
@@ -16,18 +17,13 @@ pub enum HookResult {
 /// Hook runner — no-op in Augusta.
 pub struct HookRunner;
 
+#[allow(clippy::unused_async)]
 impl HookRunner {
     /// Fire before an LLM call (void, no-op).
-    pub async fn fire_llm_input(&self, _history: &[ChatMessage], _model: &str) {
-        // No-op
-    }
+    pub async fn fire_llm_input(&self, _history: &[ChatMessage], _model: &str) {}
 
     /// Run before a tool call. Always returns Continue (pass-through).
-    pub async fn run_before_tool_call(
-        &self,
-        name: String,
-        args: serde_json::Value,
-    ) -> HookResult {
+    pub async fn run_before_tool_call(&self, name: String, args: serde_json::Value) -> HookResult {
         HookResult::Continue((name, args))
     }
 
@@ -38,6 +34,5 @@ impl HookRunner {
         _result: &ToolResult,
         _duration: Duration,
     ) {
-        // No-op
     }
 }

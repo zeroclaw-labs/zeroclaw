@@ -51,8 +51,8 @@ pub(crate) mod multimodal;
 pub mod observability;
 pub mod providers;
 pub mod runtime;
-pub(crate) mod skills;
 pub mod security;
+pub(crate) mod skills;
 pub mod tools;
 pub(crate) mod util;
 

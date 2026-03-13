@@ -95,10 +95,7 @@ pub fn execute(args: &Value) -> ExecuteResult {
 }
 
 fn execute_inner(args: &Value) -> Result<Value> {
-    let action = args
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
     match action {
         // ── Window actions ─────────────────────────
@@ -129,10 +126,7 @@ fn execute_inner(args: &Value) -> Result<Value> {
             Ok(json!({ "moved": true, "x": x, "y": y }))
         }
         "input.type" => {
-            let text = args
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
             input::type_text(text)?;
             Ok(json!({ "typed": true, "length": text.len() }))
         }
@@ -218,5 +212,168 @@ fn execute_inner(args: &Value) -> Result<Value> {
              system.battery, permission.check",
             action
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_name_is_mac_desktop() {
+        assert_eq!(TOOL_NAME, "mac_desktop");
+    }
+
+    #[test]
+    fn parameters_schema_has_required_action() {
+        let schema = parameters_schema();
+        let required = schema["required"].as_array().unwrap();
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0], "action");
+    }
+
+    #[test]
+    fn parameters_schema_lists_all_actions() {
+        let schema = parameters_schema();
+        let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
+        assert_eq!(actions.len(), 17);
+        assert!(actions.contains(&json!("window.list")));
+        assert!(actions.contains(&json!("clipboard.set")));
+        assert!(actions.contains(&json!("permission.check")));
+    }
+
+    #[test]
+    fn execute_unknown_action_fails() {
+        let result = execute(&json!({"action": "nonexistent"}));
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        assert!(result.output.contains("Unknown action"));
+    }
+
+    #[test]
+    fn execute_missing_action_fails() {
+        let result = execute(&json!({}));
+        assert!(!result.success);
+        assert!(result.output.contains("Unknown action"));
+    }
+
+    #[test]
+    fn execute_window_focus_without_pid_fails() {
+        let result = execute(&json!({"action": "window.focus"}));
+        assert!(!result.success);
+        assert!(result.output.contains("pid required"));
+    }
+
+    #[test]
+    fn execute_input_key_without_key_fails() {
+        let result = execute(&json!({"action": "input.key"}));
+        assert!(!result.success);
+        assert!(result.output.contains("key required"));
+    }
+
+    #[test]
+    fn execute_app_launch_without_name_fails() {
+        let result = execute(&json!({"action": "app.launch"}));
+        assert!(!result.success);
+        assert!(result.output.contains("name required"));
+    }
+
+    #[test]
+    fn execute_app_quit_without_name_fails() {
+        let result = execute(&json!({"action": "app.quit"}));
+        assert!(!result.success);
+        assert!(result.output.contains("name required"));
+    }
+
+    #[test]
+    fn execute_clipboard_set_without_text_fails() {
+        let result = execute(&json!({"action": "clipboard.set"}));
+        assert!(!result.success);
+        assert!(result.output.contains("text required"));
+    }
+
+    // ── macOS-only integration tests ─────────────────────
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn permission_check_returns_success() {
+        let result = execute(&json!({"action": "permission.check"}));
+        assert!(result.success);
+        let val: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(val.get("accessibility").is_some());
+        assert!(val.get("screen_capture").is_some());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn system_info_returns_valid_data() {
+        let result = execute(&json!({"action": "system.info"}));
+        assert!(result.success);
+        let val: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(!val["hostname"].as_str().unwrap_or("").is_empty());
+        assert!(val["cpu_cores"].as_u64().unwrap_or(0) > 0);
+        assert!(val["memory_gb"].as_f64().unwrap_or(0.0) > 0.0);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn battery_info_returns_success() {
+        let result = execute(&json!({"action": "system.battery"}));
+        assert!(result.success);
+        let val: Value = serde_json::from_str(&result.output).unwrap();
+        // level may be null on desktops, but charging/on_battery should exist
+        assert!(val.get("charging").is_some());
+        assert!(val.get("on_battery").is_some());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn clipboard_roundtrip() {
+        let test_str = "lightwave-macos-test-12345";
+        let set_result = execute(&json!({"action": "clipboard.set", "text": test_str}));
+        assert!(set_result.success);
+
+        let get_result = execute(&json!({"action": "clipboard.get"}));
+        assert!(get_result.success);
+        let val: Value = serde_json::from_str(&get_result.output).unwrap();
+        assert_eq!(val["content"].as_str().unwrap(), test_str);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn app_list_returns_apps() {
+        let result = execute(&json!({"action": "app.list"}));
+        assert!(result.success);
+        let val: Value = serde_json::from_str(&result.output).unwrap();
+        let apps = val["apps"].as_array().unwrap();
+        // At least Finder should always be running
+        assert!(!apps.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn app_frontmost_returns_result() {
+        let result = execute(&json!({"action": "app.frontmost"}));
+        assert!(result.success);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn screen_displays_returns_at_least_one() {
+        let result = execute(&json!({"action": "screen.displays"}));
+        assert!(result.success);
+        let val: Value = serde_json::from_str(&result.output).unwrap();
+        let displays = val["displays"].as_array().unwrap();
+        assert!(!displays.is_empty());
+        assert!(displays[0]["width"].as_u64().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn window_list_succeeds() {
+        let result = execute(&json!({"action": "window.list"}));
+        assert!(result.success);
+        let val: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(val.get("windows").is_some());
     }
 }

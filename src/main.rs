@@ -105,12 +105,8 @@ Examples:
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt().with_env_filter(filter).with_target(false).init();
 
     let cli = Cli::parse();
 
@@ -210,10 +206,7 @@ async fn main() -> Result<()> {
             println!("Runtime: native (macOS)");
             println!(
                 "Provider: {}",
-                config
-                    .default_provider
-                    .as_deref()
-                    .unwrap_or("anthropic")
+                config.default_provider.as_deref().unwrap_or("anthropic")
             );
             println!(
                 "Model: {}",

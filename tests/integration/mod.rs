@@ -1,7 +1,9 @@
 mod agent;
 mod agent_robustness;
 mod channel_routing;
-mod hooks;
+// hooks module is pub(crate) in Augusta — stub only
+// mod hooks;
 mod memory_comparison;
 mod memory_restart;
-mod telegram_attachment_fallback;
+// telegram channel was stripped in Phase 1.3
+// mod telegram_attachment_fallback;

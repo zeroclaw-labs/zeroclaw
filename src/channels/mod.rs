@@ -16,7 +16,7 @@ use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_cre
 use crate::approval::ApprovalManager;
 use crate::config::Config;
 use crate::memory::{self, Memory};
-use crate::observability::{self, Observer};
+use crate::observability;
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
@@ -52,15 +52,13 @@ pub async fn start_cli(config: Config) -> Result<()> {
         reasoning_enabled: config.runtime.reasoning_enabled,
         provider_timeout_secs: Some(config.provider_timeout_secs),
     };
-    let provider: Arc<dyn Provider> = Arc::from(
-        providers::create_resilient_provider_with_options(
-            &provider_name,
-            config.api_key.as_deref(),
-            config.api_url.as_deref(),
-            &config.reliability,
-            &provider_runtime_options,
-        )?,
-    );
+    let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
+        &provider_name,
+        config.api_key.as_deref(),
+        config.api_url.as_deref(),
+        &config.reliability,
+        &provider_runtime_options,
+    )?);
 
     if let Err(e) = provider.warmup().await {
         tracing::warn!("Provider warmup failed (non-fatal): {e}");
@@ -98,11 +96,10 @@ pub async fn start_cli(config: Config) -> Result<()> {
     ));
 
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = format!(
-        "You are LightWave Augusta, a local AI agent running on macOS.\n\
+    let mut system_prompt = "You are LightWave Augusta, a local AI agent running on macOS.\n\
          You have access to shell, file, memory, browser, and desktop automation tools.\n\
          Be concise and direct. Execute tasks autonomously when possible."
-    );
+        .to_string();
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
     }

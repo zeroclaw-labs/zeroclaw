@@ -106,7 +106,7 @@ pub fn default_tools_with_runtime(
 }
 
 /// Create full tool registry including memory, browser, HTTP, and vision tools.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::used_underscore_binding)]
 pub fn all_tools(
     _config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
@@ -135,7 +135,11 @@ pub fn all_tools(
 }
 
 /// Create full tool registry with explicit runtime adapter.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::implicit_hasher,
+    clippy::used_underscore_binding
+)]
 pub fn all_tools_with_runtime(
     _config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
