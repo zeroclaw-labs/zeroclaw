@@ -599,6 +599,51 @@ pub struct EdgeTtsConfig {
     pub binary_path: String,
 }
 
+/// Determines when a `ToolFilterGroup` is active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolFilterGroupMode {
+    /// Tools in this group are always included in every turn.
+    Always,
+    /// Tools in this group are included only when the user message contains
+    /// at least one of the configured `keywords` (case-insensitive substring match).
+    #[default]
+    Dynamic,
+}
+
+/// A named group of MCP tool patterns with an activation mode.
+///
+/// Each group lists glob patterns for MCP tool names (prefix `mcp_`) and an
+/// optional set of keywords that trigger inclusion in `dynamic` mode.
+/// Built-in (non-MCP) tools always pass through and are never affected by
+/// `tool_filter_groups`.
+///
+/// # Example
+/// ```toml
+/// [[agent.tool_filter_groups]]
+/// mode = "always"
+/// tools = ["mcp_filesystem_*"]
+/// keywords = []
+///
+/// [[agent.tool_filter_groups]]
+/// mode = "dynamic"
+/// tools = ["mcp_browser_*"]
+/// keywords = ["browse", "website", "url", "search"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ToolFilterGroup {
+    /// Activation mode: `"always"` or `"dynamic"`.
+    #[serde(default)]
+    pub mode: ToolFilterGroupMode,
+    /// Glob patterns matching MCP tool names (single `*` wildcard supported).
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Keywords that activate this group in `dynamic` mode (case-insensitive substring).
+    /// Ignored when `mode = "always"`.
+    #[serde(default)]
+    pub keywords: Vec<String>,
+}
+
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentConfig {
@@ -621,6 +666,13 @@ pub struct AgentConfig {
     /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
     #[serde(default)]
     pub tool_call_dedup_exempt: Vec<String>,
+    /// Per-turn MCP tool schema filtering groups.
+    ///
+    /// When non-empty, only MCP tools matched by an active group are included in the
+    /// tool schema sent to the LLM for that turn. Built-in tools always pass through.
+    /// Default: `[]` (no filtering — all tools included).
+    #[serde(default)]
+    pub tool_filter_groups: Vec<ToolFilterGroup>,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -644,6 +696,7 @@ impl Default for AgentConfig {
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             tool_call_dedup_exempt: Vec::new(),
+            tool_filter_groups: Vec::new(),
         }
     }
 }
