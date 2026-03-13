@@ -211,8 +211,35 @@ should_attempt_prebuilt_for_resources() {
   return 1
 }
 
+resolve_asset_url() {
+  local asset_name="$1"
+  local api_url="https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases"
+  local releases_json download_url
+
+  # Fetch up to 10 recent releases (includes prereleases) and find the first
+  # one that contains the requested asset.
+  releases_json="$(curl -fsSL "${api_url}?per_page=10" 2>/dev/null || true)"
+  if [[ -z "$releases_json" ]]; then
+    return 1
+  fi
+
+  # Parse with simple grep/sed — avoids jq dependency.
+  download_url="$(printf '%s\n' "$releases_json" \
+    | tr ',' '\n' \
+    | grep '"browser_download_url"' \
+    | sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' \
+    | grep "/${asset_name}\$" \
+    | head -n 1)"
+
+  if [[ -z "$download_url" ]]; then
+    return 1
+  fi
+
+  echo "$download_url"
+}
+
 install_prebuilt_binary() {
-  local target archive_url temp_dir archive_path extracted_bin install_dir
+  local target archive_url temp_dir archive_path extracted_bin install_dir asset_name
 
   if ! have_cmd curl; then
     warn "curl is required for pre-built binary installation."
@@ -229,9 +256,17 @@ install_prebuilt_binary() {
     return 1
   fi
 
-  archive_url="https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-${target}.tar.gz"
+  asset_name="zeroclaw-${target}.tar.gz"
+
+  # Try the GitHub API first to find the newest release (including prereleases)
+  # that actually contains the asset, then fall back to /releases/latest/.
+  archive_url="$(resolve_asset_url "$asset_name" || true)"
+  if [[ -z "$archive_url" ]]; then
+    archive_url="https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/${asset_name}"
+  fi
+
   temp_dir="$(mktemp -d -t zeroclaw-prebuilt-XXXXXX)"
-  archive_path="$temp_dir/zeroclaw-${target}.tar.gz"
+  archive_path="$temp_dir/${asset_name}"
 
   info "Attempting pre-built binary install for target: $target"
   if ! curl -fsSL "$archive_url" -o "$archive_path"; then
