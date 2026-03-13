@@ -1019,6 +1019,7 @@ data: [DONE]
             reasoning_enabled: None,
             provider_timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
+            api_path: None,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");

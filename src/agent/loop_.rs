@@ -3055,6 +3055,7 @@ pub async fn run(
         reasoning_enabled: config.runtime.reasoning_enabled,
         provider_timeout_secs: Some(config.provider_timeout_secs),
         extra_headers: config.extra_headers.clone(),
+        api_path: config.api_path.clone(),
     };
 
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
@@ -3586,6 +3587,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         reasoning_enabled: config.runtime.reasoning_enabled,
         provider_timeout_secs: Some(config.provider_timeout_secs),
         extra_headers: config.extra_headers.clone(),
+        api_path: config.api_path.clone(),
     };
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,

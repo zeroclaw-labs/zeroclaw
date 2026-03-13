@@ -49,6 +49,7 @@ pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
+pub mod node_tool;
 pub mod pdf_read;
 pub mod proxy_config;
 pub mod pushover;
@@ -92,6 +93,8 @@ pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
+#[allow(unused_imports)]
+pub use node_tool::NodeTool;
 pub use pdf_read::PdfReadTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
@@ -381,6 +384,7 @@ pub fn all_tools_with_runtime(
                 reasoning_enabled: root_config.runtime.reasoning_enabled,
                 provider_timeout_secs: Some(root_config.provider_timeout_secs),
                 extra_headers: root_config.extra_headers.clone(),
+                api_path: root_config.api_path.clone(),
             },
         )
         .with_parent_tools(Arc::clone(&parent_tools))

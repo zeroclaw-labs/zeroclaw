@@ -3,6 +3,7 @@ import { Send, Bot, User, AlertCircle, Copy, Check } from 'lucide-react';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
+import { useDraft } from '@/hooks/useDraft';
 
 interface ChatMessage {
   id: string;
@@ -11,9 +12,12 @@ interface ChatMessage {
   timestamp: Date;
 }
 
+const DRAFT_KEY = 'agent-chat';
+
 export default function AgentChat() {
+  const { draft, saveDraft, clearDraft } = useDraft(DRAFT_KEY);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [input, setInput] = useState('');
+  const [input, setInput] = useState(draft);
   const [typing, setTyping] = useState(false);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -23,6 +27,11 @@ export default function AgentChat() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const pendingContentRef = useRef('');
+
+  // Persist draft to in-memory store so it survives route changes
+  useEffect(() => {
+    saveDraft(input);
+  }, [input, saveDraft]);
 
   useEffect(() => {
     const ws = new WebSocketClient();
@@ -141,6 +150,7 @@ export default function AgentChat() {
     }
 
     setInput('');
+    clearDraft();
     if (inputRef.current) {
       inputRef.current.style.height = 'auto';
       inputRef.current.focus();

@@ -134,6 +134,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
             Some(api_key)
         },
         api_url: provider_api_url,
+        api_path: None,
         default_provider: Some(provider),
         default_model: Some(model),
         model_providers: std::collections::HashMap::new(),
@@ -175,6 +176,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         transcription: crate::config::TranscriptionConfig::default(),
         tts: crate::config::TtsConfig::default(),
         mcp: crate::config::McpConfig::default(),
+        nodes: crate::config::NodesConfig::default(),
     };
 
     println!(
@@ -490,6 +492,7 @@ async fn run_quick_setup_with_home(
             s
         }),
         api_url: None,
+        api_path: None,
         default_provider: Some(provider_name.clone()),
         default_model: Some(model.clone()),
         model_providers: std::collections::HashMap::new(),
@@ -531,6 +534,7 @@ async fn run_quick_setup_with_home(
         transcription: crate::config::TranscriptionConfig::default(),
         tts: crate::config::TtsConfig::default(),
         mcp: crate::config::McpConfig::default(),
+        nodes: crate::config::NodesConfig::default(),
     };
 
     config.save().await?;

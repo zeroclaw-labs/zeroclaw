@@ -74,6 +74,10 @@ pub struct Config {
     pub api_key: Option<String>,
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
     pub api_url: Option<String>,
+    /// Custom API path suffix for OpenAI-compatible / custom providers
+    /// (e.g. "/v2/generate" instead of the default "/v1/chat/completions").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_path: Option<String>,
     /// Default provider ID or alias (e.g. `"openrouter"`, `"ollama"`, `"anthropic"`). Default: `"openrouter"`.
     #[serde(alias = "model_provider")]
     pub default_provider: Option<String>,
@@ -247,6 +251,10 @@ pub struct Config {
     /// External MCP server connections (`[mcp]`).
     #[serde(default, alias = "mcpServers")]
     pub mcp: McpConfig,
+
+    /// Dynamic node discovery configuration (`[nodes]`).
+    #[serde(default)]
+    pub nodes: NodesConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -258,6 +266,10 @@ pub struct ModelProviderConfig {
     /// Optional base URL for OpenAI-compatible endpoints.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Optional custom API path suffix (e.g. "/v2/generate" instead of the
+    /// default "/v1/chat/completions"). Only used by OpenAI-compatible / custom providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_path: Option<String>,
     /// Provider protocol variant ("responses" or "chat_completions").
     #[serde(default)]
     pub wire_api: Option<String>,
@@ -540,6 +552,39 @@ impl Default for McpConfig {
             enabled: false,
             deferred_loading: default_deferred_loading(),
             servers: Vec::new(),
+        }
+    }
+}
+
+// ── Nodes (Dynamic Node Discovery) ───────────────────────────────
+
+/// Configuration for the dynamic node discovery system (`[nodes]`).
+///
+/// When enabled, external processes/devices can connect via WebSocket
+/// at `/ws/nodes` and advertise their capabilities at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NodesConfig {
+    /// Enable dynamic node discovery endpoint.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum number of concurrent node connections.
+    #[serde(default = "default_max_nodes")]
+    pub max_nodes: usize,
+    /// Optional bearer token for node authentication.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+fn default_max_nodes() -> usize {
+    16
+}
+
+impl Default for NodesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_nodes: default_max_nodes(),
+            auth_token: None,
         }
     }
 }
@@ -4078,6 +4123,7 @@ impl Default for Config {
             config_path: zeroclaw_dir.join("config.toml"),
             api_key: None,
             api_url: None,
+            api_path: None,
             default_provider: Some("openrouter".to_string()),
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             model_providers: HashMap::new(),
@@ -4119,6 +4165,7 @@ impl Default for Config {
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
+            nodes: NodesConfig::default(),
         }
     }
 }
@@ -4910,6 +4957,16 @@ impl Config {
         {
             if let Some(base_url) = base_url.as_ref() {
                 self.api_url = Some(base_url.clone());
+            }
+        }
+
+        // Propagate api_path from the profile when not already set at top level.
+        if self.api_path.is_none() {
+            if let Some(ref path) = profile.api_path {
+                let trimmed = path.trim();
+                if !trimmed.is_empty() {
+                    self.api_path = Some(trimmed.to_string());
+                }
             }
         }
 
@@ -6052,6 +6109,7 @@ default_temperature = 0.7
             config_path: PathBuf::from("/tmp/test/config.toml"),
             api_key: Some("sk-test-key".into()),
             api_url: None,
+            api_path: None,
             default_provider: Some("openrouter".into()),
             default_model: Some("gpt-4o".into()),
             model_providers: HashMap::new(),
@@ -6152,6 +6210,7 @@ default_temperature = 0.7
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
+            nodes: NodesConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -6400,6 +6459,7 @@ tool_dispatcher = "xml"
             config_path: config_path.clone(),
             api_key: Some("sk-roundtrip".into()),
             api_url: None,
+            api_path: None,
             default_provider: Some("openrouter".into()),
             default_model: Some("test-model".into()),
             model_providers: HashMap::new(),
@@ -6441,6 +6501,7 @@ tool_dispatcher = "xml"
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
+            nodes: NodesConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -7595,6 +7656,7 @@ requires_openai_auth = true
                     azure_openai_resource: None,
                     azure_openai_deployment: None,
                     azure_openai_api_version: None,
+                    api_path: None,
                 },
             )]),
             ..Config::default()
@@ -7626,6 +7688,7 @@ requires_openai_auth = true
                     azure_openai_resource: None,
                     azure_openai_deployment: None,
                     azure_openai_api_version: None,
+                    api_path: None,
                 },
             )]),
             api_key: None,
@@ -7691,6 +7754,7 @@ requires_openai_auth = true
                     azure_openai_resource: None,
                     azure_openai_deployment: None,
                     azure_openai_api_version: None,
+                    api_path: None,
                 },
             )]),
             ..Config::default()
