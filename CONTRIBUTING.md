@@ -2,6 +2,15 @@
 
 Thanks for your interest in contributing to ZeroClaw! This guide will help you get started.
 
+## Branch Policy FAQ
+
+ZeroClaw uses a single source-of-truth branch: `master`.
+
+- Build from `master`, debug from `master`, and open all contributor PRs against `master`.
+- Treat `main`, `dev`, and `main-fix` as historical leftovers rather than active promotion branches. If you still have any of them in an older local clone, re-sync against `origin/master`.
+- Code flow is direct: contributor branch -> PR to `master` -> required checks -> merge -> post-merge workflows on `master`.
+- Canonical branch-policy references live here, in [`docs/contributing/pr-workflow.md`](docs/contributing/pr-workflow.md), and in [`.github/workflows/master-branch-flow.md`](.github/workflows/master-branch-flow.md).
+
 ## First-Time Contributors
 
 Welcome — contributions of all sizes are valued. If this is your first contribution, here is how to get started:
