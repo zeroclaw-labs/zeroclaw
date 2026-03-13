@@ -789,7 +789,7 @@ async fn handle_pair(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    match state.pairing.try_pair(code, &rate_key).await {
+    match state.pairing.try_pair(code, &rate_key) {
         Ok(Some(token)) => {
             tracing::info!("🔐 New client paired successfully");
             if let Err(err) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
@@ -1930,7 +1930,7 @@ mod tests {
 
         let guard = PairingGuard::new(true, &[]);
         let code = guard.pairing_code().unwrap();
-        let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
+        let token = guard.try_pair(&code, "test_client").unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
 
         let shared_config = Arc::new(Mutex::new(config));

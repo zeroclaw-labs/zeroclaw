@@ -30,6 +30,8 @@ export interface AuthState {
   pair: (code: string) => Promise<void>;
   /** Clear the stored token and sign out. */
   logout: () => void;
+  /** Whether the server requires pairing. */
+  requiresPairing: boolean;
 }
 
 const AuthContext = createContext<AuthState | null>(null);
@@ -46,6 +48,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [token, setTokenState] = useState<string | null>(readToken);
   const [authenticated, setAuthenticated] = useState<boolean>(checkAuth);
   const [loading, setLoading] = useState<boolean>(!checkAuth());
+  const [requiresPairing, setRequiresPairing] = useState<boolean>(true);
 
   // On mount: check if server requires pairing at all
   useEffect(() => {
@@ -54,6 +57,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     getPublicHealth()
       .then((health) => {
         if (cancelled) return;
+        setRequiresPairing(health.require_pairing);
         if (!health.require_pairing) {
           setAuthenticated(true);
         }
@@ -101,6 +105,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     loading,
     pair,
     logout,
+    requiresPairing,
   };
 
   return React.createElement(AuthContext.Provider, { value }, children);
