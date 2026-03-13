@@ -10,14 +10,15 @@ pub use schema::{
     CostConfig, CronConfig, DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig,
     EdgeTtsConfig, ElevenLabsTtsConfig, EmbeddingRouteConfig, EstopConfig, FeishuConfig,
     GatewayConfig, GoogleTtsConfig, HardwareConfig, HardwareTransport, HeartbeatConfig,
-    HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig,
-    LinkedInConfig, LinkedInContentConfig, MatrixConfig, McpConfig, McpServerConfig,
-    McpTransport, MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig,
-    NodesConfig, ObservabilityConfig, OpenAiTtsConfig, OtpConfig, OtpMethod,
-    PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope, QdrantConfig,
-    QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig,
-    SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,
-    SkillsConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig,
+    HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, ImageProviderDalleConfig,
+    ImageProviderFluxConfig, ImageProviderImagenConfig, ImageProviderStabilityConfig,
+    LarkConfig, LinkedInConfig, LinkedInContentConfig, LinkedInImageConfig, MatrixConfig,
+    McpConfig, McpServerConfig, McpTransport, MemoryConfig, ModelRouteConfig,
+    MultimodalConfig, NextcloudTalkConfig, NodesConfig, ObservabilityConfig, OpenAiTtsConfig,
+    OtpConfig, OtpMethod, PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope,
+    QdrantConfig, QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig,
+    RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig,
+    SecurityConfig, SkillsConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig,
     StorageProviderConfig, StorageProviderSection, StreamMode, TelegramConfig,
     ToolFilterGroup, ToolFilterGroupMode, TranscriptionConfig, TtsConfig, TunnelConfig,
     WebFetchConfig, WebSearchConfig, WebhookConfig,
@@ -25,7 +26,7 @@ pub use schema::{
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
     (T::name(), channel.is_some())
-};
+}
 
 #[cfg(test)]
 mod tests {
@@ -93,4 +94,4 @@ mod tests {
         assert_eq!(feishu.app_id, "app-id");
         assert_eq!(nextcloud_talk.base_url, "https://cloud.example.com");
     }
-};
+}

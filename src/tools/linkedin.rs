@@ -1,6 +1,6 @@
-use super::linkedin_client::LinkedInClient;
+use super::linkedin_client::{ImageGenerator, LinkedInClient};
 use super::traits::{Tool, ToolResult};
-use crate::config::LinkedInContentConfig;
+use crate::config::{LinkedInContentConfig, LinkedInImageConfig};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -12,6 +12,7 @@ pub struct LinkedInTool {
     workspace_dir: PathBuf,
     api_version: String,
     content_config: LinkedInContentConfig,
+    image_config: LinkedInImageConfig,
 }
 
 impl LinkedInTool {
@@ -20,12 +21,14 @@ impl LinkedInTool {
         workspace_dir: PathBuf,
         api_version: String,
         content_config: LinkedInContentConfig,
+        image_config: LinkedInImageConfig,
     ) -> Self {
         Self {
             security,
             workspace_dir,
             api_version,
             content_config,
+            image_config,
         }
     }
 
@@ -137,6 +140,14 @@ impl Tool for LinkedInTool {
                 "count": {
                     "type": "integer",
                     "description": "Number of posts to retrieve (default 10, max 50)"
+                },
+                "generate_image": {
+                    "type": "boolean",
+                    "description": "Generate an AI image for the post (requires [linkedin.image] config). Falls back to branded SVG card if all providers fail."
+                },
+                "image_prompt": {
+                    "type": "string",
+                    "description": "Custom prompt for image generation. If omitted, a prompt is derived from the post text."
                 }
             },
             "required": ["action"]
@@ -195,6 +206,11 @@ impl Tool for LinkedInTool {
                     .and_then(|v| v.as_str())
                     .unwrap_or("PUBLIC");
 
+                let generate_image = args
+                    .get("generate_image")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
                 let article_url = args.get("article_url").and_then(|v| v.as_str());
                 let article_title = args.get("article_title").and_then(|v| v.as_str());
 
@@ -204,6 +220,52 @@ impl Tool for LinkedInTool {
                         output: String::new(),
                         error: Some("'article_title' requires 'article_url' to be provided".into()),
                     });
+                }
+
+                // Image generation flow
+                if generate_image && self.image_config.enabled {
+                    let image_prompt =
+                        args.get("image_prompt")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                            .unwrap_or_else(|| {
+                                format!(
+                                "Professional, modern illustration for a LinkedIn post about: {}",
+                                if text.len() > 200 { &text[..200] } else { &text }
+                            )
+                            });
+
+                    let generator =
+                        ImageGenerator::new(self.image_config.clone(), self.workspace_dir.clone());
+
+                    match generator.generate(&image_prompt).await {
+                        Ok(image_path) => {
+                            let image_bytes = tokio::fs::read(&image_path).await?;
+                            let creds = client.get_credentials().await?;
+                            let image_urn = client
+                                .upload_image(&image_bytes, &creds.access_token, &creds.person_id)
+                                .await?;
+
+                            let post_id = client
+                                .create_post_with_image(&text, visibility, &image_urn)
+                                .await?;
+
+                            // Clean up temp file
+                            let _ = ImageGenerator::cleanup(&image_path).await;
+
+                            return Ok(ToolResult {
+                                success: true,
+                                output: format!(
+                                    "Post created with image. Post ID: {post_id}, Image: {image_urn}"
+                                ),
+                                error: None,
+                            });
+                        }
+                        Err(e) => {
+                            // Image generation failed entirely — post without image
+                            tracing::warn!("Image generation failed, posting without image: {e}");
+                        }
+                    }
                 }
 
                 let post_id = client
@@ -384,6 +446,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "202602".to_string(),
             LinkedInContentConfig::default(),
+            LinkedInImageConfig::default(),
         )
     }
 
@@ -422,6 +485,8 @@ mod tests {
         assert!(props.get("post_id").is_some());
         assert!(props.get("reaction_type").is_some());
         assert!(props.get("count").is_some());
+        assert!(props.get("generate_image").is_some());
+        assert!(props.get("image_prompt").is_some());
     }
 
     #[tokio::test]
@@ -674,6 +739,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "202602".to_string(),
             content,
+            LinkedInImageConfig::default(),
         );
 
         let result = tool

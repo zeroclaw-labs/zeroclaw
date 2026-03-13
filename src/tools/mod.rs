@@ -356,6 +356,7 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
             root_config.linkedin.api_version.clone(),
             root_config.linkedin.content.clone(),
+            root_config.linkedin.image.clone(),
         )));
     }
 
