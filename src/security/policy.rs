@@ -1061,6 +1061,35 @@ impl SecurityPolicy {
         self.tracker.count() >= self.max_actions_per_hour as usize
     }
 
+    /// Resolve a user-provided path for tool use.
+    ///
+    /// Expands `~` prefixes and resolves relative paths against the workspace
+    /// directory. This should be called **after** `is_path_allowed` to obtain
+    /// the filesystem path that the tool actually operates on.
+    pub fn resolve_tool_path(&self, path: &str) -> PathBuf {
+        let expanded = expand_user_path(path);
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            self.workspace_dir.join(expanded)
+        }
+    }
+
+    /// Check whether the given raw path (before canonicalization) falls under
+    /// an `allowed_roots` entry. Tilde expansion is applied to the path
+    /// before comparison. This is useful for tool-level pre-checks that want
+    /// to allow absolute paths that are explicitly permitted by policy.
+    pub fn is_under_allowed_root(&self, path: &str) -> bool {
+        let expanded = expand_user_path(path);
+        if !expanded.is_absolute() {
+            return false;
+        }
+        self.allowed_roots.iter().any(|root| {
+            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            expanded.starts_with(&canonical) || expanded.starts_with(root)
+        })
+    }
+
     /// Build from config sections
     pub fn from_config(
         autonomy_config: &crate::config::AutonomyConfig,
@@ -2384,5 +2413,63 @@ mod tests {
             !policy.is_path_allowed("subdir%2f..%2f..%2fetc"),
             "URL-encoded parent dir traversal must be blocked"
         );
+    }
+
+    #[test]
+    fn resolve_tool_path_expands_tilde() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/workspace"),
+            ..SecurityPolicy::default()
+        };
+        let resolved = p.resolve_tool_path("~/Documents/file.txt");
+        // Should expand ~ to home dir, not join with workspace
+        assert!(resolved.is_absolute());
+        assert!(!resolved.starts_with("/workspace"));
+        assert!(resolved.to_string_lossy().ends_with("Documents/file.txt"));
+    }
+
+    #[test]
+    fn resolve_tool_path_keeps_absolute() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/workspace"),
+            ..SecurityPolicy::default()
+        };
+        let resolved = p.resolve_tool_path("/some/absolute/path");
+        assert_eq!(resolved, PathBuf::from("/some/absolute/path"));
+    }
+
+    #[test]
+    fn resolve_tool_path_joins_relative() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/workspace"),
+            ..SecurityPolicy::default()
+        };
+        let resolved = p.resolve_tool_path("relative/path.txt");
+        assert_eq!(resolved, PathBuf::from("/workspace/relative/path.txt"));
+    }
+
+    #[test]
+    fn is_under_allowed_root_matches_allowed_roots() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/workspace"),
+            workspace_only: true,
+            allowed_roots: vec![PathBuf::from("/projects"), PathBuf::from("/data")],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_under_allowed_root("/projects/myapp/src/main.rs"));
+        assert!(p.is_under_allowed_root("/data/file.csv"));
+        assert!(!p.is_under_allowed_root("/etc/passwd"));
+        assert!(!p.is_under_allowed_root("relative/path"));
+    }
+
+    #[test]
+    fn is_under_allowed_root_returns_false_for_empty_roots() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/workspace"),
+            workspace_only: true,
+            allowed_roots: vec![],
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_under_allowed_root("/any/path"));
     }
 }
