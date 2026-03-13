@@ -34,6 +34,7 @@ pub mod cron_update;
 pub mod delegate;
 pub mod delegate_coordination_status;
 pub mod docx_read;
+pub mod document_pipeline;
 #[cfg(feature = "channel-lark")]
 pub mod feishu_doc;
 pub mod file_edit;
@@ -104,6 +105,7 @@ pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
 pub use delegate_coordination_status::DelegateCoordinationStatusTool;
 pub use docx_read::DocxReadTool;
+pub use document_pipeline::DocumentPipelineTool;
 #[cfg(feature = "channel-lark")]
 pub use feishu_doc::FeishuDocTool;
 pub use file_edit::FileEditTool;
@@ -513,6 +515,9 @@ pub fn all_tools_with_runtime(
 
     // DOCX text extraction
     tool_arcs.push(Arc::new(DocxReadTool::new(security.clone())));
+
+    // Document processing pipeline (image PDF → Upstage OCR, digital PDF → local, office → Hancom)
+    tool_arcs.push(Arc::new(DocumentPipelineTool::new(security.as_ref().clone())));
 
     // PPTX text extraction
     tool_arcs.push(Arc::new(PptxReadTool::new(security.clone())));

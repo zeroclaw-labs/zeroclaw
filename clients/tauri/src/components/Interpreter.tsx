@@ -19,11 +19,14 @@ interface Transcript {
 type ConnectionStatus = "idle" | "connecting" | "ready" | "listening" | "stopping" | "error";
 type VoiceProvider = "gemini" | "openai";
 
+// "auto" = auto-detect language from speech input
 const LANGUAGES = [
+  { code: "auto", name: "Auto-detect / 자동 감지", flag: "🌐" },
   { code: "ko", name: "한국어", flag: "🇰🇷" },
   { code: "en", name: "English", flag: "🇺🇸" },
   { code: "ja", name: "日本語", flag: "🇯🇵" },
   { code: "zh", name: "中文", flag: "🇨🇳" },
+  { code: "zh-TW", name: "中文 (繁體)", flag: "🇹🇼" },
   { code: "es", name: "Español", flag: "🇪🇸" },
   { code: "fr", name: "Français", flag: "🇫🇷" },
   { code: "de", name: "Deutsch", flag: "🇩🇪" },
@@ -35,8 +38,20 @@ const LANGUAGES = [
   { code: "it", name: "Italiano", flag: "🇮🇹" },
   { code: "hi", name: "हिन्दी", flag: "🇮🇳" },
   { code: "id", name: "Bahasa Indonesia", flag: "🇮🇩" },
+  { code: "ms", name: "Bahasa Melayu", flag: "🇲🇾" },
+  { code: "tl", name: "Filipino", flag: "🇵🇭" },
+  { code: "nl", name: "Nederlands", flag: "🇳🇱" },
+  { code: "pl", name: "Polski", flag: "🇵🇱" },
+  { code: "sv", name: "Svenska", flag: "🇸🇪" },
+  { code: "da", name: "Dansk", flag: "🇩🇰" },
+  { code: "cs", name: "Čeština", flag: "🇨🇿" },
+  { code: "uk", name: "Українська", flag: "🇺🇦" },
   { code: "tr", name: "Türkçe", flag: "🇹🇷" },
 ];
+
+// Interpretation direction modes
+type InterpDirection = "bidirectional" | "unidirectional";
+
 
 // AudioWorklet processor code (inline, runs in audio thread)
 // Receives audio at native sample rate (e.g. 48000) and downsamples to 16kHz PCM16.
@@ -128,9 +143,11 @@ export function Interpreter({
   void onBack; // available for future navigation
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [provider, setProvider] = useState<VoiceProvider>("gemini");
-  const [sourceLang, setSourceLang] = useState("ko");
-  const [targetLang, setTargetLang] = useState("ja");
+  // Default: auto-detect source language, translate to English, bidirectional
+  const [sourceLang, setSourceLang] = useState("auto");
+  const [targetLang, setTargetLang] = useState("en");
   const [bidirectional, setBidirectional] = useState(true);
+  const [interpDirection, setInterpDirection] = useState<InterpDirection>("bidirectional");
   const [speakerMode, setSpeakerMode] = useState(true); // true=speaker(mute mic during playback), false=earphone(simultaneous)
   const [echoCancellation, setEchoCancellation] = useState(true);
   const [autoGainControl, setAutoGainControl] = useState(true);
@@ -622,6 +639,9 @@ export function Interpreter({
       {/* Language selector */}
       <div className="interpreter-controls">
         <div className="lang-selector">
+          <div className="lang-label">
+            {locale === "ko" ? "입력 언어" : "Input"}
+          </div>
           <select
             value={sourceLang}
             onChange={(e) => setSourceLang(e.target.value)}
@@ -638,19 +658,22 @@ export function Interpreter({
           <button
             className="lang-swap-btn"
             onClick={swapLanguages}
-            disabled={isActive}
-            title="Swap languages"
+            disabled={isActive || sourceLang === "auto"}
+            title={locale === "ko" ? "언어 교환" : "Swap languages"}
           >
             ⇄
           </button>
 
+          <div className="lang-label">
+            {locale === "ko" ? "출력 언어" : "Output"}
+          </div>
           <select
             value={targetLang}
             onChange={(e) => setTargetLang(e.target.value)}
             disabled={isActive}
             className="lang-select"
           >
-            {LANGUAGES.map((l) => (
+            {LANGUAGES.filter((l) => l.code !== "auto").map((l) => (
               <option key={l.code} value={l.code}>
                 {l.flag} {l.name}
               </option>
@@ -658,39 +681,64 @@ export function Interpreter({
           </select>
         </div>
 
-        <label className="bidi-toggle">
-          <input
-            type="checkbox"
-            checked={bidirectional}
-            onChange={(e) => setBidirectional(e.target.checked)}
+        {/* Interpretation direction: unidirectional or bidirectional */}
+        <div className="interp-direction-toggle">
+          <button
+            className={`direction-btn ${interpDirection === "unidirectional" ? "active" : ""}`}
+            onClick={() => {
+              setInterpDirection("unidirectional");
+              setBidirectional(false);
+            }}
             disabled={isActive}
-          />
-          <span>{t("interpreter_bidirectional", locale)}</span>
-        </label>
+            title={locale === "ko" ? "일방향 통역: 입력→출력 방향만 통역" : "One-way: input→output only"}
+          >
+            {locale === "ko" ? "일방향 →" : "One-way →"}
+          </button>
+          <button
+            className={`direction-btn ${interpDirection === "bidirectional" ? "active" : ""}`}
+            onClick={() => {
+              setInterpDirection("bidirectional");
+              setBidirectional(true);
+            }}
+            disabled={isActive}
+            title={locale === "ko" ? "쌍방향 통역: 양쪽 언어 모두 자동 감지하여 통역" : "Two-way: auto-detect and interpret both languages"}
+          >
+            {locale === "ko" ? "쌍방향 ⇄" : "Two-way ⇄"}
+          </button>
+        </div>
 
-        <select
-          value={provider}
-          onChange={(e) => setProvider(e.target.value as VoiceProvider)}
-          disabled={isActive}
-          className="provider-select"
-          title="Voice AI provider"
-        >
-          <option value="gemini">🤖 Gemini</option>
-          <option value="openai">🧠 GPT</option>
-        </select>
+        <div className="interpreter-row">
+          <select
+            value={provider}
+            onChange={(e) => setProvider(e.target.value as VoiceProvider)}
+            disabled={isActive}
+            className="provider-select"
+            title={locale === "ko" ? "음성 AI 공급자 (본인 API 키 필요)" : "Voice AI provider (requires your own API key)"}
+          >
+            <option value="gemini">🤖 Gemini</option>
+            <option value="openai">🧠 GPT</option>
+          </select>
 
-        <button
-          className={`audio-mode-btn ${speakerMode ? "speaker" : "earphone"}`}
-          onClick={() => setSpeakerMode((v) => !v)}
-          title={speakerMode
-            ? (locale === "ko" ? "스피커 모드 (순차 통역)" : "Speaker mode (sequential)")
-            : (locale === "ko" ? "이어폰 모드 (동시 통역)" : "Earphone mode (simultaneous)")}
-        >
-          {speakerMode ? "🔊" : "🎧"}{" "}
-          {speakerMode
-            ? (locale === "ko" ? "스피커" : "Speaker")
-            : (locale === "ko" ? "이어폰" : "Earphone")}
-        </button>
+          <button
+            className={`audio-mode-btn ${speakerMode ? "speaker" : "earphone"}`}
+            onClick={() => setSpeakerMode((v) => !v)}
+            title={speakerMode
+              ? (locale === "ko" ? "스피커 모드 (순차 통역)" : "Speaker mode (sequential)")
+              : (locale === "ko" ? "이어폰 모드 (동시 통역)" : "Earphone mode (simultaneous)")}
+          >
+            {speakerMode ? "🔊" : "🎧"}{" "}
+            {speakerMode
+              ? (locale === "ko" ? "스피커" : "Speaker")
+              : (locale === "ko" ? "이어폰" : "Earphone")}
+          </button>
+        </div>
+
+        {/* User API key notice */}
+        <div className="api-key-notice">
+          {locale === "ko"
+            ? "⚠️ 동시통역은 본인의 API 키가 필요합니다 (설정에서 입력)"
+            : "⚠️ Voice interpretation requires your own API key (enter in Settings)"}
+        </div>
       </div>
 
       {/* Audio processing toggles */}
@@ -709,12 +757,17 @@ export function Interpreter({
         </label>
       </div>
 
-      {/* Transcript area */}
+      {/* Subtitle / transcript area */}
       <div className="interpreter-transcripts">
         {transcripts.length === 0 && status === "idle" && (
           <div className="interpreter-empty">
             <div className="interpreter-empty-icon">🎙️</div>
             <p>{t("interpreter_hint", locale)}</p>
+            <p className="interpreter-subtitle-hint">
+              {locale === "ko"
+                ? "통역 중 화면에 자막이 실시간으로 표시됩니다"
+                : "Subtitles will appear on screen during interpretation"}
+            </p>
           </div>
         )}
         {transcripts.map((tr) => (
@@ -722,7 +775,20 @@ export function Interpreter({
             <span className="transcript-badge">
               {tr.type === "input" ? "🗣️" : tr.type === "output" ? "🔊" : "⚙️"}
             </span>
-            <span className="transcript-text">{tr.text}</span>
+            <div className="transcript-content">
+              {tr.type !== "system" && (
+                <span className="transcript-lang-label">
+                  {tr.type === "input"
+                    ? (sourceLang === "auto"
+                      ? (locale === "ko" ? "원문 (자동감지)" : "Source (auto)")
+                      : LANGUAGES.find((l) => l.code === sourceLang)?.name || sourceLang)
+                    : LANGUAGES.find((l) => l.code === targetLang)?.name || targetLang}
+                </span>
+              )}
+              <span className={`transcript-text ${tr.type !== "system" ? "subtitle-text" : ""}`}>
+                {tr.text}
+              </span>
+            </div>
           </div>
         ))}
         {status === "listening" && (

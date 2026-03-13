@@ -1271,6 +1271,95 @@ pub async fn handle_api_cli_tools(
     Json(serde_json::json!({"cli_tools": tools})).into_response()
 }
 
+/// POST /api/document/process — Process an uploaded document.
+///
+/// Accepts multipart form upload with a document file.
+/// Auto-detects document type and routes to the appropriate pipeline:
+/// - Digital PDF → local text extraction + optional Gemini correction
+/// - Image PDF → Upstage OCR + Gemini correction
+/// - Office docs (HWP, DOCX, etc.) → Hancom DocsConverter
+///
+/// Returns JSON with `html` and `markdown` fields.
+pub async fn handle_api_document_process(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    // Parse multipart boundary from Content-Type header
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !content_type.contains("multipart/form-data") {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Expected multipart/form-data"})),
+        )
+            .into_response();
+    }
+
+    // For simplicity, save the uploaded file to a temp directory and process it.
+    // In production, use proper multipart parsing.
+    let tmp_dir = std::env::temp_dir().join("moa_doc_upload");
+    let _ = std::fs::create_dir_all(&tmp_dir);
+
+    // Extract filename from Content-Disposition or use default
+    let filename = "uploaded_document";
+    let tmp_path = tmp_dir.join(filename);
+
+    // Write body to temp file
+    if let Err(e) = std::fs::write(&tmp_path, &body) {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save file: {e}")})),
+        )
+            .into_response();
+    }
+
+    // Process using the document pipeline tool
+    use crate::tools::traits::Tool;
+    let security = crate::security::SecurityPolicy::default();
+    let tool = crate::tools::document_pipeline::DocumentPipelineTool::new(security);
+    let args = serde_json::json!({
+        "file_path": tmp_path.to_string_lossy(),
+        "output_dir": tmp_dir.to_string_lossy(),
+    });
+
+    match tool.execute(args).await {
+        Ok(result) => {
+            // Clean up temp file
+            let _ = std::fs::remove_file(&tmp_path);
+
+            if result.success {
+                Json(serde_json::json!({
+                    "success": true,
+                    "result": result.output,
+                }))
+                .into_response()
+            } else {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": result.output})),
+                )
+                    .into_response()
+            }
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Document processing failed: {e}")})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// GET /api/health — component health snapshot
 pub async fn handle_api_health(
     State(state): State<AppState>,

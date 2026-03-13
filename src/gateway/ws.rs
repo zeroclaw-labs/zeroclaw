@@ -759,12 +759,18 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                 }
 
                 // Resolve API key
+                // Voice interpretation requires the USER's own API key.
+                // Operator keys are NOT used for voice — real-time streaming
+                // is too latency-sensitive for proxy, and too costly to subsidize.
                 let api_key = voice_config.gemini_api_key.clone().unwrap_or_default();
                 if api_key.is_empty() {
                     let err = ServerMessage::Error {
                         session_id: session_id.clone(),
                         code: "NO_API_KEY".into(),
-                        message: "Gemini API key not configured".into(),
+                        message: "Voice interpretation requires your own API key. \
+                            Please enter your Gemini or OpenAI API key in Settings. \
+                            (Operator keys are not available for voice features)"
+                            .into(),
                     };
                     let _ = socket
                         .send(Message::Text(

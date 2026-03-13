@@ -33,26 +33,37 @@ pub struct AdminKeys {
     pub openai: Option<String>,
     pub gemini: Option<String>,
     pub perplexity: Option<String>,
+    /// Upstage Document Parse API key (for image PDF OCR).
+    pub upstage: Option<String>,
 }
 
 impl AdminKeys {
     /// Load operator keys from environment variables.
+    ///
+    /// These are set as Railway environment variables by the operator.
+    /// In the hybrid architecture, these keys NEVER leave the server —
+    /// clients access LLM/document services through the proxy endpoints
+    /// or via temporary upload tokens.
     pub fn from_env() -> Self {
         Self {
             anthropic: std::env::var("ADMIN_ANTHROPIC_API_KEY").ok(),
             openai: std::env::var("ADMIN_OPENAI_API_KEY").ok(),
             gemini: std::env::var("ADMIN_GEMINI_API_KEY").ok(),
             perplexity: std::env::var("ADMIN_PERPLEXITY_API_KEY").ok(),
+            upstage: std::env::var("ADMIN_UPSTAGE_API_KEY")
+                .or_else(|_| std::env::var("UPSTAGE_API_KEY"))
+                .ok(),
         }
     }
 
-    /// Get the operator key for a given provider name.
+    /// Get the operator key for a given provider/service name.
     pub fn get(&self, provider: &str) -> Option<&str> {
         match provider {
             "anthropic" | "claude" => self.anthropic.as_deref(),
             "openai" | "gpt" => self.openai.as_deref(),
             "gemini" | "google" => self.gemini.as_deref(),
             "perplexity" => self.perplexity.as_deref(),
+            "upstage" => self.upstage.as_deref(),
             _ => None,
         }
     }
