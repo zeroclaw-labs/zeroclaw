@@ -1562,6 +1562,21 @@ pub struct BackupConfig {
     /// Workspace subdirectories to include in backups.
     #[serde(default = "default_backup_include_dirs")]
     pub include_dirs: Vec<String>,
+    /// Output directory for backup archives (relative to workspace root).
+    #[serde(default = "default_backup_destination_dir")]
+    pub destination_dir: String,
+    /// Optional cron expression for scheduled automatic backups (e.g. `"0 2 * * *"`).
+    #[serde(default)]
+    pub schedule_cron: Option<String>,
+    /// IANA timezone for `schedule_cron` (e.g. `"UTC"`, `"Europe/Zurich"`).
+    #[serde(default)]
+    pub schedule_timezone: Option<String>,
+    /// Compress backup archives.
+    #[serde(default = "default_true")]
+    pub compress: bool,
+    /// Encrypt backup archives (requires a configured secret store key).
+    #[serde(default)]
+    pub encrypt: bool,
 }
 
 fn default_backup_max_keep() -> usize {
@@ -1577,12 +1592,21 @@ fn default_backup_include_dirs() -> Vec<String> {
     ]
 }
 
+fn default_backup_destination_dir() -> String {
+    "state/backups".into()
+}
+
 impl Default for BackupConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             max_keep: default_backup_max_keep(),
             include_dirs: default_backup_include_dirs(),
+            destination_dir: default_backup_destination_dir(),
+            schedule_cron: None,
+            schedule_timezone: None,
+            compress: true,
+            encrypt: false,
         }
     }
 }
@@ -1598,6 +1622,12 @@ pub struct DataRetentionConfig {
     /// Days of data to retain before purge eligibility.
     #[serde(default = "default_retention_days")]
     pub retention_days: u64,
+    /// Preview what would be deleted without actually removing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Limit retention enforcement to specific data categories (empty = all).
+    #[serde(default)]
+    pub categories: Vec<String>,
 }
 
 fn default_retention_days() -> u64 {
@@ -1609,6 +1639,8 @@ impl Default for DataRetentionConfig {
         Self {
             enabled: false,
             retention_days: default_retention_days(),
+            dry_run: false,
+            categories: Vec::new(),
         }
     }
 }
