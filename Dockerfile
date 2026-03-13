@@ -132,3 +132,34 @@ USER 65534:65534
 EXPOSE 42617
 ENTRYPOINT ["zeroclaw"]
 CMD ["gateway"]
+
+# ── Stage 4: Production Runtime (Debian with shell) ────────
+# Variant with shell access for debugging and tool execution
+FROM debian:trixie-slim@sha256:f6e2cfac5cf956ea044b4bd75e6397b4372ad88fe00908045e9a0d21712ae3ba AS debian-production
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
+COPY --from=builder /zeroclaw-data /zeroclaw-data
+
+# Environment setup
+# Ensure UTF-8 locale so CJK / multibyte input is handled correctly
+ENV LANG=C.UTF-8
+ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
+ENV HOME=/zeroclaw-data
+# Default provider and model are set in config.toml, not here,
+# so config file edits are not silently overridden
+#ENV PROVIDER=
+ENV ZEROCLAW_GATEWAY_PORT=42617
+
+# API_KEY must be provided at runtime!
+
+WORKDIR /zeroclaw-data
+USER 65534:65534
+EXPOSE 42617
+ENTRYPOINT ["zeroclaw"]
+CMD ["gateway"]
