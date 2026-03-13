@@ -3110,7 +3110,7 @@ mod tests {
     fn env_provider_url_overrides_api_url() {
         std::env::set_var("ZEROCLAW_PROVIDER_URL", "http://env-ollama:11434");
 
-        let options = Default::default();
+        let options = ProviderRuntimeOptions::default();
 
         let provider = create_provider_with_url_and_options(
             "ollama",
