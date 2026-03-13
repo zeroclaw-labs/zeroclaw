@@ -255,6 +255,9 @@ pub struct Config {
     /// Dynamic node discovery configuration (`[nodes]`).
     #[serde(default)]
     pub nodes: NodesConfig,
+/// LinkedIn integration configuration (`[linkedin]`).
+    #[serde(default)]
+    pub linkedin: LinkedInConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -1539,6 +1542,19 @@ impl Default for WebSearchConfig {
             timeout_secs: default_web_search_timeout_secs(),
         }
     }
+}
+
+// ── LinkedIn ────────────────────────────────────────────────────
+
+/// LinkedIn integration configuration (`[linkedin]` section).
+///
+/// When enabled, the `linkedin` tool is registered in the agent tool surface.
+/// Requires `LINKEDIN_*` credentials in the workspace `.env` file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct LinkedInConfig {
+    /// Enable the LinkedIn tool
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 // ── Proxy ───────────────────────────────────────────────────────
@@ -4204,6 +4220,7 @@ impl Default for Config {
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+linkedin: LinkedInConfig::default(),
         }
     }
 }
@@ -6310,6 +6327,7 @@ default_temperature = 0.7
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+linkedin: LinkedInConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -6601,6 +6619,7 @@ tool_dispatcher = "xml"
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+linkedin: LinkedInConfig::default(),
         };
 
         config.save().await.unwrap();

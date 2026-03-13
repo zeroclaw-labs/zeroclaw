@@ -45,6 +45,8 @@ pub mod mcp_deferred;
 pub mod mcp_protocol;
 pub mod mcp_tool;
 pub mod mcp_transport;
+pub mod linkedin;
+pub mod linkedin_client;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
@@ -89,6 +91,7 @@ pub use image_info::ImageInfoTool;
 pub use mcp_client::McpRegistry;
 pub use mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
 pub use mcp_tool::McpToolWrapper;
+pub use linkedin::LinkedInTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
@@ -345,6 +348,14 @@ pub fn all_tools_with_runtime(
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
+
+    // LinkedIn integration (config-gated)
+    if root_config.linkedin.enabled {
+        tool_arcs.push(Arc::new(LinkedInTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+        )));
+    }
 
     if let Some(key) = composio_key {
         if !key.is_empty() {

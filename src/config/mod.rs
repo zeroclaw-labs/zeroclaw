@@ -6,24 +6,25 @@ pub use schema::{
     apply_runtime_proxy_to_builder, build_runtime_proxy_client,
     build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
     AgentConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
-    BuiltinHooksConfig, ChannelsConfig, ClassificationRule, ComposioConfig, Config, CostConfig,
-    CronConfig, DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig, EdgeTtsConfig,
-    ElevenLabsTtsConfig, EmbeddingRouteConfig, EstopConfig, FeishuConfig, GatewayConfig,
-    GoogleTtsConfig, HardwareConfig, HardwareTransport, HeartbeatConfig, HooksConfig,
-    HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig, McpConfig,
-    McpServerConfig, McpTransport, MemoryConfig, ModelRouteConfig, MultimodalConfig,
-    NextcloudTalkConfig, NodesConfig, ObservabilityConfig, OpenAiTtsConfig, OtpConfig, OtpMethod,
-    PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope, QdrantConfig,
-    QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig,
-    SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig,
-    SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
-    StorageProviderSection, StreamMode, TelegramConfig, ToolFilterGroup, ToolFilterGroupMode,
-    TranscriptionConfig, TtsConfig, TunnelConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
+    BuiltinHooksConfig, ChannelsConfig, ClassificationRule, ComposioConfig, Config,
+    CostConfig, CronConfig, DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig,
+    EdgeTtsConfig, ElevenLabsTtsConfig, EmbeddingRouteConfig, EstopConfig, FeishuConfig,
+    GatewayConfig, GoogleTtsConfig, HardwareConfig, HardwareTransport, HeartbeatConfig,
+    HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig,
+    LinkedInConfig, MatrixConfig, McpConfig, McpServerConfig, McpTransport, MemoryConfig,
+    ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, NodesConfig, ObservabilityConfig,
+    OpenAiTtsConfig, OtpConfig, OtpMethod, PeripheralBoardConfig, PeripheralsConfig,
+    ProxyConfig, ProxyScope, QdrantConfig, QueryClassificationConfig, ReliabilityConfig,
+    ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig,
+    SecretsConfig, SecurityConfig, SkillsConfig, SkillsPromptInjectionMode, SlackConfig,
+    StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode, TelegramConfig,
+    ToolFilterGroup, ToolFilterGroupMode, TranscriptionConfig, TtsConfig, TunnelConfig,
+    WebFetchConfig, WebSearchConfig, WebhookConfig,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
     (T::name(), channel.is_some())
-}
+};
 
 #[cfg(test)]
 mod tests {
@@ -91,4 +92,4 @@ mod tests {
         assert_eq!(feishu.app_id, "app-id");
         assert_eq!(nextcloud_talk.base_url, "https://cloud.example.com");
     }
-}
+};
