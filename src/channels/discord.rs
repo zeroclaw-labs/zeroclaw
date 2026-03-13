@@ -5,6 +5,7 @@ use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
 use serde_json::json;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -370,6 +371,7 @@ fn pick_uniform_index(len: usize) -> usize {
     loop {
         let value = rand::random::<u64>();
         if value < reject_threshold {
+            #[allow(clippy::cast_possible_truncation)]
             return (value % upper) as usize;
         }
     }
@@ -391,7 +393,7 @@ fn encode_emoji_for_discord(emoji: &str) -> String {
 
     let mut encoded = String::new();
     for byte in emoji.as_bytes() {
-        encoded.push_str(&format!("%{byte:02X}"));
+        let _ = write!(encoded, "%{byte:02X}");
     }
     encoded
 }
@@ -620,7 +622,18 @@ impl Channel for DiscordChannel {
                 msg = read.next() => {
                     let msg = match msg {
                         Some(Ok(Message::Text(t))) => t,
+                        Some(Ok(Message::Ping(payload))) => {
+                            if write.send(Message::Pong(payload)).await.is_err() {
+                                tracing::warn!("Discord: pong send failed, reconnecting");
+                                break;
+                            }
+                            continue;
+                        }
                         Some(Ok(Message::Close(_))) | None => break,
+                        Some(Err(e)) => {
+                            tracing::warn!("Discord: websocket read error: {e}, reconnecting");
+                            break;
+                        }
                         _ => continue,
                     };
 
@@ -1368,7 +1381,10 @@ mod tests {
     #[test]
     fn split_message_many_short_lines() {
         // Many short lines should be batched into chunks under the limit
-        let msg: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let msg: String = (0..500).fold(String::new(), |mut acc, i| {
+            let _ = writeln!(acc, "line {i}");
+            acc
+        });
         let parts = split_message_for_discord(&msg);
         for part in &parts {
             assert!(

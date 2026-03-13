@@ -281,7 +281,6 @@ fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
         return match effort {
             "low" | "medium" | "high" => effort.to_string(),
             "minimal" => "low".to_string(),
-            "xhigh" => "high".to_string(),
             _ => "high".to_string(),
         };
     }
@@ -1018,6 +1017,7 @@ data: [DONE]
             secrets_encrypt: false,
             auth_profile_override: None,
             reasoning_enabled: None,
+            provider_timeout_secs: None,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");

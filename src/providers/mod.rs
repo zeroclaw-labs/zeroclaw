@@ -17,6 +17,7 @@
 //! in [`create_provider_with_url`]. See `AGENTS.md` §7.1 for the full change playbook.
 
 pub mod anthropic;
+pub mod azure_openai;
 pub mod bedrock;
 pub mod compatible;
 pub mod copilot;
@@ -676,6 +677,9 @@ pub struct ProviderRuntimeOptions {
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
+    /// HTTP request timeout in seconds for LLM provider API calls.
+    /// `None` uses the provider's built-in default (120s for compatible providers).
+    pub provider_timeout_secs: Option<u64>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -686,6 +690,7 @@ impl Default for ProviderRuntimeOptions {
             zeroclaw_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: None,
+            provider_timeout_secs: None,
         }
     }
 }
@@ -839,6 +844,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
         "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
+        "opencode-go" => vec!["OPENCODE_GO_API_KEY"],
         "vercel" | "vercel-ai" => vec!["VERCEL_API_KEY"],
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
         "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
@@ -848,6 +854,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "vllm" => vec!["VLLM_API_KEY"],
         "osaurus" => vec!["OSAURUS_API_KEY"],
         "telnyx" => vec!["TELNYX_API_KEY"],
+        "azure_openai" | "azure-openai" | "azure" => vec!["AZURE_OPENAI_API_KEY"],
         _ => vec![],
     };
 
@@ -880,6 +887,55 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
     }
 
     None
+}
+
+/// Check whether an API key's prefix matches the selected provider.
+///
+/// Returns `Some("likely_provider")` when the key clearly belongs to a
+/// *different* provider (cross-provider mismatch).  Returns `None` when
+/// everything looks fine or the format is unrecognised.
+fn check_api_key_prefix(provider_name: &str, key: &str) -> Option<&'static str> {
+    // Identify which provider the key likely belongs to (longest prefix first).
+    let likely_provider = if key.starts_with("sk-ant-") {
+        Some("anthropic")
+    } else if key.starts_with("sk-or-") {
+        Some("openrouter")
+    } else if key.starts_with("sk-") {
+        Some("openai")
+    } else if key.starts_with("gsk_") {
+        Some("groq")
+    } else if key.starts_with("pplx-") {
+        Some("perplexity")
+    } else if key.starts_with("xai-") {
+        Some("xai")
+    } else if key.starts_with("nvapi-") {
+        Some("nvidia")
+    } else if key.starts_with("KEY-") {
+        Some("telnyx")
+    } else {
+        None
+    };
+
+    let expected = likely_provider?;
+
+    // Only flag mismatch for providers where we know the key format.
+    let matches = match provider_name {
+        "anthropic" => expected == "anthropic",
+        "openrouter" => expected == "openrouter",
+        "openai" => expected == "openai",
+        "groq" => expected == "groq",
+        "perplexity" => expected == "perplexity",
+        "xai" | "grok" => expected == "xai",
+        "nvidia" | "nvidia-nim" | "build.nvidia.com" => expected == "nvidia",
+        "telnyx" => expected == "telnyx",
+        _ => return None, // Unknown format provider — skip
+    };
+
+    if matches {
+        None
+    } else {
+        Some(expected)
+    }
 }
 
 fn parse_custom_provider_url(
@@ -941,6 +997,18 @@ fn create_provider_with_url_and_options(
     api_url: Option<&str>,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
+    // Closure to optionally apply the configured provider timeout to
+    // OpenAI-compatible providers before boxing them as trait objects.
+    let compat = {
+        let timeout = options.provider_timeout_secs;
+        move |p: OpenAiCompatibleProvider| -> Box<dyn Provider> {
+            match timeout {
+                Some(t) => Box::new(p.with_timeout_secs(t)),
+                None => Box::new(p),
+            }
+        }
+    };
+
     let qwen_oauth_context = is_qwen_oauth_alias(name).then(|| resolve_qwen_oauth_context(api_key));
 
     // Resolve credential and break static-analysis taint chain from the
@@ -954,6 +1022,23 @@ fn create_provider_with_url_and_options(
     .map(|v| String::from_utf8(v.into_bytes()).unwrap_or_default());
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
+
+    // Pre-flight: catch obvious API-key / provider mismatches early.
+    if let Some(key_value) = key {
+        let is_custom = name.starts_with("custom:") || name.starts_with("anthropic-custom:");
+        let has_custom_url = api_url.map(str::trim).filter(|u| !u.is_empty()).is_some();
+        if !is_custom && !has_custom_url {
+            if let Some(likely_provider) = check_api_key_prefix(name, key_value) {
+                let visible = &key_value[..key_value.len().min(8)];
+                anyhow::bail!(
+                    "API key prefix mismatch: key \"{visible}...\" looks like a \
+                     {likely_provider} key, but provider \"{name}\" is selected. \
+                     Set the correct provider-specific env var or use `-p {likely_provider}`."
+                );
+            }
+        }
+    }
+
     match name {
         "openai-codex" | "openai_codex" | "codex" => {
             let mut codex_options = options.clone();
@@ -997,28 +1082,28 @@ fn create_provider_with_url_and_options(
         "telnyx" => Ok(Box::new(telnyx::TelnyxProvider::new(key))),
 
         // ── OpenAI-compatible providers ──────────────────────
-        "venice" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "venice" => Ok(compat(OpenAiCompatibleProvider::new(
             "Venice", "https://api.venice.ai", key, AuthStyle::Bearer,
         ))),
-        "vercel" | "vercel-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "vercel" | "vercel-ai" => Ok(compat(OpenAiCompatibleProvider::new(
             "Vercel AI Gateway",
             VERCEL_AI_GATEWAY_BASE_URL,
             key,
             AuthStyle::Bearer,
         ))),
-        "cloudflare" | "cloudflare-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "cloudflare" | "cloudflare-ai" => Ok(compat(OpenAiCompatibleProvider::new(
             "Cloudflare AI Gateway",
             "https://gateway.ai.cloudflare.com/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        name if moonshot_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
+        name if moonshot_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new(
             "Moonshot",
             moonshot_base_url(name).expect("checked in guard"),
             key,
             AuthStyle::Bearer,
         ))),
-        "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(Box::new(
+        "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(compat(
             OpenAiCompatibleProvider::new_with_user_agent(
                 "Kimi Code",
                 "https://api.kimi.com/coding/v1",
@@ -1027,27 +1112,30 @@ fn create_provider_with_url_and_options(
                 "KimiCLI/0.77",
             ),
         )),
-        "synthetic" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "synthetic" => Ok(compat(OpenAiCompatibleProvider::new(
             "Synthetic", "https://api.synthetic.new/openai/v1", key, AuthStyle::Bearer,
         ))),
-        "opencode" | "opencode-zen" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "opencode" | "opencode-zen" => Ok(compat(OpenAiCompatibleProvider::new(
             "OpenCode Zen", "https://opencode.ai/zen/v1", key, AuthStyle::Bearer,
         ))),
-        name if zai_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "opencode-go" => Ok(compat(OpenAiCompatibleProvider::new(
+            "OpenCode Go", "https://opencode.ai/zen/go/v1", key, AuthStyle::Bearer,
+        ))),
+        name if zai_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new(
             "Z.AI",
             zai_base_url(name).expect("checked in guard"),
             key,
             AuthStyle::Bearer,
         ))),
         name if glm_base_url(name).is_some() => {
-            Ok(Box::new(OpenAiCompatibleProvider::new_no_responses_fallback(
+            Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
                 "GLM",
                 glm_base_url(name).expect("checked in guard"),
                 key,
                 AuthStyle::Bearer,
             )))
         }
-        name if minimax_base_url(name).is_some() => Ok(Box::new(
+        name if minimax_base_url(name).is_some() => Ok(compat(
             OpenAiCompatibleProvider::new_merge_system_into_user(
                 "MiniMax",
                 minimax_base_url(name).expect("checked in guard"),
@@ -1055,6 +1143,19 @@ fn create_provider_with_url_and_options(
                 AuthStyle::Bearer,
             )
         )),
+        "azure_openai" | "azure-openai" | "azure" => {
+            let resource = std::env::var("AZURE_OPENAI_RESOURCE")
+                .unwrap_or_else(|_| "my-resource".to_string());
+            let deployment = std::env::var("AZURE_OPENAI_DEPLOYMENT")
+                .unwrap_or_else(|_| "gpt-4o".to_string());
+            let api_version = std::env::var("AZURE_OPENAI_API_VERSION").ok();
+            Ok(Box::new(azure_openai::AzureOpenAiProvider::new(
+                key,
+                &resource,
+                &deployment,
+                api_version.as_deref(),
+            )))
+        }
         "bedrock" | "aws-bedrock" => Ok(Box::new(bedrock::BedrockProvider::new())),
         name if is_qwen_oauth_alias(name) => {
             let base_url = api_url
@@ -1064,7 +1165,7 @@ fn create_provider_with_url_and_options(
                 .or_else(|| qwen_oauth_context.as_ref().and_then(|context| context.base_url.clone()))
                 .unwrap_or_else(|| QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
 
-            Ok(Box::new(
+            Ok(compat(
                 OpenAiCompatibleProvider::new_with_user_agent_and_vision(
                 "Qwen Code",
                 &base_url,
@@ -1074,16 +1175,16 @@ fn create_provider_with_url_and_options(
                 true,
             )))
         }
-        name if is_qianfan_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
+        name if is_qianfan_alias(name) => Ok(compat(OpenAiCompatibleProvider::new(
             "Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer,
         ))),
-        name if is_doubao_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
+        name if is_doubao_alias(name) => Ok(compat(OpenAiCompatibleProvider::new(
             "Doubao",
             "https://ark.cn-beijing.volces.com/api/v3",
             key,
             AuthStyle::Bearer,
         ))),
-        name if qwen_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new_with_vision(
+        name if qwen_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new_with_vision(
             "Qwen",
             qwen_base_url(name).expect("checked in guard"),
             key,
@@ -1092,31 +1193,31 @@ fn create_provider_with_url_and_options(
         ))),
 
         // ── Extended ecosystem (community favorites) ─────────
-        "groq" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "groq" => Ok(compat(OpenAiCompatibleProvider::new(
             "Groq", "https://api.groq.com/openai/v1", key, AuthStyle::Bearer,
         ))),
-        "mistral" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "mistral" => Ok(compat(OpenAiCompatibleProvider::new(
             "Mistral", "https://api.mistral.ai/v1", key, AuthStyle::Bearer,
         ))),
-        "xai" | "grok" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "xai" | "grok" => Ok(compat(OpenAiCompatibleProvider::new(
             "xAI", "https://api.x.ai", key, AuthStyle::Bearer,
         ))),
-        "deepseek" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "deepseek" => Ok(compat(OpenAiCompatibleProvider::new(
             "DeepSeek", "https://api.deepseek.com", key, AuthStyle::Bearer,
         ))),
-        "together" | "together-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "together" | "together-ai" => Ok(compat(OpenAiCompatibleProvider::new(
             "Together AI", "https://api.together.xyz", key, AuthStyle::Bearer,
         ))),
-        "fireworks" | "fireworks-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "fireworks" | "fireworks-ai" => Ok(compat(OpenAiCompatibleProvider::new(
             "Fireworks AI", "https://api.fireworks.ai/inference/v1", key, AuthStyle::Bearer,
         ))),
-        "novita" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "novita" => Ok(compat(OpenAiCompatibleProvider::new(
             "Novita AI", "https://api.novita.ai/openai", key, AuthStyle::Bearer,
         ))),
-        "perplexity" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "perplexity" => Ok(compat(OpenAiCompatibleProvider::new(
             "Perplexity", "https://api.perplexity.ai", key, AuthStyle::Bearer,
         ))),
-        "cohere" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "cohere" => Ok(compat(OpenAiCompatibleProvider::new(
             "Cohere", "https://api.cohere.com/compatibility", key, AuthStyle::Bearer,
         ))),
         "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
@@ -1125,7 +1226,7 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("lm-studio");
-            Ok(Box::new(OpenAiCompatibleProvider::new(
+            Ok(compat(OpenAiCompatibleProvider::new(
                 "LM Studio",
                 "http://localhost:1234/v1",
                 Some(lm_studio_key),
@@ -1141,7 +1242,7 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("llama.cpp");
-            Ok(Box::new(OpenAiCompatibleProvider::new(
+            Ok(compat(OpenAiCompatibleProvider::new(
                 "llama.cpp",
                 base_url,
                 Some(llama_cpp_key),
@@ -1153,7 +1254,7 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("http://localhost:30000/v1");
-            Ok(Box::new(OpenAiCompatibleProvider::new(
+            Ok(compat(OpenAiCompatibleProvider::new(
                 "SGLang",
                 base_url,
                 key,
@@ -1165,7 +1266,7 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("http://localhost:8000/v1");
-            Ok(Box::new(OpenAiCompatibleProvider::new(
+            Ok(compat(OpenAiCompatibleProvider::new(
                 "vLLM",
                 base_url,
                 key,
@@ -1181,14 +1282,14 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("osaurus");
-            Ok(Box::new(OpenAiCompatibleProvider::new(
+            Ok(compat(OpenAiCompatibleProvider::new(
                 "Osaurus",
                 base_url,
                 Some(osaurus_key),
                 AuthStyle::Bearer,
             )))
         }
-        "nvidia" | "nvidia-nim" | "build.nvidia.com" => Ok(Box::new(
+        "nvidia" | "nvidia-nim" | "build.nvidia.com" => Ok(compat(
             OpenAiCompatibleProvider::new_no_responses_fallback(
                 "NVIDIA NIM",
                 "https://integrate.api.nvidia.com/v1",
@@ -1198,7 +1299,7 @@ fn create_provider_with_url_and_options(
         )),
 
         // ── AI inference routers ─────────────────────────────
-        "astrai" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "astrai" => Ok(compat(OpenAiCompatibleProvider::new(
             "Astrai", "https://as-trai.com/v1", key, AuthStyle::Bearer,
         ))),
 
@@ -1216,7 +1317,7 @@ fn create_provider_with_url_and_options(
                 "Custom provider",
                 "custom:https://your-api.com",
             )?;
-            Ok(Box::new(OpenAiCompatibleProvider::new_with_vision(
+            Ok(compat(OpenAiCompatibleProvider::new_with_vision(
                 "Custom",
                 &base_url,
                 key,
@@ -1540,6 +1641,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "opencode",
             display_name: "OpenCode Zen",
             aliases: &["opencode-zen"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "opencode-go",
+            display_name: "OpenCode Go",
+            aliases: &[],
             local: false,
         },
         ProviderInfo {
@@ -2076,6 +2183,22 @@ mod tests {
     }
 
     #[test]
+    fn factory_opencode_go() {
+        assert!(create_provider("opencode-go", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn resolve_provider_credential_opencode_go_env() {
+        let _env_lock = env_lock();
+        let _provider_guard = EnvGuard::set("OPENCODE_GO_API_KEY", Some("go-test-key"));
+        let _generic_guard = EnvGuard::set("API_KEY", None);
+        let _zeroclaw_guard = EnvGuard::set("ZEROCLAW_API_KEY", None);
+
+        let resolved = resolve_provider_credential("opencode-go", None);
+        assert_eq!(resolved.as_deref(), Some("go-test-key"));
+    }
+
+    #[test]
     fn factory_zai() {
         assert!(create_provider("zai", Some("key")).is_ok());
         assert!(create_provider("z.ai", Some("key")).is_ok());
@@ -2597,6 +2720,7 @@ mod tests {
             "kimi-code",
             "synthetic",
             "opencode",
+            "opencode-go",
             "zai",
             "zai-cn",
             "glm",
@@ -2899,5 +3023,50 @@ mod tests {
 
         let provider = create_resilient_provider("ollama", None, None, &reliability);
         assert!(provider.is_ok());
+    }
+
+    // ── API key prefix pre-flight ───────────────────────────
+
+    #[test]
+    fn api_key_prefix_cross_provider_mismatch() {
+        // Anthropic key used with openrouter
+        assert_eq!(
+            check_api_key_prefix("openrouter", "sk-ant-api03-xyz"),
+            Some("anthropic")
+        );
+        // OpenRouter key used with anthropic
+        assert_eq!(
+            check_api_key_prefix("anthropic", "sk-or-v1-xyz"),
+            Some("openrouter")
+        );
+        // Anthropic key used with openai
+        assert_eq!(
+            check_api_key_prefix("openai", "sk-ant-xyz"),
+            Some("anthropic")
+        );
+        // Groq key used with openai
+        assert_eq!(check_api_key_prefix("openai", "gsk_xyz"), Some("groq"));
+    }
+
+    #[test]
+    fn api_key_prefix_correct_match() {
+        assert_eq!(check_api_key_prefix("anthropic", "sk-ant-api03-xyz"), None);
+        assert_eq!(check_api_key_prefix("openrouter", "sk-or-v1-xyz"), None);
+        assert_eq!(check_api_key_prefix("openai", "sk-proj-xyz"), None);
+        assert_eq!(check_api_key_prefix("groq", "gsk_xyz"), None);
+    }
+
+    #[test]
+    fn api_key_prefix_unknown_provider_skips() {
+        // Providers without known key formats should never flag a mismatch.
+        assert_eq!(check_api_key_prefix("deepseek", "sk-ant-xyz"), None);
+        assert_eq!(check_api_key_prefix("ollama", "anything"), None);
+    }
+
+    #[test]
+    fn api_key_prefix_unknown_key_format_skips() {
+        // Keys without a recognisable prefix should never flag a mismatch.
+        assert_eq!(check_api_key_prefix("openai", "my-custom-key-123"), None);
+        assert_eq!(check_api_key_prefix("anthropic", "some-random-key"), None);
     }
 }

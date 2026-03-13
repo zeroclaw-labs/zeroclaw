@@ -16,6 +16,14 @@ export default defineConfig({
   },
   server: {
     proxy: {
+      "/health": {
+        target: "http://localhost:5555",
+        changeOrigin: true,
+      },
+      "/pair": {
+        target: "http://localhost:5555",
+        changeOrigin: true,
+      },
       "/api": {
         target: "http://localhost:5555",
         changeOrigin: true,

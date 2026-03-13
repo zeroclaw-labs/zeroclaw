@@ -1,9 +1,10 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, TokenUsage, ToolCall as ProviderToolCall,
+    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
+use base64::Engine as _;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,14 @@ struct NativeMessage {
 }
 
 #[derive(Debug, Serialize)]
+struct ImageSource {
+    #[serde(rename = "type")]
+    source_type: String,
+    media_type: String,
+    data: String,
+}
+
+#[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 enum NativeContentOut {
     #[serde(rename = "text")]
@@ -68,6 +77,8 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -210,7 +221,7 @@ impl AnthropicProvider {
                     | NativeContentOut::ToolResult { cache_control, .. } => {
                         *cache_control = Some(CacheControl::ephemeral());
                     }
-                    NativeContentOut::ToolUse { .. } => {}
+                    NativeContentOut::ToolUse { .. } | NativeContentOut::Image { .. } => {}
                 }
             }
         }
@@ -332,12 +343,71 @@ impl AnthropicProvider {
                     }
                 }
                 _ => {
+                    // Parse image markers from user message content
+                    let (text, image_refs) = crate::multimodal::parse_image_markers(&msg.content);
+                    let mut content_blocks: Vec<NativeContentOut> = Vec::new();
+
+                    // Add image content blocks for each image reference
+                    for img_ref in &image_refs {
+                        let (media_type, data) = if img_ref.starts_with("data:") {
+                            // Data URI format: data:image/jpeg;base64,/9j/4AAQ...
+                            if let Some(comma) = img_ref.find(',') {
+                                let header = &img_ref[5..comma];
+                                let mime =
+                                    header.split(';').next().unwrap_or("image/jpeg").to_string();
+                                let b64 = img_ref[comma + 1..].trim().to_string();
+                                (mime, b64)
+                            } else {
+                                continue;
+                            }
+                        } else if std::path::Path::new(img_ref.trim()).exists() {
+                            // Local file path
+                            match std::fs::read(img_ref.trim()) {
+                                Ok(bytes) => {
+                                    let b64 =
+                                        base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                    let ext = std::path::Path::new(img_ref.trim())
+                                        .extension()
+                                        .and_then(|e| e.to_str())
+                                        .unwrap_or("jpg");
+                                    let mime = match ext {
+                                        "png" => "image/png",
+                                        "gif" => "image/gif",
+                                        "webp" => "image/webp",
+                                        _ => "image/jpeg",
+                                    }
+                                    .to_string();
+                                    (mime, b64)
+                                }
+                                Err(_) => continue,
+                            }
+                        } else {
+                            continue;
+                        };
+
+                        content_blocks.push(NativeContentOut::Image {
+                            source: ImageSource {
+                                source_type: "base64".to_string(),
+                                media_type,
+                                data,
+                            },
+                        });
+                    }
+
+                    // Add text content block
+                    let display_text = if text.is_empty() && !image_refs.is_empty() {
+                        "[image]".to_string()
+                    } else {
+                        text
+                    };
+                    content_blocks.push(NativeContentOut::Text {
+                        text: display_text,
+                        cache_control: None,
+                    });
+
                     native_messages.push(NativeMessage {
                         role: "user".to_string(),
-                        content: vec![NativeContentOut::Text {
-                            text: msg.content.clone(),
-                            cache_control: None,
-                        }],
+                        content: content_blocks,
                     });
                 }
             }
@@ -508,6 +578,13 @@ impl Provider for AnthropicProvider {
 
         let native_response: NativeChatResponse = response.json().await?;
         Ok(Self::parse_native_response(native_response))
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+        }
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -1352,5 +1429,125 @@ mod tests {
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicProvider::parse_native_response(resp);
         assert!(result.usage.is_none());
+    }
+
+    #[test]
+    fn capabilities_returns_vision_and_native_tools() {
+        let provider = AnthropicProvider::new(Some("test-key"));
+        let caps = provider.capabilities();
+        assert!(
+            caps.native_tool_calling,
+            "Anthropic should support native tool calling"
+        );
+        assert!(caps.vision, "Anthropic should support vision");
+    }
+
+    #[test]
+    fn convert_messages_with_image_marker_data_uri() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Check this image: [IMAGE:data:image/jpeg;base64,/9j/4AAQ] What do you see?"
+                .to_string(),
+        }];
+
+        let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
+
+        assert_eq!(native_msgs.len(), 1);
+        assert_eq!(native_msgs[0].role, "user");
+        // Should have 2 content blocks: image + text
+        assert_eq!(native_msgs[0].content.len(), 2);
+
+        // First block should be image
+        match &native_msgs[0].content[0] {
+            NativeContentOut::Image { source } => {
+                assert_eq!(source.source_type, "base64");
+                assert_eq!(source.media_type, "image/jpeg");
+                assert_eq!(source.data, "/9j/4AAQ");
+            }
+            _ => panic!("Expected Image content block"),
+        }
+
+        // Second block should be text (parse_image_markers may leave extra spaces)
+        match &native_msgs[0].content[1] {
+            NativeContentOut::Text { text, .. } => {
+                // The text may have extra spaces where the marker was removed
+                assert!(
+                    text.contains("Check this image:") && text.contains("What do you see?"),
+                    "Expected text to contain 'Check this image:' and 'What do you see?', got: {}",
+                    text
+                );
+            }
+            _ => panic!("Expected Text content block"),
+        }
+    }
+
+    #[test]
+    fn convert_messages_with_only_image_marker() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "[IMAGE:data:image/png;base64,iVBORw0KGgo]".to_string(),
+        }];
+
+        let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
+
+        assert_eq!(native_msgs.len(), 1);
+        assert_eq!(native_msgs[0].content.len(), 2);
+
+        // First block should be image
+        match &native_msgs[0].content[0] {
+            NativeContentOut::Image { source } => {
+                assert_eq!(source.media_type, "image/png");
+            }
+            _ => panic!("Expected Image content block"),
+        }
+
+        // Second block should be placeholder text
+        match &native_msgs[0].content[1] {
+            NativeContentOut::Text { text, .. } => {
+                assert_eq!(text, "[image]");
+            }
+            _ => panic!("Expected Text content block with [image] placeholder"),
+        }
+    }
+
+    #[test]
+    fn convert_messages_without_image_marker() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Hello, how are you?".to_string(),
+        }];
+
+        let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
+
+        assert_eq!(native_msgs.len(), 1);
+        assert_eq!(native_msgs[0].content.len(), 1);
+
+        match &native_msgs[0].content[0] {
+            NativeContentOut::Text { text, .. } => {
+                assert_eq!(text, "Hello, how are you?");
+            }
+            _ => panic!("Expected Text content block"),
+        }
+    }
+
+    #[test]
+    fn image_content_serializes_correctly() {
+        let content = NativeContentOut::Image {
+            source: ImageSource {
+                source_type: "base64".to_string(),
+                media_type: "image/jpeg".to_string(),
+                data: "testdata".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&content).unwrap();
+        // The outer "type" is the enum tag, inner "type" (source_type) is renamed
+        assert!(json.contains(r#""type":"image""#), "JSON: {}", json);
+        assert!(json.contains(r#""type":"base64""#), "JSON: {}", json); // source_type is serialized as "type"
+        assert!(
+            json.contains(r#""media_type":"image/jpeg""#),
+            "JSON: {}",
+            json
+        );
+        assert!(json.contains(r#""data":"testdata""#), "JSON: {}", json);
     }
 }

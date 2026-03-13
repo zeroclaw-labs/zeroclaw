@@ -72,6 +72,72 @@ pub(crate) mod util;
 
 pub use config::Config;
 
+/// Gateway management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GatewayCommands {
+    /// Start the gateway server (default if no subcommand specified)
+    #[command(long_about = "\
+Start the gateway server (webhooks, websockets).
+
+Runs the HTTP/WebSocket gateway that accepts incoming webhook events \
+and WebSocket connections. Bind address defaults to the values in \
+your config file (gateway.host / gateway.port).
+
+Examples:
+  zeroclaw gateway start              # use config defaults
+  zeroclaw gateway start -p 8080      # listen on port 8080
+  zeroclaw gateway start --host 0.0.0.0   # requires [gateway].allow_public_bind=true or a tunnel
+  zeroclaw gateway start -p 0         # random available port")]
+    Start {
+        /// Port to listen on (use 0 for random available port); defaults to config gateway.port
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Host to bind to; defaults to config gateway.host
+        /// Note: Binding to 0.0.0.0 requires `gateway.allow_public_bind = true` in config
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Restart the gateway server
+    #[command(long_about = "\
+Restart the gateway server.
+
+Stops the running gateway if present, then starts a new instance \
+with the current configuration.
+
+Examples:
+  zeroclaw gateway restart            # restart with config defaults
+  zeroclaw gateway restart -p 8080    # restart on port 8080")]
+    Restart {
+        /// Port to listen on (use 0 for random available port); defaults to config gateway.port
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Host to bind to; defaults to config gateway.host
+        /// Note: Binding to 0.0.0.0 requires `gateway.allow_public_bind = true` in config
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Show or generate the pairing code without restarting
+    #[command(long_about = "\
+Show or generate the gateway pairing code.
+
+Displays the pairing code for connecting new clients without \
+restarting the gateway. Requires the gateway to be running.
+
+With --new, generates a fresh pairing code even if the gateway \
+was previously paired (useful for adding additional clients).
+
+Examples:
+  zeroclaw gateway get-paircode       # show current pairing code
+  zeroclaw gateway get-paircode --new # generate a new pairing code")]
+    GetPaircode {
+        /// Generate a new pairing code (even if already paired)
+        #[arg(long)]
+        new: bool,
+    },
+}
+
 /// Service management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ServiceCommands {
@@ -135,6 +201,31 @@ Examples:
     BindTelegram {
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
+    },
+    /// Send a message to a configured channel
+    #[command(long_about = "\
+Send a one-off message to a configured channel.
+
+Sends a text message through the specified channel without starting \
+the full agent loop. Useful for scripted notifications, hardware \
+sensor alerts, and automation pipelines.
+
+The --channel-id selects the channel by its config section name \
+(e.g. 'telegram', 'discord', 'slack'). The --recipient is the \
+platform-specific destination (e.g. a Telegram chat ID).
+
+Examples:
+  zeroclaw channel send 'Someone is near your device.' --channel-id telegram --recipient 123456789
+  zeroclaw channel send 'Build succeeded!' --channel-id discord --recipient 987654321")]
+    Send {
+        /// Message text to send
+        message: String,
+        /// Channel config name (e.g. telegram, discord, slack)
+        #[arg(long)]
+        channel_id: String,
+        /// Recipient identifier (platform-specific, e.g. Telegram chat ID)
+        #[arg(long)]
+        recipient: String,
     },
 }
 
