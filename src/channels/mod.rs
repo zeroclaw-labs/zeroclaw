@@ -25,6 +25,7 @@ pub mod discord_history;
 pub mod email_channel;
 pub mod gmail_push;
 pub mod imessage;
+pub mod inboxapi;
 pub mod irc;
 #[cfg(feature = "channel-lark")]
 pub mod lark;
@@ -74,6 +75,7 @@ pub use discord_history::DiscordHistoryChannel;
 pub use email_channel::EmailChannel;
 pub use gmail_push::GmailPushChannel;
 pub use imessage::IMessageChannel;
+pub use inboxapi::InboxApiChannel;
 pub use irc::IrcChannel;
 #[cfg(feature = "channel-lark")]
 pub use lark::LarkChannel;
@@ -4634,6 +4636,13 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "iMessage",
             channel: Arc::new(IMessageChannel::new(im.allowed_contacts.clone())),
+        });
+    }
+
+    if let Some(ref inbox) = config.channels_config.inboxapi {
+        channels.push(ConfiguredChannel {
+            display_name: "InboxAPI",
+            channel: Arc::new(InboxApiChannel::new(inbox.clone())),
         });
     }
 

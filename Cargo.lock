@@ -13047,6 +13047,7 @@ dependencies = [
  "serde",
  "serde-big-array",
  "serde_json",
+ "sha1",
  "sha2",
  "shellexpand",
  "tar",
