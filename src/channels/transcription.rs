@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 
 use crate::config::TranscriptionConfig;
+use crate::providers::resolve_provider_credential;
 
 /// Maximum upload size for Gemini API (20 MB).
 const MAX_AUDIO_BYTES: usize = 20 * 1024 * 1024;
@@ -16,7 +17,7 @@ fn normalize_non_empty(value: &str) -> Option<String> {
 }
 
 /// Get the API key for transcription using the same logic as the Gemini provider.
-/// Priority: config.api_key > GEMINI_API_KEY
+/// Priority: config.api_key > resolve_provider_credential("gemini", None) > generic fallbacks
 fn get_transcription_api_key(config: &TranscriptionConfig) -> Option<String> {
     // First try config.api_key
     if let Some(ref key) = config.api_key {
@@ -24,13 +25,8 @@ fn get_transcription_api_key(config: &TranscriptionConfig) -> Option<String> {
             return Some(normalized);
         }
     }
-    // Then try GEMINI_API_KEY (same as Gemini provider)
-    if let Ok(key) = std::env::var("GEMINI_API_KEY") {
-        if let Some(normalized) = normalize_non_empty(&key) {
-            return Some(normalized);
-        }
-    }
-    None
+    // Then use the centralized provider credential resolution (supports GEMINI_API_KEY, GOOGLE_API_KEY, ZEROCLAW_API_KEY, API_KEY)
+    resolve_provider_credential("gemini", None)
 }
 
 /// Check which transcription provider to use.

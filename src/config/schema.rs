@@ -1380,6 +1380,10 @@ pub struct MultimodalGenerationConfig {
     /// API key for image generation provider (optional, falls back to ZEROCLAW_API_KEY).
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Keywords that trigger image generation intent detection (vs vision analysis).
+    /// Uses unidecode normalization (é→e, ñ→n) before matching.
+    #[serde(default)]
+    pub image_generation_keywords: Vec<String>,
 }
 
 impl Default for MultimodalGenerationConfig {
@@ -1393,6 +1397,14 @@ impl Default for MultimodalGenerationConfig {
             default_voice: None,
             default_image_size: None,
             api_key: None,
+            image_generation_keywords: vec![
+                "dessine".to_string(),
+                "generate".to_string(),
+                "crée une image".to_string(),
+                "create image".to_string(),
+                "image un".to_string(),
+                "génère".to_string(),
+            ],
         }
     }
 }

@@ -80,6 +80,8 @@ const CANARY_EXFILTRATION_BLOCK_MESSAGE: &str =
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
+/// Prompt injected when image markers are detected but LLM calls image_generation
+/// without the `image` parameter. This helps the LLM understand it should pass
 fn filter_primary_agent_tools_or_fail(
     config: &Config,
     tools_registry: Vec<Box<dyn Tool>>,
@@ -139,7 +141,11 @@ fn should_treat_provider_as_vision_capable(provider_name: &str, provider: &dyn P
     // and rely on upstream API validation if a specific model cannot handle
     // vision.
     let normalized = provider_name.trim().to_ascii_lowercase();
-    normalized == "anthropic" || normalized.starts_with("anthropic-custom:")
+    normalized == "anthropic" 
+        || normalized.starts_with("anthropic-custom:")
+        // Gemini supports vision via generateContent API
+        || normalized == "gemini"
+        || normalized.starts_with("gemini-")
 }
 
 /// Slash-command definitions for interactive-mode completion.
@@ -1264,7 +1270,24 @@ pub async fn run_tool_call_loop(
         let image_marker_count = multimodal::count_image_markers(history);
         let provider_supports_vision =
             should_treat_provider_as_vision_capable(provider_name, provider);
-        if image_marker_count > 0 && !provider_supports_vision {
+        
+        // Check if user message contains image generation keywords (not vision analysis)
+        // If keywords are present, skip vision capability check and let agent use image_generation tool
+        let user_text = history
+            .iter()
+            .last()
+            .map(|m| m.content.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let generation_keywords = &multimodal_config.generation.image_generation_keywords;
+        let contains_generation_keyword = generation_keywords
+            .iter()
+            .any(|kw| user_text.contains(&kw.to_lowercase()));
+        
+        // Only enforce vision capability if: images present AND no generation keyword detected
+        let should_enforce_vision = image_marker_count > 0 && !contains_generation_keyword;
+
+        if should_enforce_vision && !provider_supports_vision {
             return Err(ProviderCapabilityError {
                 provider: provider_name.to_string(),
                 capability: "vision".to_string(),
@@ -1274,6 +1297,13 @@ pub async fn run_tool_call_loop(
             }
             .into());
         }
+
+        // When user sends an image with edit/modify/color keywords, inject guidance to use image_generation tool
+        let image_editing_hint = if image_marker_count > 0 && contains_generation_keyword {
+            Some("[GUIDANCE] The user wants to EDIT/MODIFY the image they provided. Use the 'image_generation' tool with the 'image' parameter (the path to the user's image) to edit it, NOT vision analysis.".to_string())
+        } else {
+            None
+        };
 
         let prepared_messages = multimodal::prepare_messages_for_provider_with_provider_hint(
             history,
@@ -1287,6 +1317,10 @@ pub async fn run_tool_call_loop(
         }
         if let Some(prompt) = loop_detection_prompt.take() {
             request_messages.push(ChatMessage::user(prompt));
+        }
+        // Inject image editing guidance if detected
+        if let Some(hint) = image_editing_hint {
+            request_messages.push(ChatMessage::user(hint));
         }
 
         // ── Safety heartbeat: periodic security-constraint re-injection ──
@@ -2023,10 +2057,54 @@ pub async fn run_tool_call_loop(
         let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
         let mut progress_indices: Vec<Option<usize>> = Vec::new();
 
+        // ═══ Image Editing Hint: Detect missing image parameter ═══
+        // Track if we need to inject a hint when user sends an image but LLM calls
+        // image_generation without the 'image' parameter.
+        let mut image_editing_hint_needed = false;
+        let mut user_image_path: Option<String> = None;
+        if tool_calls.iter().any(|c| c.name == "image_generation") {
+            // Check if there's an image in user messages
+            for msg in history.iter() {
+                if msg.role == "user" {
+                    let (_, refs) = crate::multimodal::parse_image_markers(&msg.content);
+                    if !refs.is_empty() {
+                        user_image_path = Some(refs[0].clone());
+                        // Check if any image_generation call is missing the 'image' parameter
+                        let has_missing_image_param = tool_calls.iter().any(|c| {
+                            c.name == "image_generation" && !c.arguments.get("image").is_some()
+                        });
+                        if has_missing_image_param {
+                            image_editing_hint_needed = true;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
         for (idx, call) in tool_calls.iter().enumerate() {
-            // ── Hook: before_tool_call (modifying) ──────────
+            // ═══ Hook: before_tool_call (modifying) ═══
             let mut tool_name = call.name.clone();
             let mut tool_args = call.arguments.clone();
+
+            // ═══ Inject Image Path for Editing ═══
+            // When user sends an image but LLM calls image_generation without 'image' param,
+            // automatically inject the image path so the tool edits the existing image.
+            if image_editing_hint_needed
+                && tool_name == "image_generation"
+                && !tool_args.get("image").is_some()
+            {
+                if let Some(ref image_path) = user_image_path {
+                    let mut tool_args_clone = tool_args.clone();
+                    tool_args_clone["image"] = serde_json::Value::String(image_path.clone());
+                    tool_args = tool_args_clone;
+                    tracing::info!(
+                        image_path = %image_path,
+                        "Auto-injected image path for editing - LLM will now edit the existing image instead of generating a new one"
+                    );
+                }
+            }
+
             if let Some(hooks) = hooks {
                 match hooks
                     .run_before_tool_call(tool_name.clone(), tool_args.clone())

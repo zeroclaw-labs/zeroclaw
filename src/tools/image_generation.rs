@@ -4,6 +4,7 @@
 use async_trait::async_trait;
 use super::traits::{Tool, ToolResult};
 use crate::config::schema::MultimodalGenerationConfig;
+use crate::providers::resolve_provider_credential;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -11,7 +12,7 @@ use std::path::PathBuf;
 pub const TOOL_NAME: &str = "image_generation";
 
 /// Image generation tool description
-pub const TOOL_DESCRIPTION: &str = "Generate images from text descriptions using AI providers";
+pub const TOOL_DESCRIPTION: &str = "Generate or edit images from text descriptions using AI providers (Gemini, OpenAI, etc.)";
 
 /// Parameters for image generation tool
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +43,11 @@ pub struct ImageGenerationParams {
     /// Provider to use (overrides config default)
     #[serde(default)]
     pub provider: Option<String>,
+
+    /// Path to source image for editing (Gemini models only)
+    /// When provided, the model will edit this image instead of generating from scratch
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
 fn default_n() -> usize {
@@ -106,15 +112,174 @@ impl ImageGenerationTool {
             .model
             .as_deref()
             .or(self.config.default_image_model.as_deref())
-            .unwrap_or("dall-e-3");
+            .unwrap_or("gemini-2.0-flash-exp");
+
+        // For Gemini with image editing, we need to handle multipart upload
+        // Also use Gemini if default provider is gemini (regardless of params.provider)
+        let effective_provider = if params.image.is_some() {
+            // When editing an image, force Gemini as the provider
+            "gemini".to_string()
+        } else {
+            provider_name.to_string()
+        };
+
+        if effective_provider == "gemini" && params.image.is_some() {
+            return self.generate_with_gemini_multipart(model, &params).await;
+        }
 
         // Build the request payload based on provider
         let payload = self.build_provider_payload(provider_name, model, &params)?;
 
         // Call the provider (this would integrate with the existing provider system)
-        let response = self.call_provider(provider_name, model, payload).await?;
+        let response = self.call_provider(provider_name, model, payload, None).await?;
 
         Ok(response)
+    }
+
+    /// Generate/edit images using Gemini with multipart upload (binary file)
+    async fn generate_with_gemini_multipart(
+        &self,
+        model: &str,
+        params: &ImageGenerationParams,
+    ) -> anyhow::Result<ImageGenerationResponse> {
+        let image_path = params
+            .image
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Image path is required for Gemini editing"))?;
+
+        tracing::debug!(image_path = %image_path, model = %model, prompt = %params.prompt, "Starting Gemini image edit");
+
+        // Read the image file as binary
+        let image_bytes = std::fs::read(image_path).map_err(|e| {
+            anyhow::anyhow!("Failed to read image file {}: {}", image_path, e)
+        })?;
+        
+        tracing::debug!(size_bytes = image_bytes.len(), "Image file read successfully");
+
+        // Determine MIME type from file extension
+        let mime_type = if image_path.to_lowercase().ends_with(".png") {
+            "image/png"
+        } else if image_path.to_lowercase().ends_with(".jpg") || image_path.to_lowercase().ends_with(".jpeg") {
+            "image/jpeg"
+        } else if image_path.to_lowercase().ends_with(".webp") {
+            "image/webp"
+        } else if image_path.to_lowercase().ends_with(".gif") {
+            "image/gif"
+        } else {
+            "image/png" // default
+        };
+
+        // Get API key
+        let api_key = self
+            .get_api_key("gemini")
+            .ok_or_else(|| anyhow::anyhow!("No API key configured for Gemini image generation"))?;
+
+        let client = reqwest::Client::new();
+
+        // Step 1: Upload the image file using Gemini's upload API
+        let upload_url = format!(
+            "https://generativelanguage.googleapis.com/upload/v1beta/files?uploadType=multipart&key={}",
+            api_key
+        );
+
+        // Create multipart form with the image (following Google Gemini API format)
+        // The multipart should have: 1) JSON metadata, 2) binary file data
+        let metadata = serde_json::json!({
+            "file": {
+                "display_name": "image"
+            }
+        });
+        
+        let part_metadata = reqwest::multipart::Part::text(metadata.to_string())
+            .mime_str("application/json")
+            .map_err(|e| anyhow::anyhow!("Invalid MIME type: {}", e))?;
+            
+        let part_file = reqwest::multipart::Part::bytes(image_bytes)
+            .mime_str(mime_type)
+            .map_err(|e| anyhow::anyhow!("Invalid MIME type: {}", e))?
+            .file_name("image.png".to_string());
+
+        let form = reqwest::multipart::Form::new()
+            .part("metadata", part_metadata)
+            .part("file", part_file);
+
+        let upload_response = client
+            .post(&upload_url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to upload image to Gemini: {}", e))?;
+
+        if !upload_response.status().is_success() {
+            let status = upload_response.status();
+            let error_body = upload_response.text().await.unwrap_or_default();
+            anyhow::bail!("Gemini upload error ({}): {}", status, error_body);
+        }
+
+        // Parse upload response to get file URI
+        let upload_json: serde_json::Value = upload_response
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse Gemini upload response: {}", e))?;
+
+        let file_uri = upload_json
+            .get("file")
+            .and_then(|f| f.get("uri"))
+            .and_then(|u| u.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Failed to get file URI from Gemini upload response"))?;
+
+        // Step 2: Generate content using the uploaded file
+        let generate_url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            model, api_key
+        );
+
+        let generate_payload = serde_json::json!({
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "fileData": {
+                                "mimeType": mime_type,
+                                "fileUri": file_uri
+                            }
+                        },
+                        {
+                            "text": params.prompt
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let generate_response = client
+            .post(&generate_url)
+            .header("Content-Type", "application/json")
+            .json(&generate_payload)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to call Gemini generateContent: {}", e))?;
+
+        if !generate_response.status().is_success() {
+            let status = generate_response.status();
+            let error_body = generate_response.text().await.unwrap_or_default();
+            anyhow::bail!("Gemini generateContent error ({}): {}", status, error_body);
+        }
+
+        let response_json: serde_json::Value = generate_response
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse Gemini generateContent response: {}", e))?;
+
+        // Parse response
+        let images = self.parse_provider_response("gemini", response_json)?;
+
+        Ok(ImageGenerationResponse {
+            images,
+            provider: "gemini".to_string(),
+            model: model.to_string(),
+            revised_prompt: None,
+        })
     }
 
     /// Build provider-specific payload
@@ -182,7 +347,7 @@ impl ImageGenerationTool {
 
     /// Get API key for image generation
     fn get_api_key(&self, provider: &str) -> Option<String> {
-        // Priority: config.api_key > ZEROCLAW_API_KEY
+        // Priority: config.api_key > resolve_provider_credential (provider-specific env vars, then generic fallbacks)
         if let Some(ref key) = self.config.api_key {
             let trimmed = key.trim();
             if !trimmed.is_empty() {
@@ -190,24 +355,8 @@ impl ImageGenerationTool {
             }
         }
 
-        if let Ok(key) = std::env::var("ZEROCLAW_API_KEY") {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-
-        // Provider specific environment variables
-        match provider {
-            "openai" => std::env::var("OPENAI_API_KEY").ok(),
-            "gemini" => std::env::var("GEMINI_API_KEY")
-                .ok()
-                .or_else(|| std::env::var("GOOGLE_API_KEY").ok()),
-            "anthropic" | "claude" => std::env::var("ANTHROPIC_API_KEY").ok(),
-            _ => None,
-        }
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        // Use the centralized provider credential resolution
+        resolve_provider_credential(provider, None)
     }
 
     /// Call the provider API
@@ -216,6 +365,7 @@ impl ImageGenerationTool {
         provider: &str,
         model: &str,
         payload: serde_json::Value,
+        _image_path: Option<String>,
     ) -> anyhow::Result<ImageGenerationResponse> {
         // Get API key from config or environment
         let api_key = self
@@ -447,6 +597,10 @@ impl Tool for ImageGenerationTool {
                 "provider": {
                     "type": "string",
                     "description": "Provider to use (openai, anthropic, gemini)"
+                },
+                "image": {
+                    "type": "string",
+                    "description": "Path to source image for editing (Gemini models only). When provided, the model will edit this image instead of generating from scratch."
                 }
             },
             "required": ["prompt"]
@@ -519,11 +673,14 @@ impl Tool for ImageGenerationTool {
                     error: None,
                 })
             }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(e.to_string()),
-            }),
+            Err(e) => {
+                tracing::error!(error = %e, "Image generation failed");
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                })
+            }
         }
     }
 }
@@ -558,6 +715,7 @@ mod tests {
             style: Some("natural".to_string()),
             model: Some("dall-e-3".to_string()),
             provider: Some("openai".to_string()),
+            image: None,
         };
 
         let json = serde_json::to_string(&params).unwrap();
@@ -566,5 +724,26 @@ mod tests {
         assert_eq!(parsed.prompt, "A sunset over the ocean");
         assert_eq!(parsed.n, 2);
         assert_eq!(parsed.size, Some("1024x1024".to_string()));
+    }
+
+    #[test]
+    fn test_image_generation_params_with_image() {
+        let params = ImageGenerationParams {
+            prompt: "Edit this image to make it more vibrant".to_string(),
+            n: 1,
+            size: None,
+            quality: None,
+            style: None,
+            model: Some("gemini-2.0-flash-exp".to_string()),
+            provider: Some("gemini".to_string()),
+            image: Some("/path/to/image.png".to_string()),
+        };
+
+        let json = serde_json::to_string(&params).unwrap();
+        let parsed: ImageGenerationParams = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.prompt, "Edit this image to make it more vibrant");
+        assert_eq!(parsed.image, Some("/path/to/image.png".to_string()));
+        assert_eq!(parsed.provider, Some("gemini".to_string()));
     }
 }

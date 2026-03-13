@@ -342,3 +342,45 @@ This is PROHIBITED unless:
 3. User explicitly requests a code change
 
 Always config-first, code-second.
+
+## Code Change Workflow (Mandatory)
+
+After ANY source code modification (`.rs` files) OR config file modification (`config.toml`), you MUST follow this workflow:
+
+### 1. Build the project (for code changes only)
+```bash
+cargo build --bin zeroclaw
+```
+
+### 2. Restart the daemon automatically
+```bash
+# Kill existing daemon
+lsof -ti :42617 | xargs kill -9 2>/dev/null
+sleep 1
+
+# Start daemon in background with logs
+cd /Users/alaingaldemas/Documents/agentic/zeroclaw
+set -a && source .env && set +a
+RUST_LOG=debug cargo run --bin zeroclaw -- daemon 2>&1 | tee -a logs/zeroclaw-daemon.log &
+```
+
+### 3. Verify daemon started
+Check for these indicators:
+- ✅ Config loaded
+- ✅ ZeroClaw daemon started
+- ✅ Gateway listening on http://127.0.0.1:42617
+
+### Why This Is Mandatory
+
+- **Code changes**: ZeroClaw is a compiled Rust binary. Modifying source code does NOT automatically update the running process.
+- **Config changes**: The daemon reads config.toml at startup. Modifications require a restart to take effect.
+
+**Exception:** If the user explicitly states "don't restart" or "leave daemon running", then skip the restart step.
+
+## Anti-Pattern: Build-Only Without Restart
+
+WRONG: "Build succeeded, code change complete!"
+
+CORRECT: "Build succeeded, daemon restarted on port 42617, changes are now active."
+
+Always complete the full workflow — build + restart + verify.
