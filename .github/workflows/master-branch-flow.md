@@ -12,6 +12,11 @@ Use this with:
 
 ZeroClaw uses a single default branch: `master`. All contributor PRs target `master` directly. There is no `dev` or promotion branch.
 
+Historical note:
+
+- `main`, `dev`, and `main-fix` may still exist in git history or old links, but they are not part of the current build/release policy.
+- If you are building from source, debugging, or opening a PR, use `master`.
+
 Current maintainers with PR approval authority: `theonlyhennygod` and `jordanthejet`.
 
 ## Active Workflows

@@ -2,6 +2,16 @@
 
 Thanks for your interest in contributing to ZeroClaw! This guide will help you get started.
 
+## Branching Model
+
+ZeroClaw uses `master` as the single source-of-truth branch for source builds, local debugging, PR targets, and release automation.
+
+- Build and debug from `master`.
+- Open contributor PRs against `master`.
+- Treat `main`, `dev`, and `main-fix` as historical branches only. They are not part of the active delivery flow and may diverge from the code that ships from `master`.
+- For the event-by-event delivery path from PR to release, see [`.github/workflows/master-branch-flow.md`](./.github/workflows/master-branch-flow.md).
+- For the review and merge contract on top of that branch policy, see [`docs/contributing/pr-workflow.md`](./docs/contributing/pr-workflow.md).
+
 ## First-Time Contributors
 
 Welcome — contributions of all sizes are valued. If this is your first contribution, here is how to get started:
