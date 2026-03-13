@@ -108,8 +108,35 @@ use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Shared handle to the delegate tool's parent-tools list.
+/// Callers can push additional tools (e.g. MCP wrappers) after construction.
+pub type DelegateParentToolsHandle = Arc<RwLock<Vec<Arc<dyn Tool>>>>;
+
+/// Thin wrapper that makes an `Arc<dyn Tool>` usable as `Box<dyn Tool>`.
+pub struct ArcToolRef(pub Arc<dyn Tool>);
+
+#[async_trait]
+impl Tool for ArcToolRef {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn description(&self) -> &str {
+        self.0.description()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.0.parameters_schema()
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.0.execute(args).await
+    }
+}
 
 #[derive(Clone)]
 struct ArcDelegatingTool {
@@ -180,7 +207,7 @@ pub fn all_tools(
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
-) -> Vec<Box<dyn Tool>> {
+) -> (Vec<Box<dyn Tool>>, Option<DelegateParentToolsHandle>) {
     all_tools_with_runtime(
         config,
         security,
@@ -214,7 +241,7 @@ pub fn all_tools_with_runtime(
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
-) -> Vec<Box<dyn Tool>> {
+) -> (Vec<Box<dyn Tool>>, Option<DelegateParentToolsHandle>) {
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ShellTool::new(security.clone(), runtime)),
         Arc::new(FileReadTool::new(security.clone())),
@@ -323,7 +350,9 @@ pub fn all_tools_with_runtime(
     }
 
     // Add delegation tool when agents are configured
-    if !agents.is_empty() {
+    let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {
+        None
+    } else {
         let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
             .iter()
             .map(|(name, cfg)| (name.clone(), cfg.clone()))
@@ -332,7 +361,7 @@ pub fn all_tools_with_runtime(
             let trimmed_value = value.trim();
             (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
         });
-        let parent_tools = Arc::new(tool_arcs.clone());
+        let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
         let delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
             delegate_fallback_credential,
@@ -350,12 +379,13 @@ pub fn all_tools_with_runtime(
                 extra_headers: root_config.extra_headers.clone(),
             },
         )
-        .with_parent_tools(parent_tools)
+        .with_parent_tools(Arc::clone(&parent_tools))
         .with_multimodal_config(root_config.multimodal.clone());
         tool_arcs.push(Arc::new(delegate_tool));
-    }
+        Some(parent_tools)
+    };
 
-    boxed_registry_from_arcs(tool_arcs)
+    (boxed_registry_from_arcs(tool_arcs), delegate_handle)
 }
 
 #[cfg(test)]
@@ -399,7 +429,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let tools = all_tools(
+        let (tools, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -441,7 +471,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let tools = all_tools(
+        let (tools, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -591,7 +621,7 @@ mod tests {
             },
         );
 
-        let tools = all_tools(
+        let (tools, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -624,7 +654,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let tools = all_tools(
+        let (tools, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,

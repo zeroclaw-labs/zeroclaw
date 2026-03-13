@@ -3408,21 +3408,22 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    let mut built_tools: Vec<Box<dyn Tool>> = tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        runtime,
-        Arc::clone(&mem),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
-        &workspace,
-        &config.agents,
-        config.api_key.as_deref(),
-        &config,
-    );
+    let (mut built_tools, delegate_handle_ch): (Vec<Box<dyn Tool>>, _) =
+        tools::all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            runtime,
+            Arc::clone(&mem),
+            composio_key,
+            composio_entity_id,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &workspace,
+            &config.agents,
+            config.api_key.as_deref(),
+            &config,
+        );
 
     // Wire MCP tools into the registry before freezing — non-fatal.
     if config.mcp.enabled && !config.mcp.servers.is_empty() {
@@ -3437,12 +3438,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 let mut registered = 0usize;
                 for name in names {
                     if let Some(def) = registry.get_tool_def(&name).await {
-                        let wrapper = crate::tools::McpToolWrapper::new(
-                            name,
-                            def,
-                            std::sync::Arc::clone(&registry),
-                        );
-                        built_tools.push(Box::new(wrapper));
+                        let wrapper: std::sync::Arc<dyn Tool> =
+                            std::sync::Arc::new(crate::tools::McpToolWrapper::new(
+                                name,
+                                def,
+                                std::sync::Arc::clone(&registry),
+                            ));
+                        if let Some(ref handle) = delegate_handle_ch {
+                            handle.write().push(std::sync::Arc::clone(&wrapper));
+                        }
+                        built_tools.push(Box::new(crate::tools::ArcToolRef(wrapper)));
                         registered += 1;
                     }
                 }
