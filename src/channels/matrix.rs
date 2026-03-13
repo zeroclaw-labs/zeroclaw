@@ -5,9 +5,9 @@ use matrix_sdk::{
     config::SyncSettings,
     ruma::{
         events::reaction::ReactionEventContent,
-        events::relation::{Annotation, InReplyTo, Thread},
+        events::relation::{Annotation, Thread},
         events::room::message::{
-            MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+            MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
         },
         events::room::MediaSource,
         OwnedEventId, OwnedRoomId, OwnedUserId,
@@ -540,12 +540,7 @@ impl Channel for MatrixChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let client = self.matrix_client().await?;
         let target_room_id = if message.recipient.contains("||") {
-            message
-                .recipient
-                .splitn(2, "||")
-                .nth(1)
-                .unwrap()
-                .to_string()
+            message.recipient.split_once("||").unwrap().1.to_string()
         } else {
             self.target_room_id().await?
         };
@@ -589,8 +584,7 @@ impl Channel for MatrixChannel {
             let tts_text = message
                 .content
                 .replace("**", "")
-                .replace("*", "")
-                .replace("`", "")
+                .replace(['*', '`'], "")
                 .replace("# ", "");
 
             let tts_ok = tokio::process::Command::new("edge-tts")
@@ -703,7 +697,7 @@ impl Channel for MatrixChannel {
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
-            let target_room = target_room_for_handler.clone();
+            let _target_room = target_room_for_handler.clone();
             let my_user_id = my_user_id_for_handler.clone();
             let allowed_users = allowed_users_for_handler.clone();
             let dedupe = Arc::clone(&dedupe_for_handler);
@@ -736,7 +730,7 @@ impl Channel for MatrixChannel {
                                 format!("{}/_matrix/client/v1/media/download/{}", homeserver, rest);
                             Some((url, name.to_string()))
                         }
-                        _ => None,
+                        MediaSource::Encrypted(_) => None,
                     }
                 };
 
@@ -782,7 +776,7 @@ impl Channel for MatrixChannel {
                     {
                         Ok(resp) if resp.status().is_success() => match resp.bytes().await {
                             Ok(bytes) => match tokio::fs::write(&dest, &bytes).await {
-                                Ok(_) => format!("{} — saved to {}", body, dest.display()),
+                                Ok(()) => format!("{} — saved to {}", body, dest.display()),
                                 Err(_) => format!("{} — failed to write to disk", body),
                             },
                             Err(_) => format!("{} — download failed", body),
