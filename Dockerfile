@@ -73,8 +73,8 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
         > /zeroclaw-data/.zeroclaw/config.toml && \
     chown -R 65534:65534 /zeroclaw-data
 
-# ── Stage 2: Development Runtime (Debian) ────────────────────
-FROM debian:trixie-slim@sha256:f6e2cfac5cf956ea044b4bd75e6397b4372ad88fe00908045e9a0d21712ae3ba AS dev
+# ── Stage 2: Shell Runtime (Debian) ──────────────────────────
+FROM debian:trixie-slim@sha256:f6e2cfac5cf956ea044b4bd75e6397b4372ad88fe00908045e9a0d21712ae3ba AS shell
 
 # Install essential runtime dependencies only (use docker-compose.override.yml for dev tools)
 RUN apt-get update && apt-get install -y \
@@ -106,6 +106,9 @@ USER 65534:65534
 EXPOSE 42617
 ENTRYPOINT ["zeroclaw"]
 CMD ["gateway"]
+
+# Backward-compatible alias for existing local workflows that use --target dev.
+FROM shell AS dev
 
 # ── Stage 3: Production Runtime (Distroless) ─────────────────
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS release

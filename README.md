@@ -379,6 +379,22 @@ zeroclaw migrate openclaw
 
 > **Dev fallback (no global install):** prefix commands with `cargo run --release --` (example: `cargo run --release -- status`).
 
+### Docker image flavors
+
+The default production image is still the distroless `release` target. If you need a shell-enabled container for agent tool execution or interactive debugging, build the Debian-based `shell` target:
+
+```bash
+docker build --target shell -t zeroclaw:shell .
+
+# Open a shell inside the container
+docker run --rm -it --entrypoint /bin/sh zeroclaw:shell
+
+# Or run ZeroClaw with shell tools available
+docker run --rm -it zeroclaw:shell agent -m "pwd"
+```
+
+The older `dev` target name remains available as an alias of `shell`.
+
 ## Subscription Auth (OpenAI Codex / Claude Code)
 
 ZeroClaw now supports subscription-native auth profiles (multi-account, encrypted at rest).
