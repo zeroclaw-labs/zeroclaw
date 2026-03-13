@@ -459,6 +459,60 @@ impl Default for TranscriptionConfig {
     }
 }
 
+// ── MCP ─────────────────────────────────────────────────────────
+
+/// Transport type for MCP server connections.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    /// Spawn a local process and communicate over stdin/stdout.
+    #[default]
+    Stdio,
+    /// Connect via HTTP POST.
+    Http,
+    /// Connect via HTTP + Server-Sent Events.
+    Sse,
+}
+
+/// Configuration for a single external MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct McpServerConfig {
+    /// Display name used as a tool prefix (`<server>__<tool>`).
+    pub name: String,
+    /// Transport type (default: stdio).
+    #[serde(default)]
+    pub transport: McpTransport,
+    /// URL for HTTP/SSE transports.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Executable to spawn for stdio transport.
+    #[serde(default)]
+    pub command: String,
+    /// Command arguments for stdio transport.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Optional environment variables for stdio transport.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Optional HTTP headers for HTTP/SSE transports.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Optional per-call timeout in seconds (hard capped in validation).
+    #[serde(default)]
+    pub tool_timeout_secs: Option<u64>,
+}
+
+/// External MCP client configuration (`[mcp]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct McpConfig {
+    /// Enable MCP tool loading.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Configured MCP servers.
+    #[serde(default, alias = "mcpServers")]
+    pub servers: Vec<McpServerConfig>,
+}
+
 // ── TTS (Text-to-Speech) ─────────────────────────────────────────
 
 fn default_tts_provider() -> String {
@@ -603,6 +657,51 @@ pub struct EdgeTtsConfig {
     pub binary_path: String,
 }
 
+/// Determines when a `ToolFilterGroup` is active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolFilterGroupMode {
+    /// Tools in this group are always included in every turn.
+    Always,
+    /// Tools in this group are included only when the user message contains
+    /// at least one of the configured `keywords` (case-insensitive substring match).
+    #[default]
+    Dynamic,
+}
+
+/// A named group of MCP tool patterns with an activation mode.
+///
+/// Each group lists glob patterns for MCP tool names (prefix `mcp_`) and an
+/// optional set of keywords that trigger inclusion in `dynamic` mode.
+/// Built-in (non-MCP) tools always pass through and are never affected by
+/// `tool_filter_groups`.
+///
+/// # Example
+/// ```toml
+/// [[agent.tool_filter_groups]]
+/// mode = "always"
+/// tools = ["mcp_filesystem_*"]
+/// keywords = []
+///
+/// [[agent.tool_filter_groups]]
+/// mode = "dynamic"
+/// tools = ["mcp_browser_*"]
+/// keywords = ["browse", "website", "url", "search"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ToolFilterGroup {
+    /// Activation mode: `"always"` or `"dynamic"`.
+    #[serde(default)]
+    pub mode: ToolFilterGroupMode,
+    /// Glob patterns matching MCP tool names (single `*` wildcard supported).
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Keywords that activate this group in `dynamic` mode (case-insensitive substring).
+    /// Ignored when `mode = "always"`.
+    #[serde(default)]
+    pub keywords: Vec<String>,
+}
+
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentConfig {
@@ -625,6 +724,13 @@ pub struct AgentConfig {
     /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
     #[serde(default)]
     pub tool_call_dedup_exempt: Vec<String>,
+    /// Per-turn MCP tool schema filtering groups.
+    ///
+    /// When non-empty, only MCP tools matched by an active group are included in the
+    /// tool schema sent to the LLM for that turn. Built-in tools always pass through.
+    /// Default: `[]` (no filtering — all tools included).
+    #[serde(default)]
+    pub tool_filter_groups: Vec<ToolFilterGroup>,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -648,6 +754,7 @@ impl Default for AgentConfig {
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             tool_call_dedup_exempt: Vec::new(),
+            tool_filter_groups: Vec::new(),
         }
     }
 }
@@ -902,60 +1009,6 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
     );
 
     prices
-}
-
-// ── MCP (Model Context Protocol) ─────────────────────────────────
-
-/// Transport type for MCP server connections.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum McpTransport {
-    /// Spawn a local process and communicate over stdin/stdout.
-    #[default]
-    Stdio,
-    /// Connect via HTTP POST.
-    Http,
-    /// Connect via HTTP + Server-Sent Events.
-    Sse,
-}
-
-/// Configuration for a single external MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
-pub struct McpServerConfig {
-    /// Display name used as a tool prefix (`<server>__<tool>`).
-    pub name: String,
-    /// Transport type (default: stdio).
-    #[serde(default)]
-    pub transport: McpTransport,
-    /// URL for HTTP/SSE transports.
-    #[serde(default)]
-    pub url: Option<String>,
-    /// Executable to spawn for stdio transport.
-    #[serde(default)]
-    pub command: String,
-    /// Command arguments for stdio transport.
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// Optional environment variables for stdio transport.
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    /// Optional HTTP headers for HTTP/SSE transports.
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
-    /// Optional per-call timeout in seconds (hard capped in validation).
-    #[serde(default)]
-    pub tool_timeout_secs: Option<u64>,
-}
-
-/// External MCP client configuration (`[mcp]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
-pub struct McpConfig {
-    /// Enable MCP tool loading.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Configured MCP servers.
-    #[serde(default, alias = "mcpServers")]
-    pub servers: Vec<McpServerConfig>,
 }
 
 // ── Peripherals (hardware: STM32, RPi GPIO, etc.) ────────────────────────
@@ -1690,6 +1743,65 @@ fn service_selector_matches(selector: &str, service_key: &str) -> bool {
     }
 
     false
+}
+
+const MCP_MAX_TOOL_TIMEOUT_SECS: u64 = 600;
+
+fn validate_mcp_config(config: &McpConfig) -> Result<()> {
+    let mut seen_names = std::collections::HashSet::new();
+    for (i, server) in config.servers.iter().enumerate() {
+        let name = server.name.trim();
+        if name.is_empty() {
+            anyhow::bail!("mcp.servers[{i}].name must not be empty");
+        }
+        if !seen_names.insert(name.to_ascii_lowercase()) {
+            anyhow::bail!("mcp.servers contains duplicate name: {name}");
+        }
+
+        if let Some(timeout) = server.tool_timeout_secs {
+            if timeout == 0 {
+                anyhow::bail!("mcp.servers[{i}].tool_timeout_secs must be greater than 0");
+            }
+            if timeout > MCP_MAX_TOOL_TIMEOUT_SECS {
+                anyhow::bail!(
+                    "mcp.servers[{i}].tool_timeout_secs exceeds max {MCP_MAX_TOOL_TIMEOUT_SECS}"
+                );
+            }
+        }
+
+        match server.transport {
+            McpTransport::Stdio => {
+                if server.command.trim().is_empty() {
+                    anyhow::bail!(
+                        "mcp.servers[{i}] with transport=stdio requires non-empty command"
+                    );
+                }
+            }
+            McpTransport::Http | McpTransport::Sse => {
+                let url = server
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "mcp.servers[{i}] with transport={} requires url",
+                            match server.transport {
+                                McpTransport::Http => "http",
+                                McpTransport::Sse => "sse",
+                                McpTransport::Stdio => "stdio",
+                            }
+                        )
+                    })?;
+                let parsed = reqwest::Url::parse(url)
+                    .with_context(|| format!("mcp.servers[{i}].url is not a valid URL"))?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    anyhow::bail!("mcp.servers[{i}].url must use http/https");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
@@ -4268,65 +4380,6 @@ fn config_dir_creation_error(path: &Path) -> String {
     )
 }
 
-const MCP_MAX_TOOL_TIMEOUT_SECS: u64 = 600;
-
-fn validate_mcp_config(config: &McpConfig) -> Result<()> {
-    let mut seen_names = std::collections::HashSet::new();
-    for (i, server) in config.servers.iter().enumerate() {
-        let name = server.name.trim();
-        if name.is_empty() {
-            anyhow::bail!("mcp.servers[{i}].name must not be empty");
-        }
-        if !seen_names.insert(name.to_ascii_lowercase()) {
-            anyhow::bail!("mcp.servers contains duplicate name: {name}");
-        }
-
-        if let Some(timeout) = server.tool_timeout_secs {
-            if timeout == 0 {
-                anyhow::bail!("mcp.servers[{i}].tool_timeout_secs must be greater than 0");
-            }
-            if timeout > MCP_MAX_TOOL_TIMEOUT_SECS {
-                anyhow::bail!(
-                    "mcp.servers[{i}].tool_timeout_secs exceeds max {MCP_MAX_TOOL_TIMEOUT_SECS}"
-                );
-            }
-        }
-
-        match server.transport {
-            McpTransport::Stdio => {
-                if server.command.trim().is_empty() {
-                    anyhow::bail!(
-                        "mcp.servers[{i}] with transport=stdio requires non-empty command"
-                    );
-                }
-            }
-            McpTransport::Http | McpTransport::Sse => {
-                let url = server
-                    .url
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "mcp.servers[{i}] with transport={} requires url",
-                            match server.transport {
-                                McpTransport::Http => "http",
-                                McpTransport::Sse => "sse",
-                                McpTransport::Stdio => "stdio",
-                            }
-                        )
-                    })?;
-                let parsed = reqwest::Url::parse(url)
-                    .with_context(|| format!("mcp.servers[{i}].url is not a valid URL"))?;
-                if !matches!(parsed.scheme(), "http" | "https") {
-                    anyhow::bail!("mcp.servers[{i}].url must use http/https");
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 fn is_local_ollama_endpoint(api_url: Option<&str>) -> bool {
     let Some(raw) = api_url.map(str::trim).filter(|value| !value.is_empty()) else {
         return true;
@@ -4960,6 +5013,11 @@ impl Config {
                     "default_model uses ':cloud' with provider 'ollama', but no API key is configured. Set api_key or OLLAMA_API_KEY."
                 );
             }
+        }
+
+        // MCP
+        if self.mcp.enabled {
+            validate_mcp_config(&self.mcp)?;
         }
 
         // Proxy (delegate to existing validation)
