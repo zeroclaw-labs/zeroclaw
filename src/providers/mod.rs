@@ -857,6 +857,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
         "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
         "astrai" => vec!["ASTRAI_API_KEY"],
+        "avian" => vec!["AVIAN_API_KEY"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
         "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
@@ -1327,6 +1328,9 @@ fn create_provider_with_url_and_options(
         // ── AI inference routers ─────────────────────────────
         "astrai" => Ok(compat(OpenAiCompatibleProvider::new(
             "Astrai", "https://as-trai.com/v1", key, AuthStyle::Bearer,
+        ))),
+        "avian" => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "Avian", "https://api.avian.io/v1", key, AuthStyle::Bearer,
         ))),
 
         // ── Cloud AI endpoints ───────────────────────────────
@@ -1836,6 +1840,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "ovhcloud",
             display_name: "OVHcloud AI Endpoints",
             aliases: &["ovh"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "avian",
+            display_name: "Avian",
+            aliases: &[],
             local: false,
         },
     ]
@@ -2458,6 +2468,11 @@ mod tests {
         assert!(create_provider("astrai", Some("sk-astrai-test")).is_ok());
     }
 
+    #[test]
+    fn factory_avian() {
+        assert!(create_provider("avian", Some("sk-avian-test")).is_ok());
+    }
+
     // ── Custom / BYOP provider ─────────────────────────────
 
     #[test]
@@ -2779,6 +2794,7 @@ mod tests {
             "copilot",
             "nvidia",
             "astrai",
+            "avian",
             "ovhcloud",
         ];
         for name in providers {

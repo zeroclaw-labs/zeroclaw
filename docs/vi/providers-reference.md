@@ -54,6 +54,7 @@ Với chuỗi provider dự phòng (`reliability.fallback_providers`), mỗi pro
 | `copilot` | `github-copilot` | Không | (dùng config/`API_KEY` fallback với GitHub token) |
 | `lmstudio` | `lm-studio` | Có | (tùy chọn; mặc định là cục bộ) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | Không | `NVIDIA_API_KEY` |
+| `avian` | — | Không | `AVIAN_API_KEY` |
 
 ### Ghi chú về Gemini
 

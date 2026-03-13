@@ -2,7 +2,7 @@
 
 This document maps provider IDs, aliases, and credential environment variables.
 
-Last verified: **February 21, 2026**.
+Last verified: **March 12, 2026**.
 
 ## How to List Providers
 
@@ -62,6 +62,7 @@ credential is not reused for fallback providers.
 | `vllm` | — | Yes | `VLLM_API_KEY` (optional) |
 | `osaurus` | — | Yes | `OSAURUS_API_KEY` (optional; defaults to `"osaurus"`) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
+| `avian` | — | No | `AVIAN_API_KEY` |
 
 ### Vercel AI Gateway Notes
 
