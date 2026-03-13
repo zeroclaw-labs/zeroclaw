@@ -61,24 +61,21 @@ impl LinqChannel {
 
     /// Parse an incoming webhook payload from Linq and extract messages.
     ///
-    /// Linq webhook envelope:
+    /// Supports both Linq webhook formats:
+    /// - Legacy format (2025-01-01): data.from, data.chat_id, data.is_from_me, data.message.parts
+    /// - Current format (2026-02-03): data.sender_handle.handle, data.chat.id, data.direction, data.parts
+    ///
+    /// Current format envelope:
     /// ```json
     /// {
     ///   "api_version": "v3",
+    ///   "webhook_version": "2026-02-03",
     ///   "event_type": "message.received",
-    ///   "event_id": "...",
-    ///   "created_at": "...",
-    ///   "trace_id": "...",
     ///   "data": {
-    ///     "chat_id": "...",
-    ///     "from": "+1...",
-    ///     "recipient_phone": "+1...",
-    ///     "is_from_me": false,
-    ///     "service": "iMessage",
-    ///     "message": {
-    ///       "id": "...",
-    ///       "parts": [{ "type": "text", "value": "..." }]
-    ///     }
+    ///     "chat": { "id": "..." },
+    ///     "direction": "inbound",
+    ///     "sender_handle": { "handle": "+1...", "is_me": false },
+    ///     "parts": [{ "type": "text", "value": "..." }]
     ///   }
     /// }
     /// ```
@@ -99,18 +96,45 @@ impl LinqChannel {
             return messages;
         };
 
+        // Detect payload version: new format (2026-02-03) has `sender_handle`, old format (2025-01-01) has `from`
+        let is_new_format = data.get("sender_handle").is_some();
+
         // Skip messages sent by the bot itself
-        if data
-            .get("is_from_me")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            tracing::debug!("Linq: skipping is_from_me message");
+        // New format: data.direction == "outbound" or data.sender_handle.is_me == true
+        // Old format: data.is_from_me == true
+        let is_from_me = if is_new_format {
+            data.get("direction")
+                .and_then(|v| v.as_str())
+                .map(|d| d == "outbound")
+                .unwrap_or(false)
+                || data
+                    .get("sender_handle")
+                    .and_then(|sh| sh.get("is_me"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+        } else {
+            data.get("is_from_me")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        };
+
+        if is_from_me {
+            tracing::debug!("Linq: skipping message from bot itself");
             return messages;
         }
 
         // Get sender phone number
-        let Some(from) = data.get("from").and_then(|f| f.as_str()) else {
+        // New format: data.sender_handle.handle
+        // Old format: data.from
+        let from = if is_new_format {
+            data.get("sender_handle")
+                .and_then(|sh| sh.get("handle"))
+                .and_then(|h| h.as_str())
+        } else {
+            data.get("from").and_then(|f| f.as_str())
+        };
+
+        let Some(from) = from else {
             return messages;
         };
 
@@ -132,18 +156,33 @@ impl LinqChannel {
         }
 
         // Get chat_id for reply routing
-        let chat_id = data
-            .get("chat_id")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        // Extract text from message parts
-        let Some(message) = data.get("message") else {
-            return messages;
+        // New format: data.chat.id
+        // Old format: data.chat_id
+        let chat_id = if is_new_format {
+            data.get("chat")
+                .and_then(|c| c.get("id"))
+                .and_then(|id| id.as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            data.get("chat_id")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string()
         };
 
-        let Some(parts) = message.get("parts").and_then(|p| p.as_array()) else {
+        // Extract message parts
+        // New format: data.parts (directly under data)
+        // Old format: data.message.parts
+        let parts = if is_new_format {
+            data.get("parts").and_then(|p| p.as_array())
+        } else {
+            data.get("message")
+                .and_then(|m| m.get("parts"))
+                .and_then(|p| p.as_array())
+        };
+
+        let Some(parts) = parts else {
             return messages;
         };
 
