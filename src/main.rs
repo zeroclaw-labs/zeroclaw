@@ -329,7 +329,7 @@ Examples:
     #[command(long_about = "\
 Manage communication channels.
 
-Add, remove, list, and health-check channels that connect ZeroClaw \
+Add, remove, list, send, and health-check channels that connect ZeroClaw \
 to messaging platforms. Supported channel types: telegram, discord, \
 slack, whatsapp, matrix, imessage, email.
 
@@ -338,7 +338,8 @@ Examples:
   zeroclaw channel doctor
   zeroclaw channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
   zeroclaw channel remove my-bot
-  zeroclaw channel bind-telegram zeroclaw_user")]
+  zeroclaw channel bind-telegram zeroclaw_user
+  zeroclaw channel send 'Alert!' --channel-id telegram --recipient 123456789")]
     Channel {
         #[command(subcommand)]
         channel_command: ChannelCommands,

@@ -33,6 +33,91 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
+fn glob_match(pattern: &str, name: &str) -> bool {
+    match pattern.find('*') {
+        None => pattern == name,
+        Some(star) => {
+            let prefix = &pattern[..star];
+            let suffix = &pattern[star + 1..];
+            name.starts_with(prefix)
+                && name.ends_with(suffix)
+                && name.len() >= prefix.len() + suffix.len()
+        }
+    }
+}
+
+/// Returns the subset of `tool_specs` that should be sent to the LLM for this turn.
+///
+/// Rules (mirrors NullClaw `filterToolSpecsForTurn`):
+/// - Built-in tools (names that do not start with `"mcp_"`) always pass through.
+/// - When `groups` is empty, all tools pass through (backward compatible default).
+/// - An MCP tool is included if at least one group matches it:
+///   - `always` group: included unconditionally if any pattern matches the tool name.
+///   - `dynamic` group: included if any pattern matches AND the user message contains
+///     at least one keyword (case-insensitive substring).
+pub(crate) fn filter_tool_specs_for_turn(
+    tool_specs: Vec<crate::tools::ToolSpec>,
+    groups: &[crate::config::schema::ToolFilterGroup],
+    user_message: &str,
+) -> Vec<crate::tools::ToolSpec> {
+    use crate::config::schema::ToolFilterGroupMode;
+
+    if groups.is_empty() {
+        return tool_specs;
+    }
+
+    let msg_lower = user_message.to_ascii_lowercase();
+
+    tool_specs
+        .into_iter()
+        .filter(|spec| {
+            // Built-in tools always pass through.
+            if !spec.name.starts_with("mcp_") {
+                return true;
+            }
+            // MCP tool: include if any active group matches.
+            groups.iter().any(|group| {
+                let pattern_matches = group.tools.iter().any(|pat| glob_match(pat, &spec.name));
+                if !pattern_matches {
+                    return false;
+                }
+                match group.mode {
+                    ToolFilterGroupMode::Always => true,
+                    ToolFilterGroupMode::Dynamic => group
+                        .keywords
+                        .iter()
+                        .any(|kw| msg_lower.contains(&kw.to_ascii_lowercase())),
+                }
+            })
+        })
+        .collect()
+}
+
+/// Computes the list of MCP tool names that should be excluded for a given turn
+/// based on `tool_filter_groups` and the user message.
+///
+/// Returns an empty `Vec` when `groups` is empty (no filtering).
+fn compute_excluded_mcp_tools(
+    tools_registry: &[Box<dyn Tool>],
+    groups: &[crate::config::schema::ToolFilterGroup],
+    user_message: &str,
+) -> Vec<String> {
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let filtered_specs = filter_tool_specs_for_turn(
+        tools_registry.iter().map(|t| t.spec()).collect(),
+        groups,
+        user_message,
+    );
+    let included: HashSet<&str> = filtered_specs.iter().map(|s| s.name.as_str()).collect();
+    tools_registry
+        .iter()
+        .filter(|t| t.name().starts_with("mcp_") && !included.contains(t.name()))
+        .map(|t| t.name().to_string())
+        .collect()
+}
+
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
         r"(?i)token",
@@ -65,8 +150,17 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
                 .map(|m| m.as_str())
                 .unwrap_or("");
 
-            // Preserve first 4 chars for context, then redact
-            let prefix = if val.len() > 4 { &val[..4] } else { "" };
+            // Preserve first 4 chars for context, then redact.
+            // Use char_indices to find the byte offset of the 4th character
+            // so we never slice in the middle of a multi-byte UTF-8 sequence.
+            let prefix = if val.len() > 4 {
+                val.char_indices()
+                    .nth(4)
+                    .map(|(byte_idx, _)| &val[..byte_idx])
+                    .unwrap_or(val)
+            } else {
+                ""
+            };
 
             if full_match.contains(':') {
                 if full_match.contains('"') {
@@ -299,6 +393,12 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
             context.push_str("[Memory context]\n");
             for entry in &relevant {
                 if memory::is_assistant_autosave_key(&entry.key) {
+                    continue;
+                }
+                // Skip entries containing tool_result blocks — they can leak
+                // stale tool output from previous heartbeat ticks into new
+                // sessions, presenting the LLM with orphan tool_result data.
+                if entry.content.contains("<tool_result") {
                     continue;
                 }
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
@@ -2000,6 +2100,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         &[],
+        &[],
     )
     .await
 }
@@ -2199,6 +2300,7 @@ pub(crate) async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    dedup_exempt_tools: &[String],
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2608,7 +2710,8 @@ pub(crate) async fn run_tool_call_loop(
             }
 
             let signature = tool_call_signature(&tool_name, &tool_args);
-            if !seen_tool_signatures.insert(signature) {
+            let dedup_exempt = dedup_exempt_tools.iter().any(|e| e == &tool_name);
+            if !dedup_exempt && !seen_tool_signatures.insert(signature) {
                 let duplicate = format!(
                     "Skipped duplicate tool call '{tool_name}' with identical arguments in this turn."
                 );
@@ -2883,7 +2986,7 @@ pub async fn run(
     } else {
         (None, None)
     };
-    let mut tools_registry = tools::all_tools_with_runtime(
+    let (mut tools_registry, delegate_handle) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -2906,6 +3009,77 @@ pub async fn run(
         tools_registry.extend(peripheral_tools);
     }
 
+    // ── Wire MCP tools (non-fatal) — CLI path ────────────────────
+    // NOTE: MCP tools are injected after built-in tool filtering
+    // (filter_primary_agent_tools_or_fail / agent.allowed_tools / agent.denied_tools).
+    // MCP servers are user-declared external integrations; the built-in allow/deny
+    // filter is not appropriate for them and would silently drop all MCP tools when
+    // a restrictive allowlist is configured. Keep this block after any such filter call.
+    //
+    // When `deferred_loading` is enabled, MCP tools are NOT added to the registry
+    // eagerly. Instead, a `tool_search` built-in is registered so the LLM can
+    // fetch schemas on demand. This reduces context window waste.
+    let mut deferred_section = String::new();
+    if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        tracing::info!(
+            "Initializing MCP client — {} server(s) configured",
+            config.mcp.servers.len()
+        );
+        match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
+            Ok(registry) => {
+                let registry = std::sync::Arc::new(registry);
+                if config.mcp.deferred_loading {
+                    // Deferred path: build stubs and register tool_search
+                    let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
+                        std::sync::Arc::clone(&registry),
+                    )
+                    .await;
+                    tracing::info!(
+                        "MCP deferred: {} tool stub(s) from {} server(s)",
+                        deferred_set.len(),
+                        registry.server_count()
+                    );
+                    deferred_section =
+                        crate::tools::mcp_deferred::build_deferred_tools_section(&deferred_set);
+                    let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::tools::ActivatedToolSet::new(),
+                    ));
+                    tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
+                        deferred_set,
+                        activated,
+                    )));
+                } else {
+                    // Eager path: register all MCP tools directly
+                    let names = registry.tool_names();
+                    let mut registered = 0usize;
+                    for name in names {
+                        if let Some(def) = registry.get_tool_def(&name).await {
+                            let wrapper: std::sync::Arc<dyn Tool> =
+                                std::sync::Arc::new(crate::tools::McpToolWrapper::new(
+                                    name,
+                                    def,
+                                    std::sync::Arc::clone(&registry),
+                                ));
+                            if let Some(ref handle) = delegate_handle {
+                                handle.write().push(std::sync::Arc::clone(&wrapper));
+                            }
+                            tools_registry.push(Box::new(crate::tools::ArcToolRef(wrapper)));
+                            registered += 1;
+                        }
+                    }
+                    tracing::info!(
+                        "MCP: {} tool(s) registered from {} server(s)",
+                        registered,
+                        registry.server_count()
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!("MCP registry failed to initialize: {e:#}");
+            }
+        }
+    }
+
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
         .as_deref()
@@ -2923,6 +3097,9 @@ pub async fn run(
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        provider_timeout_secs: Some(config.provider_timeout_secs),
+        extra_headers: config.extra_headers.clone(),
+        api_path: config.api_path.clone(),
     };
 
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
@@ -3092,6 +3269,12 @@ pub async fn run(
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
+    // Append deferred MCP tool names so the LLM knows what is available
+    if !deferred_section.is_empty() {
+        system_prompt.push('\n');
+        system_prompt.push_str(&deferred_section);
+    }
+
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = if interactive {
         Some(ApprovalManager::from_config(&config.autonomy))
@@ -3135,6 +3318,10 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
+        // Compute per-turn excluded MCP tools from tool_filter_groups.
+        let excluded_tools =
+            compute_excluded_mcp_tools(&tools_registry, &config.agent.tool_filter_groups, &msg);
+
         let response = run_tool_call_loop(
             provider.as_ref(),
             &mut history,
@@ -3151,7 +3338,8 @@ pub async fn run(
             None,
             None,
             None,
-            &[],
+            &excluded_tools,
+            &config.agent.tool_call_dedup_exempt,
         )
         .await?;
         final_output = response.clone();
@@ -3173,8 +3361,11 @@ pub async fn run(
             print!("> ");
             let _ = std::io::stdout().flush();
 
-            let mut input = String::new();
-            match std::io::stdin().read_line(&mut input) {
+            // Read raw bytes to avoid UTF-8 validation errors when PTY
+            // transport splits multi-byte characters at frame boundaries
+            // (e.g. CJK input with spaces over kubectl exec / SSH).
+            let mut raw = Vec::new();
+            match std::io::BufRead::read_until(&mut std::io::stdin().lock(), b'\n', &mut raw) {
                 Ok(0) => break,
                 Ok(_) => {}
                 Err(e) => {
@@ -3182,6 +3373,7 @@ pub async fn run(
                     break;
                 }
             }
+            let input = String::from_utf8_lossy(&raw).into_owned();
 
             let user_input = input.trim().to_string();
             if user_input.is_empty() {
@@ -3204,10 +3396,17 @@ pub async fn run(
                     print!("Continue? [y/N] ");
                     let _ = std::io::stdout().flush();
 
-                    let mut confirm = String::new();
-                    if std::io::stdin().read_line(&mut confirm).is_err() {
+                    let mut confirm_raw = Vec::new();
+                    if std::io::BufRead::read_until(
+                        &mut std::io::stdin().lock(),
+                        b'\n',
+                        &mut confirm_raw,
+                    )
+                    .is_err()
+                    {
                         continue;
                     }
+                    let confirm = String::from_utf8_lossy(&confirm_raw);
                     if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
                         println!("Cancelled.\n");
                         continue;
@@ -3264,6 +3463,13 @@ pub async fn run(
 
             history.push(ChatMessage::user(&enriched));
 
+            // Compute per-turn excluded MCP tools from tool_filter_groups.
+            let excluded_tools = compute_excluded_mcp_tools(
+                &tools_registry,
+                &config.agent.tool_filter_groups,
+                &user_input,
+            );
+
             let response = match run_tool_call_loop(
                 provider.as_ref(),
                 &mut history,
@@ -3280,7 +3486,8 @@ pub async fn run(
                 None,
                 None,
                 None,
-                &[],
+                &excluded_tools,
+                &config.agent.tool_call_dedup_exempt,
             )
             .await
             {
@@ -3362,7 +3569,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         (None, None)
     };
-    let mut tools_registry = tools::all_tools_with_runtime(
+    let (mut tools_registry, delegate_handle_pm) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -3381,6 +3588,47 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
 
+    // ── Wire MCP tools (non-fatal) — process_message path ────────
+    // NOTE: Same ordering contract as the CLI path above — MCP tools must be
+    // injected after filter_primary_agent_tools_or_fail (or equivalent built-in
+    // tool allow/deny filtering) to avoid MCP tools being silently dropped.
+    if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        tracing::info!(
+            "Initializing MCP client — {} server(s) configured",
+            config.mcp.servers.len()
+        );
+        match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
+            Ok(registry) => {
+                let registry = std::sync::Arc::new(registry);
+                let names = registry.tool_names();
+                let mut registered = 0usize;
+                for name in names {
+                    if let Some(def) = registry.get_tool_def(&name).await {
+                        let wrapper: std::sync::Arc<dyn Tool> =
+                            std::sync::Arc::new(crate::tools::McpToolWrapper::new(
+                                name,
+                                def,
+                                std::sync::Arc::clone(&registry),
+                            ));
+                        if let Some(ref handle) = delegate_handle_pm {
+                            handle.write().push(std::sync::Arc::clone(&wrapper));
+                        }
+                        tools_registry.push(Box::new(crate::tools::ArcToolRef(wrapper)));
+                        registered += 1;
+                    }
+                }
+                tracing::info!(
+                    "MCP: {} tool(s) registered from {} server(s)",
+                    registered,
+                    registry.server_count()
+                );
+            }
+            Err(e) => {
+                tracing::error!("MCP registry failed to initialize: {e:#}");
+            }
+        }
+    }
+
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config
         .default_model
@@ -3392,6 +3640,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        provider_timeout_secs: Some(config.provider_timeout_secs),
+        extra_headers: config.extra_headers.clone(),
+        api_path: config.api_path.clone(),
     };
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,
@@ -3873,6 +4124,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3919,6 +4171,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3958,6 +4211,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             &[],
         )
         .await
@@ -4085,6 +4339,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
         )
         .await
         .expect("parallel execution should complete");
@@ -4154,6 +4409,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4171,6 +4427,142 @@ mod tests {
             .expect("prompt-mode tool result payload should be present");
         assert!(tool_results.content.contains("counted:A"));
         assert!(tool_results.content.contains("Skipped duplicate tool call"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_dedup_exempt_allows_repeated_calls() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+        let exempt = vec!["count_tool".to_string()];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &exempt,
+        )
+        .await
+        .expect("loop should finish with exempt tool executing twice");
+
+        assert_eq!(result, "done");
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            2,
+            "exempt tool should execute both duplicate calls"
+        );
+
+        let tool_results = history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("prompt-mode tool result payload should be present");
+        assert!(
+            !tool_results.content.contains("Skipped duplicate tool call"),
+            "exempt tool calls should not be suppressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_dedup_exempt_only_affects_listed_tools() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"other_tool","arguments":{"value":"B"}}
+</tool_call>
+<tool_call>
+{"name":"other_tool","arguments":{"value":"B"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let count_invocations = Arc::new(AtomicUsize::new(0));
+        let other_invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(CountingTool::new(
+                "count_tool",
+                Arc::clone(&count_invocations),
+            )),
+            Box::new(CountingTool::new(
+                "other_tool",
+                Arc::clone(&other_invocations),
+            )),
+        ];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+        let exempt = vec!["count_tool".to_string()];
+
+        let _result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &exempt,
+        )
+        .await
+        .expect("loop should complete");
+
+        assert_eq!(
+            count_invocations.load(Ordering::SeqCst),
+            2,
+            "exempt tool should execute both calls"
+        );
+        assert_eq!(
+            other_invocations.load(Ordering::SeqCst),
+            1,
+            "non-exempt tool should still be deduped"
+        );
     }
 
     #[tokio::test]
@@ -4209,6 +4601,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             &[],
         )
         .await
@@ -5568,6 +5961,20 @@ Let me check the result."#;
     }
 
     #[test]
+    fn scrub_credentials_multibyte_chars_no_panic() {
+        // Regression test for #3024: byte index 4 is not a char boundary
+        // when the captured value contains multi-byte UTF-8 characters.
+        // The regex only matches quoted values for non-ASCII content, since
+        // capture group 4 is restricted to [a-zA-Z0-9_\-\.].
+        let input = "password=\"\u{4f60}\u{7684}WiFi\u{5bc6}\u{7801}ab\"";
+        let result = scrub_credentials(input);
+        assert!(
+            result.contains("[REDACTED]"),
+            "multi-byte quoted value should be redacted without panic, got: {result}"
+        );
+    }
+
+    #[test]
     fn scrub_credentials_short_values_not_redacted() {
         // Values shorter than 8 chars should not be redacted
         let input = r#"api_key="short""#;
@@ -5907,5 +6314,124 @@ Let me check the result."#;
         let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert!(parsed.get("reasoning_content").is_none());
+    }
+
+    // ── glob_match tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn glob_match_exact_no_wildcard() {
+        assert!(glob_match("mcp_browser_navigate", "mcp_browser_navigate"));
+        assert!(!glob_match("mcp_browser_navigate", "mcp_browser_click"));
+    }
+
+    #[test]
+    fn glob_match_prefix_wildcard() {
+        // Suffix pattern: mcp_browser_*
+        assert!(glob_match("mcp_browser_*", "mcp_browser_navigate"));
+        assert!(glob_match("mcp_browser_*", "mcp_browser_click"));
+        assert!(!glob_match("mcp_browser_*", "mcp_filesystem_read"));
+
+        // Prefix pattern: *_read
+        assert!(glob_match("*_read", "mcp_filesystem_read"));
+        assert!(!glob_match("*_read", "mcp_filesystem_write"));
+
+        // Infix: mcp_*_navigate
+        assert!(glob_match("mcp_*_navigate", "mcp_browser_navigate"));
+        assert!(!glob_match("mcp_*_navigate", "mcp_browser_click"));
+    }
+
+    #[test]
+    fn glob_match_star_matches_everything() {
+        assert!(glob_match("*", "anything_at_all"));
+        assert!(glob_match("*", ""));
+    }
+
+    // ── filter_tool_specs_for_turn tests ──────────────────────────────────────
+
+    fn make_spec(name: &str) -> crate::tools::ToolSpec {
+        crate::tools::ToolSpec {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn filter_tool_specs_no_groups_returns_all() {
+        let specs = vec![
+            make_spec("shell_exec"),
+            make_spec("mcp_browser_navigate"),
+            make_spec("mcp_filesystem_read"),
+        ];
+        let result = filter_tool_specs_for_turn(specs, &[], "hello");
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn filter_tool_specs_always_group_includes_matching_mcp_tool() {
+        use crate::config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let specs = vec![
+            make_spec("shell_exec"),
+            make_spec("mcp_browser_navigate"),
+            make_spec("mcp_filesystem_read"),
+        ];
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Always,
+            tools: vec!["mcp_filesystem_*".into()],
+            keywords: vec![],
+        }];
+        let result = filter_tool_specs_for_turn(specs, &groups, "anything");
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        // Built-in passes through, matched MCP passes, unmatched MCP excluded.
+        assert!(names.contains(&"shell_exec"));
+        assert!(names.contains(&"mcp_filesystem_read"));
+        assert!(!names.contains(&"mcp_browser_navigate"));
+    }
+
+    #[test]
+    fn filter_tool_specs_dynamic_group_included_on_keyword_match() {
+        use crate::config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let specs = vec![make_spec("shell_exec"), make_spec("mcp_browser_navigate")];
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Dynamic,
+            tools: vec!["mcp_browser_*".into()],
+            keywords: vec!["browse".into(), "website".into()],
+        }];
+        let result = filter_tool_specs_for_turn(specs, &groups, "please browse this page");
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"shell_exec"));
+        assert!(names.contains(&"mcp_browser_navigate"));
+    }
+
+    #[test]
+    fn filter_tool_specs_dynamic_group_excluded_on_no_keyword_match() {
+        use crate::config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let specs = vec![make_spec("shell_exec"), make_spec("mcp_browser_navigate")];
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Dynamic,
+            tools: vec!["mcp_browser_*".into()],
+            keywords: vec!["browse".into(), "website".into()],
+        }];
+        let result = filter_tool_specs_for_turn(specs, &groups, "read the file /etc/hosts");
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"shell_exec"));
+        assert!(!names.contains(&"mcp_browser_navigate"));
+    }
+
+    #[test]
+    fn filter_tool_specs_dynamic_keyword_match_is_case_insensitive() {
+        use crate::config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let specs = vec![make_spec("mcp_browser_navigate")];
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Dynamic,
+            tools: vec!["mcp_browser_*".into()],
+            keywords: vec!["Browse".into()],
+        }];
+        let result = filter_tool_specs_for_turn(specs, &groups, "BROWSE the site");
+        assert_eq!(result.len(), 1);
     }
 }

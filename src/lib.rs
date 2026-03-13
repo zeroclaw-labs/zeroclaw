@@ -202,6 +202,31 @@ Examples:
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
     },
+    /// Send a message to a configured channel
+    #[command(long_about = "\
+Send a one-off message to a configured channel.
+
+Sends a text message through the specified channel without starting \
+the full agent loop. Useful for scripted notifications, hardware \
+sensor alerts, and automation pipelines.
+
+The --channel-id selects the channel by its config section name \
+(e.g. 'telegram', 'discord', 'slack'). The --recipient is the \
+platform-specific destination (e.g. a Telegram chat ID).
+
+Examples:
+  zeroclaw channel send 'Someone is near your device.' --channel-id telegram --recipient 123456789
+  zeroclaw channel send 'Build succeeded!' --channel-id discord --recipient 987654321")]
+    Send {
+        /// Message text to send
+        message: String,
+        /// Channel config name (e.g. telegram, discord, slack)
+        #[arg(long)]
+        channel_id: String,
+        /// Recipient identifier (platform-specific, e.g. Telegram chat ID)
+        #[arg(long)]
+        recipient: String,
+    },
 }
 
 /// Skills management subcommands
