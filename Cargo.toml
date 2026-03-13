@@ -48,8 +48,8 @@ schemars = "1.2"
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 
-# Observability - Prometheus metrics
-prometheus = { version = "0.14", default-features = false }
+# Observability - Prometheus metrics (optional; requires AtomicU64, unavailable on 32-bit)
+prometheus = { version = "0.14", default-features = false, optional = true }
 
 # Base64 encoding (screenshots, image data)
 base64 = "0.22"
@@ -205,6 +205,8 @@ sandbox-landlock = ["dep:landlock"]
 sandbox-bubblewrap = []
 # Backward-compatible alias for older invocations
 landlock = ["sandbox-landlock"]
+# Prometheus metrics observer (requires 64-bit atomics; disable on 32-bit targets)
+metrics = ["dep:prometheus"]
 # probe = probe-rs for Nucleo memory read (adds ~50 deps; optional)
 probe = ["dep:probe-rs"]
 # rag-pdf = PDF ingestion for datasheet RAG

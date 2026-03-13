@@ -1,6 +1,10 @@
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_has_atomic = "64"))]
+use std::sync::atomic::AtomicU32;
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, Mutex};
@@ -13,7 +17,10 @@ use tokio_rustls::rustls;
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Monotonic counter to ensure unique message IDs under burst traffic.
+#[cfg(target_has_atomic = "64")]
 static MSG_SEQ: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(target_has_atomic = "64"))]
+static MSG_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// IRC over TLS channel.
 ///
