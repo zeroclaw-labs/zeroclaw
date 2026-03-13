@@ -289,11 +289,13 @@ pub fn all_tools_with_runtime(
 
     // Web search tool (enabled by default for GLM and other models)
     if root_config.web_search.enabled {
-        tool_arcs.push(Arc::new(WebSearchTool::new(
+        tool_arcs.push(Arc::new(WebSearchTool::new_with_config(
             root_config.web_search.provider.clone(),
             root_config.web_search.brave_api_key.clone(),
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
+            root_config.config_path.clone(),
+            root_config.secrets.encrypt,
         )));
     }
 
@@ -338,6 +340,7 @@ pub fn all_tools_with_runtime(
                     .map(std::path::PathBuf::from),
                 secrets_encrypt: root_config.secrets.encrypt,
                 reasoning_enabled: root_config.runtime.reasoning_enabled,
+                provider_timeout_secs: Some(root_config.provider_timeout_secs),
             },
         )
         .with_parent_tools(parent_tools)

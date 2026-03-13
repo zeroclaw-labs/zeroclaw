@@ -677,6 +677,9 @@ pub struct ProviderRuntimeOptions {
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
+    /// HTTP request timeout in seconds for LLM provider API calls.
+    /// `None` uses the provider's built-in default (120s for compatible providers).
+    pub provider_timeout_secs: Option<u64>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -687,6 +690,7 @@ impl Default for ProviderRuntimeOptions {
             zeroclaw_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: None,
+            provider_timeout_secs: None,
         }
     }
 }
@@ -993,6 +997,18 @@ fn create_provider_with_url_and_options(
     api_url: Option<&str>,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
+    // Closure to optionally apply the configured provider timeout to
+    // OpenAI-compatible providers before boxing them as trait objects.
+    let compat = {
+        let timeout = options.provider_timeout_secs;
+        move |p: OpenAiCompatibleProvider| -> Box<dyn Provider> {
+            match timeout {
+                Some(t) => Box::new(p.with_timeout_secs(t)),
+                None => Box::new(p),
+            }
+        }
+    };
+
     let qwen_oauth_context = is_qwen_oauth_alias(name).then(|| resolve_qwen_oauth_context(api_key));
 
     // Resolve credential and break static-analysis taint chain from the
@@ -1066,28 +1082,28 @@ fn create_provider_with_url_and_options(
         "telnyx" => Ok(Box::new(telnyx::TelnyxProvider::new(key))),
 
         // ── OpenAI-compatible providers ──────────────────────
-        "venice" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "venice" => Ok(compat(OpenAiCompatibleProvider::new(
             "Venice", "https://api.venice.ai", key, AuthStyle::Bearer,
         ))),
-        "vercel" | "vercel-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "vercel" | "vercel-ai" => Ok(compat(OpenAiCompatibleProvider::new(
             "Vercel AI Gateway",
             VERCEL_AI_GATEWAY_BASE_URL,
             key,
             AuthStyle::Bearer,
         ))),
-        "cloudflare" | "cloudflare-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "cloudflare" | "cloudflare-ai" => Ok(compat(OpenAiCompatibleProvider::new(
             "Cloudflare AI Gateway",
             "https://gateway.ai.cloudflare.com/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        name if moonshot_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
+        name if moonshot_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new(
             "Moonshot",
             moonshot_base_url(name).expect("checked in guard"),
             key,
             AuthStyle::Bearer,
         ))),
-        "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(Box::new(
+        "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(compat(
             OpenAiCompatibleProvider::new_with_user_agent(
                 "Kimi Code",
                 "https://api.kimi.com/coding/v1",
@@ -1096,30 +1112,30 @@ fn create_provider_with_url_and_options(
                 "KimiCLI/0.77",
             ),
         )),
-        "synthetic" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "synthetic" => Ok(compat(OpenAiCompatibleProvider::new(
             "Synthetic", "https://api.synthetic.new/openai/v1", key, AuthStyle::Bearer,
         ))),
-        "opencode" | "opencode-zen" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "opencode" | "opencode-zen" => Ok(compat(OpenAiCompatibleProvider::new(
             "OpenCode Zen", "https://opencode.ai/zen/v1", key, AuthStyle::Bearer,
         ))),
-        "opencode-go" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "opencode-go" => Ok(compat(OpenAiCompatibleProvider::new(
             "OpenCode Go", "https://opencode.ai/zen/go/v1", key, AuthStyle::Bearer,
         ))),
-        name if zai_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
+        name if zai_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new(
             "Z.AI",
             zai_base_url(name).expect("checked in guard"),
             key,
             AuthStyle::Bearer,
         ))),
         name if glm_base_url(name).is_some() => {
-            Ok(Box::new(OpenAiCompatibleProvider::new_no_responses_fallback(
+            Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
                 "GLM",
                 glm_base_url(name).expect("checked in guard"),
                 key,
                 AuthStyle::Bearer,
             )))
         }
-        name if minimax_base_url(name).is_some() => Ok(Box::new(
+        name if minimax_base_url(name).is_some() => Ok(compat(
             OpenAiCompatibleProvider::new_merge_system_into_user(
                 "MiniMax",
                 minimax_base_url(name).expect("checked in guard"),
@@ -1149,7 +1165,7 @@ fn create_provider_with_url_and_options(
                 .or_else(|| qwen_oauth_context.as_ref().and_then(|context| context.base_url.clone()))
                 .unwrap_or_else(|| QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
 
-            Ok(Box::new(
+            Ok(compat(
                 OpenAiCompatibleProvider::new_with_user_agent_and_vision(
                 "Qwen Code",
                 &base_url,
@@ -1159,16 +1175,16 @@ fn create_provider_with_url_and_options(
                 true,
             )))
         }
-        name if is_qianfan_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
+        name if is_qianfan_alias(name) => Ok(compat(OpenAiCompatibleProvider::new(
             "Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer,
         ))),
-        name if is_doubao_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
+        name if is_doubao_alias(name) => Ok(compat(OpenAiCompatibleProvider::new(
             "Doubao",
             "https://ark.cn-beijing.volces.com/api/v3",
             key,
             AuthStyle::Bearer,
         ))),
-        name if qwen_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new_with_vision(
+        name if qwen_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new_with_vision(
             "Qwen",
             qwen_base_url(name).expect("checked in guard"),
             key,
@@ -1177,31 +1193,31 @@ fn create_provider_with_url_and_options(
         ))),
 
         // ── Extended ecosystem (community favorites) ─────────
-        "groq" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "groq" => Ok(compat(OpenAiCompatibleProvider::new(
             "Groq", "https://api.groq.com/openai/v1", key, AuthStyle::Bearer,
         ))),
-        "mistral" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "mistral" => Ok(compat(OpenAiCompatibleProvider::new(
             "Mistral", "https://api.mistral.ai/v1", key, AuthStyle::Bearer,
         ))),
-        "xai" | "grok" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "xai" | "grok" => Ok(compat(OpenAiCompatibleProvider::new(
             "xAI", "https://api.x.ai", key, AuthStyle::Bearer,
         ))),
-        "deepseek" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "deepseek" => Ok(compat(OpenAiCompatibleProvider::new(
             "DeepSeek", "https://api.deepseek.com", key, AuthStyle::Bearer,
         ))),
-        "together" | "together-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "together" | "together-ai" => Ok(compat(OpenAiCompatibleProvider::new(
             "Together AI", "https://api.together.xyz", key, AuthStyle::Bearer,
         ))),
-        "fireworks" | "fireworks-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "fireworks" | "fireworks-ai" => Ok(compat(OpenAiCompatibleProvider::new(
             "Fireworks AI", "https://api.fireworks.ai/inference/v1", key, AuthStyle::Bearer,
         ))),
-        "novita" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "novita" => Ok(compat(OpenAiCompatibleProvider::new(
             "Novita AI", "https://api.novita.ai/openai", key, AuthStyle::Bearer,
         ))),
-        "perplexity" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "perplexity" => Ok(compat(OpenAiCompatibleProvider::new(
             "Perplexity", "https://api.perplexity.ai", key, AuthStyle::Bearer,
         ))),
-        "cohere" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "cohere" => Ok(compat(OpenAiCompatibleProvider::new(
             "Cohere", "https://api.cohere.com/compatibility", key, AuthStyle::Bearer,
         ))),
         "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
@@ -1210,7 +1226,7 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("lm-studio");
-            Ok(Box::new(OpenAiCompatibleProvider::new(
+            Ok(compat(OpenAiCompatibleProvider::new(
                 "LM Studio",
                 "http://localhost:1234/v1",
                 Some(lm_studio_key),
@@ -1226,7 +1242,7 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("llama.cpp");
-            Ok(Box::new(OpenAiCompatibleProvider::new(
+            Ok(compat(OpenAiCompatibleProvider::new(
                 "llama.cpp",
                 base_url,
                 Some(llama_cpp_key),
@@ -1238,7 +1254,7 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("http://localhost:30000/v1");
-            Ok(Box::new(OpenAiCompatibleProvider::new(
+            Ok(compat(OpenAiCompatibleProvider::new(
                 "SGLang",
                 base_url,
                 key,
@@ -1250,7 +1266,7 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("http://localhost:8000/v1");
-            Ok(Box::new(OpenAiCompatibleProvider::new(
+            Ok(compat(OpenAiCompatibleProvider::new(
                 "vLLM",
                 base_url,
                 key,
@@ -1266,14 +1282,14 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("osaurus");
-            Ok(Box::new(OpenAiCompatibleProvider::new(
+            Ok(compat(OpenAiCompatibleProvider::new(
                 "Osaurus",
                 base_url,
                 Some(osaurus_key),
                 AuthStyle::Bearer,
             )))
         }
-        "nvidia" | "nvidia-nim" | "build.nvidia.com" => Ok(Box::new(
+        "nvidia" | "nvidia-nim" | "build.nvidia.com" => Ok(compat(
             OpenAiCompatibleProvider::new_no_responses_fallback(
                 "NVIDIA NIM",
                 "https://integrate.api.nvidia.com/v1",
@@ -1283,7 +1299,7 @@ fn create_provider_with_url_and_options(
         )),
 
         // ── AI inference routers ─────────────────────────────
-        "astrai" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "astrai" => Ok(compat(OpenAiCompatibleProvider::new(
             "Astrai", "https://as-trai.com/v1", key, AuthStyle::Bearer,
         ))),
 
@@ -1301,7 +1317,7 @@ fn create_provider_with_url_and_options(
                 "Custom provider",
                 "custom:https://your-api.com",
             )?;
-            Ok(Box::new(OpenAiCompatibleProvider::new_with_vision(
+            Ok(compat(OpenAiCompatibleProvider::new_with_vision(
                 "Custom",
                 &base_url,
                 key,

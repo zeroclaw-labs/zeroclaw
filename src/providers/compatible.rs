@@ -37,6 +37,8 @@ pub struct OpenAiCompatibleProvider {
     /// Whether this provider supports OpenAI-style native tool calling.
     /// When false, tools are injected into the system prompt as text.
     native_tool_calling: bool,
+    /// HTTP request timeout in seconds for LLM API calls. Default: 120.
+    timeout_secs: u64,
 }
 
 /// How the provider expects the API key to be sent.
@@ -170,7 +172,14 @@ impl OpenAiCompatibleProvider {
             user_agent: user_agent.map(ToString::to_string),
             merge_system_into_user,
             native_tool_calling: !merge_system_into_user,
+            timeout_secs: 120,
         }
+    }
+
+    /// Override the HTTP request timeout for LLM API calls.
+    pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = timeout_secs;
+        self
     }
 
     /// Collect all `system` role messages, concatenate their content,
@@ -205,6 +214,7 @@ impl OpenAiCompatibleProvider {
     }
 
     fn http_client(&self) -> Client {
+        let timeout = self.timeout_secs;
         if let Some(ua) = self.user_agent.as_deref() {
             let mut headers = HeaderMap::new();
             if let Ok(value) = HeaderValue::from_str(ua) {
@@ -212,7 +222,7 @@ impl OpenAiCompatibleProvider {
             }
 
             let builder = Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                .timeout(std::time::Duration::from_secs(timeout))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .default_headers(headers);
             let builder =
@@ -224,7 +234,7 @@ impl OpenAiCompatibleProvider {
             });
         }
 
-        crate::config::build_runtime_proxy_client_with_timeouts("provider.compatible", 120, 10)
+        crate::config::build_runtime_proxy_client_with_timeouts("provider.compatible", timeout, 10)
     }
 
     /// Build the full URL for chat completions, detecting if base_url already includes the path.
@@ -2898,5 +2908,17 @@ mod tests {
             "reasoning_content should be present when Some"
         );
         assert!(json.contains("thinking..."));
+    }
+
+    #[test]
+    fn default_timeout_is_120s() {
+        let p = make_provider("test", "https://example.com", None);
+        assert_eq!(p.timeout_secs, 120);
+    }
+
+    #[test]
+    fn with_timeout_secs_overrides_default() {
+        let p = make_provider("test", "https://example.com", None).with_timeout_secs(300);
+        assert_eq!(p.timeout_secs, 300);
     }
 }

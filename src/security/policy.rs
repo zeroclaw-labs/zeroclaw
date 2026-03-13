@@ -922,9 +922,28 @@ impl SecurityPolicy {
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
 
-        // Block absolute paths when workspace_only is set
-        if self.workspace_only && expanded_path.is_absolute() {
-            return false;
+        // When workspace_only is set and the path is absolute, only allow it
+        // if it falls within the workspace directory or an explicit allowed
+        // root.  The workspace/allowed-root check runs BEFORE the forbidden
+        // prefix list so that workspace paths under broad defaults like
+        // "/home" are not rejected.  This mirrors the priority order in
+        // `is_resolved_path_allowed`.  See #2880.
+        if expanded_path.is_absolute() {
+            let in_workspace = expanded_path.starts_with(&self.workspace_dir);
+            let in_allowed_root = self
+                .allowed_roots
+                .iter()
+                .any(|root| expanded_path.starts_with(root));
+
+            if in_workspace || in_allowed_root {
+                return true;
+            }
+
+            // Absolute path outside workspace/allowed roots — block when
+            // workspace_only, or fall through to forbidden-prefix check.
+            if self.workspace_only {
+                return false;
+            }
         }
 
         // Block forbidden paths using path-component-aware matching
@@ -1382,6 +1401,37 @@ mod tests {
         assert!(!p.is_path_allowed("/etc/passwd"));
         assert!(!p.is_path_allowed("/root/.ssh/id_rsa"));
         assert!(!p.is_path_allowed("/tmp/file.txt"));
+    }
+
+    #[test]
+    fn absolute_path_inside_workspace_allowed_when_workspace_only() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/home/user/.zeroclaw/workspace"),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        // Absolute path inside workspace should be allowed
+        assert!(p.is_path_allowed("/home/user/.zeroclaw/workspace/images/example.png"));
+        assert!(p.is_path_allowed("/home/user/.zeroclaw/workspace/file.txt"));
+        // Absolute path outside workspace should still be blocked
+        assert!(!p.is_path_allowed("/home/user/other/file.txt"));
+        assert!(!p.is_path_allowed("/tmp/file.txt"));
+    }
+
+    #[test]
+    fn absolute_path_in_allowed_root_permitted_when_workspace_only() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/home/user/.zeroclaw/workspace"),
+            workspace_only: true,
+            allowed_roots: vec![PathBuf::from("/home/user/.zeroclaw/shared")],
+            ..SecurityPolicy::default()
+        };
+        // Path in allowed root should be permitted
+        assert!(p.is_path_allowed("/home/user/.zeroclaw/shared/data.txt"));
+        // Path in workspace should still be permitted
+        assert!(p.is_path_allowed("/home/user/.zeroclaw/workspace/file.txt"));
+        // Path outside both should still be blocked
+        assert!(!p.is_path_allowed("/home/user/other/file.txt"));
     }
 
     #[test]
@@ -2122,7 +2172,7 @@ mod tests {
     }
 
     #[test]
-    fn checklist_workspace_only_blocks_all_absolute() {
+    fn checklist_workspace_only_blocks_absolute_outside_workspace() {
         let p = SecurityPolicy {
             workspace_only: true,
             ..SecurityPolicy::default()
