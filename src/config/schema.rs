@@ -90,6 +90,13 @@ pub struct Config {
     )]
     pub default_temperature: f64,
 
+    /// HTTP request timeout in seconds for LLM provider API calls. Default: `120`.
+    ///
+    /// Increase for slower backends (e.g., llama.cpp on constrained hardware)
+    /// that need more time processing large contexts.
+    #[serde(default = "default_provider_timeout_secs")]
+    pub provider_timeout_secs: u64,
+
     /// Observability backend configuration (`[observability]`).
     #[serde(default)]
     pub observability: ObservabilityConfig,
@@ -225,6 +232,10 @@ pub struct Config {
     /// Text-to-Speech configuration (`[tts]`).
     #[serde(default)]
     pub tts: TtsConfig,
+
+    /// External MCP server connections (`[mcp]`).
+    #[serde(default, alias = "mcpServers")]
+    pub mcp: McpConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -293,6 +304,13 @@ const DEFAULT_TEMPERATURE: f64 = 0.7;
 
 fn default_temperature() -> f64 {
     DEFAULT_TEMPERATURE
+}
+
+/// Default provider HTTP request timeout: 120 seconds.
+const DEFAULT_PROVIDER_TIMEOUT_SECS: u64 = 120;
+
+fn default_provider_timeout_secs() -> u64 {
+    DEFAULT_PROVIDER_TIMEOUT_SECS
 }
 
 /// Validate that a temperature value is within the allowed range.
@@ -439,6 +457,60 @@ impl Default for TranscriptionConfig {
             max_duration_secs: default_transcription_max_duration_secs(),
         }
     }
+}
+
+// ── MCP ─────────────────────────────────────────────────────────
+
+/// Transport type for MCP server connections.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    /// Spawn a local process and communicate over stdin/stdout.
+    #[default]
+    Stdio,
+    /// Connect via HTTP POST.
+    Http,
+    /// Connect via HTTP + Server-Sent Events.
+    Sse,
+}
+
+/// Configuration for a single external MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct McpServerConfig {
+    /// Display name used as a tool prefix (`<server>__<tool>`).
+    pub name: String,
+    /// Transport type (default: stdio).
+    #[serde(default)]
+    pub transport: McpTransport,
+    /// URL for HTTP/SSE transports.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Executable to spawn for stdio transport.
+    #[serde(default)]
+    pub command: String,
+    /// Command arguments for stdio transport.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Optional environment variables for stdio transport.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Optional HTTP headers for HTTP/SSE transports.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Optional per-call timeout in seconds (hard capped in validation).
+    #[serde(default)]
+    pub tool_timeout_secs: Option<u64>,
+}
+
+/// External MCP client configuration (`[mcp]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct McpConfig {
+    /// Enable MCP tool loading.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Configured MCP servers.
+    #[serde(default, alias = "mcpServers")]
+    pub servers: Vec<McpServerConfig>,
 }
 
 // ── TTS (Text-to-Speech) ─────────────────────────────────────────
@@ -604,6 +676,9 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
+    #[serde(default)]
+    pub tool_call_dedup_exempt: Vec<String>,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -626,6 +701,7 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            tool_call_dedup_exempt: Vec::new(),
         }
     }
 }
@@ -1614,6 +1690,65 @@ fn service_selector_matches(selector: &str, service_key: &str) -> bool {
     }
 
     false
+}
+
+const MCP_MAX_TOOL_TIMEOUT_SECS: u64 = 600;
+
+fn validate_mcp_config(config: &McpConfig) -> Result<()> {
+    let mut seen_names = std::collections::HashSet::new();
+    for (i, server) in config.servers.iter().enumerate() {
+        let name = server.name.trim();
+        if name.is_empty() {
+            anyhow::bail!("mcp.servers[{i}].name must not be empty");
+        }
+        if !seen_names.insert(name.to_ascii_lowercase()) {
+            anyhow::bail!("mcp.servers contains duplicate name: {name}");
+        }
+
+        if let Some(timeout) = server.tool_timeout_secs {
+            if timeout == 0 {
+                anyhow::bail!("mcp.servers[{i}].tool_timeout_secs must be greater than 0");
+            }
+            if timeout > MCP_MAX_TOOL_TIMEOUT_SECS {
+                anyhow::bail!(
+                    "mcp.servers[{i}].tool_timeout_secs exceeds max {MCP_MAX_TOOL_TIMEOUT_SECS}"
+                );
+            }
+        }
+
+        match server.transport {
+            McpTransport::Stdio => {
+                if server.command.trim().is_empty() {
+                    anyhow::bail!(
+                        "mcp.servers[{i}] with transport=stdio requires non-empty command"
+                    );
+                }
+            }
+            McpTransport::Http | McpTransport::Sse => {
+                let url = server
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "mcp.servers[{i}] with transport={} requires url",
+                            match server.transport {
+                                McpTransport::Http => "http",
+                                McpTransport::Sse => "sse",
+                                McpTransport::Stdio => "stdio",
+                            }
+                        )
+                    })?;
+                let parsed = reqwest::Url::parse(url)
+                    .with_context(|| format!("mcp.servers[{i}].url is not a valid URL"))?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    anyhow::bail!("mcp.servers[{i}].url must use http/https");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
@@ -3832,6 +3967,7 @@ impl Default for Config {
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             model_providers: HashMap::new(),
             default_temperature: default_temperature(),
+            provider_timeout_secs: default_provider_timeout_secs(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
@@ -3866,6 +4002,7 @@ impl Default for Config {
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
 }
@@ -4825,6 +4962,11 @@ impl Config {
             }
         }
 
+        // MCP
+        if self.mcp.enabled {
+            validate_mcp_config(&self.mcp)?;
+        }
+
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
 
@@ -4885,6 +5027,15 @@ impl Config {
         if let Ok(model) = std::env::var("ZEROCLAW_MODEL").or_else(|_| std::env::var("MODEL")) {
             if !model.is_empty() {
                 self.default_model = Some(model);
+            }
+        }
+
+        // Provider HTTP timeout: ZEROCLAW_PROVIDER_TIMEOUT_SECS
+        if let Ok(timeout_secs) = std::env::var("ZEROCLAW_PROVIDER_TIMEOUT_SECS") {
+            if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
+                if timeout_secs > 0 {
+                    self.provider_timeout_secs = timeout_secs;
+                }
             }
         }
 
@@ -5525,6 +5676,7 @@ mod tests {
             c.skills.prompt_injection_mode,
             SkillsPromptInjectionMode::Full
         );
+        assert_eq!(c.provider_timeout_secs, 120);
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
     }
@@ -5729,6 +5881,7 @@ default_temperature = 0.7
             default_model: Some("gpt-4o".into()),
             model_providers: HashMap::new(),
             default_temperature: 0.5,
+            provider_timeout_secs: 120,
             observability: ObservabilityConfig {
                 backend: "log".into(),
                 ..ObservabilityConfig::default()
@@ -5820,6 +5973,7 @@ default_temperature = 0.7
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            mcp: McpConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -5869,6 +6023,18 @@ default_temperature = 0.7
         assert_eq!(parsed.memory.archive_after_days, 7);
         assert_eq!(parsed.memory.purge_after_days, 30);
         assert_eq!(parsed.memory.conversation_retention_days, 30);
+        // provider_timeout_secs defaults to 120 when not specified
+        assert_eq!(parsed.provider_timeout_secs, 120);
+    }
+
+    #[test]
+    async fn provider_timeout_secs_parses_from_toml() {
+        let raw = r#"
+default_temperature = 0.7
+provider_timeout_secs = 300
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.provider_timeout_secs, 300);
     }
 
     #[test]
@@ -5969,6 +6135,7 @@ tool_dispatcher = "xml"
             default_model: Some("test-model".into()),
             model_providers: HashMap::new(),
             default_temperature: 0.9,
+            provider_timeout_secs: 120,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
@@ -6003,6 +6170,7 @@ tool_dispatcher = "xml"
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            mcp: McpConfig::default(),
         };
 
         config.save().await.unwrap();

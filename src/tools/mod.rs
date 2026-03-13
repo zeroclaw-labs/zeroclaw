@@ -40,6 +40,10 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod mcp_client;
+pub mod mcp_protocol;
+pub mod mcp_tool;
+pub mod mcp_transport;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
@@ -340,6 +344,7 @@ pub fn all_tools_with_runtime(
                     .map(std::path::PathBuf::from),
                 secrets_encrypt: root_config.secrets.encrypt,
                 reasoning_enabled: root_config.runtime.reasoning_enabled,
+                provider_timeout_secs: Some(root_config.provider_timeout_secs),
             },
         )
         .with_parent_tools(parent_tools)

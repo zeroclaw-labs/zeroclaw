@@ -138,6 +138,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         default_model: Some(model),
         model_providers: std::collections::HashMap::new(),
         default_temperature: 0.7,
+        provider_timeout_secs: 120,
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         security: crate::config::SecurityConfig::default(),
@@ -172,6 +173,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
         tts: crate::config::TtsConfig::default(),
+        mcp: crate::config::McpConfig::default(),
     };
 
     println!(
@@ -490,6 +492,7 @@ async fn run_quick_setup_with_home(
         default_model: Some(model.clone()),
         model_providers: std::collections::HashMap::new(),
         default_temperature: 0.7,
+        provider_timeout_secs: 120,
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         security: crate::config::SecurityConfig::default(),
@@ -524,6 +527,7 @@ async fn run_quick_setup_with_home(
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
         tts: crate::config::TtsConfig::default(),
+        mcp: crate::config::McpConfig::default(),
     };
 
     config.save().await?;
