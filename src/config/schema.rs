@@ -232,6 +232,10 @@ pub struct Config {
     /// Text-to-Speech configuration (`[tts]`).
     #[serde(default)]
     pub tts: TtsConfig,
+
+    /// External MCP server connections (`[mcp]`).
+    #[serde(default, alias = "mcpServers")]
+    pub mcp: McpConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -898,6 +902,60 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
     );
 
     prices
+}
+
+// ── MCP (Model Context Protocol) ─────────────────────────────────
+
+/// Transport type for MCP server connections.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    /// Spawn a local process and communicate over stdin/stdout.
+    #[default]
+    Stdio,
+    /// Connect via HTTP POST.
+    Http,
+    /// Connect via HTTP + Server-Sent Events.
+    Sse,
+}
+
+/// Configuration for a single external MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct McpServerConfig {
+    /// Display name used as a tool prefix (`<server>__<tool>`).
+    pub name: String,
+    /// Transport type (default: stdio).
+    #[serde(default)]
+    pub transport: McpTransport,
+    /// URL for HTTP/SSE transports.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Executable to spawn for stdio transport.
+    #[serde(default)]
+    pub command: String,
+    /// Command arguments for stdio transport.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Optional environment variables for stdio transport.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Optional HTTP headers for HTTP/SSE transports.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Optional per-call timeout in seconds (hard capped in validation).
+    #[serde(default)]
+    pub tool_timeout_secs: Option<u64>,
+}
+
+/// External MCP client configuration (`[mcp]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct McpConfig {
+    /// Enable MCP tool loading.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Configured MCP servers.
+    #[serde(default, alias = "mcpServers")]
+    pub servers: Vec<McpServerConfig>,
 }
 
 // ── Peripherals (hardware: STM32, RPi GPIO, etc.) ────────────────────────
@@ -3885,6 +3943,7 @@ impl Default for Config {
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
 }
@@ -4207,6 +4266,65 @@ fn config_dir_creation_error(path: &Path) -> String {
          ensure this path is writable by user 'zeroclaw'.",
         path.display()
     )
+}
+
+const MCP_MAX_TOOL_TIMEOUT_SECS: u64 = 600;
+
+fn validate_mcp_config(config: &McpConfig) -> Result<()> {
+    let mut seen_names = std::collections::HashSet::new();
+    for (i, server) in config.servers.iter().enumerate() {
+        let name = server.name.trim();
+        if name.is_empty() {
+            anyhow::bail!("mcp.servers[{i}].name must not be empty");
+        }
+        if !seen_names.insert(name.to_ascii_lowercase()) {
+            anyhow::bail!("mcp.servers contains duplicate name: {name}");
+        }
+
+        if let Some(timeout) = server.tool_timeout_secs {
+            if timeout == 0 {
+                anyhow::bail!("mcp.servers[{i}].tool_timeout_secs must be greater than 0");
+            }
+            if timeout > MCP_MAX_TOOL_TIMEOUT_SECS {
+                anyhow::bail!(
+                    "mcp.servers[{i}].tool_timeout_secs exceeds max {MCP_MAX_TOOL_TIMEOUT_SECS}"
+                );
+            }
+        }
+
+        match server.transport {
+            McpTransport::Stdio => {
+                if server.command.trim().is_empty() {
+                    anyhow::bail!(
+                        "mcp.servers[{i}] with transport=stdio requires non-empty command"
+                    );
+                }
+            }
+            McpTransport::Http | McpTransport::Sse => {
+                let url = server
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "mcp.servers[{i}] with transport={} requires url",
+                            match server.transport {
+                                McpTransport::Http => "http",
+                                McpTransport::Sse => "sse",
+                                McpTransport::Stdio => "stdio",
+                            }
+                        )
+                    })?;
+                let parsed = reqwest::Url::parse(url)
+                    .with_context(|| format!("mcp.servers[{i}].url is not a valid URL"))?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    anyhow::bail!("mcp.servers[{i}].url must use http/https");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_local_ollama_endpoint(api_url: Option<&str>) -> bool {
@@ -4846,6 +4964,11 @@ impl Config {
 
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
+
+        // MCP servers
+        if self.mcp.enabled {
+            validate_mcp_config(&self.mcp)?;
+        }
 
         Ok(())
     }
@@ -5850,6 +5973,7 @@ default_temperature = 0.7
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            mcp: McpConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -6046,6 +6170,7 @@ tool_dispatcher = "xml"
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            mcp: McpConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -8422,5 +8547,227 @@ require_otp_to_resume = true
             .validate()
             .expect_err("expected ttl validation failure");
         assert!(err.to_string().contains("token_ttl_secs"));
+    }
+
+    // ── MCP config validation ─────────────────────────────────────────────
+
+    fn stdio_server(name: &str, command: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransport::Stdio,
+            command: command.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn http_server(name: &str, url: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransport::Http,
+            url: Some(url.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn sse_server(name: &str, url: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransport::Sse,
+            url: Some(url.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    async fn validate_mcp_config_empty_servers_ok() {
+        let cfg = McpConfig::default();
+        assert!(validate_mcp_config(&cfg).is_ok());
+    }
+
+    #[test]
+    async fn validate_mcp_config_valid_stdio_ok() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![stdio_server("fs", "/usr/bin/mcp-fs")],
+        };
+        assert!(validate_mcp_config(&cfg).is_ok());
+    }
+
+    #[test]
+    async fn validate_mcp_config_valid_http_ok() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![http_server("svc", "http://localhost:8080/mcp")],
+        };
+        assert!(validate_mcp_config(&cfg).is_ok());
+    }
+
+    #[test]
+    async fn validate_mcp_config_valid_sse_ok() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![sse_server("svc", "https://example.com/events")],
+        };
+        assert!(validate_mcp_config(&cfg).is_ok());
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_empty_name() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![stdio_server("", "/usr/bin/tool")],
+        };
+        let err = validate_mcp_config(&cfg).expect_err("empty name should fail");
+        assert!(
+            err.to_string().contains("name must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_whitespace_name() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![stdio_server("   ", "/usr/bin/tool")],
+        };
+        let err = validate_mcp_config(&cfg).expect_err("whitespace name should fail");
+        assert!(
+            err.to_string().contains("name must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_duplicate_names() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![
+                stdio_server("fs", "/usr/bin/mcp-a"),
+                stdio_server("fs", "/usr/bin/mcp-b"),
+            ],
+        };
+        let err = validate_mcp_config(&cfg).expect_err("duplicate name should fail");
+        assert!(err.to_string().contains("duplicate name"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_zero_timeout() {
+        let mut server = stdio_server("fs", "/usr/bin/mcp-fs");
+        server.tool_timeout_secs = Some(0);
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![server],
+        };
+        let err = validate_mcp_config(&cfg).expect_err("zero timeout should fail");
+        assert!(err.to_string().contains("greater than 0"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_timeout_exceeding_max() {
+        let mut server = stdio_server("fs", "/usr/bin/mcp-fs");
+        server.tool_timeout_secs = Some(MCP_MAX_TOOL_TIMEOUT_SECS + 1);
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![server],
+        };
+        let err = validate_mcp_config(&cfg).expect_err("oversized timeout should fail");
+        assert!(err.to_string().contains("exceeds max"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_mcp_config_allows_max_timeout_exactly() {
+        let mut server = stdio_server("fs", "/usr/bin/mcp-fs");
+        server.tool_timeout_secs = Some(MCP_MAX_TOOL_TIMEOUT_SECS);
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![server],
+        };
+        assert!(validate_mcp_config(&cfg).is_ok());
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_stdio_with_empty_command() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![stdio_server("fs", "")],
+        };
+        let err = validate_mcp_config(&cfg).expect_err("empty command should fail");
+        assert!(
+            err.to_string().contains("requires non-empty command"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_http_without_url() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                name: "svc".to_string(),
+                transport: McpTransport::Http,
+                url: None,
+                ..Default::default()
+            }],
+        };
+        let err = validate_mcp_config(&cfg).expect_err("http without url should fail");
+        assert!(err.to_string().contains("requires url"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_sse_without_url() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                name: "svc".to_string(),
+                transport: McpTransport::Sse,
+                url: None,
+                ..Default::default()
+            }],
+        };
+        let err = validate_mcp_config(&cfg).expect_err("sse without url should fail");
+        assert!(err.to_string().contains("requires url"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_non_http_scheme() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![http_server("svc", "ftp://example.com/mcp")],
+        };
+        let err = validate_mcp_config(&cfg).expect_err("non-http scheme should fail");
+        assert!(err.to_string().contains("http/https"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_invalid_url() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![http_server("svc", "not a url at all !!!")],
+        };
+        let err = validate_mcp_config(&cfg).expect_err("invalid url should fail");
+        assert!(err.to_string().contains("valid URL"), "got: {err}");
+    }
+
+    #[test]
+    async fn mcp_config_default_disabled_with_empty_servers() {
+        let cfg = McpConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.servers.is_empty());
+    }
+
+    #[test]
+    async fn mcp_transport_serde_roundtrip_lowercase() {
+        let cases = [
+            (McpTransport::Stdio, "\"stdio\""),
+            (McpTransport::Http, "\"http\""),
+            (McpTransport::Sse, "\"sse\""),
+        ];
+        for (variant, expected_json) in &cases {
+            let serialized = serde_json::to_string(variant).expect("serialize");
+            assert_eq!(&serialized, expected_json, "variant: {variant:?}");
+            let deserialized: McpTransport =
+                serde_json::from_str(expected_json).expect("deserialize");
+            assert_eq!(&deserialized, variant);
+        }
     }
 }
