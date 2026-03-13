@@ -34,7 +34,8 @@ impl Observer for VerboseObserver {
                 eprintln!("< Receive (success={success}, duration_ms={ms})");
             }
             ObserverEvent::ToolCallStart { tool, arguments } => {
-                eprintln!("> Tool {tool} args={arguments}");
+                let args_display = arguments.as_deref().unwrap_or("");
+                eprintln!("> Tool {tool} args={args_display}");
             }
             ObserverEvent::ToolCall {
                 tool,

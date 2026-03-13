@@ -101,7 +101,7 @@ Examples:
   ./install.sh --docker
 
   # Remote one-liner
-  curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 
 Environment:
   ZEROCLAW_CONTAINER_CLI     Container CLI command (default: docker; auto-fallback: podman)
@@ -689,7 +689,7 @@ run_docker_bootstrap() {
 
   if [[ "$SKIP_BUILD" == false ]]; then
     info "Building Docker image ($docker_image)"
-    "$CONTAINER_CLI" build --target release -t "$docker_image" "$WORK_DIR"
+    DOCKER_BUILDKIT=1 "$CONTAINER_CLI" build --target release -t "$docker_image" "$WORK_DIR"
   else
     info "Skipping Docker image build"
     if ! "$CONTAINER_CLI" image inspect "$docker_image" >/dev/null 2>&1; then
@@ -751,7 +751,7 @@ MSG
   fi
 
   "$CONTAINER_CLI" run --rm -it \
-    "${container_run_namespace_args[@]}" \
+    "${container_run_namespace_args[@]+"${container_run_namespace_args[@]}"}" \
     "${container_run_user_args[@]}" \
     -e HOME=/zeroclaw-data \
     -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \

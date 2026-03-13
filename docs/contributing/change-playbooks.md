@@ -2,6 +2,8 @@
 
 Step-by-step guides for common extension and modification patterns in ZeroClaw.
 
+For complete code examples of each extension trait, see [extension-examples.md](./extension-examples.md).
+
 ## Adding a Provider
 
 - Implement `Provider` in `src/providers/`.

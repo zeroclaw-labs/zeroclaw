@@ -28,7 +28,7 @@ impl Observer for LogObserver {
                 info!(provider = %provider, model = %model, duration_ms = ms, tokens = ?tokens_used, cost_usd = ?cost_usd, "agent.end");
             }
             ObserverEvent::ToolCallStart { tool, arguments } => {
-                info!(tool = %tool, arguments = %arguments, "tool.start");
+                info!(tool = %tool, arguments = ?arguments, "tool.start");
             }
             ObserverEvent::ToolCall {
                 tool,
