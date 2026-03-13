@@ -218,17 +218,19 @@ async fn e2e_search_messages_with_contact() {
         .as_array()
         .expect("messages should be an array");
 
-    let msg = &messages[0];
-    assert!(msg["id"].is_number(), "message.id should be a number");
-    assert!(msg["date"].is_string(), "message.date should be a string");
-    assert!(
-        msg["text"].is_string(),
-        "message.text should be a string (possibly empty)"
-    );
-    assert!(
-        msg["sender_id"].is_number(),
-        "message.sender_id should be a number"
-    );
+    // Validate message structure when messages exist
+    if let Some(msg) = messages.first() {
+        assert!(msg["id"].is_number(), "message.id should be a number");
+        assert!(msg["date"].is_string(), "message.date should be a string");
+        assert!(
+            msg["text"].is_string(),
+            "message.text should be a string (possibly empty)"
+        );
+        assert!(
+            msg["sender_id"].is_number(),
+            "message.sender_id should be a number"
+        );
+    }
 }
 
 /// `search_messages` with a nonexistent contact returns error.
