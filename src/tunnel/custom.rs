@@ -42,18 +42,33 @@ impl Tunnel for CustomTunnel {
     }
 
     async fn start(&self, local_host: &str, local_port: u16) -> Result<String> {
-        let cmd = self
+        let cmd_formatted = self
             .start_command
             .replace("{port}", &local_port.to_string())
             .replace("{host}", local_host);
 
-        let parts: Vec<&str> = cmd.split_whitespace().collect();
-        if parts.is_empty() {
+        if cmd_formatted.trim().is_empty() {
             bail!("Custom tunnel start_command is empty");
         }
 
-        let mut child = Command::new(parts[0])
-            .args(&parts[1..])
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg(&cmd_formatted);
+            // On Windows, cmd.exe often needs SystemRoot and windir to function correctly
+            if let Ok(val) = std::env::var("SystemRoot") {
+                c.env("SystemRoot", val);
+            }
+            if let Ok(val) = std::env::var("windir") {
+                c.env("windir", val);
+            }
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(&cmd_formatted);
+            c
+        };
+
+        let mut child = cmd
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -162,7 +177,12 @@ mod tests {
 
     #[tokio::test]
     async fn start_without_pattern_returns_local_url() {
-        let tunnel = CustomTunnel::new("sleep 1".into(), None, None);
+        let cmd = if cfg!(windows) {
+            "timeout 1"
+        } else {
+            "sleep 1"
+        };
+        let tunnel = CustomTunnel::new(cmd.into(), None, None);
 
         let url = tunnel.start("127.0.0.1", 4455).await.unwrap();
         assert_eq!(url, "http://127.0.0.1:4455");
@@ -209,11 +229,12 @@ mod tests {
 
     #[tokio::test]
     async fn health_check_with_unreachable_health_url_returns_false() {
-        let tunnel = CustomTunnel::new(
-            "sleep 1".into(),
-            Some("http://127.0.0.1:9/healthz".into()),
-            None,
-        );
+        let cmd = if cfg!(windows) {
+            "timeout 1"
+        } else {
+            "sleep 1"
+        };
+        let tunnel = CustomTunnel::new(cmd.into(), Some("http://127.0.0.1:9/healthz".into()), None);
 
         assert!(!tunnel.health_check().await);
     }

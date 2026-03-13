@@ -295,7 +295,12 @@ mod tests {
     #[tokio::test]
     async fn absolute_path_is_blocked() {
         let tool = PdfReadTool::new(test_security(std::env::temp_dir()));
-        let result = tool.execute(json!({"path": "/etc/passwd"})).await.unwrap();
+        let abs_path = if cfg!(windows) {
+            "C:\\etc\\passwd"
+        } else {
+            "/etc/passwd"
+        };
+        let result = tool.execute(json!({"path": abs_path})).await.unwrap();
         assert!(!result.success);
         assert!(result
             .error

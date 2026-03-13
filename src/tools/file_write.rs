@@ -291,8 +291,13 @@ mod tests {
     #[tokio::test]
     async fn file_write_blocks_absolute_path() {
         let tool = FileWriteTool::new(test_security(std::env::temp_dir()));
+        let abs_path = if cfg!(windows) {
+            "C:\\etc\\evil"
+        } else {
+            "/etc/evil"
+        };
         let result = tool
-            .execute(json!({"path": "/etc/evil", "content": "bad"}))
+            .execute(json!({"path": abs_path, "content": "bad"}))
             .await
             .unwrap();
         assert!(!result.success);

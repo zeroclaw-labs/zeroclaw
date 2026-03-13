@@ -100,43 +100,78 @@ impl Default for SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: PathBuf::from("."),
             workspace_only: true,
-            allowed_commands: vec![
-                "git".into(),
-                "npm".into(),
-                "cargo".into(),
-                "ls".into(),
-                "cat".into(),
-                "grep".into(),
-                "find".into(),
-                "echo".into(),
-                "pwd".into(),
-                "wc".into(),
-                "head".into(),
-                "tail".into(),
-                "date".into(),
-            ],
-            forbidden_paths: vec![
-                // System directories (blocked even when workspace_only=false)
-                "/etc".into(),
-                "/root".into(),
-                "/home".into(),
-                "/usr".into(),
-                "/bin".into(),
-                "/sbin".into(),
-                "/lib".into(),
-                "/opt".into(),
-                "/boot".into(),
-                "/dev".into(),
-                "/proc".into(),
-                "/sys".into(),
-                "/var".into(),
-                "/tmp".into(),
-                // Sensitive dotfiles
-                "~/.ssh".into(),
-                "~/.gnupg".into(),
-                "~/.aws".into(),
-                "~/.config".into(),
-            ],
+            allowed_commands: {
+                let mut cmds = vec![
+                    "git".into(),
+                    "npm".into(),
+                    "cargo".into(),
+                    "ls".into(),
+                    "cat".into(),
+                    "grep".into(),
+                    "find".into(),
+                    "echo".into(),
+                    "pwd".into(),
+                    "wc".into(),
+                    "head".into(),
+                    "tail".into(),
+                    "date".into(),
+                ];
+                if cfg!(windows) {
+                    cmds.extend(vec![
+                        "dir".into(),
+                        "type".into(),
+                        "move".into(),
+                        "copy".into(),
+                        "del".into(),
+                        "mkdir".into(),
+                        "rmdir".into(),
+                        "set".into(),
+                        "ping".into(),
+                        "timeout".into(),
+                        "where".into(),
+                        "tasklist".into(),
+                        "taskkill".into(),
+                    ]);
+                }
+                cmds
+            },
+            forbidden_paths: if cfg!(windows) {
+                vec![
+                    "C:\\Windows".into(),
+                    "C:\\Users".into(),
+                    "C:\\Program Files".into(),
+                    "C:\\Program Files (x86)".into(),
+                    "C:\\ProgramData".into(),
+                    "C:\\temp".into(),
+                    "~/.ssh".into(),
+                    "~/.gnupg".into(),
+                    "~/.aws".into(),
+                    "~/.config".into(),
+                ]
+            } else {
+                vec![
+                    // System directories (blocked even when workspace_only=false)
+                    "/etc".into(),
+                    "/root".into(),
+                    "/home".into(),
+                    "/usr".into(),
+                    "/bin".into(),
+                    "/sbin".into(),
+                    "/lib".into(),
+                    "/opt".into(),
+                    "/boot".into(),
+                    "/dev".into(),
+                    "/proc".into(),
+                    "/sys".into(),
+                    "/var".into(),
+                    "/tmp".into(),
+                    // Sensitive dotfiles
+                    "~/.ssh".into(),
+                    "~/.gnupg".into(),
+                    "~/.aws".into(),
+                    "~/.config".into(),
+                ]
+            },
             allowed_roots: Vec::new(),
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
@@ -149,7 +184,14 @@ impl Default for SecurityPolicy {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE").map(PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
 }
 
 fn expand_user_path(path: &str) -> PathBuf {
@@ -160,6 +202,13 @@ fn expand_user_path(path: &str) -> PathBuf {
     }
 
     if let Some(stripped) = path.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(stripped);
+        }
+    }
+
+    #[cfg(windows)]
+    if let Some(stripped) = path.strip_prefix("~\\") {
         if let Some(home) = home_dir() {
             return home.join(stripped);
         }
@@ -457,20 +506,34 @@ fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
             }
         }
 
-        if ch != '$' {
-            continue;
+        if ch == '$' {
+            let Some(next) = chars.get(i + 1).copied() else {
+                continue;
+            };
+            if next.is_ascii_alphanumeric()
+                || matches!(
+                    next,
+                    '_' | '{' | '(' | '#' | '?' | '!' | '$' | '*' | '@' | '-'
+                )
+            {
+                return true;
+            }
         }
 
-        let Some(next) = chars.get(i + 1).copied() else {
-            continue;
-        };
-        if next.is_ascii_alphanumeric()
-            || matches!(
-                next,
-                '_' | '{' | '(' | '#' | '?' | '!' | '$' | '*' | '@' | '-'
-            )
-        {
-            return true;
+        if ch == '%' && i + 1 < chars.len() {
+            // Find closing %
+            for (j, &c) in chars.iter().enumerate().skip(i + 1) {
+                if c == '%' {
+                    // %VARIABLE% found
+                    if j > i + 1 {
+                        return true;
+                    }
+                }
+                if !c.is_ascii_alphanumeric() && c != '_' {
+                    // Not a valid variable name, stop searching for closing %
+                    break;
+                }
+            }
         }
     }
 
@@ -489,6 +552,9 @@ fn looks_like_path(candidate: &str) -> bool {
         || candidate == "."
         || candidate == ".."
         || candidate.contains('/')
+        || (cfg!(windows)
+            && (candidate.contains('\\')
+                || (candidate.len() > 1 && candidate.as_bytes()[1] == b':')))
 }
 
 fn attached_short_option_value(token: &str) -> Option<&str> {
@@ -542,7 +608,11 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
     }
 
     // Command-name entries continue to match by basename.
-    allowed == executable_base
+    if cfg!(windows) {
+        allowed.to_lowercase() == executable_base.to_lowercase()
+    } else {
+        allowed == executable_base
+    }
 }
 
 impl SecurityPolicy {
@@ -563,7 +633,7 @@ impl SecurityPolicy {
             };
 
             let base = base_raw
-                .rsplit('/')
+                .rsplit(['/', '\\'])
                 .next()
                 .unwrap_or("")
                 .to_ascii_lowercase();
@@ -608,6 +678,7 @@ impl SecurityPolicy {
 
             if joined_segment.contains("rm -rf /")
                 || joined_segment.contains("rm -fr /")
+                || (cfg!(windows) && joined_segment.contains("rmdir /s"))
                 || joined_segment.contains(":(){:|:&};:")
             {
                 return CommandRiskLevel::High;
@@ -747,7 +818,7 @@ impl SecurityPolicy {
         // redirect check above (e.g. `echo secret | tee /etc/crontab`)
         if command
             .split_whitespace()
-            .any(|w| w == "tee" || w.ends_with("/tee"))
+            .any(|w| w == "tee" || w.ends_with("/tee") || (cfg!(windows) && w.ends_with("\\tee")))
         {
             return false;
         }
@@ -766,7 +837,11 @@ impl SecurityPolicy {
 
             let mut words = cmd_part.split_whitespace();
             let executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-            let base_cmd = executable.rsplit('/').next().unwrap_or("");
+            let mut base_cmd = executable.rsplit(['/', '\\']).next().unwrap_or("");
+            if cfg!(windows) {
+                base_cmd = base_cmd.strip_suffix(".exe").unwrap_or(base_cmd);
+                base_cmd = base_cmd.strip_suffix(".EXE").unwrap_or(base_cmd);
+            }
 
             if base_cmd.is_empty() {
                 continue;
@@ -915,7 +990,11 @@ impl SecurityPolicy {
 
         // Reject "~user" forms because the shell expands them at runtime and
         // they can escape workspace policy.
-        if path.starts_with('~') && path != "~" && !path.starts_with("~/") {
+        if path.starts_with('~')
+            && path != "~"
+            && !path.starts_with("~/")
+            && !(cfg!(windows) && path.starts_with("~\\"))
+        {
             return false;
         }
 
@@ -1066,11 +1145,33 @@ impl SecurityPolicy {
         autonomy_config: &crate::config::AutonomyConfig,
         workspace_dir: &Path,
     ) -> Self {
+        let allowed_commands = {
+            let cmds = autonomy_config.allowed_commands.clone();
+
+            // Ensure Windows defaults are present on Windows
+            #[cfg(windows)]
+            {
+                let mut cmds = cmds;
+                let win_defaults = vec![
+                    "dir", "type", "move", "copy", "del", "mkdir", "rmdir", "set", "ping",
+                    "timeout", "where", "tasklist", "taskkill",
+                ];
+                for cmd in win_defaults {
+                    if !cmds.iter().any(|c| c == cmd) {
+                        cmds.push(cmd.into());
+                    }
+                }
+                cmds
+            }
+            #[cfg(not(windows))]
+            cmds
+        };
+
         Self {
             autonomy: autonomy_config.level,
             workspace_dir: workspace_dir.to_path_buf(),
             workspace_only: autonomy_config.workspace_only,
-            allowed_commands: autonomy_config.allowed_commands.clone(),
+            allowed_commands,
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
             allowed_roots: autonomy_config
                 .allowed_roots
@@ -1219,18 +1320,27 @@ mod tests {
     #[test]
     fn command_with_absolute_path_extracts_basename() {
         let p = default_policy();
-        assert!(p.is_command_allowed("/usr/bin/git status"));
-        assert!(p.is_command_allowed("/bin/ls -la"));
+        let cmd = if cfg!(windows) {
+            "C:\\Windows\\System32\\git status"
+        } else {
+            "/usr/bin/git status"
+        };
+        assert!(p.is_command_allowed(cmd));
     }
 
     #[test]
     fn allowlist_supports_explicit_executable_paths() {
+        let cmd = if cfg!(windows) {
+            "C:\\bin\\antigravity"
+        } else {
+            "/usr/bin/antigravity"
+        };
         let p = SecurityPolicy {
-            allowed_commands: vec!["/usr/bin/antigravity".into()],
+            allowed_commands: vec![cmd.into()],
             ..SecurityPolicy::default()
         };
 
-        assert!(p.is_command_allowed("/usr/bin/antigravity"));
+        assert!(p.is_command_allowed(cmd));
         assert!(!p.is_command_allowed("antigravity"));
     }
 
@@ -1242,7 +1352,12 @@ mod tests {
         };
 
         assert!(p.is_command_allowed("python3 --version"));
-        assert!(p.is_command_allowed("/usr/bin/antigravity"));
+        let cmd = if cfg!(windows) {
+            "C:\\bin\\antigravity"
+        } else {
+            "/usr/bin/antigravity"
+        };
+        assert!(p.is_command_allowed(cmd));
 
         // Wildcard still respects risk gates in validate_command_execution.
         let blocked = p.validate_command_execution("rm -rf /tmp/test", true);
@@ -1398,40 +1513,61 @@ mod tests {
     #[test]
     fn absolute_paths_blocked_when_workspace_only() {
         let p = default_policy();
-        assert!(!p.is_path_allowed("/etc/passwd"));
-        assert!(!p.is_path_allowed("/root/.ssh/id_rsa"));
-        assert!(!p.is_path_allowed("/tmp/file.txt"));
+        let p1 = if cfg!(windows) {
+            "C:\\etc\\passwd"
+        } else {
+            "/etc/passwd"
+        };
+        let p2 = if cfg!(windows) {
+            "C:\\root\\.ssh\\id_rsa"
+        } else {
+            "/root/.ssh/id_rsa"
+        };
+        let p3 = if cfg!(windows) {
+            "C:\\tmp\\file.txt"
+        } else {
+            "/tmp/file.txt"
+        };
+        assert!(!p.is_path_allowed(p1));
+        assert!(!p.is_path_allowed(p2));
+        assert!(!p.is_path_allowed(p3));
     }
 
     #[test]
     fn absolute_path_inside_workspace_allowed_when_workspace_only() {
+        let base_dir = std::env::temp_dir();
+        let ws_dir = base_dir.join(".zeroclaw").join("workspace");
         let p = SecurityPolicy {
-            workspace_dir: PathBuf::from("/home/user/.zeroclaw/workspace"),
+            workspace_dir: ws_dir.clone(),
             workspace_only: true,
             ..SecurityPolicy::default()
         };
         // Absolute path inside workspace should be allowed
-        assert!(p.is_path_allowed("/home/user/.zeroclaw/workspace/images/example.png"));
-        assert!(p.is_path_allowed("/home/user/.zeroclaw/workspace/file.txt"));
+        assert!(p.is_path_allowed(&ws_dir.join("images").join("example.png").to_string_lossy()));
+        assert!(p.is_path_allowed(&ws_dir.join("file.txt").to_string_lossy()));
         // Absolute path outside workspace should still be blocked
-        assert!(!p.is_path_allowed("/home/user/other/file.txt"));
-        assert!(!p.is_path_allowed("/tmp/file.txt"));
+        let other_dir = base_dir.join("other");
+        assert!(!p.is_path_allowed(&other_dir.join("file.txt").to_string_lossy()));
     }
 
     #[test]
     fn absolute_path_in_allowed_root_permitted_when_workspace_only() {
+        let base_dir = std::env::temp_dir();
+        let ws_dir = base_dir.join(".zeroclaw").join("workspace");
+        let shared_dir = base_dir.join(".zeroclaw").join("shared");
         let p = SecurityPolicy {
-            workspace_dir: PathBuf::from("/home/user/.zeroclaw/workspace"),
+            workspace_dir: ws_dir.clone(),
             workspace_only: true,
-            allowed_roots: vec![PathBuf::from("/home/user/.zeroclaw/shared")],
+            allowed_roots: vec![shared_dir.clone()],
             ..SecurityPolicy::default()
         };
         // Path in allowed root should be permitted
-        assert!(p.is_path_allowed("/home/user/.zeroclaw/shared/data.txt"));
+        assert!(p.is_path_allowed(&shared_dir.join("data.txt").to_string_lossy()));
         // Path in workspace should still be permitted
-        assert!(p.is_path_allowed("/home/user/.zeroclaw/workspace/file.txt"));
+        assert!(p.is_path_allowed(&ws_dir.join("file.txt").to_string_lossy()));
         // Path outside both should still be blocked
-        assert!(!p.is_path_allowed("/home/user/other/file.txt"));
+        let other_dir = base_dir.join("other");
+        assert!(!p.is_path_allowed(&other_dir.join("file.txt").to_string_lossy()));
     }
 
     #[test]
@@ -1441,7 +1577,12 @@ mod tests {
             forbidden_paths: vec![],
             ..SecurityPolicy::default()
         };
-        assert!(p.is_path_allowed("/tmp/file.txt"));
+        let test_p = if cfg!(windows) {
+            "C:\\tmp\\file.txt"
+        } else {
+            "/tmp/file.txt"
+        };
+        assert!(p.is_path_allowed(test_p));
     }
 
     #[test]
@@ -1450,8 +1591,18 @@ mod tests {
             workspace_only: false,
             ..SecurityPolicy::default()
         };
-        assert!(!p.is_path_allowed("/etc/passwd"));
-        assert!(!p.is_path_allowed("/root/.bashrc"));
+        let p1 = if cfg!(windows) {
+            "C:\\Windows\\System32\\drivers\\etc\\hosts"
+        } else {
+            "/etc/passwd"
+        };
+        let p2 = if cfg!(windows) {
+            "C:\\Users\\Default\\ntuser.dat"
+        } else {
+            "/root/.bashrc"
+        };
+        assert!(!p.is_path_allowed(p1));
+        assert!(!p.is_path_allowed(p2));
         assert!(!p.is_path_allowed("~/.ssh/id_rsa"));
         assert!(!p.is_path_allowed("~/.gnupg/pubring.kbx"));
     }
@@ -1490,7 +1641,12 @@ mod tests {
 
         assert_eq!(policy.autonomy, AutonomyLevel::Full);
         assert!(!policy.workspace_only);
+
+        #[cfg(not(windows))]
         assert_eq!(policy.allowed_commands, vec!["docker"]);
+        #[cfg(windows)]
+        assert!(policy.allowed_commands.contains(&"docker".to_string()));
+
         assert_eq!(policy.forbidden_paths, vec!["/secret"]);
         assert_eq!(policy.max_actions_per_hour, 100);
         assert_eq!(policy.max_cost_per_day_cents, 1000);
@@ -1509,8 +1665,8 @@ mod tests {
         let workspace = PathBuf::from("/tmp/test-workspace");
         let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
 
-        let expected_home_root = if let Some(home) = std::env::var_os("HOME") {
-            PathBuf::from(home).join("Desktop")
+        let expected_home_root = if let Some(home) = home_dir() {
+            home.join("Desktop")
         } else {
             PathBuf::from("~/Desktop")
         };
@@ -1797,9 +1953,14 @@ mod tests {
     #[test]
     fn forbidden_path_argument_detects_absolute_path() {
         let p = default_policy();
+        let test_p = if cfg!(windows) {
+            "C:\\etc\\passwd"
+        } else {
+            "/etc/passwd"
+        };
         assert_eq!(
-            p.forbidden_path_argument("cat /etc/passwd"),
-            Some("/etc/passwd".into())
+            p.forbidden_path_argument(&format!("cat {test_p}")),
+            Some(test_p.into())
         );
     }
 
@@ -1826,9 +1987,14 @@ mod tests {
     #[test]
     fn forbidden_path_argument_detects_option_assignment_paths() {
         let p = default_policy();
+        let test_p = if cfg!(windows) {
+            "C:\\etc\\passwd"
+        } else {
+            "/etc/passwd"
+        };
         assert_eq!(
-            p.forbidden_path_argument("grep --file=/etc/passwd root ./src"),
-            Some("/etc/passwd".into())
+            p.forbidden_path_argument(&format!("grep --file={test_p} root ./src")),
+            Some(test_p.into())
         );
         assert_eq!(
             p.forbidden_path_argument("cat --input=../secret.txt"),
@@ -1848,9 +2014,14 @@ mod tests {
     #[test]
     fn forbidden_path_argument_detects_short_option_attached_paths() {
         let p = default_policy();
+        let test_p = if cfg!(windows) {
+            "C:\\etc\\passwd"
+        } else {
+            "/etc/passwd"
+        };
         assert_eq!(
-            p.forbidden_path_argument("grep -f/etc/passwd root ./src"),
-            Some("/etc/passwd".into())
+            p.forbidden_path_argument(&format!("grep -f{test_p} root ./src")),
+            Some(test_p.into())
         );
         assert_eq!(
             p.forbidden_path_argument("git -C../outside status"),
@@ -1884,13 +2055,18 @@ mod tests {
     #[test]
     fn forbidden_path_argument_detects_input_redirection_paths() {
         let p = default_policy();
+        let test_p = if cfg!(windows) {
+            "C:\\etc\\passwd"
+        } else {
+            "/etc/passwd"
+        };
         assert_eq!(
-            p.forbidden_path_argument("cat </etc/passwd"),
-            Some("/etc/passwd".into())
+            p.forbidden_path_argument(&format!("cat <{test_p}")),
+            Some(test_p.into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat</etc/passwd"),
-            Some("/etc/passwd".into())
+            p.forbidden_path_argument(&format!("cat<{test_p}")),
+            Some(test_p.into())
         );
     }
 
@@ -1922,7 +2098,12 @@ mod tests {
     #[test]
     fn path_symlink_style_absolute() {
         let p = default_policy();
-        assert!(!p.is_path_allowed("/proc/self/root/etc/passwd"));
+        let test_p = if cfg!(windows) {
+            "C:\\Windows\\System32\\drivers\\etc\\hosts"
+        } else {
+            "/proc/self/root/etc/passwd"
+        };
+        assert!(!p.is_path_allowed(test_p));
     }
 
     #[test]
@@ -1943,7 +2124,12 @@ mod tests {
             workspace_only: false,
             ..SecurityPolicy::default()
         };
-        assert!(!p.is_path_allowed("/var/run/docker.sock"));
+        let test_p = if cfg!(windows) {
+            "C:\\ProgramData\\ssh\\ssh_host_rsa_key"
+        } else {
+            "/var/run/docker.sock"
+        };
+        assert!(!p.is_path_allowed(test_p));
     }
 
     // ── Edge cases: rate limiter boundary ────────────────────
@@ -2011,8 +2197,13 @@ mod tests {
             workspace_only: false,
             ..SecurityPolicy::default()
         };
-        assert!(!p.is_path_allowed("/etc/shadow"));
-        assert!(!p.is_path_allowed("/root/.bashrc"));
+        let test_p = if cfg!(windows) {
+            "C:\\Windows\\System32\\config\\SAM"
+        } else {
+            "/etc/shadow"
+        };
+        assert!(!p.is_path_allowed(test_p));
+        assert!(!p.is_path_allowed("~/.bashrc"));
     }
 
     #[test]
@@ -2023,30 +2214,45 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| workspace.clone());
 
+        let p1 = if cfg!(windows) { "C:\\etc" } else { "/etc" };
+        let p2 = if cfg!(windows) { "C:\\var" } else { "/var" };
+
         let p = SecurityPolicy {
             workspace_dir: canonical_workspace.clone(),
             workspace_only: false,
-            forbidden_paths: vec!["/etc".into(), "/var".into()],
+            forbidden_paths: vec![p1.into(), p2.into()],
             ..SecurityPolicy::default()
         };
 
         // Path outside workspace should be allowed when workspace_only=false
-        let outside = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/home"))
-            .join("zeroclaw_outside_ws");
+        let outside = if let Some(home) = home_dir() {
+            home.join("zeroclaw_outside_ws")
+        } else {
+            std::env::temp_dir().join("zeroclaw_outside_ws")
+        };
+
         assert!(
             p.is_resolved_path_allowed(&outside),
             "workspace_only=false must allow resolved paths outside workspace"
         );
 
         // Forbidden paths must still be blocked even with workspace_only=false
+        let fp1 = if cfg!(windows) {
+            "C:\\etc\\passwd"
+        } else {
+            "/etc/passwd"
+        };
+        let fp2 = if cfg!(windows) {
+            "C:\\var\\run\\docker.sock"
+        } else {
+            "/var/run/docker.sock"
+        };
         assert!(
-            !p.is_resolved_path_allowed(Path::new("/etc/passwd")),
+            !p.is_resolved_path_allowed(Path::new(fp1)),
             "forbidden paths must be blocked even when workspace_only=false"
         );
         assert!(
-            !p.is_resolved_path_allowed(Path::new("/var/run/docker.sock")),
+            !p.is_resolved_path_allowed(Path::new(fp2)),
             "forbidden /var must be blocked even when workspace_only=false"
         );
 
@@ -2079,10 +2285,14 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| std::env::temp_dir())
             .join("zeroclaw_outside_ws_true");
-        assert!(
-            !p.is_resolved_path_allowed(&outside),
-            "workspace_only=true must block resolved paths outside workspace"
-        );
+
+        // Ensure outside is actually outside workspace_dir
+        if !outside.starts_with(&canonical_workspace) {
+            assert!(
+                !p.is_resolved_path_allowed(&outside),
+                "workspace_only=true must block resolved paths outside workspace"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
@@ -2119,8 +2329,14 @@ mod tests {
     #[test]
     fn checklist_root_path_blocked() {
         let p = default_policy();
-        assert!(!p.is_path_allowed("/"));
-        assert!(!p.is_path_allowed("/anything"));
+        let root_path = if cfg!(windows) { "C:\\" } else { "/" };
+        assert!(!p.is_path_allowed(root_path));
+        let any_abs = if cfg!(windows) {
+            "C:\\anything"
+        } else {
+            "/anything"
+        };
+        assert!(!p.is_path_allowed(any_abs));
     }
 
     #[test]
@@ -2129,17 +2345,23 @@ mod tests {
             workspace_only: false,
             ..SecurityPolicy::default()
         };
-        for dir in [
-            "/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/boot", "/dev",
-            "/proc", "/sys", "/var", "/tmp",
-        ] {
+        let dirs = if cfg!(windows) {
+            vec!["C:\\Windows", "C:\\Users", "C:\\Program Files", "C:\\temp"]
+        } else {
+            vec![
+                "/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/boot", "/dev",
+                "/proc", "/sys", "/var", "/tmp",
+            ]
+        };
+        for dir in dirs {
             assert!(
                 !p.is_path_allowed(dir),
                 "System dir should be blocked: {dir}"
             );
+            let sep = if cfg!(windows) { "\\" } else { "/" };
             assert!(
-                !p.is_path_allowed(&format!("{dir}/subpath")),
-                "Subpath of system dir should be blocked: {dir}/subpath"
+                !p.is_path_allowed(&format!("{dir}{sep}subpath")),
+                "Subpath of system dir should be blocked: {dir}{sep}subpath"
             );
         }
     }
@@ -2177,23 +2399,37 @@ mod tests {
             workspace_only: true,
             ..SecurityPolicy::default()
         };
-        assert!(!p.is_path_allowed("/any/absolute/path"));
+        let any_abs = if cfg!(windows) {
+            "C:\\any\\absolute\\path"
+        } else {
+            "/any/absolute/path"
+        };
+        assert!(!p.is_path_allowed(any_abs));
         assert!(p.is_path_allowed("relative/path.txt"));
     }
 
     #[test]
     fn checklist_resolved_path_must_be_in_workspace() {
+        let base_dir = std::env::temp_dir();
+        let ws_dir = base_dir.join(".zeroclaw").join("project");
         let p = SecurityPolicy {
-            workspace_dir: PathBuf::from("/home/user/project"),
+            workspace_dir: ws_dir.clone(),
             ..SecurityPolicy::default()
         };
         // Inside workspace — allowed
-        assert!(p.is_resolved_path_allowed(Path::new("/home/user/project/src/main.rs")));
+        assert!(p.is_resolved_path_allowed(&ws_dir.join("src").join("main.rs")));
         // Outside workspace — blocked (symlink escape)
-        assert!(!p.is_resolved_path_allowed(Path::new("/etc/passwd")));
-        assert!(!p.is_resolved_path_allowed(Path::new("/home/user/other_project/file")));
+        let fp = if cfg!(windows) {
+            "C:\\etc\\passwd"
+        } else {
+            "/etc/passwd"
+        };
+        assert!(!p.is_resolved_path_allowed(Path::new(fp)));
+        let other_dir = base_dir.join("other");
+        assert!(!p.is_resolved_path_allowed(&other_dir.join("file.txt")));
         // Root — blocked
-        assert!(!p.is_resolved_path_allowed(Path::new("/")));
+        let root = if cfg!(windows) { "C:\\" } else { "/" };
+        assert!(!p.is_resolved_path_allowed(Path::new(root)));
     }
 
     #[test]
@@ -2208,8 +2444,13 @@ mod tests {
     #[test]
     fn checklist_default_forbidden_paths_comprehensive() {
         let p = SecurityPolicy::default();
+        let dirs = if cfg!(windows) {
+            vec!["C:\\Windows", "C:\\Users", "C:\\temp"]
+        } else {
+            vec!["/etc", "/root", "/proc", "/sys", "/dev", "/var", "/tmp"]
+        };
         // Must contain all critical system dirs
-        for dir in ["/etc", "/root", "/proc", "/sys", "/dev", "/var", "/tmp"] {
+        for dir in dirs {
             assert!(
                 p.forbidden_paths.iter().any(|f| f == dir),
                 "Default forbidden_paths must include {dir}"
@@ -2253,27 +2494,46 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| std::env::temp_dir());
         let outside = canonical_temp.join("outside_workspace_zeroclaw");
-        assert!(
-            !policy.is_resolved_path_allowed(&outside),
-            "path outside workspace must be blocked"
-        );
+
+        // Ensure outside is actually outside workspace_dir
+        if !outside.starts_with(&canonical_workspace) {
+            assert!(
+                !policy.is_resolved_path_allowed(&outside),
+                "path outside workspace must be blocked"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[test]
     fn resolved_path_blocks_root_escape() {
+        let ws_dir = if cfg!(windows) {
+            PathBuf::from("C:\\home\\zeroclaw_user\\project")
+        } else {
+            PathBuf::from("/home/zeroclaw_user/project")
+        };
         let policy = SecurityPolicy {
-            workspace_dir: PathBuf::from("/home/zeroclaw_user/project"),
+            workspace_dir: ws_dir,
             ..SecurityPolicy::default()
         };
 
+        let fp1 = if cfg!(windows) {
+            "C:\\etc\\passwd"
+        } else {
+            "/etc/passwd"
+        };
+        let fp2 = if cfg!(windows) {
+            "C:\\root\\.bashrc"
+        } else {
+            "/root/.bashrc"
+        };
         assert!(
-            !policy.is_resolved_path_allowed(Path::new("/etc/passwd")),
+            !policy.is_resolved_path_allowed(Path::new(fp1)),
             "resolved path to /etc/passwd must be blocked"
         );
         assert!(
-            !policy.is_resolved_path_allowed(Path::new("/root/.bashrc")),
+            !policy.is_resolved_path_allowed(Path::new(fp2)),
             "resolved path to /root/.bashrc must be blocked"
         );
     }

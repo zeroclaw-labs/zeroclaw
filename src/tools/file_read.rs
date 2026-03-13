@@ -336,7 +336,12 @@ mod tests {
     #[tokio::test]
     async fn file_read_blocks_absolute_path() {
         let tool = FileReadTool::new(test_security(std::env::temp_dir()));
-        let result = tool.execute(json!({"path": "/etc/passwd"})).await.unwrap();
+        let abs_path = if cfg!(windows) {
+            "C:\\etc\\passwd"
+        } else {
+            "/etc/passwd"
+        };
+        let result = tool.execute(json!({"path": abs_path})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
     }

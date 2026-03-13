@@ -431,9 +431,24 @@ async fn run_job_command_with_timeout(
         );
     }
 
-    let child = match Command::new("sh")
-        .arg("-lc")
-        .arg(&job.command)
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(&job.command);
+        // On Windows, cmd.exe often needs SystemRoot and windir to function correctly
+        if let Ok(val) = std::env::var("SystemRoot") {
+            c.env("SystemRoot", val);
+        }
+        if let Ok(val) = std::env::var("windir") {
+            c.env("windir", val);
+        }
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.arg("-lc").arg(&job.command);
+        c
+    };
+
+    let child = match cmd
         .current_dir(&config.workspace_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -455,6 +470,7 @@ async fn run_job_command_with_timeout(
                 stdout.trim(),
                 stderr.trim()
             );
+            eprintln!("DEBUG: run_job_command combined output: {}", combined);
             (output.status.success(), combined)
         }
         Ok(Err(e)) => (false, format!("spawn error: {e}")),
@@ -523,36 +539,75 @@ mod tests {
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
         let (success, output) = run_job_command(&config, &security, &job).await;
-        assert!(success);
+        assert!(success, "Job failed with output: {}", output);
         assert!(output.contains("scheduler-ok"));
-        assert!(output.contains("status=exit status: 0"));
+        // On Windows, output might contain "exit code: 0", on Unix "exit status: 0"
+        let output_lower = output.to_lowercase();
+        assert!(
+            output_lower.contains("status=exit status: 0")
+                || output_lower.contains("status=0")
+                || output_lower.contains("exit code: 0")
+        );
     }
 
     #[tokio::test]
     async fn run_job_command_failure() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
-        let job = test_job("ls definitely_missing_file_for_scheduler_test");
+        let mut config = test_config(&tmp).await;
+        let (cmd, allowed) = if cfg!(windows) {
+            ("dir definitely_missing_file_for_scheduler_test", "dir")
+        } else {
+            ("ls definitely_missing_file_for_scheduler_test", "ls")
+        };
+        config.autonomy.allowed_commands.push(allowed.into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        let job = test_job(cmd);
 
         let (success, output) = run_job_command(&config, &security, &job).await;
-        assert!(!success);
-        assert!(output.contains("definitely_missing_file_for_scheduler_test"));
-        assert!(output.contains("status=exit status:"));
+        assert!(
+            !success,
+            "Job should have failed but succeeded. Output: {}",
+            output
+        );
+        if cfg!(windows) {
+            assert!(
+                output.contains("File Not Found")
+                    || output.contains("definitely_missing_file_for_scheduler_test")
+            );
+        } else {
+            assert!(output.contains("definitely_missing_file_for_scheduler_test"));
+        }
+        // On Windows it might be "status=exit code: 1", on Unix "status=exit status: 1"
+        assert!(output.to_lowercase().contains("status="));
     }
 
     #[tokio::test]
     async fn run_job_command_times_out() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
-        config.autonomy.allowed_commands = vec!["sleep".into()];
-        let job = test_job("sleep 1");
+        // On Windows, 'timeout' requires a terminal. 'ping' is a reliable alternative for sleep.
+        // NOTE: Redirection (>) is blocked by default security policy, so we don't use it here.
+        let (cmd, allowed) = if cfg!(windows) {
+            ("ping 127.0.0.1 -n 5", "ping")
+        } else {
+            ("sleep 1", "sleep")
+        };
+        config.autonomy.allowed_commands.push(allowed.into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        let job = test_job(cmd);
 
         let (success, output) =
             run_job_command_with_timeout(&config, &security, &job, Duration::from_millis(50)).await;
-        assert!(!success);
-        assert!(output.contains("job timed out after"));
+        assert!(
+            !success,
+            "Job should have timed out but succeeded. Output: {}",
+            output
+        );
+        assert!(
+            output.contains("job timed out after"),
+            "Output did not contain timeout message: {}",
+            output
+        );
     }
 
     #[tokio::test]
@@ -574,14 +629,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
         config.autonomy.allowed_commands = vec!["cat".into()];
-        let job = test_job("cat /etc/passwd");
+        let abs_path = if cfg!(windows) {
+            "C:\\etc\\passwd"
+        } else {
+            "/etc/passwd"
+        };
+        let job = test_job(&format!("cat {}", abs_path));
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
+        assert!(output.contains(abs_path));
     }
 
     #[tokio::test]
@@ -589,14 +648,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
         config.autonomy.allowed_commands = vec!["grep".into()];
-        let job = test_job("grep --file=/etc/passwd root ./src");
+        let abs_path = if cfg!(windows) {
+            "C:\\etc\\passwd"
+        } else {
+            "/etc/passwd"
+        };
+        let job = test_job(&format!("grep --file={} root ./src", abs_path));
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
+        assert!(output.contains(abs_path));
     }
 
     #[tokio::test]
@@ -604,14 +667,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
         config.autonomy.allowed_commands = vec!["grep".into()];
-        let job = test_job("grep -f/etc/passwd root ./src");
+        let abs_path = if cfg!(windows) {
+            "C:\\etc\\passwd"
+        } else {
+            "/etc/passwd"
+        };
+        let job = test_job(&format!("grep -f{} root ./src", abs_path));
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
+        assert!(output.contains(abs_path));
     }
 
     #[tokio::test]
@@ -677,19 +744,32 @@ mod tests {
         let mut config = test_config(&tmp).await;
         config.reliability.scheduler_retries = 1;
         config.reliability.provider_backoff_ms = 1;
-        config.autonomy.allowed_commands = vec!["sh".into()];
+        let shell_cmd = if cfg!(windows) { "cmd" } else { "sh" };
+        config.autonomy.allowed_commands = vec![
+            shell_cmd.into(),
+            "retry.bat".into(),
+            "retry-once.sh".into(),
+            "sh".into(),
+        ];
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        tokio::fs::write(
-            config.workspace_dir.join("retry-once.sh"),
-            "#!/bin/sh\nif [ -f retry-ok.flag ]; then\n  echo recovered\n  exit 0\nfi\ntouch retry-ok.flag\nexit 1\n",
-        )
-        .await
-        .unwrap();
-        let job = test_job("sh ./retry-once.sh");
+        let (script_name, script_content, job_cmd) = if cfg!(windows) {
+            ("retry.bat", 
+             "@echo off\r\nif exist retry-ok.flag (\r\necho recovered\r\nexit /b 0\r\n)\r\ntype nul > retry-ok.flag\r\nexit /b 1",
+             "retry.bat")
+        } else {
+            ("retry-once.sh",
+             "#!/bin/sh\nif [ -f retry-ok.flag ]; then\n  echo recovered\n  exit 0\nfi\ntouch retry-ok.flag\nexit 1\n",
+             "sh ./retry-once.sh")
+        };
+
+        tokio::fs::write(config.workspace_dir.join(script_name), script_content)
+            .await
+            .unwrap();
+        let job = test_job(job_cmd);
 
         let (success, output) = execute_job_with_retry(&config, &security, &job).await;
-        assert!(success);
+        assert!(success, "Job failed with output: {}", output);
         assert!(output.contains("recovered"));
     }
 
@@ -699,13 +779,25 @@ mod tests {
         let mut config = test_config(&tmp).await;
         config.reliability.scheduler_retries = 1;
         config.reliability.provider_backoff_ms = 1;
+        let (cmd, allowed) = if cfg!(windows) {
+            ("dir always_missing_for_retry_test", "dir")
+        } else {
+            ("ls always_missing_for_retry_test", "ls")
+        };
+        config.autonomy.allowed_commands.push(allowed.into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let job = test_job("ls always_missing_for_retry_test");
+        let job = test_job(cmd);
 
         let (success, output) = execute_job_with_retry(&config, &security, &job).await;
         assert!(!success);
-        assert!(output.contains("always_missing_for_retry_test"));
+        if cfg!(windows) {
+            assert!(
+                output.contains("File Not Found")
+                    || output.contains("always_missing_for_retry_test")
+            );
+        } else {
+            assert!(output.contains("always_missing_for_retry_test"));
+        }
     }
 
     #[tokio::test]

@@ -2283,41 +2283,85 @@ impl Default for AutonomyConfig {
         Self {
             level: AutonomyLevel::Supervised,
             workspace_only: true,
-            allowed_commands: vec![
-                "git".into(),
-                "npm".into(),
-                "cargo".into(),
-                "ls".into(),
-                "cat".into(),
-                "grep".into(),
-                "find".into(),
-                "echo".into(),
-                "pwd".into(),
-                "wc".into(),
-                "head".into(),
-                "tail".into(),
-                "date".into(),
-            ],
-            forbidden_paths: vec![
-                "/etc".into(),
-                "/root".into(),
-                "/home".into(),
-                "/usr".into(),
-                "/bin".into(),
-                "/sbin".into(),
-                "/lib".into(),
-                "/opt".into(),
-                "/boot".into(),
-                "/dev".into(),
-                "/proc".into(),
-                "/sys".into(),
-                "/var".into(),
-                "/tmp".into(),
-                "~/.ssh".into(),
-                "~/.gnupg".into(),
-                "~/.aws".into(),
-                "~/.config".into(),
-            ],
+            allowed_commands: {
+                let cmds = vec![
+                    "git".into(),
+                    "npm".into(),
+                    "cargo".into(),
+                    "ls".into(),
+                    "cat".into(),
+                    "grep".into(),
+                    "find".into(),
+                    "echo".into(),
+                    "pwd".into(),
+                    "wc".into(),
+                    "head".into(),
+                    "tail".into(),
+                    "date".into(),
+                ];
+                #[cfg(windows)]
+                {
+                    let mut cmds = cmds;
+                    cmds.extend(vec![
+                        "dir".into(),
+                        "type".into(),
+                        "move".into(),
+                        "copy".into(),
+                        "del".into(),
+                        "mkdir".into(),
+                        "rmdir".into(),
+                        "set".into(),
+                        "ping".into(),
+                        "timeout".into(),
+                        "where".into(),
+                        "tasklist".into(),
+                        "taskkill".into(),
+                    ]);
+                    cmds
+                }
+                #[cfg(not(windows))]
+                cmds
+            },
+            forbidden_paths: {
+                #[cfg(windows)]
+                {
+                    vec![
+                        "C:\\Windows".into(),
+                        "C:\\Users".into(),
+                        "C:\\Program Files".into(),
+                        "C:\\Program Files (x86)".into(),
+                        "C:\\ProgramData".into(),
+                        "C:\\temp".into(),
+                        "~/.ssh".into(),
+                        "~/.gnupg".into(),
+                        "~/.aws".into(),
+                        "~/.config".into(),
+                    ]
+                }
+                #[cfg(not(windows))]
+                {
+                    vec![
+                        "/etc".into(),
+                        "/root".into(),
+                        "/home".into(),
+                        "/usr".into(),
+                        "/bin".into(),
+                        "/sbin".into(),
+                        "/lib".into(),
+                        "/opt".into(),
+                        "/boot".into(),
+                        "/dev".into(),
+                        "/proc".into(),
+                        "/sys".into(),
+                        "/var".into(),
+                        "/tmp".into(),
+                        "~/.ssh".into(),
+                        "~/.gnupg".into(),
+                        "~/.aws".into(),
+                        "~/.config".into(),
+                    ]
+                }
+            },
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
@@ -3902,9 +3946,17 @@ struct ActiveWorkspaceState {
 }
 
 fn default_config_dir() -> Result<PathBuf> {
-    let home = UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .context("Could not find home directory")?;
+    let home = if cfg!(test) {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .or_else(|| UserDirs::new().map(|u| u.home_dir().to_path_buf()))
+            .context("Could not find home directory")?
+    } else {
+        UserDirs::new()
+            .map(|u| u.home_dir().to_path_buf())
+            .context("Could not find home directory")?
+    };
     Ok(home.join(".zeroclaw"))
 }
 
@@ -5499,6 +5551,7 @@ impl Config {
     }
 }
 
+#[allow(clippy::unused_async)]
 async fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -5524,7 +5577,6 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
     use tokio_stream::wrappers::ReadDirStream;
@@ -5602,7 +5654,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     async fn save_sets_config_permissions_on_new_file() {
-        let temp = TempDir::new().expect("temp dir");
+        let temp = tempfile::TempDir::new().expect("temp dir");
         let config_path = temp.path().join("config.toml");
         let workspace_dir = temp.path().join("workspace");
 
@@ -5636,7 +5688,10 @@ mod tests {
         assert!(a.workspace_only);
         assert!(a.allowed_commands.contains(&"git".to_string()));
         assert!(a.allowed_commands.contains(&"cargo".to_string()));
-        assert!(a.forbidden_paths.contains(&"/etc".to_string()));
+
+        let forbidden = if cfg!(windows) { "C:\\Windows" } else { "/etc" };
+        assert!(a.forbidden_paths.contains(&forbidden.to_string()));
+
         assert_eq!(a.max_actions_per_hour, 20);
         assert_eq!(a.max_cost_per_day_cents, 500);
         assert!(a.require_approval_for_medium_risk);
@@ -6742,13 +6797,17 @@ default_temperature = 0.7
     async fn checklist_autonomy_default_is_workspace_scoped() {
         let a = AutonomyConfig::default();
         assert!(a.workspace_only, "Default autonomy must be workspace_only");
+        let fp1 = if cfg!(windows) { "C:\\Windows" } else { "/etc" };
+        let fp2 = if cfg!(windows) { "C:\\Users" } else { "/proc" };
         assert!(
-            a.forbidden_paths.contains(&"/etc".to_string()),
-            "Must block /etc"
+            a.forbidden_paths.contains(&fp1.to_string()),
+            "Must block {}",
+            fp1
         );
         assert!(
-            a.forbidden_paths.contains(&"/proc".to_string()),
-            "Must block /proc"
+            a.forbidden_paths.contains(&fp2.to_string()),
+            "Must block {}",
+            fp2
         );
         assert!(
             a.forbidden_paths.contains(&"~/.ssh".to_string()),
@@ -7601,7 +7660,7 @@ default_model = "legacy-model"
         let _ = fs::remove_dir_all(temp_home).await;
     }
 
-    #[test]
+    #[tokio::test]
     async fn persist_active_workspace_marker_is_cleared_for_default_config_dir() {
         let _env_guard = env_override_lock().await;
         let temp_home =
@@ -7611,22 +7670,37 @@ default_model = "legacy-model"
         let marker_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
 
         let original_home = std::env::var("HOME").ok();
+        let original_userprofile = std::env::var("USERPROFILE").ok();
+
         std::env::set_var("HOME", &temp_home);
+        std::env::set_var("USERPROFILE", &temp_home);
 
         persist_active_workspace_config_dir(&custom_config_dir)
             .await
             .unwrap();
-        assert!(marker_path.exists());
+        assert!(
+            marker_path.exists(),
+            "Active workspace marker should be created at {}",
+            marker_path.display()
+        );
 
         persist_active_workspace_config_dir(&default_config_dir)
             .await
             .unwrap();
-        assert!(!marker_path.exists());
+        assert!(
+            !marker_path.exists(),
+            "Active workspace marker should be cleared when switching to default config dir"
+        );
 
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
         } else {
             std::env::remove_var("HOME");
+        }
+        if let Some(up) = original_userprofile {
+            std::env::set_var("USERPROFILE", up);
+        } else {
+            std::env::remove_var("USERPROFILE");
         }
         let _ = fs::remove_dir_all(temp_home).await;
     }

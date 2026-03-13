@@ -482,9 +482,14 @@ mod tests {
     #[tokio::test]
     async fn file_edit_blocks_absolute_path() {
         let tool = FileEditTool::new(test_security(std::env::temp_dir()));
+        let abs_path = if cfg!(windows) {
+            "C:\\etc\\passwd"
+        } else {
+            "/etc/passwd"
+        };
         let result = tool
             .execute(json!({
-                "path": "/etc/passwd",
+                "path": abs_path,
                 "old_string": "root",
                 "new_string": "hacked"
             }))

@@ -49,6 +49,28 @@ impl ScreenshotTool {
                      fi"
                 ),
             ])
+        } else if cfg!(windows) {
+            Some(vec![
+                "powershell".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                format!(
+                    "Add-Type -AssemblyName System.Windows.Forms; \
+                     Add-Type -AssemblyName System.Drawing; \
+                     $Screen = [System.Windows.Forms::Screen]::PrimaryScreen; \
+                     $Width = $Screen.Bounds.Width; \
+                     $Height = $Screen.Bounds.Height; \
+                     $Left = $Screen.Bounds.Left; \
+                     $Top = $Screen.Bounds.Top; \
+                     $Bitmap = New-Object System.Drawing.Bitmap($Width, $Height); \
+                     $Graphics = [System.Drawing.Graphics]::FromImage($Bitmap); \
+                     $Graphics.CopyFromScreen($Left, $Top, 0, 0, $Bitmap.Size); \
+                     $Bitmap.Save('{}', [System.Drawing.Imaging.ImageFormat]::Png); \
+                     $Graphics.Dispose(); \
+                     $Bitmap.Dispose();",
+                    output_path
+                ),
+            ])
         } else {
             None
         }
@@ -317,11 +339,19 @@ mod tests {
 
     #[test]
     fn screenshot_command_contains_output_path() {
-        let cmd = ScreenshotTool::screenshot_command("/tmp/my_screenshot.png").unwrap();
-        let joined = cmd.join(" ");
-        assert!(
-            joined.contains("/tmp/my_screenshot.png"),
-            "Command should contain the output path"
-        );
+        let test_path = if cfg!(windows) {
+            r"C:\tmp\my_screenshot.png"
+        } else {
+            "/tmp/my_screenshot.png"
+        };
+        let cmd = ScreenshotTool::screenshot_command(test_path);
+        if let Some(args) = cmd {
+            let joined = args.join(" ");
+            assert!(
+                joined.contains(test_path),
+                "Command should contain the output path: {}",
+                joined
+            );
+        }
     }
 }

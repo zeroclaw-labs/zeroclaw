@@ -328,12 +328,27 @@ mod tests {
     async fn kill_shared_terminates_and_clears_child() {
         let proc = new_shared_process();
 
-        let child = Command::new("sleep")
-            .arg("30")
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg("timeout 30");
+            if let Ok(val) = std::env::var("SystemRoot") {
+                c.env("SystemRoot", val);
+            }
+            if let Ok(val) = std::env::var("windir") {
+                c.env("windir", val);
+            }
+            c
+        } else {
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            c
+        };
+
+        let child = cmd
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("sleep should spawn for lifecycle test");
+            .expect("sleep process should spawn for lifecycle test");
 
         {
             let mut guard = proc.lock().await;

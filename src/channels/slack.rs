@@ -2541,10 +2541,18 @@ mod tests {
             SlackChannel::sanitize_attachment_filename("../../secret.txt").as_deref(),
             Some("secret.txt")
         );
+
+        #[cfg(windows)]
+        assert_eq!(
+            SlackChannel::sanitize_attachment_filename(r"..\\..\\secret.txt").as_deref(),
+            Some("secret.txt") // Windows treats \\ as path separator
+        );
+        #[cfg(not(windows))]
         assert_eq!(
             SlackChannel::sanitize_attachment_filename(r"..\\..\\secret.txt").as_deref(),
             Some("..__..__secret.txt")
         );
+
         assert!(SlackChannel::sanitize_attachment_filename("..").is_none());
     }
 

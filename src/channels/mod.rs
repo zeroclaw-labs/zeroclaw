@@ -5822,7 +5822,14 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert!(prompt.contains("<available_skills>"), "missing skills XML");
         assert!(prompt.contains("<name>code-review</name>"));
-        assert!(prompt.contains("<location>skills/code-review/SKILL.md</location>"));
+        // Location might have forward or backward slashes depending on OS
+        let loc_f = "<location>skills/code-review/SKILL.md</location>";
+        let loc_b = r"<location>skills\code-review\SKILL.md</location>";
+        assert!(
+            prompt.contains(loc_f) || prompt.contains(loc_b),
+            "missing location: {}",
+            prompt
+        );
         assert!(prompt.contains("loaded on demand"));
         assert!(!prompt.contains("<instructions>"));
         assert!(!prompt

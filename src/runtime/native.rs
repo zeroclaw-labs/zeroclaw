@@ -39,9 +39,29 @@ impl RuntimeAdapter for NativeRuntime {
         command: &str,
         workspace_dir: &Path,
     ) -> anyhow::Result<tokio::process::Command> {
-        let mut process = tokio::process::Command::new("sh");
-        process.arg("-c").arg(command).current_dir(workspace_dir);
-        Ok(process)
+        #[cfg(windows)]
+        {
+            let mut process = tokio::process::Command::new("cmd");
+            process.arg("/C").arg(command).current_dir(workspace_dir);
+
+            // On Windows, cmd.exe often needs SystemRoot and windir to function correctly,
+            // even if the rest of the environment is cleared.
+            if let Ok(system_root) = std::env::var("SystemRoot") {
+                process.env("SystemRoot", system_root);
+            }
+            if let Ok(windir) = std::env::var("windir") {
+                process.env("windir", windir);
+            }
+
+            Ok(process)
+        }
+
+        #[cfg(not(windows))]
+        {
+            let mut process = tokio::process::Command::new("sh");
+            process.arg("-c").arg(command).current_dir(workspace_dir);
+            Ok(process)
+        }
     }
 }
 
