@@ -20,7 +20,7 @@ use crate::providers::{
 };
 use anyhow::{bail, Context, Result};
 use console::style;
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Input, Password, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -3911,8 +3911,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     style("Matrix Setup").white().bold(),
                     style("— self-hosted, federated chat").dim()
                 );
-                print_bullet("You need a Matrix account and an access token.");
-                print_bullet("Get a token via Element → Settings → Help & About → Access Token.");
+                print_bullet("You need a Matrix account with either an access token or password.");
+                print_bullet("Access token: Element → Settings → Help & About → Access Token.");
+                print_bullet("Password: simpler setup — bot logs in automatically.");
                 println!();
 
                 let homeserver: String = Input::new()
@@ -3924,45 +3925,150 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let access_token: String =
-                    Input::new().with_prompt("  Access token").interact_text()?;
-
-                if access_token.trim().is_empty() {
-                    println!("  {} Skipped — token required", style("→").dim());
-                    continue;
+                let hs_trimmed = homeserver.trim().trim_end_matches('/');
+                if !hs_trimmed.starts_with("https://") {
+                    let is_loopback = hs_trimmed.starts_with("http://localhost")
+                        || hs_trimmed.starts_with("http://127.0.0.1")
+                        || hs_trimmed.starts_with("http://[::1]");
+                    if !is_loopback {
+                        println!(
+                            "  {} HTTPS required for non-local homeservers",
+                            style("✗").red()
+                        );
+                        continue;
+                    }
                 }
+
+                let auth_choices = vec!["Access token", "Password"];
+                let auth_choice = Select::new()
+                    .with_prompt("  Authentication method")
+                    .items(&auth_choices)
+                    .default(0)
+                    .interact()?;
+
+                let (access_token, password, user_id_input): (
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                ) = if auth_choice == 0 {
+                    // Access token auth
+                    let token: String = Password::new().with_prompt("  Access token").interact()?;
+                    if token.trim().is_empty() {
+                        println!("  {} Skipped — token required", style("→").dim());
+                        continue;
+                    }
+                    (Some(token), None, None)
+                } else {
+                    // Password auth
+                    let uid: String = Input::new()
+                        .with_prompt("  User ID (e.g. @bot:matrix.org)")
+                        .interact_text()?;
+                    if uid.trim().is_empty() {
+                        println!("  {} Skipped — user ID required", style("→").dim());
+                        continue;
+                    }
+                    let pwd: String = Password::new().with_prompt("  Password").interact()?;
+                    if pwd.trim().is_empty() {
+                        println!("  {} Skipped — password required", style("→").dim());
+                        continue;
+                    }
+                    (None, Some(pwd), Some(uid))
+                };
 
                 // Test connection (run entirely in separate thread — Response must be used/dropped there)
                 let hs = homeserver.trim_end_matches('/');
                 print!("  {} Testing connection... ", style("⏳").dim());
                 let hs_owned = hs.to_string();
                 let access_token_clone = access_token.clone();
+                let password_clone = password.clone();
+                let user_id_clone = user_id_input.clone();
                 let thread_result = std::thread::spawn(move || {
                     let client = reqwest::blocking::Client::new();
-                    let resp = client
-                        .get(format!("{hs_owned}/_matrix/client/v3/account/whoami"))
-                        .header("Authorization", format!("Bearer {access_token_clone}"))
-                        .send()?;
-                    let ok = resp.status().is_success();
 
-                    if !ok {
-                        return Ok::<_, reqwest::Error>((false, None, None));
+                    if let Some(ref token) = access_token_clone {
+                        // Verify access token via whoami
+                        let resp = client
+                            .get(format!("{hs_owned}/_matrix/client/v3/account/whoami"))
+                            .header("Authorization", format!("Bearer {token}"))
+                            .send()?;
+                        let ok = resp.status().is_success();
+
+                        if !ok {
+                            return Ok::<_, reqwest::Error>((false, None, None));
+                        }
+
+                        let payload: Value = match resp.json() {
+                            Ok(payload) => payload,
+                            Err(_) => Value::Null,
+                        };
+                        let user_id = payload
+                            .get("user_id")
+                            .and_then(|value| value.as_str())
+                            .map(|value| value.to_string());
+                        let device_id = payload
+                            .get("device_id")
+                            .and_then(|value| value.as_str())
+                            .map(|value| value.to_string());
+
+                        Ok::<_, reqwest::Error>((true, user_id, device_id))
+                    } else if let (Some(ref pwd), Some(ref uid)) = (password_clone, user_id_clone) {
+                        // Verify password login attempt
+                        let body = serde_json::json!({
+                            "type": "m.login.password",
+                            "identifier": {
+                                "type": "m.id.user",
+                                "user": uid
+                            },
+                            "password": pwd,
+                            "initial_device_display_name": "ZeroClaw (wizard test)"
+                        });
+                        let resp = client
+                            .post(format!("{hs_owned}/_matrix/client/v3/login"))
+                            .json(&body)
+                            .send()?;
+                        let ok = resp.status().is_success();
+
+                        if !ok {
+                            return Ok::<_, reqwest::Error>((false, None, None));
+                        }
+
+                        let payload: Value = match resp.json() {
+                            Ok(payload) => payload,
+                            Err(_) => Value::Null,
+                        };
+                        let device_id = payload
+                            .get("device_id")
+                            .and_then(|value| value.as_str())
+                            .map(|value| value.to_string());
+
+                        // Log out the test session to avoid orphan devices
+                        if let Some(token) = payload.get("access_token").and_then(|v| v.as_str()) {
+                            match client
+                                .post(format!("{hs_owned}/_matrix/client/v3/logout"))
+                                .header("Authorization", format!("Bearer {token}"))
+                                .send()
+                            {
+                                Ok(resp) if resp.status().is_success() => {}
+                                Ok(resp) => {
+                                    eprintln!(
+                                        "  {} Warning: test-session logout returned HTTP {} — a stale device may remain on the homeserver",
+                                        style("⚠").yellow(),
+                                        resp.status()
+                                    );
+                                }
+                                Err(err) => {
+                                    eprintln!(
+                                        "  {} Warning: test-session logout failed ({err}) — a stale device may remain on the homeserver",
+                                        style("⚠").yellow()
+                                    );
+                                }
+                            }
+                        }
+
+                        Ok::<_, reqwest::Error>((true, Some(uid.clone()), device_id))
+                    } else {
+                        Ok::<_, reqwest::Error>((false, None, None))
                     }
-
-                    let payload: Value = match resp.json() {
-                        Ok(payload) => payload,
-                        Err(_) => Value::Null,
-                    };
-                    let user_id = payload
-                        .get("user_id")
-                        .and_then(|value| value.as_str())
-                        .map(|value| value.to_string());
-                    let device_id = payload
-                        .get("device_id")
-                        .and_then(|value| value.as_str())
-                        .map(|value| value.to_string());
-
-                    Ok::<_, reqwest::Error>((true, user_id, device_id))
                 })
                 .join();
 
@@ -3984,7 +4090,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     }
                     _ => {
                         println!(
-                            "\r  {} Connection failed — check homeserver URL and token",
+                            "\r  {} Connection failed — check homeserver URL and credentials",
                             style("❌").red().bold()
                         );
                         continue;
@@ -4009,10 +4115,12 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 config.matrix = Some(MatrixConfig {
                     homeserver: homeserver.trim_end_matches('/').to_string(),
                     access_token,
-                    user_id: detected_user_id,
+                    user_id: detected_user_id.or(user_id_input),
                     device_id: detected_device_id,
                     room_id,
                     allowed_users,
+                    password,
+                    max_media_download_mb: None,
                 });
             }
             ChannelMenuChoice::Signal => {

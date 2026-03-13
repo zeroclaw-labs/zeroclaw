@@ -465,13 +465,6 @@ fn strip_tool_call_tags(message: &str) -> String {
 
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     match channel_name {
-        "matrix" => Some(
-            "When responding on Matrix:\n\
-             - Use Markdown formatting (bold, italic, code blocks)\n\
-             - Be concise and direct\n\
-             - When you receive a [Voice message], the user spoke to you. Respond naturally as in conversation.\n\
-             - Your text reply will automatically be converted to audio and sent back as a voice message.\n",
-        ),
         "telegram" => Some(
             "When responding on Telegram:\n\
              - Include media markers for files or URLs that should be sent as attachments\n\
@@ -485,6 +478,31 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+        ),
+        "matrix" => Some(
+            "When responding on Matrix:\n\n\
+             ## Media\n\
+             - You CAN send files, images, audio, and voice messages.\n\
+             - Markers: [IMAGE:<path>], [FILE:<path>], [AUDIO:<path>], [VOICE:<path>]\n\
+             - Create the file first with your tools, then include the marker.\n\n\
+             ## Reactions\n\
+             - Each incoming message starts with [msg_id:<event_id>] — use that event_id to react.\n\
+             - You CAN react to messages with emoji: [REACT:<emoji>:<event_id>]\n\
+             - React naturally and sparingly — only when genuinely appropriate.\n\
+             - Do NOT react to every message. Do NOT copy the user's reaction back.\n\
+             - When you receive [Reaction: emoji on your message: \"text\"] — this is feedback on YOUR response. Understand the emoji meaning (👍=good, 👎=bad, ❤️=love, 😂=funny, ❌=wrong/redo).\n\
+             - When you receive [Reaction: emoji on their message: \"text\"] — user reacted to their own message as an addition/emphasis.\n\
+             - Do NOT send a text reply just to acknowledge a reaction unless it requires action (like ❌ or 👎).\n\n\
+             ## Location\n\
+             - You CAN send locations: [LOCATION:geo:lat,lon:Description]\n\
+             - When you receive [Location: geo:lat,lon] — user shared their location.\n\n\
+             ## Replies\n\
+             - When you receive [Reply to $event_id] prefix — user is replying to a specific earlier message, consider that context.\n\n\
+             ## Formatting\n\
+             - Keep markers outside normal text, never in code fences.\n\
+             - Use Markdown: **bold**, *italic*, `code`, code blocks.\n\
+             - Be concise and direct. Skip filler phrases.\n\
+             - Use tool results silently: answer directly, do not narrate internal execution.",
         ),
         _ => None,
     }
@@ -2943,6 +2961,7 @@ struct ConfiguredChannel {
     channel: Arc<dyn Channel>,
 }
 
+#[allow(unused_variables)]
 fn collect_configured_channels(
     config: &Config,
     matrix_skip_context: &str,
@@ -3019,15 +3038,20 @@ fn collect_configured_channels(
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push(ConfiguredChannel {
             display_name: "Matrix",
-            channel: Arc::new(MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
-                mx.homeserver.clone(),
-                mx.access_token.clone(),
-                mx.room_id.clone(),
-                mx.allowed_users.clone(),
-                mx.user_id.clone(),
-                mx.device_id.clone(),
-                config.config_path.parent().map(|path| path.to_path_buf()),
-            )),
+            channel: Arc::new(
+                MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
+                    mx.homeserver.clone(),
+                    mx.access_token.clone(),
+                    mx.room_id.clone(),
+                    mx.allowed_users.clone(),
+                    mx.user_id.clone(),
+                    mx.device_id.clone(),
+                    config.config_path.parent().map(|path| path.to_path_buf()),
+                )
+                .with_password(mx.password.clone())
+                .with_max_media_download_mb(mx.max_media_download_mb)
+                .with_transcription(config.transcription.clone()),
+            ),
         });
     }
 
