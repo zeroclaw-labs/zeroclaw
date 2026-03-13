@@ -440,6 +440,11 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(GoogleWorkspaceTool::new(
             security.clone(),
             root_config.google_workspace.allowed_services.clone(),
+            root_config.google_workspace.credentials_path.clone(),
+            root_config.google_workspace.default_account.clone(),
+            root_config.google_workspace.rate_limit_per_minute,
+            root_config.google_workspace.timeout_secs,
+            root_config.google_workspace.audit_log,
         )));
     } else if root_config.google_workspace.enabled {
         tracing::warn!(

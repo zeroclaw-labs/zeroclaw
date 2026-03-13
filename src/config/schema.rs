@@ -2093,6 +2093,16 @@ impl Default for DataRetentionConfig {
 /// - `allowed_services`: empty vector, which grants access to the full default
 ///   service set: `drive`, `sheets`, `gmail`, `calendar`, `docs`, `slides`,
 ///   `tasks`, `people`, `chat`, `classroom`, `forms`, `keep`, `meet`, `events`.
+/// - `credentials_path`: `None` (uses default `gws` credential discovery).
+/// - `default_account`: `None` (uses the `gws` active account).
+/// - `rate_limit_per_minute`: `60`.
+/// - `timeout_secs`: `30`.
+/// - `audit_log`: `false`.
+/// - `credentials_path`: `None` (uses default `gws` credential discovery).
+/// - `default_account`: `None` (uses the `gws` active account).
+/// - `rate_limit_per_minute`: `60`.
+/// - `timeout_secs`: `30`.
+/// - `audit_log`: `false`.
 ///
 /// ## Compatibility
 /// Configs that omit the `[google_workspace]` section entirely are treated as
@@ -2103,7 +2113,7 @@ impl Default for DataRetentionConfig {
 /// To revert, remove the `[google_workspace]` section from the config file (or
 /// set `enabled = false`). No data migration is required; the tool simply stops
 /// being registered.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GoogleWorkspaceConfig {
     /// Enable the `google_workspace` tool. Default: `false`.
     #[serde(default)]
@@ -2116,6 +2126,50 @@ pub struct GoogleWorkspaceConfig {
     /// optional underscores/hyphens, and unique.
     #[serde(default)]
     pub allowed_services: Vec<String>,
+    /// Path to service account JSON or OAuth client credentials file.
+    ///
+    /// When `None`, the tool relies on the default `gws` credential discovery
+    /// (`gws auth login`). Set this to point at a service-account key or an
+    /// OAuth client-secrets JSON for headless / CI environments.
+    #[serde(default)]
+    pub credentials_path: Option<String>,
+    /// Default Google account email to pass to `gws --account`.
+    ///
+    /// When `None`, the currently active `gws` account is used.
+    #[serde(default)]
+    pub default_account: Option<String>,
+    /// Maximum number of `gws` API calls allowed per minute. Default: `60`.
+    #[serde(default = "default_gws_rate_limit")]
+    pub rate_limit_per_minute: u32,
+    /// Command execution timeout in seconds. Default: `30`.
+    #[serde(default = "default_gws_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Enable audit logging of every `gws` invocation (service, resource,
+    /// method, timestamp). Default: `false`.
+    #[serde(default)]
+    pub audit_log: bool,
+}
+
+fn default_gws_rate_limit() -> u32 {
+    60
+}
+
+fn default_gws_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for GoogleWorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_services: Vec::new(),
+            credentials_path: None,
+            default_account: None,
+            rate_limit_per_minute: default_gws_rate_limit(),
+            timeout_secs: default_gws_timeout_secs(),
+            audit_log: false,
+        }
+    }
 }
 
 impl Default for GoogleWorkspaceConfig {

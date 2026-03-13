@@ -5,8 +5,8 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Maximum `gws` command execution time before kill.
-const GWS_TIMEOUT_SECS: u64 = 30;
+/// Default `gws` command execution time before kill (overridden by config).
+const DEFAULT_GWS_TIMEOUT_SECS: u64 = 30;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 
@@ -36,13 +36,26 @@ const DEFAULT_ALLOWED_SERVICES: &[&str] = &[
 pub struct GoogleWorkspaceTool {
     security: Arc<SecurityPolicy>,
     allowed_services: Vec<String>,
+    credentials_path: Option<String>,
+    default_account: Option<String>,
+    rate_limit_per_minute: u32,
+    timeout_secs: u64,
+    audit_log: bool,
 }
 
 impl GoogleWorkspaceTool {
     /// Create a new `GoogleWorkspaceTool`.
     ///
     /// If `allowed_services` is empty, the default service set is used.
-    pub fn new(security: Arc<SecurityPolicy>, allowed_services: Vec<String>) -> Self {
+    pub fn new(
+        security: Arc<SecurityPolicy>,
+        allowed_services: Vec<String>,
+        credentials_path: Option<String>,
+        default_account: Option<String>,
+        rate_limit_per_minute: u32,
+        timeout_secs: u64,
+        audit_log: bool,
+    ) -> Self {
         let services = if allowed_services.is_empty() {
             DEFAULT_ALLOWED_SERVICES
                 .iter()
@@ -54,6 +67,11 @@ impl GoogleWorkspaceTool {
         Self {
             security,
             allowed_services: services,
+            credentials_path,
+            default_account,
+            rate_limit_per_minute,
+            timeout_secs,
+            audit_log,
         }
     }
 }
@@ -310,8 +328,48 @@ impl Tool for GoogleWorkspaceTool {
             }
         }
 
+        // Apply credential path if configured
+        if let Some(ref creds) = self.credentials_path {
+            cmd.env("GOOGLE_APPLICATION_CREDENTIALS", creds);
+        }
+
+        // Apply default account if configured
+        if let Some(ref account) = self.default_account {
+            cmd.args(["--account", account]);
+        }
+
+        if self.audit_log {
+            tracing::info!(
+                tool = "google_workspace",
+                service = service,
+                resource = resource,
+                method = method,
+                "gws audit: executing API call"
+            );
+        }
+
+        // Apply credential path if configured
+        if let Some(ref creds) = self.credentials_path {
+            cmd.env("GOOGLE_APPLICATION_CREDENTIALS", creds);
+        }
+
+        // Apply default account if configured
+        if let Some(ref account) = self.default_account {
+            cmd.args(["--account", account]);
+        }
+
+        if self.audit_log {
+            tracing::info!(
+                tool = "google_workspace",
+                service = service,
+                resource = resource,
+                method = method,
+                "gws audit: executing API call"
+            );
+        }
+
         let result =
-            tokio::time::timeout(Duration::from_secs(GWS_TIMEOUT_SECS), cmd.output()).await;
+            tokio::time::timeout(Duration::from_secs(self.timeout_secs), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -357,7 +415,7 @@ impl Tool for GoogleWorkspaceTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "gws command timed out after {GWS_TIMEOUT_SECS}s and was killed"
+                    "gws command timed out after {}s and was killed", self.timeout_secs
                 )),
             }),
         }
@@ -379,19 +437,19 @@ mod tests {
 
     #[test]
     fn tool_name() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![]);
+        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
         assert_eq!(tool.name(), "google_workspace");
     }
 
     #[test]
     fn tool_description_non_empty() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![]);
+        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
         assert!(!tool.description().is_empty());
     }
 
     #[test]
     fn tool_schema_has_required_fields() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![]);
+        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["service"].is_object());
         assert!(schema["properties"]["resource"].is_object());
@@ -406,7 +464,7 @@ mod tests {
 
     #[test]
     fn default_allowed_services_populated() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![]);
+        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
         assert!(!tool.allowed_services.is_empty());
         assert!(tool.allowed_services.contains(&"drive".to_string()));
         assert!(tool.allowed_services.contains(&"gmail".to_string()));
@@ -415,7 +473,15 @@ mod tests {
 
     #[test]
     fn custom_allowed_services_override_defaults() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec!["drive".into(), "sheets".into()]);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec!["drive".into(), "sheets".into()],
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         assert_eq!(tool.allowed_services.len(), 2);
         assert!(tool.allowed_services.contains(&"drive".to_string()));
         assert!(tool.allowed_services.contains(&"sheets".to_string()));
@@ -424,7 +490,15 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_disallowed_service() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec!["drive".into()]);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec!["drive".into()],
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool
             .execute(json!({
                 "service": "gmail",
@@ -443,7 +517,15 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_shell_injection_in_service() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec!["drive; rm -rf /".into()]);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec!["drive; rm -rf /".into()],
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool
             .execute(json!({
                 "service": "drive; rm -rf /",
@@ -462,7 +544,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_shell_injection_in_resource() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![]);
+        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -481,7 +563,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_invalid_format() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![]);
+        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -501,7 +583,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_params() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![]);
+        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -521,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_body() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![]);
+        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -541,7 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_page_all() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![]);
+        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -561,7 +643,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_page_limit() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![]);
+        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -581,7 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_sub_resource() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![]);
+        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -601,7 +683,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_required_param_returns_error() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![]);
+        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
         let result = tool.execute(json!({"service": "drive"})).await;
         assert!(result.is_err());
     }
@@ -614,7 +696,7 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = GoogleWorkspaceTool::new(security, vec![]);
+        let tool = GoogleWorkspaceTool::new(security, vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
