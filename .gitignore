@@ -41,3 +41,6 @@ credentials.json
 
 # Coverage artifacts
 lcov.info
+
+# .direnv dir
+.direnv/

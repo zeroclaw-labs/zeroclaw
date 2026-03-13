@@ -618,6 +618,31 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+
+    /// Tool injection mode. Default: `full` (all tools every turn).
+    /// Set to `rag` for semantic tool selection via Memory-backed retrieval.
+    #[serde(default)]
+    pub tools_injection_mode: ToolsInjectionMode,
+
+    /// Maximum tools returned by Tools RAG retrieval. Default: `12`.
+    #[serde(default = "default_tools_rag_top_k")]
+    pub tools_rag_top_k: usize,
+
+    /// Minimum similarity threshold for Tools RAG results. Default: `0.3`.
+    #[serde(default = "default_tools_rag_threshold")]
+    pub tools_rag_threshold: f64,
+
+    /// Core tools always included regardless of RAG. Default: basic filesystem tools.
+    #[serde(default = "default_tools_rag_core_set")]
+    pub tools_rag_core_set: Vec<String>,
+
+    /// Enable SubAgent-based tool discovery fallback. Default: `true`.
+    #[serde(default = "default_tools_rag_enable_discovery")]
+    pub tools_rag_enable_discovery: bool,
+
+    /// Number of recent turns to cache discovered tools. Default: `5`.
+    #[serde(default = "default_tools_rag_cache_window")]
+    pub tools_rag_cache_window: usize,
     /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
     #[serde(default)]
     pub tool_call_dedup_exempt: Vec<String>,
@@ -643,9 +668,51 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            tools_injection_mode: ToolsInjectionMode::default(),
+            tools_rag_top_k: default_tools_rag_top_k(),
+            tools_rag_threshold: default_tools_rag_threshold(),
+            tools_rag_core_set: default_tools_rag_core_set(),
+            tools_rag_enable_discovery: default_tools_rag_enable_discovery(),
+            tools_rag_cache_window: default_tools_rag_cache_window(),
             tool_call_dedup_exempt: Vec::new(),
         }
     }
+}
+
+fn default_tools_rag_top_k() -> usize {
+    12
+}
+
+fn default_tools_rag_threshold() -> f64 {
+    0.3
+}
+
+fn default_tools_rag_core_set() -> Vec<String> {
+    vec![
+        "shell".into(),
+        "file_read".into(),
+        "file_write".into(),
+        "file_edit".into(),
+    ]
+}
+
+fn default_tools_rag_enable_discovery() -> bool {
+    true
+}
+
+fn default_tools_rag_cache_window() -> usize {
+    5
+}
+
+/// Controls how tools are injected into the LLM context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolsInjectionMode {
+    /// All tools injected every turn (current default behavior).
+    #[default]
+    Full,
+    /// Semantic tool selection via Memory-backed RAG retrieval.
+    Rag,
 }
 
 /// Skills loading configuration (`[skills]` section).
