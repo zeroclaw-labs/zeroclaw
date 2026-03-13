@@ -244,11 +244,11 @@ impl Tool for ClaudeCodeTool {
                         .unwrap_or("");
 
                     let mut formatted = String::new();
-                    if !result_text.is_empty() {
-                        formatted.push_str(result_text);
-                    } else {
+                    if result_text.is_empty() {
                         // Fall back to full JSON if no "result" key
                         formatted.push_str(&stdout);
+                    } else {
+                        formatted.push_str(result_text);
                     }
                     if !resp_session_id.is_empty() {
                         use std::fmt::Write;

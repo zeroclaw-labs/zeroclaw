@@ -2179,6 +2179,42 @@ impl Channel for SlackChannel {
                 .get("error")
                 .and_then(|e| e.as_str())
                 .unwrap_or("unknown");
+
+            // If the thread_ts was invalid, retry without it rather than failing.
+            // This can happen when Socket Mode event timestamps don't match the
+            // format Slack expects for threaded replies.
+            if err == "invalid_thread_ts" && message.thread_ts.is_some() {
+                tracing::warn!(
+                    "Slack: invalid_thread_ts, retrying without thread (ts={:?})",
+                    message.thread_ts
+                );
+                let retry_body = serde_json::json!({
+                    "channel": message.recipient,
+                    "text": message.content
+                });
+                let retry_resp = self
+                    .http_client()
+                    .post("https://slack.com/api/chat.postMessage")
+                    .bearer_auth(&self.bot_token)
+                    .json(&retry_body)
+                    .send()
+                    .await?;
+                let retry_body_text = retry_resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+                let retry_parsed: serde_json::Value =
+                    serde_json::from_str(&retry_body_text).unwrap_or_default();
+                if retry_parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
+                    let retry_err = retry_parsed
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("unknown");
+                    anyhow::bail!("Slack chat.postMessage failed (retry): {retry_err}");
+                }
+                return Ok(());
+            }
+
             anyhow::bail!("Slack chat.postMessage failed: {err}");
         }
 
