@@ -2,15 +2,26 @@ use super::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Web search tool for searching the internet.
 /// Supports multiple providers: DuckDuckGo (free), Brave (requires API key).
+///
+/// The Brave API key is resolved lazily at execution time: if the boot-time key
+/// is missing or still encrypted, the tool re-reads `config.toml`, decrypts the
+/// `[web_search] brave_api_key` field, and uses the result. This ensures that
+/// keys set or rotated after boot, and encrypted keys, are correctly picked up.
 pub struct WebSearchTool {
     provider: String,
-    brave_api_key: Option<String>,
+    /// Boot-time key snapshot (may be `None` if not yet configured at startup).
+    boot_brave_api_key: Option<String>,
     max_results: usize,
     timeout_secs: u64,
+    /// Path to `config.toml` for lazy re-read of keys at execution time.
+    config_path: PathBuf,
+    /// Whether secret encryption is enabled (needed to create a `SecretStore`).
+    secrets_encrypt: bool,
 }
 
 impl WebSearchTool {
@@ -22,9 +33,85 @@ impl WebSearchTool {
     ) -> Self {
         Self {
             provider: provider.trim().to_lowercase(),
-            brave_api_key,
+            boot_brave_api_key: brave_api_key,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
+            config_path: PathBuf::new(),
+            secrets_encrypt: false,
+        }
+    }
+
+    /// Create a `WebSearchTool` with config-reload and decryption support.
+    ///
+    /// `config_path` is the path to `config.toml` so the tool can re-read the
+    /// Brave API key at execution time. `secrets_encrypt` controls whether the
+    /// key is decrypted via `SecretStore`.
+    pub fn new_with_config(
+        provider: String,
+        brave_api_key: Option<String>,
+        max_results: usize,
+        timeout_secs: u64,
+        config_path: PathBuf,
+        secrets_encrypt: bool,
+    ) -> Self {
+        Self {
+            provider: provider.trim().to_lowercase(),
+            boot_brave_api_key: brave_api_key,
+            max_results: max_results.clamp(1, 10),
+            timeout_secs: timeout_secs.max(1),
+            config_path,
+            secrets_encrypt,
+        }
+    }
+
+    /// Resolve the Brave API key, preferring the boot-time value but falling
+    /// back to a fresh config read + decryption when the boot-time value is
+    /// absent.
+    fn resolve_brave_api_key(&self) -> anyhow::Result<String> {
+        // Fast path: boot-time key is present and usable (not an encrypted blob).
+        if let Some(ref key) = self.boot_brave_api_key {
+            if !key.is_empty() && !crate::security::SecretStore::is_encrypted(key) {
+                return Ok(key.clone());
+            }
+        }
+
+        // Slow path: re-read config.toml to pick up keys set/rotated after boot.
+        self.reload_brave_api_key()
+    }
+
+    /// Re-read `config.toml` and decrypt `[web_search] brave_api_key`.
+    fn reload_brave_api_key(&self) -> anyhow::Result<String> {
+        let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read config file {} for Brave API key: {e}",
+                self.config_path.display()
+            )
+        })?;
+
+        let config: crate::config::Config = toml::from_str(&contents).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse config file {} for Brave API key: {e}",
+                self.config_path.display()
+            )
+        })?;
+
+        let raw_key = config
+            .web_search
+            .brave_api_key
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Brave API key not configured"))?;
+
+        // Decrypt if necessary.
+        if crate::security::SecretStore::is_encrypted(&raw_key) {
+            let zeroclaw_dir = self.config_path.parent().unwrap_or_else(|| Path::new("."));
+            let store = crate::security::SecretStore::new(zeroclaw_dir, self.secrets_encrypt);
+            let plaintext = store.decrypt(&raw_key)?;
+            if plaintext.is_empty() {
+                anyhow::bail!("Brave API key not configured (decrypted value is empty)");
+            }
+            Ok(plaintext)
+        } else {
+            Ok(raw_key)
         }
     }
 
@@ -99,10 +186,7 @@ impl WebSearchTool {
     }
 
     async fn search_brave(&self, query: &str) -> anyhow::Result<String> {
-        let api_key = self
-            .brave_api_key
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Brave API key not configured"))?;
+        let api_key = self.resolve_brave_api_key()?;
 
         let encoded_query = urlencoding::encode(query);
         let search_url = format!(
@@ -117,7 +201,7 @@ impl WebSearchTool {
         let response = client
             .get(&search_url)
             .header("Accept", "application/json")
-            .header("X-Subscription-Token", api_key)
+            .header("X-Subscription-Token", &api_key)
             .send()
             .await?;
 
@@ -327,5 +411,92 @@ mod tests {
         let result = tool.execute(json!({"query": "test"})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key"));
+    }
+
+    #[test]
+    fn test_resolve_brave_api_key_uses_boot_key() {
+        let tool = WebSearchTool::new(
+            "brave".to_string(),
+            Some("sk-plaintext-key".to_string()),
+            5,
+            15,
+        );
+        let key = tool.resolve_brave_api_key().unwrap();
+        assert_eq!(key, "sk-plaintext-key");
+    }
+
+    #[test]
+    fn test_resolve_brave_api_key_reloads_from_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nbrave_api_key = \"fresh-key-from-disk\"\n",
+        )
+        .unwrap();
+
+        // No boot key -- forces reload from config
+        let tool =
+            WebSearchTool::new_with_config("brave".to_string(), None, 5, 15, config_path, false);
+        let key = tool.resolve_brave_api_key().unwrap();
+        assert_eq!(key, "fresh-key-from-disk");
+    }
+
+    #[test]
+    fn test_resolve_brave_api_key_decrypts_encrypted_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = crate::security::SecretStore::new(tmp.path(), true);
+        let encrypted = store.encrypt("brave-secret-key").unwrap();
+
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("[web_search]\nbrave_api_key = \"{}\"\n", encrypted),
+        )
+        .unwrap();
+
+        // Boot key is the encrypted blob -- should trigger reload + decrypt
+        let tool = WebSearchTool::new_with_config(
+            "brave".to_string(),
+            Some(encrypted),
+            5,
+            15,
+            config_path,
+            true,
+        );
+        let key = tool.resolve_brave_api_key().unwrap();
+        assert_eq!(key, "brave-secret-key");
+    }
+
+    #[test]
+    fn test_resolve_brave_api_key_picks_up_runtime_update() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Start with no key in config
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+
+        let tool = WebSearchTool::new_with_config(
+            "brave".to_string(),
+            None,
+            5,
+            15,
+            config_path.clone(),
+            false,
+        );
+
+        // Key not configured yet -- should fail
+        assert!(tool.resolve_brave_api_key().is_err());
+
+        // Simulate runtime config update (e.g. via web_search_config set)
+        std::fs::write(
+            &config_path,
+            "[web_search]\nbrave_api_key = \"runtime-updated-key\"\n",
+        )
+        .unwrap();
+
+        // Now should succeed with the updated key
+        let key = tool.resolve_brave_api_key().unwrap();
+        assert_eq!(key, "runtime-updated-key");
     }
 }
