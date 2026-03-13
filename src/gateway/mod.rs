@@ -8,8 +8,8 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api;
-pub mod nodes;
 pub mod health;
+pub mod nodes;
 pub mod sse;
 pub mod static_files;
 pub mod ws;
