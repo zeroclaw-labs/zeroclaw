@@ -7,25 +7,22 @@ import Tools from './pages/Tools';
 import Cron from './pages/Cron';
 import Integrations from './pages/Integrations';
 import Memory from './pages/Memory';
-import Devices from './pages/Devices';
 import Config from './pages/Config';
 import Cost from './pages/Cost';
 import Logs from './pages/Logs';
 import Doctor from './pages/Doctor';
 import { AuthProvider, useAuth } from './hooks/useAuth';
-import { coerceLocale, setLocale, type Locale } from './lib/i18n';
-
-const LOCALE_STORAGE_KEY = 'zeroclaw:locale';
+import { setLocale, type Locale } from './lib/i18n';
 
 // Locale context
 interface LocaleContextType {
-  locale: Locale;
-  setAppLocale: (locale: Locale) => void;
+  locale: string;
+  setAppLocale: (locale: string) => void;
 }
 
 export const LocaleContext = createContext<LocaleContextType>({
-  locale: 'en',
-  setAppLocale: (_locale: Locale) => {},
+  locale: 'tr',
+  setAppLocale: () => {},
 });
 
 export const useLocaleContext = () => useContext(LocaleContext);
@@ -50,11 +47,11 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
   };
 
   return (
-    <div className="pairing-shell min-h-screen flex items-center justify-center px-4">
-      <div className="pairing-card w-full max-w-md rounded-2xl p-8">
+    <div className="min-h-screen bg-gray-950 flex items-center justify-center">
+      <div className="bg-gray-900 rounded-xl p-8 w-full max-w-md border border-gray-800">
         <div className="text-center mb-6">
-          <h1 className="mb-2 text-2xl font-semibold tracking-[0.16em] pairing-brand">ZEROCLAW</h1>
-          <p className="text-sm text-[#9bb8e8]">Enter the one-time pairing code from your terminal</p>
+          <h1 className="text-2xl font-bold text-white mb-2">ZeroClaw</h1>
+          <p className="text-gray-400">Enter the pairing code from your terminal</p>
         </div>
         <form onSubmit={handleSubmit}>
           <input
@@ -62,17 +59,17 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
             value={code}
             onChange={(e) => setCode(e.target.value)}
             placeholder="6-digit code"
-            className="w-full rounded-xl border border-[#29509c] bg-[#071228]/90 px-4 py-3 text-center text-2xl tracking-[0.35em] text-white focus:border-[#4f83ff] focus:outline-none mb-4"
+            className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white text-center text-2xl tracking-widest focus:outline-none focus:border-blue-500 mb-4"
             maxLength={6}
             autoFocus
           />
           {error && (
-            <p className="mb-4 text-center text-sm text-rose-300">{error}</p>
+            <p className="text-red-400 text-sm mb-4 text-center">{error}</p>
           )}
           <button
             type="submit"
             disabled={loading || code.length < 6}
-            className="electric-button w-full rounded-xl py-3 font-medium text-white disabled:opacity-50"
+            className="w-full py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-lg font-medium transition-colors"
           >
             {loading ? 'Pairing...' : 'Pair'}
           </button>
@@ -84,28 +81,11 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 
 function AppContent() {
   const { isAuthenticated, loading, pair, logout } = useAuth();
-  const [locale, setLocaleState] = useState<Locale>(() => {
-    if (typeof window === 'undefined') {
-      return 'en';
-    }
+  const [locale, setLocaleState] = useState('tr');
 
-    const saved = window.localStorage.getItem(LOCALE_STORAGE_KEY);
-    if (saved) {
-      return coerceLocale(saved);
-    }
-
-    return coerceLocale(window.navigator.language);
-  });
-
-  useEffect(() => {
-    setLocale(locale);
-    if (typeof window !== 'undefined') {
-      window.localStorage.setItem(LOCALE_STORAGE_KEY, locale);
-    }
-  }, [locale]);
-
-  const setAppLocale = (newLocale: Locale) => {
+  const setAppLocale = (newLocale: string) => {
     setLocaleState(newLocale);
+    setLocale(newLocale as Locale);
   };
 
   // Listen for 401 events to force logout
@@ -119,11 +99,8 @@ function AppContent() {
 
   if (loading) {
     return (
-      <div className="pairing-shell min-h-screen flex items-center justify-center">
-        <div className="flex flex-col items-center gap-3">
-          <div className="electric-loader h-10 w-10 rounded-full" />
-          <p className="text-[#a7c4f3]">Connecting...</p>
-        </div>
+      <div className="min-h-screen bg-gray-950 flex items-center justify-center">
+        <p className="text-gray-400">Connecting...</p>
       </div>
     );
   }
@@ -142,7 +119,6 @@ function AppContent() {
           <Route path="/cron" element={<Cron />} />
           <Route path="/integrations" element={<Integrations />} />
           <Route path="/memory" element={<Memory />} />
-          <Route path="/devices" element={<Devices />} />
           <Route path="/config" element={<Config />} />
           <Route path="/cost" element={<Cost />} />
           <Route path="/logs" element={<Logs />} />

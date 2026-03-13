@@ -175,7 +175,6 @@ async fn run_agent_job(
                 config.default_temperature,
                 vec![],
                 false,
-                None,
             )
             .await
         }
@@ -317,7 +316,6 @@ pub(crate) async fn deliver_announcement(
                 tg.bot_token.clone(),
                 tg.allowed_users.clone(),
                 tg.mention_only,
-                false,
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }
@@ -582,6 +580,7 @@ mod tests {
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
         assert!(output.contains("/etc/passwd"));
     }
 
@@ -596,6 +595,7 @@ mod tests {
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
         assert!(output.contains("/etc/passwd"));
     }
 
@@ -610,6 +610,7 @@ mod tests {
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
         assert!(output.contains("/etc/passwd"));
     }
 
@@ -624,6 +625,7 @@ mod tests {
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
         assert!(output.contains("~root/.ssh/id_rsa"));
     }
 

@@ -1,37 +1,15 @@
-import { useEffect, useState } from 'react';
-import type { ComponentType, ReactNode, SVGProps } from 'react';
+import { useState, useEffect } from 'react';
 import {
-  Activity,
-  ChevronDown,
-  Clock3,
   Cpu,
+  Clock,
+  Globe,
   Database,
+  Activity,
   DollarSign,
-  Globe2,
   Radio,
-  ShieldCheck,
-  Sparkles,
 } from 'lucide-react';
-import type { CostSummary, StatusResponse } from '@/types/api';
-import { getCost, getStatus } from '@/lib/api';
-
-type DashboardSectionKey = 'cost' | 'channels' | 'health';
-
-interface DashboardSectionState {
-  cost: boolean;
-  channels: boolean;
-  health: boolean;
-}
-
-interface CollapsibleSectionProps {
-  title: string;
-  subtitle: string;
-  icon: ComponentType<SVGProps<SVGSVGElement>>;
-  sectionKey: DashboardSectionKey;
-  openState: DashboardSectionState;
-  onToggle: (section: DashboardSectionKey) => void;
-  children: ReactNode;
-}
+import type { StatusResponse, CostSummary } from '@/types/api';
+import { getStatus, getCost } from '@/lib/api';
 
 function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
@@ -50,13 +28,13 @@ function healthColor(status: string): string {
   switch (status.toLowerCase()) {
     case 'ok':
     case 'healthy':
-      return 'bg-emerald-400';
+      return 'bg-green-500';
     case 'warn':
     case 'warning':
     case 'degraded':
-      return 'bg-amber-400';
+      return 'bg-yellow-500';
     default:
-      return 'bg-rose-500';
+      return 'bg-red-500';
   }
 }
 
@@ -64,105 +42,44 @@ function healthBorder(status: string): string {
   switch (status.toLowerCase()) {
     case 'ok':
     case 'healthy':
-      return 'border-emerald-500/30';
+      return 'border-green-500/30';
     case 'warn':
     case 'warning':
     case 'degraded':
-      return 'border-amber-400/30';
+      return 'border-yellow-500/30';
     default:
-      return 'border-rose-500/35';
+      return 'border-red-500/30';
   }
-}
-
-function CollapsibleSection({
-  title,
-  subtitle,
-  icon: Icon,
-  sectionKey,
-  openState,
-  onToggle,
-  children,
-}: CollapsibleSectionProps) {
-  const isOpen = openState[sectionKey];
-
-  return (
-    <section className="electric-card motion-rise">
-      <button
-        type="button"
-        onClick={() => onToggle(sectionKey)}
-        aria-expanded={isOpen}
-        className="group flex w-full items-center justify-between gap-4 rounded-xl px-4 py-4 text-left md:px-5"
-      >
-        <div className="flex items-center gap-3">
-          <div className="electric-icon h-10 w-10 rounded-xl">
-            <Icon className="h-5 w-5" />
-          </div>
-          <div>
-            <h2 className="text-base font-semibold text-white">{title}</h2>
-            <p className="text-xs uppercase tracking-[0.13em] text-[#7ea5eb]">{subtitle}</p>
-          </div>
-        </div>
-        <ChevronDown
-          className={[
-            'h-5 w-5 text-[#7ea5eb] transition-transform duration-300',
-            isOpen ? 'rotate-180' : 'rotate-0',
-          ].join(' ')}
-        />
-      </button>
-      <div
-        className={[
-          'grid overflow-hidden transition-[grid-template-rows,opacity] duration-300 ease-out',
-          isOpen ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0',
-        ].join(' ')}
-      >
-        <div className="min-h-0 border-t border-[#18356f] px-4 pb-4 pt-4 md:px-5">{children}</div>
-      </div>
-    </section>
-  );
 }
 
 export default function Dashboard() {
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [cost, setCost] = useState<CostSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [sectionsOpen, setSectionsOpen] = useState<DashboardSectionState>({
-    cost: true,
-    channels: true,
-    health: true,
-  });
 
   useEffect(() => {
     Promise.all([getStatus(), getCost()])
-      .then(([statusPayload, costPayload]) => {
-        setStatus(statusPayload);
-        setCost(costPayload);
+      .then(([s, c]) => {
+        setStatus(s);
+        setCost(c);
       })
-      .catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : 'Unknown dashboard load error';
-        setError(message);
-      });
+      .catch((err) => setError(err.message));
   }, []);
-
-  const toggleSection = (section: DashboardSectionKey) => {
-    setSectionsOpen((prev) => ({
-      ...prev,
-      [section]: !prev[section],
-    }));
-  };
 
   if (error) {
     return (
-      <div className="electric-card p-5 text-rose-200">
-        <h2 className="text-lg font-semibold text-rose-100">Dashboard load failed</h2>
-        <p className="mt-2 text-sm text-rose-200/90">{error}</p>
+      <div className="p-6">
+        <div className="rounded-lg bg-red-900/30 border border-red-700 p-4 text-red-300">
+          Failed to load dashboard: {error}
+        </div>
       </div>
     );
   }
 
   if (!status || !cost) {
     return (
-      <div className="flex h-64 items-center justify-center">
-        <div className="electric-loader h-12 w-12 rounded-full" />
+      <div className="flex items-center justify-center h-64">
+        <div className="animate-spin rounded-full h-8 w-8 border-2 border-blue-500 border-t-transparent" />
       </div>
     );
   }
@@ -170,184 +87,165 @@ export default function Dashboard() {
   const maxCost = Math.max(cost.session_cost_usd, cost.daily_cost_usd, cost.monthly_cost_usd, 0.001);
 
   return (
-    <div className="space-y-5 md:space-y-6">
-      <section className="hero-panel motion-rise">
-        <div className="relative z-10 flex flex-wrap items-start justify-between gap-4">
-          <div>
-            <p className="text-xs uppercase tracking-[0.22em] text-[#8fb8ff]">ZeroClaw Command Deck</p>
-            <h1 className="mt-2 text-2xl font-semibold tracking-[0.03em] text-white md:text-3xl">
-              Electric Runtime Dashboard
-            </h1>
-            <p className="mt-2 max-w-2xl text-sm text-[#b3cbf8] md:text-base">
-              Real-time telemetry, cost pulse, and operations status in a single collapsible surface.
-            </p>
+    <div className="p-6 space-y-6">
+      {/* Status Cards Grid */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="bg-gray-900 rounded-xl p-5 border border-gray-800">
+          <div className="flex items-center gap-3 mb-3">
+            <div className="p-2 bg-blue-600/20 rounded-lg">
+              <Cpu className="h-5 w-5 text-blue-400" />
+            </div>
+            <span className="text-sm text-gray-400">Provider / Model</span>
           </div>
-
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="status-pill">
-              <Sparkles className="h-3.5 w-3.5" />
-              Live Gateway
-            </span>
-            <span className="status-pill">
-              <ShieldCheck className="h-3.5 w-3.5" />
-              {status.paired ? 'Paired' : 'Unpaired'}
-            </span>
-          </div>
+          <p className="text-lg font-semibold text-white truncate">
+            {status.provider ?? 'Unknown'}
+          </p>
+          <p className="text-sm text-gray-400 truncate">{status.model}</p>
         </div>
-      </section>
 
-      <section className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <article className="electric-card motion-rise motion-delay-1 p-4">
-          <div className="metric-head">
-            <Cpu className="h-4 w-4" />
-            <span>Provider / Model</span>
+        <div className="bg-gray-900 rounded-xl p-5 border border-gray-800">
+          <div className="flex items-center gap-3 mb-3">
+            <div className="p-2 bg-green-600/20 rounded-lg">
+              <Clock className="h-5 w-5 text-green-400" />
+            </div>
+            <span className="text-sm text-gray-400">Uptime</span>
           </div>
-          <p className="metric-value mt-3">{status.provider ?? 'Unknown'}</p>
-          <p className="metric-sub mt-1 truncate">{status.model}</p>
-        </article>
+          <p className="text-lg font-semibold text-white">
+            {formatUptime(status.uptime_seconds)}
+          </p>
+          <p className="text-sm text-gray-400">Since last restart</p>
+        </div>
 
-        <article className="electric-card motion-rise motion-delay-2 p-4">
-          <div className="metric-head">
-            <Clock3 className="h-4 w-4" />
-            <span>Uptime</span>
+        <div className="bg-gray-900 rounded-xl p-5 border border-gray-800">
+          <div className="flex items-center gap-3 mb-3">
+            <div className="p-2 bg-purple-600/20 rounded-lg">
+              <Globe className="h-5 w-5 text-purple-400" />
+            </div>
+            <span className="text-sm text-gray-400">Gateway Port</span>
           </div>
-          <p className="metric-value mt-3">{formatUptime(status.uptime_seconds)}</p>
-          <p className="metric-sub mt-1">Since last restart</p>
-        </article>
+          <p className="text-lg font-semibold text-white">
+            :{status.gateway_port}
+          </p>
+          <p className="text-sm text-gray-400">Locale: {status.locale}</p>
+        </div>
 
-        <article className="electric-card motion-rise motion-delay-3 p-4">
-          <div className="metric-head">
-            <Globe2 className="h-4 w-4" />
-            <span>Gateway Port</span>
+        <div className="bg-gray-900 rounded-xl p-5 border border-gray-800">
+          <div className="flex items-center gap-3 mb-3">
+            <div className="p-2 bg-orange-600/20 rounded-lg">
+              <Database className="h-5 w-5 text-orange-400" />
+            </div>
+            <span className="text-sm text-gray-400">Memory Backend</span>
           </div>
-          <p className="metric-value mt-3">:{status.gateway_port}</p>
-          <p className="metric-sub mt-1">{status.locale}</p>
-        </article>
+          <p className="text-lg font-semibold text-white capitalize">
+            {status.memory_backend}
+          </p>
+          <p className="text-sm text-gray-400">
+            Paired: {status.paired ? 'Yes' : 'No'}
+          </p>
+        </div>
+      </div>
 
-        <article className="electric-card motion-rise motion-delay-4 p-4">
-          <div className="metric-head">
-            <Database className="h-4 w-4" />
-            <span>Memory Backend</span>
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Cost Widget */}
+        <div className="bg-gray-900 rounded-xl p-5 border border-gray-800">
+          <div className="flex items-center gap-2 mb-4">
+            <DollarSign className="h-5 w-5 text-blue-400" />
+            <h2 className="text-base font-semibold text-white">Cost Overview</h2>
           </div>
-          <p className="metric-value mt-3 capitalize">{status.memory_backend}</p>
-          <p className="metric-sub mt-1">{status.paired ? 'Pairing active' : 'No paired devices'}</p>
-        </article>
-      </section>
-
-      <div className="space-y-4">
-        <CollapsibleSection
-          title="Cost Pulse"
-          subtitle="Session, daily, and monthly runtime spend"
-          icon={DollarSign}
-          sectionKey="cost"
-          openState={sectionsOpen}
-          onToggle={toggleSection}
-        >
           <div className="space-y-4">
             {[
-              { label: 'Session', value: cost.session_cost_usd },
-              { label: 'Daily', value: cost.daily_cost_usd },
-              { label: 'Monthly', value: cost.monthly_cost_usd },
-            ].map(({ label, value }) => (
+              { label: 'Session', value: cost.session_cost_usd, color: 'bg-blue-500' },
+              { label: 'Daily', value: cost.daily_cost_usd, color: 'bg-green-500' },
+              { label: 'Monthly', value: cost.monthly_cost_usd, color: 'bg-purple-500' },
+            ].map(({ label, value, color }) => (
               <div key={label}>
-                <div className="mb-1.5 flex items-center justify-between text-sm">
-                  <span className="text-[#9bb8ec]">{label}</span>
-                  <span className="font-semibold text-white">{formatUSD(value)}</span>
+                <div className="flex justify-between text-sm mb-1">
+                  <span className="text-gray-400">{label}</span>
+                  <span className="text-white font-medium">{formatUSD(value)}</span>
                 </div>
-                <div className="h-2.5 overflow-hidden rounded-full bg-[#061230]">
+                <div className="w-full h-2 bg-gray-800 rounded-full overflow-hidden">
                   <div
-                    className="electric-progress h-full rounded-full"
-                    style={{ width: `${Math.max((value / maxCost) * 100, 3)}%` }}
+                    className={`h-full rounded-full ${color}`}
+                    style={{ width: `${Math.max((value / maxCost) * 100, 2)}%` }}
                   />
                 </div>
               </div>
             ))}
-
-            <div className="grid grid-cols-2 gap-3 pt-2">
-              <div className="metric-pill">
-                <span>Total Tokens</span>
-                <strong>{cost.total_tokens.toLocaleString()}</strong>
-              </div>
-              <div className="metric-pill">
-                <span>Requests</span>
-                <strong>{cost.request_count.toLocaleString()}</strong>
-              </div>
-            </div>
           </div>
-        </CollapsibleSection>
+          <div className="mt-4 pt-3 border-t border-gray-800 flex justify-between text-sm">
+            <span className="text-gray-400">Total Tokens</span>
+            <span className="text-white">{cost.total_tokens.toLocaleString()}</span>
+          </div>
+          <div className="flex justify-between text-sm mt-1">
+            <span className="text-gray-400">Requests</span>
+            <span className="text-white">{cost.request_count.toLocaleString()}</span>
+          </div>
+        </div>
 
-        <CollapsibleSection
-          title="Channel Activity"
-          subtitle="Live integrations and route connectivity"
-          icon={Radio}
-          sectionKey="channels"
-          openState={sectionsOpen}
-          onToggle={toggleSection}
-        >
-          {Object.entries(status.channels).length === 0 ? (
-            <p className="text-sm text-[#8aa8df]">No channels configured.</p>
-          ) : (
-            <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
-              {Object.entries(status.channels).map(([name, active]) => (
+        {/* Active Channels */}
+        <div className="bg-gray-900 rounded-xl p-5 border border-gray-800">
+          <div className="flex items-center gap-2 mb-4">
+            <Radio className="h-5 w-5 text-blue-400" />
+            <h2 className="text-base font-semibold text-white">Active Channels</h2>
+          </div>
+          <div className="space-y-2">
+            {Object.entries(status.channels).length === 0 ? (
+              <p className="text-sm text-gray-500">No channels configured</p>
+            ) : (
+              Object.entries(status.channels).map(([name, active]) => (
                 <div
                   key={name}
-                  className="rounded-xl border border-[#1d3770] bg-[#05112c]/90 px-3 py-2.5"
+                  className="flex items-center justify-between py-2 px-3 rounded-lg bg-gray-800/50"
                 >
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm capitalize text-white">{name}</span>
-                    <span className="flex items-center gap-2 text-xs text-[#8baee7]">
-                      <span
-                        className={[
-                          'inline-block h-2.5 w-2.5 rounded-full',
-                          active ? 'bg-emerald-400 shadow-[0_0_12px_0_rgba(52,211,153,0.8)]' : 'bg-slate-500',
-                        ].join(' ')}
-                      />
+                  <span className="text-sm text-white capitalize">{name}</span>
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={`inline-block h-2.5 w-2.5 rounded-full ${
+                        active ? 'bg-green-500' : 'bg-gray-500'
+                      }`}
+                    />
+                    <span className="text-xs text-gray-400">
                       {active ? 'Active' : 'Inactive'}
                     </span>
                   </div>
                 </div>
-              ))}
-            </div>
-          )}
-        </CollapsibleSection>
+              ))
+            )}
+          </div>
+        </div>
 
-        <CollapsibleSection
-          title="Component Health"
-          subtitle="Runtime heartbeat and restart awareness"
-          icon={Activity}
-          sectionKey="health"
-          openState={sectionsOpen}
-          onToggle={toggleSection}
-        >
-          {Object.entries(status.health.components).length === 0 ? (
-            <p className="text-sm text-[#8aa8df]">No component health is currently available.</p>
-          ) : (
-            <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
-              {Object.entries(status.health.components).map(([name, component]) => (
+        {/* Health Grid */}
+        <div className="bg-gray-900 rounded-xl p-5 border border-gray-800">
+          <div className="flex items-center gap-2 mb-4">
+            <Activity className="h-5 w-5 text-blue-400" />
+            <h2 className="text-base font-semibold text-white">Component Health</h2>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            {Object.entries(status.health.components).length === 0 ? (
+              <p className="text-sm text-gray-500 col-span-2">No components reporting</p>
+            ) : (
+              Object.entries(status.health.components).map(([name, comp]) => (
                 <div
                   key={name}
-                  className={[
-                    'rounded-xl border bg-[#05112c]/80 px-3 py-3',
-                    healthBorder(component.status),
-                  ].join(' ')}
+                  className={`rounded-lg p-3 border ${healthBorder(comp.status)} bg-gray-800/50`}
                 >
-                  <div className="flex items-center justify-between">
-                    <p className="text-sm font-semibold capitalize text-white">{name}</p>
-                    <span className={['inline-block h-2.5 w-2.5 rounded-full', healthColor(component.status)].join(' ')} />
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className={`inline-block h-2 w-2 rounded-full ${healthColor(comp.status)}`} />
+                    <span className="text-sm font-medium text-white capitalize truncate">
+                      {name}
+                    </span>
                   </div>
-                  <p className="mt-1 text-xs uppercase tracking-[0.12em] text-[#87a9e5]">
-                    {component.status}
-                  </p>
-                  {component.restart_count > 0 && (
-                    <p className="mt-2 text-xs text-amber-300">
-                      Restarts: {component.restart_count}
+                  <p className="text-xs text-gray-400 capitalize">{comp.status}</p>
+                  {comp.restart_count > 0 && (
+                    <p className="text-xs text-yellow-400 mt-1">
+                      Restarts: {comp.restart_count}
                     </p>
                   )}
                 </div>
-              ))}
-            </div>
-          )}
-        </CollapsibleSection>
+              ))
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );

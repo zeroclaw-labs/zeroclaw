@@ -70,36 +70,6 @@ pub struct IntegrationEntry {
 pub fn handle_command(command: crate::IntegrationCommands, config: &Config) -> Result<()> {
     match command {
         crate::IntegrationCommands::Info { name } => show_integration_info(config, &name),
-        crate::IntegrationCommands::List { category, status } => {
-            let entries = registry::all_integrations();
-            for entry in &entries {
-                if let Some(ref cat) = category {
-                    if !format!("{:?}", entry.category).eq_ignore_ascii_case(cat) {
-                        continue;
-                    }
-                }
-                let st = (entry.status_fn)(config);
-                if let Some(ref s) = status {
-                    if !format!("{st:?}").eq_ignore_ascii_case(s) {
-                        continue;
-                    }
-                }
-                println!("  {} ({:?}) — {:?}", entry.name, entry.category, st);
-            }
-            Ok(())
-        }
-        crate::IntegrationCommands::Search { query } => {
-            let entries = registry::all_integrations();
-            let query_lower = query.to_lowercase();
-            for entry in &entries {
-                if entry.name.to_lowercase().contains(&query_lower)
-                    || entry.description.to_lowercase().contains(&query_lower)
-                {
-                    println!("  {} — {}", entry.name, entry.description);
-                }
-            }
-            Ok(())
-        }
     }
 }
 

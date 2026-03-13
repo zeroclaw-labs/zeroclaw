@@ -165,9 +165,6 @@ async fn agent_handles_empty_provider_response() {
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
-        quota_metadata: None,
-        stop_reason: None,
-        raw_stop_reason: None,
     }]));
 
     let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
@@ -183,9 +180,6 @@ async fn agent_handles_none_text_response() {
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
-        quota_metadata: None,
-        stop_reason: None,
-        raw_stop_reason: None,
     }]));
 
     let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);

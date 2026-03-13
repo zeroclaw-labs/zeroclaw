@@ -21,7 +21,6 @@
 pub mod audit;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
-pub mod canary_guard;
 pub mod detect;
 pub mod docker;
 
@@ -38,13 +37,10 @@ pub mod pairing;
 pub mod policy;
 pub mod prompt_guard;
 pub mod secrets;
-pub mod semantic_guard;
-pub mod syscall_anomaly;
 pub mod traits;
 
 #[allow(unused_imports)]
 pub use audit::{AuditEvent, AuditEventType, AuditLogger};
-pub use canary_guard::CanaryGuard;
 #[allow(unused_imports)]
 pub use detect::create_sandbox;
 pub use domain_matcher::DomainMatcher;
@@ -57,12 +53,6 @@ pub use pairing::PairingGuard;
 pub use policy::{AutonomyLevel, SecurityPolicy};
 #[allow(unused_imports)]
 pub use secrets::SecretStore;
-#[allow(unused_imports)]
-pub use semantic_guard::{GuardCorpusUpdateReport, SemanticGuard, SemanticGuardStartupStatus};
-#[allow(unused_imports)]
-pub use syscall_anomaly::{
-    SyscallAnomalyAlert, SyscallAnomalyConfig, SyscallAnomalyDetector, SyscallAnomalyKind,
-};
 #[allow(unused_imports)]
 pub use traits::{NoopSandbox, Sandbox};
 // Prompt injection defense exports

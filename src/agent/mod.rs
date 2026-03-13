@@ -5,8 +5,6 @@ pub mod dispatcher;
 pub mod loop_;
 pub mod memory_loader;
 pub mod prompt;
-pub mod quota_aware;
-pub mod research;
 
 #[cfg(test)]
 mod tests;
@@ -14,4 +12,4 @@ mod tests;
 #[allow(unused_imports)]
 pub use agent::{Agent, AgentBuilder};
 #[allow(unused_imports)]
-pub use loop_::{process_message, process_message_with_session, run, run_tool_call_loop};
+pub use loop_::{process_message, run};

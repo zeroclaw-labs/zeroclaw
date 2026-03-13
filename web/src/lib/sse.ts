@@ -52,7 +52,6 @@ export class SSEClient {
   connect(): void {
     this.intentionallyClosed = false;
     this.clearReconnectTimer();
-
     this.controller = new AbortController();
 
     const token = getToken();

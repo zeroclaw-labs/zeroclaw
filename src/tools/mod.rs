@@ -15,10 +15,6 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
-pub mod agent_load_tracker;
-pub mod agent_selection;
-pub mod auth_profile;
-pub mod bg_run;
 pub mod browser;
 pub mod browser_open;
 pub mod cli_discovery;
@@ -48,27 +44,17 @@ pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
-pub mod orchestration_settings;
 pub mod pdf_read;
-pub mod process;
 pub mod proxy_config;
 pub mod pushover;
-pub mod quota_tools;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
-pub mod subagent_registry;
-pub mod subagent_spawn;
 pub mod traits;
-pub mod wasm_module;
 pub mod web_fetch;
 pub mod web_search_tool;
 
-#[allow(unused_imports)]
-pub use bg_run::{
-    format_bg_result_for_injection, BgJob, BgJobStatus, BgJobStore, BgRunTool, BgStatusTool,
-};
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
@@ -98,7 +84,6 @@ pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
 pub use pdf_read::PdfReadTool;
-pub use process::ProcessTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
@@ -106,16 +91,11 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
-pub use subagent_registry::SubAgentRegistry;
-pub use subagent_spawn::SubAgentSpawnTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
-
-pub use auth_profile::ManageAuthProfileTool;
-pub use quota_tools::{CheckProviderQuotaTool, EstimateQuotaCostTool, SwitchProviderTool};
 
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
@@ -159,106 +139,6 @@ fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
     tools.into_iter().map(ArcDelegatingTool::boxed).collect()
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PrimaryAgentToolFilterReport {
-    /// `agent.allowed_tools` entries that did not match any registered tool name.
-    pub unmatched_allowed_tools: Vec<String>,
-    /// Number of tools kept after applying `agent.allowed_tools` and before denylist removal.
-    pub allowlist_match_count: usize,
-}
-
-fn matches_tool_rule(rule: &str, tool_name: &str) -> bool {
-    rule == "*" || rule.eq_ignore_ascii_case(tool_name)
-}
-
-/// Filter the primary-agent tool registry based on `[agent]` allow/deny settings.
-///
-/// Filtering is done at startup so excluded tools never enter model context.
-pub fn filter_primary_agent_tools(
-    tools: Vec<Box<dyn Tool>>,
-    allowed_tools: &[String],
-    denied_tools: &[String],
-) -> (Vec<Box<dyn Tool>>, PrimaryAgentToolFilterReport) {
-    let normalized_allowed: Vec<String> = allowed_tools
-        .iter()
-        .map(|entry| entry.trim())
-        .filter(|entry| !entry.is_empty())
-        .map(ToOwned::to_owned)
-        .collect();
-    let normalized_denied: Vec<String> = denied_tools
-        .iter()
-        .map(|entry| entry.trim())
-        .filter(|entry| !entry.is_empty())
-        .map(ToOwned::to_owned)
-        .collect();
-
-    let use_allowlist = !normalized_allowed.is_empty();
-    let tool_names: Vec<String> = tools.iter().map(|tool| tool.name().to_string()).collect();
-
-    let unmatched_allowed_tools = if use_allowlist {
-        normalized_allowed
-            .iter()
-            .filter(|allowed| {
-                !tool_names
-                    .iter()
-                    .any(|tool_name| matches_tool_rule(allowed.as_str(), tool_name))
-            })
-            .cloned()
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let mut allowlist_match_count = 0usize;
-    let mut filtered = Vec::with_capacity(tools.len());
-    for tool in tools {
-        let tool_name = tool.name();
-
-        if use_allowlist
-            && !normalized_allowed
-                .iter()
-                .any(|rule| matches_tool_rule(rule.as_str(), tool_name))
-        {
-            continue;
-        }
-        if use_allowlist {
-            allowlist_match_count += 1;
-        }
-
-        if normalized_denied
-            .iter()
-            .any(|rule| matches_tool_rule(rule.as_str(), tool_name))
-        {
-            continue;
-        }
-        filtered.push(tool);
-    }
-
-    (
-        filtered,
-        PrimaryAgentToolFilterReport {
-            unmatched_allowed_tools,
-            allowlist_match_count,
-        },
-    )
-}
-
-/// Add background tool execution capabilities to a tool registry
-pub fn add_bg_tools(tools: Vec<Box<dyn Tool>>) -> (Vec<Box<dyn Tool>>, BgJobStore) {
-    let bg_job_store = BgJobStore::new();
-    let tool_arcs: Vec<Arc<dyn Tool>> = tools
-        .into_iter()
-        .map(|t| Arc::from(t) as Arc<dyn Tool>)
-        .collect();
-    let tools_arc = Arc::new(tool_arcs);
-    let bg_run = BgRunTool::new(bg_job_store.clone(), Arc::clone(&tools_arc));
-    let bg_status = BgStatusTool::new(bg_job_store.clone());
-    let mut extended: Vec<Arc<dyn Tool>> = (*tools_arc).clone();
-    extended.push(Arc::new(bg_run));
-    extended.push(Arc::new(bg_status));
-    (boxed_registry_from_arcs(extended), bg_job_store)
-}
-
 /// Create the default tool registry
 pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
     default_tools_with_runtime(security, Arc::new(NativeRuntime::new()))
@@ -269,22 +149,14 @@ pub fn default_tools_with_runtime(
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
-    let has_shell_access = runtime.has_shell_access();
-    let has_filesystem_access = runtime.has_filesystem_access();
-    let mut tools: Vec<Box<dyn Tool>> = Vec::new();
-
-    if has_shell_access {
-        tools.push(Box::new(ShellTool::new(security.clone(), runtime.clone())));
-    }
-    if has_filesystem_access {
-        tools.push(Box::new(FileReadTool::new(security.clone())));
-        tools.push(Box::new(FileWriteTool::new(security.clone())));
-        tools.push(Box::new(FileEditTool::new(security.clone())));
-        tools.push(Box::new(GlobSearchTool::new(security.clone())));
-        tools.push(Box::new(ContentSearchTool::new(security.clone())));
-    }
-
-    tools
+    vec![
+        Box::new(ShellTool::new(security.clone(), runtime)),
+        Box::new(FileReadTool::new(security.clone())),
+        Box::new(FileWriteTool::new(security.clone())),
+        Box::new(FileEditTool::new(security.clone())),
+        Box::new(GlobSearchTool::new(security.clone())),
+        Box::new(ContentSearchTool::new(security)),
+    ]
 }
 
 /// Create full tool registry including memory tools and optional Composio
@@ -337,20 +209,13 @@ pub fn all_tools_with_runtime(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
-    let has_shell_access = runtime.has_shell_access();
-    let has_filesystem_access = runtime.has_filesystem_access();
-    let zeroclaw_dir = root_config
-        .config_path
-        .parent()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| runtime.storage_path());
-    let syscall_detector = Arc::new(crate::security::SyscallAnomalyDetector::new(
-        root_config.security.syscall_anomaly.clone(),
-        &zeroclaw_dir,
-        root_config.security.audit.clone(),
-    ));
-
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(ShellTool::new(security.clone(), runtime)),
+        Arc::new(FileReadTool::new(security.clone())),
+        Arc::new(FileWriteTool::new(security.clone())),
+        Arc::new(FileEditTool::new(security.clone())),
+        Arc::new(GlobSearchTool::new(security.clone())),
+        Arc::new(ContentSearchTool::new(security.clone())),
         Arc::new(CronAddTool::new(config.clone(), security.clone())),
         Arc::new(CronListTool::new(config.clone())),
         Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
@@ -366,40 +231,15 @@ pub fn all_tools_with_runtime(
             security.clone(),
         )),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
-        Arc::new(ManageAuthProfileTool::new(config.clone())),
-        Arc::new(CheckProviderQuotaTool::new(config.clone())),
-        Arc::new(SwitchProviderTool::new(config.clone())),
-        Arc::new(EstimateQuotaCostTool),
+        Arc::new(GitOperationsTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+        )),
         Arc::new(PushoverTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
     ];
-
-    if has_shell_access {
-        tool_arcs.push(Arc::new(ShellTool::new_with_syscall_detector(
-            security.clone(),
-            runtime.clone(),
-            Some(syscall_detector.clone()),
-        )));
-        tool_arcs.push(Arc::new(ProcessTool::new_with_syscall_detector(
-            security.clone(),
-            runtime.clone(),
-            Some(syscall_detector),
-        )));
-        tool_arcs.push(Arc::new(GitOperationsTool::new(
-            security.clone(),
-            workspace_dir.to_path_buf(),
-        )));
-    }
-
-    if has_filesystem_access {
-        tool_arcs.push(Arc::new(FileReadTool::new(security.clone())));
-        tool_arcs.push(Arc::new(FileWriteTool::new(security.clone())));
-        tool_arcs.push(Arc::new(FileEditTool::new(security.clone())));
-        tool_arcs.push(Arc::new(GlobSearchTool::new(security.clone())));
-        tool_arcs.push(Arc::new(ContentSearchTool::new(security.clone())));
-    }
 
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
@@ -449,30 +289,13 @@ pub fn all_tools_with_runtime(
 
     // Web search tool (enabled by default for GLM and other models)
     if root_config.web_search.enabled {
-        tool_arcs.push(Arc::new(WebSearchTool::new_with_options(
-            security.clone(),
+        tool_arcs.push(Arc::new(WebSearchTool::new_with_config(
             root_config.web_search.provider.clone(),
-            root_config.web_search.api_key.clone(),
             root_config.web_search.brave_api_key.clone(),
-            root_config.web_search.perplexity_api_key.clone(),
-            root_config.web_search.exa_api_key.clone(),
-            root_config.web_search.jina_api_key.clone(),
-            root_config.web_search.api_url.clone(),
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
-            root_config.web_search.user_agent.clone(),
-            root_config.web_search.fallback_providers.clone(),
-            root_config.web_search.retries_per_provider,
-            root_config.web_search.retry_backoff_ms,
-            root_config.web_search.domain_filter.clone(),
-            root_config.web_search.language_filter.clone(),
-            root_config.web_search.country.clone(),
-            root_config.web_search.recency_filter.clone(),
-            root_config.web_search.max_tokens,
-            root_config.web_search.max_tokens_per_page,
-            root_config.web_search.exa_search_type.clone(),
-            root_config.web_search.exa_include_text,
-            root_config.web_search.jina_site_filters.clone(),
+            root_config.config_path.clone(),
+            root_config.secrets.encrypt,
         )));
     }
 
@@ -493,73 +316,38 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // Add delegation and sub-agent orchestration tools when agents are configured
+    // Add delegation tool when agents are configured
     if !agents.is_empty() {
-        let all_agents: HashMap<String, DelegateAgentConfig> = agents
+        let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
             .iter()
             .map(|(name, cfg)| (name.clone(), cfg.clone()))
             .collect();
-        let delegate_agents = all_agents.clone();
         let delegate_fallback_credential = fallback_api_key.and_then(|value| {
             let trimmed_value = value.trim();
             (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
         });
-        let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
-            auth_profile_override: None,
-            provider_api_url: root_config.api_url.clone(),
-            provider_transport: root_config.effective_provider_transport(),
-            zeroclaw_dir: root_config
-                .config_path
-                .parent()
-                .map(std::path::PathBuf::from),
-            secrets_encrypt: root_config.secrets.encrypt,
-            reasoning_enabled: root_config.runtime.reasoning_enabled,
-            provider_timeout_secs: Some(root_config.provider_timeout_secs),
-            reasoning_level: root_config.effective_provider_reasoning_level(),
-            custom_provider_api_mode: root_config
-                .provider_api
-                .map(|mode| mode.as_compatible_mode()),
-            custom_provider_auth_header: root_config.effective_custom_provider_auth_header(),
-            max_tokens_override: None,
-            model_support_vision: root_config.model_support_vision,
-        };
-        let runtime_config_path = Some(root_config.config_path.clone());
         let parent_tools = Arc::new(tool_arcs.clone());
         let delegate_tool = DelegateTool::new_with_options(
-            delegate_agents.clone(),
-            delegate_fallback_credential.clone(),
-            security.clone(),
-            provider_runtime_options.clone(),
-        )
-        .with_reliability(root_config.reliability.clone())
-        .with_parent_tools(parent_tools.clone())
-        .with_multimodal_config(root_config.multimodal.clone())
-        .with_runtime_team_settings(
-            root_config.agent.teams.enabled,
-            root_config.agent.teams.auto_activate,
-            root_config.agent.teams.max_agents,
-            runtime_config_path.clone(),
-        );
-
-        tool_arcs.push(Arc::new(delegate_tool));
-
-        let subagent_registry = Arc::new(SubAgentRegistry::new());
-        tool_arcs.push(Arc::new(SubAgentSpawnTool::new(
-            all_agents,
+            delegate_agents,
             delegate_fallback_credential,
             security.clone(),
-            provider_runtime_options,
-            subagent_registry,
-            parent_tools,
-            root_config.multimodal.clone(),
-            root_config.agent.subagents.enabled,
-            root_config.agent.subagents.max_concurrent,
-            root_config.agent.subagents.auto_activate,
-            runtime_config_path,
-        )));
+            crate::providers::ProviderRuntimeOptions {
+                auth_profile_override: None,
+                provider_api_url: root_config.api_url.clone(),
+                zeroclaw_dir: root_config
+                    .config_path
+                    .parent()
+                    .map(std::path::PathBuf::from),
+                secrets_encrypt: root_config.secrets.encrypt,
+                reasoning_enabled: root_config.runtime.reasoning_enabled,
+                provider_timeout_secs: Some(root_config.provider_timeout_secs),
+            },
+        )
+        .with_parent_tools(parent_tools)
+        .with_multimodal_config(root_config.multimodal.clone());
+        tool_arcs.push(Arc::new(delegate_tool));
     }
 
-    // Feishu document tools (enabled when channel-lark feature is active)
     boxed_registry_from_arcs(tool_arcs)
 }
 
@@ -567,8 +355,6 @@ pub fn all_tools_with_runtime(
 mod tests {
     use super::*;
     use crate::config::{BrowserConfig, Config, MemoryConfig};
-    use crate::runtime::WasmRuntime;
-    use serde_json::json;
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -579,130 +365,11 @@ mod tests {
         }
     }
 
-    struct DummyTool {
-        name: &'static str,
-    }
-
-    #[async_trait::async_trait]
-    impl Tool for DummyTool {
-        fn name(&self) -> &str {
-            self.name
-        }
-
-        fn description(&self) -> &str {
-            "dummy"
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            json!({
-                "type": "object",
-                "properties": {}
-            })
-        }
-
-        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-            Ok(ToolResult {
-                success: true,
-                output: "ok".to_string(),
-                error: None,
-            })
-        }
-    }
-
-    fn sample_tools() -> Vec<Box<dyn Tool>> {
-        vec![
-            Box::new(DummyTool { name: "shell" }),
-            Box::new(DummyTool { name: "file_read" }),
-            Box::new(DummyTool {
-                name: "browser_open",
-            }),
-        ]
-    }
-
-    fn names(tools: &[Box<dyn Tool>]) -> Vec<String> {
-        tools.iter().map(|tool| tool.name().to_string()).collect()
-    }
-
-    #[test]
-    fn filter_primary_agent_tools_keeps_full_registry_when_allowlist_empty() {
-        let (filtered, report) = filter_primary_agent_tools(sample_tools(), &[], &[]);
-        assert_eq!(names(&filtered), vec!["shell", "file_read", "browser_open"]);
-        assert_eq!(report.allowlist_match_count, 0);
-        assert!(report.unmatched_allowed_tools.is_empty());
-    }
-
-    #[test]
-    fn filter_primary_agent_tools_applies_allowlist() {
-        let allow = vec!["file_read".to_string()];
-        let (filtered, report) = filter_primary_agent_tools(sample_tools(), &allow, &[]);
-        assert_eq!(names(&filtered), vec!["file_read"]);
-        assert_eq!(report.allowlist_match_count, 1);
-        assert!(report.unmatched_allowed_tools.is_empty());
-    }
-
-    #[test]
-    fn filter_primary_agent_tools_reports_unmatched_allow_entries() {
-        let allow = vec!["missing_tool".to_string()];
-        let (filtered, report) = filter_primary_agent_tools(sample_tools(), &allow, &[]);
-        assert!(filtered.is_empty());
-        assert_eq!(report.allowlist_match_count, 0);
-        assert_eq!(report.unmatched_allowed_tools, vec!["missing_tool"]);
-    }
-
-    #[test]
-    fn filter_primary_agent_tools_applies_denylist_after_allowlist() {
-        let allow = vec!["shell".to_string(), "file_read".to_string()];
-        let deny = vec!["shell".to_string()];
-        let (filtered, report) = filter_primary_agent_tools(sample_tools(), &allow, &deny);
-        assert_eq!(names(&filtered), vec!["file_read"]);
-        assert_eq!(report.allowlist_match_count, 2);
-        assert!(report.unmatched_allowed_tools.is_empty());
-    }
-
-    #[test]
-    fn filter_primary_agent_tools_supports_star_rule() {
-        let allow = vec!["*".to_string()];
-        let deny = vec!["browser_open".to_string()];
-        let (filtered, report) = filter_primary_agent_tools(sample_tools(), &allow, &deny);
-        assert_eq!(names(&filtered), vec!["shell", "file_read"]);
-        assert_eq!(report.allowlist_match_count, 3);
-        assert!(report.unmatched_allowed_tools.is_empty());
-    }
-
     #[test]
     fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         assert_eq!(tools.len(), 6);
-        // apply_patch tool no longer exists
-    }
-
-    #[test]
-    fn default_tools_with_runtime_includes_wasm_module_for_wasm_runtime() {
-        let security = Arc::new(SecurityPolicy::default());
-        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(WasmRuntime::new(
-            crate::runtime::WasmRuntimeConfig::default(),
-        ));
-        let tools = default_tools_with_runtime(security, runtime);
-        // wasm_module tool is not currently added to default_tools_with_runtime
-        // Verify that wasm runtime has appropriate capabilities
-        assert!(tools.is_empty()); // WasmRuntime has no shell or filesystem access
-    }
-
-    #[test]
-    fn default_tools_with_runtime_excludes_shell_and_fs_for_wasm_runtime() {
-        let security = Arc::new(SecurityPolicy::default());
-        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(WasmRuntime::new(
-            crate::runtime::WasmRuntimeConfig::default(),
-        ));
-        let tools = default_tools_with_runtime(security, runtime);
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(!names.contains(&"shell"));
-        assert!(!names.contains(&"file_read"));
-        assert!(!names.contains(&"file_write"));
-        assert!(!names.contains(&"file_edit"));
-        assert!(!names.contains(&"glob_search"));
-        assert!(!names.contains(&"content_search"));
     }
 
     #[test]
@@ -787,130 +454,6 @@ mod tests {
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
-    }
-
-    #[test]
-    fn all_tools_includes_docx_read_tool() {
-        let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy::default());
-        let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
-            ..MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-
-        let browser = BrowserConfig {
-            enabled: false,
-            ..BrowserConfig::default()
-        };
-        let http = crate::config::HttpRequestConfig::default();
-        let cfg = test_config(&tmp);
-
-        let tools = all_tools(
-            Arc::new(Config::default()),
-            &security,
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &crate::config::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-        );
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"pdf_read"));
-        assert!(names.contains(&"screenshot"));
-    }
-
-    #[test]
-    fn all_tools_with_runtime_includes_wasm_module_for_wasm_runtime() {
-        let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy::default());
-        let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
-            ..MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(WasmRuntime::new(
-            crate::runtime::WasmRuntimeConfig::default(),
-        ));
-
-        let browser = BrowserConfig::default();
-        let http = crate::config::HttpRequestConfig::default();
-        let cfg = test_config(&tmp);
-
-        let tools = all_tools_with_runtime(
-            Arc::new(Config::default()),
-            &security,
-            runtime,
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &crate::config::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-        );
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        // wasm_module tool is not currently registered in all_tools_with_runtime
-        assert!(!names.contains(&"shell"));
-        assert!(!names.contains(&"process"));
-        assert!(!names.contains(&"git_operations"));
-        assert!(!names.contains(&"file_read"));
-        assert!(!names.contains(&"file_write"));
-        assert!(!names.contains(&"file_edit"));
-    }
-
-    #[test]
-    fn all_tools_with_runtime_includes_background_tools() {
-        let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy::default());
-        let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
-            ..MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
-        let browser = BrowserConfig::default();
-        let http = crate::config::HttpRequestConfig::default();
-        let cfg = test_config(&tmp);
-
-        let tools = all_tools_with_runtime(
-            Arc::new(Config::default()),
-            &security,
-            runtime,
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &crate::config::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-        );
-
-        // bg_run/bg_status are now added by callers (after skill tools),
-        // so all_tools_with_runtime no longer includes them directly.
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(!names.contains(&"bg_run"));
-        assert!(!names.contains(&"bg_status"));
-
-        // After add_bg_tools, they should be present.
-        let (tools, _store) = add_bg_tools(tools);
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"bg_run"));
-        assert!(names.contains(&"bg_status"));
     }
 
     #[test]
@@ -1033,16 +576,11 @@ mod tests {
                 model: "llama3".to_string(),
                 system_prompt: None,
                 api_key: None,
-                enabled: true,
-                capabilities: Vec::new(),
-                priority: 0,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
-                provider_retries: None,
-                fallback_providers: vec![],
             },
         );
 
@@ -1062,7 +600,6 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
-        assert!(names.contains(&"subagent_spawn"));
     }
 
     #[test]
@@ -1096,177 +633,5 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
-        assert!(!names.contains(&"delegate_coordination_status"));
-    }
-
-    #[test]
-    fn all_tools_disables_coordination_tool_when_coordination_is_disabled() {
-        let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy::default());
-        let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
-            ..MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-
-        let browser = BrowserConfig::default();
-        let http = crate::config::HttpRequestConfig::default();
-        let mut cfg = test_config(&tmp);
-        cfg.coordination.enabled = false;
-
-        let mut agents = HashMap::new();
-        agents.insert(
-            "researcher".to_string(),
-            DelegateAgentConfig {
-                provider: "ollama".to_string(),
-                model: "llama3".to_string(),
-                system_prompt: None,
-                api_key: None,
-                enabled: true,
-                capabilities: Vec::new(),
-                priority: 0,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                provider_retries: None,
-                fallback_providers: vec![],
-            },
-        );
-
-        let tools = all_tools(
-            Arc::new(Config::default()),
-            &security,
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &crate::config::WebFetchConfig::default(),
-            tmp.path(),
-            &agents,
-            Some("delegate-test-credential"),
-            &cfg,
-        );
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"delegate"));
-        assert!(!names.contains(&"delegate_coordination_status"));
-    }
-
-    #[test]
-    fn all_tools_keeps_delegate_registered_when_team_toggle_is_off() {
-        let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy::default());
-        let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
-            ..MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-
-        let browser = BrowserConfig::default();
-        let http = crate::config::HttpRequestConfig::default();
-        let mut cfg = test_config(&tmp);
-        cfg.agent.teams.enabled = false;
-        cfg.agent.subagents.enabled = true;
-
-        let mut agents = HashMap::new();
-        agents.insert(
-            "researcher".to_string(),
-            DelegateAgentConfig {
-                provider: "ollama".to_string(),
-                model: "llama3".to_string(),
-                system_prompt: None,
-                api_key: None,
-                enabled: true,
-                capabilities: Vec::new(),
-                priority: 0,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                provider_retries: None,
-                fallback_providers: vec![],
-            },
-        );
-
-        let tools = all_tools(
-            Arc::new(Config::default()),
-            &security,
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &crate::config::WebFetchConfig::default(),
-            tmp.path(),
-            &agents,
-            Some("delegate-test-credential"),
-            &cfg,
-        );
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"delegate"));
-        assert!(names.contains(&"subagent_spawn"));
-    }
-
-    #[test]
-    fn all_tools_keeps_subagent_tools_registered_when_toggle_is_off() {
-        let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy::default());
-        let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
-            ..MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-
-        let browser = BrowserConfig::default();
-        let http = crate::config::HttpRequestConfig::default();
-        let mut cfg = test_config(&tmp);
-        cfg.agent.teams.enabled = true;
-        cfg.agent.subagents.enabled = false;
-
-        let mut agents = HashMap::new();
-        agents.insert(
-            "researcher".to_string(),
-            DelegateAgentConfig {
-                provider: "ollama".to_string(),
-                model: "llama3".to_string(),
-                system_prompt: None,
-                api_key: None,
-                enabled: true,
-                capabilities: Vec::new(),
-                priority: 0,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                provider_retries: None,
-                fallback_providers: vec![],
-            },
-        );
-
-        let tools = all_tools(
-            Arc::new(Config::default()),
-            &security,
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &crate::config::WebFetchConfig::default(),
-            tmp.path(),
-            &agents,
-            Some("delegate-test-credential"),
-            &cfg,
-        );
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"delegate"));
-        assert!(names.contains(&"subagent_spawn"));
-        // subagent_list and subagent_manage tools no longer exist
     }
 }

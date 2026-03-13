@@ -5,32 +5,20 @@
 use crate::multimodal;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    NormalizedStopReason, Provider, StreamChunk, StreamError, StreamOptions, StreamResult,
-    TokenUsage, ToolCall as ProviderToolCall,
+    Provider, StreamChunk, StreamError, StreamOptions, StreamResult, TokenUsage,
+    ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
-use futures_util::{stream, SinkExt, StreamExt};
+use futures_util::{stream, StreamExt};
 use reqwest::{
     header::{HeaderMap, HeaderValue, USER_AGENT},
     Client,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::HashSet;
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{
-        client::IntoClientRequest,
-        http::header::{HeaderName, AUTHORIZATION},
-        http::HeaderValue as WsHeaderValue,
-        Message as WsMessage,
-    },
-};
 
 /// A provider that speaks the OpenAI-compatible chat completions API.
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
 /// Synthetic, `OpenCode` Zen, `OpenCode` Go, `Z.AI`, `GLM`, `MiniMax`, Bedrock, Qianfan, Groq, Mistral, `xAI`, etc.
-#[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct OpenAiCompatibleProvider {
     pub(crate) name: String,
@@ -51,10 +39,6 @@ pub struct OpenAiCompatibleProvider {
     native_tool_calling: bool,
     /// HTTP request timeout in seconds for LLM API calls. Default: 120.
     timeout_secs: u64,
-    /// Selects the primary protocol for this compatible endpoint.
-    api_mode: CompatibleApiMode,
-    /// Optional max token cap propagated to outbound requests.
-    max_tokens_override: Option<u32>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -68,15 +52,6 @@ pub enum AuthStyle {
     Custom(String),
 }
 
-/// API mode for OpenAI-compatible endpoints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompatibleApiMode {
-    /// Default mode: call chat-completions first and optionally fallback.
-    OpenAiChatCompletions,
-    /// Responses-first mode: call `/responses` directly.
-    OpenAiResponses,
-}
-
 impl OpenAiCompatibleProvider {
     pub fn new(
         name: &str,
@@ -85,16 +60,7 @@ impl OpenAiCompatibleProvider {
         auth_style: AuthStyle,
     ) -> Self {
         Self::new_with_options(
-            name,
-            base_url,
-            credential,
-            auth_style,
-            false,
-            true,
-            None,
-            false,
-            CompatibleApiMode::OpenAiChatCompletions,
-            None,
+            name, base_url, credential, auth_style, false, true, None, false,
         )
     }
 
@@ -114,8 +80,6 @@ impl OpenAiCompatibleProvider {
             true,
             None,
             false,
-            CompatibleApiMode::OpenAiChatCompletions,
-            None,
         )
     }
 
@@ -128,16 +92,7 @@ impl OpenAiCompatibleProvider {
         auth_style: AuthStyle,
     ) -> Self {
         Self::new_with_options(
-            name,
-            base_url,
-            credential,
-            auth_style,
-            false,
-            false,
-            None,
-            false,
-            CompatibleApiMode::OpenAiChatCompletions,
-            None,
+            name, base_url, credential, auth_style, false, false, None, false,
         )
     }
 
@@ -161,8 +116,6 @@ impl OpenAiCompatibleProvider {
             true,
             Some(user_agent),
             false,
-            CompatibleApiMode::OpenAiChatCompletions,
-            None,
         )
     }
 
@@ -183,8 +136,6 @@ impl OpenAiCompatibleProvider {
             true,
             Some(user_agent),
             false,
-            CompatibleApiMode::OpenAiChatCompletions,
-            None,
         )
     }
 
@@ -197,40 +148,7 @@ impl OpenAiCompatibleProvider {
         auth_style: AuthStyle,
     ) -> Self {
         Self::new_with_options(
-            name,
-            base_url,
-            credential,
-            auth_style,
-            false,
-            false,
-            None,
-            true,
-            CompatibleApiMode::OpenAiChatCompletions,
-            None,
-        )
-    }
-
-    /// Constructor used by `custom:` providers to choose explicit protocol mode.
-    pub fn new_custom_with_mode(
-        name: &str,
-        base_url: &str,
-        credential: Option<&str>,
-        auth_style: AuthStyle,
-        supports_vision: bool,
-        api_mode: CompatibleApiMode,
-        max_tokens_override: Option<u32>,
-    ) -> Self {
-        Self::new_with_options(
-            name,
-            base_url,
-            credential,
-            auth_style,
-            supports_vision,
-            true,
-            None,
-            false,
-            api_mode,
-            max_tokens_override,
+            name, base_url, credential, auth_style, false, false, None, true,
         )
     }
 
@@ -243,8 +161,6 @@ impl OpenAiCompatibleProvider {
         supports_responses_fallback: bool,
         user_agent: Option<&str>,
         merge_system_into_user: bool,
-        api_mode: CompatibleApiMode,
-        max_tokens_override: Option<u32>,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -257,8 +173,6 @@ impl OpenAiCompatibleProvider {
             merge_system_into_user,
             native_tool_calling: !merge_system_into_user,
             timeout_secs: 120,
-            api_mode,
-            max_tokens_override: max_tokens_override.filter(|value| *value > 0),
         }
     }
 
@@ -327,26 +241,22 @@ impl OpenAiCompatibleProvider {
     /// This allows custom providers with non-standard endpoints (e.g., VolcEngine ARK uses
     /// `/api/coding/v3/chat/completions` instead of `/v1/chat/completions`).
     fn chat_completions_url(&self) -> String {
-        if let Ok(mut url) = reqwest::Url::parse(&self.base_url) {
-            let path = url.path().trim_end_matches('/').to_string();
-            if path.ends_with("/chat/completions") {
-                return url.to_string();
-            }
+        let has_full_endpoint = reqwest::Url::parse(&self.base_url)
+            .map(|url| {
+                url.path()
+                    .trim_end_matches('/')
+                    .ends_with("/chat/completions")
+            })
+            .unwrap_or_else(|_| {
+                self.base_url
+                    .trim_end_matches('/')
+                    .ends_with("/chat/completions")
+            });
 
-            let target_path = if path.is_empty() || path == "/" {
-                "/chat/completions".to_string()
-            } else {
-                format!("{path}/chat/completions")
-            };
-            url.set_path(&target_path);
-            return url.to_string();
-        }
-
-        let normalized = self.base_url.trim_end_matches('/');
-        if normalized.ends_with("/chat/completions") {
-            normalized.to_string()
+        if has_full_endpoint {
+            self.base_url.clone()
         } else {
-            format!("{normalized}/chat/completions")
+            format!("{}/chat/completions", self.base_url)
         }
     }
 
@@ -369,32 +279,19 @@ impl OpenAiCompatibleProvider {
 
     /// Build the full URL for responses API, detecting if base_url already includes the path.
     fn responses_url(&self) -> String {
-        if let Ok(mut url) = reqwest::Url::parse(&self.base_url) {
-            let path = url.path().trim_end_matches('/').to_string();
-            let target_path = if path.ends_with("/responses") {
-                return url.to_string();
-            } else if let Some(prefix) = path.strip_suffix("/chat/completions") {
-                format!("{prefix}/responses")
-            } else if !path.is_empty() && path != "/" {
-                format!("{path}/responses")
-            } else {
-                "/v1/responses".to_string()
-            };
-
-            url.set_path(&target_path);
-            return url.to_string();
-        }
-
         if self.path_ends_with("/responses") {
             return self.base_url.clone();
         }
 
         let normalized_base = self.base_url.trim_end_matches('/');
 
+        // If chat endpoint is explicitly configured, derive sibling responses endpoint.
         if let Some(prefix) = normalized_base.strip_suffix("/chat/completions") {
             return format!("{prefix}/responses");
         }
 
+        // If an explicit API path already exists (e.g. /v1, /openai, /api/coding/v3),
+        // append responses directly to avoid duplicate /v1 segments.
         if self.has_explicit_api_path() {
             format!("{normalized_base}/responses")
         } else {
@@ -417,37 +314,6 @@ impl OpenAiCompatibleProvider {
             })
             .collect()
     }
-
-    fn openai_tools_to_tool_specs(tools: &[serde_json::Value]) -> Vec<crate::tools::ToolSpec> {
-        tools
-            .iter()
-            .filter_map(|tool| {
-                let function = tool.get("function")?;
-                let name = function.get("name")?.as_str()?.trim();
-                if name.is_empty() {
-                    return None;
-                }
-
-                let description = function
-                    .get("description")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("No description provided")
-                    .to_string();
-                let parameters = function.get("parameters").cloned().unwrap_or_else(|| {
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {}
-                    })
-                });
-
-                Some(crate::tools::ToolSpec {
-                    name: name.to_string(),
-                    description,
-                    parameters,
-                })
-            })
-            .collect()
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -455,8 +321,6 @@ struct ApiChatRequest {
     model: String,
     messages: Vec<Message>,
     temperature: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -508,8 +372,6 @@ struct UsageInfo {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
-    #[serde(default)]
-    finish_reason: Option<String>,
 }
 
 /// Remove `<think>...</think>` blocks from model output.
@@ -652,8 +514,6 @@ struct NativeChatRequest {
     messages: Vec<NativeMessage>,
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
@@ -683,13 +543,7 @@ struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    max_output_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<Value>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -698,56 +552,25 @@ struct ResponsesInput {
     content: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize)]
 struct ResponsesResponse {
-    #[serde(default)]
-    id: Option<String>,
     #[serde(default)]
     output: Vec<ResponsesOutput>,
     #[serde(default)]
     output_text: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize)]
 struct ResponsesOutput {
-    #[serde(rename = "type")]
-    #[serde(default)]
-    kind: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    arguments: Option<String>,
-    #[serde(default)]
-    call_id: Option<String>,
     #[serde(default)]
     content: Vec<ResponsesContent>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize)]
 struct ResponsesContent {
     #[serde(rename = "type")]
     kind: Option<String>,
     text: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesWebSocketCreateEvent {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    previous_response_id: Option<String>,
-    input: Vec<ResponsesInput>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    instructions: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    store: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_output_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<Value>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<String>,
 }
 
 // ---------------------------------------------------------------
@@ -944,7 +767,7 @@ fn build_responses_prompt(messages: &[ChatMessage]) -> (Option<String>, Vec<Resp
     (instructions, input)
 }
 
-fn extract_responses_text(response: &ResponsesResponse) -> Option<String> {
+fn extract_responses_text(response: ResponsesResponse) -> Option<String> {
     if let Some(text) = first_nonempty(response.output_text.as_deref()) {
         return Some(text);
     }
@@ -968,183 +791,6 @@ fn extract_responses_text(response: &ResponsesResponse) -> Option<String> {
     }
 
     None
-}
-
-fn extract_responses_tool_calls(response: &ResponsesResponse) -> Vec<ProviderToolCall> {
-    response
-        .output
-        .iter()
-        .filter(|item| item.kind.as_deref() == Some("function_call"))
-        .filter_map(|item| {
-            let name = item.name.clone()?;
-            let arguments = item.arguments.clone().unwrap_or_else(|| "{}".to_string());
-            Some(ProviderToolCall {
-                id: item
-                    .call_id
-                    .clone()
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                name,
-                arguments,
-            })
-        })
-        .collect()
-}
-
-fn parse_responses_chat_response(response: ResponsesResponse) -> ProviderChatResponse {
-    let text = extract_responses_text(&response);
-    let tool_calls = extract_responses_tool_calls(&response);
-    ProviderChatResponse {
-        text,
-        tool_calls,
-        usage: None,
-        reasoning_content: None,
-        quota_metadata: None,
-        stop_reason: None,
-        raw_stop_reason: None,
-    }
-}
-
-fn extract_responses_stream_error_message(event: &Value) -> Option<String> {
-    let event_type = event.get("type").and_then(Value::as_str);
-
-    if event_type == Some("error") {
-        return first_nonempty(
-            event
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| event.get("code").and_then(Value::as_str))
-                .or_else(|| {
-                    event
-                        .get("error")
-                        .and_then(|error| error.get("message"))
-                        .and_then(Value::as_str)
-                }),
-        );
-    }
-
-    if event_type == Some("response.failed") {
-        return first_nonempty(
-            event
-                .get("response")
-                .and_then(|response| response.get("error"))
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str),
-        );
-    }
-
-    None
-}
-
-fn extract_responses_stream_text_event(event: &Value, saw_delta: bool) -> Option<String> {
-    let event_type = event.get("type").and_then(Value::as_str);
-    match event_type {
-        Some("response.output_text.delta") => {
-            first_nonempty(event.get("delta").and_then(Value::as_str))
-        }
-        Some("response.output_text.done") if !saw_delta => {
-            first_nonempty(event.get("text").and_then(Value::as_str))
-        }
-        Some("response.completed" | "response.done") => event
-            .get("response")
-            .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
-            .and_then(|response| extract_responses_text(&response)),
-        _ => None,
-    }
-}
-
-#[derive(Debug, Default)]
-struct ResponsesWebSocketAccumulator {
-    saw_delta: bool,
-    delta_accumulator: String,
-    fallback_text: Option<String>,
-    latest_response_id: Option<String>,
-    output_items: Vec<ResponsesOutput>,
-}
-
-impl ResponsesWebSocketAccumulator {
-    fn final_text(&self) -> Option<String> {
-        if self.saw_delta {
-            first_nonempty(Some(&self.delta_accumulator))
-        } else {
-            self.fallback_text.clone()
-        }
-    }
-
-    fn fallback_response(&self) -> Option<ResponsesResponse> {
-        let output_text = self.final_text();
-        if output_text.is_none() && self.output_items.is_empty() {
-            return None;
-        }
-
-        Some(ResponsesResponse {
-            id: self.latest_response_id.clone(),
-            output: self.output_items.clone(),
-            output_text,
-        })
-    }
-
-    fn record_output_item(&mut self, event: &Value) {
-        let Some(event_type) = event.get("type").and_then(Value::as_str) else {
-            return;
-        };
-
-        if event_type != "response.output_item.done" {
-            return;
-        }
-
-        let item = event
-            .get("item")
-            .or_else(|| event.get("output_item"))
-            .cloned();
-        if let Some(item) = item {
-            if let Ok(parsed) = serde_json::from_value::<ResponsesOutput>(item) {
-                self.output_items.push(parsed);
-            }
-        }
-    }
-
-    fn apply_event(&mut self, event: &Value) -> anyhow::Result<Option<ResponsesResponse>> {
-        if let Some(message) = extract_responses_stream_error_message(event) {
-            anyhow::bail!("{}", message.trim());
-        }
-
-        self.record_output_item(event);
-
-        let event_type = event.get("type").and_then(Value::as_str);
-        if let Some(id) = event
-            .get("response")
-            .and_then(|response| response.get("id"))
-            .and_then(Value::as_str)
-        {
-            self.latest_response_id = Some(id.to_string());
-        }
-
-        if let Some(text) = extract_responses_stream_text_event(event, self.saw_delta) {
-            if event_type == Some("response.output_text.delta") {
-                self.saw_delta = true;
-                self.delta_accumulator.push_str(&text);
-            } else if self.fallback_text.is_none() {
-                self.fallback_text = Some(text);
-            }
-        }
-
-        if event_type == Some("response.completed") || event_type == Some("response.done") {
-            if let Some(value) = event.get("response").cloned() {
-                if let Ok(mut parsed) = serde_json::from_value::<ResponsesResponse>(value) {
-                    if parsed.output_text.is_none() {
-                        parsed.output_text = self.final_text();
-                    }
-                    if parsed.output.is_empty() && !self.output_items.is_empty() {
-                        parsed.output = self.output_items.clone();
-                    }
-                    return Ok(Some(parsed));
-                }
-            }
-            return Ok(self.fallback_response());
-        }
-
-        Ok(None)
-    }
 }
 
 fn compact_sanitized_body_snippet(body: &str) -> String {
@@ -1176,315 +822,6 @@ fn parse_responses_response_body(
 }
 
 impl OpenAiCompatibleProvider {
-    fn should_use_responses_mode(&self) -> bool {
-        self.api_mode == CompatibleApiMode::OpenAiResponses
-    }
-
-    fn chat_completions_fallback_provider(&self) -> Self {
-        let mut provider = self.clone();
-        provider.api_mode = CompatibleApiMode::OpenAiChatCompletions;
-        provider.supports_responses_fallback = false;
-        provider
-    }
-
-    fn error_status_code(error: &anyhow::Error) -> Option<reqwest::StatusCode> {
-        if let Some(reqwest_error) = error.downcast_ref::<reqwest::Error>() {
-            if let Some(status) = reqwest_error.status() {
-                return Some(status);
-            }
-        }
-
-        let message = error.to_string();
-        for token in message.split(|c: char| !c.is_ascii_digit()) {
-            let Ok(code) = token.parse::<u16>() else {
-                continue;
-            };
-            if let Ok(status) = reqwest::StatusCode::from_u16(code) {
-                if status.is_client_error() || status.is_server_error() {
-                    return Some(status);
-                }
-            }
-        }
-
-        None
-    }
-
-    fn is_authentication_error(error: &anyhow::Error) -> bool {
-        if let Some(status) = Self::error_status_code(error) {
-            if status == reqwest::StatusCode::UNAUTHORIZED
-                || status == reqwest::StatusCode::FORBIDDEN
-            {
-                return true;
-            }
-        }
-
-        let lower = error.to_string().to_ascii_lowercase();
-        let auth_hints = [
-            "invalid api key",
-            "incorrect api key",
-            "missing api key",
-            "api key not set",
-            "authentication failed",
-            "auth failed",
-            "unauthorized",
-            "forbidden",
-            "permission denied",
-            "access denied",
-            "invalid token",
-        ];
-
-        auth_hints.iter().any(|hint| lower.contains(hint))
-    }
-
-    fn should_fallback_to_chat_completions(error: &anyhow::Error) -> bool {
-        if Self::is_authentication_error(error) {
-            return false;
-        }
-
-        if let Some(status) = Self::error_status_code(error) {
-            return status == reqwest::StatusCode::NOT_FOUND
-                || status == reqwest::StatusCode::REQUEST_TIMEOUT
-                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                || status.is_server_error();
-        }
-
-        if let Some(reqwest_error) = error.downcast_ref::<reqwest::Error>() {
-            if reqwest_error.is_connect()
-                || reqwest_error.is_timeout()
-                || reqwest_error.is_request()
-                || reqwest_error.is_body()
-                || reqwest_error.is_decode()
-            {
-                return true;
-            }
-        }
-
-        let lower = error.to_string().to_ascii_lowercase();
-        lower.contains("responses api returned an unexpected payload")
-            || lower.contains("no response from")
-    }
-
-    fn effective_max_tokens(&self) -> Option<u32> {
-        self.max_tokens_override.filter(|value| *value > 0)
-    }
-
-    fn should_try_responses_websocket(&self) -> bool {
-        if let Ok(raw) = std::env::var("ZEROCLAW_RESPONSES_WEBSOCKET") {
-            let normalized = raw.trim().to_ascii_lowercase();
-            if matches!(normalized.as_str(), "0" | "false" | "off" | "no") {
-                return false;
-            }
-            if matches!(normalized.as_str(), "1" | "true" | "on" | "yes") {
-                return true;
-            }
-        }
-
-        reqwest::Url::parse(&self.responses_url())
-            .ok()
-            .and_then(|url| {
-                url.host_str()
-                    .map(|host| host.eq_ignore_ascii_case("api.openai.com"))
-            })
-            .unwrap_or(false)
-    }
-
-    fn responses_websocket_url(&self, model: &str) -> anyhow::Result<String> {
-        let mut url = reqwest::Url::parse(&self.responses_url())?;
-        let next_scheme: &'static str = match url.scheme() {
-            "https" | "wss" => "wss",
-            "http" | "ws" => "ws",
-            other => {
-                anyhow::bail!(
-                    "{} Responses API websocket transport does not support URL scheme: {}",
-                    self.name,
-                    other
-                );
-            }
-        };
-
-        url.set_scheme(next_scheme)
-            .map_err(|()| anyhow::anyhow!("failed to set websocket URL scheme"))?;
-
-        if !url.query_pairs().any(|(k, _)| k == "model") {
-            url.query_pairs_mut().append_pair("model", model);
-        }
-
-        Ok(url.into())
-    }
-
-    fn apply_auth_header_ws(
-        &self,
-        request: &mut tokio_tungstenite::tungstenite::http::Request<()>,
-        credential: &str,
-    ) -> anyhow::Result<()> {
-        let headers = request.headers_mut();
-        match &self.auth_header {
-            AuthStyle::Bearer => {
-                let value = WsHeaderValue::from_str(&format!("Bearer {credential}"))?;
-                headers.insert(AUTHORIZATION, value);
-            }
-            AuthStyle::XApiKey => {
-                headers.insert("x-api-key", WsHeaderValue::from_str(credential)?);
-            }
-            AuthStyle::Custom(header) => {
-                let name = HeaderName::from_bytes(header.as_bytes())?;
-                headers.insert(name, WsHeaderValue::from_str(credential)?);
-            }
-        }
-
-        if let Some(ua) = self.user_agent.as_deref() {
-            headers.insert(USER_AGENT, WsHeaderValue::from_str(ua)?);
-        }
-
-        Ok(())
-    }
-
-    async fn send_responses_websocket_request(
-        &self,
-        credential: &str,
-        messages: &[ChatMessage],
-        model: &str,
-        tools: Option<Vec<Value>>,
-    ) -> anyhow::Result<ResponsesResponse> {
-        let (instructions, input) = build_responses_prompt(messages);
-        if input.is_empty() {
-            anyhow::bail!(
-                "{} Responses API websocket mode requires at least one non-system message",
-                self.name
-            );
-        }
-
-        let tools = tools.filter(|items| !items.is_empty());
-        let payload = ResponsesWebSocketCreateEvent {
-            kind: "response.create",
-            model: model.to_string(),
-            previous_response_id: None,
-            input,
-            instructions,
-            store: Some(false),
-            max_output_tokens: self.effective_max_tokens(),
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
-            tools,
-        };
-
-        let ws_url = self.responses_websocket_url(model)?;
-        let mut request = ws_url
-            .into_client_request()
-            .map_err(|error| anyhow::anyhow!("invalid websocket request URL: {error}"))?;
-        self.apply_auth_header_ws(&mut request, credential)?;
-
-        let (mut ws_stream, _) = connect_async(request).await?;
-        ws_stream
-            .send(WsMessage::Text(serde_json::to_string(&payload)?.into()))
-            .await?;
-
-        let mut accumulator = ResponsesWebSocketAccumulator::default();
-        while let Some(frame) = ws_stream.next().await {
-            let frame = frame?;
-            match frame {
-                WsMessage::Text(text) => {
-                    let event: Value = serde_json::from_str(text.as_ref())?;
-                    if let Some(response) = accumulator.apply_event(&event)? {
-                        let _ = ws_stream.close(None).await;
-                        return Ok(response);
-                    }
-                }
-                WsMessage::Binary(binary) => {
-                    let text = String::from_utf8(binary.to_vec()).map_err(|error| {
-                        anyhow::anyhow!("invalid UTF-8 websocket frame from Responses API: {error}")
-                    })?;
-                    let event: Value = serde_json::from_str(&text)?;
-                    if let Some(response) = accumulator.apply_event(&event)? {
-                        let _ = ws_stream.close(None).await;
-                        return Ok(response);
-                    }
-                }
-                WsMessage::Ping(payload) => {
-                    ws_stream.send(WsMessage::Pong(payload)).await?;
-                }
-                WsMessage::Close(_) => break,
-                _ => {}
-            }
-        }
-
-        if let Some(response) = accumulator.fallback_response() {
-            return Ok(response);
-        }
-
-        anyhow::bail!("No response from {} Responses websocket stream", self.name)
-    }
-
-    async fn send_responses_http_request(
-        &self,
-        credential: &str,
-        messages: &[ChatMessage],
-        model: &str,
-        tools: Option<Vec<Value>>,
-    ) -> anyhow::Result<ResponsesResponse> {
-        let (instructions, input) = build_responses_prompt(messages);
-        if input.is_empty() {
-            anyhow::bail!(
-                "{} Responses API fallback requires at least one non-system message",
-                self.name
-            );
-        }
-
-        let tools = tools.filter(|items| !items.is_empty());
-        let request = ResponsesRequest {
-            model: model.to_string(),
-            input,
-            instructions,
-            max_output_tokens: self.effective_max_tokens(),
-            stream: Some(false),
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
-            tools,
-        };
-
-        let url = self.responses_url();
-
-        let response = self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error = response.text().await?;
-            let sanitized = super::sanitize_api_error(&error);
-            anyhow::bail!("{} Responses API error ({status}): {sanitized}", self.name);
-        }
-
-        let body = response.text().await?;
-        parse_responses_response_body(&self.name, &body)
-    }
-
-    async fn send_responses_request(
-        &self,
-        credential: &str,
-        messages: &[ChatMessage],
-        model: &str,
-        tools: Option<Vec<Value>>,
-    ) -> anyhow::Result<ResponsesResponse> {
-        if self.should_try_responses_websocket() {
-            match self
-                .send_responses_websocket_request(credential, messages, model, tools.clone())
-                .await
-            {
-                Ok(response) => return Ok(response),
-                Err(error) => {
-                    tracing::warn!(
-                        provider = %self.name,
-                        error = %error,
-                        "Responses websocket request failed; falling back to HTTP"
-                    );
-                }
-            }
-        }
-
-        self.send_responses_http_request(credential, messages, model, tools)
-            .await
-    }
-
     fn apply_auth_header(
         &self,
         req: reqwest::RequestBuilder,
@@ -1502,97 +839,39 @@ impl OpenAiCompatibleProvider {
         credential: &str,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
     ) -> anyhow::Result<String> {
-        let responses = match self
-            .send_responses_request(credential, messages, model, None)
-            .await
-        {
-            Ok(response) => response,
-            Err(responses_err) => {
-                if self.should_use_responses_mode()
-                    && Self::should_fallback_to_chat_completions(&responses_err)
-                {
-                    tracing::warn!(
-                        provider = %self.name,
-                        error = %responses_err,
-                        "Responses API request failed in responses mode; retrying via chat completions"
-                    );
-                    let fallback_provider = self.chat_completions_fallback_provider();
-                    let sanitized = super::sanitize_api_error(&responses_err.to_string());
-                    return fallback_provider
-                        .chat_with_history(messages, model, temperature)
-                        .await
-                        .map_err(|chat_err| {
-                            anyhow::anyhow!(
-                                "{} Responses API failed: {sanitized} (chat-completions fallback failed: {chat_err})",
-                                self.name
-                            )
-                        });
-                }
-                return Err(responses_err);
-            }
-        };
-        extract_responses_text(&responses)
-            .ok_or_else(|| anyhow::anyhow!("No response from {} Responses API", self.name))
-    }
-
-    async fn chat_via_responses_chat(
-        &self,
-        credential: &str,
-        messages: &[ChatMessage],
-        model: &str,
-        tools: Option<Vec<Value>>,
-        temperature: f64,
-    ) -> anyhow::Result<ProviderChatResponse> {
-        let responses = match self
-            .send_responses_request(credential, messages, model, tools.clone())
-            .await
-        {
-            Ok(response) => response,
-            Err(responses_err) => {
-                if self.should_use_responses_mode()
-                    && Self::should_fallback_to_chat_completions(&responses_err)
-                {
-                    tracing::warn!(
-                        provider = %self.name,
-                        error = %responses_err,
-                        "Responses API request failed in responses mode; retrying via chat completions"
-                    );
-                    let fallback_provider = self.chat_completions_fallback_provider();
-                    let fallback_tool_specs = tools
-                        .as_deref()
-                        .map(Self::openai_tools_to_tool_specs)
-                        .unwrap_or_default();
-                    let fallback_tools =
-                        (!fallback_tool_specs.is_empty()).then_some(fallback_tool_specs.as_slice());
-                    let sanitized = super::sanitize_api_error(&responses_err.to_string());
-
-                    return fallback_provider
-                        .chat(
-                            ProviderChatRequest {
-                                messages,
-                                tools: fallback_tools,
-                            },
-                            model,
-                            temperature,
-                        )
-                        .await
-                        .map_err(|chat_err| {
-                            anyhow::anyhow!(
-                                "{} Responses API failed: {sanitized} (chat-completions fallback failed: {chat_err})",
-                                self.name
-                            )
-                        });
-                }
-                return Err(responses_err);
-            }
-        };
-        let parsed = parse_responses_chat_response(responses);
-        if parsed.text.is_none() && parsed.tool_calls.is_empty() {
-            anyhow::bail!("No response from {} Responses API", self.name);
+        let (instructions, input) = build_responses_prompt(messages);
+        if input.is_empty() {
+            anyhow::bail!(
+                "{} Responses API fallback requires at least one non-system message",
+                self.name
+            );
         }
-        Ok(parsed)
+
+        let request = ResponsesRequest {
+            model: model.to_string(),
+            input,
+            instructions,
+            stream: Some(false),
+        };
+
+        let url = self.responses_url();
+
+        let response = self
+            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error = response.text().await?;
+            anyhow::bail!("{} Responses API error: {error}", self.name);
+        }
+
+        let body = response.text().await?;
+        let responses = parse_responses_response_body(&self.name, &body)?;
+
+        extract_responses_text(responses)
+            .ok_or_else(|| anyhow::anyhow!("No response from {} Responses API", self.name))
     }
 
     fn convert_tool_specs(
@@ -1650,173 +929,90 @@ impl OpenAiCompatibleProvider {
         messages: &[ChatMessage],
         allow_user_image_parts: bool,
     ) -> Vec<NativeMessage> {
-        let mut native_messages = Vec::with_capacity(messages.len());
-        let mut assistant_tool_call_ids = HashSet::new();
+        messages
+            .iter()
+            .map(|message| {
+                if message.role == "assistant" {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
+                    {
+                        if let Some(tool_calls_value) = value.get("tool_calls") {
+                            if let Ok(parsed_calls) =
+                                serde_json::from_value::<Vec<ProviderToolCall>>(
+                                    tool_calls_value.clone(),
+                                )
+                            {
+                                let tool_calls = parsed_calls
+                                    .into_iter()
+                                    .map(|tc| ToolCall {
+                                        id: Some(tc.id),
+                                        kind: Some("function".to_string()),
+                                        function: Some(Function {
+                                            name: Some(tc.name),
+                                            arguments: Some(tc.arguments),
+                                        }),
+                                        name: None,
+                                        arguments: None,
+                                        parameters: None,
+                                    })
+                                    .collect::<Vec<_>>();
 
-        for message in messages {
-            if message.role == "assistant" {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) {
-                    if let Some(tool_calls) = Self::parse_history_tool_calls(&value) {
-                        for call in &tool_calls {
-                            if let Some(id) = call.id.as_ref() {
-                                assistant_tool_call_ids.insert(id.clone());
+                                let content = value
+                                    .get("content")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(|value| MessageContent::Text(value.to_string()));
+
+                                let reasoning_content = value
+                                    .get("reasoning_content")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToString::to_string);
+
+                                return NativeMessage {
+                                    role: "assistant".to_string(),
+                                    content,
+                                    tool_call_id: None,
+                                    tool_calls: Some(tool_calls),
+                                    reasoning_content,
+                                };
                             }
                         }
+                    }
+                }
 
-                        // Some OpenAI-compatible providers (including NVIDIA NIM models)
-                        // reject assistant tool-call messages if `content` is omitted.
+                if message.role == "tool" {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) {
+                        let tool_call_id = value
+                            .get("tool_call_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToString::to_string);
                         let content = value
                             .get("content")
                             .and_then(serde_json::Value::as_str)
-                            .map(ToString::to_string)
-                            .unwrap_or_default();
+                            .map(|value| MessageContent::Text(value.to_string()))
+                            .or_else(|| Some(MessageContent::Text(message.content.clone())));
 
-                        let reasoning_content = value
-                            .get("reasoning_content")
-                            .and_then(serde_json::Value::as_str)
-                            .map(ToString::to_string);
-
-                        native_messages.push(NativeMessage {
-                            role: "assistant".to_string(),
-                            content: Some(MessageContent::Text(content)),
-                            tool_call_id: None,
-                            tool_calls: Some(tool_calls),
-                            reasoning_content,
-                        });
-                        continue;
+                        return NativeMessage {
+                            role: "tool".to_string(),
+                            content,
+                            tool_call_id,
+                            tool_calls: None,
+                            reasoning_content: None,
+                        };
                     }
                 }
-            }
 
-            if message.role == "tool" {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) {
-                    let tool_call_id = value
-                        .get("tool_call_id")
-                        .or_else(|| value.get("tool_use_id"))
-                        .or_else(|| value.get("toolUseId"))
-                        .or_else(|| value.get("id"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
-
-                    let content_text = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string)
-                        .unwrap_or_else(|| message.content.clone());
-
-                    if let Some(id) = tool_call_id {
-                        if assistant_tool_call_ids.contains(&id) {
-                            native_messages.push(NativeMessage {
-                                role: "tool".to_string(),
-                                content: Some(MessageContent::Text(content_text)),
-                                tool_call_id: Some(id),
-                                tool_calls: None,
-                                reasoning_content: None,
-                            });
-                            continue;
-                        }
-
-                        tracing::warn!(
-                            tool_call_id = %id,
-                            "Dropping orphan tool-role message; no matching assistant tool_call in history"
-                        );
-                    } else {
-                        tracing::warn!(
-                            "Dropping tool-role message missing tool_call_id; preserving as user text fallback"
-                        );
-                    }
-
-                    native_messages.push(NativeMessage {
-                        role: "user".to_string(),
-                        content: Some(MessageContent::Text(format!(
-                            "[Tool result]\n{}",
-                            content_text
-                        ))),
-                        tool_call_id: None,
-                        tool_calls: None,
-                        reasoning_content: None,
-                    });
-                    continue;
+                NativeMessage {
+                    role: message.role.clone(),
+                    content: Some(Self::to_message_content(
+                        &message.role,
+                        &message.content,
+                        allow_user_image_parts,
+                    )),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    reasoning_content: None,
                 }
-            }
-
-            native_messages.push(NativeMessage {
-                role: message.role.clone(),
-                content: Some(Self::to_message_content(
-                    &message.role,
-                    &message.content,
-                    allow_user_image_parts,
-                )),
-                tool_call_id: None,
-                tool_calls: None,
-                reasoning_content: None,
-            });
-        }
-
-        native_messages
-    }
-
-    fn parse_history_tool_calls(value: &serde_json::Value) -> Option<Vec<ToolCall>> {
-        let tool_calls_value = value.get("tool_calls")?;
-
-        if let Ok(parsed_calls) =
-            serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
-        {
-            let tool_calls = parsed_calls
-                .into_iter()
-                .map(|tc| ToolCall {
-                    id: Some(tc.id),
-                    kind: Some("function".to_string()),
-                    function: Some(Function {
-                        name: Some(tc.name),
-                        arguments: Some(Self::normalize_tool_arguments(tc.arguments)),
-                    }),
-                    name: None,
-                    arguments: None,
-                    parameters: None,
-                })
-                .collect::<Vec<_>>();
-            if !tool_calls.is_empty() {
-                return Some(tool_calls);
-            }
-        }
-
-        if let Ok(parsed_calls) = serde_json::from_value::<Vec<ToolCall>>(tool_calls_value.clone())
-        {
-            let mut normalized_calls = Vec::with_capacity(parsed_calls.len());
-            for call in parsed_calls {
-                let Some(name) = call.function_name() else {
-                    continue;
-                };
-                let arguments = call
-                    .function_arguments()
-                    .unwrap_or_else(|| "{}".to_string());
-                normalized_calls.push(ToolCall {
-                    id: Some(call.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string())),
-                    kind: Some("function".to_string()),
-                    function: Some(Function {
-                        name: Some(name),
-                        arguments: Some(Self::normalize_tool_arguments(arguments)),
-                    }),
-                    name: None,
-                    arguments: None,
-                    parameters: None,
-                });
-            }
-            if !normalized_calls.is_empty() {
-                return Some(normalized_calls);
-            }
-        }
-
-        None
-    }
-
-    fn normalize_tool_arguments(arguments: String) -> String {
-        if serde_json::from_str::<serde_json::Value>(&arguments).is_ok() {
-            arguments
-        } else {
-            "{}".to_string()
-        }
+            })
+            .collect()
     }
 
     fn with_prompt_guided_tool_instructions(
@@ -1846,12 +1042,7 @@ impl OpenAiCompatibleProvider {
         modified_messages
     }
 
-    fn parse_native_response(choice: Choice) -> ProviderChatResponse {
-        let raw_stop_reason = choice.finish_reason;
-        let stop_reason = raw_stop_reason
-            .as_deref()
-            .map(NormalizedStopReason::from_openai_finish_reason);
-        let message = choice.message;
+    fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
         let text = message.effective_content_optional();
         let reasoning_content = message.reasoning_content.clone();
         let tool_calls = message
@@ -1861,14 +1052,17 @@ impl OpenAiCompatibleProvider {
             .filter_map(|tc| {
                 let name = tc.function_name()?;
                 let arguments = tc.function_arguments().unwrap_or_else(|| "{}".to_string());
-                let normalized_arguments = Self::normalize_tool_arguments(arguments.clone());
-                if normalized_arguments == "{}" && arguments != "{}" {
-                    tracing::warn!(
-                        function = %name,
-                        arguments = %arguments,
-                        "Invalid JSON in native tool-call arguments, using empty object"
-                    );
-                }
+                let normalized_arguments =
+                    if serde_json::from_str::<serde_json::Value>(&arguments).is_ok() {
+                        arguments
+                    } else {
+                        tracing::warn!(
+                            function = %name,
+                            arguments = %arguments,
+                            "Invalid JSON in native tool-call arguments, using empty object"
+                        );
+                        "{}".to_string()
+                    };
                 Some(ProviderToolCall {
                     id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     name,
@@ -1882,36 +1076,28 @@ impl OpenAiCompatibleProvider {
             tool_calls,
             usage: None,
             reasoning_content,
-            quota_metadata: None,
-            stop_reason,
-            raw_stop_reason,
         }
     }
 
     fn is_native_tool_schema_unsupported(status: reqwest::StatusCode, error: &str) -> bool {
-        super::is_native_tool_schema_rejection(status, error)
-    }
+        if !matches!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        ) {
+            return false;
+        }
 
-    async fn prompt_guided_tools_fallback(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[crate::tools::ToolSpec]>,
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<ProviderChatResponse> {
-        let fallback_messages = Self::with_prompt_guided_tool_instructions(messages, tools);
-        let text = self
-            .chat_with_history(&fallback_messages, model, temperature)
-            .await?;
-        Ok(ProviderChatResponse {
-            text: Some(text),
-            tool_calls: vec![],
-            usage: None,
-            reasoning_content: None,
-            quota_metadata: None,
-            stop_reason: None,
-            raw_stop_reason: None,
-        })
+        let lower = error.to_lowercase();
+        [
+            "unknown parameter: tools",
+            "unsupported parameter: tools",
+            "unrecognized field `tools`",
+            "does not support tools",
+            "function calling is not supported",
+            "tool_choice",
+        ]
+        .iter()
+        .any(|hint| lower.contains(hint))
     }
 }
 
@@ -1919,9 +1105,6 @@ impl OpenAiCompatibleProvider {
 impl Provider for OpenAiCompatibleProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         crate::providers::traits::ProviderCapabilities {
-            // Providers that require system-prompt merging (e.g. MiniMax) also
-            // reject OpenAI-style `tools` in the request body. Fall back to
-            // prompt-guided tool calling for those providers.
             native_tool_calling: self.native_tool_calling,
             vision: self.supports_vision,
         }
@@ -1969,7 +1152,6 @@ impl Provider for OpenAiCompatibleProvider {
             model: model.to_string(),
             messages,
             temperature,
-            max_tokens: self.effective_max_tokens(),
             stream: Some(false),
             tools: None,
             tool_choice: None,
@@ -1988,12 +1170,6 @@ impl Provider for OpenAiCompatibleProvider {
             fallback_messages
         };
 
-        if self.should_use_responses_mode() {
-            return self
-                .chat_via_responses(credential, &fallback_messages, model, temperature)
-                .await;
-        }
-
         let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
@@ -2004,7 +1180,7 @@ impl Provider for OpenAiCompatibleProvider {
                 if self.supports_responses_fallback {
                     let sanitized = super::sanitize_api_error(&chat_error.to_string());
                     return self
-                        .chat_via_responses(credential, &fallback_messages, model, temperature)
+                        .chat_via_responses(credential, &fallback_messages, model)
                         .await
                         .map_err(|responses_err| {
                             anyhow::anyhow!(
@@ -2025,7 +1201,7 @@ impl Provider for OpenAiCompatibleProvider {
 
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 return self
-                    .chat_via_responses(credential, &fallback_messages, model, temperature)
+                    .chat_via_responses(credential, &fallback_messages, model)
                     .await
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
@@ -2098,17 +1274,10 @@ impl Provider for OpenAiCompatibleProvider {
             model: model.to_string(),
             messages: api_messages,
             temperature,
-            max_tokens: self.effective_max_tokens(),
             stream: Some(false),
             tools: None,
             tool_choice: None,
         };
-
-        if self.should_use_responses_mode() {
-            return self
-                .chat_via_responses(credential, &effective_messages, model, temperature)
-                .await;
-        }
 
         let url = self.chat_completions_url();
         let response = match self
@@ -2121,7 +1290,7 @@ impl Provider for OpenAiCompatibleProvider {
                 if self.supports_responses_fallback {
                     let sanitized = super::sanitize_api_error(&chat_error.to_string());
                     return self
-                        .chat_via_responses(credential, &effective_messages, model, temperature)
+                        .chat_via_responses(credential, &effective_messages, model)
                         .await
                         .map_err(|responses_err| {
                             anyhow::anyhow!(
@@ -2141,7 +1310,7 @@ impl Provider for OpenAiCompatibleProvider {
             // Mirror chat_with_system: 404 may mean this provider uses the Responses API
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 return self
-                    .chat_via_responses(credential, &effective_messages, model, temperature)
+                    .chat_via_responses(credential, &effective_messages, model)
                     .await
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
@@ -2215,7 +1384,6 @@ impl Provider for OpenAiCompatibleProvider {
             model: model.to_string(),
             messages: api_messages,
             temperature,
-            max_tokens: self.effective_max_tokens(),
             stream: Some(false),
             tools: if tools.is_empty() {
                 None
@@ -2228,18 +1396,6 @@ impl Provider for OpenAiCompatibleProvider {
                 Some("auto".to_string())
             },
         };
-
-        if self.should_use_responses_mode() {
-            return self
-                .chat_via_responses_chat(
-                    credential,
-                    &effective_messages,
-                    model,
-                    (!tools.is_empty()).then(|| tools.to_vec()),
-                    temperature,
-                )
-                .await;
-        }
 
         let url = self.chat_completions_url();
         let response = match self
@@ -2259,43 +1415,12 @@ impl Provider for OpenAiCompatibleProvider {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
-                    quota_metadata: None,
-                    stop_reason: None,
-                    raw_stop_reason: None,
                 });
             }
         };
 
         if !response.status().is_success() {
-            let status = response.status();
-            let error = response.text().await?;
-            let sanitized = super::sanitize_api_error(&error);
-
-            if Self::is_native_tool_schema_unsupported(status, &error) {
-                let fallback_tool_specs = Self::openai_tools_to_tool_specs(tools);
-                return self
-                    .prompt_guided_tools_fallback(
-                        messages,
-                        (!fallback_tool_specs.is_empty()).then_some(fallback_tool_specs.as_slice()),
-                        model,
-                        temperature,
-                    )
-                    .await;
-            }
-
-            if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
-                return self
-                    .chat_via_responses_chat(
-                        credential,
-                        &effective_messages,
-                        model,
-                        (!tools.is_empty()).then(|| tools.to_vec()),
-                        temperature,
-                    )
-                    .await;
-            }
-
-            anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
+            return Err(super::api_error(&self.name, response).await);
         }
 
         let body = response.text().await?;
@@ -2309,11 +1434,6 @@ impl Provider for OpenAiCompatibleProvider {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
-
-        let raw_stop_reason = choice.finish_reason;
-        let stop_reason = raw_stop_reason
-            .as_deref()
-            .map(NormalizedStopReason::from_openai_finish_reason);
 
         let text = choice.message.effective_content_optional();
         let reasoning_content = choice.message.reasoning_content;
@@ -2339,9 +1459,6 @@ impl Provider for OpenAiCompatibleProvider {
             tool_calls,
             usage,
             reasoning_content,
-            quota_metadata: None,
-            stop_reason,
-            raw_stop_reason,
         })
     }
 
@@ -2359,7 +1476,6 @@ impl Provider for OpenAiCompatibleProvider {
         })?;
 
         let tools = Self::convert_tool_specs(request.tools);
-        let response_tools = tools.clone();
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(request.messages)
         } else {
@@ -2372,23 +1488,10 @@ impl Provider for OpenAiCompatibleProvider {
                 !self.merge_system_into_user,
             ),
             temperature,
-            max_tokens: self.effective_max_tokens(),
             stream: Some(false),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
-
-        if self.should_use_responses_mode() {
-            return self
-                .chat_via_responses_chat(
-                    credential,
-                    &effective_messages,
-                    model,
-                    response_tools.clone(),
-                    temperature,
-                )
-                .await;
-        }
 
         let url = self.chat_completions_url();
         let response = match self
@@ -2404,14 +1507,14 @@ impl Provider for OpenAiCompatibleProvider {
                 if self.supports_responses_fallback {
                     let sanitized = super::sanitize_api_error(&chat_error.to_string());
                     return self
-                        .chat_via_responses_chat(
-                            credential,
-                            &effective_messages,
-                            model,
-                            response_tools.clone(),
-                            temperature,
-                        )
+                        .chat_via_responses(credential, &effective_messages, model)
                         .await
+                        .map(|text| ProviderChatResponse {
+                            text: Some(text),
+                            tool_calls: vec![],
+                            usage: None,
+                            reasoning_content: None,
+                        })
                         .map_err(|responses_err| {
                             anyhow::anyhow!(
                                 "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
@@ -2429,27 +1532,30 @@ impl Provider for OpenAiCompatibleProvider {
             let error = response.text().await?;
             let sanitized = super::sanitize_api_error(&error);
 
-            if Self::is_native_tool_schema_unsupported(status, &error) {
-                return self
-                    .prompt_guided_tools_fallback(
-                        request.messages,
-                        request.tools,
-                        model,
-                        temperature,
-                    )
-                    .await;
+            if Self::is_native_tool_schema_unsupported(status, &sanitized) {
+                let fallback_messages =
+                    Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
+                let text = self
+                    .chat_with_history(&fallback_messages, model, temperature)
+                    .await?;
+                return Ok(ProviderChatResponse {
+                    text: Some(text),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                });
             }
 
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 return self
-                    .chat_via_responses_chat(
-                        credential,
-                        &effective_messages,
-                        model,
-                        response_tools.clone(),
-                        temperature,
-                    )
+                    .chat_via_responses(credential, &effective_messages, model)
                     .await
+                    .map(|text| ProviderChatResponse {
+                        text: Some(text),
+                        tool_calls: vec![],
+                        usage: None,
+                        reasoning_content: None,
+                    })
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
                             "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
@@ -2466,13 +1572,14 @@ impl Provider for OpenAiCompatibleProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         });
-        let choice = native_response
+        let message = native_response
             .choices
             .into_iter()
             .next()
+            .map(|choice| choice.message)
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
-        let mut result = Self::parse_native_response(choice);
+        let mut result = Self::parse_native_response(message);
         result.usage = usage;
         Ok(result)
     }
@@ -2523,7 +1630,6 @@ impl Provider for OpenAiCompatibleProvider {
             model: model.to_string(),
             messages,
             temperature,
-            max_tokens: self.effective_max_tokens(),
             stream: Some(options.enabled),
             tools: None,
             tool_choice: None,
@@ -2608,10 +1714,6 @@ impl Provider for OpenAiCompatibleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
-    use serde_json::Value;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
 
     fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
         OpenAiCompatibleProvider::new(name, url, key, AuthStyle::Bearer)
@@ -2669,7 +1771,6 @@ mod tests {
                 },
             ],
             temperature: 0.4,
-            max_tokens: None,
             stream: Some(false),
             tools: None,
             tool_choice: None,
@@ -2746,22 +1847,6 @@ mod tests {
         assert!(matches!(p.auth_header, AuthStyle::Custom(_)));
     }
 
-    #[test]
-    fn custom_constructor_applies_responses_mode_and_max_tokens_override() {
-        let provider = OpenAiCompatibleProvider::new_custom_with_mode(
-            "custom",
-            "https://api.example.com",
-            Some("key"),
-            AuthStyle::Bearer,
-            true,
-            CompatibleApiMode::OpenAiResponses,
-            Some(2048),
-        );
-
-        assert!(provider.should_use_responses_mode());
-        assert_eq!(provider.effective_max_tokens(), Some(2048));
-    }
-
     #[tokio::test]
     async fn all_compatible_providers_fail_without_key() {
         let providers = vec![
@@ -2769,7 +1854,7 @@ mod tests {
             make_provider("Moonshot", "https://api.moonshot.cn", None),
             make_provider("GLM", "https://open.bigmodel.cn", None),
             make_provider("MiniMax", "https://api.minimaxi.com/v1", None),
-            make_provider("Groq", "https://api.groq.com/openai/v1", None),
+            make_provider("Groq", "https://api.groq.com/openai", None),
             make_provider("Mistral", "https://api.mistral.ai", None),
             make_provider("xAI", "https://api.x.ai", None),
             make_provider("Astrai", "https://as-trai.com/v1", None),
@@ -2791,7 +1876,7 @@ mod tests {
         let json = r#"{"output_text":"Hello from top-level","output":[]}"#;
         let response: ResponsesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            extract_responses_text(&response).as_deref(),
+            extract_responses_text(response).as_deref(),
             Some("Hello from top-level")
         );
     }
@@ -2802,7 +1887,7 @@ mod tests {
             r#"{"output":[{"content":[{"type":"output_text","text":"Hello from nested"}]}]}"#;
         let response: ResponsesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            extract_responses_text(&response).as_deref(),
+            extract_responses_text(response).as_deref(),
             Some("Hello from nested")
         );
     }
@@ -2812,127 +1897,9 @@ mod tests {
         let json = r#"{"output":[{"content":[{"type":"message","text":"Fallback text"}]}]}"#;
         let response: ResponsesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            extract_responses_text(&response).as_deref(),
+            extract_responses_text(response).as_deref(),
             Some("Fallback text")
         );
-    }
-
-    #[test]
-    fn responses_extracts_function_call_as_tool_call() {
-        let json = r#"{
-            "output":[
-                {
-                    "type":"function_call",
-                    "call_id":"call_abc",
-                    "name":"shell",
-                    "arguments":"{\"command\":\"date\"}"
-                }
-            ]
-        }"#;
-        let response: ResponsesResponse = serde_json::from_str(json).unwrap();
-        let parsed = parse_responses_chat_response(response);
-        assert_eq!(parsed.tool_calls.len(), 1);
-        assert_eq!(parsed.tool_calls[0].id, "call_abc");
-        assert_eq!(parsed.tool_calls[0].name, "shell");
-        assert_eq!(parsed.tool_calls[0].arguments, "{\"command\":\"date\"}");
-    }
-
-    #[test]
-    fn websocket_url_converts_scheme_and_adds_model_query() {
-        let provider = make_provider("custom", "https://api.openai.com/v1", Some("key"));
-        let ws_url = provider
-            .responses_websocket_url("gpt-5.2")
-            .expect("websocket URL should be derived");
-        assert_eq!(ws_url, "wss://api.openai.com/v1/responses?model=gpt-5.2");
-    }
-
-    #[test]
-    fn websocket_url_preserves_existing_model_query() {
-        let provider = make_provider(
-            "custom",
-            "https://api.openai.com/v1/responses?model=gpt-4.1-mini",
-            Some("key"),
-        );
-        let ws_url = provider
-            .responses_websocket_url("gpt-5.2")
-            .expect("existing query should be preserved");
-        assert_eq!(
-            ws_url,
-            "wss://api.openai.com/v1/responses?model=gpt-4.1-mini"
-        );
-    }
-
-    #[test]
-    fn websocket_accumulator_parses_delta_and_completed_event() {
-        let mut acc = ResponsesWebSocketAccumulator::default();
-
-        assert!(acc
-            .apply_event(&serde_json::json!({
-                "type":"response.created",
-                "response":{"id":"resp_123"}
-            }))
-            .unwrap()
-            .is_none());
-
-        assert!(acc
-            .apply_event(&serde_json::json!({
-                "type":"response.output_text.delta",
-                "delta":"Hello"
-            }))
-            .unwrap()
-            .is_none());
-
-        let response = acc
-            .apply_event(&serde_json::json!({
-                "type":"response.completed",
-                "response":{"id":"resp_123","output_text":"Hello world","output":[]}
-            }))
-            .unwrap()
-            .expect("completed event should finalize response");
-
-        assert_eq!(response.id.as_deref(), Some("resp_123"));
-        assert_eq!(
-            extract_responses_text(&response).as_deref(),
-            Some("Hello world")
-        );
-    }
-
-    #[test]
-    fn websocket_accumulator_falls_back_to_output_items() {
-        let mut acc = ResponsesWebSocketAccumulator::default();
-        assert!(acc
-            .apply_event(&serde_json::json!({
-                "type":"response.output_item.done",
-                "item":{
-                    "type":"function_call",
-                    "name":"shell",
-                    "call_id":"call_xyz",
-                    "arguments":"{\"command\":\"pwd\"}"
-                }
-            }))
-            .unwrap()
-            .is_none());
-
-        let fallback = acc
-            .fallback_response()
-            .expect("function-call output item should be retained");
-        let parsed = parse_responses_chat_response(fallback);
-        assert_eq!(parsed.tool_calls.len(), 1);
-        assert_eq!(parsed.tool_calls[0].id, "call_xyz");
-        assert_eq!(parsed.tool_calls[0].name, "shell");
-    }
-
-    #[test]
-    fn websocket_accumulator_reports_stream_error() {
-        let mut acc = ResponsesWebSocketAccumulator::default();
-        let err = acc
-            .apply_event(&serde_json::json!({
-                "type":"error",
-                "error":{"code":"previous_response_not_found","message":"missing response id"}
-            }))
-            .expect_err("error event should fail");
-
-        assert!(err.to_string().contains("missing response id"));
     }
 
     #[test]
@@ -2963,290 +1930,13 @@ mod tests {
     async fn chat_via_responses_requires_non_system_message() {
         let provider = make_provider("custom", "https://api.example.com", Some("test-key"));
         let err = provider
-            .chat_via_responses(
-                "test-key",
-                &[ChatMessage::system("policy")],
-                "gpt-test",
-                0.7,
-            )
+            .chat_via_responses("test-key", &[ChatMessage::system("policy")], "gpt-test")
             .await
             .expect_err("system-only fallback payload should fail");
 
         assert!(err
             .to_string()
             .contains("requires at least one non-system message"));
-    }
-
-    #[tokio::test]
-    async fn responses_mode_falls_back_to_chat_completions_on_responses_404() {
-        #[derive(Clone, Default)]
-        struct FallbackState {
-            hits: Arc<Mutex<Vec<String>>>,
-        }
-
-        async fn responses_endpoint(
-            State(state): State<FallbackState>,
-            Json(_payload): Json<Value>,
-        ) -> (StatusCode, Json<Value>) {
-            state.hits.lock().await.push("responses".to_string());
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": { "message": "responses endpoint unavailable" }
-                })),
-            )
-        }
-
-        async fn chat_endpoint(
-            State(state): State<FallbackState>,
-            Json(payload): Json<Value>,
-        ) -> (StatusCode, Json<Value>) {
-            state.hits.lock().await.push("chat".to_string());
-            assert_eq!(
-                payload.get("model").and_then(Value::as_str),
-                Some("test-model")
-            );
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "choices": [{
-                        "message": {
-                            "content": "chat fallback ok"
-                        }
-                    }]
-                })),
-            )
-        }
-
-        let state = FallbackState::default();
-        let app = Router::new()
-            .route("/v1/responses", post(responses_endpoint))
-            .route("/chat/completions", post(chat_endpoint))
-            .with_state(state.clone());
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test server");
-        let addr = listener.local_addr().expect("server local addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve test app");
-        });
-
-        let provider = OpenAiCompatibleProvider::new_custom_with_mode(
-            "custom",
-            &format!("http://{}", addr),
-            Some("test-key"),
-            AuthStyle::Bearer,
-            false,
-            CompatibleApiMode::OpenAiResponses,
-            None,
-        );
-        let text = provider
-            .chat_with_system(Some("system"), "hello", "test-model", 0.2)
-            .await
-            .expect("responses 404 should retry chat completions in responses mode");
-        assert_eq!(text, "chat fallback ok");
-
-        let hits = state.hits.lock().await.clone();
-        assert_eq!(
-            hits,
-            vec!["responses".to_string(), "chat".to_string()],
-            "must attempt responses first, then chat-completions fallback"
-        );
-
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn responses_mode_does_not_fallback_to_chat_completions_on_auth_error() {
-        #[derive(Clone, Default)]
-        struct AuthFailureState {
-            hits: Arc<Mutex<Vec<String>>>,
-        }
-
-        async fn responses_endpoint(
-            State(state): State<AuthFailureState>,
-            Json(_payload): Json<Value>,
-        ) -> (StatusCode, Json<Value>) {
-            state.hits.lock().await.push("responses".to_string());
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error": { "message": "invalid api key" }
-                })),
-            )
-        }
-
-        async fn chat_endpoint(
-            State(state): State<AuthFailureState>,
-            Json(_payload): Json<Value>,
-        ) -> (StatusCode, Json<Value>) {
-            state.hits.lock().await.push("chat".to_string());
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "choices": [{
-                        "message": {
-                            "content": "should not be reached"
-                        }
-                    }]
-                })),
-            )
-        }
-
-        let state = AuthFailureState::default();
-        let app = Router::new()
-            .route("/v1/responses", post(responses_endpoint))
-            .route("/chat/completions", post(chat_endpoint))
-            .with_state(state.clone());
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test server");
-        let addr = listener.local_addr().expect("server local addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve test app");
-        });
-
-        let provider = OpenAiCompatibleProvider::new_custom_with_mode(
-            "custom",
-            &format!("http://{}", addr),
-            Some("test-key"),
-            AuthStyle::Bearer,
-            false,
-            CompatibleApiMode::OpenAiResponses,
-            None,
-        );
-        let err = provider
-            .chat_with_system(None, "hello", "test-model", 0.2)
-            .await
-            .expect_err("auth errors should not trigger chat-completions fallback");
-        assert!(err.to_string().contains("401"));
-
-        let hits = state.hits.lock().await.clone();
-        assert_eq!(
-            hits,
-            vec!["responses".to_string()],
-            "auth failures must not trigger fallback chat attempt"
-        );
-
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn responses_mode_native_chat_falls_back_and_preserves_tool_call_id() {
-        #[derive(Clone, Default)]
-        struct NativeFallbackState {
-            hits: Arc<Mutex<Vec<String>>>,
-            chat_payloads: Arc<Mutex<Vec<Value>>>,
-        }
-
-        async fn responses_endpoint(
-            State(state): State<NativeFallbackState>,
-            Json(_payload): Json<Value>,
-        ) -> (StatusCode, Json<Value>) {
-            state.hits.lock().await.push("responses".to_string());
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": { "message": "responses backend unavailable" }
-                })),
-            )
-        }
-
-        async fn chat_endpoint(
-            State(state): State<NativeFallbackState>,
-            Json(payload): Json<Value>,
-        ) -> (StatusCode, Json<Value>) {
-            state.hits.lock().await.push("chat".to_string());
-            state.chat_payloads.lock().await.push(payload);
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "choices": [{
-                        "message": {
-                            "content": null,
-                            "tool_calls": [{
-                                "id": "call_abc",
-                                "type": "function",
-                                "function": {
-                                    "name": "shell",
-                                    "arguments": "{\"command\":\"pwd\"}"
-                                }
-                            }]
-                        }
-                    }]
-                })),
-            )
-        }
-
-        let state = NativeFallbackState::default();
-        let app = Router::new()
-            .route("/v1/responses", post(responses_endpoint))
-            .route("/chat/completions", post(chat_endpoint))
-            .with_state(state.clone());
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test server");
-        let addr = listener.local_addr().expect("server local addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve test app");
-        });
-
-        let provider = OpenAiCompatibleProvider::new_custom_with_mode(
-            "custom",
-            &format!("http://{}", addr),
-            Some("test-key"),
-            AuthStyle::Bearer,
-            false,
-            CompatibleApiMode::OpenAiResponses,
-            None,
-        );
-        let messages = vec![ChatMessage::user("run a command")];
-        let tools = vec![crate::tools::ToolSpec {
-            name: "shell".to_string(),
-            description: "Run a command".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {"command": {"type": "string"}},
-                "required": ["command"]
-            }),
-        }];
-        let result = provider
-            .chat(
-                ProviderChatRequest {
-                    messages: &messages,
-                    tools: Some(&tools),
-                },
-                "test-model",
-                0.2,
-            )
-            .await
-            .expect("responses server errors should retry via native chat-completions");
-
-        assert_eq!(result.tool_calls.len(), 1);
-        assert_eq!(result.tool_calls[0].id, "call_abc");
-        assert_eq!(result.tool_calls[0].name, "shell");
-
-        let hits = state.hits.lock().await.clone();
-        assert_eq!(
-            hits,
-            vec!["responses".to_string(), "chat".to_string()],
-            "responses mode should retry via chat for retryable errors"
-        );
-
-        let chat_payloads = state.chat_payloads.lock().await;
-        assert_eq!(chat_payloads.len(), 1);
-        assert!(
-            chat_payloads[0].get("tools").is_some(),
-            "fallback native chat request should preserve tool schema"
-        );
-
-        server.abort();
-        let _ = server.await;
     }
 
     #[test]
@@ -3346,32 +2036,6 @@ mod tests {
     }
 
     #[test]
-    fn chat_completions_url_preserves_query_params_for_full_endpoint() {
-        let p = make_provider(
-            "custom",
-            "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01",
-            None,
-        );
-        assert_eq!(
-            p.chat_completions_url(),
-            "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
-        );
-    }
-
-    #[test]
-    fn chat_completions_url_appends_path_before_existing_query_params() {
-        let p = make_provider(
-            "custom",
-            "https://resource.openai.azure.com/openai/deployments/my-model?api-version=2024-02-01",
-            None,
-        );
-        assert_eq!(
-            p.chat_completions_url(),
-            "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01"
-        );
-    }
-
-    #[test]
     fn chat_completions_url_requires_exact_suffix_match() {
         let p = make_provider(
             "custom",
@@ -3415,19 +2079,6 @@ mod tests {
         assert_eq!(
             p.responses_url(),
             "https://my-api.example.com/api/v2/responses-proxy/responses"
-        );
-    }
-
-    #[test]
-    fn responses_url_preserves_query_params_from_chat_endpoint() {
-        let p = make_provider(
-            "custom",
-            "https://resource.openai.azure.com/openai/deployments/my-model/chat/completions?api-version=2024-02-01",
-            None,
-        );
-        assert_eq!(
-            p.responses_url(),
-            "https://resource.openai.azure.com/openai/deployments/my-model/responses?api-version=2024-02-01"
         );
     }
 
@@ -3535,109 +2186,42 @@ mod tests {
 
     #[test]
     fn parse_native_response_preserves_tool_call_id() {
-        let choice = Choice {
-            message: ResponseMessage {
-                content: None,
-                tool_calls: Some(vec![ToolCall {
-                    id: Some("call_123".to_string()),
-                    kind: Some("function".to_string()),
-                    function: Some(Function {
-                        name: Some("shell".to_string()),
-                        arguments: Some(r#"{"command":"pwd"}"#.to_string()),
-                    }),
-                    name: None,
-                    arguments: None,
-                    parameters: None,
-                }]),
-                reasoning_content: None,
-            },
-            finish_reason: Some("tool_calls".to_string()),
+        let message = ResponseMessage {
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: Some("call_123".to_string()),
+                kind: Some("function".to_string()),
+                function: Some(Function {
+                    name: Some("shell".to_string()),
+                    arguments: Some(r#"{"command":"pwd"}"#.to_string()),
+                }),
+                name: None,
+                arguments: None,
+                parameters: None,
+            }]),
+            reasoning_content: None,
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(choice);
+        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].id, "call_123");
         assert_eq!(parsed.tool_calls[0].name, "shell");
-        assert_eq!(parsed.stop_reason, Some(NormalizedStopReason::ToolCall));
-        assert_eq!(parsed.raw_stop_reason.as_deref(), Some("tool_calls"));
     }
 
     #[test]
     fn convert_messages_for_native_maps_tool_result_payload() {
-        let input = vec![
-            ChatMessage::assistant(
-                r#"{"content":"","tool_calls":[{"id":"call_abc","name":"shell","arguments":"{}"}]}"#,
-            ),
-            ChatMessage::tool(r#"{"tool_call_id":"call_abc","content":"done"}"#),
-        ];
+        let input = vec![ChatMessage::tool(
+            r#"{"tool_call_id":"call_abc","content":"done"}"#,
+        )];
 
         let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
-        assert_eq!(converted.len(), 2);
-        assert_eq!(converted[1].role, "tool");
-        assert_eq!(converted[1].tool_call_id.as_deref(), Some("call_abc"));
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "tool");
+        assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
         assert!(matches!(
-            converted[1].content.as_ref(),
+            converted[0].content.as_ref(),
             Some(MessageContent::Text(value)) if value == "done"
         ));
-    }
-
-    #[test]
-    fn convert_messages_for_native_parses_openai_style_assistant_tool_calls() {
-        let input = vec![ChatMessage::assistant(
-            r#"{
-                "content": null,
-                "tool_calls": [{
-                    "id": "call_openai_1",
-                    "type": "function",
-                    "function": {
-                        "name": "shell",
-                        "arguments": "{\"command\":\"pwd\"}"
-                    }
-                }]
-            }"#,
-        )];
-
-        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
-        assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].role, "assistant");
-        assert!(matches!(
-            converted[0].content.as_ref(),
-            Some(MessageContent::Text(value)) if value.is_empty()
-        ));
-
-        let calls = converted[0]
-            .tool_calls
-            .as_ref()
-            .expect("assistant message should include tool_calls");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id.as_deref(), Some("call_openai_1"));
-        assert!(matches!(
-            calls[0].function.as_ref().and_then(|f| f.name.as_deref()),
-            Some("shell")
-        ));
-        assert!(matches!(
-            calls[0]
-                .function
-                .as_ref()
-                .and_then(|f| f.arguments.as_deref()),
-            Some("{\"command\":\"pwd\"}")
-        ));
-    }
-
-    #[test]
-    fn convert_messages_for_native_rewrites_orphan_tool_message_as_user() {
-        let input = vec![ChatMessage::tool(
-            r#"{"tool_call_id":"call_missing","content":"done"}"#,
-        )];
-
-        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
-        assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].role, "user");
-        assert!(matches!(
-            converted[0].content.as_ref(),
-            Some(MessageContent::Text(value)) if value.contains("[Tool result]") && value.contains("done")
-        ));
-        assert!(converted[0].tool_call_id.is_none());
     }
 
     #[test]
@@ -3704,32 +2288,12 @@ mod tests {
             reqwest::StatusCode::BAD_REQUEST,
             "unknown parameter: tools"
         ));
-        assert!(OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
-            reqwest::StatusCode::from_u16(516).expect("516 is a valid status code"),
-            "unknown parameter: tools"
-        ));
         assert!(
             !OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
                 reqwest::StatusCode::UNAUTHORIZED,
                 "unknown parameter: tools"
             )
         );
-        assert!(
-            !OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
-                reqwest::StatusCode::from_u16(516).expect("516 is a valid status code"),
-                "upstream gateway unavailable"
-            )
-        );
-        assert!(
-            !OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
-                reqwest::StatusCode::from_u16(516).expect("516 is a valid status code"),
-                "tool_choice was set to auto by default policy"
-            )
-        );
-        assert!(OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
-            reqwest::StatusCode::from_u16(516).expect("516 is a valid status code"),
-            "mapper validation failed: tool schema is incompatible"
-        ));
     }
 
     #[test]
@@ -3908,30 +2472,6 @@ mod tests {
     }
 
     #[test]
-    fn openai_tools_convert_back_to_tool_specs_for_prompt_fallback() {
-        let openai_tools = vec![serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "weather_lookup",
-                "description": "Look up weather by city",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "city": { "type": "string" }
-                    },
-                    "required": ["city"]
-                }
-            }
-        })];
-
-        let specs = OpenAiCompatibleProvider::openai_tools_to_tool_specs(&openai_tools);
-        assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].name, "weather_lookup");
-        assert_eq!(specs[0].description, "Look up weather by city");
-        assert_eq!(specs[0].parameters["required"][0], "city");
-    }
-
-    #[test]
     fn request_serializes_with_tools() {
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -3954,7 +2494,6 @@ mod tests {
                 content: MessageContent::Text("What is the weather?".to_string()),
             }],
             temperature: 0.7,
-            max_tokens: None,
             stream: Some(false),
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
@@ -4065,393 +2604,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("TestProvider API key not set"));
-    }
-
-    #[tokio::test]
-    async fn chat_with_tools_falls_back_on_http_516_tool_schema_error() {
-        #[derive(Clone, Default)]
-        struct NativeToolFallbackState {
-            requests: Arc<Mutex<Vec<Value>>>,
-        }
-
-        async fn chat_endpoint(
-            State(state): State<NativeToolFallbackState>,
-            Json(payload): Json<Value>,
-        ) -> (StatusCode, Json<Value>) {
-            state.requests.lock().await.push(payload.clone());
-
-            if payload.get("tools").is_some() {
-                let long_mapper_prefix = "x".repeat(260);
-                let error_message = format!("{long_mapper_prefix} unknown parameter: tools");
-                return (
-                    StatusCode::from_u16(516).expect("516 is a valid HTTP status"),
-                    Json(serde_json::json!({
-                        "error": {
-                            "message": error_message
-                        }
-                    })),
-                );
-            }
-
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "choices": [{
-                        "message": {
-                            "content": "CALL weather_lookup {\"city\":\"Paris\"}"
-                        }
-                    }]
-                })),
-            )
-        }
-
-        let state = NativeToolFallbackState::default();
-        let app = Router::new()
-            .route("/chat/completions", post(chat_endpoint))
-            .with_state(state.clone());
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test server");
-        let addr = listener.local_addr().expect("server local addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve test app");
-        });
-
-        let provider = make_provider(
-            "TestProvider",
-            &format!("http://{}", addr),
-            Some("test-provider-key"),
-        );
-        let messages = vec![ChatMessage::user("check weather")];
-        let tools = vec![serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "weather_lookup",
-                "description": "Look up weather by city",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "city": { "type": "string" }
-                    },
-                    "required": ["city"]
-                }
-            }
-        })];
-
-        let result = provider
-            .chat_with_tools(&messages, &tools, "test-model", 0.7)
-            .await
-            .expect("516 tool-schema rejection should trigger prompt-guided fallback");
-
-        assert_eq!(
-            result.text.as_deref(),
-            Some("CALL weather_lookup {\"city\":\"Paris\"}")
-        );
-        assert!(
-            result.tool_calls.is_empty(),
-            "prompt-guided fallback should return text without native tool_calls"
-        );
-
-        let requests = state.requests.lock().await;
-        assert_eq!(
-            requests.len(),
-            2,
-            "expected native attempt + fallback attempt"
-        );
-
-        assert!(
-            requests[0].get("tools").is_some(),
-            "native attempt must include tools schema"
-        );
-        assert_eq!(
-            requests[0].get("tool_choice").and_then(|v| v.as_str()),
-            Some("auto")
-        );
-
-        assert!(
-            requests[1].get("tools").is_none(),
-            "fallback request should not include native tools"
-        );
-        assert!(
-            requests[1].get("tool_choice").is_none(),
-            "fallback request should omit native tool_choice"
-        );
-        let fallback_messages = requests[1]
-            .get("messages")
-            .and_then(|v| v.as_array())
-            .expect("fallback request should include messages");
-        let fallback_system = fallback_messages
-            .iter()
-            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
-            .expect("fallback should prepend system tool instructions");
-        let fallback_system_text = fallback_system
-            .get("content")
-            .and_then(|v| v.as_str())
-            .expect("fallback system prompt should be plain text");
-        assert!(fallback_system_text.contains("Available Tools"));
-        assert!(fallback_system_text.contains("weather_lookup"));
-
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn chat_falls_back_on_http_516_tool_schema_error() {
-        #[derive(Clone, Default)]
-        struct NativeToolFallbackState {
-            requests: Arc<Mutex<Vec<Value>>>,
-        }
-
-        async fn chat_endpoint(
-            State(state): State<NativeToolFallbackState>,
-            Json(payload): Json<Value>,
-        ) -> (StatusCode, Json<Value>) {
-            state.requests.lock().await.push(payload.clone());
-
-            if payload.get("tools").is_some() {
-                let long_mapper_prefix = "x".repeat(260);
-                let error_message =
-                    format!("{long_mapper_prefix} mapper validation failed: tool schema mismatch");
-                return (
-                    StatusCode::from_u16(516).expect("516 is a valid HTTP status"),
-                    Json(serde_json::json!({
-                        "error": {
-                            "message": error_message
-                        }
-                    })),
-                );
-            }
-
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "choices": [{
-                        "message": {
-                            "content": "CALL weather_lookup {\"city\":\"Paris\"}"
-                        }
-                    }]
-                })),
-            )
-        }
-
-        let state = NativeToolFallbackState::default();
-        let app = Router::new()
-            .route("/chat/completions", post(chat_endpoint))
-            .with_state(state.clone());
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test server");
-        let addr = listener.local_addr().expect("server local addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve test app");
-        });
-
-        let provider = make_provider(
-            "TestProvider",
-            &format!("http://{}", addr),
-            Some("test-provider-key"),
-        );
-        let messages = vec![ChatMessage::user("check weather")];
-        let tools = vec![crate::tools::ToolSpec {
-            name: "weather_lookup".to_string(),
-            description: "Look up weather by city".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "city": { "type": "string" }
-                },
-                "required": ["city"]
-            }),
-        }];
-
-        let result = provider
-            .chat(
-                ProviderChatRequest {
-                    messages: &messages,
-                    tools: Some(&tools),
-                },
-                "test-model",
-                0.7,
-            )
-            .await
-            .expect("chat() should fallback on HTTP 516 mapper tool-schema rejection");
-
-        assert_eq!(
-            result.text.as_deref(),
-            Some("CALL weather_lookup {\"city\":\"Paris\"}")
-        );
-        assert!(
-            result.tool_calls.is_empty(),
-            "prompt-guided fallback should return text without native tool_calls"
-        );
-
-        let requests = state.requests.lock().await;
-        assert_eq!(
-            requests.len(),
-            2,
-            "expected native attempt + fallback attempt"
-        );
-        assert!(
-            requests[0].get("tools").is_some(),
-            "native attempt must include tools schema"
-        );
-        assert!(
-            requests[1].get("tools").is_none(),
-            "fallback request should not include native tools"
-        );
-        let fallback_messages = requests[1]
-            .get("messages")
-            .and_then(|v| v.as_array())
-            .expect("fallback request should include messages");
-        let fallback_system = fallback_messages
-            .iter()
-            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
-            .expect("fallback should prepend system tool instructions");
-        let fallback_system_text = fallback_system
-            .get("content")
-            .and_then(|v| v.as_str())
-            .expect("fallback system prompt should be plain text");
-        assert!(fallback_system_text.contains("Available Tools"));
-        assert!(fallback_system_text.contains("weather_lookup"));
-
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn chat_with_tools_does_not_fallback_on_generic_516() {
-        #[derive(Clone, Default)]
-        struct Generic516State {
-            requests: Arc<Mutex<Vec<Value>>>,
-        }
-
-        async fn chat_endpoint(
-            State(state): State<Generic516State>,
-            Json(payload): Json<Value>,
-        ) -> (StatusCode, Json<Value>) {
-            state.requests.lock().await.push(payload);
-            (
-                StatusCode::from_u16(516).expect("516 is a valid HTTP status"),
-                Json(serde_json::json!({
-                    "error": { "message": "upstream gateway unavailable" }
-                })),
-            )
-        }
-
-        let state = Generic516State::default();
-        let app = Router::new()
-            .route("/chat/completions", post(chat_endpoint))
-            .with_state(state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test server");
-        let addr = listener.local_addr().expect("server local addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve test app");
-        });
-
-        let provider = make_provider(
-            "TestProvider",
-            &format!("http://{}", addr),
-            Some("test-provider-key"),
-        );
-        let messages = vec![ChatMessage::user("check weather")];
-        let tools = vec![serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "weather_lookup",
-                "description": "Look up weather by city",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                    "required": ["city"]
-                }
-            }
-        })];
-
-        let err = provider
-            .chat_with_tools(&messages, &tools, "test-model", 0.7)
-            .await
-            .expect_err("generic 516 must not trigger prompt-guided fallback");
-        assert!(err.to_string().contains("API error (516"));
-
-        let requests = state.requests.lock().await;
-        assert_eq!(requests.len(), 1, "must not issue fallback retry request");
-        assert!(requests[0].get("tools").is_some());
-
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn chat_does_not_fallback_on_generic_516() {
-        #[derive(Clone, Default)]
-        struct Generic516State {
-            requests: Arc<Mutex<Vec<Value>>>,
-        }
-
-        async fn chat_endpoint(
-            State(state): State<Generic516State>,
-            Json(payload): Json<Value>,
-        ) -> (StatusCode, Json<Value>) {
-            state.requests.lock().await.push(payload);
-            (
-                StatusCode::from_u16(516).expect("516 is a valid HTTP status"),
-                Json(serde_json::json!({
-                    "error": { "message": "upstream gateway unavailable" }
-                })),
-            )
-        }
-
-        let state = Generic516State::default();
-        let app = Router::new()
-            .route("/chat/completions", post(chat_endpoint))
-            .with_state(state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test server");
-        let addr = listener.local_addr().expect("server local addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve test app");
-        });
-
-        let provider = make_provider(
-            "TestProvider",
-            &format!("http://{}", addr),
-            Some("test-provider-key"),
-        );
-        let messages = vec![ChatMessage::user("check weather")];
-        let tools = vec![crate::tools::ToolSpec {
-            name: "weather_lookup".to_string(),
-            description: "Look up weather by city".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {"city": {"type": "string"}},
-                "required": ["city"]
-            }),
-        }];
-
-        let err = provider
-            .chat(
-                ProviderChatRequest {
-                    messages: &messages,
-                    tools: Some(&tools),
-                },
-                "test-model",
-                0.7,
-            )
-            .await
-            .expect_err("generic 516 must not trigger prompt-guided fallback");
-        assert!(err.to_string().contains("API error (516"));
-
-        let requests = state.requests.lock().await;
-        assert_eq!(requests.len(), 1, "must not issue fallback retry request");
-        assert!(requests[0].get("tools").is_some());
-
-        server.abort();
-        let _ = server.await;
     }
 
     #[test]
@@ -4650,49 +2802,39 @@ mod tests {
 
     #[test]
     fn parse_native_response_captures_reasoning_content() {
-        let choice = Choice {
-            message: ResponseMessage {
-                content: Some("answer".to_string()),
-                reasoning_content: Some("thinking step".to_string()),
-                tool_calls: Some(vec![ToolCall {
-                    id: Some("call_1".to_string()),
-                    kind: Some("function".to_string()),
-                    function: Some(Function {
-                        name: Some("shell".to_string()),
-                        arguments: Some(r#"{"cmd":"ls"}"#.to_string()),
-                    }),
-                    name: None,
-                    arguments: None,
-                    parameters: None,
-                }]),
-            },
-            finish_reason: Some("length".to_string()),
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: Some("thinking step".to_string()),
+            tool_calls: Some(vec![ToolCall {
+                id: Some("call_1".to_string()),
+                kind: Some("function".to_string()),
+                function: Some(Function {
+                    name: Some("shell".to_string()),
+                    arguments: Some(r#"{"cmd":"ls"}"#.to_string()),
+                }),
+                name: None,
+                arguments: None,
+                parameters: None,
+            }]),
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(choice);
+        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
         assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
         assert_eq!(parsed.text.as_deref(), Some("answer"));
         assert_eq!(parsed.tool_calls.len(), 1);
-        assert_eq!(parsed.stop_reason, Some(NormalizedStopReason::MaxTokens));
-        assert_eq!(parsed.raw_stop_reason.as_deref(), Some("length"));
     }
 
     #[test]
     fn parse_native_response_none_reasoning_content_for_normal_model() {
-        let choice = Choice {
-            message: ResponseMessage {
-                content: Some("hello".to_string()),
-                reasoning_content: None,
-                tool_calls: None,
-            },
-            finish_reason: Some("stop".to_string()),
+        let message = ResponseMessage {
+            content: Some("hello".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(choice);
+        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
         assert!(parsed.reasoning_content.is_none());
         assert_eq!(parsed.text.as_deref(), Some("hello"));
-        assert_eq!(parsed.stop_reason, Some(NormalizedStopReason::EndTurn));
-        assert_eq!(parsed.raw_stop_reason.as_deref(), Some("stop"));
     }
 
     #[test]

@@ -298,9 +298,6 @@ impl AzureOpenAiProvider {
             tool_calls,
             usage: None,
             reasoning_content,
-            quota_metadata: None,
-            stop_reason: None,
-            raw_stop_reason: None,
         }
     }
 

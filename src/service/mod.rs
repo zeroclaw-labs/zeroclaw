@@ -457,12 +457,7 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
 /// Check if the current process is running as root (Unix only)
 #[cfg(unix)]
 fn is_root() -> bool {
-    std::process::Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map_or(false, |s| s.trim() == "0")
+    unsafe { libc::getuid() == 0 }
 }
 
 #[cfg(not(unix))]
@@ -1170,14 +1165,11 @@ mod tests {
         assert_eq!(InitSystem::default(), InitSystem::Auto);
     }
 
-    // Disabled: requires unsafe code which is forbidden at crate level
-    // #[cfg(unix)]
-    // #[test]
-    // fn is_root_matches_system_uid() {
-    //     #[allow(unsafe_code)]
-    //     let system_is_root = unsafe { libc::getuid() == 0 };
-    //     assert_eq!(is_root(), system_is_root);
-    // }
+    #[cfg(unix)]
+    #[test]
+    fn is_root_matches_system_uid() {
+        assert_eq!(is_root(), unsafe { libc::getuid() == 0 });
+    }
 
     #[test]
     fn generate_openrc_script_contains_required_directives() {

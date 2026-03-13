@@ -8,13 +8,6 @@ use std::path::{Path, PathBuf};
 
 const SCAN_PATHS: &[&str] = &["src"];
 const FORBIDDEN_PATTERNS: &[&str] = &[".reply_to", "reply_to:"];
-/// Lines matching these patterns are allowed (external API calls, not the legacy field).
-const ALLOW_PATTERNS: &[&str] = &[
-    "reply_to_message_id",        // teloxide / Telegram API field
-    ".reply_to(extract_telegram", // teloxide builder method
-    "FORBIDDEN_PATTERNS",         // this file's own constant
-    "ALLOW_PATTERNS",             // this file's own constant
-];
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = fs::read_dir(dir)
@@ -53,7 +46,7 @@ fn source_does_not_use_legacy_reply_to_field() {
 
         for (line_idx, line) in content.lines().enumerate() {
             for pattern in FORBIDDEN_PATTERNS {
-                if line.contains(pattern) && !ALLOW_PATTERNS.iter().any(|ap| line.contains(ap)) {
+                if line.contains(pattern) {
                     let rel = file_path
                         .strip_prefix(root)
                         .unwrap_or(&file_path)

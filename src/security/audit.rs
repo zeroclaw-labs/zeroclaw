@@ -166,9 +166,6 @@ impl AuditLogger {
     /// Create a new audit logger
     pub fn new(config: AuditConfig, zeroclaw_dir: PathBuf) -> Result<Self> {
         let log_path = zeroclaw_dir.join(&config.log_path);
-        if config.enabled {
-            initialize_audit_log_file(&log_path)?;
-        }
         Ok(Self {
             log_path,
             config,
@@ -184,8 +181,6 @@ impl AuditLogger {
 
         // Check log size and rotate if needed
         self.rotate_if_needed()?;
-
-        initialize_audit_log_file(&self.log_path)?;
 
         // Serialize and write
         let line = serde_json::to_string(event)?;
@@ -263,20 +258,6 @@ impl AuditLogger {
     }
 }
 
-fn initialize_audit_log_file(log_path: &std::path::Path) -> Result<()> {
-    if let Some(parent) = log_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-
-    let _ = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,39 +330,6 @@ mod tests {
 
         // File should not exist since logging is disabled
         assert!(!tmp.path().join("audit.log").exists());
-        Ok(())
-    }
-
-    #[test]
-    fn audit_logger_enabled_creates_file_on_init() -> Result<()> {
-        let tmp = TempDir::new()?;
-        let config = AuditConfig {
-            enabled: true,
-            ..Default::default()
-        };
-
-        let _logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
-        assert!(
-            tmp.path().join("audit.log").exists(),
-            "audit log file should be created when audit logging is enabled"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn audit_logger_enabled_creates_parent_directories() -> Result<()> {
-        let tmp = TempDir::new()?;
-        let config = AuditConfig {
-            enabled: true,
-            log_path: "logs/security/audit.log".to_string(),
-            ..Default::default()
-        };
-
-        let _logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
-        assert!(
-            tmp.path().join("logs/security/audit.log").exists(),
-            "audit logger should create nested directories for configured log path"
-        );
         Ok(())
     }
 

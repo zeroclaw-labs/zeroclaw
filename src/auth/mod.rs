@@ -27,7 +27,7 @@ static REFRESH_BACKOFFS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::n
 
 #[derive(Clone)]
 pub struct AuthService {
-    pub(crate) store: AuthProfilesStore,
+    store: AuthProfilesStore,
     client: reqwest::Client,
 }
 
@@ -253,28 +253,6 @@ impl AuthService {
         &self,
         profile_override: Option<&str>,
     ) -> Result<Option<String>> {
-        self.get_valid_gemini_access_token_inner(profile_override, false)
-            .await
-    }
-
-    /// Force-refresh the Gemini OAuth token regardless of local expiry.
-    ///
-    /// Use when the server rejects the token (e.g. "API key not valid")
-    /// but the local expiry hasn't passed yet (clock skew, server-side revocation).
-    pub async fn force_refresh_gemini_access_token(
-        &self,
-        profile_override: Option<&str>,
-    ) -> Result<Option<String>> {
-        tracing::info!("Forcing Gemini OAuth token refresh (server rejected current token)");
-        self.get_valid_gemini_access_token_inner(profile_override, true)
-            .await
-    }
-
-    async fn get_valid_gemini_access_token_inner(
-        &self,
-        profile_override: Option<&str>,
-        force_refresh: bool,
-    ) -> Result<Option<String>> {
         let data = self.store.load().await?;
         let Some(profile_id) = select_profile_id(&data, GEMINI_PROVIDER, profile_override) else {
             return Ok(None);
@@ -288,17 +266,12 @@ impl AuthService {
             anyhow::bail!("Gemini auth profile is not OAuth-based: {profile_id}");
         };
 
-        if !force_refresh
-            && !token_set.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS))
-        {
+        if !token_set.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS)) {
             return Ok(Some(token_set.access_token.clone()));
         }
 
         let Some(refresh_token) = token_set.refresh_token.clone() else {
-            anyhow::bail!(
-                "Gemini OAuth token is expired and no refresh_token is available for profile '{profile_id}'. \
-                 Re-run `gemini` to authenticate again."
-            );
+            return Ok(Some(token_set.access_token.clone()));
         };
 
         let refresh_lock = refresh_lock_for_profile(&profile_id);
@@ -314,9 +287,7 @@ impl AuthService {
             anyhow::bail!("Gemini auth profile is missing token set: {profile_id}");
         };
 
-        if !force_refresh
-            && !latest_tokens.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS))
-        {
+        if !latest_tokens.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS)) {
             return Ok(Some(latest_tokens.access_token.clone()));
         }
 
@@ -328,37 +299,20 @@ impl AuthService {
             );
         }
 
-        // Extract client credentials for refresh: try id_token `aud` claim
-        // first, then fall back to env var. For client_secret, use the
-        // well-known public Gemini CLI secret as the final fallback.
-        let id_token_client_id = latest_tokens
-            .id_token
-            .as_deref()
-            .and_then(gemini_oauth::extract_client_id_from_id_token);
-        let refresh_client_id = id_token_client_id.or_else(gemini_oauth::gemini_oauth_client_id);
-        let refresh_client_secret = gemini_oauth::gemini_oauth_client_secret()
-            .or_else(|| Some(gemini_oauth::GEMINI_CLI_DEFAULT_CLIENT_SECRET.to_string()));
-
-        let mut refreshed = match refresh_gemini_access_token_with_retries(
-            &self.client,
-            &refresh_token,
-            refresh_client_id.as_deref(),
-            refresh_client_secret.as_deref(),
-        )
-        .await
-        {
-            Ok(tokens) => {
-                clear_refresh_backoff(&profile_id);
-                tokens
-            }
-            Err(err) => {
-                set_refresh_backoff(
-                    &profile_id,
-                    Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
-                );
-                return Err(err);
-            }
-        };
+        let mut refreshed =
+            match refresh_gemini_access_token_with_retries(&self.client, &refresh_token).await {
+                Ok(tokens) => {
+                    clear_refresh_backoff(&profile_id);
+                    tokens
+                }
+                Err(err) => {
+                    set_refresh_backoff(
+                        &profile_id,
+                        Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
+                    );
+                    return Err(err);
+                }
+            };
         if refreshed.refresh_token.is_none() {
             refreshed
                 .refresh_token
@@ -487,25 +441,11 @@ async fn refresh_openai_access_token_with_retries(
 async fn refresh_gemini_access_token_with_retries(
     client: &reqwest::Client,
     refresh_token: &str,
-    client_id: Option<&str>,
-    client_secret: Option<&str>,
 ) -> Result<TokenSet> {
     let mut last_error: Option<anyhow::Error> = None;
 
     for attempt in 1..=OAUTH_REFRESH_MAX_ATTEMPTS {
-        let result = match (client_id, client_secret) {
-            (Some(id), Some(secret)) => {
-                gemini_oauth::refresh_access_token_with_credentials(
-                    client,
-                    refresh_token,
-                    id,
-                    secret,
-                )
-                .await
-            }
-            _ => gemini_oauth::refresh_access_token(client, refresh_token).await,
-        };
-        match result {
+        match gemini_oauth::refresh_access_token(client, refresh_token).await {
             Ok(tokens) => return Ok(tokens),
             Err(err) => {
                 let should_retry = attempt < OAUTH_REFRESH_MAX_ATTEMPTS;
@@ -571,7 +511,7 @@ fn clear_refresh_backoff(profile_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::profiles::{AuthProfile, AuthProfileKind, TokenSet};
+    use crate::auth::profiles::{AuthProfile, AuthProfileKind};
 
     #[test]
     fn normalize_provider_aliases() {
@@ -629,49 +569,6 @@ mod tests {
         assert_eq!(
             select_profile_id(&data, "openai-codex", None),
             Some(id_active)
-        );
-    }
-
-    #[tokio::test]
-    async fn gemini_expired_token_without_refresh_token_returns_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let service = AuthService::new(dir.path(), false);
-
-        let expired_token_set = TokenSet {
-            access_token: "expired-access-token".into(),
-            refresh_token: None,
-            id_token: None,
-            expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(2)),
-            token_type: Some("Bearer".into()),
-            scope: None,
-        };
-
-        let profile = AuthProfile {
-            id: profile_id(GEMINI_PROVIDER, DEFAULT_PROFILE_NAME),
-            provider: GEMINI_PROVIDER.into(),
-            profile_name: DEFAULT_PROFILE_NAME.into(),
-            kind: AuthProfileKind::OAuth,
-            account_id: None,
-            workspace_id: None,
-            token_set: Some(expired_token_set),
-            token: None,
-            metadata: std::collections::BTreeMap::default(),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-
-        service.store.upsert_profile(profile, true).await.unwrap();
-
-        let result = service.get_valid_gemini_access_token(None).await;
-        let err = result.unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("no refresh_token is available"),
-            "expected 'no refresh_token is available' in: {msg}"
-        );
-        assert!(
-            msg.contains("Re-run `gemini`"),
-            "expected 'Re-run `gemini`' in: {msg}"
         );
     }
 }

@@ -233,17 +233,6 @@ mod tests {
         config.autonomy.level = AutonomyLevel::Supervised;
         config.autonomy.allowed_commands = vec!["touch".into()];
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let _job = cron::add_shell_job_with_approval(
-            &config,
-            None,
-            crate::cron::Schedule::Cron {
-                expr: "*/5 * * * *".into(),
-                tz: None,
-            },
-            "touch cron-run-approval",
-            true,
-        )
-        .unwrap();
         let cfg = Arc::new(config);
         // Create with explicit approval so the job persists for the run test.
         let job = cron::add_shell_job_with_approval(

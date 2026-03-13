@@ -133,7 +133,7 @@ export default function Logs() {
       : entries.filter((e) => typeFilters.has(e.event.type));
 
   return (
-    <div className="flex min-h-[28rem] flex-col h-[calc(100dvh-8.5rem)]">
+    <div className="flex flex-col h-[calc(100vh-3.5rem)]">
       {/* Toolbar */}
       <div className="flex items-center justify-between px-6 py-3 border-b border-gray-800 bg-gray-900">
         <div className="flex items-center gap-3">

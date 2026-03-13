@@ -5,10 +5,7 @@
 //! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
 use crate::auth::AuthService;
-use crate::multimodal;
-use crate::providers::traits::{
-    ChatMessage, ChatResponse, NormalizedStopReason, Provider, TokenUsage,
-};
+use crate::providers::traits::{ChatMessage, ChatResponse, Provider, TokenUsage};
 use async_trait::async_trait;
 use base64::Engine;
 use directories::UserDirs;
@@ -138,22 +135,8 @@ struct Content {
 }
 
 #[derive(Debug, Serialize, Clone)]
-#[serde(untagged)]
-enum Part {
-    Text {
-        text: String,
-    },
-    InlineData {
-        #[serde(rename = "inlineData")]
-        inline_data: InlineDataPart,
-    },
-}
-
-#[derive(Debug, Serialize, Clone)]
-struct InlineDataPart {
-    #[serde(rename = "mimeType")]
-    mime_type: String,
-    data: String,
+struct Part {
+    text: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -192,8 +175,6 @@ struct InternalGenerateContentResponse {
 struct Candidate {
     #[serde(default)]
     content: Option<CandidateContent>,
-    #[serde(default, rename = "finishReason")]
-    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -346,8 +327,7 @@ fn refresh_gemini_cli_token(
         .unwrap_or_else(|_| "<failed to read response body>".to_string());
 
     if !status.is_success() {
-        let sanitized = super::sanitize_api_error(&body);
-        anyhow::bail!("Gemini CLI OAuth refresh failed (HTTP {status}): {sanitized}");
+        anyhow::bail!("Gemini CLI OAuth refresh failed (HTTP {status}): {body}");
     }
 
     #[derive(Deserialize)]
@@ -494,12 +474,6 @@ impl GeminiProvider {
             .or_else(|| Self::load_non_empty_env("GEMINI_API_KEY").map(GeminiAuth::EnvGeminiKey))
             .or_else(|| Self::load_non_empty_env("GOOGLE_API_KEY").map(GeminiAuth::EnvGoogleKey));
 
-        tracing::debug!(
-            has_api_key = resolved_auth.is_some(),
-            profile_override = ?profile_override,
-            "Gemini auth: API key resolution"
-        );
-
         // If no API key, we'll use managed OAuth (checked at runtime)
         // or fall back to CLI OAuth
         let (auth, use_managed) = if resolved_auth.is_some() {
@@ -527,12 +501,6 @@ impl GeminiProvider {
                 .is_some()
             });
 
-            tracing::debug!(
-                has_managed,
-                profile_override = ?profile_override,
-                "Gemini auth: managed OAuth check"
-            );
-
             if has_managed {
                 (Some(GeminiAuth::ManagedOAuth), true)
             } else {
@@ -542,21 +510,6 @@ impl GeminiProvider {
                 (cli_auth, false)
             }
         };
-
-        let auth_type_label = match &auth {
-            Some(GeminiAuth::ExplicitKey(_)) => "explicit_key",
-            Some(GeminiAuth::EnvGeminiKey(_)) => "env_gemini_key",
-            Some(GeminiAuth::EnvGoogleKey(_)) => "env_google_key",
-            Some(GeminiAuth::OAuthToken(_)) => "cli_oauth",
-            Some(GeminiAuth::ManagedOAuth) => "managed_oauth",
-            None => "none",
-        };
-        tracing::info!(
-            auth_type = auth_type_label,
-            profile_override = ?profile_override,
-            has_auth_service = use_managed,
-            "Gemini provider initialized"
-        );
 
         Self {
             auth,
@@ -888,8 +841,7 @@ impl GeminiProvider {
                 );
                 return Ok(seed);
             }
-            let sanitized = super::sanitize_api_error(&body);
-            anyhow::bail!("loadCodeAssist failed (HTTP {status}): {sanitized}");
+            anyhow::bail!("loadCodeAssist failed (HTTP {status}): {body}");
         }
 
         #[derive(Deserialize)]
@@ -971,69 +923,10 @@ impl GeminiProvider {
     }
 
     fn should_rotate_oauth_on_error(status: reqwest::StatusCode, error_text: &str) -> bool {
-        // NOTE: 429 TOO_MANY_REQUESTS and RESOURCE_EXHAUSTED are rate-limit errors,
-        // NOT token expiry. OAuth refresh does not help and wastes time before fallback.
-        // Only refresh when the token itself is rejected (400 "API key not valid",
-        // 401 Unauthorized, 503 Service Unavailable, or other server errors).
-        status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-            || (status.is_server_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS)
-            // Expired OAuth tokens often surface as 400 INVALID_ARGUMENT
-            // "API key not valid" — force token refresh rather than retrying
-            // with the same stale credential.
-            || (status == reqwest::StatusCode::BAD_REQUEST
-                && error_text.to_lowercase().contains("api key not valid"))
-            || status == reqwest::StatusCode::UNAUTHORIZED
-    }
-
-    fn parse_inline_image_marker(image_ref: &str) -> Option<InlineDataPart> {
-        let rest = image_ref.strip_prefix("data:")?;
-        let semi_index = rest.find(';')?;
-        let mime_type = rest[..semi_index].trim();
-        if mime_type.is_empty() {
-            return None;
-        }
-
-        let payload = rest[semi_index + 1..].strip_prefix("base64,")?.trim();
-        if payload.is_empty() {
-            return None;
-        }
-
-        Some(InlineDataPart {
-            mime_type: mime_type.to_string(),
-            data: payload.to_string(),
-        })
-    }
-
-    fn build_user_parts(content: &str) -> Vec<Part> {
-        let (cleaned_text, image_refs) = multimodal::parse_image_markers(content);
-        if image_refs.is_empty() {
-            return vec![Part::Text {
-                text: content.to_string(),
-            }];
-        }
-
-        let mut parts: Vec<Part> = Vec::with_capacity(image_refs.len() + 1);
-        if !cleaned_text.is_empty() {
-            parts.push(Part::Text { text: cleaned_text });
-        }
-
-        for image_ref in image_refs {
-            if let Some(inline_data) = Self::parse_inline_image_marker(&image_ref) {
-                parts.push(Part::InlineData { inline_data });
-            } else {
-                parts.push(Part::Text {
-                    text: format!("[IMAGE:{image_ref}]"),
-                });
-            }
-        }
-
-        if parts.is_empty() {
-            vec![Part::Text {
-                text: String::new(),
-            }]
-        } else {
-            parts
-        }
+        status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            || status.is_server_error()
+            || error_text.contains("RESOURCE_EXHAUSTED")
     }
 }
 
@@ -1044,12 +937,7 @@ impl GeminiProvider {
         system_instruction: Option<Content>,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<(
-        Option<String>,
-        Option<TokenUsage>,
-        Option<NormalizedStopReason>,
-        Option<String>,
-    )> {
+    ) -> anyhow::Result<(String, Option<TokenUsage>)> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Gemini API key not found. Options:\n\
@@ -1103,22 +991,6 @@ impl GeminiProvider {
 
         let url = Self::build_generate_content_url(model, auth);
 
-        tracing::debug!(
-            auth_type = match auth {
-                GeminiAuth::ManagedOAuth => "managed_oauth",
-                GeminiAuth::OAuthToken(_) => "cli_oauth",
-                _ if auth.is_api_key() => "api_key",
-                _ => "unknown",
-            },
-            url_prefix = if url.contains("cloudcode-pa") {
-                "cloudcode-pa"
-            } else {
-                "public"
-            },
-            model,
-            "Gemini request: auth type and endpoint"
-        );
-
         let mut response = self
             .build_generate_content_request(
                 auth,
@@ -1161,10 +1033,8 @@ impl GeminiProvider {
                         }
                         GeminiAuth::ManagedOAuth => {
                             let auth_service = self.auth_service.as_ref().unwrap();
-                            // Force-refresh: the server rejected the current token
-                            // (e.g. expired OAuth masquerading as "API key not valid").
                             let token = auth_service
-                                .force_refresh_gemini_access_token(
+                                .get_valid_gemini_access_token(
                                     self.auth_profile_override.as_deref(),
                                 )
                                 .await?
@@ -1260,18 +1130,14 @@ impl GeminiProvider {
             output_tokens: u.candidates_token_count,
         });
 
-        let candidate = result
+        let text = result
             .candidates
             .and_then(|c| c.into_iter().next())
+            .and_then(|c| c.content)
+            .and_then(|c| c.effective_text())
             .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
-        let raw_stop_reason = candidate.finish_reason.clone();
-        let stop_reason = raw_stop_reason
-            .as_deref()
-            .map(NormalizedStopReason::from_gemini_finish_reason);
 
-        let text = candidate.content.and_then(|c| c.effective_text());
-
-        Ok((text, usage, stop_reason, raw_stop_reason))
+        Ok((text, usage))
     }
 }
 
@@ -1286,20 +1152,21 @@ impl Provider for GeminiProvider {
     ) -> anyhow::Result<String> {
         let system_instruction = system_prompt.map(|sys| Content {
             role: None,
-            parts: vec![Part::Text {
+            parts: vec![Part {
                 text: sys.to_string(),
             }],
         });
 
         let contents = vec![Content {
             role: Some("user".to_string()),
-            parts: Self::build_user_parts(message),
+            parts: vec![Part {
+                text: message.to_string(),
+            }],
         }];
 
-        let (text_opt, _usage, _stop_reason, _raw_stop_reason) = self
+        let (text, _usage) = self
             .send_generate_content(contents, system_instruction, model, temperature)
             .await?;
-        let text = text_opt.ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
         Ok(text)
     }
 
@@ -1320,14 +1187,16 @@ impl Provider for GeminiProvider {
                 "user" => {
                     contents.push(Content {
                         role: Some("user".to_string()),
-                        parts: Self::build_user_parts(&msg.content),
+                        parts: vec![Part {
+                            text: msg.content.clone(),
+                        }],
                     });
                 }
                 "assistant" => {
                     // Gemini API uses "model" role instead of "assistant"
                     contents.push(Content {
                         role: Some("model".to_string()),
-                        parts: vec![Part::Text {
+                        parts: vec![Part {
                             text: msg.content.clone(),
                         }],
                     });
@@ -1341,16 +1210,15 @@ impl Provider for GeminiProvider {
         } else {
             Some(Content {
                 role: None,
-                parts: vec![Part::Text {
+                parts: vec![Part {
                     text: system_parts.join("\n\n"),
                 }],
             })
         };
 
-        let (text_opt, _usage, _stop_reason, _raw_stop_reason) = self
+        let (text, _usage) = self
             .send_generate_content(contents, system_instruction, model, temperature)
             .await?;
-        let text = text_opt.ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
         Ok(text)
     }
 
@@ -1368,11 +1236,13 @@ impl Provider for GeminiProvider {
                 "system" => system_parts.push(&msg.content),
                 "user" => contents.push(Content {
                     role: Some("user".to_string()),
-                    parts: Self::build_user_parts(&msg.content),
+                    parts: vec![Part {
+                        text: msg.content.clone(),
+                    }],
                 }),
                 "assistant" => contents.push(Content {
                     role: Some("model".to_string()),
-                    parts: vec![Part::Text {
+                    parts: vec![Part {
                         text: msg.content.clone(),
                     }],
                 }),
@@ -1385,24 +1255,21 @@ impl Provider for GeminiProvider {
         } else {
             Some(Content {
                 role: None,
-                parts: vec![Part::Text {
+                parts: vec![Part {
                     text: system_parts.join("\n\n"),
                 }],
             })
         };
 
-        let (text, usage, stop_reason, raw_stop_reason) = self
+        let (text, usage) = self
             .send_generate_content(contents, system_instruction, model, temperature)
             .await?;
 
         Ok(ChatResponse {
-            text,
+            text: Some(text),
             tool_calls: Vec::new(),
             usage,
             reasoning_content: None,
-            quota_metadata: None,
-            stop_reason,
-            raw_stop_reason,
         })
     }
 
@@ -1675,7 +1542,7 @@ mod tests {
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
-                parts: vec![Part::Text {
+                parts: vec![Part {
                     text: "hello".into(),
                 }],
             }],
@@ -1716,7 +1583,7 @@ mod tests {
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
-                parts: vec![Part::Text {
+                parts: vec![Part {
                     text: "hello".into(),
                 }],
             }],
@@ -1760,7 +1627,7 @@ mod tests {
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
-                parts: vec![Part::Text {
+                parts: vec![Part {
                     text: "hello".into(),
                 }],
             }],
@@ -1792,13 +1659,13 @@ mod tests {
         let request = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".to_string()),
-                parts: vec![Part::Text {
+                parts: vec![Part {
                     text: "Hello".to_string(),
                 }],
             }],
             system_instruction: Some(Content {
                 role: None,
-                parts: vec![Part::Text {
+                parts: vec![Part {
                     text: "You are helpful".to_string(),
                 }],
             }),
@@ -1818,74 +1685,6 @@ mod tests {
     }
 
     #[test]
-    fn build_user_parts_text_only_is_backward_compatible() {
-        let content = "Plain text message without image markers.";
-        let parts = GeminiProvider::build_user_parts(content);
-        assert_eq!(parts.len(), 1);
-        match &parts[0] {
-            Part::Text { text } => assert_eq!(text, content),
-            Part::InlineData { .. } => panic!("text-only message must stay text-only"),
-        }
-    }
-
-    #[test]
-    fn build_user_parts_single_image() {
-        let parts = GeminiProvider::build_user_parts(
-            "Describe this image [IMAGE:data:image/png;base64,aGVsbG8=]",
-        );
-        assert_eq!(parts.len(), 2);
-        match &parts[0] {
-            Part::Text { text } => assert_eq!(text, "Describe this image"),
-            Part::InlineData { .. } => panic!("first part should be text"),
-        }
-        match &parts[1] {
-            Part::InlineData { inline_data } => {
-                assert_eq!(inline_data.mime_type, "image/png");
-                assert_eq!(inline_data.data, "aGVsbG8=");
-            }
-            Part::Text { .. } => panic!("second part should be inline image data"),
-        }
-    }
-
-    #[test]
-    fn build_user_parts_multiple_images() {
-        let parts = GeminiProvider::build_user_parts(
-            "Compare [IMAGE:data:image/png;base64,aQ==] and [IMAGE:data:image/jpeg;base64,ag==]",
-        );
-        assert_eq!(parts.len(), 3);
-        assert!(matches!(parts[0], Part::Text { .. }));
-        assert!(matches!(parts[1], Part::InlineData { .. }));
-        assert!(matches!(parts[2], Part::InlineData { .. }));
-    }
-
-    #[test]
-    fn build_user_parts_image_only() {
-        let parts = GeminiProvider::build_user_parts("[IMAGE:data:image/webp;base64,YWJjZA==]");
-        assert_eq!(parts.len(), 1);
-        match &parts[0] {
-            Part::InlineData { inline_data } => {
-                assert_eq!(inline_data.mime_type, "image/webp");
-                assert_eq!(inline_data.data, "YWJjZA==");
-            }
-            Part::Text { .. } => panic!("image-only message should create inline image part"),
-        }
-    }
-
-    #[test]
-    fn build_user_parts_fallback_for_non_data_uri_markers() {
-        let parts = GeminiProvider::build_user_parts("Inspect [IMAGE:https://example.com/img.png]");
-        assert_eq!(parts.len(), 2);
-        match &parts[0] {
-            Part::Text { text } => assert_eq!(text, "Inspect"),
-            Part::InlineData { .. } => panic!("first part should be text"),
-        }
-        match &parts[1] {
-            Part::Text { text } => assert_eq!(text, "[IMAGE:https://example.com/img.png]"),
-            Part::InlineData { .. } => panic!("invalid markers should fall back to text"),
-        }
-    }
-
-    #[test]
     fn internal_request_includes_model() {
         let request = InternalGenerateContentEnvelope {
             model: "gemini-3-pro-preview".to_string(),
@@ -1894,7 +1693,7 @@ mod tests {
             request: InternalGenerateContentRequest {
                 contents: vec![Content {
                     role: Some("user".to_string()),
-                    parts: vec![Part::Text {
+                    parts: vec![Part {
                         text: "Hello".to_string(),
                     }],
                 }],
@@ -1926,7 +1725,7 @@ mod tests {
             request: InternalGenerateContentRequest {
                 contents: vec![Content {
                     role: Some("user".to_string()),
-                    parts: vec![Part::Text {
+                    parts: vec![Part {
                         text: "Hello".to_string(),
                     }],
                 }],
@@ -1949,7 +1748,7 @@ mod tests {
             request: InternalGenerateContentRequest {
                 contents: vec![Content {
                     role: Some("user".to_string()),
-                    parts: vec![Part::Text {
+                    parts: vec![Part {
                         text: "Hello".to_string(),
                     }],
                 }],
@@ -2291,22 +2090,6 @@ mod tests {
         }));
         let provider = test_provider(Some(GeminiAuth::OAuthToken(state.clone())));
         assert!(!provider.rotate_oauth_credential(&state).await);
-    }
-
-    #[test]
-    fn should_rotate_on_api_key_not_valid() {
-        assert!(GeminiProvider::should_rotate_oauth_on_error(
-            StatusCode::BAD_REQUEST,
-            r#"{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT"}}"#,
-        ));
-    }
-
-    #[test]
-    fn should_not_rotate_on_generic_bad_request() {
-        assert!(!GeminiProvider::should_rotate_oauth_on_error(
-            StatusCode::BAD_REQUEST,
-            r#"{"error":{"code":400,"message":"Invalid JSON payload","status":"INVALID_ARGUMENT"}}"#,
-        ));
     }
 
     #[test]

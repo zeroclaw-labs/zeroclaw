@@ -23,18 +23,6 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
         crate::MemoryCommands::Clear { key, category, yes } => {
             handle_clear(config, key, category, yes).await
         }
-        crate::MemoryCommands::Reindex { yes, progress } => {
-            if !yes {
-                println!("⚠️  This will rebuild all memory embeddings. Pass --yes to confirm.");
-                return Ok(());
-            }
-            println!("Reindexing memory embeddings (progress={progress})...");
-            let mem = create_cli_memory(config)?;
-            // Trigger a list to verify the backend is functional
-            let _ = mem.list(None, None).await?;
-            println!("✅ Reindex complete.");
-            Ok(())
-        }
     }
 }
 

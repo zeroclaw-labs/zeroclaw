@@ -1,12 +1,8 @@
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
-// TODO: detection and history modules removed from loop_
-// use crate::agent::loop_::detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
-// use crate::agent::loop_::history::{extract_facts_from_turns, TurnBuffer};
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
-use crate::agent::research::{self, ResearchPhaseConfig};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
@@ -19,100 +15,6 @@ use std::collections::HashMap;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
-
-const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
-
-// TODO: Stub definitions for removed modules (detection, history)
-// These allow agent.rs to compile but functionality is disabled
-#[derive(Debug, Clone)]
-struct TurnBuffer {
-    _dummy: (),
-}
-
-impl TurnBuffer {
-    fn new() -> Self {
-        Self { _dummy: () }
-    }
-
-    fn push(&mut self, _user: &str, _assistant: &str) {
-        // Stub: no-op
-    }
-
-    fn should_extract(&self) -> bool {
-        // Stub: never extract
-        false
-    }
-
-    fn drain_for_extraction(&mut self) -> Vec<(String, String)> {
-        // Stub: return empty
-        Vec::new()
-    }
-
-    fn mark_extract_success(&mut self) {
-        // Stub: no-op
-    }
-
-    fn is_empty(&self) -> bool {
-        // Stub: always empty
-        true
-    }
-}
-
-#[derive(Debug, Clone)]
-struct LoopDetectionConfig {
-    no_progress_threshold: usize,
-    ping_pong_cycles: usize,
-    failure_streak_threshold: usize,
-}
-
-struct LoopDetector {
-    _config: LoopDetectionConfig,
-}
-
-impl LoopDetector {
-    fn new(config: LoopDetectionConfig) -> Self {
-        Self { _config: config }
-    }
-
-    fn report_tool_call(&mut self, _tool_name: &str, _success: bool) -> DetectionVerdict {
-        DetectionVerdict::Continue
-    }
-
-    fn record_call(&mut self, _tool_name: &str, _args: &str, _output: &str, _success: bool) {
-        // Stub: no-op
-    }
-
-    fn check(&self) -> DetectionVerdict {
-        // Stub: always continue
-        DetectionVerdict::Continue
-    }
-}
-
-#[derive(Debug)]
-enum DetectionVerdict {
-    Continue,
-    InjectWarning(String),
-    HardStop(String),
-}
-
-struct FactExtractionResult {
-    stored: usize,
-    no_facts: bool,
-}
-
-async fn extract_facts_from_turns(
-    _provider: &dyn crate::providers::Provider,
-    _model: &str,
-    _turns: &[(String, String)],
-    _memory: &dyn crate::memory::Memory,
-    _session_id: Option<&str>,
-) -> FactExtractionResult {
-    // Stub: return empty result
-    FactExtractionResult {
-        stored: 0,
-        no_facts: true,
-    }
-}
 
 pub struct Agent {
     provider: Box<dyn Provider>,
@@ -131,13 +33,10 @@ pub struct Agent {
     skills: Vec<crate::skills::Skill>,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     auto_save: bool,
-    session_id: Option<String>,
-    turn_buffer: TurnBuffer,
     history: Vec<ConversationMessage>,
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
     route_model_by_hint: HashMap<String, String>,
-    research_config: ResearchPhaseConfig,
 }
 
 pub struct AgentBuilder {
@@ -156,11 +55,9 @@ pub struct AgentBuilder {
     skills: Option<Vec<crate::skills::Skill>>,
     skills_prompt_mode: Option<crate::config::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
-    session_id: Option<String>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
     route_model_by_hint: Option<HashMap<String, String>>,
-    research_config: Option<ResearchPhaseConfig>,
 }
 
 impl AgentBuilder {
@@ -181,11 +78,9 @@ impl AgentBuilder {
             skills: None,
             skills_prompt_mode: None,
             auto_save: None,
-            session_id: None,
             classification_config: None,
             available_hints: None,
             route_model_by_hint: None,
-            research_config: None,
         }
     }
 
@@ -267,12 +162,6 @@ impl AgentBuilder {
         self
     }
 
-    /// Set the session identifier for memory isolation across users/channels.
-    pub fn session_id(mut self, session_id: String) -> Self {
-        self.session_id = Some(session_id);
-        self
-    }
-
     pub fn classification_config(
         mut self,
         classification_config: crate::config::QueryClassificationConfig,
@@ -288,11 +177,6 @@ impl AgentBuilder {
 
     pub fn route_model_by_hint(mut self, route_model_by_hint: HashMap<String, String>) -> Self {
         self.route_model_by_hint = Some(route_model_by_hint);
-        self
-    }
-
-    pub fn research_config(mut self, research_config: ResearchPhaseConfig) -> Self {
-        self.research_config = Some(research_config);
         self
     }
 
@@ -324,7 +208,9 @@ impl AgentBuilder {
                 .memory_loader
                 .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
             config: self.config.unwrap_or_default(),
-            model_name: crate::config::resolve_default_model_id(self.model_name.as_deref(), None),
+            model_name: self
+                .model_name
+                .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into()),
             temperature: self.temperature.unwrap_or(0.7),
             workspace_dir: self
                 .workspace_dir
@@ -333,13 +219,10 @@ impl AgentBuilder {
             skills: self.skills.unwrap_or_default(),
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
-            session_id: self.session_id,
-            turn_buffer: TurnBuffer::new(),
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
-            research_config: self.research_config.unwrap_or_default(),
         })
     }
 }
@@ -347,10 +230,6 @@ impl AgentBuilder {
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
-    }
-
-    pub fn tool_specs(&self) -> &[ToolSpec] {
-        &self.tool_specs
     }
 
     pub fn history(&self) -> &[ConversationMessage] {
@@ -362,12 +241,6 @@ impl Agent {
     }
 
     pub fn from_config(config: &Config) -> Result<Self> {
-        // TODO: plugins module removed
-        // if let Err(error) = crate::plugins::runtime::initialize_from_config(&config.plugins) {
-        if let Err(error) = Ok::<(), anyhow::Error>(()) {
-            tracing::warn!("plugin registry initialization skipped: {error}");
-        }
-
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
         let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -396,7 +269,7 @@ impl Agent {
             None
         };
 
-        let mut tools = tools::all_tools_with_runtime(
+        let tools = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             runtime,
@@ -412,58 +285,13 @@ impl Agent {
             config,
         );
 
-        // Register skill tools as native function-calling tools
-        let skills = crate::skills::load_skills_with_config(&config.workspace_dir, config);
-        let skill_tools = crate::skills::create_skill_tools(&skills, Arc::clone(&security));
-        if !skill_tools.is_empty() {
-            tracing::info!("Registered {} native skill tool(s)", skill_tools.len());
-            tools.extend(skill_tools);
-        }
-
-        let (tools, _bg_job_store) = tools::add_bg_tools(tools);
-        let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        tracing::info!(
-            count = tools.len(),
-            "Agent tools after add_bg_tools: {:?}",
-            tool_names
-        );
-        let (tools, tool_filter_report) = tools::filter_primary_agent_tools(
-            tools,
-            &config.agent.allowed_tools,
-            &config.agent.denied_tools,
-        );
-        for unmatched in tool_filter_report.unmatched_allowed_tools {
-            tracing::debug!(
-                tool = %unmatched,
-                "agent.allowed_tools entry did not match any registered tool"
-            );
-        }
-        let has_agent_allowlist = config
-            .agent
-            .allowed_tools
-            .iter()
-            .any(|entry| !entry.trim().is_empty());
-        let has_agent_denylist = config
-            .agent
-            .denied_tools
-            .iter()
-            .any(|entry| !entry.trim().is_empty());
-        if has_agent_allowlist
-            && has_agent_denylist
-            && tool_filter_report.allowlist_match_count > 0
-            && tools.is_empty()
-        {
-            anyhow::bail!(
-                "agent.allowed_tools and agent.denied_tools removed all executable tools; update [agent] tool filters"
-            );
-        }
-
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
 
-        let model_name = crate::config::resolve_default_model_id(
-            config.default_model.as_deref(),
-            Some(provider_name),
-        );
+        let model_name = config
+            .default_model
+            .as_deref()
+            .unwrap_or("anthropic/claude-sonnet-4-20250514")
+            .to_string();
 
         let provider: Box<dyn Provider> = providers::create_routed_provider(
             provider_name,
@@ -514,7 +342,6 @@ impl Agent {
             ))
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
-            .research_config(config.research.clone().into())
             .build()
     }
 
@@ -562,38 +389,37 @@ impl Agent {
     async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
         let start = Instant::now();
 
-        let (result, success) =
-            if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
-                match tool.execute(call.arguments.clone()).await {
-                    Ok(r) => {
-                        self.observer.record_event(&ObserverEvent::ToolCall {
-                            tool: call.name.clone(),
-                            duration: start.elapsed(),
-                            success: r.success,
-                        });
-                        if r.success {
-                            (r.output, true)
-                        } else {
-                            (format!("Error: {}", r.error.unwrap_or(r.output)), false)
-                        }
-                    }
-                    Err(e) => {
-                        self.observer.record_event(&ObserverEvent::ToolCall {
-                            tool: call.name.clone(),
-                            duration: start.elapsed(),
-                            success: false,
-                        });
-                        (format!("Error executing {}: {e}", call.name), false)
+        let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
+            match tool.execute(call.arguments.clone()).await {
+                Ok(r) => {
+                    self.observer.record_event(&ObserverEvent::ToolCall {
+                        tool: call.name.clone(),
+                        duration: start.elapsed(),
+                        success: r.success,
+                    });
+                    if r.success {
+                        r.output
+                    } else {
+                        format!("Error: {}", r.error.unwrap_or(r.output))
                     }
                 }
-            } else {
-                (format!("Unknown tool: {}", call.name), false)
-            };
+                Err(e) => {
+                    self.observer.record_event(&ObserverEvent::ToolCall {
+                        tool: call.name.clone(),
+                        duration: start.elapsed(),
+                        success: false,
+                    });
+                    format!("Error executing {}: {e}", call.name)
+                }
+            }
+        } else {
+            format!("Unknown tool: {}", call.name)
+        };
 
         ToolExecutionResult {
             name: call.name.clone(),
             output: result,
-            success,
+            success: true,
             tool_call_id: call.tool_call_id.clone(),
         }
     }
@@ -645,22 +471,12 @@ impl Agent {
                 .push(ConversationMessage::Chat(ChatMessage::system(
                     system_prompt,
                 )));
-        } else if let Some(ConversationMessage::Chat(_system_msg)) = self.history.first_mut() {
-            // TODO: refresh_prompt_datetime removed
-            // if system_msg.role == "system" {
-            //     crate::agent::prompt::refresh_prompt_datetime(&mut system_msg.content);
-            // }
         }
 
         if self.auto_save {
             let _ = self
                 .memory
-                .store(
-                    "user_msg",
-                    user_message,
-                    MemoryCategory::Conversation,
-                    self.session_id.as_deref(),
-                )
+                .store("user_msg", user_message, MemoryCategory::Conversation, None)
                 .await;
         }
 
@@ -670,73 +486,19 @@ impl Agent {
             .await
             .unwrap_or_default();
 
-        // ── Research Phase ──────────────────────────────────────────────
-        // If enabled and triggered, run a focused research turn to gather
-        // information before the main response.
-        let research_context = if research::should_trigger(&self.research_config, user_message) {
-            if self.research_config.show_progress {
-                println!("[Research] Gathering information...");
-            }
-
-            match research::run_research_phase(
-                &self.research_config,
-                self.provider.as_ref(),
-                &self.tools,
-                user_message,
-                &self.model_name,
-                self.temperature,
-                self.observer.clone(),
-            )
-            .await
-            {
-                Ok(result) => {
-                    if self.research_config.show_progress {
-                        println!(
-                            "[Research] Complete: {} tool calls, {} chars context",
-                            result.tool_call_count,
-                            result.context.len()
-                        );
-                        for summary in &result.tool_summaries {
-                            println!("  - {}: {}", summary.tool_name, summary.result_preview);
-                        }
-                    }
-                    if result.context.is_empty() {
-                        None
-                    } else {
-                        Some(result.context)
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Research phase failed: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-        let stamped_user_message = format!("[{now}] {user_message}");
-        let enriched = match (&context, &research_context) {
-            (c, Some(r)) if !c.is_empty() => {
-                format!("{c}\n\n{r}\n\n{stamped_user_message}")
-            }
-            (_, Some(r)) => format!("{r}\n\n{stamped_user_message}"),
-            (c, None) if !c.is_empty() => format!("{c}{stamped_user_message}"),
-            _ => stamped_user_message,
+        let enriched = if context.is_empty() {
+            format!("[{now}] {user_message}")
+        } else {
+            format!("{context}[{now}] {user_message}")
         };
 
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
         let effective_model = self.classify_model(user_message);
-        let mut loop_detector = LoopDetector::new(LoopDetectionConfig {
-            no_progress_threshold: self.config.loop_detection_no_progress_threshold,
-            ping_pong_cycles: self.config.loop_detection_ping_pong_cycles,
-            failure_streak_threshold: self.config.loop_detection_failure_streak,
-        });
 
-        for iteration in 0..self.config.max_tool_iterations {
+        for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let response = match self
                 .provider
@@ -770,37 +532,7 @@ impl Agent {
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         final_text.clone(),
                     )));
-                if self.auto_save && final_text.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
-                    let _ = self
-                        .memory
-                        .store(
-                            "assistant_resp",
-                            &final_text,
-                            MemoryCategory::Conversation,
-                            self.session_id.as_deref(),
-                        )
-                        .await;
-                }
                 self.trim_history();
-
-                // ── Post-turn fact extraction ──────────────────────
-                if self.auto_save {
-                    self.turn_buffer.push(user_message, &final_text);
-                    if self.turn_buffer.should_extract() {
-                        let turns = self.turn_buffer.drain_for_extraction();
-                        let result = extract_facts_from_turns(
-                            self.provider.as_ref(),
-                            &self.model_name,
-                            &turns,
-                            self.memory.as_ref(),
-                            self.session_id.as_deref(),
-                        )
-                        .await;
-                        if result.stored > 0 || result.no_facts {
-                            self.turn_buffer.mark_extract_success();
-                        }
-                    }
-                }
 
                 return Ok(final_text);
             }
@@ -821,34 +553,9 @@ impl Agent {
             });
 
             let results = self.execute_tools(&calls).await;
-
-            // ── Loop detection: record calls ─────────────────────
-            for (call, result) in calls.iter().zip(results.iter()) {
-                let args_sig =
-                    serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
-                loop_detector.record_call(&call.name, &args_sig, &result.output, result.success);
-            }
-
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
             self.trim_history();
-
-            // ── Loop detection: check verdict ────────────────────
-            match loop_detector.check() {
-                DetectionVerdict::Continue => {}
-                DetectionVerdict::InjectWarning(warning) => {
-                    self.history
-                        .push(ConversationMessage::Chat(ChatMessage::user(warning)));
-                }
-                DetectionVerdict::HardStop(reason) => {
-                    anyhow::bail!(
-                        "Agent stopped early due to detected loop pattern (iteration {}/{}): {}",
-                        iteration + 1,
-                        self.config.max_tool_iterations,
-                        reason
-                    );
-                }
-            }
         }
 
         anyhow::bail!(
@@ -857,44 +564,8 @@ impl Agent {
         )
     }
 
-    /// Flush any remaining buffered turns for fact extraction.
-    /// Call this when the session/conversation ends to avoid losing
-    /// facts from short (< 5 turn) sessions.
-    ///
-    /// On failure the turns are restored so callers that keep the agent
-    /// alive can still fall back to compaction-based extraction.
-    pub async fn flush_turn_buffer(&mut self) {
-        if !self.auto_save || self.turn_buffer.is_empty() {
-            return;
-        }
-        let turns = self.turn_buffer.drain_for_extraction();
-        let result = extract_facts_from_turns(
-            self.provider.as_ref(),
-            &self.model_name,
-            &turns,
-            self.memory.as_ref(),
-            self.session_id.as_deref(),
-        )
-        .await;
-        if result.stored > 0 || result.no_facts {
-            self.turn_buffer.mark_extract_success();
-        } else {
-            // Restore turns so compaction fallback can still pick them up
-            // if the agent isn't dropped immediately.
-            tracing::warn!(
-                "Exit flush failed; restoring {} turn(s) to buffer",
-                turns.len()
-            );
-            for (u, a) in turns {
-                self.turn_buffer.push(&u, &a);
-            }
-        }
-    }
-
     pub async fn run_single(&mut self, message: &str) -> Result<String> {
-        let result = self.turn(message).await?;
-        self.flush_turn_buffer().await;
-        Ok(result)
+        self.turn(message).await
     }
 
     pub async fn run_interactive(&mut self) -> Result<()> {
@@ -920,7 +591,6 @@ impl Agent {
         }
 
         listen_handle.abort();
-        self.flush_turn_buffer().await;
         Ok(())
     }
 }
@@ -953,12 +623,8 @@ pub async fn run(
     let model_name = effective_config
         .default_model
         .as_deref()
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            crate::config::default_model_fallback_for_provider(Some(&provider_name)).to_string()
-        });
+        .unwrap_or("anthropic/claude-sonnet-4-20250514")
+        .to_string();
 
     agent.observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.clone(),
@@ -989,7 +655,6 @@ mod tests {
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::collections::HashMap;
-    use tempfile::TempDir;
 
     struct MockProvider {
         responses: Mutex<Vec<crate::providers::ChatResponse>>,
@@ -1020,9 +685,6 @@ mod tests {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
-                    quota_metadata: None,
-                    stop_reason: None,
-                    raw_stop_reason: None,
                 });
             }
             Ok(guard.remove(0))
@@ -1060,9 +722,6 @@ mod tests {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
-                    quota_metadata: None,
-                    stop_reason: None,
-                    raw_stop_reason: None,
                 });
             }
             Ok(guard.remove(0))
@@ -1102,9 +761,6 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
-                quota_metadata: None,
-                stop_reason: None,
-                raw_stop_reason: None,
             }]),
         });
 
@@ -1145,18 +801,12 @@ mod tests {
                     }],
                     usage: None,
                     reasoning_content: None,
-                    quota_metadata: None,
-                    stop_reason: None,
-                    raw_stop_reason: None,
                 },
                 crate::providers::ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
-                    quota_metadata: None,
-                    stop_reason: None,
-                    raw_stop_reason: None,
                 },
             ]),
         });
@@ -1198,9 +848,6 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
-                quota_metadata: None,
-                stop_reason: None,
-                raw_stop_reason: None,
             }]),
             seen_models: seen_models.clone(),
         });
@@ -1244,120 +891,5 @@ mod tests {
         assert_eq!(response, "classified");
         let seen = seen_models.lock();
         assert_eq!(seen.as_slice(), &["hint:fast".to_string()]);
-    }
-
-    #[test]
-    #[ignore = "plugin runtime removed during merge cleanup"]
-    fn from_config_loads_plugin_declared_tools() {
-        let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
-        let tmp = TempDir::new().expect("temp dir");
-        let plugin_dir = tmp.path().join("plugins");
-        std::fs::create_dir_all(&plugin_dir).expect("create plugin dir");
-        std::fs::create_dir_all(tmp.path().join("workspace")).expect("create workspace dir");
-
-        std::fs::write(
-            plugin_dir.join("agent_from_config.plugin.toml"),
-            r#"
-id = "agent-from-config"
-version = "1.0.0"
-module_path = "plugins/agent-from-config.wasm"
-wit_packages = ["zeroclaw:tools@1.0.0"]
-
-[[tools]]
-name = "__agent_from_config_plugin_tool"
-description = "plugin tool exposed for from_config tests"
-"#,
-        )
-        .expect("write plugin manifest");
-
-        let mut config = Config::default();
-        config.workspace_dir = tmp.path().join("workspace");
-        config.config_path = tmp.path().join("config.toml");
-        config.default_provider = Some("ollama".to_string());
-        config.memory.backend = "none".to_string();
-        config.plugins = crate::config::PluginsConfig {
-            enabled: true,
-            load_paths: vec![plugin_dir.to_string_lossy().to_string()],
-            ..crate::config::PluginsConfig::default()
-        };
-
-        let agent = Agent::from_config(&config).expect("agent from config should build");
-        assert!(agent
-            .tools
-            .iter()
-            .any(|tool| tool.name() == "__agent_from_config_plugin_tool"));
-    }
-
-    fn base_from_config_for_tool_filter_tests() -> Config {
-        let root = std::env::temp_dir().join(format!(
-            "zeroclaw_agent_tool_filter_{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(root.join("workspace")).expect("create workspace dir");
-
-        let mut config = Config::default();
-        config.workspace_dir = root.join("workspace");
-        config.config_path = root.join("config.toml");
-        config.default_provider = Some("ollama".to_string());
-        config.memory.backend = "none".to_string();
-        config
-    }
-
-    #[test]
-    fn from_config_primary_allowlist_filters_tools() {
-        let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
-        let mut config = base_from_config_for_tool_filter_tests();
-        config.agent.allowed_tools = vec!["shell".to_string()];
-
-        let agent = Agent::from_config(&config).expect("agent should build");
-        let names: Vec<&str> = agent.tools.iter().map(|tool| tool.name()).collect();
-        assert_eq!(names, vec!["shell"]);
-    }
-
-    #[test]
-    fn from_config_empty_allowlist_preserves_default_toolset() {
-        let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
-        let config = base_from_config_for_tool_filter_tests();
-
-        let agent = Agent::from_config(&config).expect("agent should build");
-        let names: Vec<&str> = agent.tools.iter().map(|tool| tool.name()).collect();
-        assert!(names.contains(&"shell"));
-        assert!(names.contains(&"file_read"));
-    }
-
-    #[test]
-    fn from_config_primary_denylist_removes_tools() {
-        let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
-        let mut config = base_from_config_for_tool_filter_tests();
-        config.agent.denied_tools = vec!["shell".to_string()];
-
-        let agent = Agent::from_config(&config).expect("agent should build");
-        let names: Vec<&str> = agent.tools.iter().map(|tool| tool.name()).collect();
-        assert!(!names.contains(&"shell"));
-    }
-
-    #[test]
-    fn from_config_unmatched_allowlist_entry_is_graceful() {
-        let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
-        let mut config = base_from_config_for_tool_filter_tests();
-        config.agent.allowed_tools = vec!["missing_tool".to_string()];
-
-        let agent = Agent::from_config(&config).expect("agent should build with empty toolset");
-        assert!(agent.tools.is_empty());
-    }
-
-    #[test]
-    fn from_config_conflicting_allow_and_deny_fails_fast() {
-        let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
-        let mut config = base_from_config_for_tool_filter_tests();
-        config.agent.allowed_tools = vec!["shell".to_string()];
-        config.agent.denied_tools = vec!["shell".to_string()];
-
-        let err = Agent::from_config(&config)
-            .err()
-            .expect("expected filter conflict");
-        assert!(err
-            .to_string()
-            .contains("agent.allowed_tools and agent.denied_tools removed all executable tools"));
     }
 }

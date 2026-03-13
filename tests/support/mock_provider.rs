@@ -46,9 +46,6 @@ impl Provider for MockProvider {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
-                quota_metadata: None,
-                stop_reason: None,
-                raw_stop_reason: None,
             });
         }
         Ok(guard.remove(0))
@@ -102,9 +99,6 @@ impl Provider for RecordingProvider {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
-                quota_metadata: None,
-                stop_reason: None,
-                raw_stop_reason: None,
             });
         }
         Ok(guard.remove(0))
@@ -174,9 +168,6 @@ impl Provider for TraceLlmProvider {
                     output_tokens: Some(output_tokens),
                 }),
                 reasoning_content: None,
-                quota_metadata: None,
-                stop_reason: None,
-                raw_stop_reason: None,
             }),
             TraceResponse::ToolCalls {
                 tool_calls,
@@ -199,9 +190,6 @@ impl Provider for TraceLlmProvider {
                         output_tokens: Some(output_tokens),
                     }),
                     reasoning_content: None,
-                    quota_metadata: None,
-                    stop_reason: None,
-                    raw_stop_reason: None,
                 })
             }
         }

@@ -1,4 +1,3 @@
-#![allow(unexpected_cfgs)]
 //! WASM sandbox runtime — in-process tool isolation via `wasmi`.
 //!
 //! Provides capability-based sandboxing without Docker or external runtimes.
@@ -13,100 +12,9 @@
 //! The default ZeroClaw binary excludes it to maintain the 4.6 MB size target.
 
 use super::traits::RuntimeAdapter;
+use crate::config::WasmRuntimeConfig;
 use anyhow::{bail, Context, Result};
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path, PathBuf};
-
-/// How the WASM runtime handles capability escalation requests.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WasmCapabilityEscalationMode {
-    /// Deny any capability request that exceeds the configured limits.
-    Deny,
-    /// Silently clamp requested capabilities to the configured limits.
-    Clamp,
-}
-
-/// Policy for verifying WASM module integrity via SHA-256 hashes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WasmModuleHashPolicy {
-    /// No hash verification.
-    Disabled,
-    /// Log warnings on mismatch but allow execution.
-    Warn,
-    /// Block execution on hash mismatch.
-    Enforce,
-}
-
-/// Security sub-configuration for the WASM runtime.
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone)]
-pub struct WasmSecurityConfig {
-    /// Require that the tools directory is a workspace-relative path.
-    pub require_workspace_relative_tools_dir: bool,
-    /// Policy for module hash verification.
-    pub module_hash_policy: WasmModuleHashPolicy,
-    /// SHA-256 pins for known WASM modules (module_name -> hex digest).
-    pub module_sha256: BTreeMap<String, String>,
-    /// Whether to reject invalid host entries instead of ignoring them.
-    pub strict_host_validation: bool,
-    /// How to handle capability escalation requests.
-    pub capability_escalation_mode: WasmCapabilityEscalationMode,
-    /// Reject symlinked tools directories.
-    pub reject_symlink_tools_dir: bool,
-    /// Reject symlinked module files.
-    pub reject_symlink_modules: bool,
-}
-
-impl Default for WasmSecurityConfig {
-    fn default() -> Self {
-        Self {
-            require_workspace_relative_tools_dir: true,
-            module_hash_policy: WasmModuleHashPolicy::Disabled,
-            module_sha256: BTreeMap::new(),
-            strict_host_validation: true,
-            capability_escalation_mode: WasmCapabilityEscalationMode::Deny,
-            reject_symlink_tools_dir: true,
-            reject_symlink_modules: true,
-        }
-    }
-}
-
-/// Configuration for the WASM sandbox runtime.
-#[derive(Debug, Clone)]
-pub struct WasmRuntimeConfig {
-    /// Maximum fuel (instruction budget) per invocation.
-    pub fuel_limit: u64,
-    /// Memory ceiling per module in megabytes.
-    pub memory_limit_mb: u64,
-    /// Maximum module file size in megabytes.
-    pub max_module_size_mb: u64,
-    /// Directory containing WASM tool modules (relative to workspace).
-    pub tools_dir: String,
-    /// Allowed network hosts for WASM modules.
-    pub allowed_hosts: Vec<String>,
-    /// Allow modules to read from the workspace directory.
-    pub allow_workspace_read: bool,
-    /// Allow modules to write to the workspace directory.
-    pub allow_workspace_write: bool,
-    /// Security sub-configuration.
-    pub security: WasmSecurityConfig,
-}
-
-impl Default for WasmRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            fuel_limit: 1_000_000,
-            memory_limit_mb: 64,
-            max_module_size_mb: 10,
-            tools_dir: ".zeroclaw/wasm-tools".to_string(),
-            allowed_hosts: Vec::new(),
-            allow_workspace_read: false,
-            allow_workspace_write: false,
-            security: WasmSecurityConfig::default(),
-        }
-    }
-}
+use std::path::{Path, PathBuf};
 
 /// WASM sandbox runtime — executes tool modules in an isolated interpreter.
 #[derive(Debug, Clone)]
@@ -126,8 +34,6 @@ pub struct WasmExecutionResult {
     pub exit_code: i32,
     /// Fuel consumed during execution
     pub fuel_consumed: u64,
-    /// SHA-256 digest (hex) of the executed module bytes.
-    pub module_sha256: String,
 }
 
 /// Capabilities granted to a WASM tool module.
@@ -146,9 +52,6 @@ pub struct WasmCapabilities {
 }
 
 impl WasmRuntime {
-    const MAX_MEMORY_MB: u64 = 4096;
-    const MAX_FUEL_LIMIT: u64 = 10_000_000_000;
-
     /// Create a new WASM runtime with the given configuration.
     pub fn new(config: WasmRuntimeConfig) -> Self {
         Self {
@@ -172,56 +75,21 @@ impl WasmRuntime {
 
     /// Validate the WASM config for common misconfigurations.
     pub fn validate_config(&self) -> Result<()> {
-        if self.config.fuel_limit == 0 {
-            bail!("runtime.wasm.fuel_limit must be > 0");
-        }
-        if self.config.fuel_limit > Self::MAX_FUEL_LIMIT {
-            bail!(
-                "runtime.wasm.fuel_limit of {} exceeds safety ceiling of {}",
-                self.config.fuel_limit,
-                Self::MAX_FUEL_LIMIT
-            );
-        }
         if self.config.memory_limit_mb == 0 {
             bail!("runtime.wasm.memory_limit_mb must be > 0");
         }
-        if self.config.memory_limit_mb > Self::MAX_MEMORY_MB {
+        if self.config.memory_limit_mb > 4096 {
             bail!(
                 "runtime.wasm.memory_limit_mb of {} exceeds the 4 GB safety limit for 32-bit WASM",
                 self.config.memory_limit_mb
             );
         }
-        if self.config.max_module_size_mb == 0 {
-            bail!("runtime.wasm.max_module_size_mb must be > 0");
-        }
         if self.config.tools_dir.is_empty() {
             bail!("runtime.wasm.tools_dir cannot be empty");
         }
-        if self.config.security.require_workspace_relative_tools_dir {
-            let tools_dir_path = Path::new(&self.config.tools_dir);
-            if tools_dir_path.is_absolute() {
-                bail!("runtime.wasm.tools_dir must be a workspace-relative path");
-            }
-            if tools_dir_path
-                .components()
-                .any(|c| matches!(c, Component::ParentDir))
-            {
-                bail!("runtime.wasm.tools_dir must not contain '..' path traversal");
-            }
-        }
-        let _ = self.normalize_hosts_with_policy(
-            self.config.allowed_hosts.iter().map(String::as_str),
-            "runtime.wasm.allowed_hosts",
-        )?;
-        let normalized_pins = self.normalize_module_sha256_pins()?;
-        if matches!(
-            self.config.security.module_hash_policy,
-            WasmModuleHashPolicy::Enforce
-        ) && normalized_pins.is_empty()
-        {
-            bail!(
-                "runtime.wasm.security.module_hash_policy='enforce' requires at least one module pin in runtime.wasm.security.module_sha256"
-            );
+        // Verify tools directory doesn't escape workspace
+        if self.config.tools_dir.contains("..") {
+            bail!("runtime.wasm.tools_dir must not contain '..' path traversal");
         }
         Ok(())
     }
@@ -245,7 +113,7 @@ impl WasmRuntime {
     /// Get the effective fuel limit for an invocation.
     pub fn effective_fuel(&self, caps: &WasmCapabilities) -> u64 {
         if caps.fuel_override > 0 {
-            caps.fuel_override.min(self.config.fuel_limit)
+            caps.fuel_override
         } else {
             self.config.fuel_limit
         }
@@ -254,273 +122,11 @@ impl WasmRuntime {
     /// Get the effective memory limit in bytes.
     pub fn effective_memory_bytes(&self, caps: &WasmCapabilities) -> u64 {
         let mb = if caps.memory_override_mb > 0 {
-            caps.memory_override_mb.min(self.config.memory_limit_mb)
+            caps.memory_override_mb
         } else {
             self.config.memory_limit_mb
         };
         mb.saturating_mul(1024 * 1024)
-    }
-
-    fn validate_module_name(module_name: &str) -> Result<()> {
-        if module_name.is_empty() {
-            bail!("WASM module name cannot be empty");
-        }
-        if module_name.len() > 128 {
-            bail!("WASM module name is too long (max 128 chars): {module_name}");
-        }
-        if !module_name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        {
-            bail!(
-                "WASM module name '{module_name}' contains invalid characters; \
-                 allowed set is [A-Za-z0-9_-]"
-            );
-        }
-        Ok(())
-    }
-
-    fn normalize_host(host: &str) -> Result<String> {
-        let normalized = host.trim().to_ascii_lowercase();
-        if normalized.is_empty() {
-            bail!("runtime.wasm.allowed_hosts contains an empty entry");
-        }
-        if normalized == "*" || normalized.contains('*') {
-            bail!(
-                "runtime.wasm.allowed_hosts entry '{host}' is invalid; wildcard hosts are not allowed"
-            );
-        }
-        if normalized.contains("://")
-            || normalized.contains('/')
-            || normalized.contains('?')
-            || normalized.contains('#')
-        {
-            bail!(
-                "runtime.wasm.allowed_hosts entry '{host}' must be host[:port] only (no scheme/path/query)"
-            );
-        }
-        if normalized.starts_with('.') || normalized.ends_with('.') {
-            bail!("runtime.wasm.allowed_hosts entry '{host}' must not start/end with '.'");
-        }
-        if normalized.starts_with('-') || normalized.ends_with('-') {
-            bail!("runtime.wasm.allowed_hosts entry '{host}' must not start/end with '-'");
-        }
-        if !normalized
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == ':')
-        {
-            bail!("runtime.wasm.allowed_hosts entry '{host}' contains invalid characters");
-        }
-
-        if let Some((host_part, port_part)) = normalized.rsplit_once(':') {
-            // Support host:port form while rejecting malformed host: segments.
-            if host_part.is_empty()
-                || port_part.is_empty()
-                || !port_part.chars().all(|c| c.is_ascii_digit())
-            {
-                bail!("runtime.wasm.allowed_hosts entry '{host}' has invalid port format");
-            }
-            if host_part.contains(':') {
-                bail!("runtime.wasm.allowed_hosts entry '{host}' has too many ':' separators");
-            }
-        }
-
-        Ok(normalized)
-    }
-
-    fn normalize_hosts_with_policy<'a, I>(&self, hosts: I, source: &str) -> Result<BTreeSet<String>>
-    where
-        I: IntoIterator<Item = &'a str>,
-    {
-        let mut normalized = BTreeSet::new();
-        for host in hosts {
-            match Self::normalize_host(host) {
-                Ok(value) => {
-                    normalized.insert(value);
-                }
-                Err(err) if self.config.security.strict_host_validation => return Err(err),
-                Err(err) => {
-                    tracing::warn!(
-                        host,
-                        source,
-                        error = %err,
-                        "Ignoring invalid WASM host entry because runtime.wasm.security.strict_host_validation=false"
-                    );
-                }
-            }
-        }
-        Ok(normalized)
-    }
-
-    fn normalize_sha256_pin(module_name: &str, raw: &str) -> Result<String> {
-        let normalized = raw.trim().to_ascii_lowercase();
-        if normalized.len() != 64 || !normalized.chars().all(|ch| ch.is_ascii_hexdigit()) {
-            bail!(
-                "runtime.wasm.security.module_sha256.{module_name} must be a 64-character hex SHA-256 digest"
-            );
-        }
-        Ok(normalized)
-    }
-
-    fn normalize_module_sha256_pins(&self) -> Result<BTreeMap<String, String>> {
-        let mut normalized = BTreeMap::new();
-        for (module_name, digest) in &self.config.security.module_sha256 {
-            Self::validate_module_name(module_name)?;
-            normalized.insert(
-                module_name.clone(),
-                Self::normalize_sha256_pin(module_name, digest)?,
-            );
-        }
-        Ok(normalized)
-    }
-
-    fn check_module_integrity(&self, module_name: &str, wasm_bytes: &[u8]) -> Result<String> {
-        let digest = hex::encode(Sha256::digest(wasm_bytes));
-        let normalized_pins = self.normalize_module_sha256_pins()?;
-        match self.config.security.module_hash_policy {
-            WasmModuleHashPolicy::Disabled => {}
-            WasmModuleHashPolicy::Warn => match normalized_pins.get(module_name) {
-                Some(expected) if expected == &digest => {}
-                Some(expected) => {
-                    tracing::warn!(
-                        module = module_name,
-                        expected_sha256 = expected,
-                        actual_sha256 = digest,
-                        "WASM module SHA-256 mismatch (warn mode)"
-                    );
-                }
-                None => {
-                    tracing::warn!(
-                        module = module_name,
-                        actual_sha256 = digest,
-                        "WASM module has no SHA-256 pin configured (warn mode)"
-                    );
-                }
-            },
-            WasmModuleHashPolicy::Enforce => match normalized_pins.get(module_name) {
-                Some(expected) if expected == &digest => {}
-                Some(expected) => {
-                    bail!(
-                        "WASM module integrity mismatch for '{module_name}': expected sha256={expected}, got sha256={digest}"
-                    );
-                }
-                None => {
-                    bail!(
-                        "WASM module '{module_name}' is missing required SHA-256 pin (runtime.wasm.security.module_hash_policy='enforce')"
-                    );
-                }
-            },
-        }
-        Ok(digest)
-    }
-
-    fn validate_capabilities(&self, caps: &WasmCapabilities) -> Result<WasmCapabilities> {
-        let default_hosts = self.normalize_hosts_with_policy(
-            self.config.allowed_hosts.iter().map(String::as_str),
-            "runtime.wasm.allowed_hosts",
-        )?;
-        let requested_hosts = self.normalize_hosts_with_policy(
-            caps.allowed_hosts.iter().map(String::as_str),
-            "wasm invocation allowed_hosts",
-        )?;
-
-        match self.config.security.capability_escalation_mode {
-            WasmCapabilityEscalationMode::Deny => {
-                if caps.read_workspace && !self.config.allow_workspace_read {
-                    bail!(
-                        "WASM capability escalation blocked: read_workspace requested but runtime.wasm.allow_workspace_read is false"
-                    );
-                }
-                if caps.write_workspace && !self.config.allow_workspace_write {
-                    bail!(
-                        "WASM capability escalation blocked: write_workspace requested but runtime.wasm.allow_workspace_write is false"
-                    );
-                }
-                if caps.fuel_override > self.config.fuel_limit {
-                    bail!(
-                        "WASM capability escalation blocked: fuel_override={} exceeds runtime.wasm.fuel_limit={}",
-                        caps.fuel_override,
-                        self.config.fuel_limit
-                    );
-                }
-                if caps.memory_override_mb > self.config.memory_limit_mb {
-                    bail!(
-                        "WASM capability escalation blocked: memory_override_mb={} exceeds runtime.wasm.memory_limit_mb={}",
-                        caps.memory_override_mb,
-                        self.config.memory_limit_mb
-                    );
-                }
-                for host in &requested_hosts {
-                    if !default_hosts.contains(host) {
-                        bail!(
-                            "WASM capability escalation blocked: host '{host}' is not in runtime.wasm.allowed_hosts"
-                        );
-                    }
-                }
-                Ok(WasmCapabilities {
-                    read_workspace: caps.read_workspace,
-                    write_workspace: caps.write_workspace,
-                    allowed_hosts: requested_hosts.into_iter().collect(),
-                    fuel_override: caps.fuel_override,
-                    memory_override_mb: caps.memory_override_mb,
-                })
-            }
-            WasmCapabilityEscalationMode::Clamp => {
-                let mut effective = WasmCapabilities {
-                    read_workspace: caps.read_workspace && self.config.allow_workspace_read,
-                    write_workspace: caps.write_workspace && self.config.allow_workspace_write,
-                    allowed_hosts: requested_hosts
-                        .intersection(&default_hosts)
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                    fuel_override: if caps.fuel_override > self.config.fuel_limit {
-                        self.config.fuel_limit
-                    } else {
-                        caps.fuel_override
-                    },
-                    memory_override_mb: if caps.memory_override_mb > self.config.memory_limit_mb {
-                        self.config.memory_limit_mb
-                    } else {
-                        caps.memory_override_mb
-                    },
-                };
-
-                if caps.read_workspace && !effective.read_workspace {
-                    tracing::warn!(
-                        "Clamped WASM read_workspace request because runtime.wasm.allow_workspace_read=false"
-                    );
-                }
-                if caps.write_workspace && !effective.write_workspace {
-                    tracing::warn!(
-                        "Clamped WASM write_workspace request because runtime.wasm.allow_workspace_write=false"
-                    );
-                }
-                if caps.fuel_override > self.config.fuel_limit {
-                    tracing::warn!(
-                        requested = caps.fuel_override,
-                        allowed = self.config.fuel_limit,
-                        "Clamped WASM fuel_override to runtime.wasm.fuel_limit"
-                    );
-                }
-                if caps.memory_override_mb > self.config.memory_limit_mb {
-                    tracing::warn!(
-                        requested = caps.memory_override_mb,
-                        allowed = self.config.memory_limit_mb,
-                        "Clamped WASM memory_override_mb to runtime.wasm.memory_limit_mb"
-                    );
-                }
-                if effective.allowed_hosts.len() != requested_hosts.len() {
-                    tracing::warn!(
-                        requested = requested_hosts.len(),
-                        allowed = effective.allowed_hosts.len(),
-                        "Clamped WASM allowed_hosts to runtime.wasm.allowed_hosts"
-                    );
-                }
-
-                effective.allowed_hosts.sort();
-                Ok(effective)
-            }
-        }
     }
 
     /// Execute a WASM module from the tools directory.
@@ -537,129 +143,32 @@ impl WasmRuntime {
     ) -> Result<WasmExecutionResult> {
         use wasmi::{Engine, Linker, Module, Store};
 
-        self.validate_config()?;
-        Self::validate_module_name(module_name)?;
-        let effective_caps = self.validate_capabilities(caps)?;
-
-        // Resolve and normalize module path.
+        // Resolve module path
         let tools_path = self.tools_dir(workspace_dir);
-        if !tools_path.exists() {
-            bail!(
-                "WASM tools directory does not exist: {}",
-                tools_path.display()
-            );
-        }
-        if self.config.security.reject_symlink_tools_dir {
-            let tools_meta = std::fs::symlink_metadata(&tools_path).with_context(|| {
-                format!(
-                    "Failed to inspect WASM tools directory metadata: {}",
-                    tools_path.display()
-                )
-            })?;
-            if tools_meta.file_type().is_symlink() {
-                bail!(
-                    "WASM tools directory must not be a symlink: {}",
-                    tools_path.display()
-                );
-            }
-        }
-        let canonical_tools_path = std::fs::canonicalize(&tools_path).with_context(|| {
-            format!(
-                "Failed to canonicalize WASM tools directory: {}",
-                tools_path.display()
-            )
-        })?;
-        if !canonical_tools_path.is_dir() {
-            bail!(
-                "WASM tools path is not a directory: {}",
-                canonical_tools_path.display()
-            );
-        }
-        let module_path = canonical_tools_path.join(format!("{module_name}.wasm"));
+        let module_path = tools_path.join(format!("{module_name}.wasm"));
 
         if !module_path.exists() {
             bail!(
                 "WASM module not found: {} (looked in {})",
                 module_name,
-                canonical_tools_path.display()
-            );
-        }
-        if self.config.security.reject_symlink_modules {
-            let module_symlink_meta =
-                std::fs::symlink_metadata(&module_path).with_context(|| {
-                    format!(
-                        "Failed to inspect WASM module metadata: {}",
-                        module_path.display()
-                    )
-                })?;
-            if module_symlink_meta.file_type().is_symlink() {
-                bail!(
-                    "WASM module path must not be a symlink: {}",
-                    module_path.display()
-                );
-            }
-        }
-        let canonical_module_path = std::fs::canonicalize(&module_path).with_context(|| {
-            format!(
-                "Failed to canonicalize WASM module path: {}",
-                module_path.display()
-            )
-        })?;
-        if !canonical_module_path.starts_with(&canonical_tools_path) {
-            bail!(
-                "WASM module path escapes tools directory: {}",
-                canonical_module_path.display()
-            );
-        }
-        if canonical_module_path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            != Some("wasm")
-        {
-            bail!(
-                "WASM module path must end with .wasm: {}",
-                canonical_module_path.display()
-            );
-        }
-        if !canonical_module_path.is_file() {
-            bail!(
-                "WASM module path is not a file: {}",
-                canonical_module_path.display()
-            );
-        }
-
-        let module_size_bytes = std::fs::metadata(&canonical_module_path)
-            .with_context(|| {
-                format!(
-                    "Failed to read WASM module metadata: {}",
-                    canonical_module_path.display()
-                )
-            })?
-            .len();
-        let max_size_bytes = self.config.max_module_size_mb * 1024 * 1024;
-        if module_size_bytes > max_size_bytes {
-            bail!(
-                "WASM module {} is {} MB — exceeds configured {} MB safety limit",
-                module_name,
-                module_size_bytes / (1024 * 1024),
-                self.config.max_module_size_mb
+                tools_path.display()
             );
         }
 
         // Read module bytes
-        let wasm_bytes = std::fs::read(&canonical_module_path).with_context(|| {
-            format!(
-                "Failed to read WASM module: {}",
-                canonical_module_path.display()
-            )
-        })?;
-        let module_sha256 = self.check_module_integrity(module_name, &wasm_bytes)?;
+        let wasm_bytes = std::fs::read(&module_path)
+            .with_context(|| format!("Failed to read WASM module: {}", module_path.display()))?;
 
-        // Configure engine with fuel metering.
-        // TODO(runtime-wasm): enforce memory_limit_mb at instantiation time via MemoryType
-        // limits once wasmi exposes per-instance memory ceilings. Currently fuel metering
-        // is the primary execution bound; memory_limit_mb is validated at config load but
-        // not enforced during module execution. Track in: wasm memory enforcement.
+        // Validate module size (sanity check)
+        if wasm_bytes.len() > 50 * 1024 * 1024 {
+            bail!(
+                "WASM module {} is {} MB — exceeds 50 MB safety limit",
+                module_name,
+                wasm_bytes.len() / (1024 * 1024)
+            );
+        }
+
+        // Configure engine with fuel metering
         let mut engine_config = wasmi::Config::default();
         engine_config.consume_fuel(true);
         let engine = Engine::new(&engine_config);
@@ -670,7 +179,7 @@ impl WasmRuntime {
 
         // Create store with fuel budget
         let mut store = Store::new(&engine, ());
-        let fuel = self.effective_fuel(&effective_caps);
+        let fuel = self.effective_fuel(caps);
         if fuel > 0 {
             store.set_fuel(fuel).with_context(|| {
                 format!("Failed to set fuel budget ({fuel}) for module: {module_name}")
@@ -682,7 +191,8 @@ impl WasmRuntime {
 
         // Instantiate module
         let instance = linker
-            .instantiate_and_start(&mut store, &module)
+            .instantiate(&mut store, &module)
+            .and_then(|pre| pre.start(&mut store))
             .with_context(|| format!("Failed to instantiate WASM module: {module_name}"))?;
 
         // Look for exported entry point
@@ -710,7 +220,6 @@ impl WasmRuntime {
                         ),
                         exit_code: -1,
                         fuel_consumed: fuel,
-                        module_sha256: module_sha256.clone(),
                     });
                 }
                 bail!("WASM execution error in '{module_name}': {e}");
@@ -720,11 +229,10 @@ impl WasmRuntime {
         let fuel_consumed = fuel_before.saturating_sub(fuel_after);
 
         Ok(WasmExecutionResult {
-            stdout: String::new(), // No WASI stdout yet — pure computation
+            stdout: String::new(),  // No WASI stdout yet — pure computation
             stderr: String::new(),
             exit_code,
             fuel_consumed,
-            module_sha256,
         })
     }
 
@@ -758,10 +266,7 @@ impl WasmRuntime {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "wasm") {
                 if let Some(stem) = path.file_stem() {
-                    let module_name = stem.to_string_lossy().to_string();
-                    if Self::validate_module_name(&module_name).is_ok() {
-                        modules.push(module_name);
-                    }
+                    modules.push(stem.to_string_lossy().to_string());
                 }
             }
         }
@@ -771,10 +276,6 @@ impl WasmRuntime {
 }
 
 impl RuntimeAdapter for WasmRuntime {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "wasm"
     }
@@ -878,10 +379,7 @@ mod tests {
         let rt = WasmRuntime::new(default_config());
         let result = rt.build_shell_command("echo hello", Path::new("/tmp"));
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("does not support shell"));
+        assert!(result.unwrap_err().to_string().contains("does not support shell"));
     }
 
     #[test]
@@ -893,10 +391,7 @@ mod tests {
     #[test]
     fn wasm_storage_path_with_workspace() {
         let rt = WasmRuntime::with_workspace(default_config(), PathBuf::from("/home/user/project"));
-        assert_eq!(
-            rt.storage_path(),
-            PathBuf::from("/home/user/project/.zeroclaw")
-        );
+        assert_eq!(rt.storage_path(), PathBuf::from("/home/user/project/.zeroclaw"));
     }
 
     // ── Config validation ──────────────────────────────────────
@@ -920,39 +415,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_zero_fuel() {
-        let mut cfg = default_config();
-        cfg.fuel_limit = 0;
-        let rt = WasmRuntime::new(cfg);
-        let err = rt.validate_config().unwrap_err();
-        assert!(err.to_string().contains("fuel_limit"));
-    }
-
-    #[test]
-    fn validate_rejects_zero_max_module_size() {
-        let mut cfg = default_config();
-        cfg.max_module_size_mb = 0;
-        let rt = WasmRuntime::new(cfg);
-        let err = rt.validate_config().unwrap_err();
-        assert!(err.to_string().contains("max_module_size_mb"));
-    }
-
-    #[test]
     fn validate_rejects_empty_tools_dir() {
         let mut cfg = default_config();
         cfg.tools_dir = String::new();
         let rt = WasmRuntime::new(cfg);
         let err = rt.validate_config().unwrap_err();
         assert!(err.to_string().contains("cannot be empty"));
-    }
-
-    #[test]
-    fn validate_rejects_absolute_tools_dir() {
-        let mut cfg = default_config();
-        cfg.tools_dir = "/tmp/wasm-tools".into();
-        let rt = WasmRuntime::new(cfg);
-        let err = rt.validate_config().unwrap_err();
-        assert!(err.to_string().contains("workspace-relative"));
     }
 
     #[test]
@@ -965,77 +433,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_allows_absolute_tools_dir_when_configured() {
-        let mut cfg = default_config();
-        cfg.tools_dir = "/tmp/wasm-tools".into();
-        cfg.security.require_workspace_relative_tools_dir = false;
-        let rt = WasmRuntime::new(cfg);
-        assert!(rt.validate_config().is_ok());
-    }
-
-    #[test]
-    fn validate_allows_path_traversal_when_configured() {
-        let mut cfg = default_config();
-        cfg.tools_dir = "../../../etc/passwd".into();
-        cfg.security.require_workspace_relative_tools_dir = false;
-        let rt = WasmRuntime::new(cfg);
-        assert!(rt.validate_config().is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_wildcard_host_entries() {
-        let mut cfg = default_config();
-        cfg.allowed_hosts = vec!["*.example.com".into()];
-        let rt = WasmRuntime::new(cfg);
-        let err = rt.validate_config().unwrap_err();
-        assert!(err.to_string().contains("wildcard"));
-    }
-
-    #[test]
-    fn validate_ignores_invalid_host_entries_when_non_strict() {
-        let mut cfg = default_config();
-        cfg.allowed_hosts = vec!["*.example.com".into(), "api.example.com".into()];
-        cfg.security.strict_host_validation = false;
-        let rt = WasmRuntime::new(cfg);
-        assert!(rt.validate_config().is_ok());
-    }
-
-    #[test]
     fn validate_accepts_valid_config() {
         let rt = WasmRuntime::new(default_config());
         assert!(rt.validate_config().is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_invalid_module_sha256_pin_format() {
-        let mut cfg = default_config();
-        cfg.security
-            .module_sha256
-            .insert("calc".into(), "not-a-sha256".into());
-        let rt = WasmRuntime::new(cfg);
-        let err = rt.validate_config().unwrap_err();
-        assert!(err.to_string().contains("64-character hex"));
-    }
-
-    #[test]
-    fn validate_rejects_invalid_module_sha256_pin_name() {
-        let mut cfg = default_config();
-        cfg.security.module_sha256.insert(
-            "bad$name".into(),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-        );
-        let rt = WasmRuntime::new(cfg);
-        let err = rt.validate_config().unwrap_err();
-        assert!(err.to_string().contains("invalid characters"));
-    }
-
-    #[test]
-    fn validate_rejects_enforce_hash_policy_without_pins() {
-        let mut cfg = default_config();
-        cfg.security.module_hash_policy = WasmModuleHashPolicy::Enforce;
-        let rt = WasmRuntime::new(cfg);
-        let err = rt.validate_config().unwrap_err();
-        assert!(err.to_string().contains("requires at least one module pin"));
     }
 
     #[test]
@@ -1066,18 +466,6 @@ mod tests {
     }
 
     #[test]
-    fn effective_fuel_clamps_override_to_config_limit() {
-        let mut cfg = default_config();
-        cfg.fuel_limit = 10;
-        let rt = WasmRuntime::new(cfg);
-        let caps = WasmCapabilities {
-            fuel_override: 99,
-            ..Default::default()
-        };
-        assert_eq!(rt.effective_fuel(&caps), 10);
-    }
-
-    #[test]
     fn effective_memory_uses_config_default() {
         let rt = WasmRuntime::new(default_config());
         let caps = WasmCapabilities::default();
@@ -1088,20 +476,10 @@ mod tests {
     fn effective_memory_respects_override() {
         let rt = WasmRuntime::new(default_config());
         let caps = WasmCapabilities {
-            memory_override_mb: 32,
+            memory_override_mb: 128,
             ..Default::default()
         };
-        assert_eq!(rt.effective_memory_bytes(&caps), 32 * 1024 * 1024);
-    }
-
-    #[test]
-    fn effective_memory_clamps_override_to_config_limit() {
-        let rt = WasmRuntime::new(default_config());
-        let caps = WasmCapabilities {
-            memory_override_mb: 256,
-            ..Default::default()
-        };
-        assert_eq!(rt.effective_memory_bytes(&caps), 64 * 1024 * 1024);
+        assert_eq!(rt.effective_memory_bytes(&caps), 128 * 1024 * 1024);
     }
 
     #[test]
@@ -1116,94 +494,13 @@ mod tests {
         assert_eq!(caps.allowed_hosts, vec!["api.example.com"]);
     }
 
-    #[test]
-    fn validate_capabilities_rejects_fuel_escalation() {
-        let mut cfg = default_config();
-        cfg.fuel_limit = 100;
-        let rt = WasmRuntime::new(cfg);
-        let caps = WasmCapabilities {
-            fuel_override: 101,
-            ..Default::default()
-        };
-        let err = rt.validate_capabilities(&caps).unwrap_err();
-        assert!(err.to_string().contains("fuel_override"));
-    }
-
-    #[test]
-    fn validate_capabilities_rejects_memory_escalation() {
-        let mut cfg = default_config();
-        cfg.memory_limit_mb = 64;
-        let rt = WasmRuntime::new(cfg);
-        let caps = WasmCapabilities {
-            memory_override_mb: 65,
-            ..Default::default()
-        };
-        let err = rt.validate_capabilities(&caps).unwrap_err();
-        assert!(err.to_string().contains("memory_override_mb"));
-    }
-
-    #[test]
-    fn validate_capabilities_rejects_host_escalation() {
-        let mut cfg = default_config();
-        cfg.allowed_hosts = vec!["api.example.com".into()];
-        let rt = WasmRuntime::new(cfg);
-        let caps = WasmCapabilities {
-            allowed_hosts: vec!["evil.example.com".into()],
-            ..Default::default()
-        };
-        let err = rt.validate_capabilities(&caps).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("not in runtime.wasm.allowed_hosts"));
-    }
-
-    #[test]
-    fn validate_capabilities_accepts_host_subset() {
-        let mut cfg = default_config();
-        cfg.allowed_hosts = vec!["api.example.com".into(), "cdn.example.com".into()];
-        let rt = WasmRuntime::new(cfg);
-        let caps = WasmCapabilities {
-            allowed_hosts: vec!["api.example.com".into()],
-            ..Default::default()
-        };
-        assert!(rt.validate_capabilities(&caps).is_ok());
-    }
-
-    #[test]
-    fn validate_capabilities_clamps_escalation_when_configured() {
-        let mut cfg = default_config();
-        cfg.fuel_limit = 100;
-        cfg.memory_limit_mb = 32;
-        cfg.allowed_hosts = vec!["api.example.com".into()];
-        cfg.security.capability_escalation_mode = WasmCapabilityEscalationMode::Clamp;
-        let rt = WasmRuntime::new(cfg);
-        let caps = WasmCapabilities {
-            read_workspace: true,
-            write_workspace: true,
-            allowed_hosts: vec!["api.example.com".into(), "evil.example.com".into()],
-            fuel_override: 500,
-            memory_override_mb: 64,
-        };
-        let effective = rt
-            .validate_capabilities(&caps)
-            .expect("clamp should succeed");
-        assert!(!effective.read_workspace);
-        assert!(!effective.write_workspace);
-        assert_eq!(effective.allowed_hosts, vec!["api.example.com"]);
-        assert_eq!(effective.fuel_override, 100);
-        assert_eq!(effective.memory_override_mb, 32);
-    }
-
     // ── Tools directory ────────────────────────────────────────
 
     #[test]
     fn tools_dir_resolves_relative_to_workspace() {
         let rt = WasmRuntime::new(default_config());
         let dir = rt.tools_dir(Path::new("/home/user/project"));
-        assert_eq!(
-            dir,
-            PathBuf::from("/home/user/project/.zeroclaw/wasm-tools")
-        );
+        assert_eq!(dir, PathBuf::from("/home/user/project/tools/wasm"));
     }
 
     #[test]
@@ -1216,24 +513,17 @@ mod tests {
     #[test]
     fn list_modules_finds_wasm_files() {
         let dir = tempfile::tempdir().unwrap();
-        let tools_dir = dir.path().join(".zeroclaw/wasm-tools");
+        let tools_dir = dir.path().join("tools/wasm");
         std::fs::create_dir_all(&tools_dir).unwrap();
 
         // Create dummy .wasm files
         std::fs::write(tools_dir.join("calculator.wasm"), b"\0asm").unwrap();
         std::fs::write(tools_dir.join("formatter.wasm"), b"\0asm").unwrap();
-        std::fs::write(tools_dir.join("bad$name.wasm"), b"\0asm").unwrap();
         std::fs::write(tools_dir.join("readme.txt"), b"not a wasm").unwrap();
 
         let rt = WasmRuntime::new(default_config());
         let modules = rt.list_modules(dir.path()).unwrap();
         assert_eq!(modules, vec!["calculator", "formatter"]);
-    }
-
-    #[test]
-    fn validate_module_name_rejects_traversal_like_input() {
-        let err = WasmRuntime::validate_module_name("../secrets").unwrap_err();
-        assert!(err.to_string().contains("invalid characters"));
     }
 
     // ── Module execution edge cases ────────────────────────────
@@ -1286,97 +576,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn execute_module_enforce_hash_policy_rejects_mismatch() {
-        if !WasmRuntime::is_available() {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let tools_dir = dir.path().join("tools/wasm");
-        std::fs::create_dir_all(&tools_dir).unwrap();
-        std::fs::write(tools_dir.join("calc.wasm"), b"\0asm\x01\0\0\0").unwrap();
-
-        let mut cfg = default_config();
-        cfg.security.module_hash_policy = WasmModuleHashPolicy::Enforce;
-        cfg.security.module_sha256.insert(
-            "calc".into(),
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
-        );
-
-        let rt = WasmRuntime::new(cfg);
-        let result = rt.execute_module("calc", dir.path(), &WasmCapabilities::default());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("integrity mismatch"));
-    }
-
-    #[test]
-    fn execute_module_warn_hash_policy_allows_execution_path() {
-        if !WasmRuntime::is_available() {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let tools_dir = dir.path().join("tools/wasm");
-        std::fs::create_dir_all(&tools_dir).unwrap();
-        std::fs::write(tools_dir.join("calc.wasm"), b"\0asm\x01\0\0\0").unwrap();
-
-        let mut cfg = default_config();
-        cfg.security.module_hash_policy = WasmModuleHashPolicy::Warn;
-        cfg.security.module_sha256.insert(
-            "calc".into(),
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
-        );
-
-        let rt = WasmRuntime::new(cfg);
-        let result = rt.execute_module("calc", dir.path(), &WasmCapabilities::default());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("must export a 'run() -> i32'"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn execute_module_rejects_symlink_tools_dir_when_enabled() {
-        if !WasmRuntime::is_available() {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let real_tools_dir = dir.path().join("real-tools");
-        std::fs::create_dir_all(&real_tools_dir).unwrap();
-        std::fs::write(real_tools_dir.join("calc.wasm"), b"\0asm\x01\0\0\0").unwrap();
-
-        let tools_parent = dir.path().join("tools");
-        std::fs::create_dir_all(&tools_parent).unwrap();
-        std::os::unix::fs::symlink(&real_tools_dir, tools_parent.join("wasm")).unwrap();
-
-        let rt = WasmRuntime::new(default_config());
-        let result = rt.execute_module("calc", dir.path(), &WasmCapabilities::default());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("tools directory must not be a symlink"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn execute_module_allows_symlink_tools_dir_when_disabled() {
-        if !WasmRuntime::is_available() {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let real_tools_dir = dir.path().join("real-tools");
-        std::fs::create_dir_all(&real_tools_dir).unwrap();
-        std::fs::write(real_tools_dir.join("calc.wasm"), b"\0asm\x01\0\0\0").unwrap();
-
-        let tools_parent = dir.path().join("tools");
-        std::fs::create_dir_all(&tools_parent).unwrap();
-        std::os::unix::fs::symlink(&real_tools_dir, tools_parent.join("wasm")).unwrap();
-
-        let mut cfg = default_config();
-        cfg.security.reject_symlink_tools_dir = false;
-        cfg.security.module_hash_policy = WasmModuleHashPolicy::Disabled;
-        let rt = WasmRuntime::new(cfg);
-        let result = rt.execute_module("calc", dir.path(), &WasmCapabilities::default());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("must export a 'run() -> i32'"));
-    }
-
     // ── Feature gate check ─────────────────────────────────────
 
     #[test]
@@ -1403,8 +602,8 @@ mod tests {
             memory_override_mb: u64::MAX,
             ..Default::default()
         };
-        // Should not panic — override is clamped to config ceiling.
-        assert_eq!(rt.effective_memory_bytes(&caps), 64 * 1024 * 1024);
+        // Should not panic — saturating_mul prevents overflow
+        let _bytes = rt.effective_memory_bytes(&caps);
     }
 
     // ── WasmCapabilities default ───────────────────────────────
@@ -1437,7 +636,10 @@ mod tests {
         let rt = WasmRuntime::new(default_config());
         let caps = WasmCapabilities::default();
         let mem_bytes = rt.effective_memory_bytes(&caps);
-        assert!(mem_bytes > 0, "default memory limit must be > 0");
+        assert!(
+            mem_bytes > 0,
+            "default memory limit must be > 0"
+        );
         assert!(
             mem_bytes <= 4096 * 1024 * 1024,
             "default memory must not exceed 4 GB safety limit"

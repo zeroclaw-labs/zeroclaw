@@ -10,7 +10,6 @@ pub mod none;
 pub mod postgres;
 pub mod qdrant;
 pub mod response_cache;
-pub mod retrieval;
 pub mod snapshot;
 pub mod sqlite;
 pub mod traits;
@@ -320,10 +319,7 @@ pub fn create_memory_with_storage_and_routes(
         );
     }
 
-    fn build_qdrant_memory(
-        config: &MemoryConfig,
-        resolved_embedding: &ResolvedEmbeddingConfig,
-    ) -> anyhow::Result<QdrantMemory> {
+    if matches!(backend_kind, MemoryBackendKind::Qdrant) {
         let url = config
             .qdrant
             .url
@@ -356,16 +352,12 @@ pub fn create_memory_with_storage_and_routes(
             url,
             collection
         );
-        Ok(QdrantMemory::new_lazy(
+        return Ok(Box::new(QdrantMemory::new_lazy(
             &url,
             &collection,
             qdrant_api_key,
             embedder,
-        ))
-    }
-
-    if matches!(backend_kind, MemoryBackendKind::Qdrant) {
-        return Ok(Box::new(build_qdrant_memory(config, &resolved_embedding)?));
+        )));
     }
 
     create_memory_with_builders(

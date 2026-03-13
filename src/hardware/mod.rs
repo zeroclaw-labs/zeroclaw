@@ -16,27 +16,12 @@ pub mod discover;
 ))]
 pub mod introspect;
 
-#[cfg(feature = "hardware")]
-pub mod uf2;
-
-#[cfg(feature = "hardware")]
-pub mod pico_flash;
-
-#[cfg(feature = "hardware")]
-pub mod pico_code;
-
 use crate::config::Config;
 use anyhow::Result;
 
 // Re-export config types so wizard can use `hardware::HardwareConfig` etc.
 pub use crate::config::{HardwareConfig, HardwareTransport};
 
-#[cfg(feature = "hardware")]
-#[allow(unused_imports)]
-pub use pico_code::{device_code_tools, DeviceExecTool, DeviceReadCodeTool, DeviceWriteCodeTool};
-#[cfg(feature = "hardware")]
-#[allow(unused_imports)]
-pub use pico_flash::PicoFlashTool;
 /// A hardware device discovered during auto-scan.
 #[derive(Debug, Clone)]
 pub struct DiscoveredDevice {

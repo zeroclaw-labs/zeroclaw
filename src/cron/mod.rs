@@ -57,23 +57,6 @@ pub fn add_shell_job_with_approval(
     store::add_shell_job(config, name, schedule, command)
 }
 
-pub fn add_job_approved(
-    config: &Config,
-    expression: &str,
-    command: &str,
-    approved: bool,
-) -> Result<CronJob> {
-    let schedule = Schedule::Cron {
-        expr: expression.to_string(),
-        tz: None,
-    };
-    add_shell_job_with_approval(config, None, schedule, command, approved)
-}
-
-pub fn update_shell_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
-    update_shell_job_with_approval(config, job_id, patch, false)
-}
-
 /// Update a shell job's command with security validation.
 ///
 /// Validates the new command (if changed) before persisting.
@@ -247,7 +230,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 ..CronJobPatch::default()
             };
 
-            let job = update_shell_job(config, &id, patch)?;
+            let job = update_shell_job_with_approval(config, &id, patch, false)?;
             println!("\u{2705} Updated cron job {}", job.id);
             println!("  Expr: {}", job.expression);
             println!("  Next: {}", job.next_run.to_rfc3339());
@@ -272,33 +255,12 @@ pub(crate) fn add_once(config: &Config, delay: &str, command: &str) -> Result<Cr
     add_once_validated(config, delay, command, false)
 }
 
-pub fn add_once_approved(
-    config: &Config,
-    delay: &str,
-    command: &str,
-    approved: bool,
-) -> Result<CronJob> {
-    let duration = parse_delay(delay)?;
-    let at = chrono::Utc::now() + duration;
-    add_once_at_approved(config, at, command, approved)
-}
-
 pub(crate) fn add_once_at(
     config: &Config,
     at: chrono::DateTime<chrono::Utc>,
     command: &str,
 ) -> Result<CronJob> {
     add_once_at_validated(config, at, command, false)
-}
-
-pub fn add_once_at_approved(
-    config: &Config,
-    at: chrono::DateTime<chrono::Utc>,
-    command: &str,
-    approved: bool,
-) -> Result<CronJob> {
-    let schedule = Schedule::At { at };
-    add_shell_job_with_approval(config, None, schedule, command, approved)
 }
 
 pub fn pause_job(config: &Config, id: &str) -> Result<CronJob> {
@@ -578,13 +540,14 @@ mod tests {
         config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
         let job = make_job(&config, "*/5 * * * *", None, "echo original");
 
-        let denied = update_shell_job(
+        let denied = update_shell_job_with_approval(
             &config,
             &job.id,
             CronJobPatch {
                 command: Some("touch cron-medium-risk-update".into()),
                 ..CronJobPatch::default()
             },
+            false,
         );
         assert!(denied.is_err());
         assert!(denied

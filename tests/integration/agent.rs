@@ -93,9 +93,6 @@ async fn e2e_xml_dispatcher_tool_call() {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
-            quota_metadata: None,
-            stop_reason: None,
-            raw_stop_reason: None,
         },
         text_response("XML tool executed"),
     ]));

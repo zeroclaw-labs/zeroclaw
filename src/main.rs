@@ -1,6 +1,4 @@
 #![warn(clippy::all, clippy::pedantic)]
-#![forbid(unsafe_code)]
-#![recursion_limit = "256"]
 #![allow(
     clippy::assigning_clones,
     clippy::bool_to_int_with_if,
@@ -26,40 +24,6 @@
     clippy::uninlined_format_args,
     clippy::unused_self,
     clippy::cast_precision_loss,
-    clippy::assertions_on_constants,
-    clippy::await_holding_lock,
-    clippy::cast_lossless,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::default_trait_access,
-    clippy::doc_lazy_continuation,
-    clippy::explicit_iter_loop,
-    clippy::fn_params_excessive_bools,
-    clippy::format_push_string,
-    clippy::if_not_else,
-    clippy::large_enum_variant,
-    clippy::large_futures,
-    clippy::manual_clamp,
-    clippy::manual_contains,
-    clippy::manual_is_multiple_of,
-    clippy::manual_pattern_char_comparison,
-    clippy::manual_string_new,
-    clippy::match_same_arms,
-    clippy::missing_fields_in_debug,
-    clippy::needless_borrow,
-    clippy::needless_lifetimes,
-    clippy::redundant_else,
-    clippy::semicolon_if_nothing_returned,
-    clippy::should_implement_trait,
-    clippy::stable_sort_primitive,
-    clippy::struct_excessive_bools,
-    clippy::type_complexity,
-    clippy::unchecked_time_subtraction,
-    clippy::unnecessary_debug_formatting,
-    clippy::unnested_or_patterns,
-    clippy::unreadable_literal,
-    clippy::unused_async,
-    clippy::wildcard_imports,
     clippy::unnecessary_cast,
     clippy::unnecessary_lazy_evaluations,
     clippy::unnecessary_literal_bound,
@@ -76,75 +40,18 @@ use std::io::Write;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
-const PROFILE_MISMATCH_PREFIX: &str = "Pending login profile mismatch:";
-const ZEROCLAW_BUILD_VERSION: &str = match option_env!("ZEROCLAW_BUILD_VERSION") {
-    Some(v) => v,
-    None => "dev",
-};
-
-#[derive(Debug, Clone, ValueEnum)]
-enum QuotaFormat {
-    Text,
-    Json,
-}
-
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
     config::schema::validate_temperature(t)
-}
-
-fn dashboard_open_url(host: &str, port: u16) -> String {
-    let bind_host = host.trim();
-    let browser_host = match bind_host {
-        "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
-        _ => bind_host,
-    };
-    format!("http://{browser_host}:{port}/")
-}
-
-async fn open_url_in_default_browser(url: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = tokio::process::Command::new("open");
-        command.arg(url);
-        command
-    };
-
-    #[cfg(target_os = "linux")]
-    let mut command = {
-        let mut command = tokio::process::Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
-
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = tokio::process::Command::new("cmd");
-        command.args(["/C", "start", "", url]);
-        command
-    };
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        let _ = url;
-        bail!("automatic dashboard open is unsupported on this platform");
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-    {
-        let status = command.status().await?;
-        if status.success() {
-            Ok(())
-        } else {
-            bail!("browser launcher exited with status {status}");
-        }
-    }
 }
 
 mod agent;
 mod approval;
 mod auth;
 mod channels;
+mod rag {
+    pub use zeroclaw::rag::*;
+}
 mod config;
 mod cost;
 mod cron;
@@ -164,17 +71,13 @@ mod observability;
 mod onboard;
 mod peripherals;
 mod providers;
-mod rag;
 mod runtime;
 mod security;
 mod service;
 mod skillforge;
 mod skills;
-#[cfg(test)]
-mod test_locks;
 mod tools;
 mod tunnel;
-mod update;
 mod util;
 
 use config::Config;
@@ -215,7 +118,7 @@ enum EstopLevelArg {
 #[derive(Parser, Debug)]
 #[command(name = "zeroclaw")]
 #[command(author = "theonlyhennygod")]
-#[command(version = ZEROCLAW_BUILD_VERSION)]
+#[command(version)]
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
 struct Cli {
     #[arg(long, global = true)]
@@ -233,10 +136,6 @@ enum Commands {
         #[arg(long)]
         interactive: bool,
 
-        /// Run the full-screen TUI onboarding flow (ratatui)
-        #[arg(long)]
-        interactive_ui: bool,
-
         /// Overwrite existing config without confirmation
         #[arg(long)]
         force: bool,
@@ -249,7 +148,7 @@ enum Commands {
         #[arg(long)]
         channels_only: bool,
 
-        /// API key (used in quick mode, ignored with --interactive or --interactive-ui)
+        /// API key (used in quick mode, ignored with --interactive)
         #[arg(long)]
         api_key: Option<String>,
 
@@ -262,22 +161,6 @@ enum Commands {
         /// Memory backend (sqlite, lucid, markdown, none) - used in quick mode, default: sqlite
         #[arg(long)]
         memory: Option<String>,
-
-        /// Disable OTP in quick setup (not recommended)
-        #[arg(long)]
-        no_totp: bool,
-
-        /// Merge-migrate data from OpenClaw during onboarding
-        #[arg(long)]
-        migrate_openclaw: bool,
-
-        /// Optional OpenClaw workspace path (defaults to ~/.openclaw/workspace)
-        #[arg(long)]
-        openclaw_source: Option<std::path::PathBuf>,
-
-        /// Optional OpenClaw config path (defaults to ~/.openclaw/openclaw.json)
-        #[arg(long)]
-        openclaw_config: Option<std::path::PathBuf>,
     },
 
     /// Start the AI agent loop
@@ -291,9 +174,7 @@ Examples:
   zeroclaw agent                              # interactive session
   zeroclaw agent -m \"Summarize today's logs\"  # single message
   zeroclaw agent -p anthropic --model claude-sonnet-4-20250514
-  zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0
-  zeroclaw agent --autonomy-level full --max-actions-per-hour 100
-  zeroclaw agent -m \"quick task\" --memory-backend none --compact-context")]
+  zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0")]
     Agent {
         /// Single message mode (don't enter interactive mode)
         #[arg(short, long)]
@@ -314,30 +195,6 @@ Examples:
         /// Attach a peripheral (board:path, e.g. nucleo-f401re:/dev/ttyACM0)
         #[arg(long)]
         peripheral: Vec<String>,
-
-        /// Autonomy level (read_only, supervised, full)
-        #[arg(long, value_parser = clap::value_parser!(security::AutonomyLevel))]
-        autonomy_level: Option<security::AutonomyLevel>,
-
-        /// Maximum shell/tool actions per hour
-        #[arg(long)]
-        max_actions_per_hour: Option<u32>,
-
-        /// Maximum tool-call iterations per message
-        #[arg(long)]
-        max_tool_iterations: Option<usize>,
-
-        /// Maximum conversation history messages
-        #[arg(long)]
-        max_history_messages: Option<usize>,
-
-        /// Enable compact context mode (smaller prompts for limited models)
-        #[arg(long)]
-        compact_context: bool,
-
-        /// Memory backend (sqlite, markdown, none)
-        #[arg(long)]
-        memory_backend: Option<String>,
     },
 
     /// Start/manage the gateway server (webhooks, websockets)
@@ -401,33 +258,6 @@ Examples:
     /// Show system status (full details)
     Status,
 
-    /// Self-update ZeroClaw to the latest version
-    #[command(long_about = "\
-Self-update ZeroClaw to the latest release from GitHub.
-
-Downloads the appropriate pre-built binary for your platform and
-replaces the current executable. Requires write permissions to
-the binary location.
-
-Examples:
-  zeroclaw update              # Update to latest version
-  zeroclaw update --check      # Check for updates without installing
-  zeroclaw update --instructions # Show install-method-specific update instructions
-  zeroclaw update --force      # Reinstall even if already up to date")]
-    Update {
-        /// Check for updates without installing
-        #[arg(long, conflicts_with_all = ["force", "instructions"])]
-        check: bool,
-
-        /// Force update even if already at latest version
-        #[arg(long, conflicts_with = "instructions")]
-        force: bool,
-
-        /// Show human-friendly update instructions for your installation method
-        #[arg(long, conflicts_with_all = ["check", "force"])]
-        instructions: bool,
-    },
-
     /// Engage, inspect, and resume emergency-stop states.
     ///
     /// Examples:
@@ -454,22 +284,6 @@ Examples:
         /// Tool name(s) for `tool-freeze` (repeatable).
         #[arg(long = "tool")]
         tools: Vec<String>,
-    },
-
-    /// Manage security maintenance tasks
-    #[command(long_about = "\
-Manage security maintenance tasks.
-
-Commands in this group maintain security-related data stores used at runtime.
-
-Examples:
-  zeroclaw security update-guard-corpus
-  zeroclaw security update-guard-corpus --source builtin
-  zeroclaw security update-guard-corpus --source ./data/security/attack-corpus-v1.jsonl
-  zeroclaw security update-guard-corpus --source https://example.com/guard-corpus.jsonl --checksum <sha256>")]
-    Security {
-        #[command(subcommand)]
-        security_command: SecurityCommands,
     },
 
     /// Configure and manage scheduled tasks
@@ -506,38 +320,13 @@ Examples:
     /// List supported AI providers
     Providers,
 
-    /// Show provider quota and rate limit status
-    #[command(
-        name = "providers-quota",
-        long_about = "\
-Show provider quota and rate limit status.
-
-Displays quota remaining, rate limit resets, circuit breaker state, \
-and per-profile breakdown for all configured providers. Helps diagnose \
-quota exhaustion and rate limiting issues.
-
-Examples:
-  zeroclaw providers-quota                    # text output, all providers
-  zeroclaw providers-quota --format json      # JSON output
-  zeroclaw providers-quota --provider gemini  # filter by provider"
-    )]
-    ProvidersQuota {
-        /// Filter by provider name (optional, shows all if omitted)
-        #[arg(long)]
-        provider: Option<String>,
-
-        /// Output format (text or json)
-        #[arg(long, value_enum, default_value_t = QuotaFormat::Text)]
-        format: QuotaFormat,
-    },
-    /// Manage channels (telegram, discord, slack, qq, napcat, and more)
+    /// Manage channels (telegram, discord, slack)
     #[command(long_about = "\
 Manage communication channels.
 
 Add, remove, list, send, and health-check channels that connect ZeroClaw \
 to messaging platforms. Supported channel types: telegram, discord, \
-slack, mattermost, whatsapp, matrix, signal, qq, napcat, \
-lark, feishu, dingtalk, github, nextcloud, irc, imessage, email.
+slack, whatsapp, matrix, imessage, email.
 
 Examples:
   zeroclaw channel list
@@ -558,7 +347,6 @@ Examples:
     },
 
     /// Manage skills (user-defined capabilities)
-    #[command(name = "skill", alias = "skills")]
     Skills {
         #[command(subcommand)]
         skill_command: SkillCommands,
@@ -635,13 +423,13 @@ Examples:
     #[command(long_about = "\
 Manage ZeroClaw configuration.
 
-Inspect, query, and modify configuration settings.
+Inspect and export configuration settings. Use 'schema' to dump \
+the full JSON Schema for the config file, which documents every \
+available key, type, and default value.
 
 Examples:
-  zeroclaw config show                        # show effective config (secrets masked)
-  zeroclaw config get gateway.port            # query a specific value by dot-path
-  zeroclaw config set gateway.port 8080       # update a value and save to config.toml
-  zeroclaw config schema                      # print full JSON Schema to stdout")]
+  zeroclaw config schema              # print JSON Schema to stdout
+  zeroclaw config schema > schema.json")]
     Config {
         #[command(subcommand)]
         config_command: ConfigCommands,
@@ -666,20 +454,6 @@ Examples:
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommands {
-    /// Show the current effective configuration (secrets masked)
-    Show,
-    /// Get a specific configuration value by dot-path (e.g. "gateway.port")
-    Get {
-        /// Dot-separated config path, e.g. "security.estop.enabled"
-        key: String,
-    },
-    /// Set a configuration value and save to config.toml
-    Set {
-        /// Dot-separated config path, e.g. "gateway.port"
-        key: String,
-        /// New value (string, number, boolean, or JSON for objects/arrays)
-        value: String,
-    },
     /// Dump the full configuration JSON Schema to stdout
     Schema,
 }
@@ -702,19 +476,6 @@ enum EstopSubcommands {
         /// OTP code. If omitted and OTP is required, a prompt is shown.
         #[arg(long)]
         otp: Option<String>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum SecurityCommands {
-    /// Upsert semantic prompt-injection corpus records into the configured vector collection
-    UpdateGuardCorpus {
-        /// Corpus source: `builtin`, filesystem path, or HTTP(S) URL
-        #[arg(long)]
-        source: Option<String>,
-        /// Expected SHA-256 checksum (hex) for source payload verification
-        #[arg(long)]
-        checksum: Option<String>,
     },
 }
 
@@ -889,15 +650,6 @@ enum MemoryCommands {
         #[arg(long)]
         yes: bool,
     },
-    /// Rebuild embeddings for all memories (use after changing embedding model)
-    Reindex {
-        /// Skip confirmation prompt
-        #[arg(long)]
-        yes: bool,
-        /// Show progress during reindex
-        #[arg(long, default_value = "true")]
-        progress: bool,
-    },
 }
 
 #[tokio::main]
@@ -929,7 +681,6 @@ async fn main() -> Result<()> {
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO
     let subscriber = fmt::Subscriber::builder()
-        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::rfc_3339())
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
@@ -937,14 +688,12 @@ async fn main() -> Result<()> {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    // Onboard runs quick setup by default, interactive wizard with --interactive,
-    // or full-screen TUI with --interactive-ui.
+    // Onboard runs quick setup by default, or the interactive wizard with --interactive.
     // The onboard wizard uses reqwest::blocking internally, which creates its own
     // Tokio runtime. To avoid "Cannot drop a runtime in a context where blocking is
     // not allowed", we run the wizard on a blocking thread via spawn_blocking.
     if let Commands::Onboard {
         interactive,
-        interactive_ui,
         force,
         reinit,
         channels_only,
@@ -952,14 +701,9 @@ async fn main() -> Result<()> {
         provider,
         model,
         memory,
-        no_totp,
-        migrate_openclaw,
-        openclaw_source,
-        openclaw_config,
     } = &cli.command
     {
         let interactive = *interactive;
-        let interactive_ui = *interactive_ui;
         let force = *force;
         let reinit = *reinit;
         let channels_only = *channels_only;
@@ -967,21 +711,9 @@ async fn main() -> Result<()> {
         let provider = provider.clone();
         let model = model.clone();
         let memory = memory.clone();
-        let no_totp = *no_totp;
-        let migrate_openclaw = *migrate_openclaw;
-        let openclaw_source = openclaw_source.clone();
-        let openclaw_config = openclaw_config.clone();
-        let openclaw_migration_enabled =
-            migrate_openclaw || openclaw_source.is_some() || openclaw_config.is_some();
 
-        if interactive && interactive_ui {
-            bail!("Use either --interactive or --interactive-ui, not both");
-        }
         if interactive && channels_only {
             bail!("Use either --interactive or --channels-only, not both");
-        }
-        if interactive_ui && channels_only {
-            bail!("Use either --interactive-ui or --channels-only, not both");
         }
         if reinit && channels_only {
             bail!("Use either --reinit or --channels-only, not both");
@@ -989,30 +721,10 @@ async fn main() -> Result<()> {
         if reinit && !interactive {
             bail!("--reinit requires --interactive mode");
         }
-        if interactive_ui
-            && (api_key.is_some()
-                || provider.is_some()
-                || model.is_some()
-                || memory.is_some()
-                || no_totp)
-        {
-            bail!(
-                "--interactive-ui does not accept --api-key, --provider, --model, --memory, or --no-totp"
-            );
-        }
         if channels_only
-            && (api_key.is_some()
-                || provider.is_some()
-                || model.is_some()
-                || memory.is_some()
-                || no_totp
-                || migrate_openclaw
-                || openclaw_source.is_some()
-                || openclaw_config.is_some())
+            && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
         {
-            bail!(
-                "--channels-only does not accept --api-key, --provider, --model, --memory, --no-totp, or OpenClaw migration flags"
-            );
+            bail!("--channels-only does not accept --api-key, --provider, --model, or --memory");
         }
         if channels_only && force {
             bail!("--channels-only does not accept --force");
@@ -1061,45 +773,21 @@ async fn main() -> Result<()> {
 
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
-        } else if interactive_ui {
-            Box::pin(onboard::run_wizard_tui_with_migration(
-                force,
-                onboard::OpenClawOnboardMigrationOptions {
-                    enabled: openclaw_migration_enabled,
-                    source_workspace: openclaw_source,
-                    source_config: openclaw_config,
-                },
-            ))
-            .await
         } else if interactive {
-            Box::pin(onboard::run_wizard_with_migration(
-                force,
-                onboard::OpenClawOnboardMigrationOptions {
-                    enabled: openclaw_migration_enabled,
-                    source_workspace: openclaw_source,
-                    source_config: openclaw_config,
-                },
-            ))
-            .await
+            Box::pin(onboard::run_wizard(force)).await
         } else {
-            onboard::run_quick_setup_with_migration(
+            onboard::run_quick_setup(
                 api_key.as_deref(),
                 provider.as_deref(),
                 model.as_deref(),
                 memory.as_deref(),
                 force,
-                no_totp,
-                onboard::OpenClawOnboardMigrationOptions {
-                    enabled: openclaw_migration_enabled,
-                    source_workspace: openclaw_source,
-                    source_config: openclaw_config,
-                },
             )
             .await
         }?;
         // Auto-start channels if user said yes during wizard
         if std::env::var("ZEROCLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
-            Box::pin(channels::start_channels(config)).await?;
+            channels::start_channels(config).await?;
         }
         return Ok(());
     }
@@ -1131,50 +819,18 @@ async fn main() -> Result<()> {
             model,
             temperature,
             peripheral,
-            autonomy_level,
-            max_actions_per_hour,
-            max_tool_iterations,
-            max_history_messages,
-            compact_context,
-            memory_backend,
         } => {
-            if let Some(level) = autonomy_level {
-                config.autonomy.level = level;
-            }
-            if let Some(n) = max_actions_per_hour {
-                config.autonomy.max_actions_per_hour = n;
-            }
-            if let Some(n) = max_tool_iterations {
-                config.agent.max_tool_iterations = n;
-            }
-            if let Some(n) = max_history_messages {
-                config.agent.max_history_messages = n;
-            }
-            if compact_context {
-                config.agent.compact_context = true;
-            }
-            if let Some(ref backend) = memory_backend {
-                config.memory.backend = backend.clone();
-            }
-            // Implement temperature fallback logic:
-            // 1. Use --temperature if provided
-            // 2. Use config.default_temperature if --temperature not provided
-            // 3. Use hardcoded 0.7 if config.default_temperature not set (from Config::default())
             let final_temperature = temperature.unwrap_or(config.default_temperature);
-            // interactive=true only when no --message flag (real REPL session).
-            // Single-shot mode (-m) runs non-interactively: no TTY approval prompt,
-            // so tools are not denied by a stdin read returning EOF.
-            let interactive = message.is_none();
-            Box::pin(agent::run(
+
+            agent::run(
                 config,
                 message,
                 provider,
                 model,
                 final_temperature,
                 peripheral,
-                interactive,
-                None,
-            ))
+                true,
+            )
             .await
             .map(|_| ())
         }
@@ -1289,7 +945,7 @@ async fn main() -> Result<()> {
         Commands::Status => {
             println!("🦀 ZeroClaw Status");
             println!();
-            println!("Version:     {}", ZEROCLAW_BUILD_VERSION);
+            println!("Version:     {}", env!("CARGO_PKG_VERSION"));
             println!("Workspace:   {}", config.workspace_dir.display());
             println!("Config:      {}", config.config_path.display());
             println!();
@@ -1380,30 +1036,12 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::Update {
-            check,
-            force,
-            instructions,
-        } => {
-            if instructions {
-                update::print_update_instructions()?;
-                Ok(())
-            } else {
-                update::self_update(force, check).await?;
-                Ok(())
-            }
-        }
-
         Commands::Estop {
             estop_command,
             level,
             domains,
             tools,
         } => handle_estop_command(&config, estop_command, level, domains, tools),
-
-        Commands::Security { security_command } => {
-            handle_security_command(&config, security_command).await
-        }
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
@@ -1428,14 +1066,6 @@ async fn main() -> Result<()> {
             ModelCommands::Set { model } => onboard::run_models_set(&config, &model).await,
             ModelCommands::Status => onboard::run_models_status(&config).await,
         },
-
-        Commands::ProvidersQuota { provider, format } => {
-            let format_str = match format {
-                QuotaFormat::Text => "text",
-                QuotaFormat::Json => "json",
-            };
-            providers::quota_cli::run(&config, provider.as_deref(), format_str).await
-        }
 
         Commands::Providers => {
             let providers = providers::list_providers();
@@ -1499,8 +1129,8 @@ async fn main() -> Result<()> {
         },
 
         Commands::Channel { channel_command } => match channel_command {
-            ChannelCommands::Start => Box::pin(channels::start_channels(config)).await,
-            ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
+            ChannelCommands::Start => channels::start_channels(config).await,
+            ChannelCommands::Doctor => channels::doctor_channels(config).await,
             other => channels::handle_command(other, &config).await,
         },
 
@@ -1529,94 +1159,6 @@ async fn main() -> Result<()> {
         }
 
         Commands::Config { config_command } => match config_command {
-            ConfigCommands::Show => {
-                let mut json =
-                    serde_json::to_value(&config).context("Failed to serialize config")?;
-                redact_config_secrets(&mut json);
-                println!("{}", serde_json::to_string_pretty(&json)?);
-                Ok(())
-            }
-            ConfigCommands::Get { key } => {
-                let mut json =
-                    serde_json::to_value(&config).context("Failed to serialize config")?;
-                redact_config_secrets(&mut json);
-
-                let mut current = &json;
-                for segment in key.split('.') {
-                    current = current
-                        .get(segment)
-                        .with_context(|| format!("Config path not found: {key}"))?;
-                }
-
-                match current {
-                    serde_json::Value::String(s) => println!("{s}"),
-                    serde_json::Value::Bool(b) => println!("{b}"),
-                    serde_json::Value::Number(n) => println!("{n}"),
-                    serde_json::Value::Null => println!("null"),
-                    _ => println!("{}", serde_json::to_string_pretty(current)?),
-                }
-                Ok(())
-            }
-            ConfigCommands::Set { key, value } => {
-                let mut json =
-                    serde_json::to_value(&config).context("Failed to serialize config")?;
-
-                // Parse the new value: try bool, then integer, then float, then JSON, then string
-                let new_value = if value == "true" {
-                    serde_json::Value::Bool(true)
-                } else if value == "false" {
-                    serde_json::Value::Bool(false)
-                } else if value == "null" {
-                    serde_json::Value::Null
-                } else if let Ok(n) = value.parse::<i64>() {
-                    serde_json::json!(n)
-                } else if let Ok(n) = value.parse::<f64>() {
-                    serde_json::json!(n)
-                } else if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&value) {
-                    // JSON object/array (e.g. '["a","b"]' or '{"key":"val"}')
-                    parsed
-                } else {
-                    serde_json::Value::String(value.clone())
-                };
-
-                // Navigate to the parent and set the leaf
-                let segments: Vec<&str> = key.split('.').collect();
-                if segments.is_empty() {
-                    bail!("Config key cannot be empty");
-                }
-                let (parents, leaf) = segments.split_at(segments.len() - 1);
-
-                let mut target = &mut json;
-                for segment in parents {
-                    target = target
-                        .get_mut(*segment)
-                        .with_context(|| format!("Config path not found: {key}"))?;
-                }
-
-                let leaf_key = leaf[0];
-                if target.get(leaf_key).is_none() {
-                    bail!("Config path not found: {key}");
-                }
-                target[leaf_key] = new_value.clone();
-
-                // Deserialize back to Config and save.
-                // Preserve runtime-only fields lost during JSON round-trip (#[serde(skip)]).
-                let config_path = config.config_path.clone();
-                let workspace_dir = config.workspace_dir.clone();
-                config = serde_json::from_value(json)
-                    .context("Invalid value for this config key — type mismatch")?;
-                config.config_path = config_path;
-                config.workspace_dir = workspace_dir;
-                config.save().await?;
-
-                // Show the saved value
-                let display = match &new_value {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                println!("Set {key} = {display}");
-                Ok(())
-            }
             ConfigCommands::Schema => {
                 let schema = schemars::schema_for!(config::Config);
                 println!(
@@ -1626,48 +1168,6 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
-    }
-}
-
-/// Keys whose values are masked in `config show` / `config get` output.
-const REDACTED_CONFIG_KEYS: &[&str] = &[
-    "api_key",
-    "api_keys",
-    "bot_token",
-    "paired_tokens",
-    "db_url",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-    "secret_key",
-    "webhook_secret",
-];
-
-fn redact_config_secrets(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (k, v) in map.iter_mut() {
-                if REDACTED_CONFIG_KEYS.contains(&k.as_str()) {
-                    match v {
-                        serde_json::Value::String(s) if !s.is_empty() => {
-                            *v = serde_json::Value::String("***REDACTED***".to_string());
-                        }
-                        serde_json::Value::Array(arr) if !arr.is_empty() => {
-                            *v = serde_json::json!(["***REDACTED***"]);
-                        }
-                        _ => {}
-                    }
-                } else {
-                    redact_config_secrets(v);
-                }
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for item in arr.iter_mut() {
-                redact_config_secrets(item);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -1858,30 +1358,6 @@ fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> R
     Ok(())
 }
 
-async fn handle_security_command(
-    config: &Config,
-    security_command: SecurityCommands,
-) -> Result<()> {
-    match security_command {
-        SecurityCommands::UpdateGuardCorpus { source, checksum } => {
-            let report = security::semantic_guard::update_guard_corpus(
-                config,
-                source.as_deref(),
-                checksum.as_deref(),
-            )
-            .await?;
-
-            println!("Semantic guard corpus update completed.");
-            println!("  Source:           {}", report.source);
-            println!("  SHA-256:          {}", report.sha256);
-            println!("  Parsed records:   {}", report.parsed_records);
-            println!("  Upserted records: {}", report.upserted_records);
-            println!("  Collection:       {}", report.collection);
-            Ok(())
-        }
-    }
-}
-
 // ─── Gateway helper functions ───────────────────────────────────────────────
 
 /// Resolve gateway host and port from CLI args or config.
@@ -2016,17 +1492,6 @@ fn set_owner_only_permissions(_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Check if a pending OAuth login is stale (older than 24 hours).
-fn is_pending_login_stale(pending: &PendingOAuthLogin) -> bool {
-    if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&pending.created_at) {
-        let age = chrono::Utc::now().signed_duration_since(created);
-        age > chrono::Duration::hours(24)
-    } else {
-        // If we can't parse the timestamp, consider it stale
-        true
-    }
-}
-
 fn save_pending_oauth_login(config: &Config, pending: &PendingOAuthLogin) -> Result<()> {
     let path = pending_oauth_login_path(config, &pending.provider);
     if let Some(parent) = path.parent() {
@@ -2073,23 +1538,13 @@ fn load_pending_oauth_login(config: &Config, provider: &str) -> Result<Option<Pe
     } else {
         bail!("Pending {} login is missing code verifier", provider);
     };
-
-    let pending = PendingOAuthLogin {
+    Ok(Some(PendingOAuthLogin {
         provider: persisted.provider.unwrap_or_else(|| provider.to_string()),
         profile: persisted.profile,
         code_verifier,
         state: persisted.state,
         created_at: persisted.created_at,
-    };
-
-    // Auto-cleanup if stale (older than 24 hours)
-    if is_pending_login_stale(&pending) {
-        println!("ℹ️  Removing stale pending auth file (older than 24h)");
-        let _ = std::fs::remove_file(&path);
-        return Ok(None);
-    }
-
-    Ok(Some(pending))
+    }))
 }
 
 fn clear_pending_oauth_login(config: &Config, provider: &str) {
@@ -2186,23 +1641,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                                 return Ok(());
                             }
                             Err(e) => {
-                                let err_msg = e.to_string();
-                                if err_msg.contains("403")
-                                    || err_msg.contains("Forbidden")
-                                    || err_msg.contains("Cloudflare")
-                                {
-                                    println!(
-                                        "ℹ️  Device-code flow is blocked by Cloudflare protection."
-                                    );
-                                    println!("   This is normal for server environments.");
-                                    println!("   Switching to browser authorization flow...");
-                                } else if err_msg.contains("invalid_client") {
-                                    println!("⚠️  OAuth client configuration error: {}", err_msg);
-                                    println!("   Check your GEMINI_OAUTH_CLIENT_ID and GEMINI_OAUTH_CLIENT_SECRET");
-                                } else {
-                                    println!("ℹ️  Device-code flow unavailable: {}", err_msg);
-                                    println!("   Falling back to browser flow.");
-                                }
+                                println!(
+                                    "Device-code flow unavailable: {e}. Falling back to browser flow."
+                                );
                             }
                         }
                     }
@@ -2289,20 +1730,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                                 return Ok(());
                             }
                             Err(e) => {
-                                let err_msg = e.to_string();
-                                if err_msg.contains("403")
-                                    || err_msg.contains("Forbidden")
-                                    || err_msg.contains("Cloudflare")
-                                {
-                                    println!(
-                                        "ℹ️  Device-code flow is blocked by Cloudflare protection."
-                                    );
-                                    println!("   This is normal for server environments.");
-                                    println!("   Switching to browser authorization flow...");
-                                } else {
-                                    println!("ℹ️  Device-code flow unavailable: {}", err_msg);
-                                    println!("   Falling back to browser flow.");
-                                }
+                                println!(
+                                    "Device-code flow unavailable: {e}. Falling back to browser/paste flow."
+                                );
                             }
                         }
                     }
@@ -2369,156 +1799,95 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
             match provider.as_str() {
                 "openai-codex" => {
-                    let result = async {
-                        let pending =
-                            load_pending_oauth_login(config, "openai")?.ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "No pending OpenAI login found.\n\n\
-                                💡 Please start the login flow first:\n   \
-                                zeroclaw auth login --provider openai-codex --profile {}\n\n\
-                                Then paste the callback URL or code here.",
-                                    profile
-                                )
-                            })?;
+                    let pending = load_pending_oauth_login(config, "openai")?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "No pending OpenAI login found. Run `zeroclaw auth login --provider openai-codex` first."
+                        )
+                    })?;
 
-                        if pending.profile != profile {
-                            bail!(
-                                "{} pending={}, requested={}",
-                                PROFILE_MISMATCH_PREFIX,
-                                pending.profile,
-                                profile
-                            );
-                        }
-
-                        let redirect_input = match input {
-                            Some(value) => value,
-                            None => read_plain_input("Paste redirect URL or OAuth code")?,
-                        };
-
-                        let code = auth::openai_oauth::parse_code_from_redirect(
-                            &redirect_input,
-                            Some(&pending.state),
-                        )?;
-
-                        let pkce = auth::openai_oauth::PkceState {
-                            code_verifier: pending.code_verifier.clone(),
-                            code_challenge: String::new(),
-                            state: pending.state.clone(),
-                        };
-
-                        let client = reqwest::Client::new();
-                        let token_set =
-                            auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce)
-                                .await?;
-                        let account_id =
-                            extract_openai_account_id_for_profile(&token_set.access_token);
-
-                        auth_service
-                            .store_openai_tokens(&profile, token_set, account_id, true)
-                            .await?;
-                        clear_pending_oauth_login(config, "openai");
-
-                        println!("Saved profile {profile}");
-                        println!("Active profile for openai-codex: {profile}");
-                        Ok(())
+                    if pending.profile != profile {
+                        bail!(
+                            "Pending login profile mismatch: pending={}, requested={}",
+                            pending.profile,
+                            profile
+                        );
                     }
-                    .await;
 
-                    if let Err(e) = result {
-                        // Cleanup pending file on error
-                        if e.to_string().starts_with(PROFILE_MISMATCH_PREFIX) {
-                            clear_pending_oauth_login(config, "openai");
-                            eprintln!("❌ {}", e);
-                            eprintln!(
-                                "\n💡 Tip: A previous login attempt was for a different profile."
-                            );
-                            eprintln!("   The pending auth file has been cleared.");
-                            eprintln!("   Please start fresh with:");
-                            eprintln!(
-                                "   zeroclaw auth login --provider openai-codex --profile {}",
-                                profile
-                            );
-                            std::process::exit(1);
-                        }
-                        return Err(e);
-                    }
+                    let redirect_input = match input {
+                        Some(value) => value,
+                        None => read_plain_input("Paste redirect URL or OAuth code")?,
+                    };
+
+                    let code = auth::openai_oauth::parse_code_from_redirect(
+                        &redirect_input,
+                        Some(&pending.state),
+                    )?;
+
+                    let pkce = auth::openai_oauth::PkceState {
+                        code_verifier: pending.code_verifier.clone(),
+                        code_challenge: String::new(),
+                        state: pending.state.clone(),
+                    };
+
+                    let client = reqwest::Client::new();
+                    let token_set =
+                        auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
+                    let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
+
+                    auth_service
+                        .store_openai_tokens(&profile, token_set, account_id, true)
+                        .await?;
+                    clear_pending_oauth_login(config, "openai");
+
+                    println!("Saved profile {profile}");
+                    println!("Active profile for openai-codex: {profile}");
                 }
                 "gemini" => {
-                    let result = async {
-                        let pending =
-                            load_pending_oauth_login(config, "gemini")?.ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "No pending Gemini login found.\n\n\
-                                💡 Please start the login flow first:\n   \
-                                zeroclaw auth login --provider gemini --profile {}\n\n\
-                                Then paste the callback URL or code here.",
-                                    profile
-                                )
-                            })?;
+                    let pending = load_pending_oauth_login(config, "gemini")?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "No pending Gemini login found. Run `zeroclaw auth login --provider gemini` first."
+                        )
+                    })?;
 
-                        if pending.profile != profile {
-                            bail!(
-                                "{} pending={}, requested={}",
-                                PROFILE_MISMATCH_PREFIX,
-                                pending.profile,
-                                profile
-                            );
-                        }
-
-                        let redirect_input = match input {
-                            Some(value) => value,
-                            None => read_plain_input("Paste redirect URL or OAuth code")?,
-                        };
-
-                        let code = auth::gemini_oauth::parse_code_from_redirect(
-                            &redirect_input,
-                            Some(&pending.state),
-                        )?;
-
-                        let pkce = auth::gemini_oauth::PkceState {
-                            code_verifier: pending.code_verifier.clone(),
-                            code_challenge: String::new(),
-                            state: pending.state.clone(),
-                        };
-
-                        let client = reqwest::Client::new();
-                        let token_set =
-                            auth::gemini_oauth::exchange_code_for_tokens(&client, &code, &pkce)
-                                .await?;
-                        let account_id = token_set
-                            .id_token
-                            .as_deref()
-                            .and_then(auth::gemini_oauth::extract_account_email_from_id_token);
-
-                        auth_service
-                            .store_gemini_tokens(&profile, token_set, account_id, true)
-                            .await?;
-                        clear_pending_oauth_login(config, "gemini");
-
-                        println!("Saved profile {profile}");
-                        println!("Active profile for gemini: {profile}");
-                        Ok(())
+                    if pending.profile != profile {
+                        bail!(
+                            "Pending login profile mismatch: pending={}, requested={}",
+                            pending.profile,
+                            profile
+                        );
                     }
-                    .await;
 
-                    if let Err(e) = result {
-                        // Cleanup pending file on error
-                        if e.to_string().starts_with(PROFILE_MISMATCH_PREFIX) {
-                            clear_pending_oauth_login(config, "gemini");
-                            eprintln!("❌ {}", e);
-                            eprintln!(
-                                "\n💡 Tip: A previous login attempt was for a different profile."
-                            );
-                            eprintln!("   The pending auth file has been cleared.");
-                            eprintln!("   Please start fresh with:");
-                            eprintln!(
-                                "   zeroclaw auth login --provider gemini --profile {}",
-                                profile
-                            );
-                            std::process::exit(1);
-                        }
-                        return Err(e);
-                    }
+                    let redirect_input = match input {
+                        Some(value) => value,
+                        None => read_plain_input("Paste redirect URL or OAuth code")?,
+                    };
+
+                    let code = auth::gemini_oauth::parse_code_from_redirect(
+                        &redirect_input,
+                        Some(&pending.state),
+                    )?;
+
+                    let pkce = auth::gemini_oauth::PkceState {
+                        code_verifier: pending.code_verifier.clone(),
+                        code_challenge: String::new(),
+                        state: pending.state.clone(),
+                    };
+
+                    let client = reqwest::Client::new();
+                    let token_set =
+                        auth::gemini_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
+                    let account_id = token_set
+                        .id_token
+                        .as_deref()
+                        .and_then(auth::gemini_oauth::extract_account_email_from_id_token);
+
+                    auth_service
+                        .store_gemini_tokens(&profile, token_set, account_id, true)
+                        .await?;
+                    clear_pending_oauth_login(config, "gemini");
+
+                    println!("Saved profile {profile}");
+                    println!("Active profile for gemini: {profile}");
                 }
                 _ => {
                     bail!("`auth paste-redirect` supports --provider openai-codex or gemini");
@@ -2768,92 +2137,6 @@ mod tests {
     }
 
     #[test]
-    fn gateway_help_includes_subcommands() {
-        let cmd = Cli::command();
-        let gateway = cmd
-            .get_subcommands()
-            .find(|subcommand| subcommand.get_name() == "gateway")
-            .expect("gateway subcommand must exist");
-
-        let has_start = gateway.get_subcommands().any(|s| s.get_name() == "start");
-        assert!(has_start, "gateway help should include 'start' subcommand");
-    }
-
-    #[test]
-    fn gateway_cli_accepts_start_subcommand() {
-        let cli = Cli::try_parse_from(["zeroclaw", "gateway", "start"])
-            .expect("gateway start should parse");
-
-        match cli.command {
-            Commands::Gateway { gateway_command } => {
-                assert!(matches!(
-                    gateway_command,
-                    Some(zeroclaw::GatewayCommands::Start { .. })
-                ));
-            }
-            other => panic!("expected gateway command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn gateway_cli_accepts_restart_subcommand() {
-        let cli = Cli::try_parse_from(["zeroclaw", "gateway", "restart"])
-            .expect("gateway restart should parse");
-
-        match cli.command {
-            Commands::Gateway { gateway_command } => {
-                assert!(matches!(
-                    gateway_command,
-                    Some(zeroclaw::GatewayCommands::Restart { .. })
-                ));
-            }
-            other => panic!("expected gateway command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn gateway_cli_accepts_get_paircode_subcommand() {
-        let cli = Cli::try_parse_from(["zeroclaw", "gateway", "get-paircode"])
-            .expect("gateway get-paircode should parse");
-
-        match cli.command {
-            Commands::Gateway { gateway_command } => {
-                assert!(matches!(
-                    gateway_command,
-                    Some(zeroclaw::GatewayCommands::GetPaircode { .. })
-                ));
-            }
-            other => panic!("expected gateway command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn gateway_cli_defaults_to_no_subcommand() {
-        let cli = Cli::try_parse_from(["zeroclaw", "gateway"]).expect("gateway should parse");
-
-        match cli.command {
-            Commands::Gateway { gateway_command } => {
-                assert!(gateway_command.is_none());
-            }
-            other => panic!("expected gateway command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn dashboard_open_url_prefers_loopback_for_wildcard_bind_hosts() {
-        assert_eq!(
-            dashboard_open_url("0.0.0.0", 42617),
-            "http://127.0.0.1:42617/"
-        );
-        assert_eq!(dashboard_open_url("::", 42617), "http://127.0.0.1:42617/");
-        assert_eq!(dashboard_open_url("[::]", 42617), "http://127.0.0.1:42617/");
-        assert_eq!(
-            dashboard_open_url("127.0.0.1", 42617),
-            "http://127.0.0.1:42617/"
-        );
-    }
-
-    #[test]
     fn completion_generation_mentions_binary_name() {
         let mut output = Vec::new();
         write_shell_completion(CompletionShell::Bash, &mut output)
@@ -2873,111 +2156,6 @@ mod tests {
         match cli.command {
             Commands::Onboard { force, .. } => assert!(force),
             other => panic!("expected onboard command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn onboard_cli_accepts_interactive_ui_flag() {
-        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--interactive-ui"])
-            .expect("onboard --interactive-ui should parse");
-
-        match cli.command {
-            Commands::Onboard {
-                interactive,
-                interactive_ui,
-                ..
-            } => {
-                assert!(!interactive);
-                assert!(interactive_ui);
-            }
-            other => panic!("expected onboard command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn onboard_cli_accepts_no_totp_flag() {
-        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--no-totp"])
-            .expect("onboard --no-totp should parse");
-
-        match cli.command {
-            Commands::Onboard { no_totp, .. } => assert!(no_totp),
-            other => panic!("expected onboard command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn onboard_cli_accepts_openclaw_migration_flags() {
-        let cli = Cli::try_parse_from([
-            "zeroclaw",
-            "onboard",
-            "--migrate-openclaw",
-            "--openclaw-source",
-            "/tmp/openclaw-workspace",
-            "--openclaw-config",
-            "/tmp/openclaw.json",
-        ])
-        .expect("onboard openclaw migration flags should parse");
-
-        match cli.command {
-            Commands::Onboard {
-                migrate_openclaw,
-                openclaw_source,
-                openclaw_config,
-                ..
-            } => {
-                assert!(migrate_openclaw);
-                assert_eq!(
-                    openclaw_source.as_deref(),
-                    Some(std::path::Path::new("/tmp/openclaw-workspace"))
-                );
-                assert_eq!(
-                    openclaw_config.as_deref(),
-                    Some(std::path::Path::new("/tmp/openclaw.json"))
-                );
-            }
-            other => panic!("expected onboard command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn migrate_openclaw_cli_accepts_source_and_module_flags() {
-        let cli = Cli::try_parse_from([
-            "zeroclaw",
-            "migrate",
-            "openclaw",
-            "--source",
-            "/tmp/openclaw-workspace",
-            "--source-config",
-            "/tmp/openclaw.json",
-            "--dry-run",
-            "--no-config",
-        ])
-        .expect("migrate openclaw flags should parse");
-
-        match cli.command {
-            Commands::Migrate {
-                migrate_command:
-                    MigrateCommands::Openclaw {
-                        source,
-                        source_config,
-                        dry_run,
-                        no_memory,
-                        no_config,
-                    },
-            } => {
-                assert_eq!(
-                    source.as_deref(),
-                    Some(std::path::Path::new("/tmp/openclaw-workspace"))
-                );
-                assert_eq!(
-                    source_config.as_deref(),
-                    Some(std::path::Path::new("/tmp/openclaw.json"))
-                );
-                assert!(dry_run);
-                assert!(!no_memory);
-                assert!(no_config);
-            }
-            other => panic!("expected migrate openclaw command, got {other:?}"),
         }
     }
 
@@ -3012,119 +2190,6 @@ mod tests {
                 ..
             } => assert_eq!(domains, vec!["*.chase.com".to_string()]),
             other => panic!("expected estop resume command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn config_help_mentions_show_get_set_examples() {
-        let cmd = Cli::command();
-        let config_cmd = cmd
-            .get_subcommands()
-            .find(|subcommand| subcommand.get_name() == "config")
-            .expect("config subcommand must exist");
-
-        let mut output = Vec::new();
-        config_cmd
-            .clone()
-            .write_long_help(&mut output)
-            .expect("help generation should succeed");
-        let help = String::from_utf8(output).expect("help output should be utf-8");
-        assert!(help.contains("zeroclaw config show"));
-        assert!(help.contains("zeroclaw config get gateway.port"));
-        assert!(help.contains("zeroclaw config set gateway.port 8080"));
-    }
-
-    #[test]
-    fn config_cli_parses_show_get_set_subcommands() {
-        let show =
-            Cli::try_parse_from(["zeroclaw", "config", "show"]).expect("config show should parse");
-        match show.command {
-            Commands::Config {
-                config_command: ConfigCommands::Show,
-            } => {}
-            other => panic!("expected config show, got {other:?}"),
-        }
-
-        let get = Cli::try_parse_from(["zeroclaw", "config", "get", "gateway.port"])
-            .expect("config get should parse");
-        match get.command {
-            Commands::Config {
-                config_command: ConfigCommands::Get { key },
-            } => assert_eq!(key, "gateway.port"),
-            other => panic!("expected config get, got {other:?}"),
-        }
-
-        let set = Cli::try_parse_from(["zeroclaw", "config", "set", "gateway.port", "8080"])
-            .expect("config set should parse");
-        match set.command {
-            Commands::Config {
-                config_command: ConfigCommands::Set { key, value },
-            } => {
-                assert_eq!(key, "gateway.port");
-                assert_eq!(value, "8080");
-            }
-            other => panic!("expected config set, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn redact_config_secrets_masks_nested_sensitive_values() {
-        let mut payload = serde_json::json!({
-            "api_key": "sk-test",
-            "nested": {
-                "bot_token": "token",
-                "paired_tokens": ["abc", "def"],
-                "non_secret": "ok"
-            }
-        });
-        redact_config_secrets(&mut payload);
-
-        assert_eq!(payload["api_key"], serde_json::json!("***REDACTED***"));
-        assert_eq!(
-            payload["nested"]["bot_token"],
-            serde_json::json!("***REDACTED***")
-        );
-        assert_eq!(
-            payload["nested"]["paired_tokens"],
-            serde_json::json!(["***REDACTED***"])
-        );
-        assert_eq!(payload["nested"]["non_secret"], serde_json::json!("ok"));
-    }
-
-    #[test]
-    fn update_help_mentions_instructions_flag() {
-        let cmd = Cli::command();
-        let update_cmd = cmd
-            .get_subcommands()
-            .find(|subcommand| subcommand.get_name() == "update")
-            .expect("update subcommand must exist");
-
-        let mut output = Vec::new();
-        update_cmd
-            .clone()
-            .write_long_help(&mut output)
-            .expect("help generation should succeed");
-        let help = String::from_utf8(output).expect("help output should be utf-8");
-
-        assert!(help.contains("--instructions"));
-    }
-
-    #[test]
-    fn update_cli_parses_instructions_flag() {
-        let cli = Cli::try_parse_from(["zeroclaw", "update", "--instructions"])
-            .expect("update --instructions should parse");
-
-        match cli.command {
-            Commands::Update {
-                check,
-                force,
-                instructions,
-            } => {
-                assert!(!check);
-                assert!(!force);
-                assert!(instructions);
-            }
-            other => panic!("expected update command, got {other:?}"),
         }
     }
 
