@@ -575,6 +575,25 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     normalized
 }
 
+/// Remove `<tool_result …>…</tool_result>` blocks (and a leading `[Tool results]`
+/// header, if present) from a conversation-history entry so that stale tool
+/// output is never presented to the LLM without the corresponding `<tool_call>`.
+fn strip_tool_result_content(text: &str) -> String {
+    static TOOL_RESULT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?s)<tool_result[^>]*>.*?</tool_result>").unwrap()
+    });
+
+    let cleaned = TOOL_RESULT_RE.replace_all(text, "");
+    let cleaned = cleaned.trim();
+
+    // If the only remaining content is the header, drop it entirely.
+    if cleaned == "[Tool results]" || cleaned.is_empty() {
+        return String::new();
+    }
+
+    cleaned.to_string()
+}
+
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(channel_name, "telegram" | "discord" | "matrix")
 }
@@ -953,6 +972,14 @@ fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
     // memory recall on the same turn would surface the marker again,
     // causing two identical image blocks in the provider request.
     if content.contains("[IMAGE:") {
+        return true;
+    }
+
+    // Skip entries containing tool_result blocks. After a daemon restart
+    // these can be recalled from SQLite and injected as memory context,
+    // presenting the LLM with a `<tool_result>` without a preceding
+    // `<tool_call>` and triggering hallucinated output.
+    if content.contains("<tool_result") {
         return true;
     }
 
@@ -1761,6 +1788,15 @@ async fn process_channel_message(
         .cloned()
         .unwrap_or_default();
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
+
+    // Strip stale tool_result blocks from cached turns so the LLM never
+    // sees a `<tool_result>` without a preceding `<tool_call>`, which
+    // causes hallucinated output on subsequent heartbeat ticks or sessions.
+    for turn in &mut prior_turns {
+        if turn.content.contains("<tool_result") {
+            turn.content = strip_tool_result_content(&turn.content);
+        }
+    }
 
     // Only enrich with memory context when there is no prior conversation
     // history. Follow-up turns already include context from previous messages.
@@ -3763,6 +3799,37 @@ mod tests {
             "telegram_user_msg_101",
             "Please describe the image"
         ));
+
+        // Entries containing tool_result blocks must be skipped (#3402).
+        assert!(should_skip_memory_context_entry(
+            "telegram_user_msg_200",
+            r#"[Tool results]
+<tool_result name="shell">Mon Feb 20</tool_result>"#
+        ));
+        assert!(!should_skip_memory_context_entry(
+            "telegram_user_msg_201",
+            "plain text without tool results"
+        ));
+    }
+
+    #[test]
+    fn strip_tool_result_content_removes_blocks_and_header() {
+        let input = r#"[Tool results]
+<tool_result name="shell">Mon Feb 20</tool_result>
+<tool_result name="http_request">{"status":200}</tool_result>"#;
+        assert_eq!(strip_tool_result_content(input), "");
+
+        let mixed = "Some context\n<tool_result name=\"shell\">ok</tool_result>\nMore text";
+        let cleaned = strip_tool_result_content(mixed);
+        assert!(cleaned.contains("Some context"));
+        assert!(cleaned.contains("More text"));
+        assert!(!cleaned.contains("tool_result"));
+
+        assert_eq!(
+            strip_tool_result_content("no tool results here"),
+            "no tool results here"
+        );
+        assert_eq!(strip_tool_result_content(""), "");
     }
 
     #[test]
