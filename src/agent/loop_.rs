@@ -267,6 +267,12 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
                 if memory::is_assistant_autosave_key(&entry.key) {
                     continue;
                 }
+                // Skip entries containing tool_result blocks — they can leak
+                // stale tool output from previous heartbeat ticks into new
+                // sessions, presenting the LLM with orphan tool_result data.
+                if entry.content.contains("<tool_result") {
+                    continue;
+                }
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
             if context == "[Memory context]\n" {
