@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { Send, Bot, User, AlertCircle, Copy, Check } from 'lucide-react';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
+import { generateUUID } from '@/lib/uuid';
 
 interface ChatMessage {
   id: string;
@@ -53,7 +54,7 @@ export default function AgentChat() {
             setMessages((prev) => [
               ...prev,
               {
-                id: crypto.randomUUID(),
+                id: generateUUID(),
                 role: 'agent',
                 content,
                 timestamp: new Date(),
@@ -69,7 +70,7 @@ export default function AgentChat() {
           setMessages((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: generateUUID(),
               role: 'agent',
               content: `[Tool Call] ${msg.name ?? 'unknown'}(${JSON.stringify(msg.args ?? {})})`,
               timestamp: new Date(),
@@ -81,7 +82,7 @@ export default function AgentChat() {
           setMessages((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: generateUUID(),
               role: 'agent',
               content: `[Tool Result] ${msg.output ?? ''}`,
               timestamp: new Date(),
@@ -93,7 +94,7 @@ export default function AgentChat() {
           setMessages((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: generateUUID(),
               role: 'agent',
               content: `[Error] ${msg.message ?? 'Unknown error'}`,
               timestamp: new Date(),
@@ -124,7 +125,7 @@ export default function AgentChat() {
     setMessages((prev) => [
       ...prev,
       {
-        id: crypto.randomUUID(),
+        id: generateUUID(),
         role: 'user',
         content: trimmed,
         timestamp: new Date(),
