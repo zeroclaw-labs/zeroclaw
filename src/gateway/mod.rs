@@ -597,7 +597,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  GET  /ws/chat   — WebSocket agent chat");
     println!("  GET  /health    — health check");
     println!("  GET  /metrics   — Prometheus metrics");
-    if let Some(code) = pairing.pairing_code() {
+    let pairing_code = if pairing.require_pairing() {
+        pairing
+            .pairing_code()
+            .or_else(|| pairing.generate_new_pairing_code())
+    } else {
+        None
+    };
+
+    if let Some(code) = pairing_code {
         println!();
         println!("  🔐 PAIRING REQUIRED — use this one-time code:");
         println!("     ┌──────────────┐");
