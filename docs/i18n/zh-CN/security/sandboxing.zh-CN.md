@@ -6,11 +6,13 @@
 > 如需了解当前运行时行为，请参见 [config-reference.zh-CN.md](../reference/api/config-reference.zh-CN.md)、[operations-runbook.zh-CN.md](../ops/operations-runbook.zh-CN.md) 和 [troubleshooting.zh-CN.md](../ops/troubleshooting.zh-CN.md)。
 
 ## 问题
+
 ZeroClaw 当前具有应用层安全（白名单、路径阻止、命令注入保护），但缺少操作系统级别的 containment。如果攻击者在白名单中，他们可以使用 zeroclaw 的用户权限运行任何允许的命令。
 
 ## 提议的解决方案
 
 ### 选项 1：Firejail 集成（Linux 推荐）
+
 Firejail 提供用户空间沙箱，开销极小。
 
 ```rust
@@ -73,6 +75,7 @@ sandbox_backend = \"firejail\"  # 或 \"none\", \"bubblewrap\", \"docker\"
 ---
 
 ### 选项 2：Bubblewrap（便携，无需 root）
+
 Bubblewrap 使用用户命名空间创建容器。
 
 ```bash
@@ -93,6 +96,7 @@ bwrap --ro-bind /usr /usr \
 ---
 
 ### 选项 3：Docker-in-Docker（重量级但完全隔离）
+
 在临时容器中运行代理工具。
 
 ```rust
@@ -123,6 +127,7 @@ impl DockerSandbox {
 ---
 
 ### 选项 4：Landlock（Linux 内核 LSM，Rust 原生）
+
 Landlock 提供文件系统访问控制，无需容器。
 
 ```rust

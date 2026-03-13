@@ -6,6 +6,7 @@
 > 如需了解当前运行时行为，请参见 [config-reference.zh-CN.md](../reference/api/config-reference.zh-CN.md)、[operations-runbook.zh-CN.md](../ops/operations-runbook.zh-CN.md) 和 [troubleshooting.zh-CN.md](../ops/troubleshooting.zh-CN.md)。
 
 ## 核心问题：安全功能是否会破坏...
+
 1. ❓ 快速交叉编译构建？
 2. ❓ 可插拔架构（任意替换）？
 3. ❓ 硬件不可知性（ARM、x86、RISC-V）？
@@ -295,6 +296,7 @@ backend = \"docker\"
 ## 6. 依赖影响：最小新依赖
 
 ### 当前依赖（供参考）
+
 ```
 reqwest, tokio, serde, anyhow, uuid, chrono, rusqlite,
 axum, tracing, opentelemetry, ...

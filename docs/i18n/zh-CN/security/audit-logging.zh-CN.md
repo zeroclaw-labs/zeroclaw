@@ -6,6 +6,7 @@
 > 如需了解当前运行时行为，请参见 [config-reference.zh-CN.md](../reference/api/config-reference.zh-CN.md)、[operations-runbook.zh-CN.md](../ops/operations-runbook.zh-CN.md) 和 [troubleshooting.zh-CN.md](../ops/troubleshooting.zh-CN.md)。
 
 ## 问题
+
 ZeroClaw 会记录操作，但缺乏防篡改审计追踪，用于记录：
 - 谁执行了什么命令
 - 何时以及从哪个渠道

@@ -6,6 +6,7 @@
 > 如需了解当前运行时行为，请参见 [config-reference.zh-CN.md](../reference/api/config-reference.zh-CN.md)、[operations-runbook.zh-CN.md](../ops/operations-runbook.zh-CN.md) 和 [troubleshooting.zh-CN.md](../ops/troubleshooting.zh-CN.md)。
 
 ## 核心原则
+
 > **"安全功能应该像安全气囊 — 存在、有保护作用，且在需要之前不可见。"**
 
 ## 设计：静默自动检测
@@ -265,6 +266,7 @@ impl Default for SandboxBackend {
 ## 用户体验对比
 
 ### 之前（当前）
+
 ```bash
 $ zeroclaw onboard
 [1/9] Workspace Setup...
@@ -275,6 +277,7 @@ $ zeroclaw onboard
 ```
 
 ### 之后（带无摩擦安全）
+
 ```bash
 $ zeroclaw onboard
 [1/9] Workspace Setup...
@@ -286,6 +289,7 @@ $ zeroclaw onboard
 ```
 
 ### 高级用户（显式控制）
+
 ```bash
 $ zeroclaw onboard --security-level paranoid
 [1/9] Workspace Setup...
