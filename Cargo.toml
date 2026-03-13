@@ -49,7 +49,8 @@ tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 
 # Observability - Prometheus metrics
-prometheus = { version = "0.14", default-features = false }
+# Prometheus metrics - disabled on 32-bit targets without 64-bit atomics
+prometheus = { version = "0.14", default-features = false, optional = true }
 
 # Base64 encoding (screenshots, image data)
 base64 = "0.22"
@@ -187,7 +188,7 @@ landlock = { version = "0.4", optional = true }
 libc = "0.2"
 
 [features]
-default = ["channel-nostr"]
+default = ["channel-nostr", "observability-prometheus"]
 channel-nostr = ["dep:nostr-sdk"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
@@ -195,6 +196,7 @@ channel-lark = ["dep:prost"]
 channel-feishu = ["channel-lark"]  # Alias for Feishu users (Lark and Feishu are the same platform)
 memory-postgres = ["dep:postgres"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+observability-prometheus = ["dep:prometheus"]
 peripheral-rpi = ["rppal"]
 # Browser backend feature alias used by cfg(feature = "browser-native")
 browser-native = ["dep:fantoccini"]

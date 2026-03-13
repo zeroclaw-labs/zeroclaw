@@ -747,6 +747,7 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// GET /metrics — Prometheus text exposition format
+#[cfg(feature = "observability-prometheus")]
 async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let body = if let Some(prom) = state
         .observer
@@ -763,6 +764,16 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
         StatusCode::OK,
         [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
         body,
+    )
+}
+
+/// GET /metrics — Prometheus text exposition format (disabled build stub)
+#[cfg(not(feature = "observability-prometheus"))]
+async fn handle_metrics(_state: State<AppState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
+        String::from("# Prometheus backend not compiled into this build. Rebuild with `--features observability-prometheus`\n"),
     )
 }
 
@@ -1740,6 +1751,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "observability-prometheus")]
     async fn metrics_endpoint_renders_prometheus_output() {
         let prom = Arc::new(crate::observability::PrometheusObserver::new());
         crate::observability::Observer::record_event(
