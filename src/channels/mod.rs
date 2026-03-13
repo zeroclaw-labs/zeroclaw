@@ -2083,7 +2083,14 @@ async fn process_channel_message(
     let notify_observer_flag = Arc::clone(&notify_observer);
     let notify_channel = target_channel.clone();
     let notify_reply_target = msg.reply_target.clone();
-    let notify_thread_root = followup_thread_id(&msg);
+    // Use the raw platform thread_ts for threading notifications; fall back to
+    // extracting the raw timestamp from the message ID (strip "slack_{channel}_" prefix).
+    let notify_thread_root = msg.thread_ts.clone().unwrap_or_else(|| {
+        msg.id
+            .rsplit_once('_')
+            .map(|(_, ts)| ts.to_string())
+            .unwrap_or_else(|| msg.id.clone())
+    });
     let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls {
         Some(tokio::spawn(async move {
             while notify_rx.recv().await.is_some() {}
