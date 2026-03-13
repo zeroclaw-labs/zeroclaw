@@ -54,9 +54,9 @@
 
 <p align="center">
   <a href="install.sh">一键部署</a> |
-  <a href="docs/setup-guides/README.md">安装入门</a> |
+  <a href="docs/i18n/zh-CN/setup-guides/README.zh-CN.md">安装入门</a> |
   <a href="docs/README.zh-CN.md">文档总览</a> |
-  <a href="docs/SUMMARY.md">文档目录</a>
+  <a href="docs/SUMMARY.zh-CN.md">文档目录</a>
 </p>
 
 <p align="center">
@@ -70,9 +70,9 @@
 </p>
 
 > 本文是对 `README.md` 的人工对齐翻译（强调可读性与准确性，不做逐字直译）。
-> 
+>
 > 技术标识（命令、配置键、API 路径、Trait 名称）保持英文，避免语义漂移。
-> 
+>
 > 最后对齐时间：**2026-03-14**。
 
 ## 📢 公告板
