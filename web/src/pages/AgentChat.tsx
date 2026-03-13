@@ -10,9 +10,17 @@ interface ChatMessage {
   timestamp: Date;
 }
 
+const DRAFT_STORAGE_KEY = 'zeroclaw_chat_draft';
+
 export default function AgentChat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [input, setInput] = useState('');
+  const [input, setInput] = useState(() => {
+    // Restore draft from sessionStorage on initial load
+    if (typeof window !== 'undefined') {
+      return sessionStorage.getItem(DRAFT_STORAGE_KEY) || '';
+    }
+    return '';
+  });
   const [typing, setTyping] = useState(false);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -140,6 +148,8 @@ export default function AgentChat() {
     }
 
     setInput('');
+    // Clear draft from sessionStorage when message is sent
+    sessionStorage.removeItem(DRAFT_STORAGE_KEY);
     if (inputRef.current) {
       inputRef.current.style.height = 'auto';
       inputRef.current.focus();
@@ -154,7 +164,10 @@ export default function AgentChat() {
   };
 
   const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setInput(e.target.value);
+    const newValue = e.target.value;
+    setInput(newValue);
+    // Save draft to sessionStorage
+    sessionStorage.setItem(DRAFT_STORAGE_KEY, newValue);
     e.target.style.height = 'auto';
     e.target.style.height = `${Math.min(e.target.scrollHeight, 200)}px`;
   };
