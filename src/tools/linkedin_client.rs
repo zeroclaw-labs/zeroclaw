@@ -1,8 +1,9 @@
+use crate::config::LinkedInImageConfig;
 use anyhow::Context;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::Method;
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const LINKEDIN_API_BASE: &str = "https://api.linkedin.com";
 const LINKEDIN_OAUTH_TOKEN_URL: &str = "https://www.linkedin.com/oauth/v2/accessToken";
@@ -523,6 +524,128 @@ impl LinkedInClient {
         Ok(new_token)
     }
 
+    /// Register an image asset with LinkedIn, upload binary data, and return the asset URN.
+    ///
+    /// LinkedIn's image post flow is three steps:
+    /// 1. Register the upload → get an upload URL + asset URN
+    /// 2. PUT the binary image to the upload URL
+    /// 3. Reference the asset URN when creating the post
+    pub async fn upload_image(
+        &self,
+        image_bytes: &[u8],
+        token: &str,
+        person_id: &str,
+    ) -> anyhow::Result<String> {
+        let owner_urn = format!("urn:li:person:{person_id}");
+
+        // Step 1: Register upload
+        let register_body = json!({
+            "initializeUploadRequest": {
+                "owner": owner_urn
+            }
+        });
+        let register_url = format!("{LINKEDIN_API_BASE}/rest/images?action=initializeUpload");
+        let register_resp = self
+            .api_request(Method::POST, &register_url, token, Some(register_body))
+            .await?;
+
+        let status = register_resp.status();
+        if !status.is_success() {
+            let body_text = register_resp.text().await.unwrap_or_default();
+            anyhow::bail!("LinkedIn image register failed ({status}): {body_text}");
+        }
+
+        let register_json: serde_json::Value = register_resp
+            .json()
+            .await
+            .context("Failed to parse image register response")?;
+
+        let upload_url = register_json
+            .pointer("/value/uploadUrl")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing uploadUrl in register response"))?
+            .to_string();
+
+        let image_urn = register_json
+            .pointer("/value/image")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing image URN in register response"))?
+            .to_string();
+
+        // Step 2: Upload binary
+        let client = Self::client();
+        let mut upload_headers = HeaderMap::new();
+        upload_headers.insert(
+            reqwest::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).expect("valid bearer token header"),
+        );
+
+        let upload_resp = client
+            .put(&upload_url)
+            .headers(upload_headers)
+            .header("Content-Type", "image/png")
+            .body(image_bytes.to_vec())
+            .send()
+            .await
+            .context("LinkedIn image upload failed")?;
+
+        let upload_status = upload_resp.status();
+        if !upload_status.is_success() {
+            let body_text = upload_resp.text().await.unwrap_or_default();
+            anyhow::bail!("LinkedIn image upload failed ({upload_status}): {body_text}");
+        }
+
+        Ok(image_urn)
+    }
+
+    /// Create a post with an attached image.
+    pub async fn create_post_with_image(
+        &self,
+        text: &str,
+        visibility: &str,
+        image_urn: &str,
+    ) -> anyhow::Result<String> {
+        let creds = self.get_credentials().await?;
+        let author_urn = format!("urn:li:person:{}", creds.person_id);
+
+        let body = json!({
+            "author": author_urn,
+            "lifecycleState": "PUBLISHED",
+            "visibility": visibility,
+            "commentary": text,
+            "distribution": {
+                "feedDistribution": "MAIN_FEED",
+                "targetEntities": [],
+                "thirdPartyDistributionChannels": []
+            },
+            "content": {
+                "media": {
+                    "id": image_urn
+                }
+            }
+        });
+
+        let url = format!("{LINKEDIN_API_BASE}/rest/posts");
+        let response = self
+            .api_request(Method::POST, &url, &creds.access_token, Some(body))
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("LinkedIn create_post_with_image failed ({status}): {body_text}");
+        }
+
+        let post_urn = response
+            .headers()
+            .get("x-restli-id")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+            .unwrap_or_default();
+
+        Ok(post_urn)
+    }
+
     async fn update_env_token(&self, new_token: &str) -> anyhow::Result<()> {
         let env_path = self.workspace_dir.join(".env");
         let content = tokio::fs::read_to_string(&env_path)
@@ -594,6 +717,424 @@ impl LinkedInClient {
 
         Ok(())
     }
+}
+
+// ── Image Generation ─────────────────────────────────────────────
+
+/// Multi-provider image generator with SVG fallback card.
+///
+/// Tries AI providers in configured priority order. If all fail (missing keys,
+/// API errors, exhausted credits), falls back to generating a branded SVG card.
+pub struct ImageGenerator {
+    config: LinkedInImageConfig,
+    workspace_dir: PathBuf,
+}
+
+impl ImageGenerator {
+    pub fn new(config: LinkedInImageConfig, workspace_dir: PathBuf) -> Self {
+        Self {
+            config,
+            workspace_dir,
+        }
+    }
+
+    /// Generate an image for the given prompt text. Returns the path to the saved PNG/SVG file.
+    pub async fn generate(&self, prompt: &str) -> anyhow::Result<PathBuf> {
+        let image_dir = self.workspace_dir.join(&self.config.temp_dir);
+        tokio::fs::create_dir_all(&image_dir).await?;
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let base_name = format!("post_{timestamp}");
+
+        // Try each configured provider in order
+        for provider_name in &self.config.providers {
+            let result = match provider_name.as_str() {
+                "stability" => self.try_stability(prompt, &image_dir, &base_name).await,
+                "imagen" => self.try_imagen(prompt, &image_dir, &base_name).await,
+                "dalle" => self.try_dalle(prompt, &image_dir, &base_name).await,
+                "flux" => self.try_flux(prompt, &image_dir, &base_name).await,
+                other => {
+                    tracing::warn!("Unknown image provider '{other}', skipping");
+                    continue;
+                }
+            };
+
+            match result {
+                Ok(path) => {
+                    tracing::info!("Image generated via {provider_name}: {}", path.display());
+                    return Ok(path);
+                }
+                Err(e) => {
+                    tracing::warn!("Image provider '{provider_name}' failed: {e}");
+                }
+            }
+        }
+
+        // All AI providers failed — try SVG fallback
+        if self.config.fallback_card {
+            let svg_path = image_dir.join(format!("{base_name}.svg"));
+            let svg_content = Self::generate_fallback_card(prompt, &self.config.card_accent_color);
+            tokio::fs::write(&svg_path, &svg_content).await?;
+            tracing::info!("Fallback SVG card generated: {}", svg_path.display());
+            return Ok(svg_path);
+        }
+
+        anyhow::bail!("All image generation providers failed and fallback_card is disabled")
+    }
+
+    /// Read an env var value from the workspace .env file (same format as LinkedInClient).
+    async fn read_env_var(workspace_dir: &Path, var_name: &str) -> anyhow::Result<String> {
+        let env_path = workspace_dir.join(".env");
+        let content = tokio::fs::read_to_string(&env_path)
+            .await
+            .with_context(|| format!("Failed to read {}", env_path.display()))?;
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let line = line.strip_prefix("export ").map(str::trim).unwrap_or(line);
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim() == var_name {
+                    let val = LinkedInClient::parse_env_value(value);
+                    if !val.is_empty() {
+                        return Ok(val);
+                    }
+                }
+            }
+        }
+
+        anyhow::bail!("{var_name} not found or empty in .env")
+    }
+
+    fn http_client() -> reqwest::Client {
+        crate::config::build_runtime_proxy_client_with_timeouts(
+            "tool.linkedin.image",
+            60, // image gen can be slow
+            10,
+        )
+    }
+
+    // ── Stability AI ────────────────────────────────────────────
+
+    async fn try_stability(
+        &self,
+        prompt: &str,
+        output_dir: &Path,
+        base_name: &str,
+    ) -> anyhow::Result<PathBuf> {
+        let api_key =
+            Self::read_env_var(&self.workspace_dir, &self.config.stability.api_key_env).await?;
+
+        let client = Self::http_client();
+        let url = format!(
+            "https://api.stability.ai/v1/generation/{}/text-to-image",
+            self.config.stability.model
+        );
+
+        let body = json!({
+            "text_prompts": [{"text": prompt, "weight": 1.0}],
+            "cfg_scale": 7,
+            "height": 1024,
+            "width": 1024,
+            "samples": 1,
+            "steps": 30
+        });
+
+        let resp = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("Stability AI request failed")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Stability AI failed ({status}): {body_text}");
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+        let b64 = json
+            .pointer("/artifacts/0/base64")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("No image data in Stability response"))?;
+
+        let bytes = base64_decode(b64)?;
+        let path = output_dir.join(format!("{base_name}_stability.png"));
+        tokio::fs::write(&path, &bytes).await?;
+        Ok(path)
+    }
+
+    // ── Google Imagen (Vertex AI) ───────────────────────────────
+
+    async fn try_imagen(
+        &self,
+        prompt: &str,
+        output_dir: &Path,
+        base_name: &str,
+    ) -> anyhow::Result<PathBuf> {
+        let api_key =
+            Self::read_env_var(&self.workspace_dir, &self.config.imagen.api_key_env).await?;
+        let project_id =
+            Self::read_env_var(&self.workspace_dir, &self.config.imagen.project_id_env).await?;
+
+        let client = Self::http_client();
+        let url = format!(
+            "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models/imagen-3.0-generate-001:predict",
+            self.config.imagen.region, project_id, self.config.imagen.region
+        );
+
+        let body = json!({
+            "instances": [{"prompt": prompt}],
+            "parameters": {
+                "sampleCount": 1,
+                "aspectRatio": "1:1"
+            }
+        });
+
+        let resp = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("Imagen request failed")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Imagen failed ({status}): {body_text}");
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+        let b64 = json
+            .pointer("/predictions/0/bytesBase64Encoded")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("No image data in Imagen response"))?;
+
+        let bytes = base64_decode(b64)?;
+        let path = output_dir.join(format!("{base_name}_imagen.png"));
+        tokio::fs::write(&path, &bytes).await?;
+        Ok(path)
+    }
+
+    // ── OpenAI DALL-E ───────────────────────────────────────────
+
+    async fn try_dalle(
+        &self,
+        prompt: &str,
+        output_dir: &Path,
+        base_name: &str,
+    ) -> anyhow::Result<PathBuf> {
+        let api_key =
+            Self::read_env_var(&self.workspace_dir, &self.config.dalle.api_key_env).await?;
+
+        let client = Self::http_client();
+        let url = "https://api.openai.com/v1/images/generations";
+
+        let body = json!({
+            "model": self.config.dalle.model,
+            "prompt": prompt,
+            "n": 1,
+            "size": self.config.dalle.size,
+            "response_format": "b64_json"
+        });
+
+        let resp = client
+            .post(url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("DALL-E request failed")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("DALL-E failed ({status}): {body_text}");
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+        let b64 = json
+            .pointer("/data/0/b64_json")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("No image data in DALL-E response"))?;
+
+        let bytes = base64_decode(b64)?;
+        let path = output_dir.join(format!("{base_name}_dalle.png"));
+        tokio::fs::write(&path, &bytes).await?;
+        Ok(path)
+    }
+
+    // ── Flux (fal.ai) ──────────────────────────────────────────
+
+    async fn try_flux(
+        &self,
+        prompt: &str,
+        output_dir: &Path,
+        base_name: &str,
+    ) -> anyhow::Result<PathBuf> {
+        let api_key =
+            Self::read_env_var(&self.workspace_dir, &self.config.flux.api_key_env).await?;
+
+        let client = Self::http_client();
+        let url = format!("https://fal.run/{}", self.config.flux.model);
+
+        let body = json!({
+            "prompt": prompt,
+            "image_size": "square_hd",
+            "num_images": 1
+        });
+
+        let resp = client
+            .post(&url)
+            .header("Authorization", format!("Key {api_key}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("Flux request failed")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Flux failed ({status}): {body_text}");
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+        let image_url = json
+            .pointer("/images/0/url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("No image URL in Flux response"))?;
+
+        // Download the image from the returned URL
+        let img_resp = client.get(image_url).send().await?;
+        if !img_resp.status().is_success() {
+            anyhow::bail!("Failed to download Flux image from {image_url}");
+        }
+        let bytes = img_resp.bytes().await?;
+        let path = output_dir.join(format!("{base_name}_flux.png"));
+        tokio::fs::write(&path, &bytes).await?;
+        Ok(path)
+    }
+
+    // ── SVG Fallback Card ───────────────────────────────────────
+
+    /// Generate a branded SVG text card with the post title on a gradient background.
+    pub fn generate_fallback_card(title: &str, accent_color: &str) -> String {
+        // Truncate title to ~80 chars for clean display
+        let display_title = if title.len() > 80 {
+            format!("{}...", &title[..77])
+        } else {
+            title.to_string()
+        };
+
+        // Word-wrap at ~35 chars per line, max 3 lines
+        let lines = word_wrap(&display_title, 35, 3);
+        let line_height: i32 = 48;
+        // lines.len() is capped at max_lines=3, so this cast is safe
+        #[allow(clippy::cast_possible_truncation)]
+        let line_count: i32 = lines.len() as i32;
+        let total_text_height = line_count * line_height;
+        let start_y = (1024 - total_text_height) / 2 + 24;
+
+        let font = "system-ui, sans-serif";
+        let text_elements: String = lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                #[allow(clippy::cast_possible_truncation)]
+                let y = start_y + (i as i32 * line_height); // i is max 2, safe
+                format!(
+                    "    <text x=\"512\" y=\"{y}\" text-anchor=\"middle\" fill=\"white\" \
+                     font-family=\"{font}\" font-size=\"36\" font-weight=\"600\">{}</text>",
+                    xml_escape(line)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1024\" height=\"1024\" \
+             viewBox=\"0 0 1024 1024\">\n\
+             \x20 <defs>\n\
+             \x20   <linearGradient id=\"bg\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\">\n\
+             \x20     <stop offset=\"0%\" stop-color=\"{accent_color}\"/>\n\
+             \x20     <stop offset=\"100%\" stop-color=\"#1a1a2e\"/>\n\
+             \x20   </linearGradient>\n\
+             \x20 </defs>\n\
+             \x20 <rect width=\"1024\" height=\"1024\" fill=\"url(#bg)\" rx=\"0\"/>\n\
+             \x20 <rect x=\"60\" y=\"60\" width=\"904\" height=\"904\" rx=\"24\" \
+             fill=\"none\" stroke=\"rgba(255,255,255,0.15)\" stroke-width=\"2\"/>\n\
+             {text_elements}\n\
+             \x20 <text x=\"512\" y=\"920\" text-anchor=\"middle\" \
+             fill=\"rgba(255,255,255,0.5)\" font-family=\"{font}\" \
+             font-size=\"18\">ZeroClaw</text>\n\
+             </svg>"
+        )
+    }
+
+    /// Clean up a generated image file after successful upload.
+    pub async fn cleanup(path: &Path) -> anyhow::Result<()> {
+        if path.exists() {
+            tokio::fs::remove_file(path).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Decode a base64-encoded string to bytes.
+fn base64_decode(input: &str) -> anyhow::Result<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(input)
+        .context("Failed to decode base64 image data")
+}
+
+/// Simple word-wrap: break text into lines of at most `max_width` chars, capped at `max_lines`.
+fn word_wrap(text: &str, max_width: usize, max_lines: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current_line = String::new();
+
+    for word in text.split_whitespace() {
+        if current_line.is_empty() {
+            current_line = word.to_string();
+        } else if current_line.len() + 1 + word.len() <= max_width {
+            current_line.push(' ');
+            current_line.push_str(word);
+        } else {
+            lines.push(current_line);
+            current_line = word.to_string();
+            if lines.len() >= max_lines {
+                break;
+            }
+        }
+    }
+
+    if !current_line.is_empty() && lines.len() < max_lines {
+        lines.push(current_line);
+    }
+
+    lines
+}
+
+/// Escape XML special characters for SVG text content.
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 #[cfg(test)]
@@ -944,5 +1485,204 @@ mod tests {
                 .unwrap(),
             "2.0.0"
         );
+    }
+
+    // ── Image Generation Tests ──────────────────────────────────
+
+    #[test]
+    fn fallback_card_contains_svg_structure() {
+        let svg = ImageGenerator::generate_fallback_card("Test Title", "#0A66C2");
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.contains("1024"));
+        assert!(svg.contains("#0A66C2"));
+        assert!(svg.contains("Test Title"));
+        assert!(svg.contains("ZeroClaw"));
+    }
+
+    #[test]
+    fn fallback_card_escapes_xml_characters() {
+        let svg =
+            ImageGenerator::generate_fallback_card("AI & ML <Trends> for \"2026\"", "#0A66C2");
+        assert!(svg.contains("&amp;"));
+        assert!(svg.contains("&lt;"));
+        assert!(svg.contains("&gt;"));
+        assert!(svg.contains("&quot;"));
+        assert!(!svg.contains("& "));
+    }
+
+    #[test]
+    fn fallback_card_truncates_long_titles() {
+        let long_title = "A".repeat(100);
+        let svg = ImageGenerator::generate_fallback_card(&long_title, "#0A66C2");
+        assert!(svg.contains("..."));
+        // Should not contain the full 100-char string
+        assert!(!svg.contains(&long_title));
+    }
+
+    #[test]
+    fn fallback_card_uses_custom_accent_color() {
+        let svg = ImageGenerator::generate_fallback_card("Title", "#FF5733");
+        assert!(svg.contains("#FF5733"));
+        assert!(!svg.contains("#0A66C2"));
+    }
+
+    #[test]
+    fn word_wrap_basic() {
+        let lines = word_wrap("Hello world this is a test", 15, 3);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "Hello world");
+        assert_eq!(lines[1], "this is a test");
+    }
+
+    #[test]
+    fn word_wrap_respects_max_lines() {
+        let lines = word_wrap("one two three four five six seven eight", 10, 2);
+        assert!(lines.len() <= 2);
+    }
+
+    #[test]
+    fn word_wrap_single_word() {
+        let lines = word_wrap("Hello", 35, 3);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], "Hello");
+    }
+
+    #[test]
+    fn word_wrap_empty() {
+        let lines = word_wrap("", 35, 3);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn xml_escape_handles_all_special_chars() {
+        assert_eq!(xml_escape("a&b"), "a&amp;b");
+        assert_eq!(xml_escape("a<b>c"), "a&lt;b&gt;c");
+        assert_eq!(xml_escape("a\"b'c"), "a&quot;b&apos;c");
+    }
+
+    #[test]
+    fn xml_escape_preserves_normal_text() {
+        assert_eq!(xml_escape("hello world 123"), "hello world 123");
+    }
+
+    #[tokio::test]
+    async fn image_generator_fallback_creates_svg_file() {
+        let tmp = TempDir::new().unwrap();
+        let config = LinkedInImageConfig {
+            enabled: true,
+            providers: vec![], // no AI providers — force fallback
+            fallback_card: true,
+            card_accent_color: "#0A66C2".into(),
+            temp_dir: "images".into(),
+            ..Default::default()
+        };
+
+        let generator = ImageGenerator::new(config, tmp.path().to_path_buf());
+        let path = generator.generate("Test post about Rust").await.unwrap();
+
+        assert!(path.exists());
+        assert_eq!(path.extension().unwrap(), "svg");
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("Test post about Rust"));
+    }
+
+    #[tokio::test]
+    async fn image_generator_fails_when_no_providers_and_no_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let config = LinkedInImageConfig {
+            enabled: true,
+            providers: vec![],
+            fallback_card: false, // no fallback either
+            ..Default::default()
+        };
+
+        let generator = ImageGenerator::new(config, tmp.path().to_path_buf());
+        let result = generator.generate("Test").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("All image generation providers failed"));
+    }
+
+    #[tokio::test]
+    async fn image_generator_skips_provider_without_key() {
+        let tmp = TempDir::new().unwrap();
+        // Create .env without any image API keys
+        fs::write(tmp.path().join(".env"), "SOME_OTHER_KEY=value\n").unwrap();
+
+        let config = LinkedInImageConfig {
+            enabled: true,
+            providers: vec!["stability".into(), "dalle".into()],
+            fallback_card: true,
+            temp_dir: "images".into(),
+            ..Default::default()
+        };
+
+        let generator = ImageGenerator::new(config, tmp.path().to_path_buf());
+        let path = generator.generate("Test").await.unwrap();
+
+        // Should fall through to SVG fallback since no API keys
+        assert_eq!(path.extension().unwrap(), "svg");
+    }
+
+    #[tokio::test]
+    async fn image_generator_cleanup_removes_file() {
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("test.png");
+        fs::write(&file_path, b"fake image data").unwrap();
+        assert!(file_path.exists());
+
+        ImageGenerator::cleanup(&file_path).await.unwrap();
+        assert!(!file_path.exists());
+    }
+
+    #[tokio::test]
+    async fn image_generator_cleanup_noop_for_missing_file() {
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("nonexistent.png");
+        // Should not error
+        ImageGenerator::cleanup(&file_path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_env_var_reads_value() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".env"),
+            "STABILITY_API_KEY=sk-test-123\nOTHER=val\n",
+        )
+        .unwrap();
+
+        let val = ImageGenerator::read_env_var(tmp.path(), "STABILITY_API_KEY")
+            .await
+            .unwrap();
+        assert_eq!(val, "sk-test-123");
+    }
+
+    #[tokio::test]
+    async fn read_env_var_fails_for_missing_key() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".env"), "OTHER=val\n").unwrap();
+
+        let result = ImageGenerator::read_env_var(tmp.path(), "STABILITY_API_KEY").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("STABILITY_API_KEY"));
+    }
+
+    #[test]
+    fn image_config_default_has_all_providers() {
+        let config = LinkedInImageConfig::default();
+        assert_eq!(config.providers.len(), 4);
+        assert_eq!(config.providers[0], "stability");
+        assert_eq!(config.providers[1], "imagen");
+        assert_eq!(config.providers[2], "dalle");
+        assert_eq!(config.providers[3], "flux");
+        assert!(config.fallback_card);
+        assert!(!config.enabled);
     }
 }
