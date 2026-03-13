@@ -353,6 +353,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             reasoning_enabled: config.runtime.reasoning_enabled,
             provider_timeout_secs: Some(config.provider_timeout_secs),
             extra_headers: config.extra_headers.clone(),
+            api_path: config.api_path.clone(),
         },
     )?);
     let model = config
@@ -382,7 +383,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let tools_registry_raw = tools::all_tools_with_runtime(
+    let (tools_registry_raw, _delegate_handle_gw) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -683,6 +684,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cron", get(api::handle_api_cron_list))
         .route("/api/cron", post(api::handle_api_cron_add))
         .route("/api/cron/{id}", delete(api::handle_api_cron_delete))
+        .route("/api/cron/{id}/runs", get(api::handle_api_cron_runs))
         .route("/api/integrations", get(api::handle_api_integrations))
         .route(
             "/api/integrations/settings",

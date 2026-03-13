@@ -4,7 +4,9 @@ use matrix_sdk::{
     authentication::matrix::MatrixSession,
     config::SyncSettings,
     ruma::{
+        api::client::receipt::create_receipt,
         events::reaction::ReactionEventContent,
+        events::receipt::ReceiptThread,
         events::relation::{Annotation, Thread},
         events::room::message::{
             MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
@@ -560,6 +562,11 @@ impl Channel for MatrixChannel {
             anyhow::bail!("Matrix room '{}' is not in joined state", target_room_id);
         }
 
+        // Stop typing notification before sending the response
+        if let Err(error) = room.typing_notice(false).await {
+            tracing::warn!("Matrix failed to stop typing notification: {error}");
+        }
+
         let mut content = RoomMessageEventContent::text_markdown(&message.content);
 
         if let Some(ref thread_ts) = message.thread_ts {
@@ -853,6 +860,23 @@ impl Channel for MatrixChannel {
                     if MatrixChannel::cache_event_id(&event_id, recent_order, recent_lookup) {
                         return;
                     }
+                }
+
+                // Send a read receipt for the incoming event
+                if let Err(error) = room
+                    .send_single_receipt(
+                        create_receipt::v3::ReceiptType::Read,
+                        ReceiptThread::Unthreaded,
+                        event.event_id.clone(),
+                    )
+                    .await
+                {
+                    tracing::warn!("Matrix failed to send read receipt: {error}");
+                }
+
+                // Start typing notification while processing begins
+                if let Err(error) = room.typing_notice(true).await {
+                    tracing::warn!("Matrix failed to start typing notification: {error}");
                 }
 
                 let thread_ts = match &event.content.relates_to {

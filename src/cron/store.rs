@@ -179,7 +179,10 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
 
         let mut jobs = Vec::new();
         for row in rows {
-            jobs.push(row?);
+            match row {
+                Ok(job) => jobs.push(job),
+                Err(e) => tracing::warn!("Skipping cron job with unparseable row data: {e}"),
+            }
         }
         Ok(jobs)
     })
