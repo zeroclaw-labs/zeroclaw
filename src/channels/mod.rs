@@ -1914,7 +1914,10 @@ async fn process_channel_message(
     let notify_observer_flag = Arc::clone(&notify_observer);
     let notify_channel = target_channel.clone();
     let notify_reply_target = msg.reply_target.clone();
-    let notify_thread_root = msg.id.clone();
+    // Prefer the platform-native thread identifier (e.g. Slack `ts`) over
+    // msg.id, which is a composite key ("slack_{channel}_{ts}") and not a
+    // valid thread_ts on platforms that validate the format.
+    let notify_thread_root = msg.thread_ts.clone().unwrap_or_else(|| msg.id.clone());
     let notify_task = if msg.channel == "cli" {
         Some(tokio::spawn(async move {
             while notify_rx.recv().await.is_some() {}
@@ -1979,8 +1982,15 @@ async fn process_channel_message(
         let _ = handle.await;
     }
 
-    // Thread the final reply only if tools were used (multi-message response)
-    if notify_observer_flag.tools_used.load(Ordering::Relaxed) && msg.channel != "cli" {
+    // Thread the final reply only if tools were used (multi-message response).
+    // Preserve the existing thread_ts when the channel already set one from the
+    // inbound event (e.g. Slack sets it to the message `ts`). Overwriting with
+    // msg.id would produce an invalid thread identifier on platforms where msg.id
+    // is a composite key (e.g. "slack_{channel}_{ts}").
+    if notify_observer_flag.tools_used.load(Ordering::Relaxed)
+        && msg.channel != "cli"
+        && msg.thread_ts.is_none()
+    {
         msg.thread_ts = Some(msg.id.clone());
     }
     // Drop the notify sender so the forwarder task finishes
