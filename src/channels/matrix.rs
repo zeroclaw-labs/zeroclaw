@@ -5,9 +5,9 @@ use matrix_sdk::{
     config::SyncSettings,
     ruma::{
         events::reaction::ReactionEventContent,
-        events::relation::{Annotation, InReplyTo, Thread},
+        events::relation::{Annotation, Thread},
         events::room::message::{
-            MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+            MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
         },
         events::room::MediaSource,
         OwnedEventId, OwnedRoomId, OwnedUserId,
