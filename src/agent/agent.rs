@@ -464,7 +464,81 @@ impl Agent {
         self.model_name.clone()
     }
 
+    /// Execute a raw shell command string using the system shell and return
+    /// the textual output as the user would see on the terminal (stdout
+    /// followed by stderr). This helper intentionally only targets Unix
+    /// (`sh -c`) — Windows is not considered here.
+    ///
+    /// Behavior:
+    /// - If `command` starts with a leading `!` it will be stripped (single
+    ///   leading `!`) and the rest executed.
+    /// - Returns combined stdout+stderr as a `String`. If the command exits
+    ///   with a non-zero code an error is returned including the captured
+    ///   output to aid debugging.
+    ///
+    /// NOTE: this runs the command on the host and does not perform any
+    /// policy checks; callers (e.g. `turn`) must enforce security constraints
+    /// before invoking it.
+    pub async fn execute_shell_command(&mut self, command: &str) -> Result<String> {
+        // Only support Unix shells in this helper per request.
+        #[cfg(not(unix))]
+        {
+            return Err(anyhow::anyhow!(
+                "execute_shell_command is not supported on non-Unix platforms"
+            ));
+        }
+
+        // Trim a single leading '!' if present, then any leading/trailing whitespace.
+        let cmd = if command.starts_with('!') {
+            command[1..].trim()
+        } else {
+            command.trim()
+        };
+
+        // Special internal commands that don't go to the shell.
+        if cmd == "clear_history" {
+            self.clear_history();
+            return Ok("History cleared.".into());
+        }
+
+        let output = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .output()
+            .await?;
+
+        let mut combined = String::new();
+        if !output.stdout.is_empty() {
+            combined.push_str(&String::from_utf8_lossy(&output.stdout));
+        }
+        if !output.stderr.is_empty() {
+            if !combined.ends_with('\n') && !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        }
+
+        if output.status.success() {
+            Ok(combined)
+        } else {
+            Err(anyhow::anyhow!(
+                "Shell command exited with {}: {}",
+                output.status,
+                combined
+            ))
+        }
+    }
+
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+
+        // If the user message begins with a leading '!' treat it as a
+        // direct shell command and execute it immediately. We trim any
+        // leading whitespace first so messages like "  !ls" are accepted.
+        let trimmed_start = user_message.trim_start();
+        if trimmed_start.starts_with('!') {
+            return self.execute_shell_command(trimmed_start).await;
+        }
+
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
             self.history
@@ -580,6 +654,7 @@ impl Agent {
         });
 
         while let Some(msg) = rx.recv().await {
+            println!("> {}", msg.content);
             let response = match self.turn(&msg.content).await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -603,6 +678,13 @@ pub async fn run(
     temperature: f64,
 ) -> Result<()> {
     let start = Instant::now();
+
+    // If the caller provided a single-shot message that starts with '!'
+    // (a direct shell command), don't record the AgentEnd observer event.
+    let skip_agent_end = message
+        .as_ref()
+        .map(|m| m.trim_start().starts_with('!'))
+        .unwrap_or(false);
 
     let mut effective_config = config;
     if let Some(p) = provider_override {
@@ -638,13 +720,15 @@ pub async fn run(
         agent.run_interactive().await?;
     }
 
-    agent.observer.record_event(&ObserverEvent::AgentEnd {
-        provider: provider_name,
-        model: model_name,
-        duration: start.elapsed(),
-        tokens_used: None,
-        cost_usd: None,
-    });
+    if !skip_agent_end {
+        agent.observer.record_event(&ObserverEvent::AgentEnd {
+            provider: provider_name,
+            model: model_name,
+            duration: start.elapsed(),
+            tokens_used: None,
+            cost_usd: None,
+        });
+    }
 
     Ok(())
 }
