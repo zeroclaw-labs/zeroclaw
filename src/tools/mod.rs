@@ -40,6 +40,10 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod mcp_client;
+pub mod mcp_protocol;
+pub mod mcp_tool;
+pub mod mcp_transport;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
@@ -79,6 +83,8 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+pub use mcp_client::McpRegistry;
+pub use mcp_tool::McpToolWrapper;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
@@ -341,6 +347,7 @@ pub fn all_tools_with_runtime(
                 secrets_encrypt: root_config.secrets.encrypt,
                 reasoning_enabled: root_config.runtime.reasoning_enabled,
                 provider_timeout_secs: Some(root_config.provider_timeout_secs),
+                extra_headers: root_config.extra_headers.clone(),
             },
         )
         .with_parent_tools(parent_tools)

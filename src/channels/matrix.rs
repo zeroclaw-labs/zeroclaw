@@ -765,8 +765,11 @@ impl Channel for MatrixChannel {
                 // Download media to workspace if present
                 let body = if let Some((url, filename)) = media_download {
                     let workspace = std::path::PathBuf::from(
-                        std::env::var("ZEROCLAW_WORKSPACE")
-                            .unwrap_or_else(|_| "/tmp/zeroclaw-uploads".to_string()),
+                        shellexpand::tilde(
+                            &std::env::var("ZEROCLAW_WORKSPACE")
+                                .unwrap_or_else(|_| "/tmp/zeroclaw-uploads".to_string()),
+                        )
+                        .as_ref(),
                     );
                     let _ = tokio::fs::create_dir_all(&workspace).await;
                     let dest = workspace.join(&filename);
