@@ -89,10 +89,26 @@ struct OllamaToolCall {
 #[derive(Debug, Deserialize)]
 struct OllamaFunction {
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_args")]
     arguments: serde_json::Value,
 }
 
+// ─── serde Helpers ───────────────────────────────────────────────────────────
+fn deserialize_args<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+
+    if let Some(s) = value.as_str() {
+        match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(v) => Ok(v),
+            Err(_) => Ok(serde_json::json!({})),
+        }
+    } else {
+        Ok(value)
+    }
+}
 // ─── Implementation ───────────────────────────────────────────────────────────
 
 impl OllamaProvider {
