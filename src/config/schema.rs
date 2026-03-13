@@ -3026,6 +3026,10 @@ pub struct ChannelsConfig {
     /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
     #[serde(default = "default_channel_message_timeout_secs")]
     pub message_timeout_secs: u64,
+    /// Whether to add acknowledgement reactions (👀 on receipt, ✅/⚠️ on
+    /// completion) to incoming channel messages. Default: `true`.
+    #[serde(default = "default_true")]
+    pub ack_reactions: bool,
 }
 
 impl ChannelsConfig {
@@ -3153,6 +3157,7 @@ impl Default for ChannelsConfig {
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
+            ack_reactions: true,
         }
     }
 }
@@ -6062,6 +6067,7 @@ default_temperature = 0.7
                 nostr: None,
                 clawdtalk: None,
                 message_timeout_secs: 300,
+                ack_reactions: true,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -6735,6 +6741,7 @@ allowed_users = ["@ops:matrix.org"]
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: 300,
+            ack_reactions: true,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -6949,6 +6956,7 @@ channel_id = "C123"
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: 300,
+            ack_reactions: true,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
