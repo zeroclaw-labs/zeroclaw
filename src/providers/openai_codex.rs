@@ -66,6 +66,14 @@ struct ResponsesReasoningOptions {
     summary: String,
 }
 
+#[derive(Clone)]
+struct CodexAuthHeaders {
+    use_gateway_api_key_auth: bool,
+    bearer_token: String,
+    access_token: Option<String>,
+    account_id: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ResponsesResponse {
     #[serde(default)]
@@ -544,13 +552,12 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<St
         .ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex ({metadata})"))
 }
 
+fn should_retry_without_stream(err: &anyhow::Error) -> bool {
+    err.to_string().contains("OpenAI Codex read body failed")
+}
+
 impl OpenAiCodexProvider {
-    async fn send_responses_request(
-        &self,
-        input: Vec<ResponsesInput>,
-        instructions: String,
-        model: &str,
-    ) -> anyhow::Result<String> {
+    async fn resolve_auth_headers(&self) -> anyhow::Result<CodexAuthHeaders> {
         let use_gateway_api_key_auth = self.custom_endpoint && self.gateway_api_key.is_some();
         let profile = match self
             .auth
@@ -606,14 +613,38 @@ impl OpenAiCodexProvider {
                 )
             })?)
         };
+
+        Ok(CodexAuthHeaders {
+            use_gateway_api_key_auth,
+            bearer_token: if use_gateway_api_key_auth {
+                self.gateway_api_key
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                access_token.as_deref().unwrap_or_default().to_string()
+            },
+            access_token,
+            account_id,
+        })
+    }
+
+    async fn send_responses_request_once(
+        &self,
+        auth: &CodexAuthHeaders,
+        input: &[ResponsesInput],
+        instructions: &str,
+        model: &str,
+        stream: bool,
+    ) -> anyhow::Result<String> {
         let normalized_model = normalize_model_id(model);
 
         let request = ResponsesRequest {
             model: normalized_model.to_string(),
-            input,
-            instructions,
+            input: input.to_vec(),
+            instructions: instructions.to_string(),
             store: false,
-            stream: true,
+            stream,
             text: ResponsesTextOptions {
                 verbosity: "medium".to_string(),
             },
@@ -626,30 +657,29 @@ impl OpenAiCodexProvider {
             parallel_tool_calls: true,
         };
 
-        let bearer_token = if use_gateway_api_key_auth {
-            self.gateway_api_key.as_deref().unwrap_or_default()
-        } else {
-            access_token.as_deref().unwrap_or_default()
-        };
-
         let mut request_builder = self
             .client
             .post(&self.responses_url)
-            .header("Authorization", format!("Bearer {bearer_token}"))
+            .header("Authorization", format!("Bearer {}", auth.bearer_token))
             .header("OpenAI-Beta", "responses=experimental")
             .header("originator", "pi")
-            .header("accept", "text/event-stream")
             .header("Content-Type", "application/json");
 
-        if let Some(account_id) = account_id.as_deref() {
+        if stream {
+            request_builder = request_builder.header("accept", "text/event-stream");
+        } else {
+            request_builder = request_builder.header("accept", "application/json");
+        }
+
+        if let Some(account_id) = auth.account_id.as_deref() {
             request_builder = request_builder.header("chatgpt-account-id", account_id);
         }
 
-        if use_gateway_api_key_auth {
-            if let Some(access_token) = access_token.as_deref() {
+        if auth.use_gateway_api_key_auth {
+            if let Some(access_token) = auth.access_token.as_deref() {
                 request_builder = request_builder.header("x-openai-access-token", access_token);
             }
-            if let Some(account_id) = account_id.as_deref() {
+            if let Some(account_id) = auth.account_id.as_deref() {
                 request_builder = request_builder.header("x-openai-account-id", account_id);
             }
         }
@@ -661,6 +691,32 @@ impl OpenAiCodexProvider {
         }
 
         decode_responses_body(response).await
+    }
+
+    async fn send_responses_request(
+        &self,
+        input: Vec<ResponsesInput>,
+        instructions: String,
+        model: &str,
+    ) -> anyhow::Result<String> {
+        let auth = self.resolve_auth_headers().await?;
+
+        match self
+            .send_responses_request_once(&auth, &input, &instructions, model, true)
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(err) if should_retry_without_stream(&err) => {
+                tracing::warn!(
+                    error = %err,
+                    model,
+                    "OpenAI Codex streaming body decode failed; retrying without stream"
+                );
+                self.send_responses_request_once(&auth, &input, &instructions, model, false)
+                    .await
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -928,6 +984,20 @@ data: [DONE]
 "#;
 
         assert_eq!(parse_sse_text(payload).unwrap().as_deref(), Some("Done"));
+    }
+
+    #[test]
+    fn streaming_read_body_error_retries_without_stream() {
+        let err = anyhow::anyhow!(
+            "OpenAI Codex read body failed (status=200 transfer-encoding=chunked): error decoding response body"
+        );
+        assert!(should_retry_without_stream(&err));
+    }
+
+    #[test]
+    fn non_transport_errors_do_not_retry_without_stream() {
+        let err = anyhow::anyhow!("OpenAI Codex stream error: context window exceeded");
+        assert!(!should_retry_without_stream(&err));
     }
 
     #[test]

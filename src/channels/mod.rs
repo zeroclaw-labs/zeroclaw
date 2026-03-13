@@ -864,6 +864,13 @@ fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: Chan
     }
 }
 
+fn clear_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str) {
+    ctx.route_overrides
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(sender_key);
+}
+
 fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
     ctx.conversation_histories
         .lock()
@@ -1266,7 +1273,12 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::NewSession => {
             clear_sender_history(ctx, &sender_key);
-            "Conversation history cleared. Starting fresh.".to_string()
+            clear_route_selection(ctx, &sender_key);
+            let defaults = runtime_defaults_snapshot(ctx);
+            format!(
+                "Conversation history and runtime route override cleared. Starting fresh with provider `{}` and model `{}`.",
+                defaults.default_provider, defaults.model
+            )
         }
     };
 
@@ -4863,6 +4875,113 @@ BTC is currently around $65,000 based on latest tool output."#
                 .as_slice(),
             &["route-model".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_new_session_clears_route_override() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let default_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let default_provider: Arc<dyn Provider> = default_provider_impl.clone();
+        let routed_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let routed_provider: Arc<dyn Provider> = routed_provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
+        provider_cache_seed.insert("openrouter".to_string(), routed_provider);
+
+        let route_key = "telegram_alice".to_string();
+        let mut route_overrides = HashMap::new();
+        route_overrides.insert(
+            route_key.clone(),
+            ChannelRouteSelection {
+                provider: "openrouter".to_string(),
+                model: "route-model".to_string(),
+            },
+        );
+
+        let mut histories = HashMap::new();
+        histories.insert(
+            route_key.clone(),
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "stale context".to_string(),
+            }],
+        );
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&default_provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(histories)),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(route_overrides)),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-new-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/new".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            runtime_ctx
+                .route_overrides
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&route_key)
+                .is_none()
+        );
+        assert!(
+            runtime_ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&route_key)
+                .is_none()
+        );
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("runtime route override cleared"));
+        assert!(sent[0].contains("`test-provider`"));
+        assert!(sent[0].contains("`default-model`"));
+
+        assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
+        assert_eq!(routed_provider_impl.call_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
