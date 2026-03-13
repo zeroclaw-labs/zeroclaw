@@ -599,14 +599,10 @@ HTML to correct:
             .to_string();
 
         // Strip markdown code fences if Gemini wrapped the output
-        let corrected = corrected
-            .trim()
-            .strip_prefix("```html")
-            .unwrap_or(&corrected)
-            .strip_suffix("```")
-            .unwrap_or(&corrected)
-            .trim()
-            .to_string();
+        let trimmed = corrected.trim();
+        let stripped = trimmed.strip_prefix("```html").unwrap_or(trimmed);
+        let stripped = stripped.strip_suffix("```").unwrap_or(stripped);
+        let corrected = stripped.trim().to_string();
 
         Ok(corrected)
     }

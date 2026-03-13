@@ -676,7 +676,7 @@ pub async fn handle_document_process_r2(
 
     // 6. Call Upstage Document Parse with operator key
     let client = reqwest::Client::new();
-    let form = match reqwest::multipart::Form::new()
+    let form = reqwest::multipart::Form::new()
         .part(
             "document",
             reqwest::multipart::Part::bytes(file_data)
@@ -689,10 +689,7 @@ pub async fn handle_document_process_r2(
         .text("model", "document-parse")
         .text("ocr", "force")
         .text("output_formats", "[\"html\"]")
-        .text("coordinates", "true")
-    {
-        form => form,
-    };
+        .text("coordinates", "true");
 
     let upstage_resp = client
         .post("https://api.upstage.ai/v1/document-digitization")
