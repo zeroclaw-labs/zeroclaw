@@ -472,3 +472,330 @@ async fn authenticate_user(state: &AppState, token: &str) -> Option<String> {
 
     None
 }
+
+// ── R2-based document upload flow ────────────────────────────────
+//
+// Secure image PDF processing: client uploads to R2 via pre-signed URL,
+// Railway downloads from R2, calls Upstage with operator key.
+// Operator API keys NEVER leave the server.
+
+/// Request for a pre-signed R2 upload URL.
+#[derive(Debug, Deserialize)]
+pub struct DocumentUploadUrlRequest {
+    /// Original filename (for extension detection and key generation).
+    pub filename: String,
+    /// MIME type (e.g. "application/pdf").
+    pub content_type: String,
+    /// Estimated page count (for credit pre-check).
+    #[serde(default)]
+    pub estimated_pages: u32,
+}
+
+/// Response with pre-signed upload URL.
+#[derive(Debug, Serialize)]
+pub struct DocumentUploadUrlResponse {
+    /// Pre-signed PUT URL for direct upload to R2.
+    pub upload_url: String,
+    /// The R2 object key (used to reference the file later).
+    pub object_key: String,
+    /// URL expiry in seconds.
+    pub expires_in_secs: u64,
+}
+
+/// Handle POST /api/document/upload-url — Generate a pre-signed R2 PUT URL.
+///
+/// The client uploads the file directly to R2 using this URL.
+/// No file data passes through Railway. Operator keys stay on the server.
+pub async fn handle_document_upload_url(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DocumentUploadUrlRequest>,
+) -> impl IntoResponse {
+    // 1. Authenticate
+    let token = match extract_bearer_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Missing Authorization header"})),
+            );
+        }
+    };
+
+    let user_id = match authenticate_user(&state, &token).await {
+        Some(id) => id,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid session token"})),
+            );
+        }
+    };
+
+    // 2. Check R2 configuration
+    let r2 = match &state.r2_config {
+        Some(r2) => r2,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "R2 storage not configured"})),
+            );
+        }
+    };
+
+    // 3. Pre-check credits (Upstage ≈ 6 credits/page, minimum 10)
+    let estimated_credits = (req.estimated_pages.max(1) * 6).max(10);
+    if let Some(pm) = &state.payment_manager {
+        let pm = pm.lock();
+        let balance = pm.get_balance(&user_id).unwrap_or(0);
+        if balance < estimated_credits {
+            return (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(serde_json::json!({
+                    "error": "Insufficient credits",
+                    "required": estimated_credits,
+                    "balance": balance,
+                })),
+            );
+        }
+    }
+
+    // 4. Generate object key and pre-signed PUT URL
+    let object_key = crate::storage::r2::generate_object_key(&user_id, &req.filename);
+    let expires_secs = 900; // 15 minutes
+    let upload_url = r2.presigned_put_url(&object_key, &req.content_type, expires_secs);
+
+    tracing::info!(
+        user_id = %user_id,
+        object_key = %object_key,
+        "Generated R2 pre-signed upload URL"
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "upload_url": upload_url,
+            "object_key": object_key,
+            "expires_in_secs": expires_secs,
+        })),
+    )
+}
+
+/// Request to process a document already uploaded to R2.
+#[derive(Debug, Deserialize)]
+pub struct DocumentProcessR2Request {
+    /// The R2 object key returned by /api/document/upload-url.
+    pub object_key: String,
+    /// Original filename (for extension detection).
+    pub filename: String,
+    /// Estimated page count (for billing).
+    #[serde(default)]
+    pub estimated_pages: u32,
+}
+
+/// Handle POST /api/document/process-r2 — Process a document from R2.
+///
+/// Flow: Railway downloads from R2 → calls Upstage with operator key →
+/// returns HTML/Markdown to client → deletes temp file from R2.
+///
+/// Operator API keys NEVER leave the server.
+pub async fn handle_document_process_r2(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DocumentProcessR2Request>,
+) -> impl IntoResponse {
+    // 1. Authenticate
+    let token = match extract_bearer_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Missing Authorization header"})),
+            );
+        }
+    };
+
+    let user_id = match authenticate_user(&state, &token).await {
+        Some(id) => id,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid session token"})),
+            );
+        }
+    };
+
+    // 2. Verify R2 is configured
+    let r2 = match &state.r2_config {
+        Some(r2) => r2.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "R2 storage not configured"})),
+            );
+        }
+    };
+
+    // 3. Validate object key belongs to this user (prevent unauthorized access)
+    let expected_prefix = format!("documents/{}/", user_id);
+    if !req.object_key.starts_with(&expected_prefix) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Object key does not belong to this user"})),
+        );
+    }
+
+    // 4. Get operator Upstage API key (stays on server)
+    let admin_keys = crate::billing::llm_router::AdminKeys::from_env();
+    let upstage_key = match admin_keys.get("upstage") {
+        Some(key) => key.to_string(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Upstage API key not configured on server"})),
+            );
+        }
+    };
+
+    // 5. Download file from R2
+    tracing::info!(
+        user_id = %user_id,
+        object_key = %req.object_key,
+        "Downloading document from R2 for processing"
+    );
+
+    let file_data = match r2.download_object(&req.object_key).await {
+        Ok(data) => data,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to download from R2: {e}")})),
+            );
+        }
+    };
+
+    // 6. Call Upstage Document Parse with operator key
+    let client = reqwest::Client::new();
+    let form = match reqwest::multipart::Form::new()
+        .part(
+            "document",
+            reqwest::multipart::Part::bytes(file_data)
+                .file_name(req.filename.clone())
+                .mime_str("application/pdf")
+                .unwrap_or_else(|_| {
+                    reqwest::multipart::Part::bytes(Vec::new())
+                }),
+        )
+        .text("model", "document-parse")
+        .text("ocr", "force")
+        .text("output_formats", "[\"html\"]")
+        .text("coordinates", "true")
+    {
+        form => form,
+    };
+
+    let upstage_resp = client
+        .post("https://api.upstage.ai/v1/document-digitization")
+        .header("Authorization", format!("Bearer {upstage_key}"))
+        .multipart(form)
+        .timeout(std::time::Duration::from_secs(300))
+        .send()
+        .await;
+
+    let upstage_resp = match upstage_resp {
+        Ok(r) => r,
+        Err(e) => {
+            // Clean up R2 object on failure
+            let _ = r2.delete_object(&req.object_key).await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Upstage API request failed: {e}")})),
+            );
+        }
+    };
+
+    if !upstage_resp.status().is_success() {
+        let status = upstage_resp.status();
+        let body = upstage_resp.text().await.unwrap_or_default();
+        let _ = r2.delete_object(&req.object_key).await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Upstage API error (HTTP {status}): {body}")})),
+        );
+    }
+
+    let data: serde_json::Value = match upstage_resp.json().await {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = r2.delete_object(&req.object_key).await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to parse Upstage response: {e}")})),
+            );
+        }
+    };
+
+    // 7. Extract HTML from Upstage response
+    let html = data
+        .get("content")
+        .and_then(|c| c.get("html"))
+        .and_then(|h| h.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let page_count = data
+        .get("elements")
+        .and_then(|e| e.as_array())
+        .map(|elements| {
+            elements
+                .iter()
+                .filter_map(|e| e.get("page").and_then(|p| p.as_u64()))
+                .max()
+                .unwrap_or(1) as u32
+        })
+        .unwrap_or(1);
+
+    // 8. LLM correction is NOT done server-side.
+    //    If the user has their own LLM API key, correction happens on the
+    //    user's local MoA app. If not, the raw Upstage output is used as-is.
+
+    // 9. Convert to markdown
+    let markdown = crate::tools::document_pipeline::html_to_markdown_public(&html);
+
+    // 10. Deduct credits
+    let actual_credits = (page_count * 6).max(10);
+    if let Some(pm) = &state.payment_manager {
+        let pm = pm.lock();
+        let _ = pm.deduct_credits(&user_id, actual_credits);
+    }
+
+    // 11. Clean up R2 object
+    let object_key = req.object_key.clone();
+    let r2_cleanup = r2;
+    tokio::spawn(async move {
+        if let Err(e) = r2_cleanup.delete_object(&object_key).await {
+            tracing::warn!("R2 cleanup failed for {object_key}: {e}");
+        }
+    });
+
+    tracing::info!(
+        user_id = %user_id,
+        page_count = page_count,
+        credits_deducted = actual_credits,
+        "Image PDF processed via R2 → Upstage pipeline"
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "doc_type": "image_pdf",
+            "engine": "upstage_document_parse",
+            "page_count": page_count,
+            "html": html,
+            "markdown": markdown,
+            "credits_deducted": actual_credits,
+        })),
+    )
+}
+

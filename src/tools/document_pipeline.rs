@@ -100,7 +100,10 @@ impl DocumentPipelineTool {
         }
     }
 
-    /// Process a digital PDF locally using pdf-extract + optional Gemini correction.
+    /// Process a digital PDF locally using pdf-extract (or PyMuPDF via sidecar).
+    ///
+    /// LLM correction is optional and only runs when the user has their own
+    /// LLM API key configured. If no key, the raw extraction is returned as-is.
     async fn process_digital_pdf(
         &self,
         path: &Path,
@@ -157,12 +160,17 @@ impl DocumentPipelineTool {
         })
     }
 
-    /// Process an image/scanned PDF via Upstage Document Parse + Gemini correction.
+    /// Process an image/scanned PDF via Upstage Document Parse.
     ///
-    /// This requires API keys. In hybrid mode:
-    /// - If user has their own Upstage key: use it directly
-    /// - If using operator key: client gets a temporary token from /api/llm/upload-token
-    ///   and uploads directly to Upstage. This tool just reports the result.
+    /// **Local mode** (Tauri app): This is called when a user uploads an image PDF locally.
+    /// The Upstage API key can come from the user's own settings.
+    ///
+    /// **Server mode** (Railway): Image PDFs go through the R2 pre-signed URL flow
+    /// (`/api/document/upload-url` → `/api/document/process-r2`), NOT this method.
+    ///
+    /// LLM correction (Gemini/OpenAI/Claude) is optional and only runs when the
+    /// user has configured their own LLM API key. If no LLM key is provided,
+    /// the raw Upstage HTML/Markdown is returned as-is.
     async fn process_image_pdf(
         &self,
         path: &Path,
@@ -641,6 +649,11 @@ fn text_to_markdown(text: &str) -> String {
         }
     }
     md.trim_end().to_string()
+}
+
+/// Public wrapper for HTML→Markdown conversion used by gateway endpoints.
+pub fn html_to_markdown_public(html: &str) -> String {
+    html_to_markdown(html)
 }
 
 /// Convert HTML to Markdown (simplified conversion).

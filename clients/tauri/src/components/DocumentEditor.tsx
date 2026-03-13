@@ -17,6 +17,29 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { type Locale } from "../lib/i18n";
 import { apiClient } from "../lib/api";
 
+// Tauri invoke for local commands (PyMuPDF, etc.)
+let tauriInvoke: ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null = null;
+try {
+  // Dynamic import for Tauri environment
+  const tauri = (window as Record<string, unknown>).__TAURI__;
+  if (tauri && typeof (tauri as Record<string, unknown>).invoke === "function") {
+    tauriInvoke = (tauri as Record<string, (cmd: string, args?: Record<string, unknown>) => Promise<unknown>>).invoke;
+  }
+} catch {
+  // Not in Tauri environment (web mode)
+}
+
+/** Check if running inside Tauri desktop app */
+function isTauriApp(): boolean {
+  return tauriInvoke !== null;
+}
+
+/** PDF type: digital (has text) or image (scanned/no text) */
+type PdfType = "digital" | "image" | "unknown";
+
+/** Office document extensions processed via Hancom API */
+const OFFICE_EXTENSIONS = [".hwp", ".hwpx", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"];
+
 interface DocumentEditorProps {
   locale: Locale;
   onBack: () => void;
@@ -80,7 +103,10 @@ export function DocumentEditor({
     }
   }, [initialHtml]);
 
-  // Handle file upload
+  // Handle file upload — routes to appropriate processing pipeline:
+  // 1. Digital PDF → local PyMuPDF (Tauri sidecar, no server needed)
+  // 2. Image PDF → R2 pre-signed URL → Railway → Upstage (operator key on server)
+  // 3. Office docs (HWP, DOCX, etc.) → Hancom DocsConverter API via /api/document/process
   const handleFileUpload = useCallback(async (file: File) => {
     const ext = "." + file.name.split(".").pop()?.toLowerCase();
     if (!SUPPORTED_EXTENSIONS.includes(ext)) {
@@ -96,65 +122,25 @@ export function DocumentEditor({
     setError(null);
     setUploadProgress(
       locale === "ko"
-        ? `${file.name} 업로드 중...`
-        : `Uploading ${file.name}...`
+        ? `${file.name} 처리 중...`
+        : `Processing ${file.name}...`
     );
 
     try {
-      // For PDF files, determine if it's a digital or image PDF
-      // and route to the appropriate processing pipeline
       const isPdf = ext === ".pdf";
+      const isOffice = OFFICE_EXTENSIONS.includes(ext);
 
       if (isPdf) {
-        setUploadProgress(
-          locale === "ko"
-            ? "PDF 유형 분석 중... (디지털/이미지 판별)"
-            : "Analyzing PDF type... (digital/image detection)"
-        );
-      }
-
-      // Upload file to the local agent's document processing tool
-      const formData = new FormData();
-      formData.append("file", file);
-
-      const serverUrl = apiClient.getServerUrl();
-      const token = apiClient.getToken();
-
-      const response = await fetch(`${serverUrl}/api/document/process`, {
-        method: "POST",
-        headers: {
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: formData,
-      });
-
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({ error: "Upload failed" }));
-        throw new Error(data.error || `Processing failed (${response.status})`);
-      }
-
-      const result = await response.json();
-
-      setDoc({
-        html: result.html || "",
-        markdown: result.markdown || "",
-        fileName: file.name,
-        docType: result.doc_type || "unknown",
-        engine: result.engine || "unknown",
-        isModified: false,
-      });
-
-      // Set visual editor content
-      if (editorRef.current) {
-        editorRef.current.innerHTML = result.html || "";
+        // Route PDF based on type
+        await handlePdfUpload(file);
+      } else if (isOffice) {
+        // Office docs → Hancom API via local agent
+        await handleOfficeUpload(file);
+      } else {
+        throw new Error(`Unsupported: ${ext}`);
       }
 
       setUploadProgress("");
-
-      // Notify AI about the document
-      if (onDocumentUpdate && result.markdown) {
-        onDocumentUpdate(result.markdown, result.html || "");
-      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Upload failed";
       setError(msg);
@@ -163,6 +149,190 @@ export function DocumentEditor({
       setIsUploading(false);
     }
   }, [locale, onDocumentUpdate]);
+
+  // PDF upload: try local PyMuPDF first (digital), fall back to R2→Upstage (image)
+  const handlePdfUpload = useCallback(async (file: File) => {
+    // Step 1: Try local PyMuPDF conversion for digital PDFs
+    if (isTauriApp() && tauriInvoke) {
+      setUploadProgress(
+        locale === "ko"
+          ? "디지털 PDF 로컬 변환 시도 중 (PyMuPDF)..."
+          : "Trying local digital PDF conversion (PyMuPDF)..."
+      );
+
+      try {
+        // Save file to temp path for PyMuPDF processing
+        const arrayBuf = await file.arrayBuffer();
+        const tempDir = await tauriInvoke("plugin:path|temp_dir") as string;
+        const tempPath = `${tempDir}/moa_pdf_upload_${Date.now()}.pdf`;
+
+        // Write file via Tauri FS
+        const { writeFile } = await import("@tauri-apps/plugin-fs");
+        await writeFile(tempPath, new Uint8Array(arrayBuf));
+
+        const result = await tauriInvoke("convert_pdf_local", {
+          filePath: tempPath,
+        }) as { success: boolean; html: string; markdown: string; page_count: number; engine: string };
+
+        if (result.success && result.html && result.html.length > 100) {
+          // Digital PDF converted successfully locally
+          applyDocumentResult({
+            html: result.html,
+            markdown: result.markdown,
+            doc_type: "digital_pdf",
+            engine: result.engine || "pymupdf4llm",
+            page_count: result.page_count,
+          }, file.name);
+          return;
+        }
+        // If output is too short, likely image PDF → fall through to R2 flow
+      } catch {
+        // PyMuPDF not available or conversion failed → try R2 flow
+      }
+    }
+
+    // Step 2: Image PDF → R2 pre-signed URL → Railway → Upstage
+    setUploadProgress(
+      locale === "ko"
+        ? "이미지 PDF 처리 중 (Upstage OCR)..."
+        : "Processing image PDF (Upstage OCR)..."
+    );
+
+    const serverUrl = apiClient.getServerUrl();
+    const token = apiClient.getToken();
+
+    // Step 2a: Get pre-signed R2 upload URL from Railway
+    setUploadProgress(
+      locale === "ko"
+        ? "업로드 URL 발급 중..."
+        : "Requesting upload URL..."
+    );
+
+    const urlResp = await fetch(`${serverUrl}/api/document/upload-url`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({
+        filename: file.name,
+        content_type: file.type || "application/pdf",
+        estimated_pages: 1,
+      }),
+    });
+
+    if (!urlResp.ok) {
+      const data = await urlResp.json().catch(() => ({ error: "Failed to get upload URL" }));
+      throw new Error(data.error || `Upload URL request failed (${urlResp.status})`);
+    }
+
+    const { upload_url, object_key } = await urlResp.json();
+
+    // Step 2b: Upload file directly to R2
+    setUploadProgress(
+      locale === "ko"
+        ? "파일 업로드 중 (R2)..."
+        : "Uploading file (R2)..."
+    );
+
+    const uploadResp = await fetch(upload_url, {
+      method: "PUT",
+      headers: {
+        "Content-Type": file.type || "application/pdf",
+      },
+      body: file,
+    });
+
+    if (!uploadResp.ok) {
+      throw new Error(
+        locale === "ko"
+          ? `R2 업로드 실패 (HTTP ${uploadResp.status})`
+          : `R2 upload failed (HTTP ${uploadResp.status})`
+      );
+    }
+
+    // Step 2c: Tell Railway to process the file from R2 via Upstage
+    setUploadProgress(
+      locale === "ko"
+        ? "OCR 문서 변환 중 (Upstage)..."
+        : "OCR document conversion (Upstage)..."
+    );
+
+    const processResp = await fetch(`${serverUrl}/api/document/process-r2`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({
+        object_key,
+        filename: file.name,
+        estimated_pages: 1,
+      }),
+    });
+
+    if (!processResp.ok) {
+      const data = await processResp.json().catch(() => ({ error: "Processing failed" }));
+      throw new Error(data.error || `R2 processing failed (${processResp.status})`);
+    }
+
+    const result = await processResp.json();
+    applyDocumentResult(result, file.name);
+  }, [locale, onDocumentUpdate]);
+
+  // Office document upload → Hancom API via local agent's /api/document/process
+  const handleOfficeUpload = useCallback(async (file: File) => {
+    setUploadProgress(
+      locale === "ko"
+        ? "오피스 문서 변환 중 (한컴 변환기)..."
+        : "Converting office document (Hancom converter)..."
+    );
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const serverUrl = apiClient.getServerUrl();
+    const token = apiClient.getToken();
+
+    const response = await fetch(`${serverUrl}/api/document/process`, {
+      method: "POST",
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({ error: "Upload failed" }));
+      throw new Error(data.error || `Processing failed (${response.status})`);
+    }
+
+    const result = await response.json();
+    applyDocumentResult(result, file.name);
+  }, [locale, onDocumentUpdate]);
+
+  // Apply conversion result to the editor
+  const applyDocumentResult = useCallback((result: Record<string, unknown>, fileName: string) => {
+    const html = (result.html as string) || "";
+    const markdown = (result.markdown as string) || "";
+
+    setDoc({
+      html,
+      markdown,
+      fileName,
+      docType: (result.doc_type as string) || "unknown",
+      engine: (result.engine as string) || "unknown",
+      isModified: false,
+    });
+
+    if (editorRef.current) {
+      editorRef.current.innerHTML = html;
+    }
+
+    if (onDocumentUpdate && markdown) {
+      onDocumentUpdate(markdown, html);
+    }
+  }, [onDocumentUpdate]);
 
   // Handle visual editor changes
   const handleEditorInput = useCallback(() => {
@@ -377,8 +547,8 @@ export function DocumentEditor({
       {doc.docType && (
         <div className="doc-info-bar">
           <span className="doc-info-type">
-            {doc.docType === "digital_pdf" && (locale === "ko" ? "디지털 PDF (로컬 추출)" : "Digital PDF (local extraction)")}
-            {doc.docType === "image_pdf" && (locale === "ko" ? "이미지 PDF (Upstage OCR + Gemini 교정)" : "Image PDF (Upstage OCR + Gemini correction)")}
+            {doc.docType === "digital_pdf" && (locale === "ko" ? "디지털 PDF (PyMuPDF 로컬 변환)" : "Digital PDF (PyMuPDF local conversion)")}
+            {doc.docType === "image_pdf" && (locale === "ko" ? "이미지 PDF (Upstage OCR)" : "Image PDF (Upstage OCR)")}
             {doc.docType.startsWith("office_") && (locale === "ko" ? `오피스 문서 (한컴 변환기)` : `Office document (Hancom converter)`)}
           </span>
           <span className="doc-info-engine">{doc.engine}</span>
@@ -422,8 +592,8 @@ export function DocumentEditor({
             </p>
             <p className="dropzone-note">
               {locale === "ko"
-                ? "이미지 PDF: Upstage OCR + Gemini 교정 | 디지털 PDF: 로컬 추출 | 오피스: 한컴 변환"
-                : "Image PDF: Upstage OCR + Gemini | Digital PDF: local extraction | Office: Hancom converter"}
+                ? "이미지 PDF: Upstage OCR (서버) | 디지털 PDF: PyMuPDF (로컬) | 오피스: 한컴 변환"
+                : "Image PDF: Upstage OCR (server) | Digital PDF: PyMuPDF (local) | Office: Hancom converter"}
             </p>
           </div>
         )}

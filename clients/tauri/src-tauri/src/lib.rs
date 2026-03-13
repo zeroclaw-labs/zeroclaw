@@ -873,6 +873,117 @@ async fn web_search(
     Ok(data)
 }
 
+// ── Document Processing Commands ─────────────────────────────────
+
+/// Convert a digital PDF to HTML/Markdown locally using PyMuPDF.
+///
+/// Runs the bundled `pymupdf_convert.py` script via the system Python.
+/// This handles digital (text-based) PDFs entirely on the user's machine —
+/// no server or API key required.
+///
+/// Returns JSON with `html`, `markdown`, `page_count`, and `engine` fields.
+#[tauri::command]
+async fn convert_pdf_local(
+    file_path: String,
+    output_dir: Option<String>,
+) -> Result<serde_json::Value, String> {
+    // Locate the pymupdf_convert.py script
+    // In dev: ../../../../scripts/pymupdf_convert.py (relative to src-tauri/src/)
+    // In production: bundled as a resource
+    let script_path = find_pymupdf_script()
+        .ok_or_else(|| "PyMuPDF conversion script not found. Ensure pymupdf_convert.py is in the scripts/ directory.".to_string())?;
+
+    let mut cmd = tokio::process::Command::new("python3");
+    cmd.arg(&script_path).arg(&file_path);
+
+    if let Some(ref dir) = output_dir {
+        cmd.arg("--output-dir").arg(dir);
+    }
+
+    cmd.arg("--format").arg("both");
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run PyMuPDF: {e}. Ensure Python 3 and pymupdf4llm are installed (pip install pymupdf4llm)."))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Try parsing as JSON
+    match serde_json::from_str::<serde_json::Value>(&stdout) {
+        Ok(result) => {
+            if result.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
+                Ok(result)
+            } else {
+                let error = result
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("Unknown error");
+                Err(format!("PDF conversion failed: {error}"))
+            }
+        }
+        Err(_) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!(
+                "PyMuPDF output parsing failed. stdout: {stdout}, stderr: {stderr}"
+            ))
+        }
+    }
+}
+
+/// Find the pymupdf_convert.py script in known locations.
+fn find_pymupdf_script() -> Option<String> {
+    // Check relative paths from the binary location
+    let candidates = [
+        // Development: running from clients/tauri/src-tauri/
+        "../../../../scripts/pymupdf_convert.py",
+        "../../../scripts/pymupdf_convert.py",
+        "../../scripts/pymupdf_convert.py",
+        "../scripts/pymupdf_convert.py",
+        "scripts/pymupdf_convert.py",
+        // Bundled alongside the binary
+        "pymupdf_convert.py",
+    ];
+
+    // Try relative to current exe
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            for candidate in &candidates {
+                let path = exe_dir.join(candidate);
+                if path.exists() {
+                    return Some(path.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    // Try relative to current dir
+    for candidate in &candidates {
+        let path = std::path::Path::new(candidate);
+        if path.exists() {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+
+    // Try from project root (MoA_new/scripts/)
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut dir = cwd.as_path();
+        for _ in 0..5 {
+            let script = dir.join("scripts").join("pymupdf_convert.py");
+            if script.exists() {
+                return Some(script.to_string_lossy().to_string());
+            }
+            if let Some(parent) = dir.parent() {
+                dir = parent;
+            } else {
+                break;
+            }
+        }
+    }
+
+    None
+}
+
 // ── Entry Point ──────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -933,6 +1044,7 @@ pub fn run() {
             is_zeroclaw_configured,
             browse_and_extract,
             web_search,
+            convert_pdf_local,
         ])
         .setup(|app| {
             // Override data_dir with Tauri's actual app data path

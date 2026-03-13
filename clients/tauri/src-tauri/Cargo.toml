@@ -23,7 +23,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 uuid = { version = "1", features = ["v4"] }
 dirs-next = "2"
 toml = "0.8"
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["time", "process"] }
 
 [profile.release]
 panic = "abort"

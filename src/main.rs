@@ -94,6 +94,7 @@ mod sandbox;
 mod security;
 mod service;
 mod skillforge;
+mod storage;
 mod skills;
 mod sync;
 mod task_category;
