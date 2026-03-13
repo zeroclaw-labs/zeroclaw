@@ -381,6 +381,7 @@ pub fn all_tools_with_runtime(
                 reasoning_enabled: root_config.runtime.reasoning_enabled,
                 provider_timeout_secs: Some(root_config.provider_timeout_secs),
                 extra_headers: root_config.extra_headers.clone(),
+                api_path: root_config.api_path.clone(),
             },
         )
         .with_parent_tools(Arc::clone(&parent_tools))

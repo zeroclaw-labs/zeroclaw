@@ -41,6 +41,9 @@ pub struct OpenAiCompatibleProvider {
     timeout_secs: u64,
     /// Extra HTTP headers to include in all API requests.
     extra_headers: std::collections::HashMap<String, String>,
+    /// Custom API path suffix (e.g. "/v2/generate").
+    /// When set, overrides the default `/chat/completions` path detection.
+    api_path: Option<String>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -176,6 +179,7 @@ impl OpenAiCompatibleProvider {
             native_tool_calling: !merge_system_into_user,
             timeout_secs: 120,
             extra_headers: std::collections::HashMap::new(),
+            api_path: None,
         }
     }
 
@@ -191,6 +195,13 @@ impl OpenAiCompatibleProvider {
         headers: std::collections::HashMap<String, String>,
     ) -> Self {
         self.extra_headers = headers;
+        self
+    }
+
+    /// Set a custom API path suffix for this provider.
+    /// When set, replaces the default `/chat/completions` path.
+    pub fn with_api_path(mut self, api_path: Option<String>) -> Self {
+        self.api_path = api_path;
         self
     }
 
@@ -273,6 +284,12 @@ impl OpenAiCompatibleProvider {
     /// This allows custom providers with non-standard endpoints (e.g., VolcEngine ARK uses
     /// `/api/coding/v3/chat/completions` instead of `/v1/chat/completions`).
     fn chat_completions_url(&self) -> String {
+        // If a custom api_path is configured, use it directly.
+        if let Some(ref api_path) = self.api_path {
+            let separator = if api_path.starts_with('/') { "" } else { "/" };
+            return format!("{}{separator}{api_path}", self.base_url);
+        }
+
         let has_full_endpoint = reqwest::Url::parse(&self.base_url)
             .map(|url| {
                 url.path()
