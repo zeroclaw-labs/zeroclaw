@@ -25,7 +25,7 @@ pub struct OrchestratorChannel {
     results_prefix: String,
     consumer_group: String,
     consumer_name: String,
-    streams_prefix: String,
+    pub(crate) streams_prefix: String,
 }
 
 /// Task message from the orchestrator.
@@ -40,6 +40,10 @@ pub struct OrchestratorTask {
     pub tools_allowed: Vec<String>,
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
+    /// Session context injected by the orchestrator (session .md + diagrams).
+    /// Prepended to the system prompt for workspace-aware execution.
+    #[serde(default)]
+    pub system_context: Option<String>,
 }
 
 fn default_timeout() -> u64 {
@@ -89,6 +93,92 @@ pub struct OrchestratorResult {
     pub duration_ms: u64,
 }
 
+/// Observer that publishes progress events to Redis pub/sub for streaming.
+///
+/// Publishes JSON events to `augusta:progress:{run_id}` so the Elixir side
+/// can relay them as SSE chunks. Events include tool call start/end,
+/// LLM request/response, and turn completions.
+#[cfg(feature = "orchestrator")]
+pub struct StreamingObserver {
+    conn: redis::aio::MultiplexedConnection,
+    channel: String,
+    runtime: tokio::runtime::Handle,
+}
+
+#[cfg(feature = "orchestrator")]
+impl StreamingObserver {
+    pub async fn new(redis_url: &str, run_id: &str, prefix: &str) -> Result<Self> {
+        let client = redis::Client::open(redis_url)
+            .map_err(|e| anyhow::anyhow!("StreamingObserver Redis connect failed: {}", e))?;
+        let conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| anyhow::anyhow!("StreamingObserver async connect failed: {}", e))?;
+
+        Ok(Self {
+            conn,
+            channel: format!("{}:progress:{}", prefix, run_id),
+            runtime: tokio::runtime::Handle::current(),
+        })
+    }
+
+    fn publish(&self, event: serde_json::Value) {
+        let channel = self.channel.clone();
+        let mut conn = self.conn.clone();
+        self.runtime.spawn(async move {
+            let msg = event.to_string();
+            let _: redis::RedisResult<i64> = redis::cmd("PUBLISH")
+                .arg(&channel)
+                .arg(&msg)
+                .query_async(&mut conn)
+                .await;
+        });
+    }
+}
+
+#[cfg(feature = "orchestrator")]
+impl crate::observability::Observer for StreamingObserver {
+    fn record_event(&self, event: &crate::observability::ObserverEvent) {
+        use crate::observability::ObserverEvent;
+
+        let payload = match event {
+            ObserverEvent::ToolCallStart { tool, .. } => {
+                serde_json::json!({"type": "tool_start", "tool": tool})
+            }
+            ObserverEvent::ToolCall {
+                tool,
+                duration,
+                success,
+            } => {
+                serde_json::json!({
+                    "type": "tool_end",
+                    "tool": tool,
+                    "duration_ms": duration.as_millis() as u64,
+                    "success": success,
+                })
+            }
+            ObserverEvent::LlmRequest { model, .. } => {
+                serde_json::json!({"type": "llm_request", "model": model})
+            }
+            ObserverEvent::LlmResponse {
+                duration, success, ..
+            } => {
+                serde_json::json!({
+                    "type": "llm_response",
+                    "duration_ms": duration.as_millis() as u64,
+                    "success": success,
+                })
+            }
+            ObserverEvent::TurnComplete => {
+                serde_json::json!({"type": "turn_complete"})
+            }
+            _ => return,
+        };
+
+        self.publish(payload);
+    }
+}
+
 impl OrchestratorChannel {
     pub fn new(
         redis_url: String,
@@ -115,9 +205,7 @@ impl OrchestratorChannel {
     /// Get a pooled Redis connection. Uses `get_multiplexed_async_connection`
     /// which internally multiplexes over a single TCP connection.
     #[cfg(feature = "orchestrator")]
-    async fn get_connection(
-        &self,
-    ) -> Result<redis::aio::MultiplexedConnection> {
+    async fn get_connection(&self) -> Result<redis::aio::MultiplexedConnection> {
         let client = redis::Client::open(self.redis_url.as_str())
             .map_err(|e| anyhow::anyhow!("Redis connection failed: {}", e))?;
         client
@@ -241,8 +329,7 @@ impl Channel for OrchestratorChannel {
             let run_id = &message.recipient;
 
             // Parse duration tag and classify output
-            let (status, duration_ms, error_code, clean_output) =
-                classify_output(&message.content);
+            let (status, duration_ms, error_code, clean_output) = classify_output(&message.content);
 
             self.publish_result(
                 &mut conn,
@@ -306,6 +393,11 @@ impl Channel for OrchestratorChannel {
                 match result {
                     Ok(entries) => {
                         if let Some(task) = parse_stream_entries(&entries) {
+                            let mut metadata = std::collections::HashMap::new();
+                            if let Some(ctx) = task.system_context {
+                                metadata.insert("system_context".to_string(), ctx);
+                            }
+
                             let msg = ChannelMessage {
                                 id: task.run_id.clone(),
                                 sender: format!("orchestrator:{}", task.agent_type),
@@ -317,6 +409,7 @@ impl Channel for OrchestratorChannel {
                                     .map(|d| d.as_secs())
                                     .unwrap_or(0),
                                 thread_ts: None,
+                                metadata,
                             };
                             if tx.send(msg).await.is_err() {
                                 tracing::error!("Channel receiver dropped");
@@ -436,6 +529,8 @@ fn parse_stream_entries(entries: &[redis::Value]) -> Option<OrchestratorTask> {
         .and_then(|t| t.parse().ok())
         .unwrap_or_else(default_timeout);
 
+    let system_context = map.get("system_context").cloned().filter(|s| !s.is_empty());
+
     Some(OrchestratorTask {
         run_id,
         agent_type,
@@ -443,6 +538,7 @@ fn parse_stream_entries(entries: &[redis::Value]) -> Option<OrchestratorTask> {
         context,
         tools_allowed,
         timeout_ms,
+        system_context,
     })
 }
 

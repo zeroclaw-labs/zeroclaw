@@ -118,7 +118,8 @@ pub async fn start_orchestrator(config: Config) -> Result<()> {
     info!("  Provider: {provider_name}");
     info!("  Tools:    {} registered", tools_registry.len());
 
-    let orch_channel = OrchestratorChannel::new(redis_url, None, None);
+    let orch_channel = OrchestratorChannel::new(redis_url.clone(), None, None);
+    let streams_prefix = orch_channel.streams_prefix.clone();
 
     // Start heartbeat
     #[cfg(feature = "orchestrator")]
@@ -136,7 +137,7 @@ pub async fn start_orchestrator(config: Config) -> Result<()> {
     });
 
     let provider_name = Arc::new(provider_name);
-    let observer = Arc::new(observability::create_observer(&config.observability));
+    let fallback_observer = Arc::new(observability::create_observer(&config.observability));
     let approval = Arc::new(ApprovalManager::from_config(&config.autonomy));
     let multimodal = Arc::new(config.multimodal.clone());
     let max_tool_iterations = config.agent.max_tool_iterations;
@@ -146,7 +147,8 @@ pub async fn start_orchestrator(config: Config) -> Result<()> {
     while let Some(msg) = rx.recv().await {
         let provider = Arc::clone(&provider);
         let tools_registry = Arc::clone(&tools_registry);
-        let observer = Arc::clone(&observer);
+        #[allow(unused_variables)]
+        let fallback_observer = Arc::clone(&fallback_observer);
         let provider_name = Arc::clone(&provider_name);
         let model = Arc::clone(&model);
         let system_prompt = Arc::clone(&system_prompt);
@@ -154,21 +156,56 @@ pub async fn start_orchestrator(config: Config) -> Result<()> {
         let approval = Arc::clone(&approval);
         let multimodal = Arc::clone(&multimodal);
         let dedup_exempt = Arc::clone(&dedup_exempt);
+        #[allow(unused_variables)]
+        let redis_url = redis_url.clone();
+        #[allow(unused_variables)]
+        let streams_prefix = streams_prefix.clone();
 
         tokio::spawn(async move {
             let start = std::time::Instant::now();
             info!(run_id = %msg.id, sender = %msg.sender, "Processing orchestrator task");
 
+            // Create per-task streaming observer for real-time progress events
+            #[cfg(feature = "orchestrator")]
+            let streaming_observer =
+                orchestrator::StreamingObserver::new(&redis_url, &msg.id, &streams_prefix).await;
+
+            #[cfg(feature = "orchestrator")]
+            let observer: Box<dyn observability::Observer> = match streaming_observer {
+                Ok(obs) => Box::new(obs),
+                Err(e) => {
+                    tracing::warn!(error = %e, "StreamingObserver creation failed, using fallback");
+                    Box::new(observability::create_observer(
+                        &crate::config::ObservabilityConfig::default(),
+                    ))
+                }
+            };
+
+            #[cfg(not(feature = "orchestrator"))]
+            let observer: Arc<dyn observability::Observer> = fallback_observer.clone();
+
+            // Inject session context from orchestrator into system prompt
+            let effective_prompt = if let Some(ctx) = msg.metadata.get("system_context") {
+                format!("{}\n\n{}", &*system_prompt, ctx)
+            } else {
+                system_prompt.to_string()
+            };
+
             let mut history = vec![
-                ChatMessage::system(&*system_prompt),
+                ChatMessage::system(&effective_prompt),
                 ChatMessage::user(&msg.content),
             ];
+
+            #[cfg(feature = "orchestrator")]
+            let obs_ref: &dyn observability::Observer = observer.as_ref();
+            #[cfg(not(feature = "orchestrator"))]
+            let obs_ref: &dyn observability::Observer = observer.as_ref();
 
             let result = run_tool_call_loop(
                 provider.as_ref(),
                 &mut history,
                 tools_registry.as_ref(),
-                observer.as_ref(),
+                obs_ref,
                 &provider_name,
                 &model,
                 temperature,
@@ -185,6 +222,7 @@ pub async fn start_orchestrator(config: Config) -> Result<()> {
             )
             .await;
 
+            #[allow(clippy::cast_possible_truncation)]
             let duration_ms = start.elapsed().as_millis() as u64;
 
             let output = match result {

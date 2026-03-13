@@ -12,6 +12,8 @@ pub struct ChannelMessage {
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
+    /// Channel-specific metadata (e.g. system_context from orchestrator).
+    pub metadata: std::collections::HashMap<String, String>,
 }
 
 /// Message to send through a channel
@@ -182,6 +184,7 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
+                metadata: std::collections::HashMap::new(),
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -198,6 +201,7 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
+            metadata: std::collections::HashMap::new(),
         };
 
         let cloned = message.clone();
