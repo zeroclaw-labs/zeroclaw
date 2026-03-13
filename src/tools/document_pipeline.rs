@@ -369,9 +369,16 @@ impl DocumentPipelineTool {
             "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
         );
 
-        // Truncate HTML if too long for a single Gemini call
+        // Truncate HTML if too long for a single Gemini call.
+        // Use floor_char_boundary to avoid panicking on multi-byte UTF-8 (e.g., Korean).
         let html_input = if html.len() > 30000 {
-            &html[..30000]
+            let end = html
+                .char_indices()
+                .take_while(|(i, _)| *i < 30000)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(30000.min(html.len()));
+            &html[..end]
         } else {
             html
         };
@@ -557,7 +564,13 @@ impl Tool for DocumentPipelineTool {
                     "html_length": output.html.len(),
                     "markdown_length": output.markdown.len(),
                     "markdown": if output.markdown.len() > 50000 {
-                        format!("{}... [truncated]", &output.markdown[..50000])
+                        let end = output.markdown
+                            .char_indices()
+                            .take_while(|(i, _)| *i < 50000)
+                            .last()
+                            .map(|(i, c)| i + c.len_utf8())
+                            .unwrap_or(50000.min(output.markdown.len()));
+                        format!("{}... [truncated]", &output.markdown[..end])
                     } else {
                         output.markdown
                     },

@@ -12,7 +12,6 @@ export default function Header() {
 
   // Hide header on full-screen chat page
   const isFullScreenRoute = pathname === "/chat" || pathname.startsWith("/chat/");
-  if (isFullScreenRoute) return null;
 
   useEffect(() => {
     const handleScroll = () => {
@@ -25,6 +24,8 @@ export default function Header() {
   useEffect(() => {
     setIsMobileMenuOpen(false);
   }, [pathname]);
+
+  if (isFullScreenRoute) return null;
 
   const navItems = [
     { href: "/", label: lang === "ko" ? "\uD648" : "Home" },

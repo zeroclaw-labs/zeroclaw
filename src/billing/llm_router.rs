@@ -186,6 +186,7 @@ mod tests {
             openai: Some("admin-openai-key".to_string()),
             gemini: None,
             perplexity: None,
+            upstage: None,
         }
     }
 

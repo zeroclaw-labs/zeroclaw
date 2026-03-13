@@ -380,6 +380,23 @@ pub async fn handle_upload_complete(
         }
     };
 
+    // Only deduct credits if the upload was successful
+    if !req.success {
+        tracing::warn!(
+            user_id = %user_id,
+            operation_id = %req.operation_id,
+            service = %req.service,
+            "Upload reported as failed — no credits deducted"
+        );
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "operation_id": req.operation_id,
+                "credits_deducted": 0,
+            })),
+        );
+    }
+
     // Deduct actual credits based on reported usage
     let actual_credits = match req.service.as_str() {
         "upstage" => {
