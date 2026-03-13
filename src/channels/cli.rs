@@ -48,6 +48,7 @@ impl Channel for CliChannel {
                     .unwrap_or_default()
                     .as_secs(),
                 thread_ts: None,
+                reply_to_message_id: None,
             };
 
             if tx.send(msg).await.is_err() {
@@ -113,6 +114,7 @@ mod tests {
             channel: "cli".into(),
             timestamp: 1_234_567_890,
             thread_ts: None,
+            reply_to_message_id: None,
         };
         assert_eq!(msg.id, "test-id");
         assert_eq!(msg.sender, "user");
@@ -132,6 +134,7 @@ mod tests {
             channel: "ch".into(),
             timestamp: 0,
             thread_ts: None,
+            reply_to_message_id: None,
         };
         let cloned = msg.clone();
         assert_eq!(cloned.id, msg.id);

@@ -266,6 +266,7 @@ impl SignalChannel {
             channel: "signal".to_string(),
             timestamp: timestamp / 1000, // millis → secs
             thread_ts: None,
+            reply_to_message_id: None,
         })
     }
 }

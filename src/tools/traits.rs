@@ -32,6 +32,17 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 
+    /// Semantic tags for tool classification (e.g. `["search-phase"]`).
+    fn tags(&self) -> &[String] {
+        &[]
+    }
+
+    /// Whether this tool is a terminal action whose output can be returned
+    /// directly without an additional LLM turn.
+    fn is_terminal(&self) -> bool {
+        false
+    }
+
     /// Get the full spec for LLM registration
     fn spec(&self) -> ToolSpec {
         ToolSpec {

@@ -14,16 +14,23 @@ fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool>
 /// Tools that must run AFTER all search-phase tools in the same batch complete.
 /// Calling these in parallel with searches causes hallucination (model fabricates
 /// contacts before search results arrive).
-pub(super) fn is_terminal_tool(name: &str) -> bool {
-    matches!(name, "submit_contacts")
+pub(super) fn is_terminal_tool(name: &str, tools_registry: &[Box<dyn Tool>]) -> bool {
+    if let Some(tool) = find_tool(tools_registry, name) {
+        if tool.is_terminal() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Tools that gather data for the current agent turn.
-pub(super) fn is_search_phase_tool(name: &str) -> bool {
-    name.starts_with("telegram_search_")
-        || name.starts_with("telegram_list_")
-        || name.starts_with("telegram_join_")
-        || name.starts_with("bg_")
+pub(super) fn is_search_phase_tool(name: &str, tools_registry: &[Box<dyn Tool>]) -> bool {
+    if let Some(tool) = find_tool(tools_registry, name) {
+        if tool.tags().iter().any(|t| t == "search-phase") {
+            return true;
+        }
+    }
+    false
 }
 async fn execute_one_tool(
     call_name: &str,
@@ -254,7 +261,7 @@ pub(super) async fn execute_tools_staged(
     ) = tool_calls
         .iter()
         .enumerate()
-        .partition(|(_, c)| is_terminal_tool(&c.name));
+        .partition(|(_, c)| is_terminal_tool(&c.name, tools_registry));
 
     let mut outcomes: Vec<Option<ToolExecutionOutcome>> =
         (0..tool_calls.len()).map(|_| None).collect();

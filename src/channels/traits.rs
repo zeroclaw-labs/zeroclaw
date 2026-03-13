@@ -12,6 +12,9 @@ pub struct ChannelMessage {
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
+    /// Platform-specific message ID for reply-to (e.g. Telegram `message_id`).
+    /// Filled by the channel's `listen()` so callers don't need to parse the `id` field.
+    pub reply_to_message_id: Option<String>,
 }
 
 /// Message to send through a channel
@@ -78,6 +81,27 @@ pub trait Channel: Send + Sync {
 
     /// Start listening for incoming messages (long-running)
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
+
+    /// Channel-specific formatting instructions appended to the system prompt
+    /// so the LLM produces output appropriate for this platform.
+    fn delivery_instructions(&self) -> Option<&str> {
+        None
+    }
+
+    /// Format the content of an incoming message for the LLM.
+    ///
+    /// Channels may prepend sender identity or other context.
+    /// Default: returns the content unmodified.
+    fn format_incoming_content(&self, msg: &ChannelMessage) -> String {
+        msg.content.clone()
+    }
+
+    /// Progress mode for this channel (controls draft streaming verbosity).
+    ///
+    /// Default: `None` (let the orchestrator decide).
+    fn progress_mode(&self) -> Option<crate::config::ProgressMode> {
+        None
+    }
 
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {
@@ -226,6 +250,7 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
+                reply_to_message_id: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -242,6 +267,7 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
+            reply_to_message_id: None,
         };
 
         let cloned = message.clone();

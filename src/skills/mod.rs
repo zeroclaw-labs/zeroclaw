@@ -50,6 +50,14 @@ pub struct SkillTool {
     pub command: String,
     #[serde(default)]
     pub args: HashMap<String, String>,
+    /// Semantic tags for tool classification (e.g. `["search-phase"]`).
+    /// Used by the agent loop to determine execution ordering.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// When `true`, the tool is a terminal action whose output can be returned
+    /// directly to the user without an additional LLM turn.
+    #[serde(default)]
+    pub terminal: bool,
 }
 
 /// Skill manifest parsed from SKILL.toml
@@ -2672,6 +2680,8 @@ command = "echo hello"
                 kind: "shell".to_string(),
                 command: "echo hi".to_string(),
                 args: HashMap::new(),
+                tags: vec![],
+                terminal: false,
             }],
             prompts: vec!["Do the thing.".to_string()],
             location: Some(PathBuf::from("/tmp/workspace/skills/test/SKILL.md")),
@@ -2706,6 +2716,8 @@ command = "echo hello"
                 kind: "shell".to_string(),
                 command: "echo hi".to_string(),
                 args: HashMap::new(),
+                tags: vec![],
+                terminal: false,
             }],
             prompts: vec!["Do the thing every time.".to_string()],
             location: Some(PathBuf::from("/tmp/workspace/skills/always-skill/SKILL.md")),
@@ -2938,6 +2950,8 @@ description = "Bare minimum"
                 kind: "shell".to_string(),
                 command: "curl wttr.in".to_string(),
                 args: HashMap::new(),
+                tags: vec![],
+                terminal: false,
             }],
             prompts: vec![],
             location: None,

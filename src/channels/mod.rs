@@ -217,28 +217,18 @@ fn register_live_channels(channels_by_name: &HashMap<String, Arc<dyn Channel>>) 
     }
 }
 
+fn register_live_channel(channel: Arc<dyn Channel>) {
+    live_channels_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(channel.name().to_ascii_lowercase(), channel);
+}
+
 fn clear_live_channels() {
     live_channels_registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
-}
-
-fn runtime_telegram_progress_mode_store() -> &'static Mutex<ProgressMode> {
-    static STORE: OnceLock<Mutex<ProgressMode>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(ProgressMode::default()))
-}
-
-fn set_runtime_telegram_progress_mode(mode: ProgressMode) {
-    *runtime_telegram_progress_mode_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = mode;
-}
-
-fn runtime_telegram_progress_mode() -> ProgressMode {
-    *runtime_telegram_progress_mode_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
 }
 
 pub(crate) fn get_live_channel(name: &str) -> Option<Arc<dyn Channel>> {
@@ -493,20 +483,6 @@ fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
 ///
 /// Callback query IDs have format `"telegram_cb_{chat_id}_{message_id}_{callback_id}"` and
 /// are excluded (not reply-able messages).
-fn extract_telegram_message_id(channel_msg_id: &str) -> Option<String> {
-    // Format: "telegram_{chat_id}_{message_id}"
-    // Callback format "telegram_cb_{...}" is excluded (not a reply-able message)
-    let mut parts = channel_msg_id.splitn(3, '_');
-    let prefix = parts.next()?;
-    let chat_id_part = parts.next()?;
-    let msg_id = parts.next()?;
-    if prefix == "telegram" && chat_id_part != "cb" {
-        Some(msg_id.to_string())
-    } else {
-        None
-    }
-}
-
 fn should_prefix_sender_identity(msg: &traits::ChannelMessage) -> bool {
     if msg.channel != "telegram" {
         return false;
@@ -656,6 +632,9 @@ fn strip_tool_call_tags(message: &str) -> String {
 }
 
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
+    // Channels that implement delivery_instructions() on the trait are handled
+    // via get_live_channel() at the call site.  This function provides static
+    // fallback text for channels that haven't migrated yet.
     match channel_name {
         "matrix" => Some(
             "When responding on Matrix:\n\
@@ -663,20 +642,6 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Be concise and direct\n\
              - When you receive a [Voice message], the user spoke to you. Respond naturally as in conversation.\n\
              - Your text reply will automatically be converted to audio and sent back as a voice message.\n",
-        ),
-        "telegram" => Some(
-            "When responding on Telegram:\n\
-             - Include media markers for files or URLs that should be sent as attachments\n\
-             - Use **bold** for key terms, section titles, and important info (renders as <b>)\n\
-             - Use *italic* for emphasis (renders as <i>)\n\
-             - Use `backticks` for inline code, commands, or technical terms\n\
-             - Use triple backticks for code blocks\n\
-             - Use emoji naturally to add personality — but don't overdo it\n\
-             - Be concise and direct. Skip filler phrases like 'Great question!' or 'Certainly!'\n\
-             - Structure longer answers with bold headers, not raw markdown ## headers\n\
-             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n\
-             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
         "whatsapp" => Some(
             "When responding on WhatsApp:\n\
@@ -880,8 +845,8 @@ fn effective_progress_mode_for_message(
 ) -> ProgressMode {
     if channel_name.eq_ignore_ascii_case("cli") || expose_internal_tool_details {
         ProgressMode::Verbose
-    } else if channel_name.eq_ignore_ascii_case("telegram") {
-        runtime_telegram_progress_mode()
+    } else if let Some(mode) = get_live_channel(channel_name).and_then(|ch| ch.progress_mode()) {
+        mode
     } else {
         ProgressMode::Off
     }
@@ -945,9 +910,14 @@ fn build_channel_system_prompt(
         }
     }
 
-    if let Some(instructions) = channel_delivery_instructions(channel_name) {
+    // Prefer trait-based delivery instructions from the live channel instance,
+    // falling back to the static lookup for channels that haven't migrated yet.
+    let instructions: Option<String> = get_live_channel(channel_name)
+        .and_then(|ch| ch.delivery_instructions().map(|s| s.to_string()))
+        .or_else(|| channel_delivery_instructions(channel_name).map(|s| s.to_string()));
+    if let Some(instructions) = instructions {
         if prompt.is_empty() {
-            prompt = instructions.to_string();
+            prompt = instructions;
         } else {
             prompt = format!("{prompt}\n\n{instructions}");
         }
@@ -2573,7 +2543,7 @@ async fn handle_runtime_command_if_needed(
             .send(
                 &SendMessage::new(response, &msg.reply_target)
                     .in_thread(msg.thread_ts.clone())
-                    .reply_to(extract_telegram_message_id(&msg.id)),
+                    .reply_to(msg.reply_to_message_id.clone()),
             )
             .await
         {
@@ -2610,7 +2580,7 @@ async fn handle_runtime_command_if_needed(
                     .send(
                         &SendMessage::new(response, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone())
-                            .reply_to(extract_telegram_message_id(&msg.id)),
+                            .reply_to(msg.reply_to_message_id.clone()),
                     )
                     .await
                 {
@@ -3307,7 +3277,7 @@ async fn handle_runtime_command_if_needed(
         .send(
             &SendMessage::new(response, &msg.reply_target)
                 .in_thread(msg.thread_ts.clone())
-                .reply_to(extract_telegram_message_id(&msg.id)),
+                .reply_to(msg.reply_to_message_id.clone()),
         )
         .await
     {
@@ -3871,7 +3841,7 @@ If this input is legitimate, rephrase without instruction-overrides, system-prom
                     .send(
                         &SendMessage::new(warning, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone())
-                            .reply_to(extract_telegram_message_id(&msg.id)),
+                            .reply_to(msg.reply_to_message_id.clone()),
                     )
                     .await;
             }
@@ -3945,7 +3915,7 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                     .send(
                         &SendMessage::new(warning, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone())
-                            .reply_to(extract_telegram_message_id(&msg.id)),
+                            .reply_to(msg.reply_to_message_id.clone()),
                     )
                     .await;
             }
@@ -4032,7 +4002,7 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                     .send(
                         &SendMessage::new(message, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone())
-                            .reply_to(extract_telegram_message_id(&msg.id)),
+                            .reply_to(msg.reply_to_message_id.clone()),
                     )
                     .await;
             }
@@ -4067,7 +4037,9 @@ If this input is legitimate, rephrase the request and avoid instruction-override
     // Inject per-message timestamp so the LLM always knows the current time,
     // even in multi-turn conversations where the system prompt may be stale.
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-    let llm_user_content = llm_user_content_with_sender_identity(&msg, &msg.content);
+    let llm_user_content = get_live_channel(&msg.channel)
+        .map(|ch| ch.format_incoming_content(&msg))
+        .unwrap_or_else(|| llm_user_content_with_sender_identity(&msg, &msg.content));
     let timestamped_content = format!("[{now}] {llm_user_content}");
     let persisted_user_content = msg.content.clone();
 
@@ -4164,7 +4136,7 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                 .send_draft(
                     &SendMessage::new("...", &msg.reply_target)
                         .in_thread(msg.thread_ts.clone())
-                        .reply_to(extract_telegram_message_id(&msg.id)),
+                        .reply_to(msg.reply_to_message_id.clone()),
                 )
                 .await
             {
@@ -4578,7 +4550,7 @@ If this input is legitimate, rephrase the request and avoid instruction-override
             );
             tracing::debug!(
                 channel_msg_id = %msg.id,
-                reply_to = ?extract_telegram_message_id(&msg.id),
+                reply_to = ?msg.reply_to_message_id.clone(),
                 "channel.send: dispatching reply"
             );
             if let Some(channel) = target_channel.as_ref() {
@@ -4592,7 +4564,7 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                             .send(
                                 &SendMessage::new(&delivered_response, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone())
-                                    .reply_to(extract_telegram_message_id(&msg.id)),
+                                    .reply_to(msg.reply_to_message_id.clone()),
                             )
                             .await;
                     }
@@ -4600,7 +4572,7 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                     .send(
                         &SendMessage::new(delivered_response, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone())
-                            .reply_to(extract_telegram_message_id(&msg.id)),
+                            .reply_to(msg.reply_to_message_id.clone()),
                     )
                     .await
                 {
@@ -4672,7 +4644,7 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                             .send(
                                 &SendMessage::new(error_text, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone())
-                                    .reply_to(extract_telegram_message_id(&msg.id)),
+                                    .reply_to(msg.reply_to_message_id.clone()),
                             )
                             .await;
                     }
@@ -4713,7 +4685,7 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                             .send(
                                 &SendMessage::new(pause_text, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone())
-                                    .reply_to(extract_telegram_message_id(&msg.id)),
+                                    .reply_to(msg.reply_to_message_id.clone()),
                             )
                             .await;
                     }
@@ -4766,7 +4738,7 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                             .send(
                                 &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone())
-                                    .reply_to(extract_telegram_message_id(&msg.id)),
+                                    .reply_to(msg.reply_to_message_id.clone()),
                             )
                             .await;
                     }
@@ -4818,7 +4790,7 @@ If this input is legitimate, rephrase the request and avoid instruction-override
                         .send(
                             &SendMessage::new(error_text, &msg.reply_target)
                                 .in_thread(msg.thread_ts.clone())
-                                .reply_to(extract_telegram_message_id(&msg.id)),
+                                .reply_to(msg.reply_to_message_id.clone()),
                         )
                         .await;
                 }
@@ -5621,6 +5593,7 @@ fn collect_configured_channels(
         .with_group_reply_allowed_senders(tg.group_reply_allowed_sender_ids())
         .with_ack_reaction(config.channels_config.ack_reaction.telegram.clone())
         .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+        .with_progress_mode(tg.progress_mode)
         .with_transcription(config.transcription.clone())
         .with_workspace_dir(config.workspace_dir.clone());
 
@@ -6412,14 +6385,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .telegram
         .as_ref()
         .is_some_and(|tg| tg.interrupt_on_new_message);
-    let telegram_progress_mode = config
-        .channels_config
-        .telegram
-        .as_ref()
-        .map(|tg| tg.progress_mode)
-        .unwrap_or_default();
-    set_runtime_telegram_progress_mode(telegram_progress_mode);
-
     // TODO: Session persistence disabled - SessionManager module removed from upstream
     // let session_manager = shared_session_manager(&config.agent.session, &config.workspace_dir)?
     //     .map(|mgr| mgr as Arc<dyn SessionManager + Send + Sync>);
@@ -7047,6 +7012,23 @@ mod tests {
     impl Channel for TelegramRecordingChannel {
         fn name(&self) -> &str {
             "telegram"
+        }
+
+        fn delivery_instructions(&self) -> Option<&str> {
+            Some(
+                "When responding on Telegram:\n\
+                 - Include media markers for files or URLs that should be sent as attachments\n\
+                 - Use **bold** for key terms, section titles, and important info (renders as <b>)\n\
+                 - Use *italic* for emphasis (renders as <i>)\n\
+                 - Use `backticks` for inline code, commands, or technical terms\n\
+                 - Use triple backticks for code blocks\n\
+                 - Use emoji naturally to add personality — but don't overdo it\n\
+                 - Be concise and direct. Skip filler phrases like 'Great question!' or 'Certainly!'\n\
+                 - Structure longer answers with bold headers, not raw markdown ## headers\n\
+                 - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
+                 - Keep normal text outside markers and never wrap markers in code fences.\n\
+                 - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+            )
         }
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -7683,6 +7665,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -7772,6 +7755,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -7849,6 +7833,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -7940,6 +7925,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "draft-streaming-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -8029,6 +8015,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "draft-streaming-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -8103,6 +8090,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -8179,6 +8167,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -8258,6 +8247,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -8379,6 +8369,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -8507,6 +8498,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -8598,6 +8590,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -8680,6 +8673,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     channel: "telegram".to_string(),
                     timestamp: 1,
                     thread_ts: None,
+                    reply_to_message_id: None,
                 },
                 CancellationToken::new(),
             )
@@ -8712,6 +8706,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -8850,6 +8845,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -8961,6 +8957,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -9073,6 +9070,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -9163,6 +9161,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -9267,6 +9266,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -9372,6 +9372,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -9406,6 +9407,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -9624,6 +9626,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -9658,6 +9661,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -9776,6 +9780,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -9898,6 +9903,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -10000,6 +10006,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -10029,6 +10036,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -10121,6 +10129,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -10149,6 +10158,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -10244,6 +10254,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -10325,6 +10336,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -10439,6 +10451,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 4,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -10848,6 +10861,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -10919,6 +10933,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -11102,6 +11117,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
+            reply_to_message_id: None,
         })
         .await
         .unwrap();
@@ -11113,6 +11129,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 2,
             thread_ts: None,
+            reply_to_message_id: None,
         })
         .await
         .unwrap();
@@ -11195,6 +11212,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             })
             .await
             .unwrap();
@@ -11207,6 +11225,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                reply_to_message_id: None,
             })
             .await
             .unwrap();
@@ -11299,6 +11318,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             })
             .await
             .unwrap();
@@ -11311,6 +11331,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                reply_to_message_id: None,
             })
             .await
             .unwrap();
@@ -11385,6 +11406,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -11456,6 +11478,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -11651,6 +11674,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 kind: "shell".into(),
                 command: "cargo clippy".into(),
                 args: HashMap::new(),
+                tags: vec![],
+                terminal: false,
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
@@ -11687,6 +11712,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 kind: "shell".into(),
                 command: "cargo clippy".into(),
                 args: HashMap::new(),
+                tags: vec![],
+                terminal: false,
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
@@ -11729,6 +11756,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 kind: "shell&exec".into(),
                 command: "cargo clippy".into(),
                 args: HashMap::new(),
+                tags: vec![],
+                terminal: false,
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,
@@ -11835,6 +11864,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            reply_to_message_id: None,
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -11850,6 +11880,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            reply_to_message_id: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -11859,6 +11890,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
+            reply_to_message_id: None,
         };
 
         assert_ne!(
@@ -11877,6 +11909,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            reply_to_message_id: None,
         };
 
         let user_key = conversation_memory_key(&msg);
@@ -11897,6 +11930,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "qq".into(),
             timestamp: 1,
             thread_ts: Some("msg-a".into()),
+            reply_to_message_id: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -11906,6 +11940,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "qq".into(),
             timestamp: 2,
             thread_ts: Some("msg-b".into()),
+            reply_to_message_id: None,
         };
 
         assert_eq!(conversation_history_key(&msg1), "qq_user_open_1");
@@ -11925,6 +11960,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "napcat".into(),
             timestamp: 1,
             thread_ts: Some("msg-a".into()),
+            reply_to_message_id: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -11934,6 +11970,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "napcat".into(),
             timestamp: 2,
             thread_ts: Some("msg-b".into()),
+            reply_to_message_id: None,
         };
 
         assert_eq!(conversation_history_key(&msg1), "napcat_user_1001");
@@ -11953,6 +11990,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "telegram".into(),
             timestamp: 1,
             thread_ts: None,
+            reply_to_message_id: None,
         };
 
         let enriched = llm_user_content_with_sender_identity(&msg, &msg.content);
@@ -11969,6 +12007,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "telegram".into(),
             timestamp: 1,
             thread_ts: None,
+            reply_to_message_id: None,
         };
 
         let enriched = llm_user_content_with_sender_identity(&msg, &msg.content);
@@ -11985,6 +12024,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "telegram".into(),
             timestamp: 1,
             thread_ts: Some("789".into()),
+            reply_to_message_id: None,
         };
 
         let enriched = llm_user_content_with_sender_identity(&msg, &msg.content);
@@ -12004,6 +12044,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            reply_to_message_id: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -12013,6 +12054,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
+            reply_to_message_id: None,
         };
 
         mem.store(
@@ -12178,6 +12220,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -12193,6 +12236,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -12276,6 +12320,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "qq".to_string(),
                 timestamp: 1,
                 thread_ts: Some("msg-1".to_string()),
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -12291,6 +12336,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "qq".to_string(),
                 timestamp: 2,
                 thread_ts: Some("msg-2".to_string()),
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -12373,6 +12419,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -12409,6 +12456,9 @@ BTC is currently around $65,000 based on latest tool output."#
     async fn process_channel_message_telegram_keeps_system_instruction_at_top_only() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        // Register in global live registry so delivery_instructions() is found.
+        register_live_channel(channel.clone());
 
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
@@ -12474,6 +12524,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -12500,6 +12551,8 @@ BTC is currently around $65,000 based on latest tool output."#
             "telegram media marker guidance should live in the system prompt"
         );
         assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));
+
+        clear_live_channels();
     }
 
     #[test]
@@ -12634,17 +12687,30 @@ Done reminder set for 1:38 AM."#;
     }
 
     #[test]
-    fn effective_progress_mode_uses_telegram_runtime_setting() {
-        set_runtime_telegram_progress_mode(ProgressMode::Compact);
+    fn effective_progress_mode_uses_channel_trait() {
+        // Register a live Telegram channel with Compact progress mode
+        let ch = Arc::new(
+            TelegramChannel::new("t".into(), vec!["*".into()], false, true)
+                .with_progress_mode(ProgressMode::Compact),
+        );
+        register_live_channel(ch);
         assert_eq!(
             effective_progress_mode_for_message("telegram", false),
             ProgressMode::Compact
         );
-        set_runtime_telegram_progress_mode(ProgressMode::Off);
+
+        // Replace with Off progress mode
+        let ch2 = Arc::new(
+            TelegramChannel::new("t".into(), vec!["*".into()], false, true)
+                .with_progress_mode(ProgressMode::Off),
+        );
+        register_live_channel(ch2);
         assert_eq!(
             effective_progress_mode_for_message("telegram", false),
             ProgressMode::Off
         );
+
+        clear_live_channels();
     }
 
     #[test]
@@ -13305,6 +13371,7 @@ BTC is currently around $65,000 based on latest tool output."#;
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -13382,6 +13449,7 @@ BTC is currently around $65,000 based on latest tool output."#;
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
@@ -13397,6 +13465,7 @@ BTC is currently around $65,000 based on latest tool output."#;
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                reply_to_message_id: None,
             },
             CancellationToken::new(),
         )
