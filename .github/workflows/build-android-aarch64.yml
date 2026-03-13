@@ -1,0 +1,77 @@
+name: Build Android aarch64
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: "Git ref (branch, tag, or SHA) to build"
+        required: false
+        default: "main"
+        type: string
+
+concurrency:
+  group: build-android-aarch64-${{ github.ref || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-android-aarch64:
+    name: Build aarch64-linux-android
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.release_ref }}
+
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.92.0
+          targets: aarch64-linux-android
+
+      - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+          add-to-path: true
+
+      - name: Configure Android toolchain
+        run: |
+          echo "Setting up Android NDK toolchain for aarch64-linux-android"
+          NDK_HOME="${{ steps.setup-ndk.outputs.ndk-path }}"
+          TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          
+          # Add to path for linker resolution
+          echo "$TOOLCHAIN" >> "$GITHUB_PATH"
+          
+          # Set linker environment variables
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${TOOLCHAIN}/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
+
+      - name: Build release
+        shell: bash
+        run: |
+          cargo build --profile release-fast --locked --target aarch64-linux-android
+
+      - name: Check binary size
+        run: bash scripts/ci/check_binary_size.sh "target/aarch64-linux-android/release-fast/zeroclaw" "aarch64-linux-android"
+
+      - name: Package
+        run: |
+          cd target/aarch64-linux-android/release-fast
+          tar czf ../../../zeroclaw-aarch64-linux-android.tar.gz zeroclaw
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: zeroclaw-aarch64-linux-android
+          path: zeroclaw-aarch64-linux-android.tar.gz
+          retention-days: 7
