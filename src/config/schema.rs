@@ -1206,6 +1206,9 @@ pub struct GatewayConfig {
 /// Secure transport configuration for inter-node communication (`[node_transport]`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NodeTransportConfig {
+    /// Enable the secure transport layer.
+    #[serde(default = "default_node_transport_enabled")]
+    pub enabled: bool,
     /// Shared secret for HMAC authentication between nodes.
     #[serde(default)]
     pub shared_secret: String,
@@ -1218,22 +1221,45 @@ pub struct NodeTransportConfig {
     /// Allow specific node IPs/CIDRs.
     #[serde(default)]
     pub allowed_peers: Vec<String>,
+    /// Path to TLS certificate file.
+    #[serde(default)]
+    pub tls_cert_path: Option<String>,
+    /// Path to TLS private key file.
+    #[serde(default)]
+    pub tls_key_path: Option<String>,
+    /// Require client certificates (mutual TLS).
+    #[serde(default)]
+    pub mutual_tls: bool,
+    /// Maximum number of connections per peer.
+    #[serde(default = "default_connection_pool_size")]
+    pub connection_pool_size: usize,
 }
 
+fn default_node_transport_enabled() -> bool {
+    true
+}
 fn default_max_request_age() -> i64 {
     300
 }
 fn default_require_https() -> bool {
     true
 }
+fn default_connection_pool_size() -> usize {
+    4
+}
 
 impl Default for NodeTransportConfig {
     fn default() -> Self {
         Self {
+            enabled: default_node_transport_enabled(),
             shared_secret: String::new(),
             max_request_age_secs: default_max_request_age(),
             require_https: default_require_https(),
             allowed_peers: Vec::new(),
+            tls_cert_path: None,
+            tls_key_path: None,
+            mutual_tls: false,
+            connection_pool_size: default_connection_pool_size(),
         }
     }
 }
