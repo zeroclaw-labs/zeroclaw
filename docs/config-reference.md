@@ -776,7 +776,7 @@ Image generation and editing via Gemini.
 |---|---|---|
 | `enabled` | `false` | Enable image generation tool |
 | `default_image_provider` | `"gemini"` | Provider for image generation |
-| `default_image_model` | `"nano-banana-pro-preview"` | Model for generation (nano-banana series required) |
+| `default_image_model` | `"gemini-2.5-flash-image"` | Model for generation (works with nano-banana series via config) |
 | `image_generation_keywords` | keyword list | Keywords to auto-detect generation requests |
 
 Notes:

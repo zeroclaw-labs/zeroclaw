@@ -112,7 +112,7 @@ impl ImageGenerationTool {
             .model
             .as_deref()
             .or(self.config.default_image_model.as_deref())
-            .unwrap_or("gemini-2.0-flash-exp");
+            .unwrap_or("gemini-2.5-flash-image");
 
         // For Gemini with image editing, we need to handle multipart upload
         // Also use Gemini if default provider is gemini (regardless of params.provider)
@@ -734,7 +734,7 @@ mod tests {
             size: None,
             quality: None,
             style: None,
-            model: Some("gemini-2.0-flash-exp".to_string()),
+            model: Some("gemini-2.5-flash-image".to_string()),
             provider: Some("gemini".to_string()),
             image: Some("/path/to/image.png".to_string()),
         };
