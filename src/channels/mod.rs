@@ -4424,6 +4424,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             model_routes: Arc::new(Vec::new()),
+            show_tool_calls: true,
         });
 
         process_channel_message(
@@ -4486,6 +4487,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             model_routes: Arc::new(Vec::new()),
+            show_tool_calls: true,
         });
 
         process_channel_message(
