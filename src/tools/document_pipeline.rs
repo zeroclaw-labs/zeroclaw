@@ -43,22 +43,175 @@ fn hancom_module_code(ext: &str) -> Option<&'static str> {
     }
 }
 
+/// Maximum number of pages to sample when classifying a PDF.
+const PDF_CLASSIFY_SAMPLE_PAGES: usize = 5;
+
 /// Detect if a PDF is digital (has extractable text) vs image/scanned.
 ///
-/// Checks the first 3 pages for meaningful text content.
-/// Returns true if the PDF has embedded text (digital).
+/// Uses a two-tier detection strategy for fast, precise classification:
+///
+/// 1. **Font resource check** (fast) — inspects `/Font` entries in sampled
+///    page resources.  If no page carries a `/Font` resource the PDF is
+///    almost certainly image-only.
+/// 2. **Text extraction check** (confirmatory) — extracts text from the
+///    full document via `pdf-extract` and verifies non-empty content.
+///    This catches edge cases where font resources exist but contain no
+///    renderable text (e.g. invisible watermark fonts).
+///
+/// Only PDFs with **no font resources AND no extractable text** are
+/// classified as image PDFs and routed to Upstage OCR.  Already-OCR'd
+/// scans (which carry a text layer) are correctly treated as digital.
 #[cfg(feature = "rag-pdf")]
 fn is_digital_pdf(path: &Path) -> bool {
     use std::fs;
-    if let Ok(data) = fs::read(path) {
-        // Simple heuristic: check if pdf-extract can get meaningful text
-        if let Ok(text) = pdf_extract::extract_text_from_mem(&data) {
-            let trimmed = text.trim();
-            // If we get more than 100 characters, it's likely digital
-            return trimmed.len() > 100;
+
+    let data = match fs::read(path) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+
+    // --- Tier 1: Font resource check (fast, no text parsing) ---
+    let has_font = match lopdf::Document::load_mem(&data) {
+        Ok(doc) => {
+            let page_ids: Vec<_> = {
+                let pages = doc.get_pages();
+                let mut ids: Vec<(u32, lopdf::ObjectId)> =
+                    pages.into_iter().collect();
+                ids.sort_by_key(|(num, _)| *num);
+                ids.into_iter().map(|(_, id)| id).collect()
+            };
+
+            let sample = sampled_indices(page_ids.len(), PDF_CLASSIFY_SAMPLE_PAGES);
+            sample.iter().any(|&idx| {
+                let page_id = page_ids[idx];
+                page_has_font_resource(&doc, page_id)
+            })
+        }
+        Err(e) => {
+            tracing::debug!("lopdf failed to parse PDF for font check: {e}");
+            // Cannot determine structure — fall through to text extraction.
+            false
+        }
+    };
+
+    if has_font {
+        // Font resources present → digital (or already-OCR'd scan).
+        return true;
+    }
+
+    // --- Tier 2: Text extraction check (confirmatory) ---
+    // Even without /Font resources, attempt text extraction as a safety net.
+    match pdf_extract::extract_text_from_mem(&data) {
+        Ok(text) => !text.trim().is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// Check whether a PDF page object carries a `/Font` resource.
+#[cfg(feature = "rag-pdf")]
+fn page_has_font_resource(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> bool {
+    let page_obj = match doc.get_object(page_id) {
+        Ok(obj) => obj,
+        Err(_) => return false,
+    };
+    let dict = match page_obj.as_dict() {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+
+    // Try direct /Resources/Font on the page.
+    if let Ok(resources) = dict.get(b"Resources") {
+        if has_font_in_resources(doc, resources) {
+            return true;
         }
     }
+
+    // Walk /Parent chain — shared resources may live on a parent Pages node.
+    let mut current = dict.get(b"Parent").ok().cloned();
+    // Limit depth to prevent infinite loops on malformed PDFs.
+    let mut depth = 0;
+    while let Some(ref parent_ref) = current {
+        if depth > 10 {
+            break;
+        }
+        depth += 1;
+
+        let parent_obj = match deref_object(doc, parent_ref) {
+            Some(o) => o,
+            None => break,
+        };
+        let parent_dict = match parent_obj.as_dict() {
+            Ok(d) => d,
+            Err(_) => break,
+        };
+        if let Ok(resources) = parent_dict.get(b"Resources") {
+            if has_font_in_resources(doc, resources) {
+                return true;
+            }
+        }
+        current = parent_dict.get(b"Parent").ok().cloned();
+    }
+
     false
+}
+
+/// Dereference an `Object::Reference` to the underlying object.
+#[cfg(feature = "rag-pdf")]
+fn deref_object<'a>(doc: &'a lopdf::Document, obj: &'a lopdf::Object) -> Option<&'a lopdf::Object> {
+    match obj {
+        lopdf::Object::Reference(id) => doc.get_object(*id).ok(),
+        other => Some(other),
+    }
+}
+
+/// Check whether a `/Resources` value (possibly an indirect reference)
+/// contains a non-empty `/Font` dictionary.
+#[cfg(feature = "rag-pdf")]
+fn has_font_in_resources(doc: &lopdf::Document, resources: &lopdf::Object) -> bool {
+    let res_obj = match deref_object(doc, resources) {
+        Some(o) => o,
+        None => return false,
+    };
+    let res_dict = match res_obj.as_dict() {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+
+    match res_dict.get(b"Font") {
+        Ok(font_obj) => {
+            let font = match deref_object(doc, font_obj) {
+                Some(o) => o,
+                None => return false,
+            };
+            match font.as_dict() {
+                Ok(d) => !d.is_empty(),
+                Err(_) => false,
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// Pick up to `max` evenly-spaced sample indices from a range of `total`.
+///
+/// Returns first, last, and evenly-distributed middle indices so that both
+/// the beginning and end of a document are checked.
+#[cfg(feature = "rag-pdf")]
+fn sampled_indices(total: usize, max: usize) -> Vec<usize> {
+    if total == 0 {
+        return vec![];
+    }
+    if total <= max {
+        return (0..total).collect();
+    }
+    let mut indices = Vec::with_capacity(max);
+    for i in 0..max {
+        let idx = i * (total - 1) / (max - 1);
+        if indices.last() != Some(&idx) {
+            indices.push(idx);
+        }
+    }
+    indices
 }
 
 #[cfg(not(feature = "rag-pdf"))]
@@ -816,5 +969,42 @@ mod tests {
             DocumentPipelineTool::classify_document(Path::new("test.txt")),
             DocumentType::Unsupported(_)
         ));
+    }
+
+    // ── sampled_indices tests ──────────────────────────────────
+    #[cfg(feature = "rag-pdf")]
+    mod sampled_indices_tests {
+        use super::super::sampled_indices;
+
+        #[test]
+        fn empty_total_returns_empty() {
+            assert_eq!(sampled_indices(0, 5), Vec::<usize>::new());
+        }
+
+        #[test]
+        fn total_within_max_returns_all() {
+            assert_eq!(sampled_indices(3, 5), vec![0, 1, 2]);
+            assert_eq!(sampled_indices(5, 5), vec![0, 1, 2, 3, 4]);
+        }
+
+        #[test]
+        fn samples_include_first_and_last() {
+            let s = sampled_indices(100, 5);
+            assert_eq!(*s.first().unwrap(), 0);
+            assert_eq!(*s.last().unwrap(), 99);
+        }
+
+        #[test]
+        fn samples_are_sorted_and_unique() {
+            let s = sampled_indices(1000, 5);
+            for w in s.windows(2) {
+                assert!(w[0] < w[1], "indices must be strictly increasing");
+            }
+        }
+
+        #[test]
+        fn single_page() {
+            assert_eq!(sampled_indices(1, 5), vec![0]);
+        }
     }
 }

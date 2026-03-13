@@ -180,6 +180,7 @@ probe-rs = { version = "0.31", optional = true }
 
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.10", optional = true }
+lopdf = { version = "0.38", optional = true }
 tempfile = "3.14"
 
 # WASM plugin runtime (optional, enable with --features wasm-tools)
@@ -231,7 +232,7 @@ landlock = ["sandbox-landlock"]
 # probe = probe-rs for Nucleo memory read (adds ~50 deps; optional)
 probe = ["dep:probe-rs"]
 # rag-pdf = PDF ingestion for datasheet RAG
-rag-pdf = ["dep:pdf-extract"]
+rag-pdf = ["dep:pdf-extract", "dep:lopdf"]
 # wasm-tools = WASM plugin engine for dynamically-loaded tool packages (WASI stdio protocol)
 # Runtime implementation is active on Linux/macOS/Windows; unsupported targets use stubs.
 wasm-tools = ["dep:wasmtime", "dep:wasmtime-wasi"]
