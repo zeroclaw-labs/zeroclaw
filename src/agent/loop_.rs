@@ -2875,6 +2875,11 @@ pub async fn run(
     }
 
     // ── Wire MCP tools (non-fatal) — CLI path ────────────────────
+    // NOTE: MCP tools are injected after built-in tool filtering
+    // (filter_primary_agent_tools_or_fail / agent.allowed_tools / agent.denied_tools).
+    // MCP servers are user-declared external integrations; the built-in allow/deny
+    // filter is not appropriate for them and would silently drop all MCP tools when
+    // a restrictive allowlist is configured. Keep this block after any such filter call.
     if config.mcp.enabled && !config.mcp.servers.is_empty() {
         tracing::info!(
             "Initializing MCP client — {} server(s) configured",
@@ -3387,6 +3392,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     tools_registry.extend(peripheral_tools);
 
     // ── Wire MCP tools (non-fatal) — process_message path ────────
+    // NOTE: Same ordering contract as the CLI path above — MCP tools must be
+    // injected after filter_primary_agent_tools_or_fail (or equivalent built-in
+    // tool allow/deny filtering) to avoid MCP tools being silently dropped.
     if config.mcp.enabled && !config.mcp.servers.is_empty() {
         tracing::info!(
             "Initializing MCP client — {} server(s) configured",
