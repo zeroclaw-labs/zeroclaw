@@ -31,6 +31,7 @@ use super::whatsapp_storage::RusqliteStore;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use shellexpand;
 use std::sync::Arc;
 use tokio::select;
 
@@ -82,8 +83,16 @@ impl WhatsAppWebChannel {
         pair_code: Option<String>,
         allowed_numbers: Vec<String>,
     ) -> Self {
+        let expanded = shellexpand::tilde(&session_path);
+        if expanded == "~" || expanded.starts_with("~/") {
+            panic!(
+                "Failed to expand '~' in session_path '{}': home directory not found. \
+                 Please provide an absolute path or ensure $HOME is set.",
+                session_path
+            );
+        }
         Self {
-            session_path,
+            session_path: expanded.to_string(),
             pair_phone,
             pair_code,
             allowed_numbers,
