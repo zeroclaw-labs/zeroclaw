@@ -690,6 +690,10 @@ pub struct AgentConfig {
     /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
     #[serde(default)]
     pub tool_call_dedup_exempt: Vec<String>,
+    /// When true (default), send live tool-call notifications (e.g. 🔧 `tool_name`)
+    /// as threaded messages in non-CLI channels. Set to false to suppress them.
+    #[serde(default = "default_true")]
+    pub show_tool_calls: bool,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -713,6 +717,7 @@ impl Default for AgentConfig {
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             tool_call_dedup_exempt: Vec::new(),
+            show_tool_calls: true,
         }
     }
 }
@@ -3140,6 +3145,10 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// When true (default), the bot adds a random emoji reaction to acknowledge
+    /// receipt of each incoming message. Set to false to disable.
+    #[serde(default = "default_true")]
+    pub ack_reaction: bool,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -5982,6 +5991,7 @@ default_temperature = 0.7
                     draft_update_interval_ms: default_draft_update_interval_ms(),
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    ack_reaction: true,
                 }),
                 discord: None,
                 slack: None,
@@ -6463,6 +6473,7 @@ tool_dispatcher = "xml"
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
             mention_only: false,
+            ack_reaction: true,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -8625,6 +8636,7 @@ require_otp_to_resume = true
             draft_update_interval_ms: default_draft_update_interval_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
+            ack_reaction: true,
         });
 
         // Save (triggers encryption)
