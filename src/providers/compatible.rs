@@ -549,7 +549,44 @@ struct ResponsesRequest {
 #[derive(Debug, Serialize)]
 struct ResponsesInput {
     role: String,
-    content: String,
+    content: ResponsesInputContent,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ResponsesInputContent {
+    Text(String),
+    Parts(Vec<ResponsesInputPart>),
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesInputPart {
+    #[serde(rename = "type")]
+    kind: String,
+    text: String,
+}
+
+impl ResponsesInput {
+    fn user_text(content: String) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: ResponsesInputContent::Text(content),
+            kind: None,
+        }
+    }
+
+    fn assistant_output_text(content: String) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: ResponsesInputContent::Parts(vec![ResponsesInputPart {
+                kind: "output_text".to_string(),
+                text: content,
+            }]),
+            kind: Some("message".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -731,13 +768,6 @@ fn first_nonempty(text: Option<&str>) -> Option<String> {
     })
 }
 
-fn normalize_responses_role(role: &str) -> &'static str {
-    match role {
-        "assistant" | "tool" => "assistant",
-        _ => "user",
-    }
-}
-
 fn build_responses_prompt(messages: &[ChatMessage]) -> (Option<String>, Vec<ResponsesInput>) {
     let mut instructions_parts = Vec::new();
     let mut input = Vec::new();
@@ -752,10 +782,13 @@ fn build_responses_prompt(messages: &[ChatMessage]) -> (Option<String>, Vec<Resp
             continue;
         }
 
-        input.push(ResponsesInput {
-            role: normalize_responses_role(&message.role).to_string(),
-            content: message.content.clone(),
-        });
+        let input_item = match message.role.as_str() {
+            // llama.cpp Responses parser expects assistant history items in
+            // "output_message" shape (`type=message`, `output_text` parts).
+            "assistant" | "tool" => ResponsesInput::assistant_output_text(message.content.clone()),
+            _ => ResponsesInput::user_text(message.content.clone()),
+        };
+        input.push(input_item);
     }
 
     let instructions = if instructions_parts.is_empty() {
@@ -1916,14 +1949,47 @@ mod tests {
 
         assert_eq!(instructions.as_deref(), Some("policy"));
         assert_eq!(input.len(), 4);
-        assert_eq!(input[0].role, "user");
-        assert_eq!(input[0].content, "step 1");
-        assert_eq!(input[1].role, "assistant");
-        assert_eq!(input[1].content, "ack 1");
-        assert_eq!(input[2].role, "assistant");
-        assert_eq!(input[2].content, "{\"result\":\"ok\"}");
-        assert_eq!(input[3].role, "user");
-        assert_eq!(input[3].content, "step 2");
+
+        let serialized: Vec<serde_json::Value> = input
+            .iter()
+            .map(|item| serde_json::to_value(item).expect("responses input item serializes"))
+            .collect();
+        assert_eq!(
+            serialized[0],
+            serde_json::json!({
+                "role": "user",
+                "content": "step 1"
+            })
+        );
+        assert_eq!(
+            serialized[1],
+            serde_json::json!({
+                "role": "assistant",
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "ack 1"
+                }]
+            })
+        );
+        assert_eq!(
+            serialized[2],
+            serde_json::json!({
+                "role": "assistant",
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "{\"result\":\"ok\"}"
+                }]
+            })
+        );
+        assert_eq!(
+            serialized[3],
+            serde_json::json!({
+                "role": "user",
+                "content": "step 2"
+            })
+        );
     }
 
     #[tokio::test]
