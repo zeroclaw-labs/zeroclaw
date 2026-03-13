@@ -1326,21 +1326,50 @@ impl Default for WasmConfig {
     }
 }
 
-/// Multimodal (image) handling configuration (`[multimodal]` section).
+/// Multimodal handling configuration (`[multimodal]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MultimodalConfig {
+    /// Image handling and generation settings (`[multimodal.image]`).
+    #[serde(default)]
+    pub image: MultimodalImageConfig,
+    /// Audio (TTS) settings (`[multimodal.audio]`).
+    #[serde(default)]
+    pub audio: MultimodalAudioConfig,
+    /// Video settings (`[multimodal.video]`).
+    #[serde(default)]
+    pub video: MultimodalVideoConfig,
+    /// Allow fetching remote multimodal URLs (http/https). Disabled by default.
+    #[serde(default)]
+    pub allow_remote_fetch: bool,
+}
+
+/// Image handling and generation configuration (`[multimodal.image]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MultimodalImageConfig {
+    /// Enable image generation tools.
+    #[serde(default)]
+    pub enabled: bool,
     /// Maximum number of image attachments accepted per request.
     #[serde(default = "default_multimodal_max_images")]
     pub max_images: usize,
     /// Maximum image payload size in MiB before base64 encoding.
     #[serde(default = "default_multimodal_max_image_size_mb")]
-    pub max_image_size_mb: usize,
-    /// Allow fetching remote image URLs (http/https). Disabled by default.
+    pub max_size_mb: usize,
+    /// Default provider for image generation (e.g., "openai", "gemini").
     #[serde(default)]
-    pub allow_remote_fetch: bool,
-    /// Multimedia generation configuration (image generation, TTS, video analysis).
+    pub default_provider: Option<String>,
+    /// Default model for image generation.
     #[serde(default)]
-    pub generation: MultimodalGenerationConfig,
+    pub default_model: Option<String>,
+    /// Maximum image size in pixels (width x height, e.g., "1024x1024").
+    #[serde(default)]
+    pub default_size: Option<String>,
+    /// API key for image generation provider (optional, falls back to ZEROCLAW_API_KEY).
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Keywords that trigger image generation intent detection.
+    #[serde(default = "default_image_generation_keywords")]
+    pub generation_keywords: Vec<String>,
 }
 
 fn default_multimodal_max_images() -> usize {
@@ -1351,20 +1380,38 @@ fn default_multimodal_max_image_size_mb() -> usize {
     5
 }
 
-/// Multimedia generation configuration (`[multimodal.generation]` section).
-///
-/// Controls AI-powered multimedia output capabilities: image generation, speech synthesis, and video analysis.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct MultimodalGenerationConfig {
-    /// Enable multimedia generation tools (image generation, TTS, video analysis).
+fn default_image_generation_keywords() -> Vec<String> {
+    vec![
+        "dessine".to_string(),
+        "generate".to_string(),
+        "crée une image".to_string(),
+        "create image".to_string(),
+        "image un".to_string(),
+        "génère".to_string(),
+    ]
+}
+
+impl Default for MultimodalImageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_images: default_multimodal_max_images(),
+            max_size_mb: default_multimodal_max_image_size_mb(),
+            default_provider: None,
+            default_model: None,
+            default_size: None,
+            api_key: None,
+            generation_keywords: default_image_generation_keywords(),
+        }
+    }
+}
+
+/// Audio (TTS) handling configuration (`[multimodal.audio]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct MultimodalAudioConfig {
+    /// Enable speech synthesis (TTS) tools.
     #[serde(default)]
     pub enabled: bool,
-    /// Default provider for image generation (e.g., "openai", "gemini").
-    #[serde(default)]
-    pub default_image_provider: Option<String>,
-    /// Default model for image generation.
-    #[serde(default)]
-    pub default_image_model: Option<String>,
     /// Default provider for speech synthesis (TTS).
     #[serde(default)]
     pub default_tts_provider: Option<String>,
@@ -1374,57 +1421,44 @@ pub struct MultimodalGenerationConfig {
     /// Default voice for TTS (e.g., "alloy", "echo", "fable").
     #[serde(default)]
     pub default_voice: Option<String>,
-    /// Maximum image size in pixels (width x height, e.g., "1024x1024").
-    #[serde(default)]
-    pub default_image_size: Option<String>,
-    /// API key for image generation provider (optional, falls back to ZEROCLAW_API_KEY).
+    /// API key for TTS provider (optional, falls back to ZEROCLAW_API_KEY).
     #[serde(default)]
     pub api_key: Option<String>,
-    /// Keywords that trigger image generation intent detection (vs vision analysis).
-    /// Uses unidecode normalization (é→e, ñ→n) before matching.
-    #[serde(default)]
-    pub image_generation_keywords: Vec<String>,
 }
 
-impl Default for MultimodalGenerationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            default_image_provider: None,
-            default_image_model: None,
-            default_tts_provider: None,
-            default_tts_model: None,
-            default_voice: None,
-            default_image_size: None,
-            api_key: None,
-            image_generation_keywords: vec![
-                "dessine".to_string(),
-                "generate".to_string(),
-                "crée une image".to_string(),
-                "create image".to_string(),
-                "image un".to_string(),
-                "génère".to_string(),
-            ],
-        }
-    }
+/// Video handling configuration (`[multimodal.video]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct MultimodalVideoConfig {
+    /// Enable video analysis tools.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Default provider for video analysis (e.g., "openai", "gemini").
+    #[serde(default)]
+    pub default_provider: Option<String>,
+    /// Default model for video analysis.
+    #[serde(default)]
+    pub default_model: Option<String>,
+    /// API key for video analysis provider (optional, falls back to ZEROCLAW_API_KEY).
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 impl MultimodalConfig {
     /// Clamp configured values to safe runtime bounds.
     pub fn effective_limits(&self) -> (usize, usize) {
-        let max_images = self.max_images.clamp(1, 16);
-        let max_image_size_mb = self.max_image_size_mb.clamp(1, 20);
-        (max_images, max_image_size_mb)
+        let max_images = self.image.max_images.clamp(1, 16);
+        let max_size_mb = self.image.max_size_mb.clamp(1, 20);
+        (max_images, max_size_mb)
     }
 }
 
 impl Default for MultimodalConfig {
     fn default() -> Self {
         Self {
-            max_images: default_multimodal_max_images(),
-            max_image_size_mb: default_multimodal_max_image_size_mb(),
+            image: MultimodalImageConfig::default(),
+            audio: MultimodalAudioConfig::default(),
+            video: MultimodalVideoConfig::default(),
             allow_remote_fetch: false,
-            generation: MultimodalGenerationConfig::default(),
         }
     }
 }
@@ -7782,6 +7816,21 @@ impl Config {
             )?;
             decrypt_optional_secret(
                 &store,
+                &mut config.multimodal.image.api_key,
+                "config.multimodal.image.api_key",
+            )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.multimodal.audio.api_key,
+                "config.multimodal.audio.api_key",
+            )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.multimodal.video.api_key,
+                "config.multimodal.video.api_key",
+            )?;
+            decrypt_optional_secret(
+                &store,
                 &mut config.composio.api_key,
                 "config.composio.api_key",
             )?;
@@ -9644,6 +9693,21 @@ impl Config {
             &store,
             &mut config_to_save.transcription.api_key,
             "config.transcription.api_key",
+        )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.multimodal.image.api_key,
+            "config.multimodal.image.api_key",
+        )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.multimodal.audio.api_key,
+            "config.multimodal.audio.api_key",
+        )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.multimodal.video.api_key,
+            "config.multimodal.video.api_key",
         )?;
         encrypt_optional_secret(
             &store,

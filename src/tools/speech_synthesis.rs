@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use super::traits::{Tool, ToolResult};
-use crate::config::schema::MultimodalGenerationConfig;
+use crate::config::schema::MultimodalAudioConfig;
 use serde::{Deserialize, Serialize};
 
 /// TTS tool name
@@ -66,12 +66,12 @@ pub struct SpeechSynthesisResponse {
 
 /// Speech Synthesis Tool
 pub struct SpeechSynthesisTool {
-    config: MultimodalGenerationConfig,
+    config: MultimodalAudioConfig,
 }
 
 impl SpeechSynthesisTool {
     /// Create a new TTS tool instance
-    pub fn new(config: MultimodalGenerationConfig) -> Self {
+    pub fn new(config: MultimodalAudioConfig) -> Self {
         Self { config }
     }
 
@@ -379,7 +379,7 @@ impl Tool for SpeechSynthesisTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("Speech synthesis is disabled. Enable it in config.toml: [multimodal.generation]".to_string()),
+                error: Some("Speech synthesis is disabled. Enable it in config.toml: [multimodal.audio]".to_string()),
             });
         }
 
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn test_format_to_elevenlabs() {
-        let tool = SpeechSynthesisTool::new(MultimodalGenerationConfig::default());
+        let tool = SpeechSynthesisTool::new(MultimodalAudioConfig::default());
         
         assert_eq!(tool.format_to_elevenlabs("mp3"), "mp3_44100_128");
         assert_eq!(tool.format_to_elevenlabs("opus"), "opus_48000");
@@ -419,7 +419,7 @@ mod tests {
 
     #[test]
     fn test_format_to_google() {
-        let tool = SpeechSynthesisTool::new(MultimodalGenerationConfig::default());
+        let tool = SpeechSynthesisTool::new(MultimodalAudioConfig::default());
         
         assert_eq!(tool.format_to_google("mp3"), "MP3");
         assert_eq!(tool.format_to_google("wav"), "LINEAR16");

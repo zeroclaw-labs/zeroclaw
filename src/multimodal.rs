@@ -137,8 +137,8 @@ pub async fn prepare_messages_for_provider_with_provider_hint(
     config: &MultimodalConfig,
     provider_hint: Option<&str>,
 ) -> anyhow::Result<PreparedMessages> {
-    let (max_images, max_image_size_mb) = config.effective_limits();
-    let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
+    let (max_images, max_size_mb) = config.effective_limits();
+    let max_bytes = max_size_mb.saturating_mul(1024 * 1024);
 
     let found_images = count_image_markers(messages);
     if found_images > max_images {
@@ -644,7 +644,6 @@ fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::MultimodalGenerationConfig;
 
     #[test]
     fn parse_image_markers_extracts_multiple_markers() {
@@ -702,12 +701,8 @@ mod tests {
             "[IMAGE:/tmp/1.png]\n[IMAGE:/tmp/2.png]".to_string(),
         )];
 
-        let config = MultimodalConfig {
-            max_images: 1,
-            max_image_size_mb: 5,
-            allow_remote_fetch: false,
-            generation: MultimodalGenerationConfig::default(),
-        };
+        let mut config = MultimodalConfig::default();
+        config.image.max_images = 1;
 
         let error = prepare_messages_for_provider(&messages, &config)
             .await
@@ -745,12 +740,8 @@ mod tests {
             "[IMAGE:{}]",
             image_path.display()
         ))];
-        let config = MultimodalConfig {
-            max_images: 4,
-            max_image_size_mb: 1,
-            allow_remote_fetch: false,
-            generation: MultimodalGenerationConfig::default(),
-        };
+        let mut config = MultimodalConfig::default();
+        config.image.max_size_mb = 1;
 
         let error = prepare_messages_for_provider(&messages, &config)
             .await

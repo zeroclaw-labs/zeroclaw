@@ -1279,7 +1279,7 @@ pub async fn run_tool_call_loop(
             .map(|m| m.content.as_str())
             .unwrap_or("")
             .to_lowercase();
-        let generation_keywords = &multimodal_config.generation.image_generation_keywords;
+        let generation_keywords = &multimodal_config.image.generation_keywords;
         let contains_generation_keyword = generation_keywords
             .iter()
             .any(|kw| user_text.contains(&kw.to_lowercase()));
@@ -4473,12 +4473,9 @@ mod tests {
 
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
-        let multimodal = crate::config::MultimodalConfig {
-            max_images: 4,
-            max_image_size_mb: 1,
-            allow_remote_fetch: false,
-            generation: crate::config::schema::MultimodalGenerationConfig::default(),
-        };
+        let mut multimodal = crate::config::MultimodalConfig::default();
+        multimodal.image.max_images = 4;
+        multimodal.image.max_size_mb = 5;
 
         let err = run_tool_call_loop(
             &provider,

@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use super::traits::{Tool, ToolResult};
-use crate::config::schema::MultimodalGenerationConfig;
+use crate::config::schema::MultimodalVideoConfig;
 use serde::{Deserialize, Serialize};
 
 /// Video Analysis tool name
@@ -112,12 +112,11 @@ pub struct TimingInfo {
 
 /// Video Analysis Tool
 pub struct VideoAnalysisTool {
-    config: MultimodalGenerationConfig,
+    config: MultimodalVideoConfig,
 }
 
 impl VideoAnalysisTool {
-    /// Create a new video analysis tool instance
-    pub fn new(config: MultimodalGenerationConfig) -> Self {
+    pub fn new(config: MultimodalVideoConfig) -> Self {
         Self { config }
     }
 
@@ -127,13 +126,13 @@ impl VideoAnalysisTool {
         let provider_name = params
             .provider
             .as_deref()
-            .or(self.config.default_image_provider.as_deref())
+            .or(self.config.default_provider.as_deref())
             .unwrap_or("openai");
 
         let model = params
             .model
             .as_deref()
-            .or(self.config.default_image_model.as_deref())
+            .or(self.config.default_model.as_deref())
             .unwrap_or("gpt-4o");
 
         // Validate video URL
@@ -506,7 +505,7 @@ impl Tool for VideoAnalysisTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("Video analysis is disabled. Enable multimedia features in config.toml: [multimodal.generation]".to_string()),
+                error: Some("Video analysis is disabled. Enable multimedia features in config.toml: [multimodal.video]".to_string()),
             });
         }
 

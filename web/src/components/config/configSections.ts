@@ -1008,13 +1008,64 @@ export const CONFIG_SECTIONS: SectionDef[] = [
     path: 'multimodal',
     category: 'advanced',
     title: 'Multimodal',
-    description: 'Image and multimodal input settings',
+    description: 'Global multimodal settings',
     icon: Image,
     defaultCollapsed: true,
     fields: [
-      { key: 'max_images', label: 'Max Images', type: 'number', min: 1, defaultValue: 4, description: 'Default: 4' },
-      { key: 'max_image_size_mb', label: 'Max Image Size (MB)', type: 'number', min: 1, defaultValue: 5, description: 'Default: 5' },
       { key: 'allow_remote_fetch', label: 'Allow Remote Fetch', type: 'toggle', defaultValue: false },
+    ],
+  },
+
+  // ── Multimodal Image ──────────────────────────────────────────────
+  {
+    path: 'multimodal.image',
+    category: 'advanced',
+    title: 'Multimodal: Image',
+    description: 'Image handling and generation settings',
+    icon: Image,
+    defaultCollapsed: true,
+    fields: [
+      { key: 'enabled', label: 'Enable Generation', type: 'toggle', defaultValue: true },
+      { key: 'max_images', label: 'Max Images', type: 'number', min: 1, defaultValue: 4 },
+      { key: 'max_size_mb', label: 'Max Size (MB)', type: 'number', min: 1, defaultValue: 5 },
+      { key: 'default_provider', label: 'Default Provider', type: 'text', defaultValue: 'gemini', description: 'e.g. gemini, openai' },
+      { key: 'default_model', label: 'Default Model', type: 'text', defaultValue: 'nano-banana-pro-preview', description: 'e.g. imagen-3, dall-e-3' },
+      { key: 'generation_keywords', label: 'Trigger Keywords', type: 'tag-list', defaultValue: [
+        'dessine',
+        'generate',
+        'crée une image',
+        'create image',
+        'image un',
+        'génère',
+      ], tagPlaceholder: 'e.g. dessine, generate' },
+    ],
+  },
+
+  // ── Multimodal Audio ──────────────────────────────────────────────
+  {
+    path: 'multimodal.audio',
+    category: 'advanced',
+    title: 'Multimodal: Audio',
+    description: 'Speech synthesis (TTS) settings',
+    icon: Mic,
+    defaultCollapsed: true,
+    fields: [
+      { key: 'enabled', label: 'Enable TTS', type: 'toggle', defaultValue: false },
+    ],
+  },
+
+  // ── Multimodal Video ──────────────────────────────────────────────
+  {
+    path: 'multimodal.video',
+    category: 'advanced',
+    title: 'Multimodal: Video',
+    description: 'Video analysis settings',
+    icon: Play,
+    defaultCollapsed: true,
+    fields: [
+      { key: 'enabled', label: 'Enable Analysis', type: 'toggle', defaultValue: false },
+      { key: 'default_provider', label: 'Default Provider', type: 'text', defaultValue: 'gemini', description: 'e.g. openai, gemini' },
+      { key: 'default_model', label: 'Default Model', type: 'text', defaultValue: 'veo-2.0-generate-001', description: 'e.g. gpt-4o, gemini-1.5-pro' },
     ],
   },
 

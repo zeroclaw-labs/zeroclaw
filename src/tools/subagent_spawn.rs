@@ -359,6 +359,7 @@ impl Tool for SubAgentSpawnTool {
                     &full_prompt,
                     &parent_tools,
                     &multimodal_config,
+                    agent_config.max_iterations,
                 )
                 .await
             } else {
@@ -517,6 +518,7 @@ async fn run_agentic_background(
     full_prompt: &str,
     parent_tools: &[Arc<dyn Tool>],
     multimodal_config: &crate::config::MultimodalConfig,
+    max_tool_iterations: usize,
 ) -> anyhow::Result<ToolResult> {
     if agent_config.allowed_tools.is_empty() {
         return Ok(ToolResult {
@@ -580,7 +582,7 @@ async fn run_agentic_background(
             None,
             "subagent_spawn",
             multimodal_config,
-            agent_config.max_iterations,
+            max_tool_iterations,
             None,
             None,
             None,

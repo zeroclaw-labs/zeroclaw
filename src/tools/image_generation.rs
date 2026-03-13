@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use super::traits::{Tool, ToolResult};
-use crate::config::schema::MultimodalGenerationConfig;
+use crate::config::schema::MultimodalImageConfig;
 use crate::providers::resolve_provider_credential;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -86,14 +86,17 @@ pub struct ImageData {
 
 /// Image Generation Tool
 pub struct ImageGenerationTool {
-    config: MultimodalGenerationConfig,
+    config: MultimodalImageConfig,
     workspace_dir: PathBuf,
 }
 
 impl ImageGenerationTool {
     /// Create a new image generation tool instance
-    pub fn new(config: MultimodalGenerationConfig, workspace_dir: PathBuf) -> Self {
-        Self { config, workspace_dir }
+    pub fn new(config: MultimodalImageConfig, workspace_dir: PathBuf) -> Self {
+        Self {
+            config,
+            workspace_dir,
+        }
     }
 
     /// Generate images using the configured or specified provider
@@ -105,13 +108,13 @@ impl ImageGenerationTool {
         let provider_name = params
             .provider
             .as_deref()
-            .or(self.config.default_image_provider.as_deref())
+            .or(self.config.default_provider.as_deref())
             .unwrap_or("openai");
 
         let model = params
             .model
             .as_deref()
-            .or(self.config.default_image_model.as_deref())
+            .or(self.config.default_model.as_deref())
             .unwrap_or("gemini-2.5-flash-image");
 
         // For Gemini with image editing, we need to handle multipart upload
@@ -292,7 +295,7 @@ impl ImageGenerationTool {
         let size = params
             .size
             .as_deref()
-            .or(self.config.default_image_size.as_deref())
+            .or(self.config.default_size.as_deref())
             .unwrap_or("1024x1024");
 
         let quality = params.quality.as_deref().unwrap_or("standard");
@@ -615,7 +618,10 @@ impl Tool for ImageGenerationTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("Image generation is disabled. Enable it in config.toml: [multimodal.generation]".to_string()),
+                error: Some(
+                    "Image generation is disabled. Enable it in config.toml: [multimodal.image]"
+                        .to_string(),
+                ),
             });
         }
 
@@ -696,7 +702,7 @@ mod tests {
 
     #[test]
     fn test_size_to_aspect_ratio() {
-        let tool = ImageGenerationTool::new(MultimodalGenerationConfig::default(), std::env::temp_dir());
+        let tool = ImageGenerationTool::new(MultimodalImageConfig::default(), std::env::temp_dir());
         
         assert_eq!(tool.size_to_aspect_ratio("1024x1024"), "1:1");
         assert_eq!(tool.size_to_aspect_ratio("1792x1024"), "16:9");

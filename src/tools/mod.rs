@@ -615,17 +615,21 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
 
-    // Multimedia generation tools
-    if root_config.multimodal.generation.enabled {
+    // Multimedia tools
+    if root_config.multimodal.image.enabled {
         tool_arcs.push(Arc::new(ImageGenerationTool::new(
-            root_config.multimodal.generation.clone(),
+            root_config.multimodal.image.clone(),
             workspace_dir.to_path_buf(),
         )));
+    }
+    if root_config.multimodal.audio.enabled {
         tool_arcs.push(Arc::new(SpeechSynthesisTool::new(
-            root_config.multimodal.generation.clone(),
+            root_config.multimodal.audio.clone(),
         )));
+    }
+    if root_config.multimodal.video.enabled {
         tool_arcs.push(Arc::new(VideoAnalysisTool::new(
-            root_config.multimodal.generation.clone(),
+            root_config.multimodal.video.clone(),
         )));
     }
 
