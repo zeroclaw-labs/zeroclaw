@@ -3364,7 +3364,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    let tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let mut built_tools = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -3378,7 +3378,44 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    ));
+    );
+
+    // Wire MCP tools into the registry before freezing — non-fatal.
+    if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        tracing::info!(
+            "Initializing MCP client — {} server(s) configured",
+            config.mcp.servers.len()
+        );
+        match crate::tools::mcp_client::McpRegistry::connect_all(&config.mcp.servers).await {
+            Ok(registry) => {
+                let registry = std::sync::Arc::new(registry);
+                let names = registry.tool_names();
+                let mut registered = 0usize;
+                for name in names {
+                    if let Some(def) = registry.get_tool_def(&name).await {
+                        let wrapper = crate::tools::mcp_tool::McpToolWrapper::new(
+                            name,
+                            def,
+                            std::sync::Arc::clone(&registry),
+                        );
+                        built_tools.push(Box::new(wrapper));
+                        registered += 1;
+                    }
+                }
+                tracing::info!(
+                    "MCP: {} tool(s) registered from {} server(s)",
+                    registered,
+                    registry.server_count()
+                );
+            }
+            Err(e) => {
+                // Non-fatal — daemon continues with the tools registered above.
+                tracing::error!("MCP registry failed to initialize: {e:#}");
+            }
+        }
+    }
+
+    let tools_registry = Arc::new(built_tools);
 
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
 
