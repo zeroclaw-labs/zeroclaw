@@ -393,6 +393,16 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
+                            // Rate-limited with other providers available — skip immediately
+                            if rate_limited && self.providers.len() > 1 {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    "Rate limited, skipping to next provider"
+                                );
+                                break;
+                            }
+
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
@@ -508,6 +518,16 @@ impl Provider for ReliableProvider {
                                     );
                                 }
 
+                                break;
+                            }
+
+                            // Rate-limited with other providers available — skip immediately
+                            if rate_limited && self.providers.len() > 1 {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    "Rate limited, skipping to next provider"
+                                );
                                 break;
                             }
 
@@ -635,6 +655,16 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
+                            // Rate-limited with other providers available — skip immediately
+                            if rate_limited && self.providers.len() > 1 {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    "Rate limited, skipping to next provider"
+                                );
+                                break;
+                            }
+
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
@@ -743,6 +773,16 @@ impl Provider for ReliableProvider {
                                     );
                                 }
 
+                                break;
+                            }
+
+                            // Rate-limited with other providers available — skip immediately
+                            if rate_limited && self.providers.len() > 1 {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    "Rate limited, skipping to next provider"
+                                );
                                 break;
                             }
 
