@@ -331,6 +331,10 @@ pub struct Config {
     /// Knowledge graph configuration (`[knowledge]`).
     #[serde(default)]
     pub knowledge: KnowledgeConfig,
+
+    /// LinkedIn integration configuration (`[linkedin]`).
+    #[serde(default)]
+    pub linkedin: LinkedInConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -2221,6 +2225,19 @@ impl Default for KnowledgeConfig {
             cross_workspace_search: false,
         }
     }
+}
+
+// ── LinkedIn ────────────────────────────────────────────────────
+
+/// LinkedIn integration configuration (`[linkedin]` section).
+///
+/// When enabled, the `linkedin` tool is registered in the agent tool surface.
+/// Requires `LINKEDIN_*` credentials in the workspace `.env` file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct LinkedInConfig {
+    /// Enable the LinkedIn tool
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 // ── Proxy ───────────────────────────────────────────────────────
@@ -5584,6 +5601,7 @@ impl Default for Config {
             notion: NotionConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
+            linkedin: LinkedInConfig::default(),
         }
     }
 }
@@ -8007,6 +8025,7 @@ default_temperature = 0.7
             notion: NotionConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
+            linkedin: LinkedInConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -8312,6 +8331,7 @@ tool_dispatcher = "xml"
             notion: NotionConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
+            linkedin: LinkedInConfig::default(),
         };
 
         config.save().await.unwrap();

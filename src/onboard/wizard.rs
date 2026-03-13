@@ -191,6 +191,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         notion: crate::config::NotionConfig::default(),
         node_transport: crate::config::NodeTransportConfig::default(),
         knowledge: crate::config::KnowledgeConfig::default(),
+        linkedin: crate::config::LinkedInConfig::default(),
     };
 
     println!(
@@ -563,6 +564,7 @@ async fn run_quick_setup_with_home(
         notion: crate::config::NotionConfig::default(),
         node_transport: crate::config::NodeTransportConfig::default(),
         knowledge: crate::config::KnowledgeConfig::default(),
+        linkedin: crate::config::LinkedInConfig::default(),
     };
 
     config.save().await?;
