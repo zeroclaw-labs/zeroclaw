@@ -1692,11 +1692,15 @@ async fn process_channel_message(
         msg
     };
 
-    let target_channel = ctx.channels_by_name.get(&msg.channel)
+    let target_channel = ctx
+        .channels_by_name
+        .get(&msg.channel)
         .or_else(|| {
             // Multi-room channels use "name:qualifier" format (e.g. "matrix:!roomId");
             // fall back to base channel name for routing.
-            msg.channel.split_once(':').and_then(|(base, _)| ctx.channels_by_name.get(base))
+            msg.channel
+                .split_once(':')
+                .and_then(|(base, _)| ctx.channels_by_name.get(base))
         })
         .cloned();
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
