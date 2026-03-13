@@ -386,15 +386,16 @@ pub(crate) async fn deliver_announcement(
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("matrix channel not configured"))?;
                 let room_id = resolve_matrix_delivery_room(&mx.room_id, target);
-                let channel = MatrixChannel::new(
+                let channel = MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
                     mx.homeserver.clone(),
                     mx.access_token.clone(),
-                    room_id.clone(),
+                    room_id,
                     mx.allowed_users.clone(),
+                    mx.user_id.clone(),
+                    mx.device_id.clone(),
+                    config.config_path.parent().map(|path| path.to_path_buf()),
                 );
-                channel
-                    .send(&SendMessage::new(output, room_id))
-                    .await?;
+                channel.send(&SendMessage::new(output, target)).await?;
             }
             #[cfg(not(feature = "channel-matrix"))]
             {
