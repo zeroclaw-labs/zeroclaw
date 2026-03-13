@@ -680,6 +680,9 @@ pub struct ProviderRuntimeOptions {
     /// HTTP request timeout in seconds for LLM provider API calls.
     /// `None` uses the provider's built-in default (120s for compatible providers).
     pub provider_timeout_secs: Option<u64>,
+    /// Extra HTTP headers to include in provider API requests.
+    /// These are merged from the config file and `ZEROCLAW_EXTRA_HEADERS` env var.
+    pub extra_headers: std::collections::HashMap<String, String>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -691,6 +694,7 @@ impl Default for ProviderRuntimeOptions {
             secrets_encrypt: true,
             reasoning_enabled: None,
             provider_timeout_secs: None,
+            extra_headers: std::collections::HashMap::new(),
         }
     }
 }
@@ -997,15 +1001,20 @@ fn create_provider_with_url_and_options(
     api_url: Option<&str>,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    // Closure to optionally apply the configured provider timeout to
-    // OpenAI-compatible providers before boxing them as trait objects.
+    // Closure to optionally apply the configured provider timeout and extra
+    // headers to OpenAI-compatible providers before boxing them as trait objects.
     let compat = {
         let timeout = options.provider_timeout_secs;
+        let extra_headers = options.extra_headers.clone();
         move |p: OpenAiCompatibleProvider| -> Box<dyn Provider> {
-            match timeout {
-                Some(t) => Box::new(p.with_timeout_secs(t)),
-                None => Box::new(p),
+            let mut p = p;
+            if let Some(t) = timeout {
+                p = p.with_timeout_secs(t);
             }
+            if !extra_headers.is_empty() {
+                p = p.with_extra_headers(extra_headers.clone());
+            }
+            Box::new(p)
         }
     };
 
@@ -3068,5 +3077,23 @@ mod tests {
         // Keys without a recognisable prefix should never flag a mismatch.
         assert_eq!(check_api_key_prefix("openai", "my-custom-key-123"), None);
         assert_eq!(check_api_key_prefix("anthropic", "some-random-key"), None);
+    }
+
+    #[test]
+    fn provider_runtime_options_default_has_empty_extra_headers() {
+        let options = ProviderRuntimeOptions::default();
+        assert!(options.extra_headers.is_empty());
+    }
+
+    #[test]
+    fn provider_runtime_options_extra_headers_passed_through() {
+        let mut extra_headers = std::collections::HashMap::new();
+        extra_headers.insert("X-Title".to_string(), "zeroclaw".to_string());
+        let options = ProviderRuntimeOptions {
+            extra_headers,
+            ..ProviderRuntimeOptions::default()
+        };
+        assert_eq!(options.extra_headers.len(), 1);
+        assert_eq!(options.extra_headers.get("X-Title").unwrap(), "zeroclaw");
     }
 }
