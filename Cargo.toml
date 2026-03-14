@@ -34,6 +34,7 @@ include = [
 ]
 
 [dependencies]
+google-cloud-auth = "1.6.0"
 # CLI - minimal and fast
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
@@ -171,6 +172,8 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = ["
 
 # Serial port for peripheral communication (STM32, etc.)
 tokio-serial = { version = "5", default-features = false, optional = true }
+google-cloud-aiplatform-v1 = { version = "1.7.0", features = ["prediction-service"] }
+google-cloud-wkt = "1.2.1"
 
 # USB device enumeration (hardware discovery) — only on platforms nusb supports
 # (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.

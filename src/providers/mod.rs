@@ -30,6 +30,7 @@ pub mod reliable;
 pub mod router;
 pub mod telnyx;
 pub mod traits;
+pub mod vertex;
 
 #[allow(unused_imports)]
 pub use traits::{
@@ -686,6 +687,9 @@ pub struct ProviderRuntimeOptions {
     /// Custom API path suffix for OpenAI-compatible providers
     /// (e.g. "/v2/generate" instead of the default "/chat/completions").
     pub api_path: Option<String>,
+    pub vertex_project: Option<String>,
+    pub vertex_location: Option<String>,
+    pub vertex_key_path: Option<String>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -699,6 +703,9 @@ impl Default for ProviderRuntimeOptions {
             provider_timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
+            vertex_project: None,
+            vertex_location: None,
+            vertex_key_path: None,
         }
     }
 }
@@ -863,6 +870,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "osaurus" => vec!["OSAURUS_API_KEY"],
         "telnyx" => vec!["TELNYX_API_KEY"],
         "azure_openai" | "azure-openai" | "azure" => vec!["AZURE_OPENAI_API_KEY"],
+        "vertex" | "vertex-ai" => vec!["VERTEX_PROJECT_ID", "GOOGLE_CLOUD_PROJECT"],
         _ => vec![],
     };
 
@@ -1104,6 +1112,13 @@ fn create_provider_with_url_and_options(
                 auth_service,
                 options.auth_profile_override.clone(),
             )))
+        }
+        "vertex" | "vertex-ai" => {
+             // api_url can be used to override location if needed, e.g. "us-west1"
+            let location = api_url.map(|s| s.to_string()).or(options.vertex_location.clone());
+            let project = options.vertex_project.clone();
+            let key_path = options.vertex_key_path.clone();
+            Ok(Box::new(vertex::VertexProvider::new(project, location, key, key_path)?))
         }
         "telnyx" => Ok(Box::new(telnyx::TelnyxProvider::new(key))),
 
@@ -1726,6 +1741,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "gemini",
             display_name: "Google Gemini",
             aliases: &["google", "google-gemini"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "vertex",
+            display_name: "Vertex AI (Google Cloud)",
+            aliases: &["vertex-ai"],
             local: false,
         },
         // ── OpenAI-compatible providers ──────────────────────
