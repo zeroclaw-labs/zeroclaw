@@ -1328,6 +1328,30 @@ fn create_provider_with_url_and_options(
         "astrai" => Ok(compat(OpenAiCompatibleProvider::new(
             "Astrai", "https://as-trai.com/v1", key, AuthStyle::Bearer,
         ))),
+        "siliconflow" | "silicon-flow" => Ok(compat(OpenAiCompatibleProvider::new(
+            "SiliconFlow",
+            "https://api.siliconflow.cn/v1",
+            key,
+            AuthStyle::Bearer,
+        ))),
+        "aihubmix" => Ok(compat(OpenAiCompatibleProvider::new(
+            "AiHubMix",
+            "https://aihubmix.com/v1",
+            key,
+            AuthStyle::Bearer,
+        ))),
+        "litellm" | "lite-llm" => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("http://localhost:4000/v1");
+            Ok(compat(OpenAiCompatibleProvider::new(
+                "LiteLLM",
+                base_url,
+                key,
+                AuthStyle::Bearer,
+            )))
+        }
 
         // ── Cloud AI endpoints ───────────────────────────────
         "ovhcloud" | "ovh" => Ok(Box::new(openai::OpenAiProvider::with_base_url(
@@ -1830,6 +1854,24 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "nvidia",
             display_name: "NVIDIA NIM",
             aliases: &["nvidia-nim", "build.nvidia.com"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "siliconflow",
+            display_name: "SiliconFlow",
+            aliases: &["silicon-flow"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "aihubmix",
+            display_name: "AiHubMix",
+            aliases: &[],
+            local: false,
+        },
+        ProviderInfo {
+            name: "litellm",
+            display_name: "LiteLLM",
+            aliases: &["lite-llm"],
             local: false,
         },
         ProviderInfo {
