@@ -319,7 +319,7 @@ impl AnthropicProvider {
                             role: "assistant".to_string(),
                             content: blocks,
                         });
-                    } else {
+                    } else if !msg.content.trim().is_empty() {
                         native_messages.push(NativeMessage {
                             role: "assistant".to_string(),
                             content: vec![NativeContentOut::Text {
@@ -332,7 +332,7 @@ impl AnthropicProvider {
                 "tool" => {
                     let tool_msg = if let Some(tr) = Self::parse_tool_result_message(&msg.content) {
                         tr
-                    } else {
+                    } else if !msg.content.trim().is_empty() {
                         NativeMessage {
                             role: "user".to_string(),
                             content: vec![NativeContentOut::Text {
@@ -340,6 +340,8 @@ impl AnthropicProvider {
                                 cache_control: None,
                             }],
                         }
+                    } else {
+                        continue;
                     };
                     // Tool results map to role "user"; merge consecutive ones
                     // into a single message so Anthropic doesn't reject the
@@ -409,16 +411,18 @@ impl AnthropicProvider {
                         });
                     }
 
-                    // Add text content block
-                    let display_text = if text.is_empty() && !image_refs.is_empty() {
-                        "[image]".to_string()
-                    } else {
-                        text
-                    };
-                    content_blocks.push(NativeContentOut::Text {
-                        text: display_text,
-                        cache_control: None,
-                    });
+                    // Add text content block (skip empty text when images are present)
+                    if text.is_empty() && !image_refs.is_empty() {
+                        content_blocks.push(NativeContentOut::Text {
+                            text: "[image]".to_string(),
+                            cache_control: None,
+                        });
+                    } else if !text.trim().is_empty() {
+                        content_blocks.push(NativeContentOut::Text {
+                            text,
+                            cache_control: None,
+                        });
+                    }
 
                     // Merge into previous user message if present (e.g.
                     // when a user message immediately follows tool results
