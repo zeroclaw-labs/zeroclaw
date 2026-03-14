@@ -94,49 +94,106 @@ pub struct SecurityPolicy {
     pub tracker: ActionTracker,
 }
 
+/// Default allowed commands for Unix platforms.
+#[cfg(not(target_os = "windows"))]
+fn default_allowed_commands() -> Vec<String> {
+    vec![
+        "git".into(),
+        "npm".into(),
+        "cargo".into(),
+        "ls".into(),
+        "cat".into(),
+        "grep".into(),
+        "find".into(),
+        "echo".into(),
+        "pwd".into(),
+        "wc".into(),
+        "head".into(),
+        "tail".into(),
+        "date".into(),
+    ]
+}
+
+/// Default allowed commands for Windows platforms.
+///
+/// Includes both native Windows commands and their Unix equivalents
+/// (available via Git for Windows, WSL, etc.).
+#[cfg(target_os = "windows")]
+fn default_allowed_commands() -> Vec<String> {
+    vec![
+        // Cross-platform tools
+        "git".into(),
+        "npm".into(),
+        "cargo".into(),
+        "echo".into(),
+        // Windows-native equivalents
+        "dir".into(),
+        "type".into(),
+        "findstr".into(),
+        "where".into(),
+        "more".into(),
+        "date".into(),
+        // Unix commands (available via Git for Windows / MSYS2)
+        "ls".into(),
+        "cat".into(),
+        "grep".into(),
+        "find".into(),
+        "pwd".into(),
+        "wc".into(),
+        "head".into(),
+        "tail".into(),
+    ]
+}
+
+/// Default forbidden paths for Unix platforms.
+#[cfg(not(target_os = "windows"))]
+fn default_forbidden_paths() -> Vec<String> {
+    vec![
+        "/etc".into(),
+        "/root".into(),
+        "/home".into(),
+        "/usr".into(),
+        "/bin".into(),
+        "/sbin".into(),
+        "/lib".into(),
+        "/opt".into(),
+        "/boot".into(),
+        "/dev".into(),
+        "/proc".into(),
+        "/sys".into(),
+        "/var".into(),
+        "/tmp".into(),
+        "~/.ssh".into(),
+        "~/.gnupg".into(),
+        "~/.aws".into(),
+        "~/.config".into(),
+    ]
+}
+
+/// Default forbidden paths for Windows platforms.
+#[cfg(target_os = "windows")]
+fn default_forbidden_paths() -> Vec<String> {
+    vec![
+        "C:\\Windows".into(),
+        "C:\\Windows\\System32".into(),
+        "C:\\Program Files".into(),
+        "C:\\Program Files (x86)".into(),
+        "C:\\ProgramData".into(),
+        "~/.ssh".into(),
+        "~/.gnupg".into(),
+        "~/.aws".into(),
+        "~/.config".into(),
+    ]
+}
+
 impl Default for SecurityPolicy {
     fn default() -> Self {
         Self {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: PathBuf::from("."),
             workspace_only: true,
-            allowed_commands: vec![
-                "git".into(),
-                "npm".into(),
-                "cargo".into(),
-                "ls".into(),
-                "cat".into(),
-                "grep".into(),
-                "find".into(),
-                "echo".into(),
-                "pwd".into(),
-                "wc".into(),
-                "head".into(),
-                "tail".into(),
-                "date".into(),
-            ],
-            forbidden_paths: vec![
-                // System directories (blocked even when workspace_only=false)
-                "/etc".into(),
-                "/root".into(),
-                "/home".into(),
-                "/usr".into(),
-                "/bin".into(),
-                "/sbin".into(),
-                "/lib".into(),
-                "/opt".into(),
-                "/boot".into(),
-                "/dev".into(),
-                "/proc".into(),
-                "/sys".into(),
-                "/var".into(),
-                "/tmp".into(),
-                // Sensitive dotfiles
-                "~/.ssh".into(),
-                "~/.gnupg".into(),
-                "~/.aws".into(),
-                "~/.config".into(),
-            ],
+            allowed_commands: default_allowed_commands(),
+            forbidden_paths: default_forbidden_paths(),
             allowed_roots: Vec::new(),
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
@@ -149,7 +206,16 @@ impl Default for SecurityPolicy {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+    }
 }
 
 fn expand_user_path(path: &str) -> PathBuf {
@@ -489,6 +555,12 @@ fn looks_like_path(candidate: &str) -> bool {
         || candidate == "."
         || candidate == ".."
         || candidate.contains('/')
+        // Windows path patterns: drive letters (C:\, D:\) and UNC paths (\\server\share)
+        || (cfg!(target_os = "windows")
+            && (candidate
+                .get(1..3)
+                .is_some_and(|s| s == ":\\" || s == ":/")
+                || candidate.starts_with("\\\\")))
 }
 
 fn attached_short_option_value(token: &str) -> Option<&str> {
@@ -522,6 +594,27 @@ fn redirection_target(token: &str) -> Option<&str> {
     }
 }
 
+/// Extract the basename from a command path, handling both Unix (`/`) and
+/// Windows (`\`) separators so that `C:\Git\bin\git.exe` resolves to `git.exe`.
+fn command_basename(raw: &str) -> &str {
+    let after_fwd = raw.rsplit('/').next().unwrap_or(raw);
+    after_fwd.rsplit('\\').next().unwrap_or(after_fwd)
+}
+
+/// Strip common Windows executable suffixes (.exe, .cmd, .bat) for uniform
+/// matching against allowlists and risk tables. On non-Windows platforms this
+/// is a no-op that returns the input unchanged.
+fn strip_windows_exe_suffix(name: &str) -> &str {
+    if cfg!(target_os = "windows") {
+        name.strip_suffix(".exe")
+            .or_else(|| name.strip_suffix(".cmd"))
+            .or_else(|| name.strip_suffix(".bat"))
+            .unwrap_or(name)
+    } else {
+        name
+    }
+}
+
 fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &str) -> bool {
     let allowed = strip_wrapping_quotes(allowed).trim();
     if allowed.is_empty() {
@@ -542,7 +635,27 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
     }
 
     // Command-name entries continue to match by basename.
-    allowed == executable_base
+    // On Windows, also match when the executable has a .exe/.cmd/.bat suffix
+    // that the allowlist entry omits (e.g., allowlist "git" matches "git.exe").
+    if allowed == executable_base {
+        return true;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let base_lower = executable_base.to_ascii_lowercase();
+        let allowed_lower = allowed.to_ascii_lowercase();
+        for ext in &[".exe", ".cmd", ".bat"] {
+            if base_lower == format!("{allowed_lower}{ext}") {
+                return true;
+            }
+            if allowed_lower == format!("{base_lower}{ext}") {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 impl SecurityPolicy {
@@ -562,18 +675,15 @@ impl SecurityPolicy {
                 continue;
             };
 
-            let base = base_raw
-                .rsplit('/')
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
+            let base_owned = command_basename(base_raw).to_ascii_lowercase();
+            let base = strip_windows_exe_suffix(&base_owned);
 
             let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
             let joined_segment = cmd_part.to_ascii_lowercase();
 
-            // High-risk commands
+            // High-risk commands (Unix and Windows)
             if matches!(
-                base.as_str(),
+                base,
                 "rm" | "mkfs"
                     | "dd"
                     | "shutdown"
@@ -602,6 +712,20 @@ impl SecurityPolicy {
                     | "ssh"
                     | "ftp"
                     | "telnet"
+                    // Windows-specific high-risk commands
+                    | "del"
+                    | "rmdir"
+                    | "format"
+                    | "reg"
+                    | "net"
+                    | "runas"
+                    | "icacls"
+                    | "takeown"
+                    | "powershell"
+                    | "pwsh"
+                    | "wmic"
+                    | "sc"
+                    | "netsh"
             ) {
                 return CommandRiskLevel::High;
             }
@@ -609,12 +733,16 @@ impl SecurityPolicy {
             if joined_segment.contains("rm -rf /")
                 || joined_segment.contains("rm -fr /")
                 || joined_segment.contains(":(){:|:&};:")
+                // Windows destructive patterns
+                || joined_segment.contains("del /s /q")
+                || joined_segment.contains("rmdir /s /q")
+                || joined_segment.contains("format c:")
             {
                 return CommandRiskLevel::High;
             }
 
             // Medium-risk commands (state-changing, but not inherently destructive)
-            let medium = match base.as_str() {
+            let medium = match base {
                 "git" => args.first().is_some_and(|verb| {
                     matches!(
                         verb.as_str(),
@@ -644,7 +772,9 @@ impl SecurityPolicy {
                         "add" | "remove" | "install" | "clean" | "publish"
                     )
                 }),
-                "touch" | "mkdir" | "mv" | "cp" | "ln" => true,
+                "touch" | "mkdir" | "mv" | "cp" | "ln"
+                // Windows medium-risk equivalents
+                | "copy" | "xcopy" | "robocopy" | "move" | "ren" | "rename" | "mklink" => true,
                 _ => false,
             };
 
@@ -766,7 +896,8 @@ impl SecurityPolicy {
 
             let mut words = cmd_part.split_whitespace();
             let executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-            let base_cmd = executable.rsplit('/').next().unwrap_or("");
+            let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
+            let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
 
             if base_cmd.is_empty() {
                 continue;
@@ -922,9 +1053,28 @@ impl SecurityPolicy {
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
 
-        // Block absolute paths when workspace_only is set
-        if self.workspace_only && expanded_path.is_absolute() {
-            return false;
+        // When workspace_only is set and the path is absolute, only allow it
+        // if it falls within the workspace directory or an explicit allowed
+        // root.  The workspace/allowed-root check runs BEFORE the forbidden
+        // prefix list so that workspace paths under broad defaults like
+        // "/home" are not rejected.  This mirrors the priority order in
+        // `is_resolved_path_allowed`.  See #2880.
+        if expanded_path.is_absolute() {
+            let in_workspace = expanded_path.starts_with(&self.workspace_dir);
+            let in_allowed_root = self
+                .allowed_roots
+                .iter()
+                .any(|root| expanded_path.starts_with(root));
+
+            if in_workspace || in_allowed_root {
+                return true;
+            }
+
+            // Absolute path outside workspace/allowed roots — block when
+            // workspace_only, or fall through to forbidden-prefix check.
+            if self.workspace_only {
+                return false;
+            }
         }
 
         // Block forbidden paths using path-component-aware matching
@@ -1040,6 +1190,35 @@ impl SecurityPolicy {
     /// Check if the rate limit would be exceeded without recording.
     pub fn is_rate_limited(&self) -> bool {
         self.tracker.count() >= self.max_actions_per_hour as usize
+    }
+
+    /// Resolve a user-provided path for tool use.
+    ///
+    /// Expands `~` prefixes and resolves relative paths against the workspace
+    /// directory. This should be called **after** `is_path_allowed` to obtain
+    /// the filesystem path that the tool actually operates on.
+    pub fn resolve_tool_path(&self, path: &str) -> PathBuf {
+        let expanded = expand_user_path(path);
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            self.workspace_dir.join(expanded)
+        }
+    }
+
+    /// Check whether the given raw path (before canonicalization) falls under
+    /// an `allowed_roots` entry. Tilde expansion is applied to the path
+    /// before comparison. This is useful for tool-level pre-checks that want
+    /// to allow absolute paths that are explicitly permitted by policy.
+    pub fn is_under_allowed_root(&self, path: &str) -> bool {
+        let expanded = expand_user_path(path);
+        if !expanded.is_absolute() {
+            return false;
+        }
+        self.allowed_roots.iter().any(|root| {
+            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            expanded.starts_with(&canonical) || expanded.starts_with(root)
+        })
     }
 
     /// Build from config sections
@@ -1382,6 +1561,37 @@ mod tests {
         assert!(!p.is_path_allowed("/etc/passwd"));
         assert!(!p.is_path_allowed("/root/.ssh/id_rsa"));
         assert!(!p.is_path_allowed("/tmp/file.txt"));
+    }
+
+    #[test]
+    fn absolute_path_inside_workspace_allowed_when_workspace_only() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/home/user/.zeroclaw/workspace"),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        // Absolute path inside workspace should be allowed
+        assert!(p.is_path_allowed("/home/user/.zeroclaw/workspace/images/example.png"));
+        assert!(p.is_path_allowed("/home/user/.zeroclaw/workspace/file.txt"));
+        // Absolute path outside workspace should still be blocked
+        assert!(!p.is_path_allowed("/home/user/other/file.txt"));
+        assert!(!p.is_path_allowed("/tmp/file.txt"));
+    }
+
+    #[test]
+    fn absolute_path_in_allowed_root_permitted_when_workspace_only() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/home/user/.zeroclaw/workspace"),
+            workspace_only: true,
+            allowed_roots: vec![PathBuf::from("/home/user/.zeroclaw/shared")],
+            ..SecurityPolicy::default()
+        };
+        // Path in allowed root should be permitted
+        assert!(p.is_path_allowed("/home/user/.zeroclaw/shared/data.txt"));
+        // Path in workspace should still be permitted
+        assert!(p.is_path_allowed("/home/user/.zeroclaw/workspace/file.txt"));
+        // Path outside both should still be blocked
+        assert!(!p.is_path_allowed("/home/user/other/file.txt"));
     }
 
     #[test]
@@ -2122,7 +2332,7 @@ mod tests {
     }
 
     #[test]
-    fn checklist_workspace_only_blocks_all_absolute() {
+    fn checklist_workspace_only_blocks_absolute_outside_workspace() {
         let p = SecurityPolicy {
             workspace_only: true,
             ..SecurityPolicy::default()
@@ -2334,5 +2544,63 @@ mod tests {
             !policy.is_path_allowed("subdir%2f..%2f..%2fetc"),
             "URL-encoded parent dir traversal must be blocked"
         );
+    }
+
+    #[test]
+    fn resolve_tool_path_expands_tilde() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/workspace"),
+            ..SecurityPolicy::default()
+        };
+        let resolved = p.resolve_tool_path("~/Documents/file.txt");
+        // Should expand ~ to home dir, not join with workspace
+        assert!(resolved.is_absolute());
+        assert!(!resolved.starts_with("/workspace"));
+        assert!(resolved.to_string_lossy().ends_with("Documents/file.txt"));
+    }
+
+    #[test]
+    fn resolve_tool_path_keeps_absolute() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/workspace"),
+            ..SecurityPolicy::default()
+        };
+        let resolved = p.resolve_tool_path("/some/absolute/path");
+        assert_eq!(resolved, PathBuf::from("/some/absolute/path"));
+    }
+
+    #[test]
+    fn resolve_tool_path_joins_relative() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/workspace"),
+            ..SecurityPolicy::default()
+        };
+        let resolved = p.resolve_tool_path("relative/path.txt");
+        assert_eq!(resolved, PathBuf::from("/workspace/relative/path.txt"));
+    }
+
+    #[test]
+    fn is_under_allowed_root_matches_allowed_roots() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/workspace"),
+            workspace_only: true,
+            allowed_roots: vec![PathBuf::from("/projects"), PathBuf::from("/data")],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_under_allowed_root("/projects/myapp/src/main.rs"));
+        assert!(p.is_under_allowed_root("/data/file.csv"));
+        assert!(!p.is_under_allowed_root("/etc/passwd"));
+        assert!(!p.is_under_allowed_root("relative/path"));
+    }
+
+    #[test]
+    fn is_under_allowed_root_returns_false_for_empty_roots() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/workspace"),
+            workspace_only: true,
+            allowed_roots: vec![],
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_under_allowed_root("/any/path"));
     }
 }

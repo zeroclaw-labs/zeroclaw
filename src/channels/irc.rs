@@ -1,6 +1,6 @@
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicU64, Ordering};
+use portable_atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, Mutex};

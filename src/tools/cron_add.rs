@@ -56,7 +56,7 @@ impl Tool for CronAddTool {
     fn description(&self) -> &str {
         "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
          Use job_type='agent' with a prompt to run the AI agent on schedule. \
-         To deliver output to a channel (Discord, Telegram, Slack, Mattermost), set \
+         To deliver output to a channel (Discord, Telegram, Slack, Mattermost, Matrix), set \
          delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
          This is the preferred tool for sending scheduled/delayed messages to users via channels."
     }
@@ -80,7 +80,7 @@ impl Tool for CronAddTool {
                     "description": "Delivery config to send job output to a channel. Example: {\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id>\"}",
                     "properties": {
                         "mode": { "type": "string", "enum": ["none", "announce"], "description": "Set to 'announce' to deliver output to a channel" },
-                        "channel": { "type": "string", "enum": ["telegram", "discord", "slack", "mattermost"], "description": "Channel type to deliver to" },
+                        "channel": { "type": "string", "enum": ["telegram", "discord", "slack", "mattermost", "matrix"], "description": "Channel type to deliver to" },
                         "to": { "type": "string", "description": "Target: Discord channel ID, Telegram chat ID, Slack channel, etc." },
                         "best_effort": { "type": "boolean", "description": "If true, delivery failure does not fail the job" }
                     }
@@ -184,7 +184,7 @@ impl Tool for CronAddTool {
                     return Ok(blocked);
                 }
 
-                cron::add_shell_job(&self.config, name, schedule, command)
+                cron::add_shell_job_with_approval(&self.config, name, schedule, command, approved)
             }
             JobType::Agent => {
                 let prompt = match args.get("prompt").and_then(serde_json::Value::as_str) {
@@ -481,5 +481,20 @@ mod tests {
             .error
             .unwrap_or_default()
             .contains("Missing 'prompt'"));
+    }
+
+    #[tokio::test]
+    async fn delivery_schema_includes_matrix_channel() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let values = tool.parameters_schema()["properties"]["delivery"]["properties"]["channel"]
+            ["enum"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+
+        assert!(values.iter().any(|value| value == "matrix"));
     }
 }

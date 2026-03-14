@@ -11,10 +11,33 @@ use std::time::Duration;
 const SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
+
 /// Environment variables safe to pass to shell commands.
 /// Only functional variables are included — never API keys or secrets.
+#[cfg(not(target_os = "windows"))]
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+];
+
+/// Environment variables safe to pass to shell commands on Windows.
+/// Includes Windows-specific variables needed for cmd.exe and program resolution.
+#[cfg(target_os = "windows")]
+const SAFE_ENV_VARS: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+    "TERM",
+    "LANG",
+    "USERNAME",
 ];
 
 /// Shell command execution tool with sandboxing
@@ -555,7 +578,7 @@ mod tests {
             tokio::fs::remove_file(std::env::temp_dir().join("zeroclaw_shell_approval_test")).await;
     }
 
-    // ── §5.2 Shell timeout enforcement tests ─────────────────
+    // ── shell timeout enforcement tests ─────────────────
 
     #[test]
     fn shell_timeout_constant_is_reasonable() {
@@ -570,7 +593,7 @@ mod tests {
         );
     }
 
-    // ── §5.3 Non-UTF8 binary output tests ────────────────────
+    // ── Non-UTF8 binary output tests ────────────────────
 
     #[test]
     fn shell_safe_env_vars_excludes_secrets() {
@@ -590,8 +613,8 @@ mod tests {
             "PATH must be in safe env vars"
         );
         assert!(
-            SAFE_ENV_VARS.contains(&"HOME"),
-            "HOME must be in safe env vars"
+            SAFE_ENV_VARS.contains(&"HOME") || SAFE_ENV_VARS.contains(&"USERPROFILE"),
+            "HOME or USERPROFILE must be in safe env vars"
         );
         assert!(
             SAFE_ENV_VARS.contains(&"TERM"),

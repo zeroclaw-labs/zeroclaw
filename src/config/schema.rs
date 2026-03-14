@@ -74,6 +74,10 @@ pub struct Config {
     pub api_key: Option<String>,
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
     pub api_url: Option<String>,
+    /// Custom API path suffix for OpenAI-compatible / custom providers
+    /// (e.g. "/v2/generate" instead of the default "/v1/chat/completions").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_path: Option<String>,
     /// Default provider ID or alias (e.g. `"openrouter"`, `"ollama"`, `"anthropic"`). Default: `"openrouter"`.
     #[serde(alias = "model_provider")]
     pub default_provider: Option<String>,
@@ -89,6 +93,24 @@ pub struct Config {
         deserialize_with = "deserialize_temperature"
     )]
     pub default_temperature: f64,
+
+    /// HTTP request timeout in seconds for LLM provider API calls. Default: `120`.
+    ///
+    /// Increase for slower backends (e.g., llama.cpp on constrained hardware)
+    /// that need more time processing large contexts.
+    #[serde(default = "default_provider_timeout_secs")]
+    pub provider_timeout_secs: u64,
+
+    /// Extra HTTP headers to include in LLM provider API requests.
+    ///
+    /// Some providers require specific headers (e.g., `User-Agent`, `HTTP-Referer`,
+    /// `X-Title`) for request routing or policy enforcement. Headers defined here
+    /// augment (and override) the program's default headers.
+    ///
+    /// Can also be set via `ZEROCLAW_EXTRA_HEADERS` environment variable using
+    /// the format `Key:Value,Key2:Value2`. Env var headers override config file headers.
+    #[serde(default)]
+    pub extra_headers: HashMap<String, String>,
 
     /// Observability backend configuration (`[observability]`).
     #[serde(default)]
@@ -225,6 +247,14 @@ pub struct Config {
     /// Text-to-Speech configuration (`[tts]`).
     #[serde(default)]
     pub tts: TtsConfig,
+
+    /// External MCP server connections (`[mcp]`).
+    #[serde(default, alias = "mcpServers")]
+    pub mcp: McpConfig,
+
+    /// Dynamic node discovery configuration (`[nodes]`).
+    #[serde(default)]
+    pub nodes: NodesConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -236,12 +266,25 @@ pub struct ModelProviderConfig {
     /// Optional base URL for OpenAI-compatible endpoints.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Optional custom API path suffix (e.g. "/v2/generate" instead of the
+    /// default "/v1/chat/completions"). Only used by OpenAI-compatible / custom providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_path: Option<String>,
     /// Provider protocol variant ("responses" or "chat_completions").
     #[serde(default)]
     pub wire_api: Option<String>,
     /// If true, load OpenAI auth material (OPENAI_API_KEY or ~/.codex/auth.json).
     #[serde(default)]
     pub requires_openai_auth: bool,
+    /// Azure OpenAI resource name (e.g. "my-resource" in https://my-resource.openai.azure.com).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_openai_resource: Option<String>,
+    /// Azure OpenAI deployment name (e.g. "gpt-4o").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_openai_deployment: Option<String>,
+    /// Azure OpenAI API version (defaults to "2024-08-01-preview").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_openai_api_version: Option<String>,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -284,6 +327,13 @@ const DEFAULT_TEMPERATURE: f64 = 0.7;
 
 fn default_temperature() -> f64 {
     DEFAULT_TEMPERATURE
+}
+
+/// Default provider HTTP request timeout: 120 seconds.
+const DEFAULT_PROVIDER_TIMEOUT_SECS: u64 = 120;
+
+fn default_provider_timeout_secs() -> u64 {
+    DEFAULT_PROVIDER_TIMEOUT_SECS
 }
 
 /// Validate that a temperature value is within the allowed range.
@@ -432,6 +482,113 @@ impl Default for TranscriptionConfig {
     }
 }
 
+// ── MCP ─────────────────────────────────────────────────────────
+
+/// Transport type for MCP server connections.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    /// Spawn a local process and communicate over stdin/stdout.
+    #[default]
+    Stdio,
+    /// Connect via HTTP POST.
+    Http,
+    /// Connect via HTTP + Server-Sent Events.
+    Sse,
+}
+
+/// Configuration for a single external MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct McpServerConfig {
+    /// Display name used as a tool prefix (`<server>__<tool>`).
+    pub name: String,
+    /// Transport type (default: stdio).
+    #[serde(default)]
+    pub transport: McpTransport,
+    /// URL for HTTP/SSE transports.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Executable to spawn for stdio transport.
+    #[serde(default)]
+    pub command: String,
+    /// Command arguments for stdio transport.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Optional environment variables for stdio transport.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Optional HTTP headers for HTTP/SSE transports.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Optional per-call timeout in seconds (hard capped in validation).
+    #[serde(default)]
+    pub tool_timeout_secs: Option<u64>,
+}
+
+/// External MCP client configuration (`[mcp]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct McpConfig {
+    /// Enable MCP tool loading.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Load MCP tool schemas on-demand via `tool_search` instead of eagerly
+    /// including them in the LLM context window. When `true` (the default),
+    /// only tool names are listed in the system prompt; the LLM must call
+    /// `tool_search` to fetch full schemas before invoking a deferred tool.
+    #[serde(default = "default_deferred_loading")]
+    pub deferred_loading: bool,
+    /// Configured MCP servers.
+    #[serde(default, alias = "mcpServers")]
+    pub servers: Vec<McpServerConfig>,
+}
+
+fn default_deferred_loading() -> bool {
+    true
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            deferred_loading: default_deferred_loading(),
+            servers: Vec::new(),
+        }
+    }
+}
+
+// ── Nodes (Dynamic Node Discovery) ───────────────────────────────
+
+/// Configuration for the dynamic node discovery system (`[nodes]`).
+///
+/// When enabled, external processes/devices can connect via WebSocket
+/// at `/ws/nodes` and advertise their capabilities at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NodesConfig {
+    /// Enable dynamic node discovery endpoint.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum number of concurrent node connections.
+    #[serde(default = "default_max_nodes")]
+    pub max_nodes: usize,
+    /// Optional bearer token for node authentication.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+fn default_max_nodes() -> usize {
+    16
+}
+
+impl Default for NodesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_nodes: default_max_nodes(),
+            auth_token: None,
+        }
+    }
+}
+
 // ── TTS (Text-to-Speech) ─────────────────────────────────────────
 
 fn default_tts_provider() -> String {
@@ -576,6 +733,51 @@ pub struct EdgeTtsConfig {
     pub binary_path: String,
 }
 
+/// Determines when a `ToolFilterGroup` is active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolFilterGroupMode {
+    /// Tools in this group are always included in every turn.
+    Always,
+    /// Tools in this group are included only when the user message contains
+    /// at least one of the configured `keywords` (case-insensitive substring match).
+    #[default]
+    Dynamic,
+}
+
+/// A named group of MCP tool patterns with an activation mode.
+///
+/// Each group lists glob patterns for MCP tool names (prefix `mcp_`) and an
+/// optional set of keywords that trigger inclusion in `dynamic` mode.
+/// Built-in (non-MCP) tools always pass through and are never affected by
+/// `tool_filter_groups`.
+///
+/// # Example
+/// ```toml
+/// [[agent.tool_filter_groups]]
+/// mode = "always"
+/// tools = ["mcp_filesystem_*"]
+/// keywords = []
+///
+/// [[agent.tool_filter_groups]]
+/// mode = "dynamic"
+/// tools = ["mcp_browser_*"]
+/// keywords = ["browse", "website", "url", "search"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ToolFilterGroup {
+    /// Activation mode: `"always"` or `"dynamic"`.
+    #[serde(default)]
+    pub mode: ToolFilterGroupMode,
+    /// Glob patterns matching MCP tool names (single `*` wildcard supported).
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Keywords that activate this group in `dynamic` mode (case-insensitive substring).
+    /// Ignored when `mode = "always"`.
+    #[serde(default)]
+    pub keywords: Vec<String>,
+}
+
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentConfig {
@@ -595,6 +797,16 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
+    #[serde(default)]
+    pub tool_call_dedup_exempt: Vec<String>,
+    /// Per-turn MCP tool schema filtering groups.
+    ///
+    /// When non-empty, only MCP tools matched by an active group are included in the
+    /// tool schema sent to the LLM for that turn. Built-in tools always pass through.
+    /// Default: `[]` (no filtering — all tools included).
+    #[serde(default)]
+    pub tool_filter_groups: Vec<ToolFilterGroup>,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -617,6 +829,8 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            tool_call_dedup_exempt: Vec::new(),
+            tool_filter_groups: Vec::new(),
         }
     }
 }
@@ -1234,7 +1448,7 @@ pub struct WebFetchConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Allowed domains for web fetch (exact or subdomain match; `["*"]` = all public hosts)
-    #[serde(default)]
+    #[serde(default = "default_web_fetch_allowed_domains")]
     pub allowed_domains: Vec<String>,
     /// Blocked domains (exact or subdomain match; always takes priority over allowed_domains)
     #[serde(default)]
@@ -1253,6 +1467,10 @@ fn default_web_fetch_max_response_size() -> usize {
 
 fn default_web_fetch_timeout_secs() -> u64 {
     30
+}
+
+fn default_web_fetch_allowed_domains() -> Vec<String> {
+    vec!["*".into()]
 }
 
 impl Default for WebFetchConfig {
@@ -1601,6 +1819,65 @@ fn service_selector_matches(selector: &str, service_key: &str) -> bool {
     }
 
     false
+}
+
+const MCP_MAX_TOOL_TIMEOUT_SECS: u64 = 600;
+
+fn validate_mcp_config(config: &McpConfig) -> Result<()> {
+    let mut seen_names = std::collections::HashSet::new();
+    for (i, server) in config.servers.iter().enumerate() {
+        let name = server.name.trim();
+        if name.is_empty() {
+            anyhow::bail!("mcp.servers[{i}].name must not be empty");
+        }
+        if !seen_names.insert(name.to_ascii_lowercase()) {
+            anyhow::bail!("mcp.servers contains duplicate name: {name}");
+        }
+
+        if let Some(timeout) = server.tool_timeout_secs {
+            if timeout == 0 {
+                anyhow::bail!("mcp.servers[{i}].tool_timeout_secs must be greater than 0");
+            }
+            if timeout > MCP_MAX_TOOL_TIMEOUT_SECS {
+                anyhow::bail!(
+                    "mcp.servers[{i}].tool_timeout_secs exceeds max {MCP_MAX_TOOL_TIMEOUT_SECS}"
+                );
+            }
+        }
+
+        match server.transport {
+            McpTransport::Stdio => {
+                if server.command.trim().is_empty() {
+                    anyhow::bail!(
+                        "mcp.servers[{i}] with transport=stdio requires non-empty command"
+                    );
+                }
+            }
+            McpTransport::Http | McpTransport::Sse => {
+                let url = server
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "mcp.servers[{i}] with transport={} requires url",
+                            match server.transport {
+                                McpTransport::Http => "http",
+                                McpTransport::Sse => "sse",
+                                McpTransport::Stdio => "stdio",
+                            }
+                        )
+                    })?;
+                let parsed = reqwest::Url::parse(url)
+                    .with_context(|| format!("mcp.servers[{i}].url is not a valid URL"))?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    anyhow::bail!("mcp.servers[{i}].url must use http/https");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
@@ -2042,7 +2319,7 @@ impl Default for MemoryConfig {
 /// Observability backend configuration (`[observability]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ObservabilityConfig {
-    /// "none" | "log" | "prometheus" | "otel"
+    /// "none" | "log" | "verbose" | "prometheus" | "otel"
     pub backend: String,
 
     /// OTLP endpoint (e.g. "http://localhost:4318"). Only used when backend = "otel".
@@ -2118,6 +2395,57 @@ impl Default for HooksConfig {
 pub struct BuiltinHooksConfig {
     /// Enable the command-logger hook (logs tool calls for auditing).
     pub command_logger: bool,
+    /// Configuration for the webhook-audit hook.
+    ///
+    /// When enabled, POSTs a JSON payload to `url` for every tool invocation
+    /// that matches one of `tool_patterns`.
+    #[serde(default)]
+    pub webhook_audit: WebhookAuditConfig,
+}
+
+/// Configuration for the webhook-audit builtin hook.
+///
+/// Sends an HTTP POST with a JSON body to an external endpoint each time
+/// a tool call matches one of the configured patterns. Useful for
+/// centralised audit logging, SIEM ingestion, or compliance pipelines.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WebhookAuditConfig {
+    /// Enable the webhook-audit hook. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Target URL that will receive the audit POST requests.
+    #[serde(default)]
+    pub url: String,
+    /// Glob patterns for tool names to audit (e.g. `["Bash", "Write"]`).
+    /// An empty list means **no** tools are audited.
+    #[serde(default)]
+    pub tool_patterns: Vec<String>,
+    /// Include tool call arguments in the audit payload. Default: `false`.
+    ///
+    /// Be mindful of sensitive data — arguments may contain secrets or PII.
+    #[serde(default)]
+    pub include_args: bool,
+    /// Maximum size (in bytes) of serialised arguments included in a single
+    /// audit payload. Arguments exceeding this limit are truncated.
+    /// Default: `4096`.
+    #[serde(default = "default_max_args_bytes")]
+    pub max_args_bytes: u64,
+}
+
+fn default_max_args_bytes() -> u64 {
+    4096
+}
+
+impl Default for WebhookAuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            tool_patterns: Vec::new(),
+            include_args: false,
+            max_args_bytes: default_max_args_bytes(),
+        }
+    }
 }
 
 // ── Autonomy / Security ──────────────────────────────────────────
@@ -2750,8 +3078,11 @@ pub struct ChannelsConfig {
     pub feishu: Option<FeishuConfig>,
     /// DingTalk channel configuration.
     pub dingtalk: Option<DingTalkConfig>,
+    /// WeCom (WeChat Enterprise) Bot Webhook channel configuration.
+    pub wecom: Option<WeComConfig>,
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
+    #[cfg(feature = "channel-nostr")]
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
     pub clawdtalk: Option<crate::channels::ClawdTalkConfig>,
@@ -2762,6 +3093,10 @@ pub struct ChannelsConfig {
     /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
     #[serde(default = "default_channel_message_timeout_secs")]
     pub message_timeout_secs: u64,
+    /// Whether to add acknowledgement reactions (👀 on receipt, ✅/⚠️ on
+    /// completion) to incoming channel messages. Default: `true`.
+    #[serde(default = "default_true")]
+    pub ack_reactions: bool,
 }
 
 impl ChannelsConfig {
@@ -2834,9 +3169,14 @@ impl ChannelsConfig {
                 self.dingtalk.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.wecom.as_ref())),
+                self.wecom.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.qq.as_ref())),
                 self.qq.is_some()
             ),
+            #[cfg(feature = "channel-nostr")]
             (
                 Box::new(ConfigWrapper::new(self.nostr.as_ref())),
                 self.nostr.is_some(),
@@ -2883,10 +3223,13 @@ impl Default for ChannelsConfig {
             lark: None,
             feishu: None,
             dingtalk: None,
+            wecom: None,
             qq: None,
+            #[cfg(feature = "channel-nostr")]
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
+            ack_reactions: true,
         }
     }
 }
@@ -3693,6 +4036,25 @@ impl ChannelConfig for DingTalkConfig {
     }
 }
 
+/// WeCom (WeChat Enterprise) Bot Webhook configuration
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WeComConfig {
+    /// Webhook key from WeCom Bot configuration
+    pub webhook_key: String,
+    /// Allowed user IDs. Empty = deny all, "*" = allow all
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+}
+
+impl ChannelConfig for WeComConfig {
+    fn name() -> &'static str {
+        "WeCom"
+    }
+    fn desc() -> &'static str {
+        "WeCom Bot Webhook"
+    }
+}
+
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QQConfig {
@@ -3715,6 +4077,7 @@ impl ChannelConfig for QQConfig {
 }
 
 /// Nostr channel configuration (NIP-04 + NIP-17 private messages)
+#[cfg(feature = "channel-nostr")]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NostrConfig {
     /// Private key in hex or nsec bech32 format
@@ -3727,6 +4090,7 @@ pub struct NostrConfig {
     pub allowed_pubkeys: Vec<String>,
 }
 
+#[cfg(feature = "channel-nostr")]
 impl ChannelConfig for NostrConfig {
     fn name() -> &'static str {
         "Nostr"
@@ -3736,6 +4100,7 @@ impl ChannelConfig for NostrConfig {
     }
 }
 
+#[cfg(feature = "channel-nostr")]
 pub fn default_nostr_relays() -> Vec<String> {
     vec![
         "wss://relay.damus.io".to_string(),
@@ -3758,10 +4123,13 @@ impl Default for Config {
             config_path: zeroclaw_dir.join("config.toml"),
             api_key: None,
             api_url: None,
+            api_path: None,
             default_provider: Some("openrouter".to_string()),
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             model_providers: HashMap::new(),
             default_temperature: default_temperature(),
+            provider_timeout_secs: default_provider_timeout_secs(),
+            extra_headers: HashMap::new(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
@@ -3796,6 +4164,8 @@ impl Default for Config {
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            mcp: McpConfig::default(),
+            nodes: NodesConfig::default(),
         }
     }
 }
@@ -3871,7 +4241,8 @@ async fn load_persisted_workspace_dirs(
         return Ok(None);
     }
 
-    let parsed_dir = PathBuf::from(raw_config_dir);
+    let expanded_dir = shellexpand::tilde(raw_config_dir);
+    let parsed_dir = PathBuf::from(expanded_dir.as_ref());
     let config_dir = if parsed_dir.is_absolute() {
         parsed_dir
     } else {
@@ -3981,7 +4352,7 @@ pub(crate) fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf
 ///
 /// This mirrors the same precedence used by `Config::load_or_init()`:
 /// `ZEROCLAW_CONFIG_DIR` > `ZEROCLAW_WORKSPACE` > active workspace marker > defaults.
-pub(crate) async fn resolve_runtime_dirs_for_onboarding() -> Result<(PathBuf, PathBuf)> {
+pub async fn resolve_runtime_dirs_for_onboarding() -> Result<(PathBuf, PathBuf)> {
     let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
     let (config_dir, workspace_dir, _) =
         resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
@@ -4014,7 +4385,7 @@ async fn resolve_runtime_config_dirs(
     if let Ok(custom_config_dir) = std::env::var("ZEROCLAW_CONFIG_DIR") {
         let custom_config_dir = custom_config_dir.trim();
         if !custom_config_dir.is_empty() {
-            let zeroclaw_dir = PathBuf::from(custom_config_dir);
+            let zeroclaw_dir = PathBuf::from(shellexpand::tilde(custom_config_dir).as_ref());
             return Ok((
                 zeroclaw_dir.clone(),
                 zeroclaw_dir.join("workspace"),
@@ -4025,8 +4396,9 @@ async fn resolve_runtime_config_dirs(
 
     if let Ok(custom_workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
         if !custom_workspace.is_empty() {
+            let expanded = shellexpand::tilde(&custom_workspace);
             let (zeroclaw_dir, workspace_dir) =
-                resolve_config_dir_for_workspace(&PathBuf::from(custom_workspace));
+                resolve_config_dir_for_workspace(&PathBuf::from(expanded.as_ref()));
             return Ok((
                 zeroclaw_dir,
                 workspace_dir,
@@ -4148,12 +4520,43 @@ fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
         })
 }
 
+/// Parse the `ZEROCLAW_EXTRA_HEADERS` environment variable value.
+///
+/// Format: `Key:Value,Key2:Value2`
+///
+/// Entries without a colon or with an empty key are silently skipped.
+/// Leading/trailing whitespace on both key and value is trimmed.
+pub fn parse_extra_headers_env(raw: &str) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = entry.split_once(':') {
+            let key = key.trim();
+            let value = value.trim();
+            if key.is_empty() {
+                tracing::warn!("Ignoring extra header with empty name in ZEROCLAW_EXTRA_HEADERS");
+                continue;
+            }
+            result.push((key.to_string(), value.to_string()));
+        } else {
+            tracing::warn!("Ignoring malformed extra header entry (missing ':'): {entry}");
+        }
+    }
+    result
+}
+
 fn normalize_wire_api(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "responses" => Some("responses"),
-        "chat_completions" | "chat-completions" | "chat" | "chatcompletions" => {
-            Some("chat_completions")
-        }
+        "responses" | "openai-responses" | "open-ai-responses" => Some("responses"),
+        "chat_completions"
+        | "chat-completions"
+        | "chat"
+        | "chatcompletions"
+        | "openai-chat-completions"
+        | "open-ai-chat-completions" => Some("chat_completions"),
         _ => None,
     }
 }
@@ -4276,12 +4679,206 @@ impl Config {
                 decrypt_optional_secret(&store, &mut google.api_key, "config.tts.google.api_key")?;
             }
 
+            #[cfg(feature = "channel-nostr")]
             if let Some(ref mut ns) = config.channels_config.nostr {
                 decrypt_secret(
                     &store,
                     &mut ns.private_key,
                     "config.channels_config.nostr.private_key",
                 )?;
+            }
+
+            // Decrypt channel secrets
+            if let Some(ref mut tg) = config.channels_config.telegram {
+                decrypt_secret(
+                    &store,
+                    &mut tg.bot_token,
+                    "config.channels_config.telegram.bot_token",
+                )?;
+            }
+            if let Some(ref mut dc) = config.channels_config.discord {
+                decrypt_secret(
+                    &store,
+                    &mut dc.bot_token,
+                    "config.channels_config.discord.bot_token",
+                )?;
+            }
+            if let Some(ref mut sl) = config.channels_config.slack {
+                decrypt_secret(
+                    &store,
+                    &mut sl.bot_token,
+                    "config.channels_config.slack.bot_token",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut sl.app_token,
+                    "config.channels_config.slack.app_token",
+                )?;
+            }
+            if let Some(ref mut mm) = config.channels_config.mattermost {
+                decrypt_secret(
+                    &store,
+                    &mut mm.bot_token,
+                    "config.channels_config.mattermost.bot_token",
+                )?;
+            }
+            if let Some(ref mut mx) = config.channels_config.matrix {
+                decrypt_secret(
+                    &store,
+                    &mut mx.access_token,
+                    "config.channels_config.matrix.access_token",
+                )?;
+            }
+            if let Some(ref mut wa) = config.channels_config.whatsapp {
+                decrypt_optional_secret(
+                    &store,
+                    &mut wa.access_token,
+                    "config.channels_config.whatsapp.access_token",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut wa.app_secret,
+                    "config.channels_config.whatsapp.app_secret",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut wa.verify_token,
+                    "config.channels_config.whatsapp.verify_token",
+                )?;
+            }
+            if let Some(ref mut lq) = config.channels_config.linq {
+                decrypt_secret(
+                    &store,
+                    &mut lq.api_token,
+                    "config.channels_config.linq.api_token",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut lq.signing_secret,
+                    "config.channels_config.linq.signing_secret",
+                )?;
+            }
+            if let Some(ref mut wt) = config.channels_config.wati {
+                decrypt_secret(
+                    &store,
+                    &mut wt.api_token,
+                    "config.channels_config.wati.api_token",
+                )?;
+            }
+            if let Some(ref mut nc) = config.channels_config.nextcloud_talk {
+                decrypt_secret(
+                    &store,
+                    &mut nc.app_token,
+                    "config.channels_config.nextcloud_talk.app_token",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut nc.webhook_secret,
+                    "config.channels_config.nextcloud_talk.webhook_secret",
+                )?;
+            }
+            if let Some(ref mut em) = config.channels_config.email {
+                decrypt_secret(
+                    &store,
+                    &mut em.password,
+                    "config.channels_config.email.password",
+                )?;
+            }
+            if let Some(ref mut irc) = config.channels_config.irc {
+                decrypt_optional_secret(
+                    &store,
+                    &mut irc.server_password,
+                    "config.channels_config.irc.server_password",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut irc.nickserv_password,
+                    "config.channels_config.irc.nickserv_password",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut irc.sasl_password,
+                    "config.channels_config.irc.sasl_password",
+                )?;
+            }
+            if let Some(ref mut lk) = config.channels_config.lark {
+                decrypt_secret(
+                    &store,
+                    &mut lk.app_secret,
+                    "config.channels_config.lark.app_secret",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut lk.encrypt_key,
+                    "config.channels_config.lark.encrypt_key",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut lk.verification_token,
+                    "config.channels_config.lark.verification_token",
+                )?;
+            }
+            if let Some(ref mut fs) = config.channels_config.feishu {
+                decrypt_secret(
+                    &store,
+                    &mut fs.app_secret,
+                    "config.channels_config.feishu.app_secret",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut fs.encrypt_key,
+                    "config.channels_config.feishu.encrypt_key",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut fs.verification_token,
+                    "config.channels_config.feishu.verification_token",
+                )?;
+            }
+            if let Some(ref mut dt) = config.channels_config.dingtalk {
+                decrypt_secret(
+                    &store,
+                    &mut dt.client_secret,
+                    "config.channels_config.dingtalk.client_secret",
+                )?;
+            }
+            if let Some(ref mut wc) = config.channels_config.wecom {
+                decrypt_secret(
+                    &store,
+                    &mut wc.webhook_key,
+                    "config.channels_config.wecom.webhook_key",
+                )?;
+            }
+            if let Some(ref mut qq) = config.channels_config.qq {
+                decrypt_secret(
+                    &store,
+                    &mut qq.app_secret,
+                    "config.channels_config.qq.app_secret",
+                )?;
+            }
+            if let Some(ref mut wh) = config.channels_config.webhook {
+                decrypt_optional_secret(
+                    &store,
+                    &mut wh.secret,
+                    "config.channels_config.webhook.secret",
+                )?;
+            }
+            if let Some(ref mut ct) = config.channels_config.clawdtalk {
+                decrypt_secret(
+                    &store,
+                    &mut ct.api_key,
+                    "config.channels_config.clawdtalk.api_key",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut ct.webhook_secret,
+                    "config.channels_config.clawdtalk.webhook_secret",
+                )?;
+            }
+
+            // Decrypt gateway paired tokens
+            for token in &mut config.gateway.paired_tokens {
+                decrypt_secret(&store, token, "config.gateway.paired_tokens[]")?;
             }
 
             config.apply_env_overrides();
@@ -4360,6 +4957,16 @@ impl Config {
         {
             if let Some(base_url) = base_url.as_ref() {
                 self.api_url = Some(base_url.clone());
+            }
+        }
+
+        // Propagate api_path from the profile when not already set at top level.
+        if self.api_path.is_none() {
+            if let Some(ref path) = profile.api_path {
+                let trimmed = path.trim();
+                if !trimmed.is_empty() {
+                    self.api_path = Some(trimmed.to_string());
+                }
             }
         }
 
@@ -4565,8 +5172,18 @@ impl Config {
             }
         }
 
+        // MCP
+        if self.mcp.enabled {
+            validate_mcp_config(&self.mcp)?;
+        }
+
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
+
+        // MCP servers
+        if self.mcp.enabled {
+            validate_mcp_config(&self.mcp)?;
+        }
 
         Ok(())
     }
@@ -4628,14 +5245,33 @@ impl Config {
             }
         }
 
+        // Provider HTTP timeout: ZEROCLAW_PROVIDER_TIMEOUT_SECS
+        if let Ok(timeout_secs) = std::env::var("ZEROCLAW_PROVIDER_TIMEOUT_SECS") {
+            if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
+                if timeout_secs > 0 {
+                    self.provider_timeout_secs = timeout_secs;
+                }
+            }
+        }
+
+        // Extra provider headers: ZEROCLAW_EXTRA_HEADERS
+        // Format: "Key:Value,Key2:Value2"
+        // Env var headers override config file headers with the same name.
+        if let Ok(raw) = std::env::var("ZEROCLAW_EXTRA_HEADERS") {
+            for header in parse_extra_headers_env(&raw) {
+                self.extra_headers.insert(header.0, header.1);
+            }
+        }
+
         // Apply named provider profile remapping (Codex app-server compatibility).
         self.apply_named_model_provider_profile();
 
         // Workspace directory: ZEROCLAW_WORKSPACE
         if let Ok(workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
             if !workspace.is_empty() {
+                let expanded = shellexpand::tilde(&workspace);
                 let (_, workspace_dir) =
-                    resolve_config_dir_for_workspace(&PathBuf::from(workspace));
+                    resolve_config_dir_for_workspace(&PathBuf::from(expanded.as_ref()));
                 self.workspace_dir = workspace_dir;
             }
         }
@@ -4953,12 +5589,206 @@ impl Config {
             encrypt_optional_secret(&store, &mut google.api_key, "config.tts.google.api_key")?;
         }
 
+        #[cfg(feature = "channel-nostr")]
         if let Some(ref mut ns) = config_to_save.channels_config.nostr {
             encrypt_secret(
                 &store,
                 &mut ns.private_key,
                 "config.channels_config.nostr.private_key",
             )?;
+        }
+
+        // Encrypt channel secrets
+        if let Some(ref mut tg) = config_to_save.channels_config.telegram {
+            encrypt_secret(
+                &store,
+                &mut tg.bot_token,
+                "config.channels_config.telegram.bot_token",
+            )?;
+        }
+        if let Some(ref mut dc) = config_to_save.channels_config.discord {
+            encrypt_secret(
+                &store,
+                &mut dc.bot_token,
+                "config.channels_config.discord.bot_token",
+            )?;
+        }
+        if let Some(ref mut sl) = config_to_save.channels_config.slack {
+            encrypt_secret(
+                &store,
+                &mut sl.bot_token,
+                "config.channels_config.slack.bot_token",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut sl.app_token,
+                "config.channels_config.slack.app_token",
+            )?;
+        }
+        if let Some(ref mut mm) = config_to_save.channels_config.mattermost {
+            encrypt_secret(
+                &store,
+                &mut mm.bot_token,
+                "config.channels_config.mattermost.bot_token",
+            )?;
+        }
+        if let Some(ref mut mx) = config_to_save.channels_config.matrix {
+            encrypt_secret(
+                &store,
+                &mut mx.access_token,
+                "config.channels_config.matrix.access_token",
+            )?;
+        }
+        if let Some(ref mut wa) = config_to_save.channels_config.whatsapp {
+            encrypt_optional_secret(
+                &store,
+                &mut wa.access_token,
+                "config.channels_config.whatsapp.access_token",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut wa.app_secret,
+                "config.channels_config.whatsapp.app_secret",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut wa.verify_token,
+                "config.channels_config.whatsapp.verify_token",
+            )?;
+        }
+        if let Some(ref mut lq) = config_to_save.channels_config.linq {
+            encrypt_secret(
+                &store,
+                &mut lq.api_token,
+                "config.channels_config.linq.api_token",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut lq.signing_secret,
+                "config.channels_config.linq.signing_secret",
+            )?;
+        }
+        if let Some(ref mut wt) = config_to_save.channels_config.wati {
+            encrypt_secret(
+                &store,
+                &mut wt.api_token,
+                "config.channels_config.wati.api_token",
+            )?;
+        }
+        if let Some(ref mut nc) = config_to_save.channels_config.nextcloud_talk {
+            encrypt_secret(
+                &store,
+                &mut nc.app_token,
+                "config.channels_config.nextcloud_talk.app_token",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut nc.webhook_secret,
+                "config.channels_config.nextcloud_talk.webhook_secret",
+            )?;
+        }
+        if let Some(ref mut em) = config_to_save.channels_config.email {
+            encrypt_secret(
+                &store,
+                &mut em.password,
+                "config.channels_config.email.password",
+            )?;
+        }
+        if let Some(ref mut irc) = config_to_save.channels_config.irc {
+            encrypt_optional_secret(
+                &store,
+                &mut irc.server_password,
+                "config.channels_config.irc.server_password",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut irc.nickserv_password,
+                "config.channels_config.irc.nickserv_password",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut irc.sasl_password,
+                "config.channels_config.irc.sasl_password",
+            )?;
+        }
+        if let Some(ref mut lk) = config_to_save.channels_config.lark {
+            encrypt_secret(
+                &store,
+                &mut lk.app_secret,
+                "config.channels_config.lark.app_secret",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut lk.encrypt_key,
+                "config.channels_config.lark.encrypt_key",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut lk.verification_token,
+                "config.channels_config.lark.verification_token",
+            )?;
+        }
+        if let Some(ref mut fs) = config_to_save.channels_config.feishu {
+            encrypt_secret(
+                &store,
+                &mut fs.app_secret,
+                "config.channels_config.feishu.app_secret",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut fs.encrypt_key,
+                "config.channels_config.feishu.encrypt_key",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut fs.verification_token,
+                "config.channels_config.feishu.verification_token",
+            )?;
+        }
+        if let Some(ref mut dt) = config_to_save.channels_config.dingtalk {
+            encrypt_secret(
+                &store,
+                &mut dt.client_secret,
+                "config.channels_config.dingtalk.client_secret",
+            )?;
+        }
+        if let Some(ref mut wc) = config_to_save.channels_config.wecom {
+            encrypt_secret(
+                &store,
+                &mut wc.webhook_key,
+                "config.channels_config.wecom.webhook_key",
+            )?;
+        }
+        if let Some(ref mut qq) = config_to_save.channels_config.qq {
+            encrypt_secret(
+                &store,
+                &mut qq.app_secret,
+                "config.channels_config.qq.app_secret",
+            )?;
+        }
+        if let Some(ref mut wh) = config_to_save.channels_config.webhook {
+            encrypt_optional_secret(
+                &store,
+                &mut wh.secret,
+                "config.channels_config.webhook.secret",
+            )?;
+        }
+        if let Some(ref mut ct) = config_to_save.channels_config.clawdtalk {
+            encrypt_secret(
+                &store,
+                &mut ct.api_key,
+                "config.channels_config.clawdtalk.api_key",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut ct.webhook_secret,
+                "config.channels_config.clawdtalk.webhook_secret",
+            )?;
+        }
+
+        // Encrypt gateway paired tokens
+        for token in &mut config_to_save.gateway.paired_tokens {
+            encrypt_secret(&store, token, "config.gateway.paired_tokens[]")?;
         }
 
         let toml_str =
@@ -5102,6 +5932,7 @@ mod tests {
             c.skills.prompt_injection_mode,
             SkillsPromptInjectionMode::Full
         );
+        assert_eq!(c.provider_timeout_secs, 120);
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
     }
@@ -5302,10 +6133,13 @@ default_temperature = 0.7
             config_path: PathBuf::from("/tmp/test/config.toml"),
             api_key: Some("sk-test-key".into()),
             api_url: None,
+            api_path: None,
             default_provider: Some("openrouter".into()),
             default_model: Some("gpt-4o".into()),
             model_providers: HashMap::new(),
             default_temperature: 0.5,
+            provider_timeout_secs: 120,
+            extra_headers: HashMap::new(),
             observability: ObservabilityConfig {
                 backend: "log".into(),
                 ..ObservabilityConfig::default()
@@ -5370,10 +6204,13 @@ default_temperature = 0.7
                 lark: None,
                 feishu: None,
                 dingtalk: None,
+                wecom: None,
                 qq: None,
+                #[cfg(feature = "channel-nostr")]
                 nostr: None,
                 clawdtalk: None,
                 message_timeout_secs: 300,
+                ack_reactions: true,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -5396,6 +6233,8 @@ default_temperature = 0.7
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            mcp: McpConfig::default(),
+            nodes: NodesConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -5445,6 +6284,109 @@ default_temperature = 0.7
         assert_eq!(parsed.memory.archive_after_days, 7);
         assert_eq!(parsed.memory.purge_after_days, 30);
         assert_eq!(parsed.memory.conversation_retention_days, 30);
+        // provider_timeout_secs defaults to 120 when not specified
+        assert_eq!(parsed.provider_timeout_secs, 120);
+    }
+
+    #[test]
+    async fn provider_timeout_secs_parses_from_toml() {
+        let raw = r#"
+default_temperature = 0.7
+provider_timeout_secs = 300
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.provider_timeout_secs, 300);
+    }
+
+    #[test]
+    async fn parse_extra_headers_env_basic() {
+        let headers = parse_extra_headers_env("User-Agent:MyApp/1.0,X-Title:zeroclaw");
+        assert_eq!(headers.len(), 2);
+        assert_eq!(
+            headers[0],
+            ("User-Agent".to_string(), "MyApp/1.0".to_string())
+        );
+        assert_eq!(headers[1], ("X-Title".to_string(), "zeroclaw".to_string()));
+    }
+
+    #[test]
+    async fn parse_extra_headers_env_with_url_value() {
+        let headers =
+            parse_extra_headers_env("HTTP-Referer:https://github.com/zeroclaw-labs/zeroclaw");
+        assert_eq!(headers.len(), 1);
+        // Only splits on first colon, preserving URL colons in value
+        assert_eq!(headers[0].0, "HTTP-Referer");
+        assert_eq!(headers[0].1, "https://github.com/zeroclaw-labs/zeroclaw");
+    }
+
+    #[test]
+    async fn parse_extra_headers_env_empty_string() {
+        let headers = parse_extra_headers_env("");
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    async fn parse_extra_headers_env_whitespace_trimming() {
+        let headers = parse_extra_headers_env("  X-Title : zeroclaw , User-Agent : cli/1.0 ");
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0], ("X-Title".to_string(), "zeroclaw".to_string()));
+        assert_eq!(
+            headers[1],
+            ("User-Agent".to_string(), "cli/1.0".to_string())
+        );
+    }
+
+    #[test]
+    async fn parse_extra_headers_env_skips_malformed() {
+        let headers = parse_extra_headers_env("X-Valid:value,no-colon-here,Another:ok");
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0], ("X-Valid".to_string(), "value".to_string()));
+        assert_eq!(headers[1], ("Another".to_string(), "ok".to_string()));
+    }
+
+    #[test]
+    async fn parse_extra_headers_env_skips_empty_key() {
+        let headers = parse_extra_headers_env(":value,X-Valid:ok");
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0], ("X-Valid".to_string(), "ok".to_string()));
+    }
+
+    #[test]
+    async fn parse_extra_headers_env_allows_empty_value() {
+        let headers = parse_extra_headers_env("X-Empty:");
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0], ("X-Empty".to_string(), String::new()));
+    }
+
+    #[test]
+    async fn parse_extra_headers_env_trailing_comma() {
+        let headers = parse_extra_headers_env("X-Title:zeroclaw,");
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0], ("X-Title".to_string(), "zeroclaw".to_string()));
+    }
+
+    #[test]
+    async fn extra_headers_parses_from_toml() {
+        let raw = r#"
+default_temperature = 0.7
+
+[extra_headers]
+User-Agent = "MyApp/1.0"
+X-Title = "zeroclaw"
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.extra_headers.len(), 2);
+        assert_eq!(parsed.extra_headers.get("User-Agent").unwrap(), "MyApp/1.0");
+        assert_eq!(parsed.extra_headers.get("X-Title").unwrap(), "zeroclaw");
+    }
+
+    #[test]
+    async fn extra_headers_defaults_to_empty() {
+        let raw = r#"
+default_temperature = 0.7
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert!(parsed.extra_headers.is_empty());
     }
 
     #[test]
@@ -5541,10 +6483,13 @@ tool_dispatcher = "xml"
             config_path: config_path.clone(),
             api_key: Some("sk-roundtrip".into()),
             api_url: None,
+            api_path: None,
             default_provider: Some("openrouter".into()),
             default_model: Some("test-model".into()),
             model_providers: HashMap::new(),
             default_temperature: 0.9,
+            provider_timeout_secs: 120,
+            extra_headers: HashMap::new(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
@@ -5579,6 +6524,8 @@ tool_dispatcher = "xml"
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            mcp: McpConfig::default(),
+            nodes: NodesConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -5936,10 +6883,12 @@ allowed_users = ["@ops:matrix.org"]
             lark: None,
             feishu: None,
             dingtalk: None,
+            wecom: None,
             qq: None,
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: 300,
+            ack_reactions: true,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -6150,10 +7099,12 @@ channel_id = "C123"
             lark: None,
             feishu: None,
             dingtalk: None,
+            wecom: None,
             qq: None,
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: 300,
+            ack_reactions: true,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -6726,6 +7677,10 @@ requires_openai_auth = true
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
                     wire_api: None,
                     requires_openai_auth: false,
+                    azure_openai_resource: None,
+                    azure_openai_deployment: None,
+                    azure_openai_api_version: None,
+                    api_path: None,
                 },
             )]),
             ..Config::default()
@@ -6754,6 +7709,10 @@ requires_openai_auth = true
                     base_url: Some("https://api.tonsof.blue".to_string()),
                     wire_api: Some("responses".to_string()),
                     requires_openai_auth: true,
+                    azure_openai_resource: None,
+                    azure_openai_deployment: None,
+                    azure_openai_api_version: None,
+                    api_path: None,
                 },
             )]),
             api_key: None,
@@ -6850,6 +7809,10 @@ requires_openai_auth = true
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
                     wire_api: Some("ws".to_string()),
                     requires_openai_auth: false,
+                    azure_openai_resource: None,
+                    azure_openai_deployment: None,
+                    azure_openai_api_version: None,
+                    api_path: None,
                 },
             )]),
             ..Config::default()
@@ -7893,6 +8856,73 @@ require_otp_to_resume = true
         assert!(err.to_string().contains("gated_domains"));
     }
 
+    #[tokio::test]
+    async fn channel_secret_telegram_bot_token_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_tg_bot_token_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let plaintext_token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11";
+
+        let mut config = Config::default();
+        config.workspace_dir = dir.join("workspace");
+        config.config_path = dir.join("config.toml");
+        config.channels_config.telegram = Some(TelegramConfig {
+            bot_token: plaintext_token.into(),
+            allowed_users: vec!["user1".into()],
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+
+        // Save (triggers encryption)
+        config.save().await.unwrap();
+
+        // Read raw TOML and verify plaintext token is NOT present
+        let raw_toml = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        assert!(
+            !raw_toml.contains(plaintext_token),
+            "Saved TOML must not contain the plaintext bot_token"
+        );
+
+        // Parse stored TOML and verify the value is encrypted
+        let stored: Config = toml::from_str(&raw_toml).unwrap();
+        let stored_token = &stored.channels_config.telegram.as_ref().unwrap().bot_token;
+        assert!(
+            crate::security::SecretStore::is_encrypted(stored_token),
+            "Stored bot_token must be marked as encrypted"
+        );
+
+        // Decrypt and verify it matches the original plaintext
+        let store = crate::security::SecretStore::new(&dir, true);
+        assert_eq!(store.decrypt(stored_token).unwrap(), plaintext_token);
+
+        // Simulate a full load: deserialize then decrypt (mirrors load_or_init logic)
+        let mut loaded: Config = toml::from_str(&raw_toml).unwrap();
+        loaded.config_path = dir.join("config.toml");
+        let load_store = crate::security::SecretStore::new(&dir, loaded.secrets.encrypt);
+        if let Some(ref mut tg) = loaded.channels_config.telegram {
+            decrypt_secret(
+                &load_store,
+                &mut tg.bot_token,
+                "config.channels_config.telegram.bot_token",
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            loaded.channels_config.telegram.as_ref().unwrap().bot_token,
+            plaintext_token,
+            "Loaded bot_token must match the original plaintext after decryption"
+        );
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
     #[test]
     async fn security_validation_rejects_unknown_domain_category() {
         let mut config = Config::default();
@@ -7913,5 +8943,241 @@ require_otp_to_resume = true
             .validate()
             .expect_err("expected ttl validation failure");
         assert!(err.to_string().contains("token_ttl_secs"));
+    }
+
+    // ── MCP config validation ─────────────────────────────────────────────
+
+    fn stdio_server(name: &str, command: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransport::Stdio,
+            command: command.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn http_server(name: &str, url: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransport::Http,
+            url: Some(url.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn sse_server(name: &str, url: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransport::Sse,
+            url: Some(url.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    async fn validate_mcp_config_empty_servers_ok() {
+        let cfg = McpConfig::default();
+        assert!(validate_mcp_config(&cfg).is_ok());
+    }
+
+    #[test]
+    async fn validate_mcp_config_valid_stdio_ok() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![stdio_server("fs", "/usr/bin/mcp-fs")],
+            ..Default::default()
+        };
+        assert!(validate_mcp_config(&cfg).is_ok());
+    }
+
+    #[test]
+    async fn validate_mcp_config_valid_http_ok() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![http_server("svc", "http://localhost:8080/mcp")],
+            ..Default::default()
+        };
+        assert!(validate_mcp_config(&cfg).is_ok());
+    }
+
+    #[test]
+    async fn validate_mcp_config_valid_sse_ok() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![sse_server("svc", "https://example.com/events")],
+            ..Default::default()
+        };
+        assert!(validate_mcp_config(&cfg).is_ok());
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_empty_name() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![stdio_server("", "/usr/bin/tool")],
+            ..Default::default()
+        };
+        let err = validate_mcp_config(&cfg).expect_err("empty name should fail");
+        assert!(
+            err.to_string().contains("name must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_whitespace_name() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![stdio_server("   ", "/usr/bin/tool")],
+            ..Default::default()
+        };
+        let err = validate_mcp_config(&cfg).expect_err("whitespace name should fail");
+        assert!(
+            err.to_string().contains("name must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_duplicate_names() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![
+                stdio_server("fs", "/usr/bin/mcp-a"),
+                stdio_server("fs", "/usr/bin/mcp-b"),
+            ],
+            ..Default::default()
+        };
+        let err = validate_mcp_config(&cfg).expect_err("duplicate name should fail");
+        assert!(err.to_string().contains("duplicate name"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_zero_timeout() {
+        let mut server = stdio_server("fs", "/usr/bin/mcp-fs");
+        server.tool_timeout_secs = Some(0);
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![server],
+            ..Default::default()
+        };
+        let err = validate_mcp_config(&cfg).expect_err("zero timeout should fail");
+        assert!(err.to_string().contains("greater than 0"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_timeout_exceeding_max() {
+        let mut server = stdio_server("fs", "/usr/bin/mcp-fs");
+        server.tool_timeout_secs = Some(MCP_MAX_TOOL_TIMEOUT_SECS + 1);
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![server],
+            ..Default::default()
+        };
+        let err = validate_mcp_config(&cfg).expect_err("oversized timeout should fail");
+        assert!(err.to_string().contains("exceeds max"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_mcp_config_allows_max_timeout_exactly() {
+        let mut server = stdio_server("fs", "/usr/bin/mcp-fs");
+        server.tool_timeout_secs = Some(MCP_MAX_TOOL_TIMEOUT_SECS);
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![server],
+            ..Default::default()
+        };
+        assert!(validate_mcp_config(&cfg).is_ok());
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_stdio_with_empty_command() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![stdio_server("fs", "")],
+            ..Default::default()
+        };
+        let err = validate_mcp_config(&cfg).expect_err("empty command should fail");
+        assert!(
+            err.to_string().contains("requires non-empty command"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_http_without_url() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                name: "svc".to_string(),
+                transport: McpTransport::Http,
+                url: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let err = validate_mcp_config(&cfg).expect_err("http without url should fail");
+        assert!(err.to_string().contains("requires url"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_sse_without_url() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                name: "svc".to_string(),
+                transport: McpTransport::Sse,
+                url: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let err = validate_mcp_config(&cfg).expect_err("sse without url should fail");
+        assert!(err.to_string().contains("requires url"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_non_http_scheme() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![http_server("svc", "ftp://example.com/mcp")],
+            ..Default::default()
+        };
+        let err = validate_mcp_config(&cfg).expect_err("non-http scheme should fail");
+        assert!(err.to_string().contains("http/https"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_mcp_config_rejects_invalid_url() {
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![http_server("svc", "not a url at all !!!")],
+            ..Default::default()
+        };
+        let err = validate_mcp_config(&cfg).expect_err("invalid url should fail");
+        assert!(err.to_string().contains("valid URL"), "got: {err}");
+    }
+
+    #[test]
+    async fn mcp_config_default_disabled_with_empty_servers() {
+        let cfg = McpConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.servers.is_empty());
+    }
+
+    #[test]
+    async fn mcp_transport_serde_roundtrip_lowercase() {
+        let cases = [
+            (McpTransport::Stdio, "\"stdio\""),
+            (McpTransport::Http, "\"http\""),
+            (McpTransport::Sse, "\"sse\""),
+        ];
+        for (variant, expected_json) in &cases {
+            let serialized = serde_json::to_string(variant).expect("serialize");
+            assert_eq!(&serialized, expected_json, "variant: {variant:?}");
+            let deserialized: McpTransport =
+                serde_json::from_str(expected_json).expect("deserialize");
+            assert_eq!(&deserialized, variant);
+        }
     }
 }

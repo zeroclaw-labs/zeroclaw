@@ -1,5 +1,5 @@
 # Default owner for all files
-* @JordanTheJet @SimianAstronaut7
+* @theonlyhennygod @JordanTheJet @SimianAstronaut7
 
 # Important functional modules
 /src/agent/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
@@ -13,20 +13,20 @@
 /Cargo.lock @theonlyhennygod @JordanTheJet @SimianAstronaut7
 
 # Security / tests / CI-CD ownership
-/src/security/** @JordanTheJet @SimianAstronaut7
-/tests/** @JordanTheJet @SimianAstronaut7
-/.github/** @JordanTheJet @SimianAstronaut7
-/.github/workflows/** @JordanTheJet @SimianAstronaut7
-/.github/codeql/** @JordanTheJet @SimianAstronaut7
-/.github/dependabot.yml @JordanTheJet @SimianAstronaut7
-/SECURITY.md @JordanTheJet @SimianAstronaut7
-/docs/actions-source-policy.md @JordanTheJet @SimianAstronaut7
-/docs/ci-map.md @JordanTheJet @SimianAstronaut7
+/src/security/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/tests/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/.github/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/.github/workflows/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/.github/codeql/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/.github/dependabot.yml @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/SECURITY.md @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/docs/actions-source-policy.md @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/docs/ci-map.md @theonlyhennygod @JordanTheJet @SimianAstronaut7
 
 # Docs & governance
-/docs/** @JordanTheJet @SimianAstronaut7
-/AGENTS.md @JordanTheJet @SimianAstronaut7
-/CLAUDE.md @JordanTheJet @SimianAstronaut7
-/CONTRIBUTING.md @JordanTheJet @SimianAstronaut7
-/docs/pr-workflow.md @JordanTheJet @SimianAstronaut7
-/docs/reviewer-playbook.md @JordanTheJet @SimianAstronaut7
+/docs/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/AGENTS.md @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/CLAUDE.md @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/CONTRIBUTING.md @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/docs/pr-workflow.md @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/docs/reviewer-playbook.md @theonlyhennygod @JordanTheJet @SimianAstronaut7

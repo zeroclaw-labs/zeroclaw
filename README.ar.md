@@ -221,7 +221,7 @@ ls -lh target/release/zeroclaw
 يقوم نص `bootstrap.sh` بتثبيت Rust ونسخ ZeroClaw وتجميعه وإعداد بيئة التطوير الأولية الخاصة بك:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/bootstrap.sh | bash
 ```
 
 سيقوم هذا بـ:

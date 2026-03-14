@@ -9,19 +9,22 @@ function statusBadge(status: Integration['status']) {
       return {
         icon: Check,
         label: 'Active',
-        classes: 'bg-green-900/40 text-green-400 border-green-700/50',
+        classes: 'text-[#00e68a] border-[#00e68a30]',
+        bg: 'rgba(0,230,138,0.06)',
       };
     case 'Available':
       return {
         icon: Zap,
         label: 'Available',
-        classes: 'bg-blue-900/40 text-blue-400 border-blue-700/50',
+        classes: 'text-[#0080ff] border-[#0080ff30]',
+        bg: 'rgba(0,128,255,0.06)',
       };
     case 'ComingSoon':
       return {
         icon: Clock,
         label: 'Coming Soon',
-        classes: 'bg-gray-800 text-gray-400 border-gray-700',
+        classes: 'text-[#556080] border-[#1a1a3e]',
+        bg: 'rgba(26,26,62,0.3)',
       };
   }
 }
@@ -59,8 +62,8 @@ export default function Integrations() {
 
   if (error) {
     return (
-      <div className="p-6">
-        <div className="rounded-lg bg-red-900/30 border border-red-700 p-4 text-red-300">
+      <div className="p-6 animate-fade-in">
+        <div className="rounded-xl bg-[#ff446615] border border-[#ff446630] p-4 text-[#ff6680]">
           Failed to load integrations: {error}
         </div>
       </div>
@@ -70,17 +73,17 @@ export default function Integrations() {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="animate-spin rounded-full h-8 w-8 border-2 border-blue-500 border-t-transparent" />
+        <div className="h-8 w-8 border-2 border-[#0080ff30] border-t-[#0080ff] rounded-full animate-spin" />
       </div>
     );
   }
 
   return (
-    <div className="p-6 space-y-6">
+    <div className="p-6 space-y-6 animate-fade-in">
       {/* Header */}
       <div className="flex items-center gap-2">
-        <Puzzle className="h-5 w-5 text-blue-400" />
-        <h2 className="text-base font-semibold text-white">
+        <Puzzle className="h-5 w-5 text-[#0080ff]" />
+        <h2 className="text-sm font-semibold text-white uppercase tracking-wider">
           Integrations ({integrations.length})
         </h2>
       </div>
@@ -91,11 +94,12 @@ export default function Integrations() {
           <button
             key={cat}
             onClick={() => setActiveCategory(cat)}
-            className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors capitalize ${
+            className={`px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-all duration-300 capitalize ${
               activeCategory === cat
-                ? 'bg-blue-600 text-white'
-                : 'bg-gray-900 text-gray-400 border border-gray-700 hover:bg-gray-800 hover:text-white'
+                ? 'text-white shadow-[0_0_15px_rgba(0,128,255,0.2)]'
+                : 'text-[#556080] border border-[#1a1a3e] hover:text-white hover:border-[#0080ff40]'
             }`}
+            style={activeCategory === cat ? { background: 'linear-gradient(135deg, #0080ff, #0066cc)' } : {}}
           >
             {cat}
           </button>
@@ -104,38 +108,39 @@ export default function Integrations() {
 
       {/* Grouped Integration Cards */}
       {Object.keys(grouped).length === 0 ? (
-        <div className="bg-gray-900 rounded-xl border border-gray-800 p-8 text-center">
-          <Puzzle className="h-10 w-10 text-gray-600 mx-auto mb-3" />
-          <p className="text-gray-400">No integrations found.</p>
+        <div className="glass-card p-8 text-center">
+          <Puzzle className="h-10 w-10 text-[#1a1a3e] mx-auto mb-3" />
+          <p className="text-[#556080]">No integrations found.</p>
         </div>
       ) : (
         Object.entries(grouped)
           .sort(([a], [b]) => a.localeCompare(b))
           .map(([category, items]) => (
             <div key={category}>
-              <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3 capitalize">
+              <h3 className="text-[10px] font-semibold text-[#334060] uppercase tracking-wider mb-3 capitalize">
                 {category}
               </h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 stagger-children">
                 {items.map((integration) => {
                   const badge = statusBadge(integration.status);
                   const BadgeIcon = badge.icon;
                   return (
                     <div
                       key={integration.name}
-                      className="bg-gray-900 rounded-xl border border-gray-800 p-5 hover:border-gray-700 transition-colors"
+                      className="glass-card p-5 animate-slide-in-up"
                     >
                       <div className="flex items-start justify-between gap-3">
                         <div className="min-w-0">
                           <h4 className="text-sm font-semibold text-white truncate">
                             {integration.name}
                           </h4>
-                          <p className="text-sm text-gray-400 mt-1 line-clamp-2">
+                          <p className="text-sm text-[#556080] mt-1 line-clamp-2">
                             {integration.description}
                           </p>
                         </div>
                         <span
-                          className={`flex-shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium border ${badge.classes}`}
+                          className={`flex-shrink-0 inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-semibold border ${badge.classes}`}
+                          style={{ background: badge.bg }}
                         >
                           <BadgeIcon className="h-3 w-3" />
                           {badge.label}
