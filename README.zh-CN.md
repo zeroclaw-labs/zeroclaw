@@ -175,8 +175,8 @@ cargo install --path . --force --locked
 # 快速初始化（无交互）
 zeroclaw onboard --api-key sk-... --provider openrouter
 
-# 或使用交互式向导
-zeroclaw onboard --interactive
+# 或使用引导式向导
+zeroclaw onboard
 
 # 单次对话
 zeroclaw agent -m "Hello, ZeroClaw!"

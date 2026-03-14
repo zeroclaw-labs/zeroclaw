@@ -89,19 +89,13 @@ Lệnh này build image ZeroClaw cục bộ và chạy thiết lập trong conta
 ### Thiết lập nhanh (không tương tác)
 
 ```bash
-./install.sh --onboard --api-key "sk-..." --provider openrouter
+./install.sh --api-key "sk-..." --provider openrouter
 ```
 
 Hoặc dùng biến môi trường:
 
 ```bash
-ZEROCLAW_API_KEY="sk-..." ZEROCLAW_PROVIDER="openrouter" ./install.sh --onboard
-```
-
-### Thiết lập tương tác
-
-```bash
-./install.sh --interactive-onboard
+ZEROCLAW_API_KEY="sk-..." ZEROCLAW_PROVIDER="openrouter" ./install.sh
 ```
 
 ## Các cờ hữu ích

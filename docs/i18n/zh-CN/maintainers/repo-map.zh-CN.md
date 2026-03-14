@@ -233,7 +233,7 @@ main.rs ──▶ daemon/   ──▶ gateway/ + channels/ + cron/ + heartbeat/
 
 ```
 zeroclaw
-├── onboard [--interactive] [--force]     # 首次运行设置
+├── onboard [--force] [--reinit] [--channels-only]     # 首次运行设置
 ├── agent [-m "msg"] [-p provider]        # 启动代理循环
 ├── daemon [-p port]                      # 完整运行时（网关+渠道+cron+心跳）
 ├── gateway [-p port]                     # 仅 HTTP API 服务器
