@@ -3097,6 +3097,8 @@ pub struct ChannelsConfig {
     /// completion) to incoming channel messages. Default: `true`.
     #[serde(default = "default_true")]
     pub ack_reactions: bool,
+    #[serde(default = "default_true")]
+    pub show_tool_calls: bool,
 }
 
 impl ChannelsConfig {
@@ -3230,6 +3232,7 @@ impl Default for ChannelsConfig {
             clawdtalk: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
+            show_tool_calls: true,
         }
     }
 }
@@ -6249,6 +6252,7 @@ default_temperature = 0.7
                 clawdtalk: None,
                 message_timeout_secs: 300,
                 ack_reactions: true,
+                show_tool_calls: true,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -6962,6 +6966,7 @@ allowed_users = ["@ops:matrix.org"]
             clawdtalk: None,
             message_timeout_secs: 300,
             ack_reactions: true,
+            show_tool_calls: true,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -7188,6 +7193,7 @@ channel_id = "C123"
             clawdtalk: None,
             message_timeout_secs: 300,
             ack_reactions: true,
+            show_tool_calls: true,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
