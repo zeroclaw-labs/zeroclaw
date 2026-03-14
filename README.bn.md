@@ -59,7 +59,7 @@
 
 <!-- BEGIN:WHATS_NEW -->
 
-### 🚀 What's New in v0.3.0-beta.200 (March 2026)
+### 🚀 What's New in v0.3.0-beta.201 (March 2026)
 
 | Area | Highlights |
 |---|---|
@@ -190,7 +190,7 @@ channels:
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
 
-### 🌟 Recent Contributors (v0.3.0-beta.200)
+### 🌟 Recent Contributors (v0.3.0-beta.201)
 
 1 contributors shipped features, fixes, and improvements in this release cycle:
 
