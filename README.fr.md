@@ -86,12 +86,11 @@ Construit par des étudiants et membres des communautés Harvard, MIT et Sundai.
 
 <!-- BEGIN:WHATS_NEW -->
 
-### 🚀 What's New in v0.3.0 (March 2026)
+### 🚀 What's New in v0.3.0-beta.196 (March 2026)
 
 | Area | Highlights |
 |---|---|
-| channels | comprehensive channel matrix tests + v0.2.2 |
-| ci | auto-sync README What's New and Contributors on release |
+| General | Incremental improvements and polish |
 
 <!-- END:WHATS_NEW -->
 
@@ -424,13 +423,12 @@ Nous construisons en open source parce que les meilleures idées viennent de par
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
 
-### 🌟 Recent Contributors (v0.3.0)
+### 🌟 Recent Contributors (v0.3.0-beta.196)
 
-3 contributors shipped features, fixes, and improvements in this release cycle:
+0
+0 contributors shipped features, fixes, and improvements in this release cycle:
 
-- **Argenis**
-- **argenis de la rosa**
-- **Claude Opus 4.6**
+
 
 Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
 
