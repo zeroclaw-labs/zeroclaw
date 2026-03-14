@@ -2388,6 +2388,16 @@ html, body {
   border-bottom: 1px solid var(--color-border);
 }
 
+.doc-info-type {
+  font-weight: 500;
+  color: var(--color-text-primary);
+}
+
+.doc-info-engine {
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+
 .doc-info-mode {
   color: var(--color-primary);
   font-weight: 500;

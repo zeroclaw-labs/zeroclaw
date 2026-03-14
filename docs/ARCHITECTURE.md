@@ -207,7 +207,7 @@ ZeroClaw runs as invisible background process.
 │  │  WebView (UI)                               │  │
 │  │  ┌─────────────────────────────────────┐    │  │
 │  │  │  React / TypeScript Frontend        │    │  │
-│  │  │  Chat, Voice, Settings, Billing     │    │  │
+│  │  │  Chat, Voice, Document, Settings    │    │  │
 │  │  └───────────────┬─────────────────────┘    │  │
 │  │                  │ Tauri IPC commands        │  │
 │  │                  ▼                          │  │
@@ -434,7 +434,7 @@ MoA organizes all user interactions into **7 top-bar categories** and
 | Category | Korean | UI Mode | Tool Scope |
 |----------|--------|---------|------------|
 | **WebGeneral** | 웹/일반 | default chat | BASE + VISION |
-| **Document** | 문서 | default chat | BASE |
+| **Document** | 문서 | `document` editor (2-layer viewer+Tiptap) | BASE + DOCUMENT |
 | **Coding** | 코딩 | `sandbox` | ALL tools (unrestricted) |
 | **Image** | 이미지 | default chat | BASE + VISION |
 | **Music** | 음악 | default chat | BASE |
@@ -481,6 +481,24 @@ src/
 ├── telemetry/           # Telemetry collection
 ├── plugins/             # Plugin loader
 └── ...                  # (auth, hooks, rag, etc.)
+
+clients/tauri/               # Native desktop/mobile app (Tauri 2.x + React + TypeScript) ← MoA primary
+├── src/App.tsx              # Main app shell — page routing, sidebar, auth flow
+├── src/components/
+│   ├── Chat.tsx             # AI chat interface
+│   ├── DocumentEditor.tsx   # 2-layer document editor orchestrator ← NEW
+│   ├── DocumentViewer.tsx   # Read-only iframe viewer (pdf2htmlEX/PyMuPDF HTML) ← NEW
+│   ├── TiptapEditor.tsx     # Tiptap WYSIWYG Markdown editor (Layer 2) ← NEW
+│   ├── Sidebar.tsx          # Navigation sidebar (chat list, document editor entry)
+│   ├── Interpreter.tsx      # Real-time simultaneous interpretation
+│   ├── Login.tsx / SignUp.tsx / Settings.tsx
+│   └── ...
+├── src/lib/
+│   ├── api.ts               # API client (ZeroClaw gateway + Railway relay)
+│   ├── i18n.ts              # Locale support (ko, en)
+│   └── storage.ts           # Chat session persistence (localStorage)
+├── src-tauri/src/lib.rs     # Tauri Rust host — IPC commands, PDF conversion pipeline
+└── src-tauri/Cargo.toml
 
 web/                     # Web dashboard UI (Vite + React + TypeScript)  ← MoA addition
 ├── src/pages/           # AgentChat, Config, Cost, Cron, Dashboard, Devices, …
@@ -807,6 +825,128 @@ the native app — the gateway handles WebSocket connections from any
 authenticated browser session. Memory, ontology state, and sync all work
 identically regardless of whether the client is the Tauri app or a web
 browser.
+
+---
+
+## 6C. Document Processing & 2-Layer Editor Architecture
+
+### Overview
+
+MoA provides a document processing pipeline that converts PDF and Office
+files into viewable and editable formats. The architecture uses a **2-layer
+split-pane design** that separates the original document view from
+structural editing.
+
+### 2-Layer Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  DocumentEditor (orchestrator)                                   │
+│                                                                  │
+│  ┌─────────── Left Pane (50%) ───────────┐ ┌── Right Pane (50%) ─┐
+│  │  Layer 1: DocumentViewer              │ │  Layer 2: TiptapEditor│
+│  │  ┌──────────────────────────────────┐ │ │  ┌──────────────────┐│
+│  │  │  Sandboxed <iframe>              │ │ │  │  Tiptap WYSIWYG  ││
+│  │  │  sandbox="allow-same-origin"     │ │ │  │  (Markdown-based)││
+│  │  │                                  │ │ │  │                  ││
+│  │  │  Original HTML (read-only)       │ │ │  │  Structural edit ││
+│  │  │  from pdf2htmlEX / PyMuPDF       │ │ │  │  Bold, Heading,  ││
+│  │  │                                  │ │ │  │  Table, List,    ││
+│  │  │  Never modified after upload     │ │ │  │  Code, Align...  ││
+│  │  └──────────────────────────────────┘ │ │  └──────────────────┘│
+│  └───────────────────────────────────────┘ └─────────────────────┘│
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**Key design decision**: `viewer.html` is always "원본 전용" (original-only).
+Edits happen exclusively in the Tiptap editor and are persisted as
+Markdown + JSON. This avoids layout-breaking issues with
+absolute-positioned pdf2htmlEX CSS.
+
+### PDF Conversion Pipeline
+
+```
+                        ┌─────────────────────┐
+   User uploads PDF ──▸ │  write_temp_file     │
+                        │  (base64 → temp .pdf)│
+                        └──────────┬──────────┘
+                                   │
+                        ┌──────────▼──────────┐
+                        │  convert_pdf_dual    │
+                        │                      │
+                        │  ┌────────────────┐  │
+                        │  │ pdf2htmlEX     │  │──▸ viewer_html (Layer 1)
+                        │  │ (layout HTML)  │  │    absolute CSS, fonts embedded
+                        │  └────────────────┘  │
+                        │                      │
+                        │  ┌────────────────┐  │
+                        │  │ PyMuPDF        │  │──▸ markdown (Layer 2)
+                        │  │ (pymupdf4llm)  │  │    structural text extraction
+                        │  └────────────────┘  │
+                        └──────────────────────┘
+
+   Fallback chain:
+   1. pdf2htmlEX + PyMuPDF (best quality)
+   2. PyMuPDF only (convert_pdf_local — HTML + Markdown from PyMuPDF)
+   3. R2 upload → Upstage OCR (image PDF / no local tools)
+```
+
+### Supported File Types
+
+| Format | Converter | Pipeline |
+|--------|-----------|----------|
+| **Digital PDF** | pdf2htmlEX + PyMuPDF | Local Tauri command |
+| **Image PDF** | Upstage Document OCR | Server (R2 → Railway) |
+| **HWP / HWPX** | Hancom converter API | Server |
+| **DOC / DOCX** | Hancom converter API | Server |
+| **XLS / XLSX** | Hancom converter API | Server |
+| **PPT / PPTX** | Hancom converter API | Server |
+
+### Data Flow
+
+```
+Upload → pdf2htmlEX produces viewer.html (Layer 1)
+       → PyMuPDF produces content.md    (Layer 2)
+
+Edit   → Tiptap modifies content.md + content.json in memory
+       → viewer.html stays as original (never re-rendered)
+
+Save   → ~/.moa/documents/<filename>/
+           content.md      — Markdown (primary editable content)
+           content.json    — Tiptap JSON (structured document tree)
+           editor.html     — HTML rendered by Tiptap (for export)
+
+Export → .md download (Markdown from Tiptap)
+       → .html download (HTML from Tiptap)
+```
+
+### Component Map
+
+| Component | File | Responsibility |
+|-----------|------|----------------|
+| `DocumentEditor` | `clients/tauri/src/components/DocumentEditor.tsx` | Orchestrator: upload routing, state management, split-pane layout, save/export |
+| `DocumentViewer` | `clients/tauri/src/components/DocumentViewer.tsx` | Read-only iframe renderer for original HTML output |
+| `TiptapEditor` | `clients/tauri/src/components/TiptapEditor.tsx` | WYSIWYG editor with Markdown bridge (tiptap-markdown) |
+| Tauri commands | `clients/tauri/src-tauri/src/lib.rs` | `write_temp_file`, `convert_pdf_dual`, `convert_pdf_local`, `save_document`, `load_document` |
+| PyMuPDF script | `scripts/pymupdf_convert.py` | PDF → HTML + Markdown extraction |
+
+### Tiptap Editor Extensions
+
+| Extension | Purpose |
+|-----------|---------|
+| `StarterKit` | Paragraphs, headings (H1–H4), bold, italic, lists, blockquote, code, horizontal rule |
+| `Table` (resizable) | Table insertion and editing |
+| `Underline` | Underline formatting |
+| `TextAlign` | Left / center / right alignment |
+| `Placeholder` | Empty-state placeholder text |
+| `Markdown` (tiptap-markdown) | Bidirectional Markdown ↔ ProseMirror bridge: `setContent()` parses MD, `getMarkdown()` serializes |
+
+### AI Integration
+
+When a document is saved, the Markdown content (up to 2000 chars) is
+automatically sent to the active chat session as `[Document updated]`
+context. This allows the AI agent to reference and discuss the document
+content during conversation.
 
 ---
 
@@ -1192,6 +1332,11 @@ These are **mandatory constraints**, not guidelines:
 | **Default LLM** | Gemini 3.0 Flash (cost-effective default) |
 | **Voice/Interp** | Gemini 2.5 Flash Native Audio (Live API) |
 | **Coding review** | Claude Opus 4.6 + Gemini 3.1 Pro |
+| **Document viewer** | pdf2htmlEX (layout-preserving PDF→HTML) |
+| **Document editor** | Tiptap (ProseMirror) + tiptap-markdown bridge |
+| **PDF extraction** | PyMuPDF / pymupdf4llm (structure→Markdown) |
+| **Document OCR** | Upstage Document AI (image PDF fallback) |
+| **Office conversion** | Hancom API (HWP, DOCX, XLSX, PPTX) |
 | **Relay server** | Railway (WebSocket relay, no persistent storage) |
 | **Encryption** | AES-256-GCM (vault, sync), ChaCha20-Poly1305 (secrets), HKDF key derivation |
 | **CI** | GitHub Actions |
@@ -1236,6 +1381,16 @@ These are **mandatory constraints**, not guidelines:
 - [x] Web dashboard (`web/` — Vite + React + TypeScript)
 - [x] Main website / homepage (`site/` — Vite + React + TypeScript)
 - [x] Patent dependent claims 14–18 for structured relational memory (`docs/ephemeral-relay-sync-patent.md`)
+
+### Recently Completed (2026-03-14)
+
+- [x] 2-layer document editor architecture (viewer + Tiptap editor split-pane) — `DocumentEditor.tsx`, `DocumentViewer.tsx`, `TiptapEditor.tsx`
+- [x] PDF dual conversion pipeline (pdf2htmlEX for viewer + PyMuPDF for editor) — `convert_pdf_dual` Tauri command in `lib.rs`
+- [x] Document persistence to filesystem — `save_document`/`load_document` Tauri commands (`~/.moa/documents/`)
+- [x] Tiptap rich-text editor with Markdown bridge — StarterKit, Table, Underline, TextAlign, Placeholder, tiptap-markdown
+- [x] Office document processing via Hancom API — HWP, HWPX, DOC, DOCX, XLS, XLSX, PPT, PPTX
+- [x] Image PDF fallback via R2 + Upstage Document OCR — server-side processing for scanned PDFs
+- [x] Markdown/HTML export from editor — `.md` and `.html` download buttons
 
 ### Recently Completed (2026-03-03)
 

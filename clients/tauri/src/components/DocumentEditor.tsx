@@ -467,10 +467,10 @@ export function DocumentEditor({
     <div className="document-editor-page">
       {/* Header */}
       <div className="chat-header">
-        <button className="header-toggle-btn" onClick={onToggleSidebar}>
+        <button className="chat-header-toggle" onClick={onToggleSidebar}>
           {sidebarOpen ? "\u2715" : "\u2630"}
         </button>
-        <div className="header-title">
+        <div className="chat-header-title">
           {doc.fileName
             ? `${locale === "ko" ? "문서 편집기" : "Document Editor"} — ${doc.fileName}`
             : (locale === "ko" ? "문서 편집기" : "Document Editor")}

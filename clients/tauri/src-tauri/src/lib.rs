@@ -994,8 +994,12 @@ fn write_temp_file(base64_data: String, extension: Option<String>) -> Result<Str
         .decode(&base64_data)
         .map_err(|e| format!("Base64 decode failed: {e}"))?;
     let ext = extension.unwrap_or_else(|| "tmp".to_string());
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     let temp_path = std::env::temp_dir()
-        .join(format!("moa_upload_{}.{}", std::process::id(), ext));
+        .join(format!("moa_upload_{}_{}.{}", std::process::id(), timestamp, ext));
     std::fs::write(&temp_path, &bytes)
         .map_err(|e| format!("Failed to write temp file: {e}"))?;
     Ok(temp_path.to_string_lossy().to_string())
