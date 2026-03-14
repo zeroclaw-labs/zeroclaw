@@ -75,6 +75,16 @@
 >
 > 最終同期日: **2026-02-19**。
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.2.1-beta.183 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| General | Incremental improvements and polish |
+
+<!-- END:WHATS_NEW -->
+
 ## 📢 お知らせボード
 
 重要なお知らせ（互換性破壊変更、セキュリティ告知、メンテナンス時間、リリース阻害事項など）をここに掲載します。
@@ -224,6 +234,18 @@ zeroclaw agent --provider anthropic -m "hello"
 - PR Workflow: [`docs/contributing/pr-workflow.md`](docs/contributing/pr-workflow.md)
 - Reviewer Playbook: [`docs/contributing/reviewer-playbook.md`](docs/contributing/reviewer-playbook.md)
 - License: MIT or Apache 2.0（[`LICENSE-MIT`](LICENSE-MIT), [`LICENSE-APACHE`](LICENSE-APACHE), [`NOTICE`](NOTICE)）
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.2.1-beta.183)
+
+1 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ---
 

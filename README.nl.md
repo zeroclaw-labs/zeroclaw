@@ -86,6 +86,16 @@ Gebouwd door studenten en leden van de Harvard, MIT en Sundai.Club gemeenschappe
 
 <p align="center"><code>Trait-gedreven architectuur · veilige runtime standaard · verwisselbare provider/kanaal/tool · alles is plugbaar</code></p>
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.2.1-beta.183 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| General | Incremental improvements and polish |
+
+<!-- END:WHATS_NEW -->
+
 ### 📢 Aankondigingen
 
 Gebruik deze tabel voor belangrijke aankondigingen (compatibiliteitswijzigingen, beveiligingsberichten, onderhoudsvensters en versieblokkades).
@@ -412,6 +422,18 @@ Een oprechte dankjewel aan de gemeenschappen en instellingen die dit open-source
 - **De Wereld en Verder** 🌍✨ — aan elke bijdrager, dromer, en bouwer daarbuiten die open source tot een kracht voor goed maakt. Dit is voor jou.
 
 We bouwen in open source omdat de beste ideeën van overal komen. Als je dit leest, ben je er deel van. Welkom. 🦀❤️
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.2.1-beta.183)
+
+1 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ Officiële Repository en Waarschuwing voor Imitatie
 

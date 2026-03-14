@@ -86,6 +86,16 @@ Binuo ng mga mag-aaral at miyembro ng Harvard, MIT, at Sundai.Club na komunidad.
 
 <p align="center"><code>Trait-driven architecture · secure-by-default runtime · swappable provider/channel/tool · lahat ay pluggable</code></p>
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.2.1-beta.183 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| General | Incremental improvements and polish |
+
+<!-- END:WHATS_NEW -->
+
 ### 📢 Mga Anunsyo
 
 Gamitin ang talahanayang ito para sa mahahalagang paunawa (compatibility changes, security notices, maintenance windows, at version blocks).
@@ -412,6 +422,18 @@ Isang taos-pusong pasasalamat sa mga komunidad at institusyon na nagbibigay-insp
 - **Ang Mundo at Higit Pa** 🌍✨ — sa bawat contributor, dreamer, at builder doon sa labas na gumagawa ng open source bilang isang puwersa para sa kabutihan. Ito ay para sa iyo.
 
 Kami ay bumubuo sa open source dahil ang mga pinakamahusay na ideya ay nagmumula sa lahat ng dako. Kung binabasa mo ito, ikaw ay bahagi nito. Maligayang pagdating. 🦀❤️
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.2.1-beta.183)
+
+1 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ Official Repository at Impersonation Warning
 

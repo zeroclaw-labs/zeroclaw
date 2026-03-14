@@ -57,6 +57,16 @@
 
 ---
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.2.1-beta.183 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| General | Incremental improvements and polish |
+
+<!-- END:WHATS_NEW -->
+
 ## ZeroClaw কী?
 
 ZeroClaw হল একটি হালকা, মিউটেবল এবং এক্সটেনসিবল AI অ্যাসিস্ট্যান্ট ইনফ্রাস্ট্রাকচার যা রাস্টে তৈরি। এটি বিভিন্ন LLM প্রদানকারীদের (Anthropic, OpenAI, Google, Ollama, ইত্যাদি) একটি ইউনিফাইড ইন্টারফেসের মাধ্যমে সংযুক্ত করে এবং একাধিক চ্যানেল (Telegram, Matrix, CLI, ইত্যাদি) সমর্থন করে।
@@ -177,3 +187,15 @@ channels:
 যদি ZeroClaw আপনার জন্য উপযোগী হয়, তবে অনুগ্রহ করে আমাদের একটি কফি কিনতে বিবেচনা করুন:
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee)](https://buymeacoffee.com/argenistherose)
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.2.1-beta.183)
+
+1 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->

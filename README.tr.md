@@ -86,6 +86,16 @@ Harvard, MIT ve Sundai.Club topluluklarının öğrencileri ve üyeleri tarafın
 
 <p align="center"><code>Trait tabanlı mimari · varsayılan olarak güvenli çalışma zamanı · değiştirilebilir sağlayıcı/kanal/araç · her şey eklenebilir</code></p>
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.2.1-beta.183 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| General | Incremental improvements and polish |
+
+<!-- END:WHATS_NEW -->
+
 ### 📢 Duyurular
 
 Önemli duyurular için bu tabloyu kullanın (uyumluluk değişiklikleri, güvenlik bildirimleri, bakım pencereleri ve sürüm engellemeleri).
@@ -412,6 +422,18 @@ Bu açık kaynak çalışmasını ilham veren ve besleyen topluluklara ve kuruml
 - **Dünya ve Ötesi** 🌍✨ — açık kaynağı iyi bir güç haline getiren her katılımcı, hayalper ve inşa edene. Bu senin için.
 
 En iyi fikirler her yerden geldiği için açık kaynakta inşa ediyoruz. Bunu okuyorsan, bunun bir parçasısın. Hoş geldin. 🦀❤️
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.2.1-beta.183)
+
+1 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ Resmi Depo ve Taklit Uyarısı
 

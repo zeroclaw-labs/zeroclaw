@@ -84,6 +84,16 @@
 
 <p align="center"><code>Kiến trúc trait-driven · mặc định bảo mật · provider/channel/tool hoán đổi tự do · mọi thứ đều dễ mở rộng</code></p>
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.2.1-beta.183 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| General | Incremental improvements and polish |
+
+<!-- END:WHATS_NEW -->
+
 ### 📢 Thông báo
 
 Bảng này dành cho các thông báo quan trọng (thay đổi không tương thích, cảnh báo bảo mật, lịch bảo trì, vấn đề chặn release).
@@ -455,6 +465,18 @@ Chân thành cảm ơn các cộng đồng và tổ chức đã truyền cảm h
 - **Thế giới & Xa hơn** 🌍✨ — gửi đến mọi người đóng góp, người dám mơ và người dám làm đang biến mã nguồn mở thành sức mạnh tích cực. Tất cả là dành cho các bạn.
 
 Chúng tôi xây dựng công khai vì ý tưởng hay đến từ khắp nơi. Nếu bạn đang đọc đến đây, bạn đã là một phần của chúng tôi. Chào mừng. 🦀❤️
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.2.1-beta.183)
+
+1 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ Repository Chính thức & Cảnh báo Mạo danh
 

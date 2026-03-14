@@ -86,6 +86,16 @@
 
 <p align="center"><code>بنية قائمة على السمات · وقت تشغيل آمن افتراضيًا · موفر/قناة/أداة قابلة للتبديل · كل شيء قابل للتوصيل</code></p>
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.2.1-beta.183 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| General | Incremental improvements and polish |
+
+<!-- END:WHATS_NEW -->
+
 ### 📢 الإعلانات
 
 استخدم هذا الجدول للإشعارات المهمة (تغييرات التوافق، إشعارات الأمان، نوافذ الصيانة، وحجوز الإصدارات).
@@ -412,6 +422,18 @@ zeroclaw version             # عرض الإصدار ومعلومات البنا
 - **العالم وما بعده** 🌍✨ — لكل مساهم وحالم وباني هناك يجعل المصدر المفتوح قوة للخير. هذا من أجلك.
 
 نحن نبني في المصدر المفتوح لأن أفضل الأفكار تأتي من كل مكان. إذا كنت تقرأ هذا، فأنت جزء منه. مرحبًا. 🦀❤️
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.2.1-beta.183)
+
+1 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ المستودع الرسمي وتحذير الانتحال
 
