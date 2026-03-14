@@ -110,7 +110,7 @@ jobs:
           if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
           fi
-          cargo build --release --locked --target ${{ matrix.target }}
+          cargo build --release --all --locked --all-features --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
