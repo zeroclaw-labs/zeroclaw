@@ -836,9 +836,17 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     let next_default_provider: Arc<dyn Provider> = Arc::from(next_default_provider);
 
     if let Err(err) = next_default_provider.warmup().await {
+        if crate::providers::reliable::is_non_retryable(&err) {
+            tracing::warn!(
+                provider = %next_defaults.default_provider,
+                model = %next_defaults.model,
+                "Rejecting config reload: model not available (non-retryable): {err}"
+            );
+            return Ok(());
+        }
         tracing::warn!(
             provider = %next_defaults.default_provider,
-            "Provider warmup failed after config reload: {err}"
+            "Provider warmup failed after config reload (retryable, applying anyway): {err}"
         );
     }
 
