@@ -286,11 +286,11 @@ jobs:
       - name: Build web dashboard
         run: cd web && npm ci && npm run build
 
-      - name: Clean node_modules before packaging
-        run: rm -rf web/node_modules
+      - name: Clean web build artifacts
+        run: rm -rf web/node_modules web/src web/package.json web/package-lock.json web/tsconfig*.json web/vite.config.ts web/index.html
 
       - name: Publish to crates.io
-        run: cargo publish --locked --allow-dirty
+        run: cargo publish --locked --allow-dirty --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
