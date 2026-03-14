@@ -1332,20 +1332,14 @@ mod tests {
     fn detect_homebrew_var_dir_from_cellar_path() {
         let exe = PathBuf::from("/opt/homebrew/Cellar/zeroclaw/1.2.3/bin/zeroclaw");
         let var_dir = detect_homebrew_var_dir(&exe);
-        assert_eq!(
-            var_dir,
-            Some(PathBuf::from("/opt/homebrew/var/zeroclaw"))
-        );
+        assert_eq!(var_dir, Some(PathBuf::from("/opt/homebrew/var/zeroclaw")));
     }
 
     #[test]
     fn detect_homebrew_var_dir_intel_cellar_path() {
         let exe = PathBuf::from("/usr/local/Cellar/zeroclaw/1.0.0/bin/zeroclaw");
         let var_dir = detect_homebrew_var_dir(&exe);
-        assert_eq!(
-            var_dir,
-            Some(PathBuf::from("/usr/local/var/zeroclaw"))
-        );
+        assert_eq!(var_dir, Some(PathBuf::from("/usr/local/var/zeroclaw")));
     }
 
     #[test]
