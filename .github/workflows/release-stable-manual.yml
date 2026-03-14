@@ -175,6 +175,7 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/**/*
+            install.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -186,7 +187,7 @@ jobs:
             -H "Authorization: token $PAT" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/zeroclaw-labs/zeroclaw-website/dispatches \
-            -d '{"event_type":"new-release"}'
+            -d '{"event_type":"new-release","client_payload":{"install_script_url":"https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh"}}'
 
   docker:
     name: Push Docker Image

@@ -181,6 +181,13 @@ const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
+/// Proactive context-window budget in estimated characters (~4 chars/token).
+/// When the total character count of conversation history exceeds this limit,
+/// older turns are dropped before the request is sent to the provider,
+/// preventing context-window-exceeded errors.  Set conservatively below
+/// common context windows (128 k tokens ≈ 512 k chars) to leave room for
+/// system prompt, memory context, and model output.
+const PROACTIVE_CONTEXT_BUDGET_CHARS: usize = 400_000;
 /// Guardrail for hook-modified outbound channel content.
 const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
@@ -929,6 +936,31 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 
     *turns = compacted;
     true
+}
+
+/// Proactively trim conversation turns so that the total estimated character
+/// count stays within [`PROACTIVE_CONTEXT_BUDGET_CHARS`].  Drops the oldest
+/// turns first, but always preserves the most recent turn (the current user
+/// message).  Returns the number of turns dropped.
+fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
+    let total_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
+    if total_chars <= budget || turns.len() <= 1 {
+        return 0;
+    }
+
+    let mut excess = total_chars.saturating_sub(budget);
+    let mut drop_count = 0;
+
+    // Walk from the oldest turn forward, but never drop the very last turn.
+    while excess > 0 && drop_count < turns.len().saturating_sub(1) {
+        excess = excess.saturating_sub(turns[drop_count].content.chars().count());
+        drop_count += 1;
+    }
+
+    if drop_count > 0 {
+        turns.drain(..drop_count);
+    }
+    drop_count
 }
 
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
@@ -1808,6 +1840,19 @@ async fn process_channel_message(
         if turn.content.contains("<tool_result") {
             turn.content = strip_tool_result_content(&turn.content);
         }
+    }
+
+    // Proactively trim conversation history before sending to the provider
+    // to prevent context-window-exceeded errors (bug #3460).
+    let dropped = proactive_trim_turns(&mut prior_turns, PROACTIVE_CONTEXT_BUDGET_CHARS);
+    if dropped > 0 {
+        tracing::info!(
+            channel = %msg.channel,
+            sender = %msg.sender,
+            dropped_turns = dropped,
+            remaining_turns = prior_turns.len(),
+            "Proactively trimmed conversation history to fit context budget"
+        );
     }
 
     // Only enrich with memory context when there is no prior conversation
@@ -4042,6 +4087,53 @@ mod tests {
                 || (len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3
                     && turn.content.ends_with("..."))
         }));
+    }
+
+    #[test]
+    fn proactive_trim_drops_oldest_turns_when_over_budget() {
+        // Each message is 100 chars; 10 messages = 1000 chars total.
+        let mut turns: Vec<ChatMessage> = (0..10)
+            .map(|i| {
+                let content = format!("m{i}-{}", "a".repeat(96));
+                if i % 2 == 0 {
+                    ChatMessage::user(content)
+                } else {
+                    ChatMessage::assistant(content)
+                }
+            })
+            .collect();
+
+        // Budget of 500 should drop roughly half (oldest turns).
+        let dropped = proactive_trim_turns(&mut turns, 500);
+        assert!(dropped > 0, "should have dropped some turns");
+        assert!(turns.len() < 10, "should have fewer turns after trimming");
+        // Last turn should always be preserved.
+        assert!(
+            turns.last().unwrap().content.starts_with("m9-"),
+            "most recent turn must be preserved"
+        );
+        // Total chars should now be within budget.
+        let total: usize = turns.iter().map(|t| t.content.chars().count()).sum();
+        assert!(total <= 500, "total chars {total} should be within budget");
+    }
+
+    #[test]
+    fn proactive_trim_noop_when_within_budget() {
+        let mut turns = vec![
+            ChatMessage::user("hello".to_string()),
+            ChatMessage::assistant("hi there".to_string()),
+        ];
+        let dropped = proactive_trim_turns(&mut turns, 10_000);
+        assert_eq!(dropped, 0);
+        assert_eq!(turns.len(), 2);
+    }
+
+    #[test]
+    fn proactive_trim_preserves_last_turn_even_when_over_budget() {
+        let mut turns = vec![ChatMessage::user("x".repeat(2000))];
+        let dropped = proactive_trim_turns(&mut turns, 100);
+        assert_eq!(dropped, 0, "single turn must never be dropped");
+        assert_eq!(turns.len(), 1);
     }
 
     #[test]
