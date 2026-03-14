@@ -281,7 +281,7 @@ jobs:
     name: Push Docker Image
     needs: [version, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
