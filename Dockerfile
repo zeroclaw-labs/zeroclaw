@@ -88,7 +88,20 @@ FROM debian:trixie-slim@sha256:f6e2cfac5cf956ea044b4bd75e6397b4372ad88fe00908045
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
+    git \
     && rm -rf /var/lib/apt/lists/*
+
+# Install gh CLI (GitHub CLI for PR creation from claude_code tool / remote-control sessions)
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      | tee /etc/apt/sources.list.d/github-cli.list > /dev/null && \
+    apt-get update && apt-get install -y gh && \
+    rm -rf /var/lib/apt/lists/*
+
+# Set git identity for the container user
+RUN git config --system user.name "ZeroClaw Agent" && \
+    git config --system user.email "zeroclaw@noreply.github.com"
 
 # Install Node.js and Claude Code CLI for claude_code tool support.
 # Auth: run `claude login` once in the container (persists in /zeroclaw-data/.claude/).
