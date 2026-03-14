@@ -313,6 +313,8 @@ pub struct TelegramChannel {
     transcription: Option<crate::config::TranscriptionConfig>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
+    /// Per-channel proxy URL override.
+    proxy_url: Option<String>,
 }
 
 impl TelegramChannel {
@@ -344,7 +346,14 @@ impl TelegramChannel {
             transcription: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
+            proxy_url: None,
         }
+    }
+
+    /// Set a per-channel proxy URL that overrides the global proxy config.
+    pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
+        self.proxy_url = proxy_url;
+        self
     }
 
     /// Configure workspace directory for saving downloaded attachments.
@@ -429,7 +438,7 @@ impl TelegramChannel {
     }
 
     fn http_client(&self) -> reqwest::Client {
-        crate::config::build_runtime_proxy_client("channel.telegram")
+        crate::config::build_channel_proxy_client("channel.telegram", self.proxy_url.as_deref())
     }
 
     fn normalize_identity(value: &str) -> String {

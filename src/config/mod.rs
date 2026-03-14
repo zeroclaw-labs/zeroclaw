@@ -3,7 +3,8 @@ pub mod traits;
 
 #[allow(unused_imports)]
 pub use schema::{
-    apply_runtime_proxy_to_builder, build_runtime_proxy_client,
+    apply_channel_proxy_to_builder, apply_runtime_proxy_to_builder, build_channel_proxy_client,
+    build_channel_proxy_client_with_timeouts, build_runtime_proxy_client,
     build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
     AgentConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
     BuiltinHooksConfig, ChannelsConfig, ClassificationRule, ComposioConfig, Config, CostConfig,
@@ -47,6 +48,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            proxy_url: None,
         };
 
         let discord = DiscordConfig {
@@ -55,6 +57,7 @@ mod tests {
             allowed_users: vec![],
             listen_to_bots: false,
             mention_only: false,
+            proxy_url: None,
         };
 
         let lark = LarkConfig {
@@ -67,6 +70,7 @@ mod tests {
             use_feishu: false,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         };
         let feishu = FeishuConfig {
             app_id: "app-id".into(),
@@ -76,6 +80,7 @@ mod tests {
             allowed_users: vec![],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         };
 
         let nextcloud_talk = NextcloudTalkConfig {
@@ -83,6 +88,7 @@ mod tests {
             app_token: "app-token".into(),
             webhook_secret: None,
             allowed_users: vec!["*".into()],
+            proxy_url: None,
         };
 
         assert_eq!(telegram.allowed_users.len(), 1);
