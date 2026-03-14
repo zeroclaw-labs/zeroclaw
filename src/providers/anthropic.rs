@@ -320,19 +320,23 @@ impl AnthropicProvider {
                             content: blocks,
                         });
                     } else {
-                        native_messages.push(NativeMessage {
-                            role: "assistant".to_string(),
-                            content: vec![NativeContentOut::Text {
-                                text: msg.content.clone(),
-                                cache_control: None,
-                            }],
-                        });
+                        // Skip assistant messages with empty content to avoid
+                        // Anthropic API 400 error: "text content blocks must be non-empty"
+                        if !msg.content.trim().is_empty() {
+                            native_messages.push(NativeMessage {
+                                role: "assistant".to_string(),
+                                content: vec![NativeContentOut::Text {
+                                    text: msg.content.clone(),
+                                    cache_control: None,
+                                }],
+                            });
+                        }
                     }
                 }
                 "tool" => {
                     if let Some(tool_result) = Self::parse_tool_result_message(&msg.content) {
                         native_messages.push(tool_result);
-                    } else {
+                    } else if !msg.content.trim().is_empty() {
                         native_messages.push(NativeMessage {
                             role: "user".to_string(),
                             content: vec![NativeContentOut::Text {

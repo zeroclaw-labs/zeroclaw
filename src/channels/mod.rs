@@ -2153,6 +2153,10 @@ async fn process_channel_message(
                 && !outbound_response.trim().is_empty()
             {
                 "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
+            } else if sanitized_response.trim().is_empty() {
+                // Prevent empty responses from being stored in history, which
+                // would cause Anthropic API 400 errors on subsequent turns.
+                "(no response)".to_string()
             } else {
                 sanitized_response
             };
