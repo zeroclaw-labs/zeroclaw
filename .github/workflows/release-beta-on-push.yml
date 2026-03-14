@@ -54,12 +54,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Use a wider range — find the previous minor/major version tag
-          # (skip other betas of the same base version to capture all contributors)
-          BASE_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
-          CURRENT_BASE="v${BASE_VERSION}"
+          # Use a wider range — find the previous stable tag to capture all
+          # contributors across the full release cycle, not just one beta bump
           PREV_TAG=$(git tag --sort=-creatordate \
-            | grep -v "^${CURRENT_BASE}-beta\." \
+            | grep -vE '\-beta\.' \
             | head -1 || echo "")
           if [ -z "$PREV_TAG" ]; then
             RANGE="HEAD"

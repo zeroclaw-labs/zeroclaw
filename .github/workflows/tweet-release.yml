@@ -35,12 +35,11 @@ jobs:
           if [ -n "$MANUAL_TEXT" ]; then
             TWEET="$MANUAL_TEXT"
           else
-            # Use a wider range — find the previous minor/major version tag
-            # (skip other betas of the same version to capture all contributors)
-            CURRENT_BASE=$(echo "$RELEASE_TAG" | sed 's/-beta\..*//')
+            # Use a wider range — find the previous stable tag to capture all
+            # contributors across the full release cycle, not just one beta bump
             PREV_TAG=$(git tag --sort=-creatordate \
               | grep -v "^${RELEASE_TAG}$" \
-              | grep -v "^${CURRENT_BASE}-beta\." \
+              | grep -vE '\-beta\.' \
               | head -1 || echo "")
             if [ -z "$PREV_TAG" ]; then
               RANGE="HEAD"
