@@ -58,7 +58,7 @@
 
 <p align="center">
   <a href="#quick-start">Bắt đầu</a> |
-  <a href="install.sh">Cài đặt một lần bấm</a> |
+  <a href="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh">Cài đặt một lần bấm</a> |
   <a href="docs/i18n/vi/README.md">Trung tâm tài liệu</a> |
   <a href="docs/SUMMARY.md">Mục lục tài liệu</a>
 </p>

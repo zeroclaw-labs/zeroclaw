@@ -2112,14 +2112,7 @@ async fn execute_one_tool(
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<ToolExecutionOutcome> {
-    let args_summary = {
-        let raw = call_arguments.to_string();
-        if raw.len() > 300 {
-            format!("{}…", &raw[..300])
-        } else {
-            raw
-        }
-    };
+    let args_summary = truncate_with_ellipsis(&call_arguments.to_string(), 300);
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
         arguments: Some(args_summary),
@@ -2961,8 +2954,9 @@ pub async fn run(
     ));
 
     // ── Memory (the brain) ────────────────────────────────────────
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
         &config.memory,
+        &config.embedding_routes,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
@@ -3554,8 +3548,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.autonomy,
         &config.workspace_dir,
     ));
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
         &config.memory,
+        &config.embedding_routes,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
@@ -3843,6 +3838,26 @@ mod tests {
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
         assert!(scrubbed.contains("public"));
     }
+
+    #[tokio::test]
+    async fn execute_one_tool_does_not_panic_on_utf8_boundary() {
+        let call_arguments = (0..600)
+            .map(|n| serde_json::json!({ "content": format!("{}：tail", "a".repeat(n)) }))
+            .find(|args| {
+                let raw = args.to_string();
+                raw.len() > 300 && !raw.is_char_boundary(300)
+            })
+            .expect("should produce a sample whose byte index 300 is not a char boundary");
+
+        let observer = NoopObserver;
+        let result = execute_one_tool("unknown_tool", call_arguments, &[], &observer, None).await;
+        assert!(result.is_ok(), "execute_one_tool should not panic or error");
+
+        let outcome = result.unwrap();
+        assert!(!outcome.success);
+        assert!(outcome.output.contains("Unknown tool: unknown_tool"));
+    }
+
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::traits::ProviderCapabilities;
