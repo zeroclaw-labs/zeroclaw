@@ -120,14 +120,32 @@ jobs:
               "$RELEASE_TAG" "$FEATURES" "$TOTAL_COUNT" "$RELEASE_URL")
           fi
 
-          # Append release URL if not already present and we have one
-          if [ -n "$RELEASE_URL" ] && ! echo "$TWEET" | grep -q "$RELEASE_URL"; then
-            TWEET=$(printf "%s\n\n%s" "$TWEET" "$RELEASE_URL")
+          # X/Twitter counts any URL as 23 chars (t.co shortening).
+          # Extract the URL (if present), truncate the BODY to fit, then
+          # re-append the URL so it is never chopped.
+          URL=""
+          BODY="$TWEET"
+
+          # Pull URL out of existing tweet text or use RELEASE_URL
+          FOUND_URL=$(echo "$TWEET" | grep -oE 'https?://[^ ]+' | tail -1 || true)
+          if [ -n "$FOUND_URL" ]; then
+            URL="$FOUND_URL"
+            BODY=$(echo "$TWEET" | sed "s|${URL}||" | sed -e 's/[[:space:]]*$//')
+          elif [ -n "$RELEASE_URL" ]; then
+            URL="$RELEASE_URL"
           fi
 
-          # Truncate to 280 chars if needed
-          if [ ${#TWEET} -gt 280 ]; then
-            TWEET="${TWEET:0:277}..."
+          if [ -n "$URL" ]; then
+            # URL counts as 23 chars on X + 2 chars for \n\n separator = 25
+            MAX_BODY=$((280 - 25))
+            if [ ${#BODY} -gt $MAX_BODY ]; then
+              BODY="${BODY:0:$((MAX_BODY - 3))}..."
+            fi
+            TWEET=$(printf "%s\n\n%s" "$BODY" "$URL")
+          else
+            if [ ${#TWEET} -gt 280 ]; then
+              TWEET="${TWEET:0:277}..."
+            fi
           fi
 
           echo "--- Tweet preview ---"
