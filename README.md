@@ -58,7 +58,7 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 
 <p align="center">
   <a href="#quick-start">Getting Started</a> |
-  <a href="install.sh">One-Click Setup</a> |
+  <a href="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh">One-Click Setup</a> |
   <a href="docs/README.md">Docs Hub</a> |
   <a href="docs/SUMMARY.md">Docs TOC</a>
 </p>
