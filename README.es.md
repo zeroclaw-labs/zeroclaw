@@ -88,7 +88,7 @@ Construido por estudiantes y miembros de las comunidades de Harvard, MIT y Sunda
 
 <!-- BEGIN:WHATS_NEW -->
 
-### 🚀 What's New in v0.2.1-beta.188 (March 2026)
+### 🚀 What's New in v0.2.2-beta.190 (March 2026)
 
 | Area | Highlights |
 |---|---|
@@ -426,7 +426,7 @@ Construimos en código abierto porque las mejores ideas vienen de todas partes. 
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
 
-### 🌟 Recent Contributors (v0.2.1-beta.188)
+### 🌟 Recent Contributors (v0.2.2-beta.190)
 
 3 contributors shipped features, fixes, and improvements in this release cycle:
 

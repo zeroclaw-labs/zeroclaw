@@ -88,7 +88,7 @@ Zbudowany przez studentów i członków społeczności Harvard, MIT i Sundai.Clu
 
 <!-- BEGIN:WHATS_NEW -->
 
-### 🚀 What's New in v0.2.1-beta.188 (March 2026)
+### 🚀 What's New in v0.2.2-beta.190 (March 2026)
 
 | Area | Highlights |
 |---|---|
@@ -426,7 +426,7 @@ Budujemy w open source ponieważ najlepsze pomysły przychodzą zewsząd. Jeśli
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
 
-### 🌟 Recent Contributors (v0.2.1-beta.188)
+### 🌟 Recent Contributors (v0.2.2-beta.190)
 
 3 contributors shipped features, fixes, and improvements in this release cycle:
 

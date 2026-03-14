@@ -92,7 +92,7 @@ Erstellt von Studenten und Mitgliedern der Harvard, MIT und Sundai.Club Gemeinsc
 
 <!-- BEGIN:WHATS_NEW -->
 
-### 🚀 What's New in v0.2.1-beta.188 (March 2026)
+### 🚀 What's New in v0.2.2-beta.190 (March 2026)
 
 | Area | Highlights |
 |---|---|
@@ -430,7 +430,7 @@ Wir bauen in Open Source, weil die besten Ideen von überall kommen. Wenn du das
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
 
-### 🌟 Recent Contributors (v0.2.1-beta.188)
+### 🌟 Recent Contributors (v0.2.2-beta.190)
 
 3 contributors shipped features, fixes, and improvements in this release cycle:
 
