@@ -231,6 +231,74 @@ impl SignalChannel {
         Ok(parsed.get("result").cloned())
     }
 
+    /// Build the JSON body for the `/v2/send` REST endpoint.
+    ///
+    /// The v2 REST API is required for message editing — the JSON-RPC `send`
+    /// method silently ignores edit parameters.
+    fn build_v2_send_body(
+        &self,
+        recipient: &str,
+        text: &str,
+        edit_timestamp: Option<i64>,
+    ) -> serde_json::Value {
+        let recipients = match Self::parse_recipient_target(recipient) {
+            RecipientTarget::Direct(id) => serde_json::json!([id]),
+            RecipientTarget::Group(gid) => serde_json::json!([gid]),
+        };
+
+        let mut body = serde_json::json!({
+            "message": text,
+            "number": &self.account,
+            "recipients": recipients,
+        });
+
+        if let Some(ts) = edit_timestamp {
+            body["edit_timestamp"] = serde_json::json!(ts);
+        }
+
+        body
+    }
+
+    /// Send a message via the `/v2/send` REST endpoint, returning the
+    /// response timestamp as a string (used as message ID for edits).
+    async fn v2_send(
+        &self,
+        recipient: &str,
+        text: &str,
+        edit_timestamp: Option<i64>,
+    ) -> anyhow::Result<Option<String>> {
+        let url = format!("{}/v2/send", self.http_url);
+        let body = self.build_v2_send_body(recipient, text, edit_timestamp);
+
+        let resp = self
+            .http_client()
+            .post(&url)
+            .timeout(Duration::from_secs(30))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Signal v2/send error ({status}): {text}");
+        }
+
+        let parsed: serde_json::Value = resp.json().await?;
+        let ts = parsed
+            .get("timestamp")
+            .and_then(|t| t.as_str().or_else(|| t.as_i64().map(|_| "")))
+            .map(String::from)
+            .or_else(|| {
+                parsed
+                    .get("timestamp")
+                    .and_then(|t| t.as_i64())
+                    .map(|t| t.to_string())
+            });
+        Ok(ts)
+    }
+
     /// Process a single SSE envelope, returning a ChannelMessage if valid.
     fn process_envelope(&self, envelope: &Envelope) -> Option<ChannelMessage> {
         // Skip story messages when configured
@@ -556,33 +624,12 @@ impl Channel for SignalChannel {
         }
 
         let text = if message.content.is_empty() {
-            "\u{1f9e0} Working...".to_string()
+            "\u{1f9e0} Working..."
         } else {
-            message.content.clone()
+            &message.content
         };
 
-        let params = match Self::parse_recipient_target(&message.recipient) {
-            RecipientTarget::Direct(number) => serde_json::json!({
-                "recipient": [number],
-                "message": text,
-                "account": &self.account,
-            }),
-            RecipientTarget::Group(group_id) => serde_json::json!({
-                "groupId": group_id,
-                "message": text,
-                "account": &self.account,
-            }),
-        };
-
-        let result = self.rpc_request("send", params).await?;
-        // The send RPC returns { "timestamp": <millis> } — use it as the
-        // message ID for subsequent edits via `editTimestamp`.
-        let ts = result
-            .as_ref()
-            .and_then(|r| r.get("timestamp"))
-            .and_then(|t| t.as_i64())
-            .map(|t| t.to_string());
-        Ok(ts)
+        self.v2_send(&message.recipient, text, None).await
     }
 
     async fn update_draft(
@@ -595,29 +642,7 @@ impl Channel for SignalChannel {
             anyhow::anyhow!("invalid Signal draft message ID (expected timestamp): {message_id}")
         })?;
 
-        let params = match Self::parse_recipient_target(recipient) {
-            RecipientTarget::Direct(number) => serde_json::json!({
-                "recipient": [number],
-                "message": text,
-                "account": &self.account,
-                "editTimestamp": edit_ts,
-            }),
-            RecipientTarget::Group(group_id) => serde_json::json!({
-                "groupId": group_id,
-                "message": text,
-                "account": &self.account,
-                "editTimestamp": edit_ts,
-            }),
-        };
-
-        let result = self.rpc_request("send", params).await?;
-        // Return the new timestamp so the next edit targets the latest version.
-        let new_ts = result
-            .as_ref()
-            .and_then(|r| r.get("timestamp"))
-            .and_then(|t| t.as_i64())
-            .map(|t| t.to_string());
-        Ok(new_ts)
+        self.v2_send(recipient, text, Some(edit_ts)).await
     }
 
     async fn finalize_draft(
@@ -626,7 +651,6 @@ impl Channel for SignalChannel {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
-        // Final edit — same as update_draft, just ignore the returned timestamp.
         self.update_draft(recipient, message_id, text).await?;
         Ok(())
     }
@@ -689,6 +713,43 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn build_v2_send_body_includes_edit_timestamp_for_edits() {
+        let ch = make_channel_with_edits();
+        let body = ch.build_v2_send_body("+1111111111", "updated text", Some(1773509376671));
+
+        // Must use snake_case edit_timestamp (v2 REST API), not camelCase editTimestamp (JSON-RPC)
+        assert_eq!(body["edit_timestamp"], 1773509376671_i64);
+        assert_eq!(body["message"], "updated text");
+        assert_eq!(body["number"], "+1234567890"); // bot's account
+        assert!(body.get("editTimestamp").is_none(), "must NOT use camelCase editTimestamp");
+    }
+
+    #[test]
+    fn build_v2_send_body_omits_edit_timestamp_for_new_messages() {
+        let ch = make_channel_with_edits();
+        let body = ch.build_v2_send_body("+1111111111", "hello", None);
+
+        assert!(body.get("edit_timestamp").is_none());
+        assert_eq!(body["message"], "hello");
+    }
+
+    #[test]
+    fn build_v2_send_body_uses_recipients_for_direct() {
+        let ch = make_channel_with_edits();
+        let body = ch.build_v2_send_body("+1111111111", "test", None);
+
+        assert_eq!(body["recipients"], serde_json::json!(["+1111111111"]));
+    }
+
+    #[test]
+    fn build_v2_send_body_uses_recipients_for_group() {
+        let ch = make_channel_with_edits();
+        let body = ch.build_v2_send_body("group:testgroup123", "test", None);
+
+        assert_eq!(body["recipients"], serde_json::json!(["testgroup123"]));
     }
 
     fn make_envelope(source_number: Option<&str>, message: Option<&str>) -> Envelope {
