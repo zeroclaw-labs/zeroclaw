@@ -287,7 +287,7 @@ jobs:
         run: cd web && npm ci && npm run build
 
       - name: Publish to crates.io
-        run: cargo publish --locked
+        run: cargo publish --locked --allow-dirty
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 

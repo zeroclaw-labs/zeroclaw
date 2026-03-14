@@ -65,16 +65,16 @@ jobs:
         run: cd web && npm ci && npm run build
 
       - name: Verify package
-        run: cargo package --locked
+        run: cargo package --locked --allow-dirty
 
       - name: Publish (dry run)
         if: inputs.dry_run
-        run: cargo publish --dry-run --locked
+        run: cargo publish --dry-run --locked --allow-dirty
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
       - name: Publish to crates.io
         if: "!inputs.dry_run"
-        run: cargo publish --locked
+        run: cargo publish --locked --allow-dirty
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
