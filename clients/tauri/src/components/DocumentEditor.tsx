@@ -19,7 +19,7 @@
  * Supports: PDF (digital + image), HWP, HWPX, DOC, DOCX, XLS, XLSX, PPT, PPTX
  */
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { type Locale } from "../lib/i18n";
 import { apiClient } from "../lib/api";
 import { DocumentViewer } from "./DocumentViewer";
@@ -52,6 +52,8 @@ interface DocumentEditorProps {
   initialHtml?: string;
   /** Callback when document is saved/updated — sends Markdown to AI */
   onDocumentUpdate?: (markdown: string, html: string) => void;
+  /** Optional file name to auto-load a previously saved document */
+  initialFileName?: string;
 }
 
 interface DocumentState {
@@ -83,6 +85,7 @@ export function DocumentEditor({
   sidebarOpen,
   initialHtml,
   onDocumentUpdate,
+  initialFileName,
 }: DocumentEditorProps) {
   // Editor open/close state — starts closed (viewer only)
   const [editorOpen, setEditorOpen] = useState(false);
@@ -101,6 +104,78 @@ export function DocumentEditor({
 
   const tiptapRef = useRef<TiptapEditorHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Saved documents list for the "Open" picker
+  const [savedDocs, setSavedDocs] = useState<string[]>([]);
+  const [showSavedDocs, setShowSavedDocs] = useState(false);
+
+  // Fetch saved documents list on mount (Tauri only)
+  useEffect(() => {
+    if (!isTauriApp() || !tauriInvoke) return;
+    tauriInvoke("list_documents", {})
+      .then((result) => {
+        const r = result as { documents: string[] };
+        setSavedDocs(r.documents || []);
+      })
+      .catch(() => {});
+  }, []);
+
+  // Auto-load a saved document if initialFileName is provided
+  useEffect(() => {
+    if (!initialFileName || !isTauriApp() || !tauriInvoke) return;
+    tauriInvoke("load_document", { fileName: initialFileName })
+      .then((result) => {
+        const r = result as { success: boolean; markdown: string; tiptap_json?: string };
+        if (r.success && r.markdown) {
+          setDoc({
+            viewerHtml: "",
+            markdown: r.markdown,
+            tiptapJson: r.tiptap_json ? JSON.parse(r.tiptap_json) : null,
+            fileName: initialFileName,
+            docType: "saved",
+            engine: "local",
+            isModified: false,
+          });
+          setEditorOpen(true);
+        }
+      })
+      .catch(() => {});
+  }, [initialFileName]);
+
+  // Load a previously saved document by name
+  const handleLoadSavedDocument = useCallback(async (name: string) => {
+    if (!isTauriApp() || !tauriInvoke) return;
+    setShowSavedDocs(false);
+    setIsUploading(true);
+    setUploadProgress(locale === "ko" ? "문서 불러오는 중..." : "Loading document...");
+    try {
+      const result = await tauriInvoke("load_document", { fileName: name }) as {
+        success: boolean;
+        markdown: string;
+        tiptap_json?: string;
+      };
+      if (result.success && result.markdown) {
+        setDoc({
+          viewerHtml: "",
+          markdown: result.markdown,
+          tiptapJson: result.tiptap_json ? JSON.parse(result.tiptap_json) : null,
+          fileName: name,
+          docType: "saved",
+          engine: "local",
+          isModified: false,
+        });
+        setEditorOpen(true);
+        if (onDocumentUpdate && result.markdown) {
+          onDocumentUpdate(result.markdown, "");
+        }
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load document");
+    } finally {
+      setIsUploading(false);
+      setUploadProgress("");
+    }
+  }, [locale, onDocumentUpdate]);
 
   // ── Apply conversion result (sets both viewer HTML and editor Markdown) ──
   const applyDualResult = useCallback((result: {
@@ -158,53 +233,58 @@ export function DocumentEditor({
         }) as string;
 
         // Run both conversions: pdf2htmlEX (viewer) + PyMuPDF (editor)
-        const result = await tauriInvoke("convert_pdf_dual", {
-          filePath: tempPath,
-        }) as {
-          success: boolean;
-          viewer_html: string;
-          markdown: string;
-          page_count: number;
-          engine: string;
-        };
+        try {
+          const result = await tauriInvoke("convert_pdf_dual", {
+            filePath: tempPath,
+          }) as {
+            success: boolean;
+            viewer_html: string;
+            markdown: string;
+            page_count: number;
+            engine: string;
+          };
 
-        if (result.success && result.viewer_html && result.viewer_html.length > 100) {
-          applyDualResult({
-            viewer_html: result.viewer_html,
-            markdown: result.markdown,
-            doc_type: "digital_pdf",
-            engine: result.engine || "pdf2htmlEX+pymupdf",
-            page_count: result.page_count,
-          }, file.name);
-          return;
-        }
+          if (result.success && result.viewer_html && result.viewer_html.length > 100) {
+            applyDualResult({
+              viewer_html: result.viewer_html,
+              markdown: result.markdown,
+              doc_type: "digital_pdf",
+              engine: result.engine || "pdf2htmlEX+pymupdf",
+              page_count: result.page_count,
+            }, file.name);
+            return;
+          }
 
-        // Fallback: try PyMuPDF-only conversion (pdf2htmlEX not available)
-        setUploadProgress(
-          locale === "ko"
-            ? "PyMuPDF 로컬 변환 중..."
-            : "Trying PyMuPDF local conversion..."
-        );
+          // Fallback: try PyMuPDF-only conversion (pdf2htmlEX not available)
+          setUploadProgress(
+            locale === "ko"
+              ? "PyMuPDF 로컬 변환 중..."
+              : "Trying PyMuPDF local conversion..."
+          );
 
-        const fallback = await tauriInvoke("convert_pdf_local", {
-          filePath: tempPath,
-        }) as {
-          success: boolean;
-          html: string;
-          markdown: string;
-          page_count: number;
-          engine: string;
-        };
+          const fallback = await tauriInvoke("convert_pdf_local", {
+            filePath: tempPath,
+          }) as {
+            success: boolean;
+            html: string;
+            markdown: string;
+            page_count: number;
+            engine: string;
+          };
 
-        if (fallback.success && fallback.html && fallback.html.length > 100) {
-          applyDualResult({
-            viewer_html: fallback.html,
-            markdown: fallback.markdown,
-            doc_type: "digital_pdf",
-            engine: fallback.engine || "pymupdf4llm",
-            page_count: fallback.page_count,
-          }, file.name);
-          return;
+          if (fallback.success && fallback.html && fallback.html.length > 100) {
+            applyDualResult({
+              viewer_html: fallback.html,
+              markdown: fallback.markdown,
+              doc_type: "digital_pdf",
+              engine: fallback.engine || "pymupdf4llm",
+              page_count: fallback.page_count,
+            }, file.name);
+            return;
+          }
+        } finally {
+          // Clean up the temp file after conversion (success or failure)
+          tauriInvoke("cleanup_temp_file", { filePath: tempPath })?.catch(() => {});
         }
       } catch {
         // Local conversion not available → fall through to server
@@ -420,6 +500,10 @@ export function DocumentEditor({
           tiptapJson: JSON.stringify(tiptapJson),
           editorHtml,
         });
+        // Refresh saved docs list after successful save
+        tauriInvoke("list_documents", {})
+          .then((r) => setSavedDocs((r as { documents: string[] }).documents || []))
+          .catch(() => {});
       } catch {
         // Filesystem save failed — content still in memory
       }
@@ -503,6 +587,33 @@ export function DocumentEditor({
         >
           {locale === "ko" ? "업로드" : "Upload"}
         </button>
+
+        {/* Open saved document (Tauri only) */}
+        {isTauriApp() && savedDocs.length > 0 && (
+          <div style={{ position: "relative", display: "inline-block" }}>
+            <button
+              className="toolbar-btn"
+              onClick={() => setShowSavedDocs((p) => !p)}
+              disabled={isUploading}
+              title={locale === "ko" ? "저장된 문서 열기" : "Open saved document"}
+            >
+              {locale === "ko" ? "열기" : "Open"}
+            </button>
+            {showSavedDocs && (
+              <div className="saved-docs-dropdown">
+                {savedDocs.map((name) => (
+                  <button
+                    key={name}
+                    className="saved-doc-item"
+                    onClick={() => handleLoadSavedDocument(name)}
+                  >
+                    {name}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         <span className="toolbar-divider" />
 

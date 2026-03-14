@@ -617,7 +617,7 @@ export function Interpreter({
     <div className="interpreter-page">
       {/* Header */}
       <div className="chat-header">
-        <button className="header-toggle-btn" onClick={onToggleSidebar}>
+        <button className="chat-header-toggle" onClick={onToggleSidebar}>
           {sidebarOpen ? "\u2715" : "\u2630"}
         </button>
         <div className="header-title">{t("interpreter", locale)}</div>

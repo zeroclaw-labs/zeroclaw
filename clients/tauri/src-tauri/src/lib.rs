@@ -987,6 +987,9 @@ fn find_pymupdf_script() -> Option<String> {
 /// Write binary data (base64-encoded) to a temporary file.
 /// Returns the generated temp file path. Used by the frontend to stage
 /// PDF uploads for local conversion without needing tauri-plugin-path.
+///
+/// Note: The caller should invoke `cleanup_temp_file` after conversion
+/// is complete to avoid leaving stale files in the OS temp directory.
 #[tauri::command]
 fn write_temp_file(base64_data: String, extension: Option<String>) -> Result<String, String> {
     use base64::Engine;
@@ -1003,6 +1006,27 @@ fn write_temp_file(base64_data: String, extension: Option<String>) -> Result<Str
     std::fs::write(&temp_path, &bytes)
         .map_err(|e| format!("Failed to write temp file: {e}"))?;
     Ok(temp_path.to_string_lossy().to_string())
+}
+
+/// Remove a temporary file created by `write_temp_file`.
+/// Only deletes files inside the OS temp directory with the `moa_upload_` prefix
+/// to prevent misuse as a general file-deletion command.
+#[tauri::command]
+fn cleanup_temp_file(file_path: String) -> Result<(), String> {
+    let path = std::path::Path::new(&file_path);
+    let temp_dir = std::env::temp_dir();
+
+    // Safety: only allow deletion of moa_upload_ files in the temp directory
+    let in_temp = path.parent().map_or(false, |p| p == temp_dir);
+    let is_moa = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map_or(false, |n| n.starts_with("moa_upload_"));
+
+    if in_temp && is_moa {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(())
 }
 
 // ── 2-Layer Document Commands ─────────────────────────────────────
@@ -1204,6 +1228,34 @@ fn load_document(
     }))
 }
 
+/// List previously saved documents from ~/.moa/documents/.
+/// Returns an array of document names that can be loaded via `load_document`.
+#[tauri::command]
+fn list_documents() -> Result<serde_json::Value, String> {
+    let home = dirs_next::home_dir()
+        .ok_or_else(|| "Cannot find home directory".to_string())?;
+    let doc_dir = home.join(".moa").join("documents");
+
+    if !doc_dir.exists() {
+        return Ok(serde_json::json!({ "documents": [] }));
+    }
+
+    let mut docs = Vec::new();
+    let entries = std::fs::read_dir(&doc_dir)
+        .map_err(|e| format!("Failed to read documents directory: {e}"))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() && path.join("content.md").exists() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                docs.push(name.to_string());
+            }
+        }
+    }
+    docs.sort();
+
+    Ok(serde_json::json!({ "documents": docs }))
+}
+
 /// Sanitize a filename for use as a directory name (remove path separators and special chars).
 fn sanitize_filename(name: &str) -> String {
     let stem = std::path::Path::new(name)
@@ -1278,8 +1330,10 @@ pub fn run() {
             convert_pdf_local,
             convert_pdf_dual,
             write_temp_file,
+            cleanup_temp_file,
             save_document,
             load_document,
+            list_documents,
         ])
         .setup(|app| {
             // Override data_dir with Tauri's actual app data path
