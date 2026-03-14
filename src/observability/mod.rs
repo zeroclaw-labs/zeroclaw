@@ -3,7 +3,7 @@ pub mod multi;
 pub mod noop;
 #[cfg(feature = "observability-otel")]
 pub mod otel;
-#[cfg(feature = "metrics")]
+#[cfg(feature = "observability-prometheus")]
 pub mod prometheus;
 pub mod runtime_trace;
 pub mod traits;
@@ -16,7 +16,7 @@ pub use self::multi::MultiObserver;
 pub use noop::NoopObserver;
 #[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
-#[cfg(feature = "metrics")]
+#[cfg(feature = "observability-prometheus")]
 pub use prometheus::PrometheusObserver;
 pub use traits::{Observer, ObserverEvent};
 #[allow(unused_imports)]
@@ -28,15 +28,16 @@ use crate::config::ObservabilityConfig;
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     match config.backend.as_str() {
         "log" => Box::new(LogObserver::new()),
+        "verbose" => Box::new(VerboseObserver::new()),
         "prometheus" => {
-            #[cfg(feature = "metrics")]
+            #[cfg(feature = "observability-prometheus")]
             {
                 Box::new(PrometheusObserver::new())
             }
-            #[cfg(not(feature = "metrics"))]
+            #[cfg(not(feature = "observability-prometheus"))]
             {
                 tracing::warn!(
-                    "Prometheus backend requested but this build was compiled without `metrics`; falling back to noop."
+                    "Prometheus backend requested but this build was compiled without `observability-prometheus`; falling back to noop."
                 );
                 Box::new(NoopObserver)
             }
@@ -113,12 +114,21 @@ mod tests {
     }
 
     #[test]
+    fn factory_verbose_returns_verbose() {
+        let cfg = ObservabilityConfig {
+            backend: "verbose".into(),
+            ..ObservabilityConfig::default()
+        };
+        assert_eq!(create_observer(&cfg).name(), "verbose");
+    }
+
+    #[test]
     fn factory_prometheus_returns_prometheus() {
         let cfg = ObservabilityConfig {
             backend: "prometheus".into(),
             ..ObservabilityConfig::default()
         };
-        let expected = if cfg!(feature = "metrics") {
+        let expected = if cfg!(feature = "observability-prometheus") {
             "prometheus"
         } else {
             "noop"

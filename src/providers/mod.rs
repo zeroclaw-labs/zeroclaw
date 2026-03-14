@@ -680,6 +680,12 @@ pub struct ProviderRuntimeOptions {
     /// HTTP request timeout in seconds for LLM provider API calls.
     /// `None` uses the provider's built-in default (120s for compatible providers).
     pub provider_timeout_secs: Option<u64>,
+    /// Extra HTTP headers to include in provider API requests.
+    /// These are merged from the config file and `ZEROCLAW_EXTRA_HEADERS` env var.
+    pub extra_headers: std::collections::HashMap<String, String>,
+    /// Custom API path suffix for OpenAI-compatible providers
+    /// (e.g. "/v2/generate" instead of the default "/chat/completions").
+    pub api_path: Option<String>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -691,6 +697,8 @@ impl Default for ProviderRuntimeOptions {
             secrets_encrypt: true,
             reasoning_enabled: None,
             provider_timeout_secs: None,
+            extra_headers: std::collections::HashMap::new(),
+            api_path: None,
         }
     }
 }
@@ -997,15 +1005,24 @@ fn create_provider_with_url_and_options(
     api_url: Option<&str>,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    // Closure to optionally apply the configured provider timeout to
-    // OpenAI-compatible providers before boxing them as trait objects.
+    // Closure to optionally apply the configured provider timeout and extra
+    // headers to OpenAI-compatible providers before boxing them as trait objects.
     let compat = {
         let timeout = options.provider_timeout_secs;
+        let extra_headers = options.extra_headers.clone();
+        let api_path = options.api_path.clone();
         move |p: OpenAiCompatibleProvider| -> Box<dyn Provider> {
-            match timeout {
-                Some(t) => Box::new(p.with_timeout_secs(t)),
-                None => Box::new(p),
+            let mut p = p;
+            if let Some(t) = timeout {
+                p = p.with_timeout_secs(t);
             }
+            if !extra_headers.is_empty() {
+                p = p.with_extra_headers(extra_headers.clone());
+            }
+            if api_path.is_some() {
+                p = p.with_api_path(api_path.clone());
+            }
+            Box::new(p)
         }
     };
 
@@ -1057,11 +1074,20 @@ fn create_provider_with_url_and_options(
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
         "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
-        "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
-            api_url,
-            key,
-            options.reasoning_enabled,
-        ))),
+        "ollama" => {
+
+                let env_url = std::env::var("ZEROCLAW_PROVIDER_URL").ok();
+
+                let api_url = env_url
+                    .as_deref()
+                    .or(api_url);
+
+                Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
+                    api_url,
+                    key,
+                    options.reasoning_enabled,
+                )))
+        },
         "gemini" | "google" | "google-gemini" => {
             let state_dir = options
                 .zeroclaw_dir
@@ -3068,5 +3094,41 @@ mod tests {
         // Keys without a recognisable prefix should never flag a mismatch.
         assert_eq!(check_api_key_prefix("openai", "my-custom-key-123"), None);
         assert_eq!(check_api_key_prefix("anthropic", "some-random-key"), None);
+    }
+
+    #[test]
+    fn provider_runtime_options_default_has_empty_extra_headers() {
+        let options = ProviderRuntimeOptions::default();
+        assert!(options.extra_headers.is_empty());
+    }
+
+    #[test]
+    fn provider_runtime_options_extra_headers_passed_through() {
+        let mut extra_headers = std::collections::HashMap::new();
+        extra_headers.insert("X-Title".to_string(), "zeroclaw".to_string());
+        let options = ProviderRuntimeOptions {
+            extra_headers,
+            ..ProviderRuntimeOptions::default()
+        };
+        assert_eq!(options.extra_headers.len(), 1);
+        assert_eq!(options.extra_headers.get("X-Title").unwrap(), "zeroclaw");
+    }
+
+    #[test]
+    fn env_provider_url_overrides_api_url() {
+        std::env::set_var("ZEROCLAW_PROVIDER_URL", "http://env-ollama:11434");
+
+        let options = ProviderRuntimeOptions::default();
+
+        let provider = create_provider_with_url_and_options(
+            "ollama",
+            Some("http://config-ollama:11434"),
+            None,
+            &options,
+        );
+
+        assert!(provider.is_ok());
+
+        std::env::remove_var("ZEROCLAW_PROVIDER_URL");
     }
 }
