@@ -2046,26 +2046,37 @@ fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<(
         return Ok(());
     }
 
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    #[cfg(test)]
+    {
         bail!(
-            "Refusing to overwrite existing config at {} in non-interactive mode. Re-run with --force if overwrite is intentional.",
+            "Refusing to overwrite existing config at {} in test mode. Re-run with --force if overwrite is intentional.",
             config_path.display()
         );
     }
 
-    let confirmed = Confirm::new()
-        .with_prompt(format!(
-            "  Existing config found at {}. Re-running onboarding will overwrite config.toml and may create missing workspace files (including BOOTSTRAP.md). Continue?",
-            config_path.display()
-        ))
-        .default(false)
-        .interact()?;
+    #[cfg(not(test))]
+    {
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            bail!(
+                "Refusing to overwrite existing config at {} in non-interactive mode. Re-run with --force if overwrite is intentional.",
+                config_path.display()
+            );
+        }
 
-    if !confirmed {
-        bail!("Onboarding canceled: existing configuration was left unchanged.");
+        let confirmed = Confirm::new()
+            .with_prompt(format!(
+                "  Existing config found at {}. Re-running onboarding will overwrite config.toml and may create missing workspace files (including BOOTSTRAP.md). Continue?",
+                config_path.display()
+            ))
+            .default(false)
+            .interact()?;
+
+        if !confirmed {
+            bail!("Onboarding canceled: existing configuration was left unchanged.");
+        }
+
+        Ok(())
     }
-
-    Ok(())
 }
 
 async fn persist_workspace_selection(config_path: &Path) -> Result<()> {

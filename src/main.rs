@@ -37,12 +37,37 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+use std::path::PathBuf;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
     config::schema::validate_temperature(t)
+}
+
+fn print_no_command_help() -> Result<()> {
+    println!("No command provided.");
+    println!("Try `zeroclaw onboard --interactive` to initialize your workspace.");
+    println!();
+
+    let mut cmd = Cli::command();
+    cmd.print_help()?;
+    println!();
+
+    #[cfg(windows)]
+    pause_after_no_command_help();
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn pause_after_no_command_help() {
+    println!();
+    print!("Press Enter to exit...");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
 }
 
 mod agent;
@@ -179,6 +204,10 @@ Examples:
         /// Single message mode (don't enter interactive mode)
         #[arg(short, long)]
         message: Option<String>,
+
+        /// Load and save interactive session state in this JSON file
+        #[arg(long)]
+        session_state_file: Option<PathBuf>,
 
         /// Provider to use (openrouter, anthropic, openai, openai-codex)
         #[arg(short, long)]
@@ -662,6 +691,10 @@ async fn main() -> Result<()> {
         eprintln!("Warning: Failed to install default crypto provider: {e:?}");
     }
 
+    if std::env::args_os().len() <= 1 {
+        return print_no_command_help();
+    }
+
     let cli = Cli::parse();
 
     if let Some(config_dir) = &cli.config_dir {
@@ -815,6 +848,7 @@ async fn main() -> Result<()> {
 
         Commands::Agent {
             message,
+            session_state_file,
             provider,
             model,
             temperature,
@@ -830,6 +864,7 @@ async fn main() -> Result<()> {
                 final_temperature,
                 peripheral,
                 true,
+                session_state_file,
             )
             .await
             .map(|_| ())
@@ -2214,6 +2249,22 @@ mod tests {
         match cli.command {
             Commands::Agent { temperature, .. } => {
                 assert_eq!(temperature, None);
+            }
+            other => panic!("expected agent command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_command_parses_session_state_file() {
+        let cli =
+            Cli::try_parse_from(["zeroclaw", "agent", "--session-state-file", "session.json"])
+                .expect("agent command with session state file should parse");
+
+        match cli.command {
+            Commands::Agent {
+                session_state_file, ..
+            } => {
+                assert_eq!(session_state_file, Some(PathBuf::from("session.json")));
             }
             other => panic!("expected agent command, got {other:?}"),
         }
