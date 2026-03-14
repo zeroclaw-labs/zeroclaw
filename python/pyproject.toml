@@ -52,7 +52,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/zeroclaw-labs/zeroclaw"
-Documentation = "https://github.com/zeroclaw-labs/zeroclaw/tree/main/python"
+Documentation = "https://github.com/zeroclaw-labs/zeroclaw/tree/master/python"
 Repository = "https://github.com/zeroclaw-labs/zeroclaw"
 Issues = "https://github.com/zeroclaw-labs/zeroclaw/issues"
 

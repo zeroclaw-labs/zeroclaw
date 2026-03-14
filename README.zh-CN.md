@@ -13,9 +13,6 @@
   <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
   <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
   <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
-  <a href="https://zeroclawlabs.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
-  <a href="https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search"><img src="https://img.shields.io/badge/Xiaohongshu-Official-FF2442?style=flat" alt="Xiaohongshu: Official" /></a>
-  <a href="https://t.me/zeroclawlabs"><img src="https://img.shields.io/badge/Telegram-%40zeroclawlabs-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @zeroclawlabs" /></a>
   <a href="https://www.facebook.com/groups/zeroclaw"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
   <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
 </p>
@@ -57,26 +54,26 @@
 
 <p align="center">
   <a href="install.sh">一键部署</a> |
-  <a href="docs/setup-guides/README.md">安装入门</a> |
+  <a href="docs/i18n/zh-CN/setup-guides/README.zh-CN.md">安装入门</a> |
   <a href="docs/README.zh-CN.md">文档总览</a> |
-  <a href="docs/SUMMARY.md">文档目录</a>
+  <a href="docs/SUMMARY.zh-CN.md">文档目录</a>
 </p>
 
 <p align="center">
   <strong>场景分流：</strong>
-  <a href="docs/reference/README.md">参考手册</a> ·
-  <a href="docs/ops/README.md">运维部署</a> ·
-  <a href="docs/ops/troubleshooting.md">故障排查</a> ·
-  <a href="docs/security/README.md">安全专题</a> ·
-  <a href="docs/hardware/README.md">硬件外设</a> ·
-  <a href="docs/contributing/README.md">贡献与 CI</a>
+  <a href="docs/i18n/zh-CN/reference/README.zh-CN.md">参考手册</a> ·
+  <a href="docs/i18n/zh-CN/ops/README.zh-CN.md">运维部署</a> ·
+  <a href="docs/i18n/zh-CN/ops/troubleshooting.zh-CN.md">故障排查</a> ·
+  <a href="docs/i18n/zh-CN/security/README.zh-CN.md">安全专题</a> ·
+  <a href="docs/i18n/zh-CN/hardware/README.zh-CN.md">硬件外设</a> ·
+  <a href="docs/i18n/zh-CN/contributing/README.zh-CN.md">贡献与 CI</a>
 </p>
 
 > 本文是对 `README.md` 的人工对齐翻译（强调可读性与准确性，不做逐字直译）。
-> 
+>
 > 技术标识（命令、配置键、API 路径、Trait 名称）保持英文，避免语义漂移。
-> 
-> 最后对齐时间：**2026-02-22**。
+>
+> 最后对齐时间：**2026-03-14**。
 
 ## 📢 公告板
 
@@ -149,7 +146,7 @@ cd zeroclaw
 
 可选环境初始化：`./install.sh --install-system-deps --install-rust`（可能需要 `sudo`）。
 
-详细说明见：[`docs/setup-guides/one-click-bootstrap.md`](docs/setup-guides/one-click-bootstrap.md)。
+详细说明见：[`docs/setup-guides/one-click-bootstrap.md`](docs/i18n/zh-CN/setup-guides/one-click-bootstrap.zh-CN.md)。
 
 ## 快速开始
 
@@ -315,20 +312,20 @@ allow_public_bind = false
 - 文档总览（英文）：[`docs/README.md`](docs/README.md)
 - 统一目录（TOC）：[`docs/SUMMARY.md`](docs/SUMMARY.md)
 - 文档总览（简体中文）：[`docs/README.zh-CN.md`](docs/README.zh-CN.md)
-- 命令参考：[`docs/reference/cli/commands-reference.md`](docs/reference/cli/commands-reference.md)
-- 配置参考：[`docs/reference/api/config-reference.md`](docs/reference/api/config-reference.md)
-- Provider 参考：[`docs/reference/api/providers-reference.md`](docs/reference/api/providers-reference.md)
-- Channel 参考：[`docs/reference/api/channels-reference.md`](docs/reference/api/channels-reference.md)
-- 运维手册：[`docs/ops/operations-runbook.md`](docs/ops/operations-runbook.md)
-- 故障排查：[`docs/ops/troubleshooting.md`](docs/ops/troubleshooting.md)
-- 文档清单与分类：[`docs/maintainers/docs-inventory.md`](docs/maintainers/docs-inventory.md)
-- 项目 triage 快照（2026-02-18）：[`docs/maintainers/project-triage-snapshot-2026-02-18.md`](docs/maintainers/project-triage-snapshot-2026-02-18.md)
+- 命令参考：[`docs/reference/cli/commands-reference.md`](docs/i18n/zh-CN/reference/cli/commands-reference.zh-CN.md)
+- 配置参考：[`docs/reference/api/config-reference.md`](docs/i18n/zh-CN/reference/api/config-reference.zh-CN.md)
+- Provider 参考：[`docs/reference/api/providers-reference.md`](docs/i18n/zh-CN/reference/api/providers-reference.zh-CN.md)
+- Channel 参考：[`docs/reference/api/channels-reference.md`](docs/i18n/zh-CN/reference/api/channels-reference.zh-CN.md)
+- 运维手册：[`docs/ops/operations-runbook.md`](docs/i18n/zh-CN/ops/operations-runbook.zh-CN.md)
+- 故障排查：[`docs/ops/troubleshooting.md`](docs/i18n/zh-CN/ops/troubleshooting.zh-CN.md)
+- 文档清单与分类：[`docs/maintainers/docs-inventory.md`](docs/i18n/zh-CN/maintainers/docs-inventory.zh-CN.md)
+- 项目 triage 快照（2026-02-18）：[`docs/maintainers/project-triage-snapshot-2026-02-18.md`](docs/i18n/zh-CN/maintainers/project-triage-snapshot-2026-02-18.zh-CN.md)
 
 ## 贡献与许可证
 
 - 贡献指南：[`CONTRIBUTING.md`](CONTRIBUTING.md)
-- PR 工作流：[`docs/contributing/pr-workflow.md`](docs/contributing/pr-workflow.md)
-- Reviewer 指南：[`docs/contributing/reviewer-playbook.md`](docs/contributing/reviewer-playbook.md)
+- PR 工作流：[`docs/contributing/pr-workflow.md`](docs/i18n/zh-CN/contributing/pr-workflow.zh-CN.md)
+- Reviewer 指南：[`docs/contributing/reviewer-playbook.md`](docs/i18n/zh-CN/contributing/reviewer-playbook.zh-CN.md)
 - 许可证：MIT 或 Apache 2.0（见 [`LICENSE-MIT`](LICENSE-MIT)、[`LICENSE-APACHE`](LICENSE-APACHE) 与 [`NOTICE`](NOTICE)）
 
 ---

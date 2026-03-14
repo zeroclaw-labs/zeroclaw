@@ -221,7 +221,7 @@ ls -lh target/release/zeroclaw
 `bootstrap.sh` betiği Rust'u yükler, ZeroClaw'ı klonlar, derler ve ilk geliştirme ortamınızı ayarlar:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/bootstrap.sh | bash
 ```
 
 Bu işlem:

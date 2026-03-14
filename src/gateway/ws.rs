@@ -15,39 +15,108 @@ use axum::{
         ws::{Message, WebSocket},
         Query, State, WebSocketUpgrade,
     },
+    http::{header, HeaderMap},
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 
+/// The sub-protocol we support for the chat WebSocket.
+const WS_PROTOCOL: &str = "zeroclaw.v1";
+
+/// Prefix used in `Sec-WebSocket-Protocol` to carry a bearer token.
+const BEARER_SUBPROTO_PREFIX: &str = "bearer.";
+
 #[derive(Deserialize)]
 pub struct WsQuery {
     pub token: Option<String>,
+    pub session_id: Option<String>,
+}
+
+/// Extract a bearer token from WebSocket-compatible sources.
+///
+/// Precedence (first non-empty wins):
+/// 1. `Authorization: Bearer <token>` header
+/// 2. `Sec-WebSocket-Protocol: bearer.<token>` subprotocol
+/// 3. `?token=<token>` query parameter
+///
+/// Browsers cannot set custom headers on `new WebSocket(url)`, so the query
+/// parameter and subprotocol paths are required for browser-based clients.
+fn extract_ws_token<'a>(headers: &'a HeaderMap, query_token: Option<&'a str>) -> Option<&'a str> {
+    // 1. Authorization header
+    if let Some(t) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|auth| auth.strip_prefix("Bearer "))
+    {
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+
+    // 2. Sec-WebSocket-Protocol: bearer.<token>
+    if let Some(t) = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|protos| {
+            protos
+                .split(',')
+                .map(|p| p.trim())
+                .find_map(|p| p.strip_prefix(BEARER_SUBPROTO_PREFIX))
+        })
+    {
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+
+    // 3. ?token= query parameter
+    if let Some(t) = query_token {
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+
+    None
 }
 
 /// GET /ws/chat — WebSocket upgrade for agent chat
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
     Query(params): Query<WsQuery>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // Auth via query param (browser WebSocket limitation)
+    // Auth: check header, subprotocol, then query param (precedence order)
     if state.pairing.require_pairing() {
-        let token = params.token.as_deref().unwrap_or("");
+        let token = extract_ws_token(&headers, params.token.as_deref()).unwrap_or("");
         if !state.pairing.is_authenticated(token) {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide ?token=<bearer_token>",
+                "Unauthorized — provide Authorization header, Sec-WebSocket-Protocol bearer, or ?token= query param",
             )
                 .into_response();
         }
     }
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    // Echo Sec-WebSocket-Protocol if the client requests our sub-protocol.
+    let ws = if headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |protos| {
+            protos.split(',').any(|p| p.trim() == WS_PROTOCOL)
+        }) {
+        ws.protocols([WS_PROTOCOL])
+    } else {
+        ws
+    };
+
+    let session_id = params.session_id.clone();
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id))
         .into_response()
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<String>) {
     let (mut sender, mut receiver) = socket.split();
 
     while let Some(msg) = receiver.next().await {
@@ -162,5 +231,87 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 }));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn extract_ws_token_from_authorization_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer zc_test123".parse().unwrap());
+        assert_eq!(extract_ws_token(&headers, None), Some("zc_test123"));
+    }
+
+    #[test]
+    fn extract_ws_token_from_subprotocol() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "sec-websocket-protocol",
+            "zeroclaw.v1, bearer.zc_sub456".parse().unwrap(),
+        );
+        assert_eq!(extract_ws_token(&headers, None), Some("zc_sub456"));
+    }
+
+    #[test]
+    fn extract_ws_token_from_query_param() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            extract_ws_token(&headers, Some("zc_query789")),
+            Some("zc_query789")
+        );
+    }
+
+    #[test]
+    fn extract_ws_token_precedence_header_over_subprotocol() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer zc_header".parse().unwrap());
+        headers.insert("sec-websocket-protocol", "bearer.zc_sub".parse().unwrap());
+        assert_eq!(
+            extract_ws_token(&headers, Some("zc_query")),
+            Some("zc_header")
+        );
+    }
+
+    #[test]
+    fn extract_ws_token_precedence_subprotocol_over_query() {
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-websocket-protocol", "bearer.zc_sub".parse().unwrap());
+        assert_eq!(extract_ws_token(&headers, Some("zc_query")), Some("zc_sub"));
+    }
+
+    #[test]
+    fn extract_ws_token_returns_none_when_empty() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_ws_token(&headers, None), None);
+    }
+
+    #[test]
+    fn extract_ws_token_skips_empty_header_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer ".parse().unwrap());
+        assert_eq!(
+            extract_ws_token(&headers, Some("zc_fallback")),
+            Some("zc_fallback")
+        );
+    }
+
+    #[test]
+    fn extract_ws_token_skips_empty_query_param() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_ws_token(&headers, Some("")), None);
+    }
+
+    #[test]
+    fn extract_ws_token_subprotocol_with_multiple_entries() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "sec-websocket-protocol",
+            "zeroclaw.v1, bearer.zc_tok, other".parse().unwrap(),
+        );
+        assert_eq!(extract_ws_token(&headers, None), Some("zc_tok"));
     }
 }
