@@ -101,6 +101,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use arc_swap::ArcSwap;
+use chrono::{DateTime, FixedOffset, Utc};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
@@ -229,7 +230,11 @@ enum ChannelRuntimeCommand {
     ApproveTool(String),
     UnapproveTool(String),
     ListApprovals,
+    Checkpoint,
+    PrivateSession,
 }
+
+type PrivateSessionSet = Arc<Mutex<HashSet<String>>>;
 
 const APPROVAL_ALL_TOOLS_ONCE_TOKEN: &str = "__all_tools_once__";
 
@@ -358,6 +363,11 @@ struct ChannelRuntimeContext {
     safety_heartbeat: Option<SafetyHeartbeatConfig>,
     startup_perplexity_filter: crate::config::PerplexityFilterConfig,
     proactive_messaging: Arc<crate::config::ProactiveMessagingConfig>,
+    /// Sender keys currently in `/private` (ephemeral) mode.
+    /// Private sessions disable auto-save and hide memory tools.
+    private_sessions: PrivateSessionSet,
+    /// Tools excluded when sender is in private mode (from config).
+    private_session_excluded_tools: Vec<String>,
     /// Per-conversation injection queues for mid-turn message injection.
     /// Populated when a loop starts for a sender, removed on exit.
     injection_queues: injection::InjectionQueueMap,
@@ -406,6 +416,24 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
 
 fn assistant_memory_key(msg: &traits::ChannelMessage) -> String {
     format!("assistant_resp_{}", conversation_memory_key(msg))
+}
+
+/// Strip the Signal delivery-receipt prefix from message content so that
+/// slash commands are detected from the raw user text.
+///
+/// Signal's `listen()` prepends a `[Message delivery status …]\n\n` block
+/// to `msg.content`.  This is fine for LLM context but breaks command
+/// parsing because the content no longer starts with `/`.
+fn strip_receipt_prefix(content: &str) -> &str {
+    const PREFIX: &str = "[Message delivery status since your last message:\n";
+    let trimmed = content.trim_start();
+    if trimmed.starts_with(PREFIX) {
+        // Find the closing "]\n\n" that ends the receipt block.
+        if let Some(end) = trimmed.find("]\n\n") {
+            return trimmed[end + 3..].trim_start();
+        }
+    }
+    content
 }
 
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
@@ -800,6 +828,7 @@ fn strip_progress_section_markers(text: &str) -> String {
     text.replace(crate::agent::loop_::DRAFT_PROGRESS_SECTION_START, "")
         .replace(crate::agent::loop_::DRAFT_PROGRESS_SECTION_END, "")
 }
+
 fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
@@ -906,6 +935,8 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
     match base_command.as_str() {
         // History reset commands are safe for all channels.
         "/new" | "/clear" => Some(ChannelRuntimeCommand::NewSession),
+        "/checkpoint" => Some(ChannelRuntimeCommand::Checkpoint),
+        "/private" => Some(ChannelRuntimeCommand::PrivateSession),
         "/approve-all-once" => Some(ChannelRuntimeCommand::RequestAllToolsOnce),
         "/approve-request" => Some(ChannelRuntimeCommand::RequestToolApproval(tail)),
         "/approve-confirm" => Some(ChannelRuntimeCommand::ConfirmToolApproval(tail)),
@@ -1232,6 +1263,13 @@ fn snapshot_non_cli_excluded_tools(ctx: &ChannelRuntimeContext) -> Vec<String> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
+}
+
+fn is_sender_private(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
+    ctx.private_sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(sender_key)
 }
 
 fn filtered_tool_specs_for_runtime(
@@ -2009,6 +2047,12 @@ fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
         return true;
     }
 
+    // Safety net: filter out cron prompts and slash commands that may have
+    // been saved before the write-time filter was deployed.
+    if crate::agent::loop_::should_skip_autosave(content) {
+        return true;
+    }
+
     content.chars().count() > MEMORY_CONTEXT_MAX_CHARS
 }
 
@@ -2208,8 +2252,11 @@ async fn handle_runtime_command_if_needed(
     msg: &traits::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
 ) -> bool {
-    let is_slash_command = msg.content.trim_start().starts_with('/');
-    let Some(mut command) = parse_runtime_command(&msg.channel, &msg.content) else {
+    // Signal prepends delivery/read receipt metadata to msg.content.
+    // Strip it so slash commands like /private and /new are detected.
+    let user_text = strip_receipt_prefix(&msg.content);
+    let is_slash_command = user_text.trim_start().starts_with('/');
+    let Some(mut command) = parse_runtime_command(&msg.channel, user_text) else {
         return false;
     };
 
@@ -2441,8 +2488,57 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::NewSession => {
             clear_sender_history(ctx, &sender_key);
+            // Also exit private mode so the new session starts clean.
+            ctx.private_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&sender_key);
             rebuild_system_prompt(ctx);
             "Conversation history cleared. Starting fresh.".to_string()
+        }
+        ChannelRuntimeCommand::Checkpoint => {
+            let history: Vec<ChatMessage> = ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&sender_key)
+                .cloned()
+                .unwrap_or_default();
+
+            if history.is_empty() {
+                "Nothing to checkpoint — no conversation history for this session.".to_string()
+            } else {
+                let current = get_route_selection(ctx, &sender_key);
+                match get_or_create_provider(ctx, &current.provider).await {
+                    Ok(provider) => {
+                        crate::agent::loop_::history::checkpoint_conversation(
+                            &history,
+                            provider.as_ref(),
+                            &current.model,
+                            ctx.memory.as_ref(),
+                        )
+                        .await
+                    }
+                    Err(e) => {
+                        let safe = providers::sanitize_api_error(&e.to_string());
+                        format!("Checkpoint failed — could not initialize provider: {safe}")
+                    }
+                }
+            }
+        }
+        ChannelRuntimeCommand::PrivateSession => {
+            let mut set = ctx
+                .private_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if set.remove(&sender_key) {
+                "Private mode disabled. Auto-save and memory tools restored.".to_string()
+            } else {
+                set.insert(sender_key.clone());
+                "Private mode enabled. Auto-save disabled and memory tools hidden for this session.\n\
+                 Use /private again to return to normal mode, or /new to start a fresh (non-private) session."
+                    .to_string()
+            }
         }
         ChannelRuntimeCommand::RequestAllToolsOnce => {
             let req = ctx.approval_manager.create_non_cli_pending_request(
@@ -2959,14 +3055,19 @@ async fn build_memory_context(
     let mut context = String::new();
 
     if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
-        let mut included = 0usize;
-        let mut used_chars = 0usize;
+        // Collect qualifying entries first, then sort chronologically so the
+        // model sees older context first and the current message last.
+        let mut qualifying: Vec<(usize, String)> = Vec::new();
 
-        for entry in entries.iter().filter(|e| match e.score {
-            Some(score) => score >= min_relevance_score,
-            None => true, // keep entries without a score (e.g. non-vector backends)
-        }) {
-            if included >= MEMORY_CONTEXT_MAX_ENTRIES {
+        for (idx, entry) in entries
+            .iter()
+            .filter(|e| match e.score {
+                Some(score) => score >= min_relevance_score,
+                None => true, // keep entries without a score (e.g. non-vector backends)
+            })
+            .enumerate()
+        {
+            if qualifying.len() >= MEMORY_CONTEXT_MAX_ENTRIES {
                 break;
             }
 
@@ -2980,14 +3081,29 @@ async fn build_memory_context(
                 entry.content.clone()
             };
 
-            let line = format!("- {}: {}\n", entry.key, content);
+            qualifying.push((idx, content));
+        }
+
+        // Sort by timestamp ascending (oldest first) so the model naturally
+        // gives more weight to recent entries near the current message.
+        qualifying.sort_by(|a, b| entries[a.0].timestamp.cmp(&entries[b.0].timestamp));
+
+        let mut used_chars = 0usize;
+        let mut included = 0usize;
+
+        for (idx, content) in &qualifying {
+            let entry = &entries[*idx];
+            let age = format_memory_age(&entry.timestamp);
+            let line = format!("- {} ({}): {}\n", entry.key, age, content);
             let line_chars = line.chars().count();
             if used_chars + line_chars > MEMORY_CONTEXT_MAX_CHARS {
                 break;
             }
 
             if included == 0 {
-                context.push_str("[Memory context]\n");
+                context.push_str(
+                    "[Memory context — recalled from prior conversations, oldest first]\n",
+                );
             }
 
             context.push_str(&line);
@@ -3001,6 +3117,26 @@ async fn build_memory_context(
     }
 
     context
+}
+
+/// Format a memory timestamp as a human-readable relative age string.
+fn format_memory_age(timestamp: &str) -> String {
+    let parsed: Option<DateTime<FixedOffset>> = DateTime::parse_from_rfc3339(timestamp).ok();
+    let Some(ts) = parsed else {
+        return timestamp.to_string();
+    };
+    let delta = Utc::now().signed_duration_since(ts);
+    if delta.num_minutes() < 2 {
+        "just now".to_string()
+    } else if delta.num_minutes() < 60 {
+        format!("{}m ago", delta.num_minutes())
+    } else if delta.num_hours() < 24 {
+        format!("{}h ago", delta.num_hours())
+    } else if delta.num_days() == 1 {
+        "yesterday".to_string()
+    } else {
+        format!("{}d ago", delta.num_days())
+    }
 }
 
 /// Extract a compact summary of tool interactions from history messages added
@@ -3606,8 +3742,11 @@ or tune thresholds in config.",
             return;
         }
     };
+    let sender_is_private = is_sender_private(ctx.as_ref(), &history_key);
     if runtime_defaults.auto_save_memory
+        && !sender_is_private
         && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !crate::agent::loop_::should_skip_autosave(&msg.content)
     {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
@@ -3698,11 +3837,19 @@ or tune thresholds in config.",
         msg.channel == "cli" || should_expose_internal_tool_details(&msg.content);
     let progress_mode =
         effective_progress_mode_for_message(msg.channel.as_str(), expose_internal_tool_details);
-    let excluded_tools_snapshot = if msg.channel == "cli" {
+    let mut excluded_tools_snapshot = if msg.channel == "cli" {
         Vec::new()
     } else {
         snapshot_non_cli_excluded_tools(ctx.as_ref())
     };
+    // In private mode, also exclude memory-related tools.
+    if sender_is_private {
+        for tool in &ctx.private_session_excluded_tools {
+            if !excluded_tools_snapshot.contains(tool) {
+                excluded_tools_snapshot.push(tool.clone());
+            }
+        }
+    }
     let current_system_prompt = ctx.system_prompt.load();
     let mut system_prompt = build_channel_system_prompt(
         current_system_prompt.as_str(),
@@ -3737,6 +3884,16 @@ or tune thresholds in config.",
     let use_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
+
+    // When the channel supports draft updates (e.g. Signal with edit_messages),
+    // upgrade progress mode to at least Compact so LLM content text alongside
+    // tool calls is surfaced in the draft, while internal bookkeeping lines
+    // (e.g. "🤔 Thinking…", "💬 Got N tool calls") are still filtered out.
+    let progress_mode = if use_streaming && progress_mode == ProgressMode::Off {
+        ProgressMode::Compact
+    } else {
+        progress_mode
+    };
 
     tracing::debug!(
         channel = %msg.channel,
@@ -3809,9 +3966,15 @@ or tune thresholds in config.",
                         {
                             continue;
                         }
+                        // Clear everything and show only the latest status line.
+                        // The tool execution table will be re-populated by
+                        // DRAFT_PROGRESS_BLOCK_SENTINEL deltas as tools run.
+                        accumulated.clear();
+                        accumulated.push_str(visible_delta);
+                    } else {
+                        // Streaming final-response chunks — keep accumulating.
+                        accumulated.push_str(visible_delta);
                     }
-
-                    accumulated.push_str(visible_delta);
                 }
                 let display_text = strip_progress_section_markers(&accumulated);
                 if let Err(e) = channel
@@ -4265,6 +4428,7 @@ or tune thresholds in config.",
                 ChatMessage::assistant(&history_response),
             );
             if runtime_defaults.auto_save_memory
+                && !sender_is_private
                 && delivered_response.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
             {
                 let assistant_key = assistant_memory_key(&msg);
@@ -5411,6 +5575,7 @@ fn collect_configured_channels(
                 sig.allowed_from.clone(),
                 sig.ignore_attachments,
                 sig.ignore_stories,
+                sig.edit_messages,
             )),
         });
     }
@@ -6169,6 +6334,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
             None
         },
         proactive_messaging: Arc::new(config.proactive_messaging.clone()),
+        private_sessions: Arc::new(Mutex::new(HashSet::new())),
+        private_session_excluded_tools: config.autonomy.private_session_excluded_tools.clone(),
         injection_queues: Arc::new(Mutex::new(HashMap::new())),
     });
 
@@ -6324,6 +6491,110 @@ mod tests {
     }
 
     #[test]
+    fn parse_runtime_command_recognises_checkpoint() {
+        assert_eq!(
+            parse_runtime_command("signal", "/checkpoint"),
+            Some(ChannelRuntimeCommand::Checkpoint)
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/checkpoint"),
+            Some(ChannelRuntimeCommand::Checkpoint)
+        );
+        assert_eq!(
+            parse_runtime_command("discord", "/checkpoint"),
+            Some(ChannelRuntimeCommand::Checkpoint)
+        );
+    }
+
+    #[test]
+    fn parse_runtime_command_recognises_private() {
+        assert_eq!(
+            parse_runtime_command("signal", "/private"),
+            Some(ChannelRuntimeCommand::PrivateSession)
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/private"),
+            Some(ChannelRuntimeCommand::PrivateSession)
+        );
+        assert_eq!(
+            parse_runtime_command("discord", "/private"),
+            Some(ChannelRuntimeCommand::PrivateSession)
+        );
+    }
+
+    #[test]
+    fn strip_receipt_prefix_extracts_slash_command() {
+        let content = "[Message delivery status since your last message:\n\
+            [SIGNAL:DELIVERY_RECEIPT] Message delivered to abc (original timestamps: 123)\n\
+            [SIGNAL:READ_RECEIPT] Message read by abc (original timestamps: 123)]\n\n\
+            /private";
+        assert_eq!(strip_receipt_prefix(content), "/private");
+    }
+
+    #[test]
+    fn strip_receipt_prefix_passthrough_without_receipts() {
+        assert_eq!(strip_receipt_prefix("/new"), "/new");
+        assert_eq!(strip_receipt_prefix("hello world"), "hello world");
+    }
+
+    #[test]
+    fn parse_command_works_after_receipt_strip() {
+        let content = "[Message delivery status since your last message:\n\
+            [SIGNAL:READ_RECEIPT] Message read by abc (original timestamps: 123)]\n\n\
+            /private";
+        let user_text = strip_receipt_prefix(content);
+        assert_eq!(
+            parse_runtime_command("signal", user_text),
+            Some(ChannelRuntimeCommand::PrivateSession)
+        );
+    }
+
+    #[test]
+    fn receipt_prefixed_private_intercepted_not_sent_to_llm() {
+        let content = "[Message delivery status since your last message:\n\
+            [SIGNAL:DELIVERY_RECEIPT] Message delivered to abc (ts: 123)]\n\n\
+            /private";
+        let user_text = strip_receipt_prefix(content);
+
+        // Command is detected from cleaned text
+        assert_eq!(
+            parse_runtime_command("signal", user_text),
+            Some(ChannelRuntimeCommand::PrivateSession),
+        );
+
+        // Raw content would NOT be detected (the original bug)
+        assert_eq!(parse_runtime_command("signal", content), None);
+    }
+
+    #[test]
+    fn receipt_prefixed_regular_message_not_intercepted() {
+        let content = "[Message delivery status since your last message:\n\
+            [SIGNAL:READ_RECEIPT] Message read by abc (ts: 123)]\n\n\
+            hey what's up";
+        let user_text = strip_receipt_prefix(content);
+
+        // Regular messages should NOT match any command
+        assert_eq!(parse_runtime_command("signal", user_text), None);
+    }
+
+    #[test]
+    fn private_session_toggle() {
+        let set: PrivateSessionSet = Arc::new(Mutex::new(HashSet::new()));
+        let key = "signal_alice".to_string();
+
+        // Initially not private.
+        assert!(!set.lock().unwrap().contains(&key));
+
+        // Enter private mode.
+        set.lock().unwrap().insert(key.clone());
+        assert!(set.lock().unwrap().contains(&key));
+
+        // Toggle off.
+        set.lock().unwrap().remove(&key);
+        assert!(!set.lock().unwrap().contains(&key));
+    }
+
+    #[test]
     fn parse_runtime_command_supports_natural_language_approval_intents() {
         assert_eq!(
             parse_runtime_command("telegram", "授权工具 shell"),
@@ -6405,6 +6676,22 @@ mod tests {
             "fabricated memory"
         ));
         assert!(!should_skip_memory_context_entry("telegram_123_45", "hi"));
+    }
+
+    #[test]
+    fn memory_context_skip_rules_exclude_cron_prompts() {
+        assert!(should_skip_memory_context_entry(
+            "signal_U1_msg42",
+            "[cron:7 speakr-daily-summary] You are running inside an isolated cron session..."
+        ));
+    }
+
+    #[test]
+    fn memory_context_skip_rules_allow_normal_messages() {
+        assert!(!should_skip_memory_context_entry(
+            "signal_U1_msg43",
+            "What meetings did I have today?"
+        ));
     }
 
     #[test]
@@ -6529,6 +6816,8 @@ mod tests {
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         };
 
@@ -6589,6 +6878,8 @@ mod tests {
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         };
 
@@ -6652,6 +6943,8 @@ mod tests {
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         };
 
@@ -7338,6 +7631,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -7428,6 +7723,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -7505,6 +7802,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -7596,6 +7895,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -7686,6 +7987,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -7761,6 +8064,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -7838,6 +8143,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -7917,6 +8224,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -8027,6 +8336,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
         assert_eq!(
@@ -8168,6 +8479,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -8260,6 +8573,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -8341,6 +8656,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -8508,6 +8825,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
         assert_eq!(
@@ -8626,6 +8945,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -8739,6 +9060,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -8834,6 +9157,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -8939,6 +9264,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -9045,6 +9372,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -9199,6 +9528,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
         maybe_apply_runtime_config_update(runtime_ctx.as_ref())
@@ -9299,6 +9630,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -9452,6 +9785,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -9575,6 +9910,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -9678,6 +10015,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -9800,6 +10139,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -9923,6 +10264,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -10005,6 +10348,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -10121,6 +10466,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -10311,6 +10658,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -10471,6 +10820,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -10542,6 +10893,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -10727,6 +11080,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -10820,6 +11175,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -10925,6 +11282,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -11012,6 +11371,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -11084,6 +11445,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -11640,8 +12003,13 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
 
         let context = build_memory_context(&mem, "age", 0.0, None).await;
-        assert!(context.contains("[Memory context]"));
+        assert!(context.contains("[Memory context"));
         assert!(context.contains("Age is 45"));
+        // Should include a relative timestamp like "just now" or "Xm ago"
+        assert!(
+            context.contains("ago") || context.contains("just now"),
+            "expected relative timestamp in: {context}"
+        );
     }
 
     #[tokio::test]
@@ -11668,6 +12036,64 @@ BTC is currently around $65,000 based on latest tool output."#
         let session_a_context = build_memory_context(&mem, "age", 0.0, Some("session-a")).await;
         assert!(session_a_context.contains("age 45"));
         assert!(!session_a_context.contains("age 31"));
+    }
+
+    #[test]
+    fn format_memory_age_relative_timestamps() {
+        let now = Utc::now();
+
+        // Just now
+        let ts = now.to_rfc3339();
+        assert_eq!(format_memory_age(&ts), "just now");
+
+        // Minutes ago
+        let ts = (now - chrono::Duration::minutes(30)).to_rfc3339();
+        assert_eq!(format_memory_age(&ts), "30m ago");
+
+        // Hours ago
+        let ts = (now - chrono::Duration::hours(5)).to_rfc3339();
+        assert_eq!(format_memory_age(&ts), "5h ago");
+
+        // Yesterday
+        let ts = (now - chrono::Duration::days(1)).to_rfc3339();
+        assert_eq!(format_memory_age(&ts), "yesterday");
+
+        // Days ago
+        let ts = (now - chrono::Duration::days(3)).to_rfc3339();
+        assert_eq!(format_memory_age(&ts), "3d ago");
+
+        // Non-RFC3339 passthrough
+        assert_eq!(format_memory_age("not-a-date"), "not-a-date");
+    }
+
+    #[tokio::test]
+    async fn build_memory_context_sorts_chronologically() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        // Store two entries — "old" first, "recent" second
+        mem.store("fact_old", "Old fact from last week", MemoryCategory::Conversation, None)
+            .await
+            .unwrap();
+        // Small delay so timestamps differ
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        mem.store("fact_recent", "Recent fact from today", MemoryCategory::Conversation, None)
+            .await
+            .unwrap();
+
+        let context = build_memory_context(&mem, "fact", 0.0, None).await;
+
+        // Both should appear
+        assert!(context.contains("Old fact from last week"));
+        assert!(context.contains("Recent fact from today"));
+
+        // Old entry should appear before recent entry (chronological order)
+        let old_pos = context.find("Old fact").unwrap();
+        let recent_pos = context.find("Recent fact").unwrap();
+        assert!(
+            old_pos < recent_pos,
+            "expected chronological order: old ({old_pos}) before recent ({recent_pos})"
+        );
     }
 
     #[tokio::test]
@@ -11718,6 +12144,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -11817,6 +12245,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -11915,6 +12345,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -12017,6 +12449,8 @@ BTC is currently around $65,000 based on latest tool output."#
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -12848,6 +13282,8 @@ BTC is currently around $65,000 based on latest tool output."#;
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
@@ -12927,6 +13363,8 @@ BTC is currently around $65,000 based on latest tool output."#;
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
             proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
             injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 

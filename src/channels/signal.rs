@@ -28,6 +28,10 @@ pub struct SignalChannel {
     allowed_from: Vec<String>,
     ignore_attachments: bool,
     ignore_stories: bool,
+    /// Enable progressive message editing: send "🧠 Working..." then edit
+    /// in-place with intermediate progress and final response.  Requires
+    /// signal-cli REST API v2 (`editMessage` RPC).
+    edit_messages: bool,
 }
 
 // ── signal-cli SSE event JSON shapes ────────────────────────────
@@ -88,6 +92,7 @@ impl SignalChannel {
         allowed_from: Vec<String>,
         ignore_attachments: bool,
         ignore_stories: bool,
+        edit_messages: bool,
     ) -> Self {
         let http_url = http_url.trim_end_matches('/').to_string();
         Self {
@@ -97,6 +102,7 @@ impl SignalChannel {
             allowed_from,
             ignore_attachments,
             ignore_stories,
+            edit_messages,
         }
     }
 
@@ -539,6 +545,91 @@ impl Channel for SignalChannel {
         // auto-expire after ~15s on the client side.
         Ok(())
     }
+
+    fn supports_draft_updates(&self) -> bool {
+        self.edit_messages
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        if !self.edit_messages {
+            return Ok(None);
+        }
+
+        let text = if message.content.is_empty() {
+            "\u{1f9e0} Working...".to_string()
+        } else {
+            message.content.clone()
+        };
+
+        let params = match Self::parse_recipient_target(&message.recipient) {
+            RecipientTarget::Direct(number) => serde_json::json!({
+                "recipient": [number],
+                "message": text,
+                "account": &self.account,
+            }),
+            RecipientTarget::Group(group_id) => serde_json::json!({
+                "groupId": group_id,
+                "message": text,
+                "account": &self.account,
+            }),
+        };
+
+        let result = self.rpc_request("send", params).await?;
+        // The send RPC returns { "timestamp": <millis> } — use it as the
+        // message ID for subsequent edits via `editTimestamp`.
+        let ts = result
+            .as_ref()
+            .and_then(|r| r.get("timestamp"))
+            .and_then(|t| t.as_i64())
+            .map(|t| t.to_string());
+        Ok(ts)
+    }
+
+    async fn update_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let edit_ts: i64 = message_id.parse().map_err(|_| {
+            anyhow::anyhow!("invalid Signal draft message ID (expected timestamp): {message_id}")
+        })?;
+
+        let params = match Self::parse_recipient_target(recipient) {
+            RecipientTarget::Direct(number) => serde_json::json!({
+                "recipient": [number],
+                "message": text,
+                "account": &self.account,
+                "editTimestamp": edit_ts,
+            }),
+            RecipientTarget::Group(group_id) => serde_json::json!({
+                "groupId": group_id,
+                "message": text,
+                "account": &self.account,
+                "editTimestamp": edit_ts,
+            }),
+        };
+
+        let result = self.rpc_request("send", params).await?;
+        // Return the new timestamp so the next edit targets the latest version.
+        let new_ts = result
+            .as_ref()
+            .and_then(|r| r.get("timestamp"))
+            .and_then(|t| t.as_i64())
+            .map(|t| t.to_string());
+        Ok(new_ts)
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        // Final edit — same as update_draft, just ignore the returned timestamp.
+        self.update_draft(recipient, message_id, text).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -553,6 +644,7 @@ mod tests {
             vec!["+1111111111".to_string()],
             false,
             false,
+            false,
         )
     }
 
@@ -564,7 +656,39 @@ mod tests {
             vec!["*".to_string()],
             true,
             true,
+            false,
         )
+    }
+
+    fn make_channel_with_edits() -> SignalChannel {
+        SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            None,
+            vec!["+1111111111".to_string()],
+            false,
+            false,
+            true, // edit_messages enabled
+        )
+    }
+
+    #[test]
+    fn supports_draft_updates_follows_edit_messages_flag() {
+        let ch_off = make_channel();
+        assert!(!ch_off.supports_draft_updates());
+
+        let ch_on = make_channel_with_edits();
+        assert!(ch_on.supports_draft_updates());
+    }
+
+    #[tokio::test]
+    async fn send_draft_returns_none_when_edits_disabled() {
+        let ch = make_channel();
+        let result = ch
+            .send_draft(&crate::channels::traits::SendMessage::new("test", "+1111111111"))
+            .await
+            .unwrap();
+        assert!(result.is_none());
     }
 
     fn make_envelope(source_number: Option<&str>, message: Option<&str>) -> Envelope {
@@ -603,6 +727,7 @@ mod tests {
             vec![],
             false,
             false,
+            false,
         );
         assert_eq!(ch.http_url, "http://127.0.0.1:8686");
     }
@@ -632,6 +757,7 @@ mod tests {
             "+1234567890".to_string(),
             None,
             vec![],
+            false,
             false,
             false,
         );
@@ -825,6 +951,7 @@ mod tests {
             vec!["*".to_string()],
             false,
             false,
+            false,
         );
         let env = Envelope {
             source: Some(uuid.to_string()),
@@ -857,6 +984,7 @@ mod tests {
             "+1234567890".to_string(),
             Some("testgroup".to_string()),
             vec!["*".to_string()],
+            false,
             false,
             false,
         );
