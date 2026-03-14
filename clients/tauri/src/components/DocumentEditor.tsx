@@ -165,9 +165,15 @@ export function DocumentEditor({
           isModified: false,
         });
         setEditorOpen(true);
-        if (onDocumentUpdate && result.markdown) {
+        if (onDocumentUpdate) {
           onDocumentUpdate(result.markdown, "");
         }
+      } else {
+        setError(
+          locale === "ko"
+            ? "문서를 불러올 수 없습니다. 파일이 비어있거나 손상되었을 수 있습니다."
+            : "Could not load document. The file may be empty or corrupted."
+        );
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load document");
@@ -284,7 +290,7 @@ export function DocumentEditor({
           }
         } finally {
           // Clean up the temp file after conversion (success or failure)
-          tauriInvoke("cleanup_temp_file", { filePath: tempPath })?.catch(() => {});
+          tauriInvoke!("cleanup_temp_file", { filePath: tempPath }).catch(() => {});
         }
       } catch {
         // Local conversion not available → fall through to server
@@ -455,11 +461,17 @@ export function DocumentEditor({
   // ── "Edit" button: open Tiptap editor pane ───────────────────────
   const handleOpenEditor = useCallback(() => {
     setEditorOpen(true);
-    // Load markdown into Tiptap when it opens
-    setTimeout(() => {
-      tiptapRef.current?.setMarkdown(doc.markdown);
-      tiptapRef.current?.focus();
-    }, 100);
+    // Load markdown into Tiptap — retry until ref is available (editor may
+    // need a render cycle to mount after setEditorOpen(true))
+    const tryLoad = (attempts: number) => {
+      if (tiptapRef.current) {
+        tiptapRef.current.setMarkdown(doc.markdown);
+        tiptapRef.current.focus();
+      } else if (attempts < 10) {
+        setTimeout(() => tryLoad(attempts + 1), 50);
+      }
+    };
+    setTimeout(() => tryLoad(0), 0);
   }, [doc.markdown]);
 
   // ── Close editor pane ─────────────────────────────────────────────

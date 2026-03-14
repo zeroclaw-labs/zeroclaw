@@ -82,11 +82,14 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
       content: "",
       onUpdate: ({ editor: ed }) => {
         if (onChange) {
-          // tiptap-markdown stores getMarkdown on the editor instance or storage
-          const storage = (ed.storage as unknown) as Record<string, unknown>;
-          const markdownStorage = storage.markdown as { getMarkdown?: () => string } | undefined;
-          const md = markdownStorage?.getMarkdown?.() ?? ed.getHTML();
-          onChange(md);
+          // tiptap-markdown extension adds getMarkdown() to editor.storage.markdown
+          try {
+            const md = (ed.storage.markdown as { getMarkdown: () => string }).getMarkdown();
+            onChange(md);
+          } catch {
+            // Fallback if tiptap-markdown extension is not loaded
+            onChange(ed.getHTML());
+          }
         }
       },
     });
@@ -102,9 +105,11 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
     // Expose imperative handle
     const getMarkdown = useCallback((): string => {
       if (!editor) return "";
-      const storage = (editor.storage as unknown) as Record<string, unknown>;
-      const markdownStorage = storage.markdown as { getMarkdown?: () => string } | undefined;
-      return markdownStorage?.getMarkdown?.() ?? editor.getHTML();
+      try {
+        return (editor.storage.markdown as { getMarkdown: () => string }).getMarkdown();
+      } catch {
+        return editor.getHTML();
+      }
     }, [editor]);
 
     const getJSON = useCallback((): Record<string, unknown> => {
