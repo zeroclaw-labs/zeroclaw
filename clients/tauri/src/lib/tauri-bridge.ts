@@ -210,6 +210,44 @@ export async function onGatewayStatus(
   });
 }
 
+// ── Python environment status event listener ────────────────────
+
+export interface PythonEnvStatus {
+  stage: "creating_venv" | "venv_created" | "installing_packages" | "packages_installed" | "ready" | "error";
+  detail: string;
+}
+
+/**
+ * Listen for python-env-status events emitted by the Rust backend.
+ * These fire during first-launch setup when the app auto-installs
+ * pymupdf4llm into the embedded Python venv.
+ * Returns an unlisten function.
+ */
+export async function onPythonEnvStatus(
+  handler: (event: PythonEnvStatus) => void,
+): Promise<() => void> {
+  const listen = await getListen();
+  if (!listen) return () => {};
+  return listen("python-env-status", (e) => {
+    handler(e.payload as PythonEnvStatus);
+  });
+}
+
+/** Check the current Python environment status. */
+export async function checkPythonEnv(): Promise<{
+  venv_exists: boolean;
+  packages_installed: boolean;
+  python_path: string | null;
+} | null> {
+  const invoke = await getInvoke();
+  if (!invoke) return null;
+  return invoke("check_python_env") as Promise<{
+    venv_exists: boolean;
+    packages_installed: boolean;
+    python_path: string | null;
+  }>;
+}
+
 // ── Mobile lifecycle event listeners ─────────────────────────────
 
 /** Register a handler for Tauri lifecycle events. Returns an unlisten fn. */
