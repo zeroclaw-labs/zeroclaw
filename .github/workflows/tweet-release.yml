@@ -158,8 +158,36 @@ jobs:
             echo "TWEET_EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Post to X
+      - name: Check for duplicate tweet
+        id: dedup
         if: steps.check.outputs.skip != 'true'
+        shell: bash
+        env:
+          TWEET_TEXT: ${{ steps.tweet.outputs.text }}
+        run: |
+          # Hash the tweet content (ignore whitespace differences)
+          TWEET_HASH=$(echo "$TWEET_TEXT" | tr -s '[:space:]' | sha256sum | cut -d' ' -f1)
+          echo "hash=${TWEET_HASH}" >> "$GITHUB_OUTPUT"
+
+          # Check if we already have a cache hit for this exact tweet
+          MARKER_FILE="/tmp/tweet-dedup-${TWEET_HASH}"
+          echo "$TWEET_HASH" > "$MARKER_FILE"
+
+      - uses: actions/cache@v4
+        if: steps.check.outputs.skip != 'true'
+        id: tweet-cache
+        with:
+          path: /tmp/tweet-dedup-${{ steps.dedup.outputs.hash }}
+          key: tweet-${{ steps.dedup.outputs.hash }}
+
+      - name: Skip duplicate tweet
+        if: steps.check.outputs.skip != 'true' && steps.tweet-cache.outputs.cache-hit == 'true'
+        run: |
+          echo "::warning::Duplicate tweet detected (hash=${{ steps.dedup.outputs.hash }}) — skipping"
+          echo "This exact tweet was already posted in a previous run."
+
+      - name: Post to X
+        if: steps.check.outputs.skip != 'true' && steps.tweet-cache.outputs.cache-hit != 'true'
         shell: bash
         env:
           TWITTER_CONSUMER_KEY: ${{ secrets.TWITTER_CONSUMER_API_KEY }}
