@@ -1,0 +1,33 @@
+name: Sync README
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Sync README sections
+        run: bash .github/scripts/sync-readme.sh
+
+      - name: Commit and push
+        run: |
+          git config user.name "ZeroClaw Bot"
+          git config user.email "bot@zeroclawlabs.ai"
+          if git diff --quiet -- 'README*.md'; then
+            echo "No README changes — skipping commit"
+            exit 0
+          fi
+          git add README*.md
+          git commit -m "docs(readme): auto-sync What's New and Contributors"
+          git push origin HEAD:master

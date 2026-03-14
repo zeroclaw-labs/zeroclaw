@@ -251,6 +251,10 @@ pub struct Config {
     /// External MCP server connections (`[mcp]`).
     #[serde(default, alias = "mcpServers")]
     pub mcp: McpConfig,
+
+    /// Dynamic node discovery configuration (`[nodes]`).
+    #[serde(default)]
+    pub nodes: NodesConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -548,6 +552,39 @@ impl Default for McpConfig {
             enabled: false,
             deferred_loading: default_deferred_loading(),
             servers: Vec::new(),
+        }
+    }
+}
+
+// ── Nodes (Dynamic Node Discovery) ───────────────────────────────
+
+/// Configuration for the dynamic node discovery system (`[nodes]`).
+///
+/// When enabled, external processes/devices can connect via WebSocket
+/// at `/ws/nodes` and advertise their capabilities at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NodesConfig {
+    /// Enable dynamic node discovery endpoint.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum number of concurrent node connections.
+    #[serde(default = "default_max_nodes")]
+    pub max_nodes: usize,
+    /// Optional bearer token for node authentication.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+fn default_max_nodes() -> usize {
+    16
+}
+
+impl Default for NodesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_nodes: default_max_nodes(),
+            auth_token: None,
         }
     }
 }
@@ -3060,6 +3097,11 @@ pub struct ChannelsConfig {
     /// completion) to incoming channel messages. Default: `true`.
     #[serde(default = "default_true")]
     pub ack_reactions: bool,
+    /// Whether to send tool-call notification messages (e.g. `🔧 web_search_tool: …`)
+    /// to channel users. When `false`, tool calls are still logged server-side but
+    /// not forwarded as individual channel messages. Default: `true`.
+    #[serde(default = "default_true")]
+    pub show_tool_calls: bool,
 }
 
 impl ChannelsConfig {
@@ -3193,6 +3235,7 @@ impl Default for ChannelsConfig {
             clawdtalk: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
+            show_tool_calls: true,
         }
     }
 }
@@ -3286,6 +3329,10 @@ pub struct SlackConfig {
     /// Allowed Slack user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, a newer Slack message from the same sender in the same channel
+    /// cancels the in-flight request and starts a fresh response with preserved history.
+    #[serde(default)]
+    pub interrupt_on_new_message: bool,
 }
 
 impl ChannelConfig for SlackConfig {
@@ -4128,6 +4175,7 @@ impl Default for Config {
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
+            nodes: NodesConfig::default(),
         }
     }
 }
@@ -4647,6 +4695,23 @@ impl Config {
                     &store,
                     &mut ns.private_key,
                     "config.channels_config.nostr.private_key",
+                )?;
+            }
+            if let Some(ref mut fs) = config.channels_config.feishu {
+                decrypt_secret(
+                    &store,
+                    &mut fs.app_secret,
+                    "config.channels_config.feishu.app_secret",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut fs.encrypt_key,
+                    "config.channels_config.feishu.encrypt_key",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut fs.verification_token,
+                    "config.channels_config.feishu.verification_token",
                 )?;
             }
 
@@ -5471,11 +5536,38 @@ impl Config {
         set_runtime_proxy_config(self.proxy.clone());
     }
 
+    async fn resolve_config_path_for_save(&self) -> Result<PathBuf> {
+        if self
+            .config_path
+            .parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty())
+        {
+            return Ok(self.config_path.clone());
+        }
+
+        let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
+        let (zeroclaw_dir, _workspace_dir, source) =
+            resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
+        let file_name = self
+            .config_path
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| std::ffi::OsStr::new("config.toml"));
+        let resolved = zeroclaw_dir.join(file_name);
+        tracing::warn!(
+            path = %self.config_path.display(),
+            resolved = %resolved.display(),
+            source = source.as_str(),
+            "Config path missing parent directory; resolving from runtime environment"
+        );
+        Ok(resolved)
+    }
+
     pub async fn save(&self) -> Result<()> {
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
-        let zeroclaw_dir = self
-            .config_path
+        let config_path = self.resolve_config_path_for_save().await?;
+        let zeroclaw_dir = config_path
             .parent()
             .context("Config path must have a parent directory")?;
         let store = crate::security::SecretStore::new(zeroclaw_dir, self.secrets.encrypt);
@@ -5530,6 +5622,23 @@ impl Config {
                 &store,
                 &mut ns.private_key,
                 "config.channels_config.nostr.private_key",
+            )?;
+        }
+        if let Some(ref mut fs) = config_to_save.channels_config.feishu {
+            encrypt_secret(
+                &store,
+                &mut fs.app_secret,
+                "config.channels_config.feishu.app_secret",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut fs.encrypt_key,
+                "config.channels_config.feishu.encrypt_key",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut fs.verification_token,
+                "config.channels_config.feishu.verification_token",
             )?;
         }
 
@@ -5729,8 +5838,7 @@ impl Config {
         let toml_str =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
 
-        let parent_dir = self
-            .config_path
+        let parent_dir = config_path
             .parent()
             .context("Config path must have a parent directory")?;
 
@@ -5741,8 +5849,7 @@ impl Config {
             )
         })?;
 
-        let file_name = self
-            .config_path
+        let file_name = config_path
             .file_name()
             .and_then(|v| v.to_str())
             .unwrap_or("config.toml");
@@ -5770,9 +5877,9 @@ impl Config {
             .context("Failed to fsync temporary config file")?;
         drop(temp_file);
 
-        let had_existing_config = self.config_path.exists();
+        let had_existing_config = config_path.exists();
         if had_existing_config {
-            fs::copy(&self.config_path, &backup_path)
+            fs::copy(&config_path, &backup_path)
                 .await
                 .with_context(|| {
                     format!(
@@ -5782,10 +5889,10 @@ impl Config {
                 })?;
         }
 
-        if let Err(e) = fs::rename(&temp_path, &self.config_path).await {
+        if let Err(e) = fs::rename(&temp_path, &config_path).await {
             let _ = fs::remove_file(&temp_path).await;
             if had_existing_config && backup_path.exists() {
-                fs::copy(&backup_path, &self.config_path)
+                fs::copy(&backup_path, &config_path)
                     .await
                     .context("Failed to restore config backup")?;
             }
@@ -5795,12 +5902,11 @@ impl Config {
         #[cfg(unix)]
         {
             use std::{fs::Permissions, os::unix::fs::PermissionsExt};
-            if let Err(err) =
-                fs::set_permissions(&self.config_path, Permissions::from_mode(0o600)).await
+            if let Err(err) = fs::set_permissions(&config_path, Permissions::from_mode(0o600)).await
             {
                 tracing::warn!(
                     "Failed to harden config permissions to 0600 at {}: {}",
-                    self.config_path.display(),
+                    config_path.display(),
                     err
                 );
             }
@@ -6149,6 +6255,7 @@ default_temperature = 0.7
                 clawdtalk: None,
                 message_timeout_secs: 300,
                 ack_reactions: true,
+                show_tool_calls: true,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -6172,6 +6279,7 @@ default_temperature = 0.7
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
+            nodes: NodesConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -6462,6 +6570,7 @@ tool_dispatcher = "xml"
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
+            nodes: NodesConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -6498,6 +6607,15 @@ tool_dispatcher = "xml"
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
+        config.channels_config.feishu = Some(FeishuConfig {
+            app_id: "cli_feishu_123".into(),
+            app_secret: "feishu-secret".into(),
+            encrypt_key: Some("feishu-encrypt".into()),
+            verification_token: Some("feishu-verify".into()),
+            allowed_users: vec!["*".into()],
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+        });
 
         config.agents.insert(
             "worker".into(),
@@ -6563,6 +6681,32 @@ tool_dispatcher = "xml"
         assert_eq!(
             store.decrypt(storage_db_url).unwrap(),
             "postgres://user:pw@host/db"
+        );
+
+        let feishu = stored.channels_config.feishu.as_ref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            &feishu.app_secret
+        ));
+        assert_eq!(store.decrypt(&feishu.app_secret).unwrap(), "feishu-secret");
+        assert!(feishu
+            .encrypt_key
+            .as_deref()
+            .is_some_and(crate::security::SecretStore::is_encrypted));
+        assert_eq!(
+            store
+                .decrypt(feishu.encrypt_key.as_deref().unwrap())
+                .unwrap(),
+            "feishu-encrypt"
+        );
+        assert!(feishu
+            .verification_token
+            .as_deref()
+            .is_some_and(crate::security::SecretStore::is_encrypted));
+        assert_eq!(
+            store
+                .decrypt(feishu.verification_token.as_deref().unwrap())
+                .unwrap(),
+            "feishu-verify"
         );
 
         let _ = fs::remove_dir_all(&dir).await;
@@ -6825,6 +6969,7 @@ allowed_users = ["@ops:matrix.org"]
             clawdtalk: None,
             message_timeout_secs: 300,
             ack_reactions: true,
+            show_tool_calls: true,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -6863,6 +7008,7 @@ allowed_users = ["@ops:matrix.org"]
         let json = r#"{"bot_token":"xoxb-tok"}"#;
         let parsed: SlackConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.allowed_users.is_empty());
+        assert!(!parsed.interrupt_on_new_message);
     }
 
     #[test]
@@ -6870,6 +7016,14 @@ allowed_users = ["@ops:matrix.org"]
         let json = r#"{"bot_token":"xoxb-tok","allowed_users":["U111"]}"#;
         let parsed: SlackConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.allowed_users, vec!["U111"]);
+        assert!(!parsed.interrupt_on_new_message);
+    }
+
+    #[test]
+    async fn slack_config_deserializes_interrupt_on_new_message() {
+        let json = r#"{"bot_token":"xoxb-tok","interrupt_on_new_message":true}"#;
+        let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.interrupt_on_new_message);
     }
 
     #[test]
@@ -6891,6 +7045,7 @@ channel_id = "C123"
 "#;
         let parsed: SlackConfig = toml::from_str(toml_str).unwrap();
         assert!(parsed.allowed_users.is_empty());
+        assert!(!parsed.interrupt_on_new_message);
         assert_eq!(parsed.channel_id.as_deref(), Some("C123"));
     }
 
@@ -7041,6 +7196,7 @@ channel_id = "C123"
             clawdtalk: None,
             message_timeout_secs: 300,
             ack_reactions: true,
+            show_tool_calls: true,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -7665,6 +7821,40 @@ requires_openai_auth = true
     }
 
     #[test]
+    async fn save_repairs_bare_config_filename_using_runtime_resolution() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("workspace");
+        let resolved_config_path = temp_home.join(".zeroclaw").join("config.toml");
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
+        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+
+        let mut config = Config::default();
+        config.workspace_dir = workspace_dir;
+        config.config_path = PathBuf::from("config.toml");
+        config.default_temperature = 0.5;
+        config.save().await.unwrap();
+
+        assert!(resolved_config_path.exists());
+        let saved = tokio::fs::read_to_string(&resolved_config_path)
+            .await
+            .unwrap();
+        let parsed: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(parsed.default_temperature, 0.5);
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = tokio::fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
     async fn validate_ollama_cloud_model_requires_remote_api_url() {
         let _env_guard = env_override_lock().await;
         let config = Config {
@@ -7942,6 +8132,49 @@ default_model = "legacy-model"
         assert_eq!(config.default_model.as_deref(), Some("legacy-model"));
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    async fn load_or_init_decrypts_feishu_channel_secrets() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_home.join(".zeroclaw");
+        let config_path = config_dir.join("config.toml");
+
+        fs::create_dir_all(&config_dir).await.unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+
+        let mut config = Config::default();
+        config.config_path = config_path.clone();
+        config.workspace_dir = config_dir.join("workspace");
+        config.secrets.encrypt = true;
+        config.channels_config.feishu = Some(FeishuConfig {
+            app_id: "cli_feishu_123".into(),
+            app_secret: "feishu-secret".into(),
+            encrypt_key: Some("feishu-encrypt".into()),
+            verification_token: Some("feishu-verify".into()),
+            allowed_users: vec!["*".into()],
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+        });
+        config.save().await.unwrap();
+
+        let loaded = Config::load_or_init().await.unwrap();
+        let feishu = loaded.channels_config.feishu.as_ref().unwrap();
+        assert_eq!(feishu.app_secret, "feishu-secret");
+        assert_eq!(feishu.encrypt_key.as_deref(), Some("feishu-encrypt"));
+        assert_eq!(feishu.verification_token.as_deref(), Some("feishu-verify"));
+
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
         } else {
