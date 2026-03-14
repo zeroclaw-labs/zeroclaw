@@ -86,7 +86,7 @@
 
 <!-- BEGIN:WHATS_NEW -->
 
-### 🚀 What's New in v0.2.2-beta.190 (March 2026)
+### 🚀 What's New in v0.3.0 (March 2026)
 
 | Area | Highlights |
 |---|---|
@@ -469,7 +469,7 @@ Chúng tôi xây dựng công khai vì ý tưởng hay đến từ khắp nơi. 
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
 
-### 🌟 Recent Contributors (v0.2.2-beta.190)
+### 🌟 Recent Contributors (v0.3.0)
 
 3 contributors shipped features, fixes, and improvements in this release cycle:
 
