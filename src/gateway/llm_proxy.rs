@@ -676,12 +676,26 @@ pub async fn handle_document_process_r2(
 
     // 6. Call Upstage Document Parse with operator key
     let client = reqwest::Client::new();
+    // Derive MIME type from filename extension
+    let mime_type = match req.filename.rsplit('.').next().map(|e| e.to_lowercase()).as_deref() {
+        Some("pdf") => "application/pdf",
+        Some("doc") => "application/msword",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("ppt") => "application/vnd.ms-powerpoint",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        Some("hwp") | Some("hwpx") => "application/x-hwp",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        _ => "application/octet-stream",
+    };
     let form = reqwest::multipart::Form::new()
         .part(
             "document",
             reqwest::multipart::Part::bytes(file_data)
                 .file_name(req.filename.clone())
-                .mime_str("application/pdf")
+                .mime_str(mime_type)
                 .unwrap_or_else(|_| {
                     reqwest::multipart::Part::bytes(Vec::new())
                 }),

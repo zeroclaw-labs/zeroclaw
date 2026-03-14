@@ -40,7 +40,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "targets": "all",
+    "resources": [
+        "../../../scripts/pymupdf_convert.py"
+      ],
+      "targets": "all",
     "windows": {
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
@@ -72,6 +75,10 @@
   "plugins": {
     "shell": {
       "open": true
+    },
+    "dialog": {
+      "open": true,
+      "save": true
     },
     "updater": {
       "active": false

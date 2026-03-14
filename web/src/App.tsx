@@ -26,7 +26,7 @@ interface LocaleContextType {
 }
 
 export const LocaleContext = createContext<LocaleContextType>({
-  locale: 'tr',
+  locale: 'en',
   setAppLocale: (_locale: Locale) => {},
 });
 
@@ -75,7 +75,7 @@ function KakaoCallback() {
 
 function AppContent() {
   const { isAuthenticated, loading, pair, logout, refreshAuth } = useAuth();
-  const [locale, setLocaleState] = useState<Locale>('tr');
+  const [locale, setLocaleState] = useState<Locale>('en');
   const [requiresPairing, setRequiresPairing] = useState(true);
 
   const setAppLocale = (newLocale: Locale) => {

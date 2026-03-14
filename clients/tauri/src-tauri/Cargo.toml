@@ -25,6 +25,8 @@ dirs-next = "2"
 toml = "0.8"
 tokio = { version = "1", features = ["time", "process"] }
 base64 = "0.22"
+rusqlite = { version = "0.31", features = ["bundled", "vtab"] }
+tauri-plugin-dialog = "2"
 
 [profile.release]
 panic = "abort"

@@ -11,7 +11,7 @@ import { GatewayStatus } from "./components/GatewayStatus";
 import { DocumentEditor } from "./components/DocumentEditor";
 import { apiClient, type DeviceInfo, type ToolInfo } from "./lib/api";
 import { getStoredLocale, setStoredLocale, t, type Locale } from "./lib/i18n";
-import { isTauri, onLifecycleEvent, isAuthenticated } from "./lib/tauri-bridge";
+import { isTauri, onLifecycleEvent, isAuthenticated, onPythonEnvStatus, type PythonEnvStatus } from "./lib/tauri-bridge";
 import {
   loadChats,
   saveChats,
@@ -41,6 +41,8 @@ function App() {
   // In Tauri mode, wait for the ZeroClaw gateway to be ready before
   // allowing the user to interact with auth/chat screens.
   const [gatewayReady, setGatewayReady] = useState(!isTauri());
+  // Python environment setup status (shown as a banner during first launch)
+  const [pythonSetup, setPythonSetup] = useState<PythonEnvStatus | null>(null);
 
   const activeChat = chats.find((c) => c.id === activeChatId) ?? null;
 
@@ -51,6 +53,20 @@ function App() {
   useEffect(() => {
     setActiveChatId(activeChatId);
   }, [activeChatId]);
+
+  // Listen for Python environment setup events (first-launch auto-install)
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cleanup: (() => void) | null = null;
+    onPythonEnvStatus((status) => {
+      setPythonSetup(status);
+      // Auto-hide the banner after "ready" or "error" after a delay
+      if (status.stage === "ready") {
+        setTimeout(() => setPythonSetup(null), 3000);
+      }
+    }).then((unlisten) => { cleanup = unlisten; });
+    return () => { cleanup?.(); };
+  }, []);
 
   // Check auth on startup — show setup wizard for first-time users.
   // In Tauri mode, wait for the gateway to be ready before proceeding.
@@ -355,6 +371,22 @@ function App() {
   // Stable callback for GatewayStatus
   const handleGatewayReady = useCallback(() => setGatewayReady(true), []);
 
+  // ── Python setup banner ────────────────────────────────────────
+  const pythonBanner = pythonSetup && pythonSetup.stage !== "ready" ? (
+    <div style={{
+      position: "fixed", bottom: 16, right: 16, zIndex: 9999,
+      background: pythonSetup.stage === "error" ? "#dc2626" : "#2563eb",
+      color: "#fff", padding: "10px 16px", borderRadius: 8,
+      fontSize: 13, maxWidth: 360, boxShadow: "0 2px 8px rgba(0,0,0,0.2)",
+      display: "flex", alignItems: "center", gap: 8,
+    }}>
+      {pythonSetup.stage !== "error" && (
+        <span style={{ display: "inline-block", width: 14, height: 14, border: "2px solid #fff", borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+      )}
+      <span>{pythonSetup.detail}</span>
+    </div>
+  ) : null;
+
   // ── Render ─────────────────────────────────────────────────────
 
   // Show gateway startup overlay while waiting for backend (Tauri only)
@@ -421,6 +453,7 @@ function App() {
   // Main app (with sidebar)
   return (
     <div className="app">
+      {pythonBanner}
       <Sidebar
         chats={chats}
         activeChatId={activeChatId}

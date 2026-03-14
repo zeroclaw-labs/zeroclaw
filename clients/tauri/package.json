@@ -23,6 +23,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",
+    "@tauri-apps/plugin-dialog": "^2.0.1",
     "@tauri-apps/plugin-shell": "^2.0.1",
     "@tiptap/core": "^3.20.1",
     "@tiptap/extension-placeholder": "^3.20.1",

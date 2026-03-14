@@ -5,9 +5,11 @@
  * sandboxed iframe so absolute-positioning CSS from the converter does
  * not interfere with the app layout. The viewer is strictly read-only —
  * all editing happens in the companion TiptapEditor.
+ *
+ * Uses srcdoc for secure rendering without needing allow-same-origin.
  */
 
-import { useRef, useEffect, useCallback } from "react";
+import { useMemo } from "react";
 import { type Locale } from "../lib/i18n";
 
 interface DocumentViewerProps {
@@ -19,18 +21,10 @@ interface DocumentViewerProps {
 }
 
 export function DocumentViewer({ html, locale, className }: DocumentViewerProps) {
-  const iframeRef = useRef<HTMLIFrameElement>(null);
-
-  // Write the HTML into the iframe each time it changes
-  const renderHtml = useCallback(() => {
-    const iframe = iframeRef.current;
-    if (!iframe || !html) return;
-
-    const doc = iframe.contentDocument;
-    if (!doc) return;
-
-    // Build a self-contained HTML page with dark-mode-aware styling
-    const wrappedHtml = `<!DOCTYPE html>
+  // Build a self-contained HTML page with dark-mode-aware styling
+  const srcdoc = useMemo(() => {
+    if (!html) return "";
+    return `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -60,20 +54,7 @@ export function DocumentViewer({ html, locale, className }: DocumentViewerProps)
 </head>
 <body>${html}</body>
 </html>`;
-
-    doc.open();
-    doc.write(wrappedHtml);
-    doc.close();
   }, [html]);
-
-  useEffect(() => {
-    renderHtml();
-  }, [renderHtml]);
-
-  // Also render when iframe loads (important for initial mount)
-  const handleLoad = useCallback(() => {
-    renderHtml();
-  }, [renderHtml]);
 
   if (!html) {
     return (
@@ -89,9 +70,8 @@ export function DocumentViewer({ html, locale, className }: DocumentViewerProps)
 
   return (
     <iframe
-      ref={iframeRef}
       className={`doc-viewer-iframe ${className || ""}`}
-      onLoad={handleLoad}
+      srcDoc={srcdoc}
       sandbox="allow-same-origin"
       title={locale === "ko" ? "원본 문서 미리보기" : "Original document preview"}
     />

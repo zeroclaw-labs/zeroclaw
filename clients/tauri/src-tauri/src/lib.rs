@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
 use tauri_plugin_shell::ShellExt;
+use rusqlite::Connection;
 
 // ── State ────────────────────────────────────────────────────────
 
@@ -875,9 +876,204 @@ async fn web_search(
 
 // ── Document Processing Commands ─────────────────────────────────
 
+// ── Embedded Python Environment ──────────────────────────────────
+//
+// MoA bundles its own Python virtual environment so users never need to
+// open a terminal or run `pip install`. On first launch the app:
+//   1. Locates a system Python 3 interpreter (python3 / python).
+//   2. Creates a venv inside `~/.moa/python-env/`.
+//   3. Installs pymupdf4llm (+ markdown) into that venv automatically.
+// Subsequent launches reuse the existing venv.
+
+/// Directory name for the embedded Python venv (lives inside ~/.moa/).
+const PYTHON_VENV_DIR: &str = "python-env";
+/// Packages to auto-install into the embedded venv.
+const PYTHON_REQUIRED_PACKAGES: &[&str] = &["pymupdf4llm", "markdown"];
+
+/// Return the path to the MoA-managed venv directory (`~/.moa/python-env`).
+fn moa_venv_dir() -> Option<PathBuf> {
+    dirs_next::home_dir().map(|h| h.join(".moa").join(PYTHON_VENV_DIR))
+}
+
+/// Return the Python binary inside the MoA venv, if the venv exists.
+fn venv_python() -> Option<PathBuf> {
+    let venv = moa_venv_dir()?;
+    let bin = if cfg!(target_os = "windows") {
+        venv.join("Scripts").join("python.exe")
+    } else {
+        venv.join("bin").join("python3")
+    };
+    if bin.exists() { Some(bin) } else { None }
+}
+
+/// Find a usable Python 3 binary on the system (for creating the venv).
+fn find_system_python() -> Option<String> {
+    let names = if cfg!(target_os = "windows") {
+        vec!["python", "python3"]
+    } else {
+        vec!["python3", "python"]
+    };
+    for name in names {
+        let check = std::process::Command::new(name)
+            .arg("--version")
+            .output();
+        if let Ok(output) = check {
+            if output.status.success() {
+                let ver = String::from_utf8_lossy(&output.stdout);
+                // Accept Python 3.10+
+                if ver.contains("Python 3.") {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the best Python binary to use for running scripts.
+/// Priority: MoA venv → system python.
+fn resolve_python() -> Result<String, String> {
+    if let Some(venv_py) = venv_python() {
+        return Ok(venv_py.to_string_lossy().to_string());
+    }
+    find_system_python()
+        .ok_or_else(|| "Python 3 not found. Please install Python 3.10 or later.".to_string())
+}
+
+/// Ensure the MoA Python venv exists and required packages are installed.
+/// Called once at app startup. Emits `python-env-status` events to the
+/// frontend so the UI can show a setup progress indicator.
+async fn ensure_python_env(app_handle: tauri::AppHandle) {
+    use tokio::process::Command;
+
+    let emit = |stage: &str, detail: &str| {
+        let _ = app_handle.emit(
+            "python-env-status",
+            serde_json::json!({ "stage": stage, "detail": detail }),
+        );
+    };
+
+    // 1. Find a system Python
+    let system_python = match find_system_python() {
+        Some(p) => p,
+        None => {
+            emit("error", "Python 3 not found on this system. PDF features will be unavailable.");
+            return;
+        }
+    };
+
+    let venv_dir = match moa_venv_dir() {
+        Some(d) => d,
+        None => {
+            emit("error", "Cannot determine home directory.");
+            return;
+        }
+    };
+
+    let venv_py = if cfg!(target_os = "windows") {
+        venv_dir.join("Scripts").join("python.exe")
+    } else {
+        venv_dir.join("bin").join("python3")
+    };
+
+    // 2. Create venv if it does not exist
+    if !venv_py.exists() {
+        emit("creating_venv", "Setting up Python environment...");
+        let _ = std::fs::create_dir_all(venv_dir.parent().unwrap_or(&venv_dir));
+        let result = Command::new(&system_python)
+            .arg("-m")
+            .arg("venv")
+            .arg(venv_dir.to_string_lossy().as_ref())
+            .output()
+            .await;
+        match result {
+            Ok(output) if output.status.success() => {
+                emit("venv_created", "Python environment created.");
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                emit("error", &format!("Failed to create Python venv: {stderr}"));
+                return;
+            }
+            Err(e) => {
+                emit("error", &format!("Failed to run Python: {e}"));
+                return;
+            }
+        }
+    }
+
+    // 3. Install required packages (idempotent — pip will skip if already present)
+    let pip_bin = if cfg!(target_os = "windows") {
+        venv_dir.join("Scripts").join("pip.exe")
+    } else {
+        venv_dir.join("bin").join("pip")
+    };
+
+    // Quick check: can we import pymupdf4llm already?
+    let check = Command::new(venv_py.to_string_lossy().as_ref())
+        .arg("-c")
+        .arg("import pymupdf4llm; import markdown")
+        .output()
+        .await;
+    let already_installed = check.map_or(false, |o| o.status.success());
+
+    if !already_installed {
+        emit("installing_packages", "Installing PDF processing libraries (first-time setup)...");
+        let mut args = vec!["install", "--quiet", "--disable-pip-version-check"];
+        for pkg in PYTHON_REQUIRED_PACKAGES {
+            args.push(pkg);
+        }
+        let result = Command::new(pip_bin.to_string_lossy().as_ref())
+            .args(&args)
+            .output()
+            .await;
+        match result {
+            Ok(output) if output.status.success() => {
+                emit("packages_installed", "PDF libraries installed successfully.");
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                emit("error", &format!("Failed to install packages: {stderr}"));
+                return;
+            }
+            Err(e) => {
+                emit("error", &format!("pip failed: {e}"));
+                return;
+            }
+        }
+    }
+
+    emit("ready", "Python environment ready.");
+}
+
+/// Check the status of the embedded Python environment.
+/// Returns whether venv exists and packages are importable.
+#[tauri::command]
+async fn check_python_env() -> Result<serde_json::Value, String> {
+    let has_venv = venv_python().is_some();
+    let mut packages_ok = false;
+
+    if let Some(py) = venv_python() {
+        let check = tokio::process::Command::new(py.to_string_lossy().as_ref())
+            .arg("-c")
+            .arg("import pymupdf4llm; import markdown; print('ok')")
+            .output()
+            .await;
+        packages_ok = check.map_or(false, |o| o.status.success());
+    }
+
+    Ok(serde_json::json!({
+        "venv_exists": has_venv,
+        "packages_installed": packages_ok,
+        "python_path": venv_python().map(|p| p.to_string_lossy().to_string()),
+    }))
+}
+
+// ── PDF Conversion ───────────────────────────────────────────────
+
 /// Convert a digital PDF to HTML/Markdown locally using PyMuPDF.
 ///
-/// Runs the bundled `pymupdf_convert.py` script via the system Python.
+/// Uses the MoA-managed Python venv (auto-installed on first launch).
 /// This handles digital (text-based) PDFs entirely on the user's machine —
 /// no server or API key required.
 ///
@@ -887,13 +1083,11 @@ async fn convert_pdf_local(
     file_path: String,
     output_dir: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    // Locate the pymupdf_convert.py script
-    // In dev: ../../../../scripts/pymupdf_convert.py (relative to src-tauri/src/)
-    // In production: bundled as a resource
+    let python = resolve_python()?;
     let script_path = find_pymupdf_script()
-        .ok_or_else(|| "PyMuPDF conversion script not found. Ensure pymupdf_convert.py is in the scripts/ directory.".to_string())?;
+        .ok_or_else(|| "PyMuPDF conversion script not found.".to_string())?;
 
-    let mut cmd = tokio::process::Command::new("python3");
+    let mut cmd = tokio::process::Command::new(&python);
     cmd.arg(&script_path).arg(&file_path);
 
     if let Some(ref dir) = output_dir {
@@ -905,11 +1099,10 @@ async fn convert_pdf_local(
     let output = cmd
         .output()
         .await
-        .map_err(|e| format!("Failed to run PyMuPDF: {e}. Ensure Python 3 and pymupdf4llm are installed (pip install pymupdf4llm)."))?;
+        .map_err(|e| format!("Failed to run PyMuPDF: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Try parsing as JSON
     match serde_json::from_str::<serde_json::Value>(&stdout) {
         Ok(result) => {
             if result.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
@@ -933,7 +1126,6 @@ async fn convert_pdf_local(
 
 /// Find the pymupdf_convert.py script in known locations.
 fn find_pymupdf_script() -> Option<String> {
-    // Check relative paths from the binary location
     let candidates = [
         // Development: running from clients/tauri/src-tauri/
         "../../../../scripts/pymupdf_convert.py",
@@ -945,9 +1137,14 @@ fn find_pymupdf_script() -> Option<String> {
         "pymupdf_convert.py",
     ];
 
-    // Try relative to current exe
+    // Try relative to current exe (covers bundled production builds)
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
+            // Tauri bundles resources next to the binary
+            let resource_path = exe_dir.join("pymupdf_convert.py");
+            if resource_path.exists() {
+                return Some(resource_path.to_string_lossy().to_string());
+            }
             for candidate in &candidates {
                 let path = exe_dir.join(candidate);
                 if path.exists() {
@@ -1096,7 +1293,8 @@ async fn convert_pdf_dual(
     // Step 2: PyMuPDF for Markdown (structure extraction for editor)
     let pymupdf_script = find_pymupdf_script();
     if let Some(script_path) = pymupdf_script {
-        let output = tokio::process::Command::new("python3")
+        let python = resolve_python().unwrap_or_else(|_| "python3".to_string());
+        let output = tokio::process::Command::new(&python)
             .arg(&script_path)
             .arg(&file_path)
             .arg("--format")
@@ -1256,6 +1454,266 @@ fn list_documents() -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "documents": docs }))
 }
 
+// ── SQLite FTS5 Document Storage ─────────────────────────────
+
+/// Open (or create) the MoA documents SQLite database with FTS5 support.
+/// Database path: ~/.moa/moa_documents.db
+fn open_documents_db() -> Result<Connection, String> {
+    let home = dirs_next::home_dir()
+        .ok_or_else(|| "Cannot find home directory".to_string())?;
+    let moa_dir = home.join(".moa");
+    std::fs::create_dir_all(&moa_dir)
+        .map_err(|e| format!("Failed to create .moa directory: {e}"))?;
+
+    let db_path = moa_dir.join("moa_documents.db");
+    let conn = Connection::open(&db_path)
+        .map_err(|e| format!("Failed to open documents database: {e}"))?;
+
+    // Create documents table
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_name TEXT NOT NULL,
+            markdown TEXT NOT NULL,
+            html TEXT,
+            tiptap_json TEXT,
+            doc_type TEXT,
+            engine TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_file_name
+            ON documents(file_name);
+        "
+    ).map_err(|e| format!("Failed to create documents table: {e}"))?;
+
+    // Create FTS5 virtual table for full-text search
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+            file_name,
+            markdown,
+            content='documents',
+            content_rowid='id',
+            tokenize='unicode61'
+        );
+        -- Triggers to keep FTS index in sync
+        CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
+            INSERT INTO documents_fts(rowid, file_name, markdown)
+            VALUES (new.id, new.file_name, new.markdown);
+        END;
+        CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
+            INSERT INTO documents_fts(documents_fts, rowid, file_name, markdown)
+            VALUES ('delete', old.id, old.file_name, old.markdown);
+        END;
+        CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
+            INSERT INTO documents_fts(documents_fts, rowid, file_name, markdown)
+            VALUES ('delete', old.id, old.file_name, old.markdown);
+            INSERT INTO documents_fts(rowid, file_name, markdown)
+            VALUES (new.id, new.file_name, new.markdown);
+        END;
+        "
+    ).map_err(|e| format!("Failed to create FTS5 table: {e}"))?;
+
+    Ok(conn)
+}
+
+/// Save a document to MoA's local SQLite database with FTS5 indexing.
+/// This enables full-text search across all stored documents.
+#[tauri::command]
+fn save_document_to_sqlite(
+    file_name: String,
+    markdown: String,
+    html: Option<String>,
+    tiptap_json: Option<String>,
+    doc_type: Option<String>,
+    engine: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let conn = open_documents_db()?;
+    let sanitized = sanitize_filename(&file_name);
+
+    conn.execute(
+        "INSERT INTO documents (file_name, markdown, html, tiptap_json, doc_type, engine)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(file_name) DO UPDATE SET
+            markdown = excluded.markdown,
+            html = excluded.html,
+            tiptap_json = excluded.tiptap_json,
+            doc_type = excluded.doc_type,
+            engine = excluded.engine,
+            updated_at = datetime('now')",
+        rusqlite::params![
+            sanitized,
+            markdown,
+            html,
+            tiptap_json,
+            doc_type.unwrap_or_default(),
+            engine.unwrap_or_default(),
+        ],
+    ).map_err(|e| format!("Failed to save document to SQLite: {e}"))?;
+
+    Ok(serde_json::json!({
+        "success": true,
+        "storage": "sqlite",
+        "file_name": sanitized,
+    }))
+}
+
+/// Load a document from MoA's SQLite database.
+#[tauri::command]
+fn load_document_from_sqlite(
+    file_name: String,
+) -> Result<serde_json::Value, String> {
+    let conn = open_documents_db()?;
+    let sanitized = sanitize_filename(&file_name);
+
+    let result = conn.query_row(
+        "SELECT file_name, markdown, html, tiptap_json, doc_type, engine, created_at, updated_at
+         FROM documents WHERE file_name = ?1",
+        rusqlite::params![sanitized],
+        |row| {
+            Ok(serde_json::json!({
+                "success": true,
+                "file_name": row.get::<_, String>(0)?,
+                "markdown": row.get::<_, String>(1)?,
+                "html": row.get::<_, Option<String>>(2)?,
+                "tiptap_json": row.get::<_, Option<String>>(3)?,
+                "doc_type": row.get::<_, String>(4)?,
+                "engine": row.get::<_, String>(5)?,
+                "created_at": row.get::<_, String>(6)?,
+                "updated_at": row.get::<_, String>(7)?,
+            }))
+        },
+    );
+
+    match result {
+        Ok(val) => Ok(val),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            Ok(serde_json::json!({ "success": false, "error": "Document not found" }))
+        }
+        Err(e) => Err(format!("Failed to load document from SQLite: {e}")),
+    }
+}
+
+/// List all documents stored in MoA's SQLite database.
+#[tauri::command]
+fn list_documents_sqlite() -> Result<serde_json::Value, String> {
+    let conn = open_documents_db()?;
+
+    let mut stmt = conn.prepare(
+        "SELECT file_name, doc_type, engine, created_at, updated_at FROM documents ORDER BY updated_at DESC"
+    ).map_err(|e| format!("Failed to query documents: {e}"))?;
+
+    let docs: Vec<serde_json::Value> = stmt.query_map([], |row| {
+        Ok(serde_json::json!({
+            "file_name": row.get::<_, String>(0)?,
+            "doc_type": row.get::<_, String>(1)?,
+            "engine": row.get::<_, String>(2)?,
+            "created_at": row.get::<_, String>(3)?,
+            "updated_at": row.get::<_, String>(4)?,
+        }))
+    }).map_err(|e| format!("Failed to iterate documents: {e}"))?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    Ok(serde_json::json!({ "documents": docs }))
+}
+
+/// Full-text search across all MoA documents using FTS5.
+#[tauri::command]
+fn search_documents_sqlite(
+    query: String,
+) -> Result<serde_json::Value, String> {
+    let conn = open_documents_db()?;
+
+    let mut stmt = conn.prepare(
+        "SELECT d.file_name, d.doc_type, d.engine, d.updated_at,
+                snippet(documents_fts, 1, '<mark>', '</mark>', '...', 48) as snippet
+         FROM documents_fts f
+         JOIN documents d ON d.id = f.rowid
+         WHERE documents_fts MATCH ?1
+         ORDER BY rank
+         LIMIT 20"
+    ).map_err(|e| format!("Failed to prepare search query: {e}"))?;
+
+    let results: Vec<serde_json::Value> = stmt.query_map(rusqlite::params![query], |row| {
+        Ok(serde_json::json!({
+            "file_name": row.get::<_, String>(0)?,
+            "doc_type": row.get::<_, String>(1)?,
+            "engine": row.get::<_, String>(2)?,
+            "updated_at": row.get::<_, String>(3)?,
+            "snippet": row.get::<_, String>(4)?,
+        }))
+    }).map_err(|e| format!("Failed to execute search: {e}"))?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    Ok(serde_json::json!({ "results": results }))
+}
+
+/// Delete a document from MoA's SQLite database.
+#[tauri::command]
+fn delete_document_sqlite(
+    file_name: String,
+) -> Result<serde_json::Value, String> {
+    let conn = open_documents_db()?;
+    let sanitized = sanitize_filename(&file_name);
+
+    let rows = conn.execute(
+        "DELETE FROM documents WHERE file_name = ?1",
+        rusqlite::params![sanitized],
+    ).map_err(|e| format!("Failed to delete document: {e}"))?;
+
+    Ok(serde_json::json!({
+        "success": rows > 0,
+        "deleted": rows,
+    }))
+}
+
+// ── Hard Disk Save (user-chosen directory) ──────────────────
+
+/// Save document files (markdown + HTML) to a user-specified directory.
+/// The directory path is provided by the frontend after the user picks
+/// a folder via the Tauri dialog plugin.
+#[tauri::command]
+fn save_document_to_disk(
+    dir_path: String,
+    file_name: String,
+    markdown: String,
+    html: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let dir = std::path::Path::new(&dir_path);
+    if !dir.exists() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("Failed to create directory: {e}"))?;
+    }
+
+    let stem = sanitize_filename(&file_name);
+
+    // Save Markdown
+    let md_path = dir.join(format!("{stem}.md"));
+    std::fs::write(&md_path, &markdown)
+        .map_err(|e| format!("Failed to write markdown file: {e}"))?;
+
+    // Save HTML if provided
+    let mut html_saved = false;
+    if let Some(ref html_content) = html {
+        if !html_content.is_empty() {
+            let html_path = dir.join(format!("{stem}.html"));
+            std::fs::write(&html_path, html_content)
+                .map_err(|e| format!("Failed to write HTML file: {e}"))?;
+            html_saved = true;
+        }
+    }
+
+    Ok(serde_json::json!({
+        "success": true,
+        "storage": "disk",
+        "dir_path": dir_path,
+        "markdown_path": md_path.to_string_lossy(),
+        "html_saved": html_saved,
+    }))
+}
+
 /// Sanitize a filename for use as a directory name (remove path separators and special chars).
 fn sanitize_filename(name: &str) -> String {
     let stem = std::path::Path::new(name)
@@ -1273,6 +1731,7 @@ fn sanitize_filename(name: &str) -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             // Local ZeroClaw gateway (runs on this device)
             server_url: std::sync::Mutex::new(
@@ -1329,11 +1788,18 @@ pub fn run() {
             web_search,
             convert_pdf_local,
             convert_pdf_dual,
+            check_python_env,
             write_temp_file,
             cleanup_temp_file,
             save_document,
             load_document,
             list_documents,
+            save_document_to_sqlite,
+            load_document_from_sqlite,
+            list_documents_sqlite,
+            search_documents_sqlite,
+            delete_document_sqlite,
+            save_document_to_disk,
         ])
         .setup(|app| {
             // Override data_dir with Tauri's actual app data path
@@ -1361,6 +1827,14 @@ pub fn run() {
                     }
                 }
             }
+
+            // ── Setup embedded Python environment ─────────────────────
+            // Auto-create venv and install pymupdf4llm on first launch.
+            // Runs in background so the main UI is not blocked.
+            let py_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                ensure_python_env(py_handle).await;
+            });
 
             // ── Launch ZeroClaw Gateway ──────────────────────────────
             // MoA's primary mission: start ZeroClaw so the user has a

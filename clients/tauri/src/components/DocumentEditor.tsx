@@ -16,6 +16,12 @@
  *   Save   → content.md + Tiptap JSON persisted
  *          → viewer.html stays as original (no re-render)
  *
+ * Save options:
+ *   1. MoA에 저장 (SQLite FTS5) — stored in ~/.moa/moa_documents.db
+ *   2. 하드디스크에 저장 — user picks a folder, saves .md + .html
+ *   Both can be selected simultaneously.
+ *   "저장하지 않음" — sends to LLM only, no local persistence.
+ *
  * Supports: PDF (digital + image), HWP, HWPX, DOC, DOCX, XLS, XLSX, PPT, PPTX
  */
 
@@ -38,6 +44,17 @@ try {
 
 function isTauriApp(): boolean {
   return tauriInvoke !== null;
+}
+
+/** Save target options */
+type SaveTarget = "moa" | "disk";
+
+interface SaveDialogState {
+  open: boolean;
+  targets: Set<SaveTarget>;
+  diskPath: string | null;
+  saving: boolean;
+  result: string | null;
 }
 
 /** Office document extensions processed via Hancom API */
@@ -109,6 +126,15 @@ export function DocumentEditor({
   const [savedDocs, setSavedDocs] = useState<string[]>([]);
   const [showSavedDocs, setShowSavedDocs] = useState(false);
 
+  // Save dialog state
+  const [saveDialog, setSaveDialog] = useState<SaveDialogState>({
+    open: false,
+    targets: new Set<SaveTarget>(["moa"]),
+    diskPath: null,
+    saving: false,
+    result: null,
+  });
+
   // Fetch saved documents list on mount (Tauri only)
   useEffect(() => {
     if (!isTauriApp() || !tauriInvoke) return;
@@ -165,9 +191,15 @@ export function DocumentEditor({
           isModified: false,
         });
         setEditorOpen(true);
-        if (onDocumentUpdate && result.markdown) {
+        if (onDocumentUpdate) {
           onDocumentUpdate(result.markdown, "");
         }
+      } else {
+        setError(
+          locale === "ko"
+            ? "문서를 불러올 수 없습니다. 파일이 비어있거나 손상되었을 수 있습니다."
+            : "Could not load document. The file may be empty or corrupted."
+        );
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load document");
@@ -284,7 +316,7 @@ export function DocumentEditor({
           }
         } finally {
           // Clean up the temp file after conversion (success or failure)
-          tauriInvoke("cleanup_temp_file", { filePath: tempPath })?.catch(() => {});
+          tauriInvoke!("cleanup_temp_file", { filePath: tempPath }).catch(() => {});
         }
       } catch {
         // Local conversion not available → fall through to server
@@ -455,11 +487,17 @@ export function DocumentEditor({
   // ── "Edit" button: open Tiptap editor pane ───────────────────────
   const handleOpenEditor = useCallback(() => {
     setEditorOpen(true);
-    // Load markdown into Tiptap when it opens
-    setTimeout(() => {
-      tiptapRef.current?.setMarkdown(doc.markdown);
-      tiptapRef.current?.focus();
-    }, 100);
+    // Load markdown into Tiptap — retry until ref is available (editor may
+    // need a render cycle to mount after setEditorOpen(true))
+    const tryLoad = (attempts: number) => {
+      if (tiptapRef.current) {
+        tiptapRef.current.setMarkdown(doc.markdown);
+        tiptapRef.current.focus();
+      } else if (attempts < 10) {
+        setTimeout(() => tryLoad(attempts + 1), 50);
+      }
+    };
+    setTimeout(() => tryLoad(0), 0);
   }, [doc.markdown]);
 
   // ── Close editor pane ─────────────────────────────────────────────
@@ -476,7 +514,59 @@ export function DocumentEditor({
     }));
   }, []);
 
-  // ── Save: persist markdown + JSON, notify parent ──────────────────
+  // ── Save dialog: open ──────────────────────────────────────────
+  const handleOpenSaveDialog = useCallback(() => {
+    setSaveDialog((prev) => ({
+      ...prev,
+      open: true,
+      result: null,
+    }));
+  }, []);
+
+  // ── Save dialog: close ─────────────────────────────────────────
+  const handleCloseSaveDialog = useCallback(() => {
+    setSaveDialog((prev) => ({
+      ...prev,
+      open: false,
+      saving: false,
+      result: null,
+    }));
+  }, []);
+
+  // ── Save dialog: toggle save target ────────────────────────────
+  const handleToggleSaveTarget = useCallback((target: SaveTarget) => {
+    setSaveDialog((prev) => {
+      const next = new Set(prev.targets);
+      if (next.has(target)) {
+        next.delete(target);
+      } else {
+        next.add(target);
+      }
+      return { ...prev, targets: next };
+    });
+  }, []);
+
+  // ── Save dialog: pick folder for disk save ─────────────────────
+  const handlePickFolder = useCallback(async () => {
+    if (!isTauriApp() || !tauriInvoke) return;
+
+    try {
+      // Use Tauri dialog plugin to pick a folder
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: locale === "ko" ? "저장 폴더 선택" : "Select save folder",
+      });
+      if (selected && typeof selected === "string") {
+        setSaveDialog((prev) => ({ ...prev, diskPath: selected }));
+      }
+    } catch {
+      // Dialog not available — let user type a path manually
+    }
+  }, [locale]);
+
+  // ── Execute save with selected targets ─────────────────────────
   const handleSave = useCallback(async () => {
     if (!tiptapRef.current) return;
 
@@ -484,6 +574,12 @@ export function DocumentEditor({
     const tiptapJson = tiptapRef.current.getJSON();
     const editorHtml = tiptapRef.current.getHTML();
 
+    setSaveDialog((prev) => ({ ...prev, saving: true, result: null }));
+
+    const results: string[] = [];
+    const { targets, diskPath } = saveDialog;
+
+    // Update document state
     setDoc((prev) => ({
       ...prev,
       markdown,
@@ -491,29 +587,118 @@ export function DocumentEditor({
       isModified: false,
     }));
 
-    // Save to filesystem via Tauri if available
     if (isTauriApp() && tauriInvoke && doc.fileName) {
-      try {
-        await tauriInvoke("save_document", {
-          fileName: doc.fileName,
-          markdown,
-          tiptapJson: JSON.stringify(tiptapJson),
-          editorHtml,
-        });
-        // Refresh saved docs list after successful save
-        tauriInvoke("list_documents", {})
-          .then((r) => setSavedDocs((r as { documents: string[] }).documents || []))
-          .catch(() => {});
-      } catch {
-        // Filesystem save failed — content still in memory
+      // Save to MoA (SQLite FTS5)
+      if (targets.has("moa")) {
+        try {
+          await tauriInvoke("save_document_to_sqlite", {
+            fileName: doc.fileName,
+            markdown,
+            html: editorHtml,
+            tiptapJson: JSON.stringify(tiptapJson),
+            docType: doc.docType,
+            engine: doc.engine,
+          });
+          results.push(locale === "ko" ? "MoA에 저장 완료" : "Saved to MoA");
+        } catch (e) {
+          results.push(
+            locale === "ko"
+              ? `MoA 저장 실패: ${e}`
+              : `MoA save failed: ${e}`
+          );
+        }
+
+        // Also save to filesystem for backward compat
+        try {
+          await tauriInvoke("save_document", {
+            fileName: doc.fileName,
+            markdown,
+            tiptapJson: JSON.stringify(tiptapJson),
+            editorHtml,
+          });
+          // Refresh saved docs list
+          tauriInvoke("list_documents", {})
+            .then((r) => setSavedDocs((r as { documents: string[] }).documents || []))
+            .catch(() => {});
+        } catch {
+          // Filesystem save failed — SQLite has the data
+        }
+      }
+
+      // Save to hard disk (user-chosen directory)
+      if (targets.has("disk")) {
+        if (!diskPath) {
+          results.push(
+            locale === "ko"
+              ? "저장 폴더를 선택해주세요"
+              : "Please select a save folder first"
+          );
+        } else {
+          try {
+            const diskResult = await tauriInvoke("save_document_to_disk", {
+              dirPath: diskPath,
+              fileName: doc.fileName,
+              markdown,
+              html: editorHtml,
+            }) as { success: boolean; markdown_path: string };
+            results.push(
+              locale === "ko"
+                ? `하드디스크에 저장 완료: ${diskResult.markdown_path}`
+                : `Saved to disk: ${diskResult.markdown_path}`
+            );
+          } catch (e) {
+            results.push(
+              locale === "ko"
+                ? `하드디스크 저장 실패: ${e}`
+                : `Disk save failed: ${e}`
+            );
+          }
+        }
       }
     }
 
-    // Notify parent (AI context)
+    // Always notify parent (AI context) regardless of save target
     if (onDocumentUpdate) {
       onDocumentUpdate(markdown, editorHtml);
     }
-  }, [doc.fileName, onDocumentUpdate]);
+
+    setSaveDialog((prev) => ({
+      ...prev,
+      saving: false,
+      result: results.join(" | "),
+    }));
+
+    // Auto-close dialog after short delay on success
+    if (results.length > 0 && results.every((r) => r.includes("완료") || r.includes("Saved"))) {
+      setTimeout(() => {
+        setSaveDialog((prev) => ({ ...prev, open: false, result: null }));
+      }, 1500);
+    }
+  }, [saveDialog, doc.fileName, doc.docType, doc.engine, onDocumentUpdate, locale]);
+
+  // ── Send to LLM only (no save) ────────────────────────────────
+  const handleSendToLlmOnly = useCallback(() => {
+    if (!tiptapRef.current) return;
+
+    const markdown = tiptapRef.current.getMarkdown();
+    const editorHtml = tiptapRef.current.getHTML();
+
+    setDoc((prev) => ({
+      ...prev,
+      markdown,
+      isModified: false,
+    }));
+
+    if (onDocumentUpdate) {
+      onDocumentUpdate(markdown, editorHtml);
+    }
+
+    setSaveDialog((prev) => ({
+      ...prev,
+      open: false,
+      result: null,
+    }));
+  }, [onDocumentUpdate]);
 
   // ── Export as Markdown ────────────────────────────────────────────
   const handleExportMarkdown = useCallback(() => {
@@ -644,9 +829,9 @@ export function DocumentEditor({
           <>
             <button
               className="toolbar-btn save-btn"
-              onClick={handleSave}
-              disabled={!doc.isModified || !editorOpen}
-              title={locale === "ko" ? "저장 (Markdown + HTML)" : "Save (Markdown + HTML)"}
+              onClick={handleOpenSaveDialog}
+              disabled={!editorOpen}
+              title={locale === "ko" ? "저장 옵션 선택" : "Save options"}
             >
               {locale === "ko" ? "저장하기" : "Save"}
             </button>
@@ -774,6 +959,117 @@ export function DocumentEditor({
           </div>
         )}
       </div>
+
+      {/* ── Save Dialog Overlay ──────────────────────────────────── */}
+      {saveDialog.open && (
+        <div className="save-dialog-overlay" onClick={handleCloseSaveDialog}>
+          <div className="save-dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="save-dialog-header">
+              <h3>{locale === "ko" ? "저장 옵션" : "Save Options"}</h3>
+              <button className="save-dialog-close" onClick={handleCloseSaveDialog}>
+                {"\u2715"}
+              </button>
+            </div>
+
+            <div className="save-dialog-body">
+              {/* Option 1: Save to MoA (SQLite) */}
+              <label className="save-option">
+                <input
+                  type="checkbox"
+                  checked={saveDialog.targets.has("moa")}
+                  onChange={() => handleToggleSaveTarget("moa")}
+                />
+                <div className="save-option-info">
+                  <span className="save-option-title">
+                    {locale === "ko" ? "MoA에 저장" : "Save to MoA"}
+                  </span>
+                  <span className="save-option-desc">
+                    {locale === "ko"
+                      ? "로컬 SQLite (FTS5 전문 검색 지원) — 나중에 MoA에서 문서를 검색/열기 가능"
+                      : "Local SQLite (FTS5 full-text search) — searchable and reopenable from MoA"}
+                  </span>
+                </div>
+              </label>
+
+              {/* Option 2: Save to hard disk */}
+              <label className="save-option">
+                <input
+                  type="checkbox"
+                  checked={saveDialog.targets.has("disk")}
+                  onChange={() => handleToggleSaveTarget("disk")}
+                />
+                <div className="save-option-info">
+                  <span className="save-option-title">
+                    {locale === "ko" ? "하드디스크에 저장" : "Save to Disk"}
+                  </span>
+                  <span className="save-option-desc">
+                    {locale === "ko"
+                      ? "로컬 하드디스크에 .md + .html 파일로 저장"
+                      : "Save as .md + .html files on local disk"}
+                  </span>
+                </div>
+              </label>
+
+              {/* Folder picker (shown when disk is selected) */}
+              {saveDialog.targets.has("disk") && (
+                <div className="save-disk-path">
+                  <button
+                    className="toolbar-btn"
+                    onClick={handlePickFolder}
+                    type="button"
+                  >
+                    {locale === "ko" ? "폴더 선택" : "Choose Folder"}
+                  </button>
+                  <span className="save-disk-path-display">
+                    {saveDialog.diskPath
+                      ? saveDialog.diskPath
+                      : (locale === "ko" ? "폴더를 선택해주세요" : "No folder selected")}
+                  </span>
+                </div>
+              )}
+
+              {/* Result message */}
+              {saveDialog.result && (
+                <div className="save-dialog-result">
+                  {saveDialog.result}
+                </div>
+              )}
+            </div>
+
+            <div className="save-dialog-footer">
+              {/* Save button */}
+              <button
+                className="toolbar-btn save-btn"
+                onClick={handleSave}
+                disabled={saveDialog.saving || saveDialog.targets.size === 0}
+              >
+                {saveDialog.saving
+                  ? (locale === "ko" ? "저장 중..." : "Saving...")
+                  : (locale === "ko" ? "저장하기" : "Save")}
+              </button>
+
+              {/* Send to LLM only (no save) */}
+              <button
+                className="toolbar-btn save-llm-only-btn"
+                onClick={handleSendToLlmOnly}
+                disabled={saveDialog.saving}
+                title={locale === "ko"
+                  ? "로컬에 저장하지 않고 LLM에게만 전송"
+                  : "Send to LLM only without saving locally"}
+              >
+                {locale === "ko" ? "저장하지 않음 (LLM에만 전송)" : "Don't Save (Send to LLM only)"}
+              </button>
+
+              <button
+                className="toolbar-btn"
+                onClick={handleCloseSaveDialog}
+              >
+                {locale === "ko" ? "취소" : "Cancel"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

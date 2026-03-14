@@ -124,6 +124,43 @@ export interface CliTool {
   category: string;
 }
 
+export interface CreditBalance {
+  balance: number;
+  enabled: boolean;
+}
+
+export interface UsdCreditPackage {
+  id: string;
+  name: string;
+  price_usd: string;
+  price_cents: number;
+  price_krw: number;
+  credits: number;
+}
+
+export interface CreditPackagesResponse {
+  packages: UsdCreditPackage[];
+  providers: {
+    stripe: boolean;
+    toss: boolean;
+  };
+}
+
+export interface CheckoutResponse {
+  checkout_url: string;
+  transaction_id: string;
+  provider: string;
+}
+
+export interface CreditHistory {
+  transaction_id: string;
+  package_id: string;
+  amount_krw: number;
+  credits: number;
+  status: string;
+  created_at: string;
+}
+
 export interface SSEEvent {
   type: string;
   timestamp?: string;
