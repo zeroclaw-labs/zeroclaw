@@ -98,7 +98,7 @@ The installer builds ZeroClaw, configures your provider and API key,
 starts the gateway service, and opens the dashboard — all in one step.
 
 Options:
-  --guided                   Run interactive guided installer (default on Linux TTY)
+  --guided                   Run interactive guided installer (default when TTY detected)
   --no-guided                Disable guided installer
   --docker                   Run install in Docker-compatible mode
   --install-system-deps      Install build dependencies (Linux/macOS)
@@ -953,7 +953,7 @@ done
 
 OS_NAME="$(uname -s)"
 if [[ "$GUIDED_MODE" == "auto" ]]; then
-  if [[ "$OS_NAME" == "Linux" && "$ORIGINAL_ARG_COUNT" -eq 0 && -t 0 && -t 1 ]]; then
+  if [[ "$ORIGINAL_ARG_COUNT" -eq 0 && -t 0 && -t 1 ]]; then
     GUIDED_MODE="on"
   else
     GUIDED_MODE="off"
