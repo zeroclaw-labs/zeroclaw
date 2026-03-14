@@ -818,6 +818,24 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
                 if let Some(credential) = resolve_minimax_oauth_refresh_token(name) {
                     return Some(credential);
                 }
+            } else if name == "anthropic" {
+                // For Anthropic, prefer provider-specific env vars (ANTHROPIC_OAUTH_TOKEN)
+                // over the global api_key override, since the global key may belong to a
+                // different provider (e.g. a custom: gateway). This enables subscription-
+                // based auth (Claude Code) to work alongside a non-Anthropic primary provider.
+                if let Ok(oauth_token) = std::env::var("ANTHROPIC_OAUTH_TOKEN") {
+                    let trimmed = oauth_token.trim().to_string();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed);
+                    }
+                }
+                if let Ok(api_key_val) = std::env::var("ANTHROPIC_API_KEY") {
+                    let trimmed = api_key_val.trim().to_string();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed);
+                    }
+                }
+                return Some(trimmed_override.to_owned());
             } else {
                 return Some(trimmed_override.to_owned());
             }
