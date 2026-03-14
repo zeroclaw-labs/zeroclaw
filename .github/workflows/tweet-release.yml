@@ -16,48 +16,65 @@ on:
 
 jobs:
   tweet:
-    # Skip beta pre-releases on auto trigger
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      !github.event.release.prerelease
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
       - name: Build tweet text
         id: tweet
         shell: bash
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name || '' }}
           RELEASE_URL: ${{ github.event.release.html_url || '' }}
-          RELEASE_BODY: ${{ github.event.release.body || '' }}
           MANUAL_TEXT: ${{ inputs.tweet_text || '' }}
         run: |
+          set -euo pipefail
+
           if [ -n "$MANUAL_TEXT" ]; then
-            # Manual dispatch — use the custom text as-is
             TWEET="$MANUAL_TEXT"
           else
-            # Auto trigger — look for <!-- tweet --> block in release body
-            # Format in your release notes:
-            #   <!-- tweet -->
-            #   ZeroClaw v0.2.0 🐾
-            #
-            #   🚀 feature one
-            #   🔧 feature two
-            #
-            #   the claw strikes
-            #   <!-- /tweet -->
-            TWEET_BLOCK=$(echo "$RELEASE_BODY" | sed -n '/<!-- tweet -->/,/<!-- \/tweet -->/p' | sed '1d;$d' || true)
-
-            if [ -n "$TWEET_BLOCK" ]; then
-              TWEET="$TWEET_BLOCK"
+            # Find the previous release tag to diff against
+            PREV_TAG=$(git tag --sort=-creatordate | grep -v "^${RELEASE_TAG}$" | head -1 || echo "")
+            if [ -z "$PREV_TAG" ]; then
+              RANGE="HEAD"
             else
-              # Fallback: auto-generate a simple announcement
-              TWEET=$(printf "ZeroClaw %s 🐾\n\nFull release notes 👇\n%s" "$RELEASE_TAG" "$RELEASE_URL")
+              RANGE="${PREV_TAG}..${RELEASE_TAG}"
             fi
+
+            # Extract features only — no bug fixes, keep it clean and concise
+            FEATURES=$(git log "$RANGE" --pretty=format:"%s" --no-merges \
+              | grep -iE '^feat(\(|:)' \
+              | sed 's/^feat(\([^)]*\)): /\1: /' \
+              | sed 's/^feat: //' \
+              | sed 's/ (#[0-9]*)$//' \
+              | head -4 \
+              | while IFS= read -r line; do echo "🚀 ${line}"; done || true)
+
+            if [ -z "$FEATURES" ]; then
+              FEATURES="🚀 Incremental improvements and polish"
+            fi
+
+            # Get contributors for this release
+            CONTRIBUTORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges \
+              | sort -uf \
+              | head -8 \
+              | paste -sd ', ' - || true)
+
+            # Build the tweet — punchy, features-first, contributors featured
+            TWEET=$(printf "🦀 ZeroClaw %s\n\n%s\n\nContributors: %s\n\n%s" \
+              "$RELEASE_TAG" "$FEATURES" "$CONTRIBUTORS" "$RELEASE_URL")
           fi
 
           # Append release URL if not already present and we have one
           if [ -n "$RELEASE_URL" ] && ! echo "$TWEET" | grep -q "$RELEASE_URL"; then
             TWEET=$(printf "%s\n\n%s" "$TWEET" "$RELEASE_URL")
+          fi
+
+          # Truncate to 280 chars if needed (keep room for URL)
+          if [ ${#TWEET} -gt 280 ]; then
+            TWEET="${TWEET:0:277}..."
           fi
 
           echo "--- Tweet preview ---"
@@ -81,6 +98,12 @@ jobs:
           IMAGE_URL: ${{ inputs.image_url || '' }}
         run: |
           set -euo pipefail
+
+          # Skip if Twitter secrets are not configured
+          if [ -z "$TWITTER_CONSUMER_KEY" ] || [ -z "$TWITTER_ACCESS_TOKEN" ]; then
+            echo "::warning::Twitter secrets not configured — skipping tweet"
+            exit 0
+          fi
 
           pip install requests requests-oauthlib --quiet
 
