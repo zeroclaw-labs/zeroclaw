@@ -239,19 +239,35 @@ jobs:
           find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec sha256sum {} + | sed 's|  \./[^/]*/|  |' > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe # v2.4.2
-        with:
-          tag_name: ${{ needs.validate.outputs.tag }}
-          name: ${{ needs.validate.outputs.tag }}
-          prerelease: false
-          body: ${{ needs.release-notes.outputs.notes }}
-          files: |
-            artifacts/**/*
-            install.sh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name 'SHA256SUMS' \) -exec cp {} release-assets/ \;
+          cp install.sh release-assets/
+          echo "--- Assets ---"
+          ls -lh release-assets/
 
+      - name: Write release notes
+        env:
+          NOTES: ${{ needs.release-notes.outputs.notes }}
+        run: printf '%s\n' "$NOTES" > release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          gh release create "$TAG" release-assets/* \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --notes-file release-notes.md \
+            --latest
+
+  redeploy-website:
+    name: Trigger Website Redeploy
+    needs: [publish]
+    runs-on: ubuntu-latest
+    steps:
       - name: Trigger website redeploy
         env:
           PAT: ${{ secrets.WEBSITE_REPO_PAT }}
