@@ -41,3 +41,6 @@ credentials.json
 
 # Coverage artifacts
 lcov.info
+
+# IDE's stuff
+.idea

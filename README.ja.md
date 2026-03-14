@@ -53,7 +53,7 @@
 </p>
 
 <p align="center">
-  <a href="install.sh">ワンクリック導入</a> |
+  <a href="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh">ワンクリック導入</a> |
   <a href="docs/setup-guides/README.md">導入ガイド</a> |
   <a href="docs/README.ja.md">ドキュメントハブ</a> |
   <a href="docs/SUMMARY.md">Docs TOC</a>

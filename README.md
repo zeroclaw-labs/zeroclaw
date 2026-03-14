@@ -58,7 +58,7 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 
 <p align="center">
   <a href="#quick-start">Getting Started</a> |
-  <a href="install.sh">One-Click Setup</a> |
+  <a href="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh">One-Click Setup</a> |
   <a href="docs/README.md">Docs Hub</a> |
   <a href="docs/SUMMARY.md">Docs TOC</a>
 </p>
@@ -83,6 +83,16 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 </p>
 
 <p align="center"><code>Trait-driven architecture · secure-by-default runtime · provider/channel/tool swappable · pluggable everything</code></p>
+
+### 🚀 What's New in v0.1.9b (March 2026)
+
+| Area | Highlights |
+|---|---|
+| Web Dashboard | Electric blue restyle with glassmorphism and animations, ZeroClaw logo, cron run history panel, message draft persistence, auto-expanding chat composer |
+| Providers & Channels | Azure OpenAI support, WeCom webhook channel, Matrix read markers/typing/file uploads/voice/multi-room, custom HTTP headers, `ZEROCLAW_PROVIDER_URL` override, configurable `ack_reactions` |
+| Tools & MCP | On-demand MCP tool loading via `tool_search`, multi-transport MCP client, `tool_filter_groups` for per-turn schema filtering, Windows shell `tool_call` support, dynamic node discovery |
+| Infrastructure | 32-bit system support via feature gates, Debian Docker variant with shell tools, session state persistence/recovery, docs hub translations for all 30 languages |
+| Fixes | Slack thread events in polling mode, Discord WebSocket Ping handling, Ollama Qwen think-tag stripping, security hardening (filesystem scoping, credential scrubbing, cron validation), 32-bit atomic fallbacks |
 
 ### 📢 Announcements
 
@@ -1131,6 +1141,27 @@ A heartfelt thank you to the communities and institutions that inspire and fuel 
 - **The World & Beyond** 🌍✨ — to every contributor, dreamer, and builder out there making open source a force for good. This is for you.
 
 We're building in the open because the best ideas come from everywhere. If you're reading this, you're part of it. Welcome. 🦀❤️
+
+### 🌟 Recent Contributors (v0.1.9b)
+
+Special recognition to the contributors who shipped features, fixes, and improvements in this release cycle:
+
+| Contributor | Highlights |
+|---|---|
+| **@SimianAstronaut7** | Security hardening (credential scrubbing, filesystem scoping), Discord WebSocket fixes, Lark/Feishu channel restoration, WhatsApp Web concurrency fix |
+| **@Alix-007** | CI/CD master branch migration, release runner fixes, install script Bash 3.2 compatibility |
+| **@darrenzeng2025** | Anthropic vision support, email subject config, auto-expanding chat composer, config fixes, SIGTERM graceful shutdown |
+| **@imadnyc** | Live tool call notifications, Matrix reactions/threading, datetime refresh in cached prompts |
+| **@jameslcowan** | Channel secrets encryption roundtrip fix |
+| **@ImanHashemi** | Webhook-audit builtin hook |
+| **@alanpjohn** | Opencode-go provider integration |
+| **@parziva-1** | WhatsApp Web session reconnect and QR flow |
+| **@ttuffin** | Docker dependency management |
+| **@zverozabr** | Embedding API key resolution fix |
+| **@Jacobinwwey** | MCP tools and subsystem integration |
+| **@vernonstinebaker** | MCP tool filter groups and schema filtering |
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
 
 ## ⚠️ Official Repository & Impersonation Warning
 
