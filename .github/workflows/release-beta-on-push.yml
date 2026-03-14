@@ -246,22 +246,26 @@ jobs:
           echo "--- Assets ---"
           ls -lh release-assets/
 
+      - name: Write release notes
+        env:
+          NOTES: ${{ needs.release-notes.outputs.notes }}
+        run: printf '%s\n' "$NOTES" > release-notes.md
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           TAG: ${{ needs.version.outputs.tag }}
-          NOTES: ${{ needs.release-notes.outputs.notes }}
         run: |
           gh release create "$TAG" release-assets/* \
+            --repo "${{ github.repository }}" \
             --title "$TAG" \
-            --notes "$NOTES" \
+            --notes-file release-notes.md \
             --prerelease
 
   redeploy-website:
     name: Trigger Website Redeploy
     needs: [publish]
     runs-on: ubuntu-latest
-    if: always() && needs.publish.result != 'cancelled'
     steps:
       - name: Trigger website redeploy
         env:
