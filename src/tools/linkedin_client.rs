@@ -200,13 +200,20 @@ impl LinkedInClient {
         visibility: &str,
         article_url: Option<&str>,
         article_title: Option<&str>,
+        scheduled_at: Option<&str>,
     ) -> anyhow::Result<String> {
         let creds = self.get_credentials().await?;
         let author_urn = format!("urn:li:person:{}", creds.person_id);
 
+        let lifecycle = if scheduled_at.is_some() {
+            "DRAFT"
+        } else {
+            "PUBLISHED"
+        };
+
         let mut body = json!({
             "author": author_urn,
-            "lifecycleState": "PUBLISHED",
+            "lifecycleState": lifecycle,
             "visibility": visibility,
             "commentary": text,
             "distribution": {
@@ -215,6 +222,20 @@ impl LinkedInClient {
                 "thirdPartyDistributionChannels": []
             }
         });
+
+        // Add scheduled publish options if a future timestamp is provided.
+        // The timestamp must be ISO 8601 / RFC 3339, e.g. "2026-03-17T08:00:00Z".
+        if let Some(ts) = scheduled_at {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+                let epoch_ms = dt.timestamp_millis();
+                body.as_object_mut().unwrap().insert(
+                    "scheduledPublishOptions".to_string(),
+                    json!({ "scheduledPublishTime": epoch_ms }),
+                );
+                // Scheduled posts use DRAFT lifecycle
+                body["lifecycleState"] = json!("DRAFT");
+            }
+        }
 
         if let Some(url) = article_url {
             let mut article = json!({
@@ -604,13 +625,20 @@ impl LinkedInClient {
         text: &str,
         visibility: &str,
         image_urn: &str,
+        scheduled_at: Option<&str>,
     ) -> anyhow::Result<String> {
         let creds = self.get_credentials().await?;
         let author_urn = format!("urn:li:person:{}", creds.person_id);
 
-        let body = json!({
+        let lifecycle = if scheduled_at.is_some() {
+            "DRAFT"
+        } else {
+            "PUBLISHED"
+        };
+
+        let mut body = json!({
             "author": author_urn,
-            "lifecycleState": "PUBLISHED",
+            "lifecycleState": lifecycle,
             "visibility": visibility,
             "commentary": text,
             "distribution": {
@@ -624,6 +652,16 @@ impl LinkedInClient {
                 }
             }
         });
+
+        if let Some(ts) = scheduled_at {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+                let epoch_ms = dt.timestamp_millis();
+                body.as_object_mut().unwrap().insert(
+                    "scheduledPublishOptions".to_string(),
+                    json!({ "scheduledPublishTime": epoch_ms }),
+                );
+            }
+        }
 
         let url = format!("{LINKEDIN_API_BASE}/rest/posts");
         let response = self

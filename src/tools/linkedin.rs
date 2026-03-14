@@ -148,6 +148,10 @@ impl Tool for LinkedInTool {
                 "image_prompt": {
                     "type": "string",
                     "description": "Custom prompt for image generation. If omitted, a prompt is derived from the post text."
+                },
+                "scheduled_at": {
+                    "type": "string",
+                    "description": "Schedule the post for future publication. ISO 8601 / RFC 3339 timestamp, e.g. '2026-03-17T08:00:00Z'. The post is saved as a draft with scheduledPublishTime on LinkedIn."
                 }
             },
             "required": ["action"]
@@ -213,6 +217,7 @@ impl Tool for LinkedInTool {
 
                 let article_url = args.get("article_url").and_then(|v| v.as_str());
                 let article_title = args.get("article_title").and_then(|v| v.as_str());
+                let scheduled_at = args.get("scheduled_at").and_then(|v| v.as_str());
 
                 if article_title.is_some() && article_url.is_none() {
                     return Ok(ToolResult {
@@ -247,16 +252,17 @@ impl Tool for LinkedInTool {
                                 .await?;
 
                             let post_id = client
-                                .create_post_with_image(&text, visibility, &image_urn)
+                                .create_post_with_image(&text, visibility, &image_urn, scheduled_at)
                                 .await?;
 
                             // Clean up temp file
                             let _ = ImageGenerator::cleanup(&image_path).await;
 
+                            let action_word = if scheduled_at.is_some() { "scheduled" } else { "published" };
                             return Ok(ToolResult {
                                 success: true,
                                 output: format!(
-                                    "Post created with image. Post ID: {post_id}, Image: {image_urn}"
+                                    "Post {action_word} with image. Post ID: {post_id}, Image: {image_urn}"
                                 ),
                                 error: None,
                             });
@@ -269,12 +275,13 @@ impl Tool for LinkedInTool {
                 }
 
                 let post_id = client
-                    .create_post(&text, visibility, article_url, article_title)
+                    .create_post(&text, visibility, article_url, article_title, scheduled_at)
                     .await?;
 
+                let action_word = if scheduled_at.is_some() { "scheduled" } else { "published" };
                 Ok(ToolResult {
                     success: true,
-                    output: format!("Post created successfully. Post ID: {post_id}"),
+                    output: format!("Post {action_word} successfully. Post ID: {post_id}"),
                     error: None,
                 })
             }
