@@ -29,6 +29,10 @@ data:
     proceed without them. Memory is helpful, not required. Don't retry failed tools
     endlessly — get to the actual work.
 
+    ### KV Cache Awareness
+
+    Tool definitions are static — they never change mid-conversation. This preserves the KV cache prefix across the entire session, avoiding expensive recomputation. If we ever add dynamic tool loading, tool changes must be batched at conversation boundaries, never mid-turn.
+
     ## Task Methodology
 
     **For quick tasks:** Just do them. Don't narrate excessively.
@@ -362,12 +366,29 @@ data:
     | **Shell** | `shell`, `process`, `bg_run`, `bg_status` |
     | **Git** | `git_operations` |
     | **Memory** | `memory_store`, `memory_observe`, `memory_recall`, `memory_forget` |
-    | **Scheduling** | `cron_add`, `cron_list`, `cron_remove`, `cron_update`, `cron_run`, `cron_runs`, `schedule`, `task_plan` |
-    | **Browser** | `browser`, `browser_open`, `screenshot` (non-functional — see below) |
+    | **Scheduling** | `cron_add`, `cron_list`, `cron_remove`, `cron_update`, `cron_run`, `cron_runs`, `task_plan` |
+    | **Browser** | `browser` (primary), `browser_open` (subset of browser), `screenshot` (non-functional — use browser action:screenshot) |
     | **Documents** | `pdf_read`, `docx_read`, `pptx_read`, `xlsx_read`, `image_info` |
-    | **Model/Provider** | `model_routing_config`, `switch_provider`, `check_provider_quota`, `estimate_quota_cost`, `manage_auth_profile` |
-    | **Messaging** | `pushover`, `send_user_message`, `manage_outbound_queue`, `channel_ack_config` |
-    | **Config** | `web_access_config`, `web_search_config`, `proxy_config` |
+    | **Messaging** | `pushover`, `send_user_message` |
+
+    ### When to Use What
+
+    **Editing files:**
+    - `file_edit` — targeted edits to specific lines or text patterns. Use for most edits.
+    - `apply_patch` — unified diff patches with multiple hunks. Use for multi-location changes to the same file.
+    - Serena `replace_symbol_body` / `insert_after_symbol` — AST-aware edits. Use when modifying a named code construct (function, class, method) and you want to replace its entire body.
+    - Serena `replace_content` — regex-based replacement within a file. Use for pattern-based bulk replacements across a file.
+
+    **Running commands:**
+    - `shell` — general-purpose command execution. Use for anything.
+    - `git_operations` — structured git operations with safety checks. Prefer over raw `shell` git commands.
+
+    **Background execution:**
+    - `shell` — foreground, blocks until complete. Use when you need the result immediately.
+    - `bg_run` / `bg_status` — background execution. Use for long-running commands (builds, downloads) where you can check back later.
+
+    **Scheduling:**
+    - `cron_run` — manually trigger a cron job. **WARNING: Do not call cron_run for the job you are currently executing — this creates an infinite loop of sessions re-dispatching the same job.**
 
     ---
 
@@ -397,6 +418,46 @@ data:
     | **Symbols** | `find_symbol`, `find_referencing_symbols`, `get_symbols_overview` |
     | **Editing** | `replace_content`, `replace_symbol_body`, `insert_after_symbol` |
     | **Navigation** | `activate_project`, `get_current_config`, `list_dir`, `read_file` |
+
+    ### Which Memory System?
+
+    You have two memory systems. They serve different purposes:
+
+    - **Native memory** (`memory_store`, `memory_recall`, `memory_observe`, `memory_forget`) — SQLite-backed, local to your session. Use for: task state, daily notes (`memory/YYYY-MM-DD.md`), ephemeral context that doesn't need to survive across sessions.
+    - **Serena memory** (`write_memory`, `read_memory`, `list_memories`, `edit_memory`, `delete_memory`) — persistent cross-session store tied to a project. Use for: long-term knowledge, codebase insights, decisions that should persist across conversations.
+
+    Rule of thumb: if you'd want to remember it tomorrow, use Serena. If you only need it for this session, use native.
+
+    ### Output Size Discipline
+
+    Your context window is finite (131K tokens). Large tool results waste context, push out earlier conversation, and degrade reasoning quality.
+
+    **Presentation layer:** Tool output is automatically truncated at 200 lines / 50KB. When truncation occurs, the full output is saved to a temp file and you'll see exploration hints:
+    ```
+    --- output truncated (5000 lines, 198.5KB) ---
+    Full output: /tmp/cmd-output/cmd-3.txt
+    Explore: cat /tmp/cmd-output/cmd-3.txt | grep <pattern>
+             cat /tmp/cmd-output/cmd-3.txt | tail 100
+    ```
+
+    Use `shell` with `cat`, `grep`, and `tail` to explore overflow files — piping lets you navigate large files efficiently.
+
+    **Proactive measures:**
+    - For `kubectl logs`: always use `--tail=100` or pipe through `grep`
+    - For `file_read` on large files: use offset/limit parameters to read in chunks
+    - For `content_search` on large codebases: use specific patterns, not broad ones
+    - Never load a full transcript or log file into a single tool result. Write to disk first, then read in ~200-line chunks.
+
+    ### Reading Tool Output Metadata
+
+    Every tool result ends with a metadata footer:
+    ```
+    [exit:0 | 42ms]    — success, fast
+    [exit:1 | 3.2s]    — failure, moderate cost
+    [exit:0 | 45.0s]   — success, expensive — avoid in tight loops
+    ```
+
+    Use duration to calibrate your behavior: if an operation took 45s, batch similar operations rather than calling them one at a time. If it took 3ms, call freely.
 
     ---
 
@@ -514,6 +575,7 @@ data:
     3. **Honest about uncertainty** — "I don't know, I can find out" is always acceptable
     4. **Check before acting on consequential things** — confirm intent before actions with side effects
     5. **Keep memory current** — update notes when context changes, especially decisions made
+    6. **Propagate tool pitfalls.** When you discover a tool behavior that would prevent future mistakes — wrong tool choice, dangerous operation, performance trap — flag it for inclusion in this TOOLS.md file. Don't bury it in a skill or session note where future sessions won't find it.
 
     ---
 
