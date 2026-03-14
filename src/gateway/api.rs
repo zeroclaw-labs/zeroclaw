@@ -71,11 +71,6 @@ pub struct CronAddBody {
     pub command: String,
 }
 
-#[derive(Deserialize)]
-pub struct CronRunsQuery {
-    pub limit: Option<usize>,
-}
-
 // ── Handlers ────────────────────────────────────────────────────
 
 /// GET /api/status — system status overview
@@ -357,47 +352,6 @@ pub async fn handle_api_cron_delete(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to remove cron job: {e}")})),
-        )
-            .into_response(),
-    }
-}
-
-/// GET /api/cron/:id/runs — list recent runs for a cron job
-pub async fn handle_api_cron_runs(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Query(query): Query<CronRunsQuery>,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
-    let config = state.config.lock().clone();
-    let limit = query.limit.unwrap_or(10).clamp(1, 50);
-
-    match crate::cron::list_runs(&config, &id, limit) {
-        Ok(runs) => {
-            let runs_json: Vec<serde_json::Value> = runs
-                .iter()
-                .map(|run| {
-                    serde_json::json!({
-                        "id": run.id,
-                        "job_id": run.job_id,
-                        "started_at": run.started_at.to_rfc3339(),
-                        "finished_at": run.finished_at.to_rfc3339(),
-                        "status": run.status,
-                        "output": run.output,
-                        "duration_ms": run.duration_ms,
-                    })
-                })
-                .collect();
-
-            Json(serde_json::json!({"runs": runs_json})).into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to list cron runs: {e}")})),
         )
             .into_response(),
     }
