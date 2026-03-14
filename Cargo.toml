@@ -3,7 +3,7 @@ members = [".", "crates/robot-kit"]
 resolver = "2"
 
 [package]
-name = "zeroclaw"
+name = "zeroclawlabs"
 version = "0.2.0"
 edition = "2021"
 authors = ["theonlyhennygod"]
