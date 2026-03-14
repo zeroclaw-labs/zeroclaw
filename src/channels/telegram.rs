@@ -179,7 +179,9 @@ fn format_attachment_content(
     local_path: &Path,
 ) -> String {
     match kind {
-        IncomingAttachmentKind::Photo if is_image_extension(local_path) => {
+        IncomingAttachmentKind::Photo | IncomingAttachmentKind::Document
+            if is_image_extension(local_path) =>
+        {
             format!("[IMAGE:{}]", local_path.display())
         }
         _ => {
