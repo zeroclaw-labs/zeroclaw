@@ -294,7 +294,10 @@ group_id = "dm"                    # optional: "dm" / group id / omitted
 allowed_from = ["*"]
 ignore_attachments = false
 ignore_stories = true
+edit_messages = true               # progressive draft edits via signal-cli editMessage RPC
 ```
+
+When `edit_messages = true`, the agent sends an initial "🧠 Working..." message, then edits it in-place with intermediate progress (tool calls, thinking) and finally replaces it with the complete response. Signal preserves the edit history so users can review the agent's reasoning path.
 
 ### 4.7 WhatsApp
 
