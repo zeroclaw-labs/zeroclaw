@@ -48,6 +48,7 @@ shellexpand = "3.1"
 
 # JSON Schema generation for config export
 schemars = "1.2"
+strip-ansi-escapes = "0.2"
 
 # Logging - minimal
 tracing = { version = "0.1", default-features = false }

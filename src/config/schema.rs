@@ -385,6 +385,10 @@ pub struct Config {
     #[serde(default)]
     pub agents_ipc: AgentsIpcConfig,
 
+    /// Tool output presentation layer (`[presentation]`).
+    #[serde(default)]
+    pub presentation: PresentationConfig,
+
     /// External MCP server connections (`[mcp]`).
     #[serde(default, alias = "mcpServers")]
     pub mcp: McpConfig,
@@ -800,6 +804,53 @@ impl Default for AgentsIpcConfig {
             staleness_secs: default_agents_ipc_staleness_secs(),
         }
     }
+}
+
+/// Tool output presentation layer configuration.
+/// Controls how raw tool output is processed before the LLM sees it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PresentationConfig {
+    /// Maximum lines before overflow triggers. Default: 200.
+    #[serde(default = "default_max_output_lines")]
+    pub max_output_lines: usize,
+
+    /// Maximum bytes before overflow triggers. Default: 51200 (50KB).
+    #[serde(default = "default_max_output_bytes")]
+    pub max_output_bytes: usize,
+
+    /// Strip ANSI escape codes from tool output. Default: true.
+    #[serde(default = "default_true")]
+    pub strip_ansi: bool,
+
+    /// Append exit code/status and duration footer to tool results. Default: true.
+    #[serde(default = "default_true")]
+    pub show_metadata: bool,
+
+    /// Directory for overflow file storage. Default: "/tmp/cmd-output".
+    #[serde(default = "default_overflow_dir")]
+    pub overflow_dir: String,
+}
+
+impl Default for PresentationConfig {
+    fn default() -> Self {
+        Self {
+            max_output_lines: default_max_output_lines(),
+            max_output_bytes: default_max_output_bytes(),
+            strip_ansi: default_true(),
+            show_metadata: default_true(),
+            overflow_dir: default_overflow_dir(),
+        }
+    }
+}
+
+fn default_max_output_lines() -> usize {
+    200
+}
+fn default_max_output_bytes() -> usize {
+    51_200
+}
+fn default_overflow_dir() -> String {
+    "/tmp/cmd-output".into()
 }
 
 fn default_coordination_enabled() -> bool {
@@ -1817,6 +1868,16 @@ pub struct AcpServerConfig {
     /// Maximum session lifetime in seconds before automatic cleanup.
     #[serde(default = "default_acp_session_ttl_secs")]
     pub session_ttl_secs: u64,
+
+    /// Maximum number of concurrent ACP transport sessions.
+    ///
+    /// When a new `initialize` request would exceed this limit, the oldest
+    /// session is cancelled and evicted. Set to `1` to ensure only one
+    /// caller can run a task at a time (e.g. one session for Sam).
+    ///
+    /// Default: `1`.
+    #[serde(default = "default_acp_max_concurrent_sessions")]
+    pub max_concurrent_sessions: usize,
 }
 
 impl Default for AcpServerConfig {
@@ -1824,8 +1885,13 @@ impl Default for AcpServerConfig {
         Self {
             enabled: false,
             session_ttl_secs: default_acp_session_ttl_secs(),
+            max_concurrent_sessions: default_acp_max_concurrent_sessions(),
         }
     }
+}
+
+fn default_acp_max_concurrent_sessions() -> usize {
+    1
 }
 
 fn default_acp_session_ttl_secs() -> u64 {
@@ -3485,6 +3551,17 @@ pub struct AutonomyConfig {
     /// Maximum cost per day in cents per policy. Default: `1000`.
     pub max_cost_per_day_cents: u32,
 
+    /// Allow shell redirection (`>`, `<`, `2>&1`), process substitution,
+    /// variable expansion, `tee`, and background (`&`) in shell commands.
+    ///
+    /// By default these are blocked to prevent accidental data exfiltration.
+    /// Set to `true` for agents that need full shell access (e.g. a K8s
+    /// infrastructure agent running kubectl).
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub allow_shell_redirections: bool,
+
     /// Require explicit approval for medium-risk shell commands.
     #[serde(default = "default_true")]
     pub require_approval_for_medium_risk: bool,
@@ -3534,6 +3611,13 @@ pub struct AutonomyConfig {
     /// model in tool specs.
     #[serde(default = "default_non_cli_excluded_tools")]
     pub non_cli_excluded_tools: Vec<String>,
+
+    /// Additional tools to exclude when a sender is in `/private` mode.
+    ///
+    /// Private sessions disable auto-save and hide these tools from the model.
+    /// Typically memory-related tools so conversations stay ephemeral.
+    #[serde(default = "default_private_session_excluded_tools")]
+    pub private_session_excluded_tools: Vec<String>,
 
     /// Optional allowlist for who can manage non-CLI approval commands.
     ///
@@ -3612,6 +3696,17 @@ fn default_non_cli_excluded_tools() -> Vec<String> {
     .collect()
 }
 
+fn default_private_session_excluded_tools() -> Vec<String> {
+    [
+        "memory_store",
+        "memory_forget",
+        "memory_observe",
+    ]
+    .into_iter()
+    .map(std::string::ToString::to_string)
+    .collect()
+}
+
 fn is_valid_env_var_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
@@ -3669,6 +3764,7 @@ impl Default for AutonomyConfig {
             ],
             max_actions_per_hour: 100,
             max_cost_per_day_cents: 1000,
+            allow_shell_redirections: false,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
@@ -3678,6 +3774,7 @@ impl Default for AutonomyConfig {
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
             non_cli_excluded_tools: default_non_cli_excluded_tools(),
+            private_session_excluded_tools: default_private_session_excluded_tools(),
             non_cli_approval_approvers: Vec::new(),
             non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode::default(),
             non_cli_natural_language_approval_mode_by_channel: HashMap::new(),
@@ -4082,7 +4179,7 @@ fn default_provider_retries() -> u32 {
 }
 
 fn default_provider_backoff_ms() -> u64 {
-    500
+    1500
 }
 
 fn default_channel_backoff_secs() -> u64 {
@@ -5389,6 +5486,12 @@ pub struct SignalConfig {
     /// Skip incoming story messages.
     #[serde(default)]
     pub ignore_stories: bool,
+    /// Enable progressive message editing: send a draft message when the agent
+    /// starts working, update it with intermediate status, then replace it with
+    /// the final response. Requires signal-cli REST API v2 (`/v2/send` with
+    /// `edit_timestamp`). Defaults to false.
+    #[serde(default)]
+    pub edit_messages: bool,
 }
 
 impl ChannelConfig for SignalConfig {
@@ -6715,6 +6818,7 @@ impl Default for Config {
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            presentation: PresentationConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
             strip_prior_reasoning: false,
@@ -8208,6 +8312,27 @@ impl Config {
             if !seen_non_cli_excluded.insert(normalized.to_string()) {
                 anyhow::bail!(
                     "autonomy.non_cli_excluded_tools contains duplicate entry: {normalized}"
+                );
+            }
+        }
+
+        let mut seen_private_excluded = std::collections::HashSet::new();
+        for (i, tool_name) in self.autonomy.private_session_excluded_tools.iter().enumerate() {
+            let normalized = tool_name.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("autonomy.private_session_excluded_tools[{i}] must not be empty");
+            }
+            if !normalized
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                anyhow::bail!(
+                    "autonomy.private_session_excluded_tools[{i}] contains invalid characters: {normalized}"
+                );
+            }
+            if !seen_private_excluded.insert(normalized.to_string()) {
+                anyhow::bail!(
+                    "autonomy.private_session_excluded_tools contains duplicate entry: {normalized}"
                 );
             }
         }
@@ -10100,6 +10225,34 @@ allowed_roots = []
     }
 
     #[test]
+    async fn config_validate_rejects_duplicate_private_session_excluded_tools() {
+        let mut cfg = Config::default();
+        cfg.autonomy.private_session_excluded_tools =
+            vec!["memory_store".into(), "memory_store".into()];
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("autonomy.private_session_excluded_tools contains duplicate entry"));
+    }
+
+    #[test]
+    async fn private_session_excluded_tools_default() {
+        let cfg = Config::default();
+        assert!(cfg
+            .autonomy
+            .private_session_excluded_tools
+            .contains(&"memory_store".to_string()));
+        assert!(cfg
+            .autonomy
+            .private_session_excluded_tools
+            .contains(&"memory_forget".to_string()));
+        assert!(cfg
+            .autonomy
+            .private_session_excluded_tools
+            .contains(&"memory_observe".to_string()));
+    }
+
+    #[test]
     async fn runtime_config_default() {
         let r = RuntimeConfig::default();
         assert_eq!(r.kind, "native");
@@ -10288,6 +10441,7 @@ ws_url = "ws://127.0.0.1:3002"
                 forbidden_paths: vec!["/secret".into()],
                 max_actions_per_hour: 50,
                 max_cost_per_day_cents: 1000,
+                allow_shell_redirections: false,
                 require_approval_for_medium_risk: false,
                 block_high_risk_commands: true,
                 shell_env_passthrough: vec!["DATABASE_URL".into()],
@@ -10297,6 +10451,7 @@ ws_url = "ws://127.0.0.1:3002"
                 always_ask: vec![],
                 allowed_roots: vec![],
                 non_cli_excluded_tools: vec![],
+                private_session_excluded_tools: vec![],
                 non_cli_approval_approvers: vec![],
                 non_cli_natural_language_approval_mode:
                     NonCliNaturalLanguageApprovalMode::RequestConfirm,
@@ -10389,6 +10544,7 @@ ws_url = "ws://127.0.0.1:3002"
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            presentation: PresentationConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
             strip_prior_reasoning: false,
@@ -10768,6 +10924,7 @@ tool_dispatcher = "xml"
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            presentation: PresentationConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
             strip_prior_reasoning: false,
@@ -11260,6 +11417,7 @@ allowed_users = ["@ops:matrix.org"]
             allowed_from: vec!["+1111111111".into()],
             ignore_attachments: true,
             ignore_stories: false,
+            edit_messages: true,
         };
         let json = serde_json::to_string(&sc).unwrap();
         let parsed: SignalConfig = serde_json::from_str(&json).unwrap();
@@ -11269,6 +11427,7 @@ allowed_users = ["@ops:matrix.org"]
         assert_eq!(parsed.allowed_from.len(), 1);
         assert!(parsed.ignore_attachments);
         assert!(!parsed.ignore_stories);
+        assert!(parsed.edit_messages);
     }
 
     #[test]
@@ -11280,6 +11439,7 @@ allowed_users = ["@ops:matrix.org"]
             allowed_from: vec!["*".into()],
             ignore_attachments: false,
             ignore_stories: true,
+            edit_messages: false,
         };
         let toml_str = toml::to_string(&sc).unwrap();
         let parsed: SignalConfig = toml::from_str(&toml_str).unwrap();

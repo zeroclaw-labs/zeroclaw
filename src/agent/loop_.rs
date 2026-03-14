@@ -35,7 +35,7 @@ use uuid::Uuid;
 mod context;
 pub(crate) mod detection;
 mod execution;
-mod history;
+pub(crate) mod history;
 mod parsing;
 
 use context::{build_context, build_hardware_context};
@@ -79,6 +79,26 @@ const MAX_TOKENS_CONTINUATION_NOTICE: &str =
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
+/// Returns `true` if `content` should NOT be auto-saved to memory.
+///
+/// Filters out:
+/// - **Cron dispatch prompts** — system-generated messages prefixed with `[cron:`.
+///   These are multi-KB prompt payloads that pollute semantic recall.
+/// - **Bare slash commands** — single-token `/new`, `/help`, etc. that carry no
+///   conversational value.  (Channel-side slash commands already return early
+///   before auto-save, but this covers the CLI/agent paths too.)
+pub(crate) fn should_skip_autosave(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if trimmed.starts_with("[cron:") {
+        return true;
+    }
+    // Bare slash command: starts with `/`, single token, no meaningful body.
+    if trimmed.starts_with('/') && !trimmed.contains(char::is_whitespace) {
+        return true;
+    }
+    false
+}
+
 fn should_treat_provider_as_vision_capable(provider_name: &str, provider: &dyn Provider) -> bool {
     if provider.supports_vision() {
         return true;
@@ -97,6 +117,16 @@ fn should_treat_provider_as_vision_capable(provider_name: &str, provider: &dyn P
 /// Each entry: (trigger aliases, display label, description).
 const SLASH_COMMANDS: &[(&[&str], &str, &str)] = &[
     (&["/help"], "/help", "Show this help message"),
+    (
+        &["/checkpoint"],
+        "/checkpoint",
+        "Save conversation snapshot to persistent memory",
+    ),
+    (
+        &["/private"],
+        "/private",
+        "Toggle private mode (disables auto-save and memory tools)",
+    ),
     (
         &["/clear", "/new"],
         "/clear /new",
@@ -318,6 +348,7 @@ tokio::task_local! {
     static TOOL_LOOP_COST_ENFORCEMENT_CONTEXT: Option<CostEnforcementContext>;
     static TOOL_LOOP_STRIP_PRIOR_REASONING: bool;
     static TOOL_LOOP_COMPACTION_CONTEXT: Option<ToolLoopCompactionContext>;
+    static TOOL_LOOP_PRESENTATION_CONFIG: super::presentation::PresentationConfig;
 }
 
 /// Context needed for LLM-powered compaction inside the tool-call loop.
@@ -2008,10 +2039,18 @@ pub async fn run_tool_call_loop(
             return Ok(display_text);
         }
 
-        // Print any text the LLM produced alongside tool calls (unless silent)
-        if !silent && !display_text.is_empty() {
-            print!("{display_text}");
-            let _ = std::io::stdout().flush();
+        // Surface any text the LLM produced alongside tool calls.
+        // In CLI mode: print to stdout. In channel mode: send as a draft
+        // progress update so the user sees intermediate status messages.
+        if !display_text.is_empty() {
+            if !silent {
+                print!("{display_text}");
+                let _ = std::io::stdout().flush();
+            } else if let Some(ref tx) = on_delta {
+                let _ = tx
+                    .send(format!("{DRAFT_PROGRESS_SENTINEL}{display_text}\n"))
+                    .await;
+            }
         }
 
         // Execute tool calls and build results. `individual_results` tracks per-call output so
@@ -2209,7 +2248,9 @@ pub async fn run_tool_call_loop(
             }
 
             let signature = tool_call_signature(&tool_name, &tool_args);
-            if !seen_tool_signatures.insert(signature) {
+            // Browser is stateful — identical args (e.g. snapshot) produce
+            // different results after navigation, so skip dedup for it.
+            if tool_name != "browser" && !seen_tool_signatures.insert(signature) {
                 let duplicate = format!(
                     "Skipped duplicate tool call '{tool_name}' with identical arguments in this turn."
                 );
@@ -2361,6 +2402,20 @@ pub async fn run_tool_call_loop(
             {
                 let sig = tool_call_signature(&call.name, &call.arguments);
                 loop_detector.record_call(&sig.0, &sig.1, &outcome.output, outcome.success);
+            }
+
+            // ── Presentation: prepare output for LLM ──
+            {
+                let pres_cfg = TOOL_LOOP_PRESENTATION_CONFIG
+                    .try_with(|c| c.clone())
+                    .unwrap_or_default();
+                outcome.output = super::presentation::present_for_llm(
+                    &outcome.output,
+                    &call.name,
+                    outcome.success,
+                    outcome.duration,
+                    &pres_cfg,
+                );
             }
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
@@ -2934,8 +2989,11 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
-        // Auto-save user message to memory (skip short/trivial messages)
-        if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+        // Auto-save user message to memory (skip short/trivial/system-generated messages)
+        if config.memory.auto_save
+            && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+            && !should_skip_autosave(&msg)
+        {
             let user_key = autosave_memory_key("user_msg");
             let _ = mem
                 .store(&user_key, &msg, MemoryCategory::Conversation, None)
@@ -2991,16 +3049,18 @@ pub async fn run(
                         config.strip_prior_reasoning,
                         TOOL_LOOP_COMPACTION_CONTEXT.scope(
                             Some(compact_ctx),
-                            run_tool_call_loop(
-                                provider.as_ref(),
-                                &mut history,
-                                &tools_registry,
-                                observer.as_ref(),
-                                provider_name,
-                                &model_name,
-                                temperature,
-                                false,
-                                approval_manager.as_ref(),
+                            TOOL_LOOP_PRESENTATION_CONFIG.scope(
+                                config.presentation.clone(),
+                                run_tool_call_loop(
+                                    provider.as_ref(),
+                                    &mut history,
+                                    &tools_registry,
+                                    observer.as_ref(),
+                                    provider_name,
+                                    &model_name,
+                                    temperature,
+                                    false,
+                                    approval_manager.as_ref(),
                                 channel_name,
                                 &config.multimodal,
                                 config.agent.max_tool_iterations,
@@ -3009,6 +3069,7 @@ pub async fn run(
                                 effective_hooks,
                                 &[],
                                 None,
+                                ),
                             ),
                         ),
                     ),
@@ -3068,8 +3129,27 @@ pub async fn run(
                 "/help" => {
                     println!("Available commands:");
                     println!("  /help        Show this help message");
+                    println!("  /checkpoint  Save conversation snapshot to persistent memory");
+                    println!("  /private     Toggle private mode (disables auto-save and memory tools)");
                     println!("  /clear /new  Clear conversation history");
                     println!("  /quit /exit  Exit interactive mode\n");
+                    continue;
+                }
+                "/private" => {
+                    println!("Private mode is only available on channel sessions (Signal, Slack, etc.).");
+                    println!("Interactive CLI mode does not auto-save to memory.\n");
+                    continue;
+                }
+                "/checkpoint" => {
+                    println!("Saving conversation checkpoint...");
+                    let result = history::checkpoint_conversation(
+                        &history,
+                        provider.as_ref(),
+                        &model_name,
+                        mem.as_ref(),
+                    )
+                    .await;
+                    println!("{result}\n");
                     continue;
                 }
                 "/clear" | "/new" => {
@@ -3109,8 +3189,11 @@ pub async fn run(
                 _ => {}
             }
 
-            // Auto-save conversation turns (skip short/trivial messages)
-            if config.memory.auto_save && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+            // Auto-save conversation turns (skip short/trivial/system-generated messages)
+            if config.memory.auto_save
+                && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+                && !should_skip_autosave(&user_input)
+            {
                 let user_key = autosave_memory_key("user_msg");
                 let _ = mem
                     .store(&user_key, &user_input, MemoryCategory::Conversation, None)
@@ -3188,24 +3271,27 @@ pub async fn run(
                             config.strip_prior_reasoning,
                             TOOL_LOOP_COMPACTION_CONTEXT.scope(
                                 Some(compact_ctx),
-                                run_tool_call_loop(
-                                    provider.as_ref(),
-                                    &mut history,
-                                    &tools_registry,
-                                    observer.as_ref(),
-                                    provider_name,
-                                    &model_name,
-                                    temperature,
-                                    false,
-                                    approval_manager.as_ref(),
-                                    channel_name,
-                                    &config.multimodal,
-                                    config.agent.max_tool_iterations,
-                                    None,
-                                    None,
-                                    effective_hooks,
-                                    &[],
-                                    None,
+                                TOOL_LOOP_PRESENTATION_CONFIG.scope(
+                                    config.presentation.clone(),
+                                    run_tool_call_loop(
+                                        provider.as_ref(),
+                                        &mut history,
+                                        &tools_registry,
+                                        observer.as_ref(),
+                                        provider_name,
+                                        &model_name,
+                                        temperature,
+                                        false,
+                                        approval_manager.as_ref(),
+                                        channel_name,
+                                        &config.multimodal,
+                                        config.agent.max_tool_iterations,
+                                        None,
+                                        None,
+                                        effective_hooks,
+                                        &[],
+                                        None,
+                                    ),
                                 ),
                             ),
                         ),
@@ -3728,6 +3814,17 @@ pub async fn process_message_with_history(
     } else {
         None
     };
+    // Auto-save user message to memory (mirrors run() auto-save)
+    if config.memory.auto_save
+        && message.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !should_skip_autosave(message)
+    {
+        let user_key = autosave_memory_key("user_msg");
+        let _ = mem
+            .store(&user_key, message, MemoryCategory::Conversation, None)
+            .await;
+    }
+
     tracing::info!(
         provider = provider_name,
         model = %model_name,
@@ -3764,6 +3861,19 @@ pub async fn process_message_with_history(
     )
     .await?;
 
+    // Auto-save assistant response to memory (mirrors run() auto-save)
+    if config.memory.auto_save && result.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+        let assistant_key = autosave_memory_key("assistant_resp");
+        let _ = mem
+            .store(
+                &assistant_key,
+                &result,
+                MemoryCategory::Conversation,
+                None,
+            )
+            .await;
+    }
+
     Ok((result, history))
 }
 
@@ -3776,6 +3886,31 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn should_skip_autosave_filters_cron_prompts() {
+        assert!(should_skip_autosave(
+            "[cron:7 speakr-daily-summary] You are running inside an isolated cron session..."
+        ));
+        assert!(should_skip_autosave(
+            "[cron:12 health-check deliver_to:signal/+1234] Check cluster health"
+        ));
+    }
+
+    #[test]
+    fn should_skip_autosave_filters_bare_slash_commands() {
+        assert!(should_skip_autosave("/new"));
+        assert!(should_skip_autosave("/help"));
+        assert!(should_skip_autosave("/quit"));
+        assert!(should_skip_autosave("/models"));
+    }
+
+    #[test]
+    fn should_skip_autosave_allows_normal_messages() {
+        assert!(!should_skip_autosave("What meetings did I have today?"));
+        assert!(!should_skip_autosave("Check the /api/v1/users endpoint"));
+        assert!(!should_skip_autosave("/models set openai — and then check status"));
+    }
 
     #[test]
     fn test_scrub_credentials() {
