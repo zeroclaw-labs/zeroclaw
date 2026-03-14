@@ -187,7 +187,12 @@ detect_release_target() {
       echo "x86_64-unknown-linux-gnu"
       ;;
     Linux:aarch64|Linux:arm64)
-      echo "aarch64-unknown-linux-gnu"
+      # Termux on Android needs the android target, not linux-gnu
+      if [[ -n "${TERMUX_VERSION:-}" || -d "/data/data/com.termux" ]]; then
+        echo "aarch64-linux-android"
+      else
+        echo "aarch64-unknown-linux-gnu"
+      fi
       ;;
     Linux:armv7l|Linux:armv6l)
       echo "armv7-unknown-linux-gnueabihf"
@@ -534,6 +539,8 @@ install_system_deps() {
           openssl \
           perl \
           ca-certificates
+      elif have_cmd pkg && [[ -n "${TERMUX_VERSION:-}" ]]; then
+        pkg install -y build-essential pkg-config git curl openssl perl
       else
         warn "Unsupported Linux distribution. Install compiler toolchain + pkg-config + git + curl + OpenSSL headers + perl manually."
       fi

@@ -170,6 +170,11 @@ jobs:
             target: aarch64-apple-darwin
             artifact: zeroclaw
             ext: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+            artifact: zeroclaw
+            ext: tar.gz
+            ndk: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: zeroclaw.exe
@@ -193,6 +198,10 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ${{ matrix.cross_compiler }}
+
+      - name: Setup Android NDK
+        if: matrix.ndk
+        run: echo "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
 
       - name: Build release
         shell: bash
