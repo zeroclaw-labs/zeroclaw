@@ -48,6 +48,8 @@ const SLACK_USER_CACHE_MAX_ENTRIES: usize = 1000;
 const SLACK_ATTACHMENT_SAVE_SUBDIR: &str = "slack_files";
 const SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE: usize = 8;
 const SLACK_ATTACHMENT_RENDER_CONCURRENCY: usize = 3;
+const SLACK_POLL_ACTIVE_THREAD_MAX: usize = 50;
+const SLACK_POLL_THREAD_EXPIRE_SECS: u64 = 24 * 60 * 60;
 const SLACK_MEDIA_REDIRECT_MAX_HOPS: usize = 5;
 const SLACK_ALLOWED_MEDIA_HOST_SUFFIXES: &[&str] =
     &["slack.com", "slack-edge.com", "slack-files.com"];
@@ -1977,6 +1979,162 @@ impl SlackChannel {
 
         None
     }
+
+    async fn fetch_thread_replies_with_retry(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+        oldest: &str,
+    ) -> Option<serde_json::Value> {
+        let mut total_wait = Duration::from_secs(0);
+
+        for attempt in 0..=SLACK_HISTORY_MAX_RETRIES {
+            let resp = match self
+                .http_client()
+                .get("https://slack.com/api/conversations.replies")
+                .bearer_auth(&self.bot_token)
+                .query(&[
+                    ("channel", channel_id),
+                    ("ts", thread_ts),
+                    ("oldest", oldest),
+                    ("limit", "50"),
+                ])
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        "Slack conversations.replies error for thread {thread_ts} in {channel_id}: {e}"
+                    );
+                    return None;
+                }
+            };
+
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+            let is_ratelimited_http = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+            let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let is_ratelimited_payload = payload.get("ok") == Some(&serde_json::Value::Bool(false))
+                && payload
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .is_some_and(|err| err == "ratelimited");
+
+            if is_ratelimited_http || is_ratelimited_payload {
+                if attempt >= SLACK_HISTORY_MAX_RETRIES {
+                    tracing::error!(
+                        "Slack rate limit retries exhausted for conversations.replies on thread {} in channel {}. Total wait: {}s across {} attempts.",
+                        thread_ts,
+                        channel_id,
+                        total_wait.as_secs(),
+                        SLACK_HISTORY_MAX_RETRIES
+                    );
+                    return None;
+                }
+
+                let retry_after_secs = Self::parse_retry_after_secs(&headers)
+                    .unwrap_or(SLACK_HISTORY_DEFAULT_RETRY_AFTER_SECS);
+                let jitter_ms = Self::jitter_ms(SLACK_HISTORY_MAX_JITTER_MS);
+                let wait = Self::compute_retry_delay(retry_after_secs, attempt, jitter_ms);
+                total_wait += wait;
+                let next_retry_at = Self::next_retry_timestamp(wait);
+                tracing::warn!(
+                    "Slack conversations.replies rate limited for thread {} in channel {}. Retry-After: {}s. Attempt {}/{}. Next retry at {}.",
+                    thread_ts,
+                    channel_id,
+                    retry_after_secs,
+                    attempt + 1,
+                    SLACK_HISTORY_MAX_RETRIES,
+                    next_retry_at
+                );
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+
+            if !status.is_success() {
+                let sanitized = crate::providers::sanitize_api_error(&body);
+                tracing::warn!(
+                    "Slack conversations.replies failed for thread {} in channel {} ({}): {}",
+                    thread_ts,
+                    channel_id,
+                    status,
+                    sanitized
+                );
+                return None;
+            }
+
+            if payload.get("ok") == Some(&serde_json::Value::Bool(false)) {
+                let err = payload
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("unknown");
+                tracing::warn!(
+                    "Slack conversations.replies error for thread {} in channel {}: {}",
+                    thread_ts,
+                    channel_id,
+                    err
+                );
+                return None;
+            }
+
+            return Some(payload);
+        }
+
+        None
+    }
+
+    /// Extract thread parent timestamps from channel history messages.
+    /// Returns `(thread_ts, latest_reply_ts)` pairs for messages with active threads.
+    fn extract_active_threads(messages: &[serde_json::Value]) -> Vec<(String, String)> {
+        messages
+            .iter()
+            .filter_map(|msg| {
+                let thread_ts = msg.get("thread_ts").and_then(|v| v.as_str())?;
+                let ts = msg.get("ts").and_then(|v| v.as_str()).unwrap_or_default();
+                // Only consider messages that are thread parents (ts == thread_ts)
+                if ts != thread_ts {
+                    return None;
+                }
+                let reply_count = msg.get("reply_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                if reply_count == 0 {
+                    return None;
+                }
+                let latest_reply = msg
+                    .get("latest_reply")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(thread_ts);
+                Some((thread_ts.to_string(), latest_reply.to_string()))
+            })
+            .collect()
+    }
+
+    /// Evict expired or excess threads from the active-thread tracker.
+    /// Each value is `(channel_id, last_seen_reply_ts, last_activity)`.
+    fn evict_stale_threads(
+        active_threads: &mut HashMap<String, (String, String, Instant)>,
+        now: Instant,
+    ) {
+        let max_age = Duration::from_secs(SLACK_POLL_THREAD_EXPIRE_SECS);
+        active_threads
+            .retain(|_, (_, _, last_activity)| now.duration_since(*last_activity) < max_age);
+        if active_threads.len() > SLACK_POLL_ACTIVE_THREAD_MAX {
+            let overflow = active_threads.len() - SLACK_POLL_ACTIVE_THREAD_MAX;
+            let mut entries: Vec<_> = active_threads
+                .iter()
+                .map(|(k, (_, _, t))| (k.clone(), *t))
+                .collect();
+            entries.sort_by_key(|(_, t)| *t);
+            for (key, _) in entries.into_iter().take(overflow) {
+                active_threads.remove(&key);
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -2040,6 +2198,8 @@ impl Channel for SlackChannel {
         let mut discovered_channels: Vec<String> = Vec::new();
         let mut last_discovery = Instant::now();
         let mut last_ts_by_channel: HashMap<String, String> = HashMap::new();
+        // Active thread tracker: thread_ts -> (channel_id, last_seen_reply_ts, last_activity)
+        let mut active_threads: HashMap<String, (String, String, Instant)> = HashMap::new();
 
         if let Some(ref channel_ids) = scoped_channels {
             tracing::info!(
@@ -2110,6 +2270,17 @@ impl Channel for SlackChannel {
                 };
 
                 if let Some(messages) = data.get("messages").and_then(|m| m.as_array()) {
+                    // Register thread parents discovered in channel history.
+                    for (thread_ts, latest_reply) in Self::extract_active_threads(messages) {
+                        let entry = active_threads.entry(thread_ts.clone()).or_insert_with(|| {
+                            (channel_id.clone(), thread_ts.clone(), Instant::now())
+                        });
+                        if latest_reply > entry.1 {
+                            entry.1 = latest_reply;
+                        }
+                        entry.2 = Instant::now();
+                    }
+
                     // Messages come newest-first, reverse to process oldest first
                     for msg in messages.iter().rev() {
                         let subtype = msg.get("subtype").and_then(|value| value.as_str());
@@ -2174,6 +2345,89 @@ impl Channel for SlackChannel {
                         if tx.send(channel_msg).await.is_err() {
                             return Ok(());
                         }
+                    }
+                }
+            }
+
+            // Poll active threads for new replies via conversations.replies.
+            Self::evict_stale_threads(&mut active_threads, Instant::now());
+            let thread_snapshot: Vec<(String, String, String)> = active_threads
+                .iter()
+                .map(|(thread_ts, (ch, last_reply, _))| {
+                    (thread_ts.clone(), ch.clone(), last_reply.clone())
+                })
+                .collect();
+
+            for (thread_ts, thread_channel_id, last_reply_ts) in thread_snapshot {
+                let Some(data) = self
+                    .fetch_thread_replies_with_retry(&thread_channel_id, &thread_ts, &last_reply_ts)
+                    .await
+                else {
+                    continue;
+                };
+
+                let Some(replies) = data.get("messages").and_then(|m| m.as_array()) else {
+                    continue;
+                };
+
+                for reply in replies {
+                    let reply_ts = reply.get("ts").and_then(|v| v.as_str()).unwrap_or_default();
+                    if reply_ts.is_empty() || reply_ts <= last_reply_ts.as_str() {
+                        continue;
+                    }
+                    let subtype = reply.get("subtype").and_then(|v| v.as_str());
+                    if !Self::is_supported_message_subtype(subtype) {
+                        continue;
+                    }
+
+                    let user = reply
+                        .get("user")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or_default();
+                    if user.is_empty() || user == bot_user_id {
+                        continue;
+                    }
+                    if !self.is_user_allowed(user) {
+                        continue;
+                    }
+
+                    let is_group_message = Self::is_group_channel_id(&thread_channel_id);
+                    let allow_sender_without_mention =
+                        is_group_message && self.is_group_sender_trigger_enabled(user);
+                    let require_mention =
+                        self.mention_only && is_group_message && !allow_sender_without_mention;
+                    let Some(normalized_text) = self
+                        .build_incoming_content(reply, require_mention, &bot_user_id)
+                        .await
+                    else {
+                        continue;
+                    };
+
+                    // Update the last-seen reply ts for this thread.
+                    if let Some(entry) = active_threads.get_mut(&thread_ts) {
+                        if reply_ts > entry.1.as_str() {
+                            entry.1 = reply_ts.to_string();
+                        }
+                        entry.2 = Instant::now();
+                    }
+
+                    let sender = self.resolve_sender_identity(user).await;
+
+                    let channel_msg = ChannelMessage {
+                        id: format!("slack_{thread_channel_id}_{reply_ts}"),
+                        sender,
+                        reply_target: thread_channel_id.clone(),
+                        content: normalized_text,
+                        channel: "slack".to_string(),
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        thread_ts: Some(thread_ts.clone()),
+                    };
+
+                    if tx.send(channel_msg).await.is_err() {
+                        return Ok(());
                     }
                 }
             }
@@ -2868,5 +3122,113 @@ mod tests {
     fn compute_retry_delay_applies_backoff_and_jitter_with_cap() {
         let delay = SlackChannel::compute_retry_delay(30, 3, 250);
         assert_eq!(delay, Duration::from_secs(120) + Duration::from_millis(250));
+    }
+
+    // ── Thread reply handling ────────────────────────────────────
+
+    #[test]
+    fn extract_active_threads_finds_thread_parents_with_replies() {
+        let messages = vec![
+            serde_json::json!({
+                "ts": "100.000",
+                "thread_ts": "100.000",
+                "reply_count": 3,
+                "latest_reply": "103.000"
+            }),
+            serde_json::json!({
+                "ts": "200.000",
+                "text": "no thread"
+            }),
+            serde_json::json!({
+                "ts": "300.000",
+                "thread_ts": "300.000",
+                "reply_count": 0
+            }),
+        ];
+
+        let threads = SlackChannel::extract_active_threads(&messages);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].0, "100.000");
+        assert_eq!(threads[0].1, "103.000");
+    }
+
+    #[test]
+    fn extract_active_threads_ignores_reply_messages() {
+        // A reply message has ts != thread_ts; it should not be treated as a thread parent.
+        let messages = vec![serde_json::json!({
+            "ts": "101.000",
+            "thread_ts": "100.000",
+            "text": "reply in thread"
+        })];
+
+        let threads = SlackChannel::extract_active_threads(&messages);
+        assert!(threads.is_empty());
+    }
+
+    #[test]
+    fn extract_active_threads_uses_thread_ts_as_fallback_latest_reply() {
+        let messages = vec![serde_json::json!({
+            "ts": "100.000",
+            "thread_ts": "100.000",
+            "reply_count": 1
+        })];
+
+        let threads = SlackChannel::extract_active_threads(&messages);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].1, "100.000");
+    }
+
+    #[test]
+    fn evict_stale_threads_removes_expired_entries() {
+        let mut threads: HashMap<String, (String, String, Instant)> = HashMap::new();
+        let old = Instant::now()
+            .checked_sub(Duration::from_secs(SLACK_POLL_THREAD_EXPIRE_SECS + 1))
+            .unwrap();
+        threads.insert(
+            "old.thread".to_string(),
+            ("C1".to_string(), "old.reply".to_string(), old),
+        );
+        threads.insert(
+            "new.thread".to_string(),
+            ("C1".to_string(), "new.reply".to_string(), Instant::now()),
+        );
+
+        SlackChannel::evict_stale_threads(&mut threads, Instant::now());
+        assert_eq!(threads.len(), 1);
+        assert!(threads.contains_key("new.thread"));
+    }
+
+    #[test]
+    fn evict_stale_threads_trims_excess_by_oldest_key() {
+        let mut threads: HashMap<String, (String, String, Instant)> = HashMap::new();
+        let now = Instant::now();
+        for i in 0..(SLACK_POLL_ACTIVE_THREAD_MAX + 5) {
+            threads.insert(
+                format!("{i:06}.000"),
+                ("C1".to_string(), format!("{i:06}.001"), now),
+            );
+        }
+
+        SlackChannel::evict_stale_threads(&mut threads, now);
+        assert_eq!(threads.len(), SLACK_POLL_ACTIVE_THREAD_MAX);
+    }
+
+    #[test]
+    fn is_supported_message_subtype_rejects_message_replied() {
+        // message_replied is a parent-level notification, not an actual reply.
+        assert!(!SlackChannel::is_supported_message_subtype(Some(
+            "message_replied"
+        )));
+    }
+
+    #[test]
+    fn inbound_thread_ts_on_thread_reply_uses_thread_ts() {
+        let reply = serde_json::json!({
+            "ts": "200.000",
+            "thread_ts": "100.000",
+            "text": "a thread reply"
+        });
+        let thread_ts = SlackChannel::inbound_thread_ts(&reply, "200.000");
+        assert_eq!(thread_ts.as_deref(), Some("100.000"));
     }
 }

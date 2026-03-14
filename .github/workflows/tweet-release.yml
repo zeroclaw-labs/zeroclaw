@@ -1,0 +1,85 @@
+name: Tweet Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  tweet:
+    # Only tweet for stable releases, not betas
+    if: "!github.event.release.prerelease"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build tweet text
+        id: tweet
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_URL: ${{ github.event.release.html_url }}
+          RELEASE_BODY: ${{ github.event.release.body }}
+        run: |
+          # Extract lines that look like changelog bullets (- or *)
+          BULLETS=$(echo "$RELEASE_BODY" | grep -E '^\s*[-*]' | head -8 | sed 's/^[[:space:]]*[-*][[:space:]]*/- /' || true)
+
+          if [ -n "$BULLETS" ]; then
+            TWEET=$(printf "ZeroClaw %s is out!\n\n%s\n\n%s" "$RELEASE_TAG" "$BULLETS" "$RELEASE_URL")
+          else
+            TWEET=$(printf "ZeroClaw %s is out!\n\nCheck out the full release notes:\n%s" "$RELEASE_TAG" "$RELEASE_URL")
+          fi
+
+          # X API v2 max is 280 chars — truncate bullets if needed
+          if [ ${#TWEET} -gt 280 ]; then
+            TWEET=$(printf "ZeroClaw %s is out!\n\nCheck out what's new:\n%s" "$RELEASE_TAG" "$RELEASE_URL")
+          fi
+
+          # Export for next step (handle multiline)
+          {
+            echo "text<<TWEET_EOF"
+            echo "$TWEET"
+            echo "TWEET_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post to X
+        shell: bash
+        env:
+          TWITTER_CONSUMER_KEY: ${{ secrets.TWITTER_CONSUMER_API_KEY }}
+          TWITTER_CONSUMER_SECRET: ${{ secrets.TWITTER_CONSUMER_API_SECRET_KEY }}
+          TWITTER_ACCESS_TOKEN: ${{ secrets.TWITTER_ACCESS_TOKEN }}
+          TWITTER_ACCESS_TOKEN_SECRET: ${{ secrets.TWITTER_ACCESS_TOKEN_SECRET }}
+          TWEET_TEXT: ${{ steps.tweet.outputs.text }}
+        run: |
+          set -euo pipefail
+
+          pip install requests requests-oauthlib --quiet
+
+          python3 - <<'PYEOF'
+          import json, os, sys
+          from requests_oauthlib import OAuth1Session
+
+          consumer_key = os.environ["TWITTER_CONSUMER_KEY"]
+          consumer_secret = os.environ["TWITTER_CONSUMER_SECRET"]
+          access_token = os.environ["TWITTER_ACCESS_TOKEN"]
+          access_token_secret = os.environ["TWITTER_ACCESS_TOKEN_SECRET"]
+          tweet_text = os.environ["TWEET_TEXT"]
+
+          oauth = OAuth1Session(
+              consumer_key,
+              client_secret=consumer_secret,
+              resource_owner_key=access_token,
+              resource_owner_secret=access_token_secret,
+          )
+
+          resp = oauth.post(
+              "https://api.x.com/2/tweets",
+              json={"text": tweet_text},
+          )
+
+          if resp.status_code == 201:
+              data = resp.json()
+              tweet_id = data["data"]["id"]
+              print(f"Tweet posted: https://x.com/zeroclawlabs/status/{tweet_id}")
+          else:
+              print(f"Failed to post tweet: {resp.status_code}", file=sys.stderr)
+              print(resp.text, file=sys.stderr)
+              sys.exit(1)
+          PYEOF

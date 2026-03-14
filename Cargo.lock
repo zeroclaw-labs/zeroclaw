@@ -8099,6 +8099,7 @@ dependencies = [
  "base64",
  "chrono",
  "directories",
+ "portable-atomic",
  "reqwest",
  "rppal",
  "serde",
