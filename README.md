@@ -86,40 +86,13 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 
 ### 🚀 What's New in v0.1.9a (March 2026)
 
-**Web Dashboard**
-- Electric blue dashboard restyle with glassmorphism, animations, and ZeroClaw logo
-- Cron run history panel with expandable rows
-- Message draft persistence across view switches
-- Auto-expanding multiline chat composer with copy-on-hover messages
-
-**Providers & Channels**
-- Azure OpenAI provider support
-- WeCom (WeChat Enterprise) Bot Webhook channel
-- Matrix read markers, typing notifications, file uploads, voice messages, multi-room support
-- Custom HTTP headers for LLM API requests
-- Custom API path suffix for `custom:` endpoints
-- `ZEROCLAW_PROVIDER_URL` env variable override
-- Configurable `ack_reactions` to disable channel reactions
-
-**Tools & MCP**
-- On-demand MCP tool loading via `tool_search`
-- MCP subsystem tools layer with multi-transport client
-- `tool_filter_groups` for per-turn MCP tool schema filtering
-- Windows support for shell `tool_call` execution
-- Dynamic node discovery and capability advertisement
-
-**Infrastructure**
-- 32-bit system support via feature gates
-- Debian-based Docker container variant with shell tools
-- Interactive session state persistence and recovery
-- Documentation hub translations for all 30 languages
-
-**Fixes**
-- Slack thread message events in polling mode
-- Discord WebSocket Ping frame handling
-- Ollama Qwen think-tag stripping
-- Security: filesystem scoping, credential scrubbing, cron shell validation
-- 32-bit atomic fallbacks for embedded targets
+| Area | Highlights |
+|---|---|
+| Web Dashboard | Electric blue restyle with glassmorphism and animations, ZeroClaw logo, cron run history panel, message draft persistence, auto-expanding chat composer |
+| Providers & Channels | Azure OpenAI support, WeCom webhook channel, Matrix read markers/typing/file uploads/voice/multi-room, custom HTTP headers, `ZEROCLAW_PROVIDER_URL` override, configurable `ack_reactions` |
+| Tools & MCP | On-demand MCP tool loading via `tool_search`, multi-transport MCP client, `tool_filter_groups` for per-turn schema filtering, Windows shell `tool_call` support, dynamic node discovery |
+| Infrastructure | 32-bit system support via feature gates, Debian Docker variant with shell tools, session state persistence/recovery, docs hub translations for all 30 languages |
+| Fixes | Slack thread events in polling mode, Discord WebSocket Ping handling, Ollama Qwen think-tag stripping, security hardening (filesystem scoping, credential scrubbing, cron validation), 32-bit atomic fallbacks |
 
 ### 📢 Announcements
 
