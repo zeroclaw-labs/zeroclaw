@@ -1,0 +1,124 @@
+name: Auto-sync crates.io
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "Cargo.toml"
+
+concurrency:
+  group: publish-crates-auto
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  detect-version-change:
+    name: Detect Version Bump
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check if version changed
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          current=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          previous=$(git show HEAD~1:Cargo.toml 2>/dev/null | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -1 || echo "")
+
+          echo "Current version: ${current}"
+          echo "Previous version: ${previous}"
+
+          if [[ "$current" != "$previous" && -n "$current" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "version=${current}" >> "$GITHUB_OUTPUT"
+            echo "Version bumped from ${previous} to ${current} — will publish"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Version unchanged (${current}) — skipping publish"
+          fi
+
+  check-registry:
+    name: Check if Already Published
+    needs: [detect-version-change]
+    if: needs.detect-version-change.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.check.outputs.should_publish }}
+    steps:
+      - name: Check crates.io for existing version
+        id: check
+        shell: bash
+        env:
+          VERSION: ${{ needs.detect-version-change.outputs.version }}
+        run: |
+          set -euo pipefail
+          status=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://crates.io/api/v1/crates/zeroclawlabs/${VERSION}")
+
+          if [[ "$status" == "200" ]]; then
+            echo "Version ${VERSION} already exists on crates.io — skipping"
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version ${VERSION} not yet published — proceeding"
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    name: Publish to crates.io
+    needs: [detect-version-change, check-registry]
+    if: needs.check-registry.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web dashboard
+        run: cd web && npm ci && npm run build
+
+      - name: Clean web build artifacts
+        run: rm -rf web/node_modules web/src web/package.json web/package-lock.json web/tsconfig*.json web/vite.config.ts web/index.html
+
+      - name: Publish to crates.io
+        run: cargo publish --locked --allow-dirty --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Verify published
+        shell: bash
+        env:
+          VERSION: ${{ needs.detect-version-change.outputs.version }}
+        run: |
+          echo "Waiting for crates.io to index..."
+          sleep 15
+          status=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://crates.io/api/v1/crates/zeroclawlabs/${VERSION}")
+          if [[ "$status" == "200" ]]; then
+            echo "zeroclawlabs v${VERSION} is live on crates.io"
+            echo "Install: cargo install zeroclawlabs"
+          else
+            echo "::warning::Version may still be indexing — check https://crates.io/crates/zeroclawlabs"
+          fi
