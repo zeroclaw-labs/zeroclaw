@@ -84,6 +84,16 @@ Construit par des étudiants et membres des communautés Harvard, MIT et Sundai.
 
 <p align="center"><code>Architecture pilotée par traits · runtime sécurisé par défaut · fournisseur/canal/outil interchangeables · tout est pluggable</code></p>
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.2.1-beta.183 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| General | Incremental improvements and polish |
+
+<!-- END:WHATS_NEW -->
+
 ### 📢 Annonces
 
 Utilisez ce tableau pour les avis importants (changements incompatibles, avis de sécurité, fenêtres de maintenance et bloqueurs de version).
@@ -410,6 +420,18 @@ Un remerciement sincère aux communautés et institutions qui inspirent et alime
 - **Le Monde & Au-Delà** 🌍✨ — à chaque contributeur, rêveur, et constructeur là-bas qui fait de l'open source une force pour le bien. C'est pour vous.
 
 Nous construisons en open source parce que les meilleures idées viennent de partout. Si vous lisez ceci, vous en faites partie. Bienvenue. 🦀❤️
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.2.1-beta.183)
+
+1 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ Dépôt Officiel & Avertissement d'Usurpation d'Identité
 

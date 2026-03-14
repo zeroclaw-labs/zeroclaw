@@ -75,6 +75,16 @@
 >
 > Последняя синхронизация: **2026-02-19**.
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.2.1-beta.183 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| General | Incremental improvements and polish |
+
+<!-- END:WHATS_NEW -->
+
 ## 📢 Доска объявлений
 
 Публикуйте здесь важные уведомления (breaking changes, security advisories, окна обслуживания и блокеры релиза).
@@ -224,6 +234,18 @@ zeroclaw agent --provider anthropic -m "hello"
 - PR workflow: [`docs/contributing/pr-workflow.md`](docs/contributing/pr-workflow.md)
 - Reviewer playbook: [`docs/contributing/reviewer-playbook.md`](docs/contributing/reviewer-playbook.md)
 - License: MIT or Apache 2.0 ([`LICENSE-MIT`](LICENSE-MIT), [`LICENSE-APACHE`](LICENSE-APACHE), [`NOTICE`](NOTICE))
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.2.1-beta.183)
+
+1 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ---
 

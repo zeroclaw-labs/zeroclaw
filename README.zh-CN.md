@@ -75,6 +75,16 @@
 >
 > 最后对齐时间：**2026-03-14**。
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.2.1-beta.183 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| General | Incremental improvements and polish |
+
+<!-- END:WHATS_NEW -->
+
 ## 📢 公告板
 
 用于发布重要通知（破坏性变更、安全通告、维护窗口、版本阻塞问题等）。
@@ -229,6 +239,18 @@ zeroclaw agent --provider anthropic -m "hello"
 - PR 工作流：[`docs/contributing/pr-workflow.md`](docs/i18n/zh-CN/contributing/pr-workflow.zh-CN.md)
 - Reviewer 指南：[`docs/contributing/reviewer-playbook.md`](docs/i18n/zh-CN/contributing/reviewer-playbook.zh-CN.md)
 - 许可证：MIT 或 Apache 2.0（见 [`LICENSE-MIT`](LICENSE-MIT)、[`LICENSE-APACHE`](LICENSE-APACHE) 与 [`NOTICE`](NOTICE)）
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.2.1-beta.183)
+
+1 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ---
 

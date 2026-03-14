@@ -57,6 +57,16 @@
 
 ---
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.2.1-beta.183 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| General | Incremental improvements and polish |
+
+<!-- END:WHATS_NEW -->
+
 ## Ce este ZeroClaw?
 
 ZeroClaw este o infrastructură de asistent AI ușoară, mutabilă și extensibilă construită în Rust. Conectează diverși furnizori de LLM (Anthropic, OpenAI, Google, Ollama, etc.) printr-o interfață unificată și suportă multiple canale (Telegram, Matrix, CLI, etc.).
@@ -177,3 +187,15 @@ Vezi [LICENSE-APACHE](LICENSE-APACHE) și [LICENSE-MIT](LICENSE-MIT) pentru deta
 Dacă ZeroClaw îți este util, te rugăm să iei în considerare să ne cumperi o cafea:
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee)](https://buymeacoffee.com/argenistherose)
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.2.1-beta.183)
+
+1 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->

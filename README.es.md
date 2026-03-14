@@ -86,6 +86,16 @@ Construido por estudiantes y miembros de las comunidades de Harvard, MIT y Sunda
 
 <p align="center"><code>Arquitectura basada en traits · runtime seguro por defecto · proveedor/canal/herramienta intercambiables · todo es conectable</code></p>
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.2.1-beta.183 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| General | Incremental improvements and polish |
+
+<!-- END:WHATS_NEW -->
+
 ### 📢 Anuncios
 
 Usa esta tabla para avisos importantes (cambios de compatibilidad, avisos de seguridad, ventanas de mantenimiento y bloqueos de versión).
@@ -412,6 +422,18 @@ Un sincero agradecimiento a las comunidades e instituciones que inspiran y alime
 - **El Mundo y Más Allá** 🌍✨ — a cada contribuyente, soñador, y constructor allá afuera que hace del código abierto una fuerza para el bien. Esto es por ti.
 
 Construimos en código abierto porque las mejores ideas vienen de todas partes. Si estás leyendo esto, eres parte de esto. Bienvenido. 🦀❤️
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.2.1-beta.183)
+
+1 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ Repositorio Oficial y Advertencia de Suplantación
 
