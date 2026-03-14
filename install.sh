@@ -419,39 +419,29 @@ bool_to_word() {
   fi
 }
 
-guided_input_stream() {
-  if [[ -t 0 ]]; then
-    echo "/dev/stdin"
-    return 0
-  fi
-
-  if (: </dev/tty) 2>/dev/null; then
-    echo "/dev/tty"
-    return 0
-  fi
-
-  return 1
-}
-
 guided_read() {
   local __target_var="$1"
   local __prompt="$2"
   local __silent="${3:-false}"
-  local __input_source=""
   local __value=""
-
-  if ! __input_source="$(guided_input_stream)"; then
-    return 1
-  fi
+  local __read_args=(-r -p "$__prompt")
 
   if [[ "$__silent" == true ]]; then
-    if ! read -r -s -p "$__prompt" __value <"$__input_source"; then
+    __read_args+=(-s)
+  fi
+
+  if [[ -t 0 ]]; then
+    # stdin is already a terminal — read directly, no redirect needed
+    if ! read "${__read_args[@]}" __value; then
+      return 1
+    fi
+  elif (: </dev/tty) 2>/dev/null; then
+    # stdin is not a terminal but /dev/tty is available — redirect from it
+    if ! read "${__read_args[@]}" __value </dev/tty; then
       return 1
     fi
   else
-    if ! read -r -p "$__prompt" __value <"$__input_source"; then
-      return 1
-    fi
+    return 1
   fi
 
   printf -v "$__target_var" '%s' "$__value"
@@ -670,7 +660,7 @@ prompt_model() {
 run_guided_installer() {
   local os_name="$1"
 
-  if ! guided_input_stream >/dev/null; then
+  if ! [[ -t 0 ]] && ! (: </dev/tty) 2>/dev/null; then
     error "guided installer requires an interactive terminal."
     error "Run from a terminal, or pass --no-guided with explicit flags."
     exit 1
