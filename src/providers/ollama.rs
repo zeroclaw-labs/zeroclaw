@@ -56,6 +56,9 @@ struct OutgoingFunction {
 #[derive(Debug, Serialize)]
 struct Options {
     temperature: f64,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_ctx: Option<u32>,
 }
 
 // ─── Response Structures ──────────────────────────────────────────────────────
@@ -123,6 +126,19 @@ impl OllamaProvider {
             .unwrap_or(trimmed)
             .trim_end_matches('/')
             .to_string()
+    }
+
+    fn runtime_num_ctx() -> Option<u32> {
+        match std::env::var("ZEROCLAW_OLLAMA_NUM_CTX") {
+            Ok(v) => match v.parse::<u32>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    tracing::warn!("Invalid ZEROCLAW_OLLAMA_NUM_CTX value '{}', ignoring", v);
+                    None
+                }
+            },
+            Err(_) => None,
+        }
     }
 
     pub fn new(base_url: Option<&str>, api_key: Option<&str>) -> Self {
@@ -297,7 +313,10 @@ impl OllamaProvider {
             model: model.to_string(),
             messages,
             stream: false,
-            options: Options { temperature },
+            options: Options {
+                temperature,
+                num_ctx: Self::runtime_num_ctx(),
+            },
             think,
             tools: tools.map(|t| t.to_vec()),
         }
@@ -446,13 +465,14 @@ impl OllamaProvider {
         let url = format!("{}/api/chat", self.base_url);
 
         tracing::debug!(
-            "Ollama request: url={} model={} message_count={} temperature={} think={:?} tool_count={}",
+            "Ollama request: url={} model={} message_count={} temperature={} think={:?} tool_count={} num_ctx={:?}",
             url,
             model,
             request.messages.len(),
             temperature,
             request.think,
             request.tools.as_ref().map_or(0, |t| t.len()),
+            request.options.num_ctx
         );
 
         let mut request_builder = self.http_client().post(&url).json(&request);
@@ -1362,5 +1382,23 @@ mod tests {
         let text = result.unwrap();
         assert!(text.contains("<tool_call>"));
         assert!(text.contains("date"));
+    }
+
+    #[test]
+    fn runtime_num_ctx_reads_env_variable() {
+        std::env::set_var("ZEROCLAW_OLLAMA_NUM_CTX", "16384");
+
+        let ctx = OllamaProvider::runtime_num_ctx();
+
+        assert_eq!(ctx, Some(16384));
+    }
+
+    #[test]
+    fn runtime_num_ctx_handles_invalid_value() {
+        std::env::set_var("ZEROCLAW_OLLAMA_NUM_CTX", "invalid");
+
+        let ctx = OllamaProvider::runtime_num_ctx();
+
+        assert_eq!(ctx, None);
     }
 }
