@@ -187,7 +187,7 @@ spec:
               mountPath: /data
       containers:
         - name: zeroclaw
-          image: citizendaniel/zeroclaw-sam:v1.4.4
+          image: citizendaniel/zeroclaw-sam:v1.4.8
           imagePullPolicy: Always
           command:
             - bash
@@ -256,7 +256,7 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 10
         - name: serena
-          image: citizendaniel/zeroclaw-sam:v1.4.4
+          image: citizendaniel/zeroclaw-sam:v1.4.8
           imagePullPolicy: IfNotPresent
           command:
             - sh
