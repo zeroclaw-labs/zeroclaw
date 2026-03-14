@@ -113,28 +113,20 @@ impl Observer for ChannelNotifyObserver {
                 Some(args) if !args.is_empty() => {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
                         if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
-                            format!(": `{}`", if cmd.len() > 200 { &cmd[..200] } else { cmd })
+                            format!(": `{}`", truncate_with_ellipsis(cmd, 200))
                         } else if let Some(q) = v.get("query").and_then(|c| c.as_str()) {
-                            format!(": {}", if q.len() > 200 { &q[..200] } else { q })
+                            format!(": {}", truncate_with_ellipsis(q, 200))
                         } else if let Some(p) = v.get("path").and_then(|c| c.as_str()) {
                             format!(": {p}")
                         } else if let Some(u) = v.get("url").and_then(|c| c.as_str()) {
                             format!(": {u}")
                         } else {
                             let s = args.to_string();
-                            if s.len() > 120 {
-                                format!(": {}…", &s[..120])
-                            } else {
-                                format!(": {s}")
-                            }
+                            format!(": {}", truncate_with_ellipsis(&s, 120))
                         }
                     } else {
                         let s = args.to_string();
-                        if s.len() > 120 {
-                            format!(": {}…", &s[..120])
-                        } else {
-                            format!(": {s}")
-                        }
+                        format!(": {}", truncate_with_ellipsis(&s, 120))
                     }
                 }
                 _ => String::new(),
@@ -189,6 +181,13 @@ const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
+/// Proactive context-window budget in estimated characters (~4 chars/token).
+/// When the total character count of conversation history exceeds this limit,
+/// older turns are dropped before the request is sent to the provider,
+/// preventing context-window-exceeded errors.  Set conservatively below
+/// common context windows (128 k tokens ≈ 512 k chars) to leave room for
+/// system prompt, memory context, and model output.
+const PROACTIVE_CONTEXT_BUDGET_CHARS: usize = 400_000;
 /// Guardrail for hook-modified outbound channel content.
 const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
@@ -266,6 +265,22 @@ const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "zeroclaw.service"
 const OPENRC_STATUS_ARGS: [&str; 2] = ["zeroclaw", "status"];
 const OPENRC_RESTART_ARGS: [&str; 2] = ["zeroclaw", "restart"];
 
+#[derive(Clone, Copy)]
+struct InterruptOnNewMessageConfig {
+    telegram: bool,
+    slack: bool,
+}
+
+impl InterruptOnNewMessageConfig {
+    fn enabled_for_channel(self, channel: &str) -> bool {
+        match channel {
+            "telegram" => self.telegram,
+            "slack" => self.slack,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ChannelRuntimeContext {
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
@@ -289,7 +304,7 @@ struct ChannelRuntimeContext {
     provider_runtime_options: providers::ProviderRuntimeOptions,
     workspace_dir: Arc<PathBuf>,
     message_timeout_secs: u64,
-    interrupt_on_new_message: bool,
+    interrupt_on_new_message: InterruptOnNewMessageConfig,
     multimodal: crate::config::MultimodalConfig,
     hooks: Option<Arc<crate::hooks::HookRunner>>,
     non_cli_excluded_tools: Arc<Vec<String>>,
@@ -345,6 +360,10 @@ fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
         Some(tid) => format!("{}_{}_{}", msg.channel, tid, msg.sender),
         None => format!("{}_{}", msg.channel, msg.sender),
     }
+}
+
+fn followup_thread_id(msg: &traits::ChannelMessage) -> Option<String> {
+    msg.thread_ts.clone().or_else(|| Some(msg.id.clone()))
 }
 
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
@@ -917,6 +936,31 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 
     *turns = compacted;
     true
+}
+
+/// Proactively trim conversation turns so that the total estimated character
+/// count stays within [`PROACTIVE_CONTEXT_BUDGET_CHARS`].  Drops the oldest
+/// turns first, but always preserves the most recent turn (the current user
+/// message).  Returns the number of turns dropped.
+fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
+    let total_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
+    if total_chars <= budget || turns.len() <= 1 {
+        return 0;
+    }
+
+    let mut excess = total_chars.saturating_sub(budget);
+    let mut drop_count = 0;
+
+    // Walk from the oldest turn forward, but never drop the very last turn.
+    while excess > 0 && drop_count < turns.len().saturating_sub(1) {
+        excess = excess.saturating_sub(turns[drop_count].content.chars().count());
+        drop_count += 1;
+    }
+
+    if drop_count > 0 {
+        turns.drain(..drop_count);
+    }
+    drop_count
 }
 
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
@@ -1798,6 +1842,19 @@ async fn process_channel_message(
         }
     }
 
+    // Proactively trim conversation history before sending to the provider
+    // to prevent context-window-exceeded errors (bug #3460).
+    let dropped = proactive_trim_turns(&mut prior_turns, PROACTIVE_CONTEXT_BUDGET_CHARS);
+    if dropped > 0 {
+        tracing::info!(
+            channel = %msg.channel,
+            sender = %msg.sender,
+            dropped_turns = dropped,
+            remaining_turns = prior_turns.len(),
+            "Proactively trimmed conversation history to fit context budget"
+        );
+    }
+
     // Only enrich with memory context when there is no prior conversation
     // history. Follow-up turns already include context from previous messages.
     if !had_prior_history {
@@ -1914,14 +1971,14 @@ async fn process_channel_message(
     let notify_observer_flag = Arc::clone(&notify_observer);
     let notify_channel = target_channel.clone();
     let notify_reply_target = msg.reply_target.clone();
-    let notify_thread_root = msg.id.clone();
+    let notify_thread_root = followup_thread_id(&msg);
     let notify_task = if msg.channel == "cli" {
         Some(tokio::spawn(async move {
             while notify_rx.recv().await.is_some() {}
         }))
     } else {
         Some(tokio::spawn(async move {
-            let thread_ts = Some(notify_thread_root);
+            let thread_ts = notify_thread_root;
             while let Some(text) = notify_rx.recv().await {
                 if let Some(ref ch) = notify_channel {
                     let _ = ch
@@ -1981,7 +2038,7 @@ async fn process_channel_message(
 
     // Thread the final reply only if tools were used (multi-message response)
     if notify_observer_flag.tools_used.load(Ordering::Relaxed) && msg.channel != "cli" {
-        msg.thread_ts = Some(msg.id.clone());
+        msg.thread_ts = followup_thread_id(&msg);
     }
     // Drop the notify sender so the forwarder task finishes
     drop(notify_observer);
@@ -2365,8 +2422,9 @@ async fn run_message_dispatch_loop(
         let task_sequence = Arc::clone(&task_sequence);
         workers.spawn(async move {
             let _permit = permit;
-            let interrupt_enabled =
-                worker_ctx.interrupt_on_new_message && msg.channel == "telegram";
+            let interrupt_enabled = worker_ctx
+                .interrupt_on_new_message
+                .enabled_for_channel(msg.channel.as_str());
             let sender_scope_key = interruption_scope_key(&msg);
             let cancellation_token = CancellationToken::new();
             let completion = Arc::new(InFlightTaskCompletion::new());
@@ -3694,6 +3752,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .telegram
         .as_ref()
         .is_some_and(|tg| tg.interrupt_on_new_message);
+    let interrupt_on_new_message_slack = config
+        .channels_config
+        .slack
+        .as_ref()
+        .is_some_and(|sl| sl.interrupt_on_new_message);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -3717,7 +3780,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         provider_runtime_options,
         workspace_dir: Arc::new(config.workspace_dir.clone()),
         message_timeout_secs,
-        interrupt_on_new_message,
+        interrupt_on_new_message: InterruptOnNewMessageConfig {
+            telegram: interrupt_on_new_message,
+            slack: interrupt_on_new_message_slack,
+        },
         multimodal: config.multimodal.clone(),
         hooks: if config.hooks.enabled {
             let mut runner = crate::hooks::HookRunner::new();
@@ -3757,7 +3823,7 @@ mod tests {
     use crate::providers::{ChatMessage, Provider};
     use crate::tools::{Tool, ToolResult};
     use std::collections::{HashMap, HashSet};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -3990,7 +4056,10 @@ mod tests {
             api_key: None,
             api_url: None,
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
@@ -4021,6 +4090,53 @@ mod tests {
     }
 
     #[test]
+    fn proactive_trim_drops_oldest_turns_when_over_budget() {
+        // Each message is 100 chars; 10 messages = 1000 chars total.
+        let mut turns: Vec<ChatMessage> = (0..10)
+            .map(|i| {
+                let content = format!("m{i}-{}", "a".repeat(96));
+                if i % 2 == 0 {
+                    ChatMessage::user(content)
+                } else {
+                    ChatMessage::assistant(content)
+                }
+            })
+            .collect();
+
+        // Budget of 500 should drop roughly half (oldest turns).
+        let dropped = proactive_trim_turns(&mut turns, 500);
+        assert!(dropped > 0, "should have dropped some turns");
+        assert!(turns.len() < 10, "should have fewer turns after trimming");
+        // Last turn should always be preserved.
+        assert!(
+            turns.last().unwrap().content.starts_with("m9-"),
+            "most recent turn must be preserved"
+        );
+        // Total chars should now be within budget.
+        let total: usize = turns.iter().map(|t| t.content.chars().count()).sum();
+        assert!(total <= 500, "total chars {total} should be within budget");
+    }
+
+    #[test]
+    fn proactive_trim_noop_when_within_budget() {
+        let mut turns = vec![
+            ChatMessage::user("hello".to_string()),
+            ChatMessage::assistant("hi there".to_string()),
+        ];
+        let dropped = proactive_trim_turns(&mut turns, 10_000);
+        assert_eq!(dropped, 0);
+        assert_eq!(turns.len(), 2);
+    }
+
+    #[test]
+    fn proactive_trim_preserves_last_turn_even_when_over_budget() {
+        let mut turns = vec![ChatMessage::user("x".repeat(2000))];
+        let dropped = proactive_trim_turns(&mut turns, 100);
+        assert_eq!(dropped, 0, "single turn must never be dropped");
+        assert_eq!(turns.len(), 1);
+    }
+
+    #[test]
     fn append_sender_turn_stores_single_turn_per_call() {
         let sender = "telegram_u2".to_string();
         let ctx = ChannelRuntimeContext {
@@ -4042,7 +4158,10 @@ mod tests {
             api_key: None,
             api_url: None,
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
@@ -4097,7 +4216,10 @@ mod tests {
             api_key: None,
             api_url: None,
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
@@ -4152,10 +4274,45 @@ mod tests {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
     }
 
+    #[derive(Default)]
+    struct SlackRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
     #[async_trait::async_trait]
     impl Channel for TelegramRecordingChannel {
         fn name(&self) -> &str {
             "telegram"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for SlackRecordingChannel {
+        fn name(&self) -> &str {
+            "slack"
         }
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -4578,7 +4735,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             multimodal: crate::config::MultimodalConfig::default(),
@@ -4641,7 +4801,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             multimodal: crate::config::MultimodalConfig::default(),
@@ -4718,7 +4881,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -4780,7 +4946,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -4852,7 +5021,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -4944,7 +5116,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -5018,7 +5193,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -5107,7 +5285,10 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -5181,7 +5362,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -5245,7 +5429,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -5420,7 +5607,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -5503,7 +5693,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: true,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: true,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -5567,6 +5760,107 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn message_dispatch_interrupts_in_flight_slack_request_and_preserves_context() {
+        let channel_impl = Arc::new(SlackRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(DelayedHistoryCaptureProvider {
+            delay: Duration::from_millis(250),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: true,
+            },
+            ack_reactions: true,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
+        let send_task = tokio::spawn(async move {
+            tx.send(traits::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "U123".to_string(),
+                reply_target: "C123".to_string(),
+                content: "first question".to_string(),
+                channel: "slack".to_string(),
+                timestamp: 1,
+                thread_ts: Some("1741234567.100001".to_string()),
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            tx.send(traits::ChannelMessage {
+                id: "msg-2".to_string(),
+                sender: "U123".to_string(),
+                reply_target: "C123".to_string(),
+                content: "second question".to_string(),
+                channel: "slack".to_string(),
+                timestamp: 2,
+                thread_ts: Some("1741234567.100001".to_string()),
+            })
+            .await
+            .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+        send_task.await.unwrap();
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].starts_with("C123:"));
+        assert!(sent_messages[0].contains("response-2"));
+        drop(sent_messages);
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 2);
+        let second_call = &calls[1];
+        assert!(second_call
+            .iter()
+            .any(|(role, content)| { role == "user" && content.contains("first question") }));
+        assert!(second_call
+            .iter()
+            .any(|(role, content)| { role == "user" && content.contains("second question") }));
+        assert!(
+            !second_call.iter().any(|(role, _)| role == "assistant"),
+            "cancelled turn should not persist an assistant response"
+        );
+    }
+
+    #[tokio::test]
     async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -5598,7 +5892,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: true,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: true,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -5675,7 +5972,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -5737,7 +6037,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -6123,6 +6426,33 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn channel_notify_observer_truncates_utf8_arguments_safely() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let observer = ChannelNotifyObserver {
+            inner: Arc::new(NoopObserver),
+            tx,
+            tools_used: AtomicBool::new(false),
+        };
+
+        let payload = (0..300)
+            .map(|n| serde_json::json!({ "content": format!("{}置tail", "a".repeat(n)) }))
+            .map(|v| v.to_string())
+            .find(|raw| raw.len() > 120 && !raw.is_char_boundary(120))
+            .expect("should produce non-char-boundary data at byte index 120");
+
+        observer.record_event(
+            &crate::observability::traits::ObserverEvent::ToolCallStart {
+                tool: "file_write".to_string(),
+                arguments: Some(payload),
+            },
+        );
+
+        let emitted = rx.try_recv().expect("observer should emit notify message");
+        assert!(emitted.contains("`file_write`"));
+        assert!(emitted.is_char_boundary(emitted.len()));
+    }
+
+    #[test]
     fn conversation_memory_key_uses_message_id() {
         let msg = traits::ChannelMessage {
             id: "msg_abc123".into(),
@@ -6135,6 +6465,39 @@ BTC is currently around $65,000 based on latest tool output."#
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
+    }
+
+    #[test]
+    fn followup_thread_id_prefers_thread_ts() {
+        let msg = traits::ChannelMessage {
+            id: "slack_C123_1741234567.123456".into(),
+            sender: "U123".into(),
+            reply_target: "C123".into(),
+            content: "hello".into(),
+            channel: "slack".into(),
+            timestamp: 1,
+            thread_ts: Some("1741234567.123456".into()),
+        };
+
+        assert_eq!(
+            followup_thread_id(&msg).as_deref(),
+            Some("1741234567.123456")
+        );
+    }
+
+    #[test]
+    fn followup_thread_id_falls_back_to_message_id() {
+        let msg = traits::ChannelMessage {
+            id: "msg_abc123".into(),
+            sender: "U123".into(),
+            reply_target: "C456".into(),
+            content: "hello".into(),
+            channel: "cli".into(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+
+        assert_eq!(followup_thread_id(&msg).as_deref(), Some("msg_abc123"));
     }
 
     #[test]
@@ -6297,7 +6660,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -6385,7 +6751,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -6473,7 +6842,10 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -7025,7 +7397,10 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -7094,7 +7469,10 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: false,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),

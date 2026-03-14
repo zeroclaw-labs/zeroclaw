@@ -53,7 +53,7 @@
 </p>
 
 <p align="center">
-  <a href="install.sh">Установка в 1 клик</a> |
+  <a href="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh">Установка в 1 клик</a> |
   <a href="docs/setup-guides/README.md">Быстрый старт</a> |
   <a href="docs/README.ru.md">Хаб документации</a> |
   <a href="docs/SUMMARY.md">TOC docs</a>
