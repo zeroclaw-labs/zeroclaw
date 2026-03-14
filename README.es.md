@@ -88,7 +88,7 @@ Construido por estudiantes y miembros de las comunidades de Harvard, MIT y Sunda
 
 <!-- BEGIN:WHATS_NEW -->
 
-### 🚀 What's New in v0.3.0-beta.196 (March 2026)
+### 🚀 What's New in v0.3.0-beta.200 (March 2026)
 
 | Area | Highlights |
 |---|---|
@@ -425,12 +425,11 @@ Construimos en código abierto porque las mejores ideas vienen de todas partes. 
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
 
-### 🌟 Recent Contributors (v0.3.0-beta.196)
+### 🌟 Recent Contributors (v0.3.0-beta.200)
 
-0
-0 contributors shipped features, fixes, and improvements in this release cycle:
+1 contributors shipped features, fixes, and improvements in this release cycle:
 
-
+- **Argenis**
 
 Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
 
