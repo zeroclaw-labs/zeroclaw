@@ -286,6 +286,9 @@ jobs:
       - name: Build web dashboard
         run: cd web && npm ci && npm run build
 
+      - name: Clean node_modules before packaging
+        run: rm -rf web/node_modules
+
       - name: Publish to crates.io
         run: cargo publish --locked --allow-dirty
         env:
