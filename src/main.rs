@@ -810,10 +810,7 @@ async fn main() -> Result<()> {
         // No auth material is placed in URLs to prevent leakage via browser history,
         // Referer headers, clipboard, or proxy logs.
         if config.gateway.require_pairing {
-            let pairing = security::PairingGuard::new(
-                true,
-                &config.gateway.paired_tokens,
-            );
+            let pairing = security::PairingGuard::new(true, &config.gateway.paired_tokens);
             if let Some(code) = pairing.pairing_code() {
                 println!();
                 println!("  \x1b[1;34m🦀 Gateway Pairing Code\x1b[0m");
@@ -825,7 +822,10 @@ async fn main() -> Result<()> {
                 println!("  Enter this code in the dashboard to pair your device.");
                 println!("  The code is single-use and expires after pairing.");
                 println!();
-                println!("  \x1b[2mDashboard: http://127.0.0.1:{}\x1b[0m", config.gateway.port);
+                println!(
+                    "  \x1b[2mDashboard: http://127.0.0.1:{}\x1b[0m",
+                    config.gateway.port
+                );
                 println!("  \x1b[2mDocs: https://www.zeroclawlabs.ai/docs\x1b[0m");
                 println!();
             }
