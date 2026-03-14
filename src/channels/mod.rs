@@ -445,6 +445,41 @@ fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
 ///
 /// LLM responses may contain `<function_calls>`, `<function_call>`,
 /// `<tool_call>`, `<toolcall>`, `<tool-call>`, `<tool>`, or `<invoke>`
+/// Detect raw provider error dumps in user-facing messages and replace
+/// with a short, human-readable explanation.  Returns `None` when the
+/// message is clean, `Some(sanitized)` when errors were detected.
+fn sanitize_provider_errors(message: &str) -> Option<String> {
+    let text = message
+        .strip_prefix("(continued)")
+        .map(|s| s.trim_start())
+        .unwrap_or(message);
+
+    let is_error_dump = text.contains("provider=")
+        && (text.contains("attempt ") || text.contains("non_retryable") || text.contains("rate_limited"));
+
+    if !is_error_dump {
+        return None;
+    }
+
+    let sanitized = if text.contains("input token count") && text.contains("exceeds") {
+        "Запрос слишком большой — попробуйте более конкретный вопрос."
+    } else if text.contains("rate_limited") || text.contains("RESOURCE_EXHAUSTED") {
+        "Все провайдеры перегружены, попробуйте через минуту."
+    } else if text.contains("model is not supported") || text.contains("UNAUTHENTICATED") {
+        "Ошибка конфигурации провайдера."
+    } else {
+        "Не удалось обработать запрос. Попробуйте позже."
+    };
+
+    tracing::warn!(
+        original_len = message.len(),
+        sanitized,
+        "Sanitized provider error dump in outgoing message"
+    );
+
+    Some(sanitized.to_string())
+}
+
 /// blocks that are internal protocol and must not be forwarded to end
 /// users on any channel.
 fn strip_tool_call_tags(message: &str) -> String {
@@ -2162,6 +2197,9 @@ async fn process_channel_message(
 
             let sanitized_response =
                 sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
+            // Replace raw provider error dumps with user-friendly messages.
+            let sanitized_response = sanitize_provider_errors(&sanitized_response)
+                .unwrap_or(sanitized_response);
             let delivered_response = if sanitized_response.is_empty()
                 && !outbound_response.trim().is_empty()
             {
@@ -2340,14 +2378,17 @@ async fn process_channel_message(
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
+                    let error_str = e.to_string();
+                    let user_error = sanitize_provider_errors(&error_str)
+                        .unwrap_or_else(|| format!("⚠️ Error: {safe_error}"));
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
+                            .finalize_draft(&msg.reply_target, draft_id, &user_error)
                             .await;
                     } else {
                         let _ = channel
                             .send(
-                                &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
+                                &SendMessage::new(user_error, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone())
                                     .reply_to(msg.reply_to_message_id.clone()),
                             )
@@ -7264,5 +7305,42 @@ This is an example JSON object for profile settings."#;
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
             Err(e) => panic!("should succeed when telegram is configured: {e}"),
         }
+    }
+
+    #[test]
+    fn sanitize_provider_errors_detects_rate_limit_dump() {
+        let input = "provider=gemini:gemini-1 attempt 1/4: rate_limited RESOURCE_EXHAUSTED";
+        let result = sanitize_provider_errors(input);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("перегружены"));
+    }
+
+    #[test]
+    fn sanitize_provider_errors_detects_token_overflow() {
+        let input = "provider=gemini attempt 1/4: non_retryable input token count 1300000 exceeds limit 1048576";
+        let result = sanitize_provider_errors(input);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("большой"));
+    }
+
+    #[test]
+    fn sanitize_provider_errors_ignores_clean_text() {
+        let input = "Вот контакты сантехников на Самуи";
+        assert!(sanitize_provider_errors(input).is_none());
+    }
+
+    #[test]
+    fn sanitize_provider_errors_detects_generic_dump() {
+        let input = "provider=gemini:gemini-api-2 attempt 3/4: non_retryable something weird";
+        let result = sanitize_provider_errors(input);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("Попробуйте"));
+    }
+
+    #[test]
+    fn sanitize_provider_errors_handles_continued_prefix() {
+        let input = "(continued)\n\nprovider=gemini attempt 1/4: rate_limited";
+        let result = sanitize_provider_errors(input);
+        assert!(result.is_some());
     }
 }
