@@ -46,6 +46,30 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     config::schema::validate_temperature(t)
 }
 
+fn print_no_command_help() -> Result<()> {
+    println!("No command provided.");
+    println!("Try `zeroclaw onboard --interactive` to initialize your workspace.");
+    println!();
+
+    let mut cmd = Cli::command();
+    cmd.print_help()?;
+    println!();
+
+    #[cfg(windows)]
+    pause_after_no_command_help();
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn pause_after_no_command_help() {
+    println!();
+    print!("Press Enter to exit...");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+}
+
 mod agent;
 mod approval;
 mod auth;
@@ -665,6 +689,10 @@ async fn main() -> Result<()> {
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
     if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
         eprintln!("Warning: Failed to install default crypto provider: {e:?}");
+    }
+
+    if std::env::args_os().len() <= 1 {
+        return print_no_command_help();
     }
 
     let cli = Cli::parse();
