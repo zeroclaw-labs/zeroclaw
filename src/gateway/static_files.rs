@@ -4,7 +4,7 @@
 
 use axum::{
     http::{header, StatusCode, Uri},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use rust_embed::Embed;
 
@@ -13,7 +13,7 @@ use rust_embed::Embed;
 struct WebAssets;
 
 /// Serve static files from `/_app/*` path
-pub async fn handle_static(uri: Uri) -> impl IntoResponse {
+pub async fn handle_static(uri: Uri) -> Response {
     let path = uri
         .path()
         .strip_prefix("/_app/")
@@ -24,18 +24,18 @@ pub async fn handle_static(uri: Uri) -> impl IntoResponse {
 }
 
 /// SPA fallback: serve index.html for any non-API, non-static GET request
-pub async fn handle_spa_fallback() -> impl IntoResponse {
-    match WebAssets::get("index.html") {
-        Some(_) => serve_embedded_file("index.html"),
-        None => (
+pub async fn handle_spa_fallback() -> Response {
+    if WebAssets::get("index.html").is_none() {
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Web dashboard not available. Build it with: cd web && npm ci && npm run build",
         )
-            .into_response(),
+            .into_response();
     }
+    serve_embedded_file("index.html")
 }
 
-fn serve_embedded_file(path: &str) -> impl IntoResponse {
+fn serve_embedded_file(path: &str) -> Response {
     match WebAssets::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path)
