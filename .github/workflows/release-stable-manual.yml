@@ -263,6 +263,34 @@ jobs:
             --notes-file release-notes.md \
             --latest
 
+  crates-io:
+    name: Publish to crates.io
+    needs: [validate, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web dashboard
+        run: cd web && npm ci && npm run build
+
+      - name: Publish to crates.io
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
   redeploy-website:
     name: Trigger Website Redeploy
     needs: [publish]

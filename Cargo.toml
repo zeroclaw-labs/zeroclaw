@@ -14,6 +14,15 @@ readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]
 rust-version = "1.87"
+include = [
+  "/src/**/*",
+  "/build.rs",
+  "/Cargo.toml",
+  "/Cargo.lock",
+  "/LICENSE*",
+  "/README.md",
+  "/web/dist/**/*",
+]
 
 [dependencies]
 # CLI - minimal and fast
