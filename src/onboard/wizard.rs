@@ -3877,6 +3877,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         Some(channel)
                     },
                     allowed_users,
+                    interrupt_on_new_message: false,
                 });
             }
             ChannelMenuChoice::IMessage => {
