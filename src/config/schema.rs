@@ -3097,6 +3097,11 @@ pub struct ChannelsConfig {
     /// completion) to incoming channel messages. Default: `true`.
     #[serde(default = "default_true")]
     pub ack_reactions: bool,
+    /// Whether to send tool-call notification messages (e.g. `🔧 web_search_tool: …`)
+    /// to channel users. When `false`, tool calls are still logged server-side but
+    /// not forwarded as individual channel messages. Default: `true`.
+    #[serde(default = "default_true")]
+    pub show_tool_calls: bool,
 }
 
 impl ChannelsConfig {
@@ -3230,6 +3235,7 @@ impl Default for ChannelsConfig {
             clawdtalk: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
+            show_tool_calls: true,
         }
     }
 }
@@ -3323,6 +3329,10 @@ pub struct SlackConfig {
     /// Allowed Slack user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, a newer Slack message from the same sender in the same channel
+    /// cancels the in-flight request and starts a fresh response with preserved history.
+    #[serde(default)]
+    pub interrupt_on_new_message: bool,
 }
 
 impl ChannelConfig for SlackConfig {
@@ -6245,6 +6255,7 @@ default_temperature = 0.7
                 clawdtalk: None,
                 message_timeout_secs: 300,
                 ack_reactions: true,
+                show_tool_calls: true,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -6958,6 +6969,7 @@ allowed_users = ["@ops:matrix.org"]
             clawdtalk: None,
             message_timeout_secs: 300,
             ack_reactions: true,
+            show_tool_calls: true,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -6996,6 +7008,7 @@ allowed_users = ["@ops:matrix.org"]
         let json = r#"{"bot_token":"xoxb-tok"}"#;
         let parsed: SlackConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.allowed_users.is_empty());
+        assert!(!parsed.interrupt_on_new_message);
     }
 
     #[test]
@@ -7003,6 +7016,14 @@ allowed_users = ["@ops:matrix.org"]
         let json = r#"{"bot_token":"xoxb-tok","allowed_users":["U111"]}"#;
         let parsed: SlackConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.allowed_users, vec!["U111"]);
+        assert!(!parsed.interrupt_on_new_message);
+    }
+
+    #[test]
+    async fn slack_config_deserializes_interrupt_on_new_message() {
+        let json = r#"{"bot_token":"xoxb-tok","interrupt_on_new_message":true}"#;
+        let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.interrupt_on_new_message);
     }
 
     #[test]
@@ -7024,6 +7045,7 @@ channel_id = "C123"
 "#;
         let parsed: SlackConfig = toml::from_str(toml_str).unwrap();
         assert!(parsed.allowed_users.is_empty());
+        assert!(!parsed.interrupt_on_new_message);
         assert_eq!(parsed.channel_id.as_deref(), Some("C123"));
     }
 
@@ -7174,6 +7196,7 @@ channel_id = "C123"
             clawdtalk: None,
             message_timeout_secs: 300,
             ack_reactions: true,
+            show_tool_calls: true,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

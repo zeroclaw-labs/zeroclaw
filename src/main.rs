@@ -48,7 +48,7 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
 
 fn print_no_command_help() -> Result<()> {
     println!("No command provided.");
-    println!("Try `zeroclaw onboard --interactive` to initialize your workspace.");
+    println!("Try `zeroclaw onboard` to initialize your workspace.");
     println!();
 
     let mut cmd = Cli::command();
@@ -157,10 +157,6 @@ struct Cli {
 enum Commands {
     /// Initialize your workspace and configuration
     Onboard {
-        /// Run the full interactive wizard (default is quick setup)
-        #[arg(long)]
-        interactive: bool,
-
         /// Overwrite existing config without confirmation
         #[arg(long)]
         force: bool,
@@ -173,7 +169,7 @@ enum Commands {
         #[arg(long)]
         channels_only: bool,
 
-        /// API key (used in quick mode, ignored with --interactive)
+        /// API key for provider configuration
         #[arg(long)]
         api_key: Option<String>,
 
@@ -726,7 +722,6 @@ async fn main() -> Result<()> {
     // Tokio runtime. To avoid "Cannot drop a runtime in a context where blocking is
     // not allowed", we run the wizard on a blocking thread via spawn_blocking.
     if let Commands::Onboard {
-        interactive,
         force,
         reinit,
         channels_only,
@@ -736,7 +731,6 @@ async fn main() -> Result<()> {
         memory,
     } = &cli.command
     {
-        let interactive = *interactive;
         let force = *force;
         let reinit = *reinit;
         let channels_only = *channels_only;
@@ -745,14 +739,8 @@ async fn main() -> Result<()> {
         let model = model.clone();
         let memory = memory.clone();
 
-        if interactive && channels_only {
-            bail!("Use either --interactive or --channels-only, not both");
-        }
         if reinit && channels_only {
-            bail!("Use either --reinit or --channels-only, not both");
-        }
-        if reinit && !interactive {
-            bail!("--reinit requires --interactive mode");
+            bail!("--reinit and --channels-only cannot be used together");
         }
         if channels_only
             && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
@@ -806,8 +794,6 @@ async fn main() -> Result<()> {
 
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
-        } else if interactive {
-            Box::pin(onboard::run_wizard(force)).await
         } else {
             onboard::run_quick_setup(
                 api_key.as_deref(),
@@ -818,6 +804,33 @@ async fn main() -> Result<()> {
             )
             .await
         }?;
+
+        // Display pairing code — user enters it in the dashboard to pair securely.
+        // The code is one-time use and brute-force protected (5 attempts → lockout).
+        // No auth material is placed in URLs to prevent leakage via browser history,
+        // Referer headers, clipboard, or proxy logs.
+        if config.gateway.require_pairing {
+            let pairing = security::PairingGuard::new(true, &config.gateway.paired_tokens);
+            if let Some(code) = pairing.pairing_code() {
+                println!();
+                println!("  \x1b[1;34m🦀 Gateway Pairing Code\x1b[0m");
+                println!();
+                println!("  \x1b[1;34m┌──────────────┐\x1b[0m");
+                println!("  \x1b[1;34m│\x1b[0m  \x1b[1m{code}\x1b[0m  \x1b[1;34m│\x1b[0m");
+                println!("  \x1b[1;34m└──────────────┘\x1b[0m");
+                println!();
+                println!("  Enter this code in the dashboard to pair your device.");
+                println!("  The code is single-use and expires after pairing.");
+                println!();
+                println!(
+                    "  \x1b[2mDashboard: http://127.0.0.1:{}\x1b[0m",
+                    config.gateway.port
+                );
+                println!("  \x1b[2mDocs: https://www.zeroclawlabs.ai/docs\x1b[0m");
+                println!();
+            }
+        }
+
         // Auto-start channels if user said yes during wizard
         if std::env::var("ZEROCLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
             channels::start_channels(config).await?;
@@ -2140,7 +2153,6 @@ mod tests {
 
         match cli.command {
             Commands::Onboard {
-                interactive,
                 force,
                 channels_only,
                 api_key,
@@ -2148,7 +2160,6 @@ mod tests {
                 model,
                 ..
             } => {
-                assert!(!interactive);
                 assert!(!force);
                 assert!(!channels_only);
                 assert_eq!(provider.as_deref(), Some("openrouter"));

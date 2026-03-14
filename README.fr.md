@@ -58,7 +58,7 @@ Construit par des étudiants et membres des communautés Harvard, MIT et Sundai.
 
 <p align="center">
   <a href="#démarrage-rapide">Démarrage</a> |
-  <a href="install.sh">Configuration en un clic</a> |
+  <a href="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh">Configuration en un clic</a> |
   <a href="docs/README.md">Hub Documentation</a> |
   <a href="docs/SUMMARY.md">Table des matières Documentation</a>
 </p>

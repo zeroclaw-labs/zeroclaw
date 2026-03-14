@@ -37,6 +37,96 @@ jobs:
           echo "tag=${beta_tag}" >> "$GITHUB_OUTPUT"
           echo "Beta release: ${beta_tag}"
 
+  release-notes:
+    name: Generate Release Notes
+    runs-on: ubuntu-latest
+    outputs:
+      notes: ${{ steps.notes.outputs.body }}
+      features: ${{ steps.notes.outputs.features }}
+      contributors: ${{ steps.notes.outputs.contributors }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Build release notes
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Use a wider range — find the previous stable tag to capture all
+          # contributors across the full release cycle, not just one beta bump
+          PREV_TAG=$(git tag --sort=-creatordate \
+            | grep -vE '\-beta\.' \
+            | head -1 || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="${PREV_TAG}..HEAD"
+          fi
+
+          # Extract features only (feat commits) — skip bug fixes for clean notes
+          FEATURES=$(git log "$RANGE" --pretty=format:"%s" --no-merges \
+            | grep -iE '^feat(\(|:)' \
+            | sed 's/^feat(\([^)]*\)): /\1: /' \
+            | sed 's/^feat: //' \
+            | sed 's/ (#[0-9]*)$//' \
+            | sort -uf \
+            | while IFS= read -r line; do echo "- ${line}"; done || true)
+
+          if [ -z "$FEATURES" ]; then
+            FEATURES="- Incremental improvements and polish"
+          fi
+
+          # Collect ALL unique contributors: git authors + Co-Authored-By
+          GIT_AUTHORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges | sort -uf || true)
+          CO_AUTHORS=$(git log "$RANGE" --pretty=format:"%b" --no-merges \
+            | grep -ioE 'Co-Authored-By: *[^<]+' \
+            | sed 's/Co-Authored-By: *//i' \
+            | sed 's/ *$//' \
+            | sort -uf || true)
+
+          # Merge, deduplicate, and filter out bots
+          ALL_CONTRIBUTORS=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
+            | sort -uf \
+            | grep -v '^$' \
+            | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^ZeroClaw Bot|^ZeroClaw Runner|^ZeroClaw Agent|^blacksmith' \
+            | while IFS= read -r name; do echo "- ${name}"; done || true)
+
+          # Build release body
+          BODY=$(cat <<NOTES_EOF
+          ## What's New
+
+          ${FEATURES}
+
+          ## Contributors
+
+          ${ALL_CONTRIBUTORS}
+
+          ---
+          *Full changelog: ${PREV_TAG}...HEAD*
+          NOTES_EOF
+          )
+
+          # Output multiline values
+          {
+            echo "body<<BODY_EOF"
+            echo "$BODY"
+            echo "BODY_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "features<<FEAT_EOF"
+            echo "$FEATURES"
+            echo "FEAT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "contributors<<CONTRIB_EOF"
+            echo "$ALL_CONTRIBUTORS"
+            echo "CONTRIB_EOF"
+          } >> "$GITHUB_OUTPUT"
+
   web:
     name: Build Web Dashboard
     runs-on: ubuntu-latest
@@ -132,7 +222,7 @@ jobs:
 
   publish:
     name: Publish Beta Release
-    needs: [version, build]
+    needs: [version, release-notes, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -154,11 +244,22 @@ jobs:
           tag_name: ${{ needs.version.outputs.tag }}
           name: ${{ needs.version.outputs.tag }}
           prerelease: true
-          generate_release_notes: true
+          body: ${{ needs.release-notes.outputs.notes }}
           files: |
             artifacts/**/*
+            install.sh
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Trigger website redeploy
+        env:
+          PAT: ${{ secrets.WEBSITE_REPO_PAT }}
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: token $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/zeroclaw-labs/zeroclaw-website/dispatches \
+            -d '{"event_type":"new-release","client_payload":{"install_script_url":"https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh"}}'
 
   docker:
     name: Push Docker Image

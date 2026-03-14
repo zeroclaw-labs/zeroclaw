@@ -53,7 +53,7 @@
 </p>
 
 <p align="center">
-  <a href="install.sh">一键部署</a> |
+  <a href="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh">一键部署</a> |
   <a href="docs/i18n/zh-CN/setup-guides/README.zh-CN.md">安装入门</a> |
   <a href="docs/README.zh-CN.md">文档总览</a> |
   <a href="docs/SUMMARY.zh-CN.md">文档目录</a>
