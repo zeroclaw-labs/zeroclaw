@@ -39,6 +39,47 @@ fn normalize_audio_filename(file_name: &str) -> String {
     }
 }
 
+/// Resolve the API key for voice transcription.
+///
+/// Priority order:
+/// 1. Explicit `config.api_key` (if set and non-empty).
+/// 2. Provider-specific env var based on `api_url`:
+///    - URL contains "openai.com" -> `OPENAI_API_KEY`
+///    - URL contains "groq.com"   -> `GROQ_API_KEY`
+/// 3. Fallback chain: `TRANSCRIPTION_API_KEY` -> `GROQ_API_KEY` -> `OPENAI_API_KEY`.
+fn resolve_transcription_api_key(config: &TranscriptionConfig) -> Result<String> {
+    // 1. Explicit config key
+    if let Some(ref key) = config.api_key {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    // 2. Provider-specific env var based on API URL
+    if config.api_url.contains("openai.com") {
+        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+            return Ok(key);
+        }
+    } else if config.api_url.contains("groq.com") {
+        if let Ok(key) = std::env::var("GROQ_API_KEY") {
+            return Ok(key);
+        }
+    }
+
+    // 3. Fallback chain
+    for var in ["TRANSCRIPTION_API_KEY", "GROQ_API_KEY", "OPENAI_API_KEY"] {
+        if let Ok(key) = std::env::var(var) {
+            return Ok(key);
+        }
+    }
+
+    bail!(
+        "No API key found for voice transcription — set one of: \
+         transcription.api_key in config, TRANSCRIPTION_API_KEY, GROQ_API_KEY, or OPENAI_API_KEY"
+    );
+}
+
 /// Validate audio data and resolve MIME type from file name.
 ///
 /// Returns `(normalized_filename, mime_type)` on success.
@@ -710,8 +751,10 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_missing_api_key() {
-        // Ensure fallback env key is absent for this test.
+        // Ensure all candidate keys are absent for this test.
         std::env::remove_var("GROQ_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("TRANSCRIPTION_API_KEY");
 
         let data = vec![0u8; 100];
         let config = TranscriptionConfig::default();
