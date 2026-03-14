@@ -455,7 +455,9 @@ fn sanitize_provider_errors(message: &str) -> Option<String> {
         .unwrap_or(message);
 
     let is_error_dump = text.contains("provider=")
-        && (text.contains("attempt ") || text.contains("non_retryable") || text.contains("rate_limited"));
+        && (text.contains("attempt ")
+            || text.contains("non_retryable")
+            || text.contains("rate_limited"));
 
     if !is_error_dump {
         return None;
@@ -2077,6 +2079,7 @@ async fn process_channel_message(
                 ctx.tool_call_dedup_exempt.as_ref(),
                 ctx.max_parallel_tool_calls,
                 ctx.max_tool_result_chars,
+                0,
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -2198,8 +2201,8 @@ async fn process_channel_message(
             let sanitized_response =
                 sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
             // Replace raw provider error dumps with user-friendly messages.
-            let sanitized_response = sanitize_provider_errors(&sanitized_response)
-                .unwrap_or(sanitized_response);
+            let sanitized_response =
+                sanitize_provider_errors(&sanitized_response).unwrap_or(sanitized_response);
             let delivered_response = if sanitized_response.is_empty()
                 && !outbound_response.trim().is_empty()
             {

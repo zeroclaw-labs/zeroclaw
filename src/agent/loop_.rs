@@ -2019,6 +2019,7 @@ pub(crate) async fn agent_turn(
         &[],
         5,
         4000,
+        0,
     )
     .await
 }
@@ -2221,6 +2222,7 @@ pub(crate) async fn run_tool_call_loop(
     dedup_exempt_tools: &[String],
     max_parallel_tool_calls: usize,
     max_tool_result_chars: usize,
+    iteration_cooldown_ms: u64,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2236,6 +2238,7 @@ pub(crate) async fn run_tool_call_loop(
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
+    let mut llm_last_response_at = Instant::now();
 
     for iteration in 0..max_iterations {
         tracing::info!(
@@ -2250,6 +2253,16 @@ pub(crate) async fn run_tool_call_loop(
             .is_some_and(CancellationToken::is_cancelled)
         {
             return Err(ToolLoopCancelled.into());
+        }
+
+        if iteration > 0 && iteration_cooldown_ms > 0 {
+            let elapsed = llm_last_response_at.elapsed();
+            let cooldown = Duration::from_millis(iteration_cooldown_ms);
+            if elapsed < cooldown {
+                let wait = cooldown - elapsed;
+                tracing::info!(wait_ms = wait.as_millis() as u64, "Iteration cooldown");
+                tokio::time::sleep(wait).await;
+            }
         }
 
         let image_marker_count = multimodal::count_image_markers(history);
@@ -2337,6 +2350,8 @@ pub(crate) async fn run_tool_call_loop(
                         .as_ref()
                         .map(|u| (u.input_tokens, u.output_tokens))
                         .unwrap_or((None, None));
+
+                    llm_last_response_at = Instant::now();
 
                     observer.record_event(&ObserverEvent::LlmResponse {
                         provider: provider_name.to_string(),
@@ -2780,46 +2795,100 @@ pub(crate) async fn run_tool_call_loop(
             });
         }
 
-        let executed_outcomes = if allow_parallel_execution && executable_calls.len() > 1 {
-            let max_par = max_parallel_tool_calls.max(1);
-            if executable_calls.len() <= max_par {
-                // Small batch — run all in parallel
-                execute_tools_parallel(
-                    &executable_calls,
+        // Partition: non-terminal run first (parallel), terminal deferred (sequential after).
+        // This prevents terminal tools (e.g. submit_contacts) from executing before
+        // search results are available when the LLM batches them together.
+        let (non_terminal_indices, terminal_indices): (Vec<usize>, Vec<usize>) =
+            (0..executable_calls.len()).partition(|&i| {
+                !tools_registry
+                    .iter()
+                    .find(|t| t.name() == executable_calls[i].name)
+                    .is_some_and(|t| t.is_terminal())
+            });
+
+        let has_deferred_terminal =
+            !terminal_indices.is_empty() && !non_terminal_indices.is_empty();
+        if has_deferred_terminal {
+            tracing::info!(
+                count = terminal_indices.len(),
+                "Deferring terminal tools to sequential phase"
+            );
+        }
+
+        let mut outcome_by_orig: Vec<(usize, ToolExecutionOutcome)> =
+            Vec::with_capacity(executable_calls.len());
+
+        // Phase 1: non-terminal tools (parallel or sequential per existing logic)
+        if !non_terminal_indices.is_empty() {
+            let phase1_calls: Vec<ParsedToolCall> = non_terminal_indices
+                .iter()
+                .map(|&i| executable_calls[i].clone())
+                .collect();
+            let outcomes = if allow_parallel_execution && phase1_calls.len() > 1 {
+                let max_par = max_parallel_tool_calls.max(1);
+                if phase1_calls.len() <= max_par {
+                    execute_tools_parallel(
+                        &phase1_calls,
+                        tools_registry,
+                        observer,
+                        cancellation_token.as_ref(),
+                    )
+                    .await?
+                } else {
+                    tracing::info!(
+                        total = phase1_calls.len(),
+                        batch_size = max_par,
+                        "Batching tool calls to limit parallelism"
+                    );
+                    let mut all_outcomes = Vec::new();
+                    for chunk in phase1_calls.chunks(max_par) {
+                        let batch = execute_tools_parallel(
+                            chunk,
+                            tools_registry,
+                            observer,
+                            cancellation_token.as_ref(),
+                        )
+                        .await?;
+                        all_outcomes.extend(batch);
+                    }
+                    all_outcomes
+                }
+            } else {
+                execute_tools_sequential(
+                    &phase1_calls,
                     tools_registry,
                     observer,
                     cancellation_token.as_ref(),
                 )
                 .await?
-            } else {
-                // Large batch — split into sequential groups of max_parallel
-                tracing::info!(
-                    total = executable_calls.len(),
-                    batch_size = max_par,
-                    "Batching tool calls to limit parallelism"
-                );
-                let mut all_outcomes = Vec::new();
-                for chunk in executable_calls.chunks(max_par) {
-                    let batch = execute_tools_parallel(
-                        chunk,
-                        tools_registry,
-                        observer,
-                        cancellation_token.as_ref(),
-                    )
-                    .await?;
-                    all_outcomes.extend(batch);
-                }
-                all_outcomes
+            };
+            for (&orig_idx, outcome) in non_terminal_indices.iter().zip(outcomes) {
+                outcome_by_orig.push((orig_idx, outcome));
             }
-        } else {
-            execute_tools_sequential(
-                &executable_calls,
+        }
+
+        // Phase 2: terminal tools — always sequential, AFTER search results available
+        if !terminal_indices.is_empty() {
+            let phase2_calls: Vec<ParsedToolCall> = terminal_indices
+                .iter()
+                .map(|&i| executable_calls[i].clone())
+                .collect();
+            let outcomes = execute_tools_sequential(
+                &phase2_calls,
                 tools_registry,
                 observer,
                 cancellation_token.as_ref(),
             )
-            .await?
-        };
+            .await?;
+            for (&orig_idx, outcome) in terminal_indices.iter().zip(outcomes) {
+                outcome_by_orig.push((orig_idx, outcome));
+            }
+        }
+
+        // Sort back to original order for result accumulation
+        outcome_by_orig.sort_by_key(|(idx, _)| *idx);
+        let executed_outcomes: Vec<ToolExecutionOutcome> =
+            outcome_by_orig.into_iter().map(|(_, o)| o).collect();
 
         for ((idx, call), outcome) in executable_indices
             .iter()
@@ -2900,10 +2969,8 @@ pub(crate) async fn run_tool_call_loop(
         // meaningful output, return it directly — skip the LLM re-turn that would
         // often generate a redundant plain-text summary or a malformed tool call.
         {
-            let terminal_output = tool_calls
-                .iter()
-                .zip(individual_results.iter())
-                .find_map(|(call, (_id, output))| {
+            let terminal_output = tool_calls.iter().zip(individual_results.iter()).find_map(
+                |(call, (_id, output))| {
                     let is_terminal = tools_registry
                         .iter()
                         .find(|t| t.name() == call.name)
@@ -2915,8 +2982,8 @@ pub(crate) async fn run_tool_call_loop(
                             || trimmed.starts_with("skipped")
                             || trimmed.is_empty();
                         // Don't early-return raw JSON — let LLM format it
-                        let is_raw_json = output.trim().starts_with('{')
-                            || output.trim().starts_with('[');
+                        let is_raw_json =
+                            output.trim().starts_with('{') || output.trim().starts_with('[');
                         if is_trivial || is_raw_json {
                             None
                         } else {
@@ -2925,7 +2992,8 @@ pub(crate) async fn run_tool_call_loop(
                     } else {
                         None
                     }
-                });
+                },
+            );
             if let Some(output) = terminal_output {
                 tracing::info!(
                     channel = channel_name,
@@ -3378,6 +3446,7 @@ pub async fn run(
             &config.agent.tool_call_dedup_exempt,
             config.agent.max_parallel_tool_calls,
             config.agent.max_tool_result_chars,
+            0,
         )
         .await?;
         final_output = response.clone();
@@ -3514,6 +3583,7 @@ pub async fn run(
                 &config.agent.tool_call_dedup_exempt,
                 config.agent.max_parallel_tool_calls,
                 config.agent.max_tool_result_chars,
+                0,
             )
             .await
             {
@@ -4062,6 +4132,7 @@ mod tests {
             &[],
             5,
             4000,
+            0,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -4111,6 +4182,7 @@ mod tests {
             &[],
             5,
             4000,
+            0,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -4154,6 +4226,7 @@ mod tests {
             &[],
             5,
             4000,
+            0,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -4283,6 +4356,7 @@ mod tests {
             &[],
             5,
             4000,
+            0,
         )
         .await
         .expect("parallel execution should complete");
@@ -4355,6 +4429,7 @@ mod tests {
             &[],
             5,
             4000,
+            0,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4419,6 +4494,7 @@ mod tests {
             &exempt,
             5,
             4000,
+            0,
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -4498,6 +4574,7 @@ mod tests {
             &exempt,
             5,
             4000,
+            0,
         )
         .await
         .expect("loop should complete");
@@ -4554,6 +4631,7 @@ mod tests {
             &[],
             5,
             4000,
+            0,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -6436,6 +6514,7 @@ Let me check the result."#;
             &[],
             2, // max_parallel_tool_calls = 2
             4000,
+            0,
         )
         .await
         .expect("tool loop should succeed");
@@ -6485,10 +6564,7 @@ Let me check the result."#;
         ]);
 
         let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(LargeOutputTool)];
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("do it"),
-        ];
+        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("do it")];
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(
@@ -6511,6 +6587,7 @@ Let me check the result."#;
             &[],
             5,
             50, // max_tool_result_chars = 50
+            0,
         )
         .await
         .expect("should succeed");
@@ -6624,6 +6701,7 @@ Let me check the result."#;
             &[],
             5,
             4000,
+            0,
         )
         .await
         .expect("tool loop should succeed");
@@ -6646,9 +6724,7 @@ Let me check the result."#;
             .map(|m| m.content.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        let skip_count = all_history
-            .matches("already called")
-            .count();
+        let skip_count = all_history.matches("already called").count();
         assert_eq!(
             skip_count, 7,
             "Expected 7 skip messages for capped calls, but found {skip_count}"

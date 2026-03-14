@@ -302,6 +302,10 @@ pub struct DelegateAgentConfig {
     /// Defaults to 4000 when absent.
     #[serde(default)]
     pub max_tool_result_chars: Option<usize>,
+    /// Minimum milliseconds between agent loop iterations.
+    /// Helps avoid rate limits on low-RPM providers.
+    #[serde(default)]
+    pub iteration_cooldown_ms: Option<u64>,
 }
 
 /// Valid temperature range for all paths (config, CLI, env override).
@@ -6133,6 +6137,7 @@ tool_dispatcher = "xml"
                 fallback_providers: Vec::new(),
                 max_parallel_tool_calls: None,
                 max_tool_result_chars: None,
+                iteration_cooldown_ms: None,
             },
         );
 

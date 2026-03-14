@@ -641,6 +641,7 @@ impl ModelRoutingConfigTool {
                 fallback_providers: Vec::new(),
                 max_parallel_tool_calls: None,
                 max_tool_result_chars: None,
+                iteration_cooldown_ms: None,
             });
 
         next_agent.provider = provider;

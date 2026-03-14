@@ -472,6 +472,7 @@ impl DelegateTool {
                 &[],
                 agent_config.max_parallel_tool_calls.unwrap_or(5),
                 agent_config.max_tool_result_chars.unwrap_or(4000),
+                agent_config.iteration_cooldown_ms.unwrap_or(0),
             ),
         )
         .await;
@@ -607,6 +608,7 @@ mod tests {
                 fallback_providers: Vec::new(),
                 max_parallel_tool_calls: None,
                 max_tool_result_chars: None,
+                iteration_cooldown_ms: None,
             },
         );
         agents.insert(
@@ -624,6 +626,7 @@ mod tests {
                 fallback_providers: Vec::new(),
                 max_parallel_tool_calls: None,
                 max_tool_result_chars: None,
+                iteration_cooldown_ms: None,
             },
         );
         agents
@@ -780,6 +783,7 @@ mod tests {
             fallback_providers: Vec::new(),
             max_parallel_tool_calls: None,
             max_tool_result_chars: None,
+            iteration_cooldown_ms: None,
         }
     }
 
@@ -891,6 +895,7 @@ mod tests {
                 fallback_providers: Vec::new(),
                 max_parallel_tool_calls: None,
                 max_tool_result_chars: None,
+                iteration_cooldown_ms: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1000,6 +1005,7 @@ mod tests {
                 fallback_providers: Vec::new(),
                 max_parallel_tool_calls: None,
                 max_tool_result_chars: None,
+                iteration_cooldown_ms: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1038,6 +1044,7 @@ mod tests {
                 fallback_providers: Vec::new(),
                 max_parallel_tool_calls: None,
                 max_tool_result_chars: None,
+                iteration_cooldown_ms: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
