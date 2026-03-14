@@ -65,12 +65,13 @@ pub mod rag;
 pub mod runtime;
 pub(crate) mod security;
 pub(crate) mod service;
-pub(crate) mod skills;
+pub mod skills;
 pub mod tools;
 pub(crate) mod tunnel;
 pub(crate) mod util;
 
 pub use config::Config;
+pub use skills::Skill;
 
 /// Gateway management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -30,7 +30,7 @@ pub struct Agent {
     temperature: f64,
     workspace_dir: std::path::PathBuf,
     identity_config: crate::config::IdentityConfig,
-    skills: Vec<crate::skills::Skill>,
+    skills: Vec<Box<dyn crate::skills::Skill>>,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     auto_save: bool,
     history: Vec<ConversationMessage>,
@@ -52,7 +52,7 @@ pub struct AgentBuilder {
     temperature: Option<f64>,
     workspace_dir: Option<std::path::PathBuf>,
     identity_config: Option<crate::config::IdentityConfig>,
-    skills: Option<Vec<crate::skills::Skill>>,
+    skills: Option<Vec<Box<dyn crate::skills::Skill>>>,
     skills_prompt_mode: Option<crate::config::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
@@ -144,7 +144,7 @@ impl AgentBuilder {
         self
     }
 
-    pub fn skills(mut self, skills: Vec<crate::skills::Skill>) -> Self {
+    pub fn skills(mut self, skills: Vec<Box<dyn crate::skills::Skill>>) -> Self {
         self.skills = Some(skills);
         self
     }

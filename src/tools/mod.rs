@@ -257,7 +257,10 @@ pub fn all_tools_with_runtime(
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
         Arc::new(GlobSearchTool::new(security.clone())),
-        Arc::new(GoogleWorkspaceTool::new(security.clone())),
+        Arc::new(GoogleWorkspaceTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+        )),
         Arc::new(ContentSearchTool::new(security.clone())),
         Arc::new(CronAddTool::new(config.clone(), security.clone())),
         Arc::new(CronListTool::new(config.clone())),

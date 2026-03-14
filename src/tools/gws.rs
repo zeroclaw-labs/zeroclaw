@@ -5,10 +5,9 @@
 //!
 //! # Configuration
 //!
-//! Requires Google OAuth2 credentials set as environment variables:
-//! - `GOOGLE_CLIENT_ID`
-//! - `GOOGLE_CLIENT_SECRET`
-//! - `GOOGLE_REFRESH_TOKEN`
+//! Credentials are resolved in this order:
+//! 1. Process environment variables (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`)
+//! 2. `.env` file in the zeroclaw config directory (parent of workspace_dir, e.g. `~/.zeroclaw/.env`)
 //!
 //! # Example Usage
 //!
@@ -28,6 +27,7 @@ use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -38,32 +38,108 @@ const TOKEN_TTL: Duration = Duration::from_secs(55 * 60);
 /// Google Workspace integration tool
 pub struct GoogleWorkspaceTool {
     security: Arc<SecurityPolicy>,
-    client_id: Option<String>,
-    client_secret: Option<String>,
-    refresh_token: Option<String>,
+    /// Parent of workspace_dir (the zeroclaw config dir, e.g. ~/.zeroclaw/) for .env fallback
+    zeroclaw_dir: Option<PathBuf>,
     /// Cached (access_token, acquired_at)
     token_cache: Arc<Mutex<Option<(String, Instant)>>>,
 }
 
 impl GoogleWorkspaceTool {
-    /// Create a new GoogleWorkspaceTool instance
-    pub fn new(security: Arc<SecurityPolicy>) -> Self {
+    /// Create a new GoogleWorkspaceTool instance.
+    /// `workspace_dir` is the agent workspace path (e.g. `~/.zeroclaw/workspace`);
+    /// the `.env` file is read from its parent directory as a credential fallback.
+    pub fn new(security: Arc<SecurityPolicy>, workspace_dir: PathBuf) -> Self {
+        let zeroclaw_dir = workspace_dir.parent().map(|p| p.to_path_buf());
         Self {
             security,
-            client_id: std::env::var("GOOGLE_CLIENT_ID").ok(),
-            client_secret: std::env::var("GOOGLE_CLIENT_SECRET").ok(),
-            refresh_token: std::env::var("GOOGLE_REFRESH_TOKEN").ok(),
+            zeroclaw_dir,
             token_cache: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Validate credentials are configured
-    fn validate_credentials(&self) -> anyhow::Result<()> {
-        if self.client_id.is_none() || self.client_secret.is_none() || self.refresh_token.is_none()
+    /// Parse a single value from a `.env` file line, stripping quotes and inline comments.
+    fn parse_env_value(raw: &str) -> String {
+        let raw = raw.trim();
+        let unquoted = if raw.len() >= 2
+            && ((raw.starts_with('"') && raw.ends_with('"'))
+                || (raw.starts_with('\'') && raw.ends_with('\'')))
         {
+            &raw[1..raw.len() - 1]
+        } else {
+            raw
+        };
+        unquoted.split_once(" #").map_or_else(
+            || unquoted.trim().to_string(),
+            |(v, _)| v.trim().to_string(),
+        )
+    }
+
+    /// Read a named key from a `.env` file.
+    async fn read_env_file_key(path: &std::path::Path, key: &str) -> Option<String> {
+        let content = tokio::fs::read_to_string(path).await.ok()?;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let line = line.strip_prefix("export ").map(str::trim).unwrap_or(line);
+            if let Some((k, v)) = line.split_once('=') {
+                if k.trim().eq_ignore_ascii_case(key) {
+                    return Some(Self::parse_env_value(v));
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve a credential: process env first, then `.env` file fallback.
+    async fn resolve_credential(&self, env_var: &str) -> Option<String> {
+        // 1. Process environment (works when daemon is started with env already set)
+        if let Ok(val) = std::env::var(env_var) {
+            if !val.is_empty() {
+                return Some(val);
+            }
+        }
+        // 2. .env file in the zeroclaw config dir (parent of workspace, e.g. ~/.zeroclaw/.env)
+        if let Some(ref dir) = self.zeroclaw_dir {
+            let env_path = dir.join(".env");
+            if let Some(val) = Self::read_env_file_key(&env_path, env_var).await {
+                if !val.is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+        None
+    }
+
+    /// Validate that credentials can be resolved (either from env or .env file).
+    async fn validate_credentials(&self) -> anyhow::Result<()> {
+        let missing: Vec<&str> = {
+            let mut m = Vec::new();
+            if self.resolve_credential("GOOGLE_CLIENT_ID").await.is_none() {
+                m.push("GOOGLE_CLIENT_ID");
+            }
+            if self
+                .resolve_credential("GOOGLE_CLIENT_SECRET")
+                .await
+                .is_none()
+            {
+                m.push("GOOGLE_CLIENT_SECRET");
+            }
+            if self
+                .resolve_credential("GOOGLE_REFRESH_TOKEN")
+                .await
+                .is_none()
+            {
+                m.push("GOOGLE_REFRESH_TOKEN");
+            }
+            m
+        };
+        if !missing.is_empty() {
             return Err(anyhow::anyhow!(
-                "Google Workspace credentials not configured. Set GOOGLE_CLIENT_ID, \
-                 GOOGLE_CLIENT_SECRET, and GOOGLE_REFRESH_TOKEN environment variables."
+                "Google Workspace credentials not configured: {}. \
+                 Set them as environment variables or add them to ~/.zeroclaw/.env.",
+                missing.join(", ")
             ));
         }
         Ok(())
@@ -110,10 +186,19 @@ impl GoogleWorkspaceTool {
             }
         }
 
-        // Refresh the token
-        let client_id = self.client_id.as_deref().unwrap();
-        let client_secret = self.client_secret.as_deref().unwrap();
-        let refresh_token = self.refresh_token.as_deref().unwrap();
+        // Refresh the token — resolve credentials now (env or .env file)
+        let client_id = self
+            .resolve_credential("GOOGLE_CLIENT_ID")
+            .await
+            .ok_or_else(|| anyhow::anyhow!("GOOGLE_CLIENT_ID not found"))?;
+        let client_secret = self
+            .resolve_credential("GOOGLE_CLIENT_SECRET")
+            .await
+            .ok_or_else(|| anyhow::anyhow!("GOOGLE_CLIENT_SECRET not found"))?;
+        let refresh_token = self
+            .resolve_credential("GOOGLE_REFRESH_TOKEN")
+            .await
+            .ok_or_else(|| anyhow::anyhow!("GOOGLE_REFRESH_TOKEN not found"))?;
 
         let builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
@@ -125,9 +210,9 @@ impl GoogleWorkspaceTool {
             .post("https://oauth2.googleapis.com/token")
             .form(&[
                 ("grant_type", "refresh_token"),
-                ("client_id", client_id),
-                ("client_secret", client_secret),
-                ("refresh_token", refresh_token),
+                ("client_id", client_id.as_str()),
+                ("client_secret", client_secret.as_str()),
+                ("refresh_token", refresh_token.as_str()),
             ])
             .send()
             .await?;
@@ -292,7 +377,7 @@ impl GoogleWorkspaceTool {
 
 impl Default for GoogleWorkspaceTool {
     fn default() -> Self {
-        Self::new(Arc::new(SecurityPolicy::default()))
+        Self::new(Arc::new(SecurityPolicy::default()), PathBuf::from("."))
     }
 }
 
@@ -354,7 +439,7 @@ impl Tool for GoogleWorkspaceTool {
         }
 
         // Validate credentials
-        if let Err(e) = self.validate_credentials() {
+        if let Err(e) = self.validate_credentials().await {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -415,7 +500,8 @@ mod tests {
     use crate::security::{AutonomyLevel, SecurityPolicy};
 
     fn tool_with_security(security: SecurityPolicy) -> GoogleWorkspaceTool {
-        GoogleWorkspaceTool::new(Arc::new(security))
+        // Use a non-existent dir so .env fallback finds nothing (env vars control credentials in tests)
+        GoogleWorkspaceTool::new(Arc::new(security), PathBuf::from("/nonexistent/workspace"))
     }
 
     fn supervised_tool() -> GoogleWorkspaceTool {
@@ -538,17 +624,14 @@ mod tests {
 
     #[tokio::test]
     async fn execute_returns_error_when_credentials_missing() {
-        // Construct a tool with credentials explicitly cleared
-        let tool = GoogleWorkspaceTool {
-            security: Arc::new(SecurityPolicy {
+        // Tool pointing at a nonexistent dir so .env fallback also finds nothing
+        let tool = GoogleWorkspaceTool::new(
+            Arc::new(SecurityPolicy {
                 autonomy: AutonomyLevel::Supervised,
                 ..SecurityPolicy::default()
             }),
-            client_id: None,
-            client_secret: None,
-            refresh_token: None,
-            token_cache: Arc::new(Mutex::new(None)),
-        };
+            PathBuf::from("/nonexistent/workspace"),
+        );
         let result = tool
             .execute(json!({
                 "service": "gmail",

@@ -38,6 +38,11 @@ pub trait HookHandler: Send + Sync {
     async fn on_after_tool_call(&self, _tool: &str, _result: &ToolResult, _duration: Duration) {}
     async fn on_message_sent(&self, _channel: &str, _recipient: &str, _content: &str) {}
     async fn on_heartbeat_tick(&self) {}
+    async fn on_startup(&self) {}
+    async fn on_shutdown(&self) {}
+    async fn on_error(&self, _error: &anyhow::Error) {}
+    async fn on_skill_loaded(&self, _skill_name: &str) {}
+    async fn on_skill_unloaded(&self, _skill_name: &str) {}
 
     // --- Modifying hooks (sequential by priority, can cancel) ---
     async fn before_model_resolve(

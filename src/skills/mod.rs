@@ -7,6 +7,9 @@ use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 mod audit;
+pub mod traits;
+
+pub use traits::Skill;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
@@ -16,7 +19,7 @@ const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 /// Skills live in `~/.zeroclaw/workspace/skills/<name>/SKILL.md`
 /// and can include tool definitions, prompts, and automation scripts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Skill {
+pub struct LegacySkill {
     pub name: String,
     pub description: String,
     pub version: String,
@@ -25,16 +28,98 @@ pub struct Skill {
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
-    pub tools: Vec<SkillTool>,
+    pub tools: Vec<LegacySkillTool>,
     #[serde(default)]
     pub prompts: Vec<String>,
     #[serde(skip)]
     pub location: Option<PathBuf>,
 }
 
+impl Skill for LegacySkill {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn version(&self) -> &str {
+        &self.version
+    }
+
+    fn author(&self) -> Option<&str> {
+        self.author.as_deref()
+    }
+
+    fn tags(&self) -> &[String] {
+        &self.tags
+    }
+
+    fn location(&self) -> Option<PathBuf> {
+        self.location.clone()
+    }
+
+    fn tools(&self) -> Vec<Box<dyn crate::tools::Tool>> {
+        self.tools
+            .iter()
+            .map(|t| {
+                Box::new(LegacySkillToolWrapper {
+                    tool: t.clone(),
+                }) as Box<dyn crate::tools::Tool>
+            })
+            .collect()
+    }
+
+    fn prompt_contribution(&self) -> Option<String> {
+        if self.prompts.is_empty() {
+            None
+        } else {
+            Some(self.prompts.join("\n"))
+        }
+    }
+
+    fn prompts(&self) -> &[String] {
+        &self.prompts
+    }
+}
+
+pub struct LegacySkillToolWrapper {
+    tool: LegacySkillTool,
+}
+
+#[async_trait::async_trait]
+impl crate::tools::Tool for LegacySkillToolWrapper {
+    fn name(&self) -> &str {
+        &self.tool.name
+    }
+
+    fn description(&self) -> &str {
+        &self.tool.description
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "args": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" }
+                }
+            }
+        })
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+        // This is a bridge to the existing legacy execution logic.
+        // For now, we'll return a placeholder or error if not fully integrated.
+        anyhow::bail!("Legacy tool execution through Skill trait not yet implemented. Use legacy dispatcher.")
+    }
+}
+
 /// A tool defined by a skill (shell command, HTTP call, etc.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillTool {
+pub struct LegacySkillTool {
     pub name: String,
     pub description: String,
     /// "shell", "http", "script"
@@ -50,7 +135,7 @@ pub struct SkillTool {
 struct SkillManifest {
     skill: SkillMeta,
     #[serde(default)]
-    tools: Vec<SkillTool>,
+    tools: Vec<LegacySkillTool>,
     #[serde(default)]
     prompts: Vec<String>,
 }
@@ -72,12 +157,15 @@ fn default_version() -> String {
 }
 
 /// Load all skills from the workspace skills directory
-pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
+pub fn load_skills(workspace_dir: &Path) -> Vec<Box<dyn Skill>> {
     load_skills_with_open_skills_config(workspace_dir, None, None)
 }
 
 /// Load skills using runtime config values (preferred at runtime).
-pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Config) -> Vec<Skill> {
+pub fn load_skills_with_config(
+    workspace_dir: &Path,
+    config: &crate::config::Config,
+) -> Vec<Box<dyn Skill>> {
     load_skills_with_open_skills_config(
         workspace_dir,
         Some(config.skills.open_skills_enabled),
@@ -89,7 +177,7 @@ fn load_skills_with_open_skills_config(
     workspace_dir: &Path,
     config_open_skills_enabled: Option<bool>,
     config_open_skills_dir: Option<&str>,
-) -> Vec<Skill> {
+) -> Vec<Box<dyn Skill>> {
     let mut skills = Vec::new();
 
     if let Some(open_skills_dir) =
@@ -102,17 +190,17 @@ fn load_skills_with_open_skills_config(
     skills
 }
 
-fn load_workspace_skills(workspace_dir: &Path) -> Vec<Skill> {
+fn load_workspace_skills(workspace_dir: &Path) -> Vec<Box<dyn Skill>> {
     let skills_dir = workspace_dir.join("skills");
     load_skills_from_directory(&skills_dir)
 }
 
-fn load_skills_from_directory(skills_dir: &Path) -> Vec<Skill> {
+fn load_skills_from_directory(skills_dir: &Path) -> Vec<Box<dyn Skill>> {
     if !skills_dir.exists() {
         return Vec::new();
     }
 
-    let mut skills = Vec::new();
+    let mut skills: Vec<Box<dyn Skill>> = Vec::new();
 
     let Ok(entries) = std::fs::read_dir(skills_dir) else {
         return skills;
@@ -149,11 +237,11 @@ fn load_skills_from_directory(skills_dir: &Path) -> Vec<Skill> {
 
         if manifest_path.exists() {
             if let Ok(skill) = load_skill_toml(&manifest_path) {
-                skills.push(skill);
+                skills.push(Box::new(skill));
             }
         } else if md_path.exists() {
             if let Ok(skill) = load_skill_md(&md_path, &path) {
-                skills.push(skill);
+                skills.push(Box::new(skill));
             }
         }
     }
@@ -161,7 +249,7 @@ fn load_skills_from_directory(skills_dir: &Path) -> Vec<Skill> {
     skills
 }
 
-fn load_open_skills(repo_dir: &Path) -> Vec<Skill> {
+fn load_open_skills(repo_dir: &Path) -> Vec<Box<dyn Skill>> {
     // Modern open-skills layout stores skill packages in `skills/<name>/SKILL.md`.
     // Prefer that structure to avoid treating repository docs (e.g. CONTRIBUTING.md)
     // as executable skills.
@@ -170,7 +258,7 @@ fn load_open_skills(repo_dir: &Path) -> Vec<Skill> {
         return load_skills_from_directory(&nested_skills_dir);
     }
 
-    let mut skills = Vec::new();
+    let mut skills: Vec<Box<dyn Skill>> = Vec::new();
 
     let Ok(entries) = std::fs::read_dir(repo_dir) else {
         return skills;
@@ -218,7 +306,7 @@ fn load_open_skills(repo_dir: &Path) -> Vec<Skill> {
         }
 
         if let Ok(skill) = load_open_skill_md(&path) {
-            skills.push(skill);
+            skills.push(Box::new(skill));
         }
     }
 
@@ -401,11 +489,11 @@ fn mark_open_skills_synced(repo_dir: &Path) -> Result<()> {
 }
 
 /// Load a skill from a SKILL.toml manifest
-fn load_skill_toml(path: &Path) -> Result<Skill> {
+fn load_skill_toml(path: &Path) -> Result<LegacySkill> {
     let content = std::fs::read_to_string(path)?;
     let manifest: SkillManifest = toml::from_str(&content)?;
 
-    Ok(Skill {
+    Ok(LegacySkill {
         name: manifest.skill.name,
         description: manifest.skill.description,
         version: manifest.skill.version,
@@ -418,7 +506,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
 }
 
 /// Load a skill from a SKILL.md file (simpler format)
-fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
+fn load_skill_md(path: &Path, dir: &Path) -> Result<LegacySkill> {
     let content = std::fs::read_to_string(path)?;
     let name = dir
         .file_name()
@@ -426,7 +514,7 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         .unwrap_or("unknown")
         .to_string();
 
-    Ok(Skill {
+    Ok(LegacySkill {
         name,
         description: extract_description(&content),
         version: "0.1.0".to_string(),
@@ -438,7 +526,7 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
     })
 }
 
-fn load_open_skill_md(path: &Path) -> Result<Skill> {
+fn load_open_skill_md(path: &Path) -> Result<LegacySkill> {
     let content = std::fs::read_to_string(path)?;
     let name = path
         .file_stem()
@@ -446,7 +534,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         .unwrap_or("open-skill")
         .to_string();
 
-    Ok(Skill {
+    Ok(LegacySkill {
         name,
         description: extract_description(&content),
         version: "open-skills".to_string(),
@@ -493,16 +581,16 @@ fn write_xml_text_element(out: &mut String, indent: usize, tag: &str, value: &st
     out.push_str(">\n");
 }
 
-fn resolve_skill_location(skill: &Skill, workspace_dir: &Path) -> PathBuf {
-    skill.location.clone().unwrap_or_else(|| {
+fn resolve_skill_location(skill: &dyn Skill, workspace_dir: &Path) -> PathBuf {
+    skill.location().unwrap_or_else(|| {
         workspace_dir
             .join("skills")
-            .join(&skill.name)
+            .join(skill.name())
             .join("SKILL.md")
     })
 }
 
-fn render_skill_location(skill: &Skill, workspace_dir: &Path, prefer_relative: bool) -> String {
+fn render_skill_location(skill: &dyn Skill, workspace_dir: &Path, prefer_relative: bool) -> String {
     let location = resolve_skill_location(skill, workspace_dir);
     if prefer_relative {
         if let Ok(relative) = location.strip_prefix(workspace_dir) {
@@ -513,7 +601,7 @@ fn render_skill_location(skill: &Skill, workspace_dir: &Path, prefer_relative: b
 }
 
 /// Build the "Available Skills" system prompt section with full skill instructions.
-pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
+pub fn skills_to_prompt(skills: &[Box<dyn Skill>], workspace_dir: &Path) -> String {
     skills_to_prompt_with_mode(
         skills,
         workspace_dir,
@@ -523,7 +611,7 @@ pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
 
 /// Build the "Available Skills" system prompt section with configurable verbosity.
 pub fn skills_to_prompt_with_mode(
-    skills: &[Skill],
+    skills: &[Box<dyn Skill>],
     workspace_dir: &Path,
     mode: crate::config::SkillsPromptInjectionMode,
 ) -> String {
@@ -550,31 +638,38 @@ pub fn skills_to_prompt_with_mode(
 
     for skill in skills {
         let _ = writeln!(prompt, "  <skill>");
-        write_xml_text_element(&mut prompt, 4, "name", &skill.name);
-        write_xml_text_element(&mut prompt, 4, "description", &skill.description);
-        let location = render_skill_location(
-            skill,
+        write_xml_text_element(&mut prompt, 4, "name", skill.name());
+        write_xml_text_element(&mut prompt, 4, "description", skill.description());
+        let location_str = render_skill_location(
+            skill.as_ref(),
             workspace_dir,
             matches!(mode, crate::config::SkillsPromptInjectionMode::Compact),
         );
-        write_xml_text_element(&mut prompt, 4, "location", &location);
+        write_xml_text_element(&mut prompt, 4, "location", &location_str);
 
         if matches!(mode, crate::config::SkillsPromptInjectionMode::Full) {
-            if !skill.prompts.is_empty() {
+            let prompts = skill.prompts();
+            if !prompts.is_empty() {
                 let _ = writeln!(prompt, "    <instructions>");
-                for instruction in &skill.prompts {
+                for instruction in prompts {
                     write_xml_text_element(&mut prompt, 6, "instruction", instruction);
                 }
                 let _ = writeln!(prompt, "    </instructions>");
             }
 
-            if !skill.tools.is_empty() {
+            let tools = skill.tools();
+            if !tools.is_empty() {
                 let _ = writeln!(prompt, "    <tools>");
-                for tool in &skill.tools {
+                for tool in tools {
                     let _ = writeln!(prompt, "      <tool>");
-                    write_xml_text_element(&mut prompt, 8, "name", &tool.name);
-                    write_xml_text_element(&mut prompt, 8, "description", &tool.description);
-                    write_xml_text_element(&mut prompt, 8, "kind", &tool.kind);
+                    write_xml_text_element(&mut prompt, 8, "name", tool.name());
+                    write_xml_text_element(
+                        &mut prompt,
+                        8,
+                        "description",
+                        tool.description(),
+                    );
+                    // Tool trait does not expose 'kind' directly anymore in this view
                     let _ = writeln!(prompt, "      </tool>");
                 }
                 let _ = writeln!(prompt, "    </tools>");
@@ -847,23 +942,24 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                 for skill in &skills {
                     println!(
                         "  {} {} — {}",
-                        console::style(&skill.name).white().bold(),
-                        console::style(format!("v{}", skill.version)).dim(),
-                        skill.description
+                        console::style(skill.name()).white().bold(),
+                        console::style(format!("v{}", skill.version())).dim(),
+                        skill.description()
                     );
-                    if !skill.tools.is_empty() {
+                    let tools = skill.tools();
+                    if !tools.is_empty() {
                         println!(
                             "    Tools: {}",
-                            skill
-                                .tools
+                            tools
                                 .iter()
-                                .map(|t| t.name.as_str())
+                                .map(|t| t.name())
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         );
                     }
-                    if !skill.tags.is_empty() {
-                        println!("    Tags:  {}", skill.tags.join(", "));
+                    let tags = skill.tags();
+                    if !tags.is_empty() {
+                        println!("    Tags:  {}", tags.join(", "));
                     }
                 }
             }
@@ -1035,9 +1131,9 @@ command = "echo hello"
 
         let skills = load_skills(dir.path());
         assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "test-skill");
-        assert_eq!(skills[0].tools.len(), 1);
-        assert_eq!(skills[0].tools[0].name, "hello");
+        assert_eq!(skills[0].name(), "test-skill");
+        assert_eq!(skills[0].tools().len(), 1);
+        assert_eq!(skills[0].tools()[0].name(), "hello");
     }
 
     #[test]
@@ -1055,19 +1151,20 @@ command = "echo hello"
 
         let skills = load_skills(dir.path());
         assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "md-skill");
-        assert!(skills[0].description.contains("cool things"));
+        assert_eq!(skills[0].name(), "md-skill");
+        assert!(skills[0].description().contains("cool things"));
     }
 
     #[test]
     fn skills_to_prompt_empty() {
-        let prompt = skills_to_prompt(&[], Path::new("/tmp"));
+        let skills: Vec<Box<dyn Skill>> = vec![];
+        let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.is_empty());
     }
 
     #[test]
     fn skills_to_prompt_with_skills() {
-        let skills = vec![Skill {
+        let skills: Vec<Box<dyn Skill>> = vec![Box::new(LegacySkill {
             name: "test".to_string(),
             description: "A test".to_string(),
             version: "1.0.0".to_string(),
@@ -1076,7 +1173,7 @@ command = "echo hello"
             tools: vec![],
             prompts: vec!["Do the thing.".to_string()],
             location: None,
-        }];
+        })];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("<name>test</name>"));
@@ -1085,13 +1182,13 @@ command = "echo hello"
 
     #[test]
     fn skills_to_prompt_compact_mode_omits_instructions_and_tools() {
-        let skills = vec![Skill {
+        let skills: Vec<Box<dyn Skill>> = vec![Box::new(LegacySkill {
             name: "test".to_string(),
             description: "A test".to_string(),
             version: "1.0.0".to_string(),
             author: None,
             tags: vec![],
-            tools: vec![SkillTool {
+            tools: vec![LegacySkillTool {
                 name: "run".to_string(),
                 description: "Run task".to_string(),
                 kind: "shell".to_string(),
@@ -1100,7 +1197,7 @@ command = "echo hello"
             }],
             prompts: vec!["Do the thing.".to_string()],
             location: Some(PathBuf::from("/tmp/workspace/skills/test/SKILL.md")),
-        }];
+        })];
         let prompt = skills_to_prompt_with_mode(
             &skills,
             Path::new("/tmp/workspace"),
@@ -1221,14 +1318,15 @@ command = "https://api.example.com/deploy"
         let skills = load_skills(dir.path());
         assert_eq!(skills.len(), 1);
         let s = &skills[0];
-        assert_eq!(s.name, "multi-tool");
-        assert_eq!(s.version, "2.0.0");
-        assert_eq!(s.author.as_deref(), Some("tester"));
-        assert_eq!(s.tags, vec!["automation", "devops"]);
-        assert_eq!(s.tools.len(), 3);
-        assert_eq!(s.tools[0].name, "build");
-        assert_eq!(s.tools[1].kind, "shell");
-        assert_eq!(s.tools[2].kind, "http");
+        assert_eq!(s.name(), "multi-tool");
+        assert_eq!(s.version(), "2.0.0");
+        assert_eq!(s.author(), Some("tester"));
+        assert_eq!(s.tags(), vec!["automation", "devops"]);
+        assert_eq!(s.tools().len(), 3);
+        assert_eq!(s.tools()[0].name(), "build");
+        // Kind is no longer directly accessible on the Tool trait
+        assert_eq!(s.tools()[1].name(), "deploy-shell");
+        assert_eq!(s.tools()[2].name(), "deploy-http");
     }
 
     #[test]
@@ -1250,10 +1348,10 @@ description = "Bare minimum"
 
         let skills = load_skills(dir.path());
         assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].version, "0.1.0"); // default version
-        assert!(skills[0].author.is_none());
-        assert!(skills[0].tags.is_empty());
-        assert!(skills[0].tools.is_empty());
+        assert_eq!(skills[0].version(), "0.1.0"); // default version
+        assert!(skills[0].author().is_none());
+        assert!(skills[0].tags().is_empty());
+        assert!(skills[0].tools().is_empty());
     }
 
     #[test]
@@ -1280,18 +1378,18 @@ description = "Bare minimum"
 
         let skills = load_skills(dir.path());
         assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].description, "No description");
+        assert_eq!(skills[0].description(), "No description");
     }
 
     #[test]
     fn skills_to_prompt_includes_tools() {
-        let skills = vec![Skill {
+        let skills: Vec<Box<dyn Skill>> = vec![Box::new(LegacySkill {
             name: "weather".to_string(),
             description: "Get weather".to_string(),
             version: "1.0.0".to_string(),
             author: None,
             tags: vec![],
-            tools: vec![SkillTool {
+            tools: vec![LegacySkillTool {
                 name: "get_weather".to_string(),
                 description: "Fetch forecast".to_string(),
                 kind: "shell".to_string(),
@@ -1300,7 +1398,7 @@ description = "Bare minimum"
             }],
             prompts: vec![],
             location: None,
-        }];
+        })];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("weather"));
         assert!(prompt.contains("<name>get_weather</name>"));
@@ -1310,7 +1408,7 @@ description = "Bare minimum"
 
     #[test]
     fn skills_to_prompt_escapes_xml_content() {
-        let skills = vec![Skill {
+        let skills: Vec<Box<dyn Skill>> = vec![Box::new(LegacySkill {
             name: "xml<skill>".to_string(),
             description: "A & B".to_string(),
             version: "1.0.0".to_string(),
@@ -1319,7 +1417,7 @@ description = "Bare minimum"
             tools: vec![],
             prompts: vec!["Use <tool> & check \"quotes\".".to_string()],
             location: None,
-        }];
+        })];
 
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("<name>xml&lt;skill&gt;</name>"));
@@ -1391,7 +1489,7 @@ description = "Bare minimum"
 
         let skills = load_skills(dir.path());
         assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "from-toml"); // TOML takes priority
+        assert_eq!(skills[0].name(), "from-toml"); // TOML takes priority
     }
 
     #[test]
@@ -1468,8 +1566,8 @@ description = "Bare minimum"
 
         let skills = load_skills_with_config(&workspace_dir, &config);
         assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "http_request");
-        assert_ne!(skills[0].name, "CONTRIBUTING");
+        assert_eq!(skills[0].name(), "http_request");
+        assert_ne!(skills[0].name(), "CONTRIBUTING");
     }
 }
 

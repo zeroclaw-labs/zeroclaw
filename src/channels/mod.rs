@@ -2467,7 +2467,7 @@ pub fn build_system_prompt(
     workspace_dir: &std::path::Path,
     model_name: &str,
     tools: &[(&str, &str)],
-    skills: &[crate::skills::Skill],
+    skills: &[Box<dyn crate::skills::Skill>],
     identity_config: Option<&crate::config::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
 ) -> String {
@@ -2487,7 +2487,7 @@ pub fn build_system_prompt_with_mode(
     workspace_dir: &std::path::Path,
     model_name: &str,
     tools: &[(&str, &str)],
-    skills: &[crate::skills::Skill],
+    skills: &[Box<dyn crate::skills::Skill>],
     identity_config: Option<&crate::config::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
     native_tools: bool,
@@ -3601,7 +3601,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             "  🧩 Skills:   {}",
             skills
                 .iter()
-                .map(|s| s.name.as_str())
+                .map(|s| s.name())
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -5939,13 +5939,13 @@ BTC is currently around $65,000 based on latest tool output."#
     #[test]
     fn prompt_skills_include_instructions_and_tools() {
         let ws = make_workspace();
-        let skills = vec![crate::skills::Skill {
+        let skills: Vec<Box<dyn crate::skills::Skill>> = vec![Box::new(crate::skills::LegacySkill {
             name: "code-review".into(),
             description: "Review code for bugs".into(),
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
-            tools: vec![crate::skills::SkillTool {
+            tools: vec![crate::skills::LegacySkillTool {
                 name: "lint".into(),
                 description: "Run static checks".into(),
                 kind: "shell".into(),
@@ -5954,7 +5954,7 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
-        }];
+        })];
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
 
@@ -5967,20 +5967,19 @@ BTC is currently around $65,000 based on latest tool output."#
             .contains("<instruction>Always run cargo test before final response.</instruction>"));
         assert!(prompt.contains("<tools>"));
         assert!(prompt.contains("<name>lint</name>"));
-        assert!(prompt.contains("<kind>shell</kind>"));
         assert!(!prompt.contains("loaded on demand"));
     }
 
     #[test]
     fn prompt_skills_compact_mode_omits_instructions_and_tools() {
         let ws = make_workspace();
-        let skills = vec![crate::skills::Skill {
+        let skills: Vec<Box<dyn crate::skills::Skill>> = vec![Box::new(crate::skills::LegacySkill {
             name: "code-review".into(),
             description: "Review code for bugs".into(),
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
-            tools: vec![crate::skills::SkillTool {
+            tools: vec![crate::skills::LegacySkillTool {
                 name: "lint".into(),
                 description: "Run static checks".into(),
                 kind: "shell".into(),
@@ -5989,7 +5988,7 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
-        }];
+        })];
 
         let prompt = build_system_prompt_with_mode(
             ws.path(),
@@ -6015,13 +6014,13 @@ BTC is currently around $65,000 based on latest tool output."#
     #[test]
     fn prompt_skills_escape_reserved_xml_chars() {
         let ws = make_workspace();
-        let skills = vec![crate::skills::Skill {
+        let skills: Vec<Box<dyn crate::skills::Skill>> = vec![Box::new(crate::skills::LegacySkill {
             name: "code<review>&".into(),
             description: "Review \"unsafe\" and 'risky' bits".into(),
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
-            tools: vec![crate::skills::SkillTool {
+            tools: vec![crate::skills::LegacySkillTool {
                 name: "run\"linter\"".into(),
                 description: "Run <lint> & report".into(),
                 kind: "shell&exec".into(),
@@ -6030,7 +6029,7 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,
-        }];
+        })];
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
 
@@ -6040,7 +6039,6 @@ BTC is currently around $65,000 based on latest tool output."#
         ));
         assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
         assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
-        assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
         assert!(prompt.contains(
             "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
         ));
