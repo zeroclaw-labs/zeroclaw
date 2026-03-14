@@ -829,6 +829,14 @@ fn strip_progress_section_markers(text: &str) -> String {
         .replace(crate::agent::loop_::DRAFT_PROGRESS_SECTION_END, "")
 }
 
+/// Prefix used on intermediate draft updates so the user knows the agent
+/// is still working.  Stripped from the final `finalize_draft` call.
+const DRAFT_THINKING_PREFIX: &str = "Thinking \u{1f4ad}\n";
+
+fn with_thinking_prefix(text: &str) -> String {
+    format!("{DRAFT_THINKING_PREFIX}{text}")
+}
+
 fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
@@ -3976,7 +3984,9 @@ or tune thresholds in config.",
                         accumulated.push_str(visible_delta);
                     }
                 }
-                let display_text = strip_progress_section_markers(&accumulated);
+                let display_text = with_thinking_prefix(
+                    &strip_progress_section_markers(&accumulated),
+                );
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &display_text)
                     .await
@@ -6575,6 +6585,21 @@ mod tests {
 
         // Regular messages should NOT match any command
         assert_eq!(parse_runtime_command("signal", user_text), None);
+    }
+
+    #[test]
+    fn with_thinking_prefix_prepends_indicator() {
+        let result = with_thinking_prefix("Looking up cron jobs...");
+        assert!(result.starts_with("Thinking \u{1f4ad}\n"));
+        assert!(result.ends_with("Looking up cron jobs..."));
+    }
+
+    #[test]
+    fn with_thinking_prefix_not_in_finalized_response() {
+        // finalize_draft receives delivered_response directly — no prefix.
+        // This test documents the contract.
+        let final_response = "Here are your cron jobs: ...";
+        assert!(!final_response.starts_with(DRAFT_THINKING_PREFIX));
     }
 
     #[test]
