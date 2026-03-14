@@ -86,6 +86,14 @@ data:
     - `kubectl apply -f manifest.yaml`
     - `kubectl logs -n todolist deployment/vikunja`
 
+    ### When kubectl Fails
+
+    - **Exit 1 + "already exists"** — resource exists. Use `kubectl get` to inspect current state before deciding whether to update or skip.
+    - **Exit 1 + "forbidden"** — RBAC limitation. Flag the specific permission needed to Sam via ACP response. Do not attempt workarounds.
+    - **Exit 1 + "the object has been modified"** — conflict. Re-fetch the resource and retry.
+    - **Pod stuck in Pending** — check `kubectl describe pod` for events. Common causes: insufficient resources, node selector mismatch, PVC not bound.
+    - **Pod in CrashLoopBackOff** — check `kubectl logs --previous` for the crash reason before attempting fixes.
+
     ## Scrapyard-Applications Repo
 
     The GitOps repo is at `/data/workspace/scrapyard-applications`. All infrastructure changes should be made here and applied from here.
@@ -132,6 +140,18 @@ data:
 
     **Always check memories at task start.** Run `list_memories` and read relevant ones before doing work you may have already done.
 
+    **Memory routing:** Use native `memory_store`/`memory_recall` for task state within this session. Use Serena `write_memory`/`read_memory` for persistent knowledge that should survive across sessions (e.g., "this namespace uses Longhorn not NFS" or "PV expansion requires OSD restart").
+
+    ### Output Size Discipline
+
+    Tool output is automatically truncated at 200 lines / 50KB. When this happens, the full output is saved to a temp file with exploration hints. Use `shell` to explore overflow files with grep/tail.
+
+    **kubectl specifics:**
+    - Always use `--tail=100` with `kubectl logs` unless you need the full log
+    - Use `-o jsonpath='{...}'` or `jq` to extract specific fields from large JSON output
+    - Pipe `kubectl get` through `grep` when listing many resources
+    - For `kubectl get all -A`: add `--no-headers` and filter by namespace or resource type
+
     ## Key Principles
 
     1. **Check before creating** — `kubectl get` before `kubectl apply`. Don't duplicate resources.
@@ -139,6 +159,7 @@ data:
     3. **Commit your work** — manifests go in the repo, not just applied ephemerally.
     4. **Report concretely** — include resource names, statuses, and any errors in your responses.
     5. **Use memory** — save deployment state, decisions, and blockers to Serena memories.
+    6. **Propagate tool pitfalls.** When you discover a kubectl pattern, RBAC gap, or infrastructure behavior that would prevent future mistakes, flag it for inclusion in this TOOLS.md file. Don't leave it only in a Serena memory or session note.
 
   AGENTS.md: |
     # AGENTS.md - Goose
@@ -184,6 +205,7 @@ data:
 
     - I operate within the namespaces my RBAC permits (primarily `todolist`)
     - I do NOT modify production namespaces or existing production deployments
+      If a production change is needed, flag it to Sam via the ACP response with a clear description of what needs to change and why. Do not attempt the change directly.
     - I do NOT create or manage secrets directly — I create VaultStaticSecret CRDs
     - I flag RBAC gaps rather than trying to work around them
     - When I hit something outside my scope, I say so clearly and move on
