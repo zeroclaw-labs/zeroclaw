@@ -22,8 +22,44 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Check for new features
+        id: check
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || '' }}
+          MANUAL_TEXT: ${{ inputs.tweet_text || '' }}
+        run: |
+          # Manual dispatch always proceeds
+          if [ -n "$MANUAL_TEXT" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Find the PREVIOUS release tag (including betas) to check for new features
+          PREV_TAG=$(git tag --sort=-creatordate \
+            | grep -v "^${RELEASE_TAG}$" \
+            | head -1 || echo "")
+
+          if [ -z "$PREV_TAG" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Count new feat() commits since the previous release
+          NEW_FEATS=$(git log "${PREV_TAG}..${RELEASE_TAG}" --pretty=format:"%s" --no-merges \
+            | grep -ciE '^feat(\(|:)' || echo "0")
+
+          if [ "$NEW_FEATS" -eq 0 ]; then
+            echo "No new features since ${PREV_TAG} — skipping tweet"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "${NEW_FEATS} new feature(s) since ${PREV_TAG} — tweeting"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build tweet text
         id: tweet
+        if: steps.check.outputs.skip != 'true'
         shell: bash
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name || '' }}
@@ -35,20 +71,24 @@ jobs:
           if [ -n "$MANUAL_TEXT" ]; then
             TWEET="$MANUAL_TEXT"
           else
-            # Use a wider range — find the previous stable tag to capture all
-            # contributors across the full release cycle, not just one beta bump
-            PREV_TAG=$(git tag --sort=-creatordate \
+            # For features: diff against the PREVIOUS release (including betas)
+            # This prevents duplicate feature lists across consecutive betas
+            PREV_RELEASE=$(git tag --sort=-creatordate \
+              | grep -v "^${RELEASE_TAG}$" \
+              | head -1 || echo "")
+
+            # For contributors: diff against the last STABLE release
+            # This captures everyone across the full release cycle
+            PREV_STABLE=$(git tag --sort=-creatordate \
               | grep -v "^${RELEASE_TAG}$" \
               | grep -vE '\-beta\.' \
               | head -1 || echo "")
-            if [ -z "$PREV_TAG" ]; then
-              RANGE="HEAD"
-            else
-              RANGE="${PREV_TAG}..${RELEASE_TAG}"
-            fi
 
-            # Extract features only — no bug fixes, keep it clean and concise
-            FEATURES=$(git log "$RANGE" --pretty=format:"%s" --no-merges \
+            FEAT_RANGE="${PREV_RELEASE:+${PREV_RELEASE}..}${RELEASE_TAG}"
+            CONTRIB_RANGE="${PREV_STABLE:+${PREV_STABLE}..}${RELEASE_TAG}"
+
+            # Extract NEW features only since the last release
+            FEATURES=$(git log "$FEAT_RANGE" --pretty=format:"%s" --no-merges \
               | grep -iE '^feat(\(|:)' \
               | sed 's/^feat(\([^)]*\)): /\1: /' \
               | sed 's/^feat: //' \
@@ -61,34 +101,23 @@ jobs:
               FEATURES="🚀 Incremental improvements and polish"
             fi
 
-            # Collect ALL unique contributors: git authors + Co-Authored-By
-            # Filter out bots and service accounts
-            GIT_AUTHORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges | sort -uf || true)
-            CO_AUTHORS=$(git log "$RANGE" --pretty=format:"%b" --no-merges \
+            # Count ALL contributors across the full release cycle
+            GIT_AUTHORS=$(git log "$CONTRIB_RANGE" --pretty=format:"%an" --no-merges | sort -uf || true)
+            CO_AUTHORS=$(git log "$CONTRIB_RANGE" --pretty=format:"%b" --no-merges \
               | grep -ioE 'Co-Authored-By: *[^<]+' \
               | sed 's/Co-Authored-By: *//i' \
               | sed 's/ *$//' \
               | sort -uf || true)
 
-            ALL_NAMES=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
+            TOTAL_COUNT=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
               | sort -uf \
               | grep -v '^$' \
               | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^ZeroClaw Bot|^ZeroClaw Runner|^ZeroClaw Agent|^blacksmith' \
-              || true)
+              | grep -c . || echo "0")
 
-            TOTAL_COUNT=$(echo "$ALL_NAMES" | grep -c . || echo "0")
-            # Show up to 6 names, then "+ N more" if there are extras
-            SHOWN=$(echo "$ALL_NAMES" | head -6 | paste -sd ', ' -)
-            if [ "$TOTAL_COUNT" -gt 6 ]; then
-              EXTRA=$((TOTAL_COUNT - 6))
-              CONTRIBUTORS="${SHOWN} + ${EXTRA} more"
-            else
-              CONTRIBUTORS="$SHOWN"
-            fi
-
-            # Build the tweet — punchy, features-first, all contributors credited
-            TWEET=$(printf "🦀 ZeroClaw %s\n\n%s\n\n🙌 Contributors: %s\n\n🔗 %s" \
-              "$RELEASE_TAG" "$FEATURES" "$CONTRIBUTORS" "$RELEASE_URL")
+            # Build tweet — new features, contributor count, hashtags
+            TWEET=$(printf "🦀 ZeroClaw %s\n\n%s\n\n🙌 %s contributors\n\n%s\n\n#zeroclaw #rust #ai #opensource" \
+              "$RELEASE_TAG" "$FEATURES" "$TOTAL_COUNT" "$RELEASE_URL")
           fi
 
           # Append release URL if not already present and we have one
@@ -96,7 +125,7 @@ jobs:
             TWEET=$(printf "%s\n\n%s" "$TWEET" "$RELEASE_URL")
           fi
 
-          # Truncate to 280 chars if needed — trim features first, keep contributors
+          # Truncate to 280 chars if needed
           if [ ${#TWEET} -gt 280 ]; then
             TWEET="${TWEET:0:277}..."
           fi
@@ -112,6 +141,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Post to X
+        if: steps.check.outputs.skip != 'true'
         shell: bash
         env:
           TWITTER_CONSUMER_KEY: ${{ secrets.TWITTER_CONSUMER_API_KEY }}
@@ -159,7 +189,6 @@ jobs:
               img_resp.raise_for_status()
 
               content_type = img_resp.headers.get("content-type", "image/png")
-              # X media upload (v1.1 chunked INIT/APPEND/FINALIZE)
               init_resp = oauth.post(
                   "https://upload.twitter.com/1.1/media/upload.json",
                   data={
@@ -191,7 +220,6 @@ jobs:
                   print(f"Media FINALIZE failed: {fin_resp.status_code} {fin_resp.text}", file=sys.stderr)
                   sys.exit(1)
 
-              # Wait for processing if needed
               state = fin_resp.json().get("processing_info", {}).get("state")
               while state == "pending" or state == "in_progress":
                   wait = fin_resp.json().get("processing_info", {}).get("check_after_secs", 2)
