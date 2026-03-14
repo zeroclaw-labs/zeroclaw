@@ -134,6 +134,9 @@ export function DocumentEditor({
     saving: false,
     result: null,
   });
+  // Ref to always access latest saveDialog in async callbacks (avoids stale closure)
+  const saveDialogRef = useRef(saveDialog);
+  saveDialogRef.current = saveDialog;
 
   // Fetch saved documents list on mount (Tauri only)
   useEffect(() => {
@@ -558,8 +561,12 @@ export function DocumentEditor({
         multiple: false,
         title: locale === "ko" ? "저장 폴더 선택" : "Select save folder",
       });
-      if (selected && typeof selected === "string") {
-        setSaveDialog((prev) => ({ ...prev, diskPath: selected }));
+      // open() may return string, string[], or null depending on config
+      if (selected) {
+        const path = Array.isArray(selected) ? selected[0] : selected;
+        if (path) {
+          setSaveDialog((prev) => ({ ...prev, diskPath: path }));
+        }
       }
     } catch {
       // Dialog not available — let user type a path manually
@@ -577,7 +584,7 @@ export function DocumentEditor({
     setSaveDialog((prev) => ({ ...prev, saving: true, result: null }));
 
     const results: string[] = [];
-    const { targets, diskPath } = saveDialog;
+    const { targets, diskPath } = saveDialogRef.current;
 
     // Update document state
     setDoc((prev) => ({
@@ -674,7 +681,7 @@ export function DocumentEditor({
         setSaveDialog((prev) => ({ ...prev, open: false, result: null }));
       }, 1500);
     }
-  }, [saveDialog, doc.fileName, doc.docType, doc.engine, onDocumentUpdate, locale]);
+  }, [doc.fileName, doc.docType, doc.engine, onDocumentUpdate, locale]);
 
   // ── Send to LLM only (no save) ────────────────────────────────
   const handleSendToLlmOnly = useCallback(() => {
@@ -824,8 +831,8 @@ export function DocumentEditor({
 
         <span className="toolbar-divider" />
 
-        {/* Save & Export (visible when document is loaded) */}
-        {doc.viewerHtml && (
+        {/* Save & Export (visible when document is loaded or opened from saved) */}
+        {(doc.viewerHtml || doc.fileName) && (
           <>
             <button
               className="toolbar-btn save-btn"

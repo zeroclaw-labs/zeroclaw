@@ -1577,10 +1577,10 @@ fn load_document_from_sqlite(
                 "markdown": row.get::<_, String>(1)?,
                 "html": row.get::<_, Option<String>>(2)?,
                 "tiptap_json": row.get::<_, Option<String>>(3)?,
-                "doc_type": row.get::<_, String>(4)?,
-                "engine": row.get::<_, String>(5)?,
-                "created_at": row.get::<_, String>(6)?,
-                "updated_at": row.get::<_, String>(7)?,
+                "doc_type": row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                "engine": row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                "created_at": row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                "updated_at": row.get::<_, Option<String>>(7)?.unwrap_or_default(),
             }))
         },
     );
@@ -1606,10 +1606,10 @@ fn list_documents_sqlite() -> Result<serde_json::Value, String> {
     let docs: Vec<serde_json::Value> = stmt.query_map([], |row| {
         Ok(serde_json::json!({
             "file_name": row.get::<_, String>(0)?,
-            "doc_type": row.get::<_, String>(1)?,
-            "engine": row.get::<_, String>(2)?,
-            "created_at": row.get::<_, String>(3)?,
-            "updated_at": row.get::<_, String>(4)?,
+            "doc_type": row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            "engine": row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            "created_at": row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            "updated_at": row.get::<_, Option<String>>(4)?.unwrap_or_default(),
         }))
     }).map_err(|e| format!("Failed to iterate documents: {e}"))?
     .filter_map(|r| r.ok())
@@ -1638,10 +1638,10 @@ fn search_documents_sqlite(
     let results: Vec<serde_json::Value> = stmt.query_map(rusqlite::params![query], |row| {
         Ok(serde_json::json!({
             "file_name": row.get::<_, String>(0)?,
-            "doc_type": row.get::<_, String>(1)?,
-            "engine": row.get::<_, String>(2)?,
-            "updated_at": row.get::<_, String>(3)?,
-            "snippet": row.get::<_, String>(4)?,
+            "doc_type": row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            "engine": row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            "updated_at": row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            "snippet": row.get::<_, Option<String>>(4)?.unwrap_or_default(),
         }))
     }).map_err(|e| format!("Failed to execute search: {e}"))?
     .filter_map(|r| r.ok())
