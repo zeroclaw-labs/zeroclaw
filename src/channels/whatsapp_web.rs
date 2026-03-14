@@ -68,8 +68,13 @@ pub struct WhatsAppWebChannel {
     transcription: Option<crate::config::TranscriptionConfig>,
     /// Text-to-speech config for voice replies
     tts_config: Option<crate::config::TtsConfig>,
-    /// Senders whose last message was a voice note (reply with voice)
-    voice_senders: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Chats awaiting a voice reply — maps chat JID to the latest substantive
+    /// reply text. A background task debounces and sends the voice note after
+    /// the agent finishes its turn (no new send() for 3 seconds).
+    pending_voice:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
+    /// Chats whose last incoming message was a voice note.
+    voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl WhatsAppWebChannel {
@@ -98,7 +103,8 @@ impl WhatsAppWebChannel {
             tx: Arc::new(Mutex::new(None)),
             transcription: None,
             tts_config: None,
-            voice_senders: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -371,10 +377,9 @@ impl WhatsAppWebChannel {
         }
     }
 
-    /// Synthesize text to speech and send as a WhatsApp voice note.
+    /// Synthesize text to speech and send as a WhatsApp voice note (static version for spawned tasks).
     #[cfg(feature = "whatsapp-web")]
-    async fn synthesize_and_send_voice(
-        &self,
+    async fn synthesize_voice_static(
         client: &wa_rs::Client,
         to: &wa_rs_binary::jid::Jid,
         text: &str,
@@ -460,38 +465,77 @@ impl Channel for WhatsAppWebChannel {
 
         let to = self.recipient_to_jid(&message.recipient)?;
 
-        // Only send a voice reply if TTS is enabled AND the last message in this
-        // chat was a voice note. Consume the flag (remove) so we send exactly ONE
-        // voice note per incoming voice message, even if the agent emits multiple
-        // send() calls (e.g. tool outputs, streaming chunks).
-        let is_voice_sender = self
-            .voice_senders
+        // If this chat expects a voice reply, accumulate substantive messages.
+        // A background task will debounce and send the voice note after the agent
+        // finishes (no new send() for 3 seconds). This ensures we voice the FINAL
+        // answer, not intermediate tool outputs.
+        let is_voice_chat = self
+            .voice_chats
             .lock()
-            .map(|mut vs| vs.remove(&message.recipient))
+            .map(|vs| vs.contains(&message.recipient))
             .unwrap_or(false);
 
-        if is_voice_sender {
-            if let Some(ref tts_config) = self.tts_config {
-                match Box::pin(self.synthesize_and_send_voice(
-                    &client,
-                    &to,
-                    &message.content,
-                    tts_config,
-                ))
-                .await
-                {
-                    Ok(()) => {
-                        tracing::info!("WhatsApp Web: sent voice reply to {}", message.recipient);
-                        // Voice note sent — skip the text message below so the
-                        // user gets a single voice note, not voice + text.
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "WhatsApp Web: TTS voice reply failed, falling back to text only: {e}"
-                        );
-                    }
+        if is_voice_chat && self.tts_config.is_some() {
+            let content = &message.content;
+            // Only accumulate substantive replies (skip tool outputs, URLs, JSON)
+            let is_substantive = content.len() > 30
+                && !content.starts_with("http")
+                && !content.starts_with('{')
+                && !content.starts_with('[')
+                && !content.contains("```")
+                && !content.starts_with("Error:");
+
+            if is_substantive {
+                if let Ok(mut pv) = self.pending_voice.lock() {
+                    pv.insert(
+                        message.recipient.clone(),
+                        (content.clone(), std::time::Instant::now()),
+                    );
                 }
+                // Spawn debounce task if this is the first substantive message
+                let pending = self.pending_voice.clone();
+                let voice_chats = self.voice_chats.clone();
+                let client_clone = client.clone();
+                let to_clone = to.clone();
+                let recipient = message.recipient.clone();
+                let tts_config = self.tts_config.clone().unwrap();
+                tokio::spawn(async move {
+                    // Wait 4 seconds — if no newer message arrives, send the voice note
+                    tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+                    let should_send = pending.lock().ok().and_then(|pv| {
+                        pv.get(&recipient)
+                            .map(|(text, ts)| (text.clone(), ts.elapsed().as_secs() >= 3))
+                    });
+
+                    if let Some((text, true)) = should_send {
+                        // Remove from pending and voice_chats
+                        if let Ok(mut pv) = pending.lock() {
+                            pv.remove(&recipient);
+                        }
+                        if let Ok(mut vc) = voice_chats.lock() {
+                            vc.remove(&recipient);
+                        }
+                        // Synthesize and send
+                        match Box::pin(WhatsAppWebChannel::synthesize_voice_static(
+                            &client_clone,
+                            &to_clone,
+                            &text,
+                            &tts_config,
+                        ))
+                        .await
+                        {
+                            Ok(()) => {
+                                tracing::info!(
+                                    "WhatsApp Web: sent debounced voice reply ({} chars)",
+                                    text.len()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("WhatsApp Web: debounced TTS failed: {e}");
+                            }
+                        }
+                    }
+                });
             }
         }
 
@@ -575,7 +619,7 @@ impl Channel for WhatsAppWebChannel {
             let transcription_config = self.transcription.clone();
 
             let transcription_config = self.transcription.clone();
-            let voice_senders = self.voice_senders.clone();
+            let voice_chats = self.voice_chats.clone();
 
             let mut builder = Bot::builder()
                 .with_backend(backend)
@@ -588,7 +632,7 @@ impl Channel for WhatsAppWebChannel {
                     let retry_count = retry_count_clone.clone();
                     let session_revoked = session_revoked_clone.clone();
                     let transcription_config = transcription_config.clone();
-                    let voice_senders = voice_senders.clone();
+                    let voice_chats = voice_chats.clone();
                     async move {
                         match event {
                             Event::Message(msg, info) => {
@@ -649,12 +693,12 @@ impl Channel for WhatsAppWebChannel {
                                 // Track whether this chat used a voice note so we reply in kind.
                                 // We store the chat JID (reply_target) since that's what send() receives.
                                 let content = if let Some(ref vt) = voice_text {
-                                    if let Ok(mut vs) = voice_senders.lock() {
+                                    if let Ok(mut vs) = voice_chats.lock() {
                                         vs.insert(chat.clone());
                                     }
                                     format!("[Voice] {vt}")
                                 } else {
-                                    if let Ok(mut vs) = voice_senders.lock() {
+                                    if let Ok(mut vs) = voice_chats.lock() {
                                         vs.remove(&chat);
                                     }
                                     let text = msg.text_content().unwrap_or("");
