@@ -84,7 +84,7 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 
 <p align="center"><code>Trait-driven architecture · secure-by-default runtime · provider/channel/tool swappable · pluggable everything</code></p>
 
-### 🚀 What's New in v0.1.9a (March 2026)
+### 🚀 What's New in v0.1.9b (March 2026)
 
 | Area | Highlights |
 |---|---|
@@ -1142,7 +1142,7 @@ A heartfelt thank you to the communities and institutions that inspire and fuel 
 
 We're building in the open because the best ideas come from everywhere. If you're reading this, you're part of it. Welcome. 🦀❤️
 
-### 🌟 Recent Contributors (v0.1.9a)
+### 🌟 Recent Contributors (v0.1.9b)
 
 Special recognition to the contributors who shipped features, fixes, and improvements in this release cycle:
 
