@@ -1283,39 +1283,60 @@ pub async fn handle_api_cli_tools(
 pub async fn handle_api_document_process(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: axum::body::Bytes,
+    mut multipart: axum::extract::Multipart,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    // Parse multipart boundary from Content-Type header
-    let content_type = headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    // Extract file from multipart body
+    let mut file_data: Option<Vec<u8>> = None;
+    let mut original_filename = String::from("uploaded_document.bin");
 
-    if !content_type.contains("multipart/form-data") {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Expected multipart/form-data"})),
-        )
-            .into_response();
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" {
+            // Extract original filename with extension for correct classification
+            if let Some(fname) = field.file_name() {
+                original_filename = fname.to_string();
+            }
+            match field.bytes().await {
+                Ok(bytes) => file_data = Some(bytes.to_vec()),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": format!("Failed to read file field: {e}")})),
+                    )
+                        .into_response();
+                }
+            }
+            break;
+        }
     }
 
-    // For simplicity, save the uploaded file to a temp directory and process it.
-    // In production, use proper multipart parsing.
+    let file_bytes = match file_data {
+        Some(b) if !b.is_empty() => b,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "No file uploaded. Send a multipart field named 'file'."})),
+            )
+                .into_response();
+        }
+    };
+
+    // Write to a unique temp file preserving the original extension
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     let tmp_dir = std::env::temp_dir().join("moa_doc_upload");
     let _ = std::fs::create_dir_all(&tmp_dir);
+    let tmp_path = tmp_dir.join(format!("doc_{timestamp}_{original_filename}"));
 
-    // Extract filename from Content-Disposition or use default
-    let filename = "uploaded_document";
-    let tmp_path = tmp_dir.join(filename);
-
-    // Write body to temp file
-    if let Err(e) = std::fs::write(&tmp_path, &body) {
+    if let Err(e) = std::fs::write(&tmp_path, &file_bytes) {
         return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to save file: {e}")})),
         )
             .into_response();
@@ -1326,8 +1347,8 @@ pub async fn handle_api_document_process(
     let security = crate::security::SecurityPolicy::default();
     let tool = crate::tools::document_pipeline::DocumentPipelineTool::new(security);
     let args = serde_json::json!({
-        "file_path": tmp_path.to_string_lossy(),
-        "output_dir": tmp_dir.to_string_lossy(),
+        "file_path": tmp_path.to_string_lossy().as_ref(),
+        "output_dir": tmp_dir.to_string_lossy().as_ref(),
     });
 
     match tool.execute(args).await {
@@ -1343,7 +1364,7 @@ pub async fn handle_api_document_process(
                 .into_response()
             } else {
                 (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": result.output})),
                 )
                     .into_response()
@@ -1352,7 +1373,7 @@ pub async fn handle_api_document_process(
         Err(e) => {
             let _ = std::fs::remove_file(&tmp_path);
             (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Document processing failed: {e}")})),
             )
                 .into_response()
