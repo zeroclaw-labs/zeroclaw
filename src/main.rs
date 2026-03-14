@@ -792,7 +792,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        let config = if channels_only {
+        let mut config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
         } else {
             onboard::run_quick_setup(
@@ -805,13 +805,20 @@ async fn main() -> Result<()> {
             .await
         }?;
 
-        // Display pairing code after onboarding so the user can pair immediately
+        // Auto-pair and display dashboard URL with token so user can access immediately
         if config.gateway.require_pairing {
             let pairing = security::PairingGuard::new(
                 true,
                 &config.gateway.paired_tokens,
             );
             if let Some(code) = pairing.pairing_code() {
+                // Auto-pair using the generated code to get a bearer token
+                let token = pairing
+                    .try_pair(&code, "onboard-cli")
+                    .await
+                    .ok()
+                    .flatten();
+
                 println!();
                 println!("  \x1b[1;34m🦀 Gateway Pairing Code\x1b[0m");
                 println!();
@@ -819,10 +826,26 @@ async fn main() -> Result<()> {
                 println!("  \x1b[1;34m│\x1b[0m  \x1b[1m{code}\x1b[0m  \x1b[1;34m│\x1b[0m");
                 println!("  \x1b[1;34m└──────────────┘\x1b[0m");
                 println!();
-                println!("  Use this one-time code to pair your first device.");
-                println!("  Send: POST /pair with header X-Pairing-Code: {code}");
-                println!();
-                println!("  \x1b[2mDashboard: http://127.0.0.1:{}\x1b[0m", config.gateway.port);
+
+                if let Some(ref tk) = token {
+                    let dashboard_url = format!(
+                        "http://127.0.0.1:{}?token={}",
+                        config.gateway.port, tk
+                    );
+                    println!("  \x1b[2mDashboard:\x1b[0m \x1b[1;34m{dashboard_url}\x1b[0m");
+
+                    // Persist the paired token so it survives restarts
+                    let hashed_tokens = pairing.tokens();
+                    config.gateway.paired_tokens = hashed_tokens;
+                    if let Err(e) = config.save().await {
+                        eprintln!("  \x1b[33mWarning: could not persist paired token: {e}\x1b[0m");
+                    }
+                } else {
+                    println!("  \x1b[2mDashboard: http://127.0.0.1:{}\x1b[0m", config.gateway.port);
+                    println!("  Use this one-time code to pair your first device.");
+                    println!("  Send: POST /pair with header X-Pairing-Code: {code}");
+                }
+
                 println!("  \x1b[2mDocs: https://www.zeroclawlabs.ai/docs\x1b[0m");
                 println!();
             }

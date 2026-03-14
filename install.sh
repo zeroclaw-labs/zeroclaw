@@ -1203,6 +1203,21 @@ fi
 echo
 echo -e "${BOLD_BLUE}[3/3]${RESET} ${BOLD}Finalizing setup${RESET}"
 
+# Helper: run onboard command and extract token-bearing dashboard URL from output
+ONBOARD_TOKEN_URL=""
+run_onboard() {
+  local output
+  output=$("$@" 2>/dev/null) || return 1
+  # Extract dashboard URL with token from onboard output (e.g. http://127.0.0.1:42617?token=zc_...)
+  local token_url
+  token_url=$(echo "$output" | grep -oE 'http://127\.0\.0\.1:[0-9]+\?token=[^ ]+' | head -1)
+  if [[ -n "$token_url" ]]; then
+    # Strip ANSI escape codes if present
+    ONBOARD_TOKEN_URL=$(echo "$token_url" | sed 's/\x1b\[[0-9;]*m//g')
+  fi
+  return 0
+}
+
 # --- Inline onboarding (provider + API key configuration) ---
 if [[ "$SKIP_ONBOARD" == false && -n "$ZEROCLAW_BIN" ]]; then
   if [[ -n "$API_KEY" ]]; then
@@ -1211,14 +1226,14 @@ if [[ "$SKIP_ONBOARD" == false && -n "$ZEROCLAW_BIN" ]]; then
     if [[ -n "$MODEL" ]]; then
       ONBOARD_CMD+=(--model "$MODEL")
     fi
-    if "${ONBOARD_CMD[@]}" 2>/dev/null; then
+    if run_onboard "${ONBOARD_CMD[@]}"; then
       step_ok "Provider configured"
     else
       step_fail "Provider configuration failed — run zeroclaw onboard to retry"
     fi
   elif [[ "$PROVIDER" == "ollama" ]]; then
     step_dot "Configuring Ollama (no API key needed)"
-    if "$ZEROCLAW_BIN" onboard --provider ollama 2>/dev/null; then
+    if run_onboard "$ZEROCLAW_BIN" onboard --provider ollama; then
       step_ok "Ollama configured"
     else
       step_fail "Ollama configuration failed — run zeroclaw onboard to retry"
@@ -1233,7 +1248,7 @@ if [[ "$SKIP_ONBOARD" == false && -n "$ZEROCLAW_BIN" ]]; then
         if [[ -n "$MODEL" ]]; then
           ONBOARD_CMD+=(--model "$MODEL")
         fi
-        if "${ONBOARD_CMD[@]}" 2>/dev/null; then
+        if run_onboard "${ONBOARD_CMD[@]}"; then
           step_ok "Provider configured"
         else
           step_fail "Provider configuration failed — run zeroclaw onboard to retry"
@@ -1294,6 +1309,12 @@ fi
 # --- Dashboard URL ---
 GATEWAY_PORT=42617
 DASHBOARD_URL="http://127.0.0.1:${GATEWAY_PORT}"
+
+# Try to extract the token-bearing dashboard URL from the onboard output
+if [[ -n "$ONBOARD_TOKEN_URL" ]]; then
+  DASHBOARD_URL="$ONBOARD_TOKEN_URL"
+fi
+
 echo
 echo -e "${BOLD}Dashboard URL:${RESET} ${BLUE}${DASHBOARD_URL}${RESET}"
 
