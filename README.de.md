@@ -92,10 +92,11 @@ Erstellt von Studenten und Mitgliedern der Harvard, MIT und Sundai.Club Gemeinsc
 
 <!-- BEGIN:WHATS_NEW -->
 
-### 🚀 What's New in v0.2.1-beta.187 (March 2026)
+### 🚀 What's New in v0.2.1-beta.188 (March 2026)
 
 | Area | Highlights |
 |---|---|
+| channels | comprehensive channel matrix tests + v0.2.2 |
 | ci | auto-sync README What's New and Contributors on release |
 
 <!-- END:WHATS_NEW -->
@@ -429,7 +430,7 @@ Wir bauen in Open Source, weil die besten Ideen von überall kommen. Wenn du das
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
 
-### 🌟 Recent Contributors (v0.2.1-beta.187)
+### 🌟 Recent Contributors (v0.2.1-beta.188)
 
 3 contributors shipped features, fixes, and improvements in this release cycle:
 

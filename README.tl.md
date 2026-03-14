@@ -88,10 +88,11 @@ Binuo ng mga mag-aaral at miyembro ng Harvard, MIT, at Sundai.Club na komunidad.
 
 <!-- BEGIN:WHATS_NEW -->
 
-### 🚀 What's New in v0.2.1-beta.187 (March 2026)
+### 🚀 What's New in v0.2.1-beta.188 (March 2026)
 
 | Area | Highlights |
 |---|---|
+| channels | comprehensive channel matrix tests + v0.2.2 |
 | ci | auto-sync README What's New and Contributors on release |
 
 <!-- END:WHATS_NEW -->
@@ -425,7 +426,7 @@ Kami ay bumubuo sa open source dahil ang mga pinakamahusay na ideya ay nagmumula
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
 
-### 🌟 Recent Contributors (v0.2.1-beta.187)
+### 🌟 Recent Contributors (v0.2.1-beta.188)
 
 3 contributors shipped features, fixes, and improvements in this release cycle:
 
