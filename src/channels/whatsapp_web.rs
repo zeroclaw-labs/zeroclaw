@@ -64,6 +64,12 @@ pub struct WhatsAppWebChannel {
     client: Arc<Mutex<Option<Arc<wa_rs::Client>>>>,
     /// Message sender channel
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
+    /// Voice transcription (STT) config
+    transcription: Option<crate::config::TranscriptionConfig>,
+    /// Text-to-speech config for voice replies
+    tts_config: Option<crate::config::TtsConfig>,
+    /// Senders whose last message was a voice note (reply with voice)
+    voice_senders: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl WhatsAppWebChannel {
@@ -90,7 +96,28 @@ impl WhatsAppWebChannel {
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
+            transcription: None,
+            tts_config: None,
+            voice_senders: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Configure voice transcription (STT) for incoming voice notes.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        if config.enabled {
+            self.transcription = Some(config);
+        }
+        self
+    }
+
+    /// Configure text-to-speech for outgoing voice replies.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_tts(mut self, config: crate::config::TtsConfig) -> Self {
+        if config.enabled {
+            self.tts_config = Some(config);
+        }
+        self
     }
 
     /// Check if a phone number is allowed (E.164 format: +1234567890)
@@ -275,6 +302,137 @@ impl WhatsAppWebChannel {
             format!("{expanded_session_path}-shm"),
         ]
     }
+
+    /// Attempt to download and transcribe a WhatsApp voice note.
+    ///
+    /// Returns `None` if transcription is disabled, download fails, or
+    /// transcription fails (all logged as warnings).
+    #[cfg(feature = "whatsapp-web")]
+    async fn try_transcribe_voice_note(
+        client: &wa_rs::Client,
+        audio: &wa_rs_proto::whatsapp::message::AudioMessage,
+        transcription_config: Option<&crate::config::TranscriptionConfig>,
+    ) -> Option<String> {
+        let config = transcription_config?;
+
+        // Enforce duration limit
+        if let Some(seconds) = audio.seconds {
+            if u64::from(seconds) > config.max_duration_secs {
+                tracing::info!(
+                    "WhatsApp Web: skipping voice note ({}s exceeds {}s limit)",
+                    seconds,
+                    config.max_duration_secs
+                );
+                return None;
+            }
+        }
+
+        // Download the encrypted audio
+        use wa_rs::download::Downloadable;
+        let audio_data = match client.download(audio as &dyn Downloadable).await {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!("WhatsApp Web: failed to download voice note: {e}");
+                return None;
+            }
+        };
+
+        // Determine filename from mimetype for transcription API
+        let file_name = match audio.mimetype.as_deref() {
+            Some(m) if m.contains("opus") || m.contains("ogg") => "voice.ogg",
+            Some(m) if m.contains("mp4") || m.contains("m4a") => "voice.m4a",
+            Some(m) if m.contains("mpeg") || m.contains("mp3") => "voice.mp3",
+            Some(m) if m.contains("webm") => "voice.webm",
+            _ => "voice.ogg", // WhatsApp default
+        };
+
+        tracing::info!(
+            "WhatsApp Web: transcribing voice note ({} bytes, file={})",
+            audio_data.len(),
+            file_name
+        );
+
+        match super::transcription::transcribe_audio(audio_data, file_name, config).await {
+            Ok(text) if text.trim().is_empty() => {
+                tracing::info!("WhatsApp Web: voice transcription returned empty text, skipping");
+                None
+            }
+            Ok(text) => {
+                tracing::info!(
+                    "WhatsApp Web: voice note transcribed ({} chars)",
+                    text.len()
+                );
+                Some(text)
+            }
+            Err(e) => {
+                tracing::warn!("WhatsApp Web: voice transcription failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Synthesize text to speech and send as a WhatsApp voice note.
+    #[cfg(feature = "whatsapp-web")]
+    async fn synthesize_and_send_voice(
+        &self,
+        client: &wa_rs::Client,
+        to: &wa_rs_binary::jid::Jid,
+        text: &str,
+        tts_config: &crate::config::TtsConfig,
+    ) -> Result<()> {
+        let tts_manager = super::tts::TtsManager::new(tts_config)?;
+        let audio_bytes = tts_manager.synthesize(text).await?;
+        let audio_len = audio_bytes.len();
+        tracing::info!("WhatsApp Web TTS: synthesized {} bytes of audio", audio_len);
+
+        if audio_bytes.is_empty() {
+            anyhow::bail!("TTS returned empty audio");
+        }
+
+        use wa_rs_core::download::MediaType;
+        let upload = client
+            .upload(audio_bytes, MediaType::Audio)
+            .await
+            .map_err(|e| anyhow!("Failed to upload TTS audio: {e}"))?;
+
+        tracing::info!(
+            "WhatsApp Web TTS: uploaded audio (url_len={}, file_length={})",
+            upload.url.len(),
+            upload.file_length
+        );
+
+        // Estimate duration: Opus at ~32kbps → bytes / 4000 ≈ seconds
+        #[allow(clippy::cast_possible_truncation)]
+        let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
+
+        let voice_msg = wa_rs_proto::whatsapp::Message {
+            audio_message: Some(Box::new(
+                wa_rs_proto::whatsapp::message::AudioMessage {
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(upload.media_key),
+                    file_enc_sha256: Some(upload.file_enc_sha256),
+                    file_sha256: Some(upload.file_sha256),
+                    file_length: Some(upload.file_length),
+                    mimetype: Some("audio/ogg; codecs=opus".to_string()),
+                    ptt: Some(true),
+                    seconds: Some(estimated_seconds),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        Box::pin(client.send_message(to.clone(), voice_msg))
+            .await
+            .map_err(|e| anyhow!("Failed to send voice note: {e}"))?;
+        tracing::info!(
+            "WhatsApp Web TTS: sent voice note ({} bytes, ~{}s)",
+            audio_len,
+            estimated_seconds
+        );
+        Ok(())
+    }
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -303,6 +461,45 @@ impl Channel for WhatsAppWebChannel {
         }
 
         let to = self.recipient_to_jid(&message.recipient)?;
+
+        // Only send a voice reply if TTS is enabled AND the last message in this
+        // chat was a voice note. Consume the flag (remove) so we send exactly ONE
+        // voice note per incoming voice message, even if the agent emits multiple
+        // send() calls (e.g. tool outputs, streaming chunks).
+        let is_voice_sender = self
+            .voice_senders
+            .lock()
+            .map(|mut vs| vs.remove(&message.recipient))
+            .unwrap_or(false);
+
+        if is_voice_sender {
+            if let Some(ref tts_config) = self.tts_config {
+                match Box::pin(self.synthesize_and_send_voice(
+                    &client,
+                    &to,
+                    &message.content,
+                    tts_config,
+                ))
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            "WhatsApp Web: sent voice reply to {}",
+                            message.recipient
+                        );
+                        // Voice note sent — skip the text message below so the
+                        // user gets a single voice note, not voice + text.
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "WhatsApp Web: TTS voice reply failed, falling back to text only: {e}"
+                        );
+                    }
+                }
+            }
+        }
+
         let outgoing = wa_rs_proto::whatsapp::Message {
             conversation: Some(message.content.clone()),
             ..Default::default()
@@ -381,6 +578,9 @@ impl Channel for WhatsAppWebChannel {
             let retry_count_clone = retry_count.clone();
             let session_revoked_clone = session_revoked.clone();
 
+            let transcription_config = self.transcription.clone();
+            let voice_senders = self.voice_senders.clone();
+
             let mut builder = Bot::builder()
                 .with_backend(backend)
                 .with_transport_factory(transport_factory)
@@ -391,26 +591,15 @@ impl Channel for WhatsAppWebChannel {
                     let logout_tx = logout_tx_clone.clone();
                     let retry_count = retry_count_clone.clone();
                     let session_revoked = session_revoked_clone.clone();
+                    let transcription_config = transcription_config.clone();
+                    let voice_senders = voice_senders.clone();
                     async move {
                         match event {
                             Event::Message(msg, info) => {
-                                // Extract message content
-                                let text = msg.text_content().unwrap_or("");
                                 let sender_jid = info.source.sender.clone();
                                 let sender_alt = info.source.sender_alt.clone();
                                 let sender = sender_jid.user().to_string();
                                 let chat = info.source.chat.to_string();
-
-                                tracing::info!(
-                                    "WhatsApp Web message received (sender_len={}, chat_len={}, text_len={})",
-                                    sender.len(),
-                                    chat.len(),
-                                    text.len()
-                                );
-                                tracing::debug!(
-                                    "WhatsApp Web message content: {}",
-                                    text
-                                );
 
                                 let mapped_phone = if sender_jid.is_lid() {
                                     _client.get_phone_number_from_lid(&sender_jid.user).await
@@ -423,42 +612,92 @@ impl Channel for WhatsAppWebChannel {
                                     mapped_phone.as_deref(),
                                 );
 
-                                if let Some(normalized) = sender_candidates
+                                let normalized = match sender_candidates
                                     .iter()
                                     .find(|candidate| {
                                         Self::is_number_allowed_for_list(&allowed_numbers, candidate)
                                     })
                                     .cloned()
                                 {
-                                    let trimmed = text.trim();
-                                    if trimmed.is_empty() {
-                                        tracing::debug!(
-                                            "WhatsApp Web: ignoring empty or non-text message from {}",
-                                            normalized
+                                    Some(n) => n,
+                                    None => {
+                                        tracing::warn!(
+                                            "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={})",
+                                            sender_candidates.len()
                                         );
                                         return;
                                     }
+                                };
 
-                                    if let Err(e) = tx_inner
-                                        .send(ChannelMessage {
-                                            id: uuid::Uuid::new_v4().to_string(),
-                                            channel: "whatsapp".to_string(),
-                                            sender: normalized.clone(),
-                                            // Reply to the originating chat JID (DM or group).
-                                            reply_target: chat,
-                                            content: trimmed.to_string(),
-                                            timestamp: chrono::Utc::now().timestamp() as u64,
-                                            thread_ts: None,
-                                        })
+                                // Attempt voice note transcription (ptt = push-to-talk = voice note)
+                                let voice_text = if let Some(ref audio) = msg.audio_message {
+                                    if audio.ptt == Some(true) {
+                                        Self::try_transcribe_voice_note(
+                                            &_client,
+                                            audio,
+                                            transcription_config.as_ref(),
+                                        )
                                         .await
-                                    {
-                                        tracing::error!("Failed to send message to channel: {}", e);
+                                    } else {
+                                        tracing::debug!(
+                                            "WhatsApp Web: ignoring non-PTT audio message from {}",
+                                            normalized
+                                        );
+                                        None
                                     }
                                 } else {
-                                    tracing::warn!(
-                                        "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={})",
-                                        sender_candidates.len()
+                                    None
+                                };
+
+                                // Use transcribed voice text, or fall back to text content.
+                                // Track whether this chat used a voice note so we reply in kind.
+                                // We store the chat JID (reply_target) since that's what send() receives.
+                                let content = if let Some(ref vt) = voice_text {
+                                    if let Ok(mut vs) = voice_senders.lock() {
+                                        vs.insert(chat.clone());
+                                    }
+                                    format!("[Voice] {vt}")
+                                } else {
+                                    if let Ok(mut vs) = voice_senders.lock() {
+                                        vs.remove(&chat);
+                                    }
+                                    let text = msg.text_content().unwrap_or("");
+                                    text.trim().to_string()
+                                };
+
+                                tracing::info!(
+                                    "WhatsApp Web message received (sender_len={}, chat_len={}, content_len={})",
+                                    sender.len(),
+                                    chat.len(),
+                                    content.len()
+                                );
+                                tracing::debug!(
+                                    "WhatsApp Web message content: {}",
+                                    content
+                                );
+
+                                if content.is_empty() {
+                                    tracing::debug!(
+                                        "WhatsApp Web: ignoring empty or non-text message from {}",
+                                        normalized
                                     );
+                                    return;
+                                }
+
+                                if let Err(e) = tx_inner
+                                    .send(ChannelMessage {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        channel: "whatsapp".to_string(),
+                                        sender: normalized.clone(),
+                                        // Reply to the originating chat JID (DM or group).
+                                        reply_target: chat,
+                                        content,
+                                        timestamp: chrono::Utc::now().timestamp() as u64,
+                                        thread_ts: None,
+                                    })
+                                    .await
+                                {
+                                    tracing::error!("Failed to send message to channel: {}", e);
                                 }
                             }
                             Event::Connected(_) => {
@@ -694,6 +933,14 @@ impl WhatsAppWebChannel {
         _allowed_numbers: Vec<String>,
     ) -> Self {
         Self { _private: () }
+    }
+
+    pub fn with_transcription(self, _config: crate::config::TranscriptionConfig) -> Self {
+        self
+    }
+
+    pub fn with_tts(self, _config: crate::config::TtsConfig) -> Self {
+        self
     }
 }
 

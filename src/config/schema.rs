@@ -471,6 +471,10 @@ pub struct TranscriptionConfig {
     /// Maximum voice duration in seconds (messages longer than this are skipped).
     #[serde(default = "default_transcription_max_duration_secs")]
     pub max_duration_secs: u64,
+    /// Explicit API key for the transcription service. If empty, the key is
+    /// resolved from environment variables based on the `api_url` provider.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 impl Default for TranscriptionConfig {
@@ -481,6 +485,7 @@ impl Default for TranscriptionConfig {
             model: default_transcription_model(),
             language: None,
             max_duration_secs: default_transcription_max_duration_secs(),
+            api_key: None,
         }
     }
 }
