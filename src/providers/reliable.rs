@@ -211,11 +211,44 @@ fn push_failure(
     ));
 }
 
+// ── Model–Provider Compatibility ─────────────────────────────────────────
+// Avoids wasting API calls on incompatible model–provider pairs (e.g.
+// sending `gemini-3-flash-preview` to an openai-codex provider).
+
+/// Returns model name prefixes accepted by a provider, based on its name.
+/// Returns None if unknown (accept any model).
+fn accepted_model_prefixes(provider_name: &str) -> Option<&[&str]> {
+    // Strip profile suffix: "gemini:gemini-api-1" → "gemini"
+    let base = provider_name.split(':').next().unwrap_or(provider_name);
+    match base {
+        "gemini" => Some(&["gemini-"]),
+        "openai-codex" => Some(&["gpt-", "o1-", "o3-", "o4-"]),
+        "openai" => Some(&["gpt-", "o1-", "o3-", "o4-", "chatgpt-"]),
+        "anthropic" => Some(&["claude-"]),
+        _ => None, // unknown provider — accept any model
+    }
+}
+
+fn is_model_compatible(provider_name: &str, model: &str) -> bool {
+    match accepted_model_prefixes(provider_name) {
+        None => true,
+        Some(prefixes) => prefixes.iter().any(|p| model.starts_with(p)),
+    }
+}
+
+/// Pick the first compatible model from the chain for a given provider.
+fn select_model_for_provider<'a>(provider_name: &str, models: &[&'a str]) -> Option<&'a str> {
+    models
+        .iter()
+        .copied()
+        .find(|m| is_model_compatible(provider_name, m))
+}
+
 // ── Resilient Provider Wrapper ────────────────────────────────────────────
-// Three-level failover strategy: model chain → provider chain → retry loop.
-//   Outer loop:  iterate model fallback chain (original model first, then
-//                configured alternatives).
-//   Middle loop: iterate registered providers in priority order.
+// Two-level failover strategy: provider chain → (compatible models + retry).
+//   Outer loop:  iterate registered providers in priority order.
+//   Middle loop: iterate compatible models from the model fallback chain
+//                (incompatible models for this provider are skipped).
 //   Inner loop:  retry the same (provider, model) pair with exponential
 //                backoff, rotating API keys on rate-limit errors.
 // Loop invariant: `failures` accumulates every failed attempt so the final
@@ -318,12 +351,18 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
-        // Outer: model fallback chain. Middle: provider priority. Inner: retries.
-        // Each iteration: attempt one (provider, model) call. On success, return
-        // immediately. On non-retryable error, break to next provider. On
-        // retryable error, sleep with exponential backoff and retry.
-        for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+        // Outer: provider priority. Middle: compatible models. Inner: retries.
+        for (provider_name, provider) in &self.providers {
+            for current_model in &models {
+                if !is_model_compatible(provider_name, current_model) {
+                    tracing::debug!(
+                        provider = provider_name,
+                        model = *current_model,
+                        "Skipping incompatible model for provider"
+                    );
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -364,8 +403,6 @@ impl Provider for ReliableProvider {
                                 &error_detail,
                             );
 
-                            // Rate-limit with rotatable keys: cycle to the next API key
-                            // so the retry hits a different quota bucket.
                             if rate_limited && !non_retryable_rate_limit {
                                 if let Some(new_key) = self.rotate_key() {
                                     tracing::warn!(
@@ -394,16 +431,17 @@ impl Provider for ReliableProvider {
                                     );
                                 }
 
-                                break;
+                                break; // try next model on this provider
                             }
 
-                            // Rate-limited with other providers available — skip immediately
+                            // Rate-limited — skip to next provider (not just next model)
                             if rate_limited && self.providers.len() > 1 {
                                 tracing::info!(
                                     provider = provider_name,
                                     model = *current_model,
                                     "Rate limited, skipping to next provider"
                                 );
+                                // Break both model and retry loops for this provider
                                 break;
                             }
 
@@ -424,20 +462,6 @@ impl Provider for ReliableProvider {
                         }
                     }
                 }
-
-                tracing::warn!(
-                    provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next provider/model"
-                );
-            }
-
-            if *current_model != model {
-                tracing::warn!(
-                    original_model = model,
-                    fallback_model = *current_model,
-                    "Model fallback exhausted all providers, trying next fallback model"
-                );
             }
         }
 
@@ -456,8 +480,12 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
-        for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+        for (provider_name, provider) in &self.providers {
+            for current_model in &models {
+                if !is_model_compatible(provider_name, current_model) {
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -529,7 +557,6 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
-                            // Rate-limited with other providers available — skip immediately
                             if rate_limited && self.providers.len() > 1 {
                                 tracing::info!(
                                     provider = provider_name,
@@ -556,12 +583,6 @@ impl Provider for ReliableProvider {
                         }
                     }
                 }
-
-                tracing::warn!(
-                    provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next provider/model"
-                );
             }
         }
 
@@ -594,8 +615,12 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
-        for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+        for (provider_name, provider) in &self.providers {
+            for current_model in &models {
+                if !is_model_compatible(provider_name, current_model) {
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -667,7 +692,6 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
-                            // Rate-limited with other providers available — skip immediately
                             if rate_limited && self.providers.len() > 1 {
                                 tracing::info!(
                                     provider = provider_name,
@@ -694,12 +718,6 @@ impl Provider for ReliableProvider {
                         }
                     }
                 }
-
-                tracing::warn!(
-                    provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next provider/model"
-                );
             }
         }
 
@@ -718,8 +736,12 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
-        for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+        for (provider_name, provider) in &self.providers {
+            for current_model in &models {
+                if !is_model_compatible(provider_name, current_model) {
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -792,7 +814,6 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
-                            // Rate-limited with other providers available — skip immediately
                             if rate_limited && self.providers.len() > 1 {
                                 tracing::info!(
                                     provider = provider_name,
@@ -819,20 +840,6 @@ impl Provider for ReliableProvider {
                         }
                     }
                 }
-
-                tracing::warn!(
-                    provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next provider/model"
-                );
-            }
-
-            if *current_model != model {
-                tracing::warn!(
-                    original_model = model,
-                    fallback_model = *current_model,
-                    "Model fallback exhausted all providers, trying next fallback model"
-                );
             }
         }
 
@@ -2041,5 +2048,110 @@ mod tests {
         // Primary should have been called only once (no retries)
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ── Model–provider compatibility tests ──────────────────────
+
+    #[test]
+    fn model_compatibility_gemini_accepts_gemini_models() {
+        assert!(is_model_compatible("gemini", "gemini-3-flash-preview"));
+        assert!(is_model_compatible("gemini", "gemini-2.5-flash"));
+        assert!(is_model_compatible("gemini:gemini-api-1", "gemini-3-flash-preview"));
+        assert!(!is_model_compatible("gemini", "gpt-5.1"));
+        assert!(!is_model_compatible("gemini", "claude-sonnet"));
+    }
+
+    #[test]
+    fn model_compatibility_codex_accepts_gpt_models() {
+        assert!(is_model_compatible("openai-codex", "gpt-5.1"));
+        assert!(is_model_compatible("openai-codex", "gpt-5.1-codex-mini"));
+        assert!(is_model_compatible("openai-codex:codex-1", "o4-mini"));
+        assert!(!is_model_compatible("openai-codex", "gemini-3-flash-preview"));
+        assert!(!is_model_compatible("openai-codex", "claude-sonnet"));
+    }
+
+    #[test]
+    fn model_compatibility_unknown_accepts_any() {
+        assert!(is_model_compatible("custom-provider", "any-model"));
+        assert!(is_model_compatible("primary", "test"));
+        assert!(is_model_compatible("fallback", "gemini-3-flash-preview"));
+    }
+
+    #[test]
+    fn select_model_picks_first_compatible() {
+        let models = vec!["gemini-3-flash-preview", "gpt-5.1"];
+        assert_eq!(
+            select_model_for_provider("gemini", &models),
+            Some("gemini-3-flash-preview")
+        );
+        assert_eq!(
+            select_model_for_provider("openai-codex", &models),
+            Some("gpt-5.1")
+        );
+        assert_eq!(
+            select_model_for_provider("custom", &models),
+            Some("gemini-3-flash-preview")
+        );
+    }
+
+    #[test]
+    fn select_model_returns_none_for_incompatible() {
+        let models = vec!["gemini-3-flash-preview", "gemini-2.5-flash"];
+        assert_eq!(select_model_for_provider("openai-codex", &models), None);
+    }
+
+    #[tokio::test]
+    async fn provider_first_skips_incompatible_model() {
+        // Simulate gemini + openai-codex chain with gemini-3-flash-preview + gpt-5.1 models.
+        // Gemini provider should only see gemini-*, codex should only see gpt-*.
+        let gemini_mock = Arc::new(ModelAwareMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec!["gemini-3-flash-preview"], // gemini fails
+            response: "never",
+        });
+
+        let codex_mock = Arc::new(ModelAwareMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec![],
+            response: "codex ok",
+        });
+
+        let mut fallbacks = HashMap::new();
+        fallbacks.insert(
+            "gemini-3-flash-preview".to_string(),
+            vec!["gpt-5.1".to_string()],
+        );
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "gemini".into(),
+                    Box::new(gemini_mock.clone()) as Box<dyn Provider>,
+                ),
+                (
+                    "openai-codex".into(),
+                    Box::new(codex_mock.clone()) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            1,
+        )
+        .with_model_fallbacks(fallbacks);
+
+        let result = provider
+            .simple_chat("hello", "gemini-3-flash-preview", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "codex ok");
+
+        // Gemini should have tried only gemini-3-flash-preview (not gpt-5.1)
+        let gemini_seen = gemini_mock.models_seen.lock();
+        assert_eq!(gemini_seen.as_slice(), &["gemini-3-flash-preview"]);
+
+        // Codex should have tried only gpt-5.1 (not gemini-3-flash-preview)
+        let codex_seen = codex_mock.models_seen.lock();
+        assert_eq!(codex_seen.as_slice(), &["gpt-5.1"]);
     }
 }
