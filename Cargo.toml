@@ -9,10 +9,10 @@ resolver = "2"
 
 [package]
 name = "zeroclaw"
-version = "0.1.8"
+version = "1.4.10"
 edition = "2021"
 build = "build.rs"
-authors = ["theonlyhennygod"]
+authors = ["coffee-anon"]
 license = "MIT OR Apache-2.0"
 description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
