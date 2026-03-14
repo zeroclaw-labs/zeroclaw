@@ -32,7 +32,6 @@ Xác minh lần cuối: **2026-02-20**.
 ### `onboard`
 
 - `zeroclaw onboard`
-- `zeroclaw onboard --interactive`
 - `zeroclaw onboard --channels-only`
 - `zeroclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
 - `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
