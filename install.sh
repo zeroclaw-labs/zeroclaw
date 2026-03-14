@@ -1062,7 +1062,41 @@ MSG
   exit 1
 fi
 
+build_web_frontend() {
+  local web_dir="$1"
+  if [[ ! -d "$web_dir" ]]; then
+    warn "Web frontend directory not found: $web_dir"
+    return 1
+  fi
+
+  if ! have_cmd npm; then
+    warn "npm is not installed. Skipping web frontend build."
+    warn "The Web Dashboard will not be available. Install Node.js to enable it."
+    return 1
+  fi
+
+  info "Building web frontend"
+  cd "$web_dir"
+
+  if [[ ! -d "node_modules" ]]; then
+    info "Installing web dependencies"
+    npm install --silent
+  fi
+
+  npm run build
+  local build_status=$?
+  cd "$WORK_DIR"
+  return $build_status
+}
+
 if [[ "$SKIP_BUILD" == false ]]; then
+  # Build web frontend before Rust compilation (rust-embed requires assets at compile time)
+  if [[ -d "$WORK_DIR/web" ]]; then
+    if ! build_web_frontend "$WORK_DIR/web"; then
+      warn "Web frontend build failed or skipped. Web Dashboard may not be available."
+    fi
+  fi
+
   info "Building release binary"
   cargo build --release --locked
 else
