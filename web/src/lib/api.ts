@@ -175,6 +175,13 @@ export function deleteCronJob(id: string): Promise<void> {
   });
 }
 
+export function getCronRuns(id: string, limit = 10): Promise<CronRun[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  return apiFetch<CronRun[] | { runs: CronRun[] }>(
+    `/api/cron/${encodeURIComponent(id)}/runs?${params.toString()}`,
+  ).then((data) => unwrapField(data, 'runs'));
+}
+
 // ---------------------------------------------------------------------------
 // Integrations
 // ---------------------------------------------------------------------------
