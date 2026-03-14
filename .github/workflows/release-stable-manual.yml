@@ -105,25 +105,27 @@ jobs:
             | sed 's/^feat(\([^)]*\)): /\1: /' \
             | sed 's/^feat: //' \
             | sed 's/ (#[0-9]*)$//' \
+            | sort -uf \
             | while IFS= read -r line; do echo "- ${line}"; done || true)
 
           if [ -z "$FEATURES" ]; then
             FEATURES="- Incremental improvements and polish"
           fi
 
-          # Get unique contributors
-          CONTRIBUTORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges \
-            | sort -uf \
-            | while IFS= read -r name; do echo "@${name}"; done || true)
-
+          # Collect ALL unique contributors: git authors + Co-Authored-By
+          GIT_AUTHORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges | sort -uf || true)
           CO_AUTHORS=$(git log "$RANGE" --pretty=format:"%b" --no-merges \
-            | grep -ioE 'Co-Authored-By:.*' \
+            | grep -ioE 'Co-Authored-By: *[^<]+' \
             | sed 's/Co-Authored-By: *//i' \
-            | sed 's/ *<.*>//' \
-            | sort -uf \
-            | while IFS= read -r name; do echo "@${name}"; done || true)
+            | sed 's/ *$//' \
+            | sort -uf || true)
 
-          ALL_CONTRIBUTORS=$(printf "%s\n%s" "$CONTRIBUTORS" "$CO_AUTHORS" | sort -uf | grep -v '^$' || true)
+          # Merge, deduplicate, and filter out bots
+          ALL_CONTRIBUTORS=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
+            | sort -uf \
+            | grep -v '^$' \
+            | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^ZeroClaw Bot|^ZeroClaw Runner|^ZeroClaw Agent|^blacksmith' \
+            | while IFS= read -r name; do echo "- ${name}"; done || true)
 
           BODY=$(cat <<NOTES_EOF
           ## What's New

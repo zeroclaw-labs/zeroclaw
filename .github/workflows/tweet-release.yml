@@ -35,8 +35,13 @@ jobs:
           if [ -n "$MANUAL_TEXT" ]; then
             TWEET="$MANUAL_TEXT"
           else
-            # Find the previous release tag to diff against
-            PREV_TAG=$(git tag --sort=-creatordate | grep -v "^${RELEASE_TAG}$" | head -1 || echo "")
+            # Use a wider range — find the previous minor/major version tag
+            # (skip other betas of the same version to capture all contributors)
+            CURRENT_BASE=$(echo "$RELEASE_TAG" | sed 's/-beta\..*//')
+            PREV_TAG=$(git tag --sort=-creatordate \
+              | grep -v "^${RELEASE_TAG}$" \
+              | grep -v "^${CURRENT_BASE}-beta\." \
+              | head -1 || echo "")
             if [ -z "$PREV_TAG" ]; then
               RANGE="HEAD"
             else
@@ -49,6 +54,7 @@ jobs:
               | sed 's/^feat(\([^)]*\)): /\1: /' \
               | sed 's/^feat: //' \
               | sed 's/ (#[0-9]*)$//' \
+              | sort -uf \
               | head -4 \
               | while IFS= read -r line; do echo "🚀 ${line}"; done || true)
 
@@ -56,14 +62,33 @@ jobs:
               FEATURES="🚀 Incremental improvements and polish"
             fi
 
-            # Get contributors for this release
-            CONTRIBUTORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges \
-              | sort -uf \
-              | head -8 \
-              | paste -sd ', ' - || true)
+            # Collect ALL unique contributors: git authors + Co-Authored-By
+            # Filter out bots and service accounts
+            GIT_AUTHORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges | sort -uf || true)
+            CO_AUTHORS=$(git log "$RANGE" --pretty=format:"%b" --no-merges \
+              | grep -ioE 'Co-Authored-By: *[^<]+' \
+              | sed 's/Co-Authored-By: *//i' \
+              | sed 's/ *$//' \
+              | sort -uf || true)
 
-            # Build the tweet — punchy, features-first, contributors featured
-            TWEET=$(printf "🦀 ZeroClaw %s\n\n%s\n\nContributors: %s\n\n%s" \
+            ALL_NAMES=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
+              | sort -uf \
+              | grep -v '^$' \
+              | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^ZeroClaw Bot|^ZeroClaw Runner|^ZeroClaw Agent|^blacksmith' \
+              || true)
+
+            TOTAL_COUNT=$(echo "$ALL_NAMES" | grep -c . || echo "0")
+            # Show up to 6 names, then "+ N more" if there are extras
+            SHOWN=$(echo "$ALL_NAMES" | head -6 | paste -sd ', ' -)
+            if [ "$TOTAL_COUNT" -gt 6 ]; then
+              EXTRA=$((TOTAL_COUNT - 6))
+              CONTRIBUTORS="${SHOWN} + ${EXTRA} more"
+            else
+              CONTRIBUTORS="$SHOWN"
+            fi
+
+            # Build the tweet — punchy, features-first, all contributors credited
+            TWEET=$(printf "🦀 ZeroClaw %s\n\n%s\n\n🙌 Contributors: %s\n\n🔗 %s" \
               "$RELEASE_TAG" "$FEATURES" "$CONTRIBUTORS" "$RELEASE_URL")
           fi
 
@@ -72,7 +97,7 @@ jobs:
             TWEET=$(printf "%s\n\n%s" "$TWEET" "$RELEASE_URL")
           fi
 
-          # Truncate to 280 chars if needed (keep room for URL)
+          # Truncate to 280 chars if needed — trim features first, keep contributors
           if [ ${#TWEET} -gt 280 ]; then
             TWEET="${TWEET:0:277}..."
           fi

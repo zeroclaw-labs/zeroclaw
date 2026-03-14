@@ -54,8 +54,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Find the previous release tag
-          PREV_TAG=$(git tag --sort=-creatordate | head -1 || echo "")
+          # Use a wider range — find the previous minor/major version tag
+          # (skip other betas of the same base version to capture all contributors)
+          BASE_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          CURRENT_BASE="v${BASE_VERSION}"
+          PREV_TAG=$(git tag --sort=-creatordate \
+            | grep -v "^${CURRENT_BASE}-beta\." \
+            | head -1 || echo "")
           if [ -z "$PREV_TAG" ]; then
             RANGE="HEAD"
           else
@@ -68,27 +73,27 @@ jobs:
             | sed 's/^feat(\([^)]*\)): /\1: /' \
             | sed 's/^feat: //' \
             | sed 's/ (#[0-9]*)$//' \
+            | sort -uf \
             | while IFS= read -r line; do echo "- ${line}"; done || true)
 
           if [ -z "$FEATURES" ]; then
             FEATURES="- Incremental improvements and polish"
           fi
 
-          # Get unique contributors since last release
-          CONTRIBUTORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges \
-            | sort -uf \
-            | while IFS= read -r name; do echo "@${name}"; done || true)
-
-          # Also extract GitHub usernames from Co-Authored-By trailers
+          # Collect ALL unique contributors: git authors + Co-Authored-By
+          GIT_AUTHORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges | sort -uf || true)
           CO_AUTHORS=$(git log "$RANGE" --pretty=format:"%b" --no-merges \
-            | grep -ioE 'Co-Authored-By:.*' \
+            | grep -ioE 'Co-Authored-By: *[^<]+' \
             | sed 's/Co-Authored-By: *//i' \
-            | sed 's/ *<.*>//' \
-            | sort -uf \
-            | while IFS= read -r name; do echo "@${name}"; done || true)
+            | sed 's/ *$//' \
+            | sort -uf || true)
 
-          # Merge and deduplicate contributors
-          ALL_CONTRIBUTORS=$(printf "%s\n%s" "$CONTRIBUTORS" "$CO_AUTHORS" | sort -uf | grep -v '^$' || true)
+          # Merge, deduplicate, and filter out bots
+          ALL_CONTRIBUTORS=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
+            | sort -uf \
+            | grep -v '^$' \
+            | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^ZeroClaw Bot|^ZeroClaw Runner|^ZeroClaw Agent|^blacksmith' \
+            | while IFS= read -r name; do echo "- ${name}"; done || true)
 
           # Build release body
           BODY=$(cat <<NOTES_EOF
