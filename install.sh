@@ -420,8 +420,15 @@ bool_to_word() {
 }
 
 guided_input_stream() {
-  if [[ -t 0 ]]; then
+  # Some constrained containers report interactive stdin (-t 0) but deny
+  # opening /dev/stdin directly. Probe readability before selecting it.
+  if [[ -t 0 ]] && (: </dev/stdin) 2>/dev/null; then
     echo "/dev/stdin"
+    return 0
+  fi
+
+  if [[ -t 0 ]] && (: </proc/self/fd/0) 2>/dev/null; then
+    echo "/proc/self/fd/0"
     return 0
   fi
 
