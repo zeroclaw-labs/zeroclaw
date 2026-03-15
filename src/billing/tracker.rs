@@ -263,25 +263,13 @@ impl CostTracker {
     }
 
     /// Estimate cost for a given model based on token counts.
+    ///
+    /// Uses the comprehensive pricing registry for accurate per-model rates.
+    /// Falls back to conservative defaults ($1.00/$3.00 per 1M) for unknown models.
     pub fn estimate_cost(model: &str, input_tokens: i64, output_tokens: i64) -> f64 {
-        // Cost per 1M tokens (approximate, as of 2024)
-        let (input_rate, output_rate) = match model {
-            m if m.contains("gpt-4o") => (2.50, 10.00),
-            m if m.contains("gpt-4") => (30.00, 60.00),
-            m if m.contains("gpt-3.5") => (0.50, 1.50),
-            m if m.contains("claude-3-opus") => (15.00, 75.00),
-            m if m.contains("claude-sonnet-4") => (3.00, 15.00),
-            m if m.contains("claude-3-haiku") => (0.25, 1.25),
-            m if m.contains("gemini-pro") => (0.50, 1.50),
-            m if m.contains("llama") => (0.20, 0.20),
-            m if m.contains("mistral") => (0.20, 0.60),
-            _ => (1.00, 3.00), // Default estimate
-        };
-
-        let input_cost = (input_tokens as f64 / 1_000_000.0) * input_rate;
-        let output_cost = (output_tokens as f64 / 1_000_000.0) * output_rate;
-
-        input_cost + output_cost
+        let registry = super::pricing::PricingRegistry::defaults();
+        let (cost, _found) = registry.estimate_cost(model, input_tokens, output_tokens);
+        cost
     }
 }
 

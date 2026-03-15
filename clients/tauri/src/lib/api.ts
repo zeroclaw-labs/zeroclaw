@@ -348,8 +348,9 @@ export class MoAClient {
   // - If no local API key → chat via relay server (operator key, credits deducted)
 
   hasLocalApiKey(): boolean {
-    const providers = ["claude", "openai", "gemini"];
-    return providers.some((p) => {
+    // Check all possible key storage names (anthropic = claude provider key)
+    const keyNames = ["anthropic", "openai", "gemini"];
+    return keyNames.some((p) => {
       const key = localStorage.getItem(`zeroclaw_api_key_${p}`);
       return key && key.trim().length > 0;
     });
@@ -368,14 +369,32 @@ export class MoAClient {
     const provider = localStorage.getItem("zeroclaw_llm_provider") || "claude";
     const model = localStorage.getItem("zeroclaw_llm_model") || "claude-opus-4-20250514";
 
+    // Map frontend provider names to API key storage names
+    const providerKeyMap: Record<string, string> = {
+      claude: "anthropic",
+      openai: "openai",
+      gemini: "gemini",
+    };
+    const keyStorageName = providerKeyMap[provider] || provider;
+    const apiKey = localStorage.getItem(`zeroclaw_api_key_${keyStorageName}`) || "";
+
     const chatBaseUrl = this.getChatUrl();
+    const isLocal = this.hasLocalApiKey();
+
     const res = await fetch(`${chatBaseUrl}/api/chat`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${this.token}`,
       },
-      body: JSON.stringify({ message, context, provider, model }),
+      body: JSON.stringify({
+        message,
+        context,
+        provider,
+        model,
+        // Only send API key to local gateway, not to relay
+        ...(isLocal && apiKey ? { api_key: apiKey } : {}),
+      }),
     });
 
     if (!res.ok) {

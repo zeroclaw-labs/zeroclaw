@@ -1257,6 +1257,194 @@ pub async fn handle_api_checkout_webhook_stripe(
     Json(serde_json::json!({"received": true})).into_response()
 }
 
+// ── Admin: Model Pricing Registry ────────────────────────────────
+//
+// These endpoints allow operators to view and manage per-model API pricing.
+// All pricing data is persisted in `model_pricing.toml` and used for
+// credit billing calculations.
+
+/// GET /api/admin/pricing — list all models with pricing, grouped by provider
+pub async fn handle_api_admin_pricing_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let registry = state.pricing_registry.snapshot();
+    let grouped = registry.by_provider();
+
+    Json(serde_json::json!({
+        "total_models": registry.models.len(),
+        "providers": grouped,
+        "credit_multiplier": state.config.lock().platform_routing.credit_multiplier,
+        "vat_rate": state.config.lock().platform_routing.vat_rate,
+    }))
+    .into_response()
+}
+
+/// GET /api/admin/pricing/:model_id — get pricing for a single model
+pub async fn handle_api_admin_pricing_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(model_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    match state.pricing_registry.get_model(&model_id) {
+        Some(price) => Json(serde_json::json!({
+            "model_id": model_id,
+            "pricing": price,
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Model '{}' not found in pricing registry", model_id)})),
+        )
+            .into_response(),
+    }
+}
+
+/// Request body for upserting a model's pricing.
+#[derive(Deserialize)]
+pub struct UpsertPricingRequest {
+    pub provider: String,
+    pub display_name: String,
+    pub input_per_million: f64,
+    pub output_per_million: f64,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// PUT /api/admin/pricing/:model_id — add or update a model's pricing
+pub async fn handle_api_admin_pricing_upsert(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(model_id): Path<String>,
+    Json(body): Json<UpsertPricingRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    // Validate input
+    if body.input_per_million < 0.0 || body.output_per_million < 0.0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Prices must be non-negative"})),
+        )
+            .into_response();
+    }
+
+    if body.provider.trim().is_empty() || body.display_name.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "provider and display_name are required"})),
+        )
+            .into_response();
+    }
+
+    let price = crate::billing::ModelPrice {
+        provider: body.provider,
+        display_name: body.display_name,
+        input_per_million: body.input_per_million,
+        output_per_million: body.output_per_million,
+        note: body.note,
+    };
+
+    match state
+        .pricing_registry
+        .upsert_and_save(model_id.clone(), price.clone())
+    {
+        Ok(()) => {
+            tracing::info!(model_id = model_id.as_str(), "Model pricing updated");
+            Json(serde_json::json!({
+                "status": "ok",
+                "model_id": model_id,
+                "pricing": price,
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save pricing: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/admin/pricing/:model_id — remove a model from the registry
+pub async fn handle_api_admin_pricing_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(model_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    match state.pricing_registry.remove_and_save(&model_id) {
+        Ok(Some(removed)) => Json(serde_json::json!({
+            "status": "ok",
+            "removed": {
+                "model_id": model_id,
+                "pricing": removed,
+            }
+        }))
+        .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Model '{}' not found", model_id)})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/admin/pricing/estimate — estimate credit cost for given usage
+#[derive(Deserialize)]
+pub struct EstimateCostRequest {
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
+pub async fn handle_api_admin_pricing_estimate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<EstimateCostRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let raw_cost = state
+        .pricing_registry
+        .estimate_cost(&body.model, body.input_tokens, body.output_tokens);
+    let platform = &state.config.lock().platform_routing;
+    let credit_charge = platform.credit_charge(raw_cost);
+    let multiplier = platform.credit_multiplier;
+    let vat = platform.vat_rate;
+
+    Json(serde_json::json!({
+        "model": body.model,
+        "input_tokens": body.input_tokens,
+        "output_tokens": body.output_tokens,
+        "raw_api_cost_usd": raw_cost,
+        "credit_multiplier": multiplier,
+        "vat_rate": vat,
+        "total_credit_charge_usd": credit_charge,
+    }))
+    .into_response()
+}
+
 /// GET /api/cli-tools — discovered CLI tools
 pub async fn handle_api_cli_tools(
     State(state): State<AppState>,

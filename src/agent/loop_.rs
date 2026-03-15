@@ -2429,7 +2429,7 @@ pub async fn run(
     let provider_name = provider_override
         .as_deref()
         .or(config.default_provider.as_deref())
-        .unwrap_or("openrouter");
+        .unwrap_or("gemini");
 
     let model_name = crate::config::resolve_default_model_id(
         model_override
@@ -3081,7 +3081,7 @@ pub async fn process_message_with_session(
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
 
-    let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+    let provider_name = config.default_provider.as_deref().unwrap_or("gemini");
     let model_name = crate::config::resolve_default_model_id(
         config.default_model.as_deref(),
         Some(provider_name),

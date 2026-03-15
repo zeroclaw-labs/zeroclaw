@@ -1038,7 +1038,7 @@ async fn main() -> Result<()> {
             println!();
             println!(
                 "🤖 Provider:      {}",
-                config.default_provider.as_deref().unwrap_or("openrouter")
+                config.default_provider.as_deref().unwrap_or("gemini")
             );
             println!(
                 "   Model:         {}",
@@ -1189,7 +1189,7 @@ async fn main() -> Result<()> {
             let current = config
                 .default_provider
                 .as_deref()
-                .unwrap_or("openrouter")
+                .unwrap_or("gemini")
                 .trim()
                 .to_ascii_lowercase();
             println!("Supported providers ({} total):\n", providers.len());

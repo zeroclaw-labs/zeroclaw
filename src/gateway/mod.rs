@@ -383,6 +383,8 @@ pub struct AppState {
     /// Cloudflare R2 configuration for secure document upload flow.
     /// Present only when R2_ACCOUNT_ID + R2_ACCESS_KEY_ID + R2_SECRET_ACCESS_KEY are set.
     pub r2_config: Option<crate::storage::r2::R2Config>,
+    /// Shared model pricing registry for accurate cost calculation and admin management.
+    pub pricing_registry: crate::billing::SharedPricingRegistry,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -412,7 +414,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let display_addr = format!("{host}:{actual_port}");
 
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
-        config.default_provider.as_deref().unwrap_or("openrouter"),
+        config.default_provider.as_deref().unwrap_or("gemini"),
         config.api_key.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
@@ -998,6 +1000,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         email_verify_service,
         supabase,
         r2_config: crate::storage::r2::R2Config::from_env(),
+        pricing_registry: crate::billing::SharedPricingRegistry::new(&config.workspace_dir),
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -1113,6 +1116,18 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route(
             "/api/checkout/webhook/stripe",
             post(api::handle_api_checkout_webhook_stripe),
+        )
+        // ── Admin: Model Pricing Management ──
+        .route("/api/admin/pricing", get(api::handle_api_admin_pricing_list))
+        .route(
+            "/api/admin/pricing/estimate",
+            post(api::handle_api_admin_pricing_estimate),
+        )
+        .route(
+            "/api/admin/pricing/{model_id}",
+            get(api::handle_api_admin_pricing_get)
+                .put(api::handle_api_admin_pricing_upsert)
+                .delete(api::handle_api_admin_pricing_delete),
         )
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
@@ -3145,6 +3160,7 @@ mod tests {
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -3217,6 +3233,7 @@ mod tests {
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -3272,6 +3289,7 @@ mod tests {
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let response = handle_metrics(State(state), test_public_connect_info(), HeaderMap::new())
@@ -3328,6 +3346,7 @@ mod tests {
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let unauthorized =
@@ -3826,6 +3845,7 @@ Reminder set successfully."#;
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let mut headers = HeaderMap::new();
@@ -3910,6 +3930,7 @@ Reminder set successfully."#;
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let response = handle_webhook(
@@ -3975,6 +3996,7 @@ Reminder set successfully."#;
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let response = handle_webhook(
@@ -4041,6 +4063,7 @@ Reminder set successfully."#;
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let response = handle_webhook(
@@ -4116,6 +4139,7 @@ Reminder set successfully."#;
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let response = handle_node_control(
@@ -4183,6 +4207,7 @@ Reminder set successfully."#;
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let response = handle_node_control(
@@ -4255,6 +4280,7 @@ Reminder set successfully."#;
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let headers = HeaderMap::new();
@@ -4353,6 +4379,7 @@ Reminder set successfully."#;
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let response = handle_webhook(
@@ -4421,6 +4448,7 @@ Reminder set successfully."#;
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let mut headers = HeaderMap::new();
@@ -4494,6 +4522,7 @@ Reminder set successfully."#;
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let mut headers = HeaderMap::new();
@@ -4581,6 +4610,7 @@ Reminder set successfully."#;
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let response = handle_github_webhook(
@@ -4647,6 +4677,7 @@ Reminder set successfully."#;
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let body = r#"{
@@ -4724,6 +4755,7 @@ Reminder set successfully."#;
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let body = r#"{
@@ -4806,6 +4838,7 @@ Reminder set successfully."#;
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -4878,6 +4911,7 @@ Reminder set successfully."#;
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let mut headers = HeaderMap::new();
@@ -4943,6 +4977,7 @@ Reminder set successfully."#;
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let response = handle_qq_webhook(
@@ -5007,6 +5042,7 @@ Reminder set successfully."#;
             email_verify_service: None,
             supabase: None,
             r2_config: None,
+            pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
         };
 
         let mut headers = HeaderMap::new();

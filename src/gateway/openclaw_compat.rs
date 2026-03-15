@@ -62,6 +62,21 @@ pub struct ApiChatBody {
     /// semantic memory might not surface (e.g., the last few exchanges).
     #[serde(default)]
     pub context: Vec<String>,
+
+    /// Optional LLM provider override (e.g. "anthropic", "openai", "gemini").
+    /// When provided, overrides the server's default_provider for this request.
+    #[serde(default)]
+    pub provider: Option<String>,
+
+    /// Optional model ID override (e.g. "claude-opus-4-20250514", "gpt-4o").
+    /// When provided, overrides the server's default_model for this request.
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// Optional API key for the selected provider.
+    /// When provided, overrides the server's configured api_key for this request.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 fn api_chat_memory_key() -> String {
@@ -172,14 +187,39 @@ pub async fn handle_api_chat(
         )
     };
 
+    // ── Build config with client-provided overrides ──
+    let mut config = state.config.lock().clone();
+
+    // Map frontend provider names to backend provider names
+    if let Some(ref client_provider) = chat_body.provider {
+        let backend_provider = match client_provider.as_str() {
+            "claude" => "anthropic",
+            p => p,
+        };
+        config.default_provider = Some(backend_provider.to_string());
+    }
+
+    if let Some(ref client_model) = chat_body.model {
+        if !client_model.trim().is_empty() {
+            config.default_model = Some(client_model.clone());
+        }
+    }
+
+    if let Some(ref client_key) = chat_body.api_key {
+        if !client_key.trim().is_empty() {
+            config.api_key = Some(client_key.clone());
+        }
+    }
+
     // ── Observability ──
-    let provider_label = state
-        .config
-        .lock()
+    let provider_label = config
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
-    let model_label = state.model.clone();
+    let model_label = config
+        .default_model
+        .clone()
+        .unwrap_or_else(|| state.model.clone());
     let started_at = Instant::now();
 
     state
@@ -197,7 +237,7 @@ pub async fn handle_api_chat(
         });
 
     // ── Run the full agent loop ──
-    match run_gateway_chat_with_tools(&state, &enriched_message, session_id).await {
+    match crate::agent::process_message_with_session(config, &enriched_message, session_id).await {
         Ok(response) => {
             let leak_guard_cfg = state.config.lock().security.outbound_leak_guard.clone();
             let safe_response = sanitize_gateway_response(
@@ -225,7 +265,7 @@ pub async fn handle_api_chat(
                 .observer
                 .record_event(&crate::observability::ObserverEvent::AgentEnd {
                     provider: provider_label,
-                    model: model_label,
+                    model: model_label.clone(),
                     duration,
                     tokens_used: None,
                     cost_usd: None,
@@ -233,7 +273,7 @@ pub async fn handle_api_chat(
 
             let body = serde_json::json!({
                 "reply": safe_response,
-                "model": state.model,
+                "model": model_label,
                 "session_id": chat_body.session_id,
             });
             (StatusCode::OK, Json(body))
@@ -787,12 +827,16 @@ mod tests {
         let json = r#"{
             "message": "What's my schedule?",
             "session_id": "sess-123",
-            "context": ["User: hi", "Assistant: hello"]
+            "context": ["User: hi", "Assistant: hello"],
+            "provider": "anthropic",
+            "model": "claude-opus-4-20250514"
         }"#;
         let body: ApiChatBody = serde_json::from_str(json).unwrap();
         assert_eq!(body.message, "What's my schedule?");
         assert_eq!(body.session_id.as_deref(), Some("sess-123"));
         assert_eq!(body.context.len(), 2);
+        assert_eq!(body.provider.as_deref(), Some("anthropic"));
+        assert_eq!(body.model.as_deref(), Some("claude-opus-4-20250514"));
     }
 
     #[test]

@@ -23,19 +23,25 @@ interface ModelOption {
 
 const MODEL_OPTIONS: Record<string, ModelOption[]> = {
   claude: [
-    { id: "claude-opus-4-20250514", label: "Claude Opus 4", tier: "Premium" },
-    { id: "claude-sonnet-4-20250514", label: "Claude Sonnet 4", tier: "Standard" },
+    { id: "claude-opus-4-20250514", label: "Claude Opus 4.6", tier: "Premium" },
+    { id: "claude-sonnet-4-20250514", label: "Claude Sonnet 4.6", tier: "Standard" },
     { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5", tier: "Fast" },
   ],
   openai: [
-    { id: "gpt-4o", label: "GPT-4o", tier: "Premium" },
-    { id: "gpt-4-turbo", label: "GPT-4 Turbo", tier: "Standard" },
-    { id: "gpt-3.5-turbo", label: "GPT-3.5 Turbo", tier: "Fast" },
+    { id: "gpt-5.4", label: "GPT-5.4", tier: "Premium" },
+    { id: "gpt-5-mini", label: "GPT-5 Mini", tier: "Standard" },
+    { id: "gpt-4.1", label: "GPT-4.1", tier: "Standard" },
+    { id: "gpt-4.1-mini", label: "GPT-4.1 Mini", tier: "Fast" },
   ],
   gemini: [
-    { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash", tier: "Premium" },
-    { id: "gemini-1.5-pro", label: "Gemini 1.5 Pro", tier: "Standard" },
-    { id: "gemini-1.5-flash", label: "Gemini 1.5 Flash", tier: "Fast" },
+    { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview", tier: "Premium" },
+    { id: "gemini-3.1-flash-lite", label: "Gemini 3.1 Flash-Lite", tier: "Standard" },
+    { id: "gemini-3.1-flash-image-preview", label: "Gemini 3.1 Flash Image Preview", tier: "Standard" },
+    { id: "gemini-3-flash-preview", label: "Gemini 3 Flash Preview", tier: "Standard" },
+    { id: "gemini-3-pro-image-preview", label: "Gemini 3 Pro Image Preview", tier: "Standard" },
+    { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", tier: "Standard" },
+    { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", tier: "Fast" },
+    { id: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash-Lite", tier: "Fast" },
   ],
 };
 

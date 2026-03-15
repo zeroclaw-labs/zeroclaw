@@ -8,10 +8,12 @@
 //! - Per-provider, per-model cost tracking with token counts
 //! - Configurable spending limits (daily/monthly) with alerts
 //! - Usage summary export for billing reconciliation
+//! - TOML-backed model pricing registry with admin API
 
 pub mod checkout;
 pub mod llm_router;
 pub mod payment;
+pub mod pricing;
 pub mod tracker;
 
 #[allow(unused_imports)]
@@ -23,5 +25,7 @@ pub use checkout::{
 pub use llm_router::{AdminKeys, KeySource, ResolvedKey};
 #[allow(unused_imports)]
 pub use payment::{CreditPackage, PaymentManager, PaymentRecord, PaymentStatus};
+#[allow(unused_imports)]
+pub use pricing::{ModelPrice, PricingRegistry, SharedPricingRegistry};
 #[allow(unused_imports)]
 pub use tracker::{CostEntry, CostTracker, UsageSummary};
