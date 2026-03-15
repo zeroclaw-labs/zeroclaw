@@ -6582,6 +6582,6 @@ Let me check the result."#;
         let specs = vec![make_spec("shell"), make_spec("file_read")];
         let allowed: Vec<String> = vec![];
         let result = filter_by_allowed_tools(specs, Some(&allowed));
-        assert!(result.is_empty();
+        assert!(result.is_empty());
     }
 }
