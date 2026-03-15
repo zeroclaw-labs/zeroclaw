@@ -30,6 +30,7 @@ pub mod mattermost;
 pub mod nextcloud_talk;
 #[cfg(feature = "channel-nostr")]
 pub mod nostr;
+pub mod notion;
 pub mod qq;
 pub mod signal;
 pub mod slack;
@@ -61,6 +62,7 @@ pub use mattermost::MattermostChannel;
 pub use nextcloud_talk::NextcloudTalkChannel;
 #[cfg(feature = "channel-nostr")]
 pub use nostr::NostrChannel;
+pub use notion::NotionChannel;
 pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
@@ -3268,6 +3270,54 @@ fn collect_configured_channels(
                 verify_tls: irc.verify_tls.unwrap_or(true),
             })),
         });
+    }
+
+    if let Some(ref notion) = config.channels_config.notion {
+        if notion.enabled {
+            let api_key = notion
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("NOTION_API_KEY").ok())
+                .unwrap_or_default();
+            let api_key = api_key.trim().to_string();
+
+            if let Some(ref db_id) = notion.database_id {
+                if api_key.is_empty() {
+                    tracing::warn!("Notion channel enabled but API key is missing. Set it in config or NOTION_API_KEY env var.");
+                } else {
+                    let status_type = match notion.status_type.as_str() {
+                        "status" => notion::NotionStatusType::Status,
+                        _ => notion::NotionStatusType::Select,
+                    };
+
+                    channels.push(ConfiguredChannel {
+                        display_name: "Notion",
+                        channel: Arc::new(NotionChannel::new(notion::NotionChannelConfig {
+                            database_id: db_id.clone(),
+                            data_source_id: Some(
+                                notion
+                                    .data_source_id
+                                    .clone()
+                                    .unwrap_or_else(|| db_id.clone()),
+                            ),
+                            api_key,
+                            poll_interval_secs: notion.poll_interval_secs,
+                            status_property: notion.status_property.clone(),
+                            input_property: notion.input_property.clone(),
+                            result_property: notion.result_property.clone(),
+                            pending_value: notion.pending_value.clone(),
+                            running_value: notion.running_value.clone(),
+                            done_value: notion.done_value.clone(),
+                            error_value: notion.error_value.clone(),
+                            status_type,
+                            recover_stale: notion.recover_stale,
+                        })),
+                    });
+                }
+            } else {
+                tracing::warn!("Notion channel enabled but database_id is missing.");
+            }
+        }
     }
 
     #[cfg(feature = "channel-lark")]

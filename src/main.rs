@@ -170,6 +170,10 @@ enum Commands {
         #[arg(long)]
         channels_only: bool,
 
+        /// Run the full interactive wizard (default is quick setup)
+        #[arg(short, long)]
+        interactive: bool,
+
         /// API key for provider configuration
         #[arg(long)]
         api_key: Option<String>,
@@ -725,6 +729,7 @@ async fn main() -> Result<()> {
     if let Commands::Onboard {
         force,
         reinit,
+        interactive,
         channels_only,
         api_key,
         provider,
@@ -734,6 +739,7 @@ async fn main() -> Result<()> {
     {
         let force = *force;
         let reinit = *reinit;
+        let interactive = *interactive;
         let channels_only = *channels_only;
         let api_key = api_key.clone();
         let provider = provider.clone();
@@ -795,6 +801,8 @@ async fn main() -> Result<()> {
 
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
+        } else if interactive {
+            Box::pin(onboard::run_wizard(force)).await
         } else {
             onboard::run_quick_setup(
                 api_key.as_deref(),
