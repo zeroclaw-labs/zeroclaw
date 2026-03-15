@@ -1121,7 +1121,7 @@ impl LarkChannel {
             channel: self.channel_name().to_string(),
             timestamp,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
         });
 
         messages

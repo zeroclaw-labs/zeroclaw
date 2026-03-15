@@ -580,7 +580,7 @@ impl Channel for IrcChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: None,
-                reply_to_message_id: None,
+                        reply_to_message_id: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {

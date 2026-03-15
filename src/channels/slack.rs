@@ -1776,7 +1776,7 @@ impl SlackChannel {
                         .unwrap_or_default()
                         .as_secs(),
                     thread_ts: Self::inbound_thread_ts(event, ts),
-                reply_to_message_id: None,
+                    reply_to_message_id: None,
                 };
 
                 if tx.send(channel_msg).await.is_err() {
@@ -2341,7 +2341,7 @@ impl Channel for SlackChannel {
                                 .unwrap_or_default()
                                 .as_secs(),
                             thread_ts: Self::inbound_thread_ts(msg, ts),
-                reply_to_message_id: None,
+                            reply_to_message_id: None,
                         };
 
                         if tx.send(channel_msg).await.is_err() {
@@ -2426,7 +2426,7 @@ impl Channel for SlackChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: Some(thread_ts.clone()),
-                reply_to_message_id: None,
+                        reply_to_message_id: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {
