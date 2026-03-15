@@ -91,6 +91,7 @@ Branch/commit/PR rules:
 ## Contributing Guidelines (from CONTRIBUTING.md)
 
 ### Branch & PR Rules
+
 - `master` is the ONLY default branch. There is no `main` branch.
 - Fork the repo, create `feat/*` or `fix/*` branch from `master`, open PR targeting `master`.
 - IMPORTANT: Use `feat/` NOT `feature/` — the prefix must be `feat/` or `fix/` exactly.
@@ -100,6 +101,7 @@ Branch/commit/PR rules:
 - If replacing an older PR, add `Supersedes #...` and request maintainers close the old one.
 
 ### PR Template (All Sections Required)
+
 1. Summary (base branch, problem, what changed, what didn't change)
 2. Label Snapshot (risk, size, scope, module labels)
 3. Change Metadata (change type, primary scope)
@@ -115,11 +117,13 @@ Branch/commit/PR rules:
 13. Risks and Mitigations
 
 ### Collaboration Tracks (Risk-Based)
+
 - **Track A (Low risk)**: docs/tests/chore — 1 maintainer review + green CI
 - **Track B (Medium risk)**: providers/channels/memory/tools behavior — 1 subsystem-aware review + validation evidence
 - **Track C (High risk)**: `src/security/**`, `src/runtime/**`, `src/gateway/**`, `.github/workflows/**` — 2-pass review, rollback plan required
 
 ### Code Naming Conventions
+
 - Rust casing: modules/files `snake_case`, types/traits/enums `PascalCase`, functions/variables `snake_case`, constants `SCREAMING_SNAKE_CASE`
 - Domain-first naming: `DiscordChannel`, `SecurityPolicy`, `SqliteMemory` (not `Manager`, `Helper`, `Util`)
 - Trait implementers: `*Provider`, `*Channel`, `*Tool`, `*Memory`, `*Observer`
@@ -128,6 +132,7 @@ Branch/commit/PR rules:
 - Identity labels: use ZeroClaw-native identifiers only (`ZeroClawAgent`, `zeroclaw_user`, `zeroclaw_node`)
 
 ### Architecture Boundary Rules
+
 - Extend via trait implementations + factory registration before considering broad refactors.
 - Dependency direction: concrete integrations depend on shared traits/config/util, not on each other.
 - No cross-subsystem coupling (provider <-> channel internals, tools mutating security directly).
@@ -136,20 +141,25 @@ Branch/commit/PR rules:
 - `src/config/schema.rs` keys are public contract — document compatibility, migration, rollback.
 
 ### Validation Commands
+
 ```bash
 # Required before every PR
+
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
 
 # Full quality gate
+
 ./scripts/ci/rust_quality_gate.sh
 
 # Strict delta lint (changed lines only)
+
 ./scripts/ci/rust_strict_delta_gate.sh
 ```
 
 ### What Must Never Be Committed
+
 - `.env` files (use `.env.example` only)
 - API keys, tokens, passwords, credentials (plain or encrypted)
 - OAuth tokens, session identifiers, webhook signing secrets
@@ -157,6 +167,7 @@ cargo test --locked
 - Personal identifiers or real user data in tests/fixtures
 
 ### CI Details
+
 - Quality Gate: Lint (fmt+clippy), Build (x86_64-linux + aarch64-darwin), Test, Security Audit
 - CI uses Rust 1.92.0 (may differ from local toolchain)
 - `clippy::large_futures` triggers at 16KB on Linux — fix with `Box::pin()`
