@@ -1,20 +1,32 @@
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::auth::AuthService;
 use crate::multimodal;
-use crate::providers::traits::{ChatMessage, Provider, ProviderCapabilities};
+use crate::providers::traits::{
+    ChatMessage, Provider, ProviderCapabilities, StreamChunk, StreamError, StreamOptions,
+    StreamResult,
+};
 use crate::providers::ProviderRuntimeOptions;
 use async_trait::async_trait;
+use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::time::Duration;
 
 const DEFAULT_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const CODEX_RESPONSES_URL_ENV: &str = "ZEROCLAW_CODEX_RESPONSES_URL";
 const CODEX_BASE_URL_ENV: &str = "ZEROCLAW_CODEX_BASE_URL";
+const CODEX_TIMEOUT_SECS_ENV: &str = "ZEROCLAW_CODEX_TIMEOUT_SECS";
+const CODEX_CONNECT_TIMEOUT_SECS_ENV: &str = "ZEROCLAW_CODEX_CONNECT_TIMEOUT_SECS";
+const CODEX_STREAM_IDLE_TIMEOUT_SECS_ENV: &str = "ZEROCLAW_CODEX_STREAM_IDLE_TIMEOUT_SECS";
+const DEFAULT_CODEX_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_CODEX_CONNECT_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_CODEX_STREAM_IDLE_TIMEOUT_SECS: u64 = 180;
 const DEFAULT_CODEX_INSTRUCTIONS: &str =
     "You are ZeroClaw, a concise and helpful coding assistant.";
 
+#[derive(Clone)]
 pub struct OpenAiCodexProvider {
     auth: AuthService,
     auth_profile_override: Option<String>,
@@ -104,13 +116,37 @@ impl OpenAiCodexProvider {
             custom_endpoint: !is_default_responses_url(&responses_url),
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            client: build_codex_http_client(),
         })
     }
+}
+
+fn parse_timeout_env_secs(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn build_codex_http_client() -> Client {
+    let timeout_secs = parse_timeout_env_secs(CODEX_TIMEOUT_SECS_ENV)
+        .unwrap_or(DEFAULT_CODEX_TIMEOUT_SECS)
+        .max(30);
+    let connect_timeout_secs = parse_timeout_env_secs(CODEX_CONNECT_TIMEOUT_SECS_ENV)
+        .unwrap_or(DEFAULT_CODEX_CONNECT_TIMEOUT_SECS)
+        .max(1);
+
+    crate::config::build_runtime_proxy_client_with_timeouts(
+        "provider.openai-codex",
+        timeout_secs,
+        connect_timeout_secs,
+    )
+}
+
+fn codex_stream_idle_timeout_secs() -> u64 {
+    parse_timeout_env_secs(CODEX_STREAM_IDLE_TIMEOUT_SECS_ENV)
+        .unwrap_or(DEFAULT_CODEX_STREAM_IDLE_TIMEOUT_SECS)
+        .max(5)
 }
 
 fn default_zeroclaw_dir() -> PathBuf {
@@ -312,6 +348,31 @@ fn resolve_reasoning_effort(model_id: &str) -> String {
     clamp_reasoning_effort(model_id, &raw)
 }
 
+fn build_responses_request(
+    input: Vec<ResponsesInput>,
+    instructions: String,
+    model: &str,
+) -> ResponsesRequest {
+    let normalized_model = normalize_model_id(model);
+    ResponsesRequest {
+        model: normalized_model.to_string(),
+        input,
+        instructions,
+        store: false,
+        stream: true,
+        text: ResponsesTextOptions {
+            verbosity: "medium".to_string(),
+        },
+        reasoning: ResponsesReasoningOptions {
+            effort: resolve_reasoning_effort(normalized_model),
+            summary: "auto".to_string(),
+        },
+        include: vec!["reasoning.encrypted_content".to_string()],
+        tool_choice: "auto".to_string(),
+        parallel_tool_calls: true,
+    }
+}
+
 fn nonempty_preserve(text: Option<&str>) -> Option<String> {
     text.and_then(|value| {
         if value.is_empty() {
@@ -365,46 +426,64 @@ fn extract_stream_event_text(event: &Value, saw_delta: bool) -> Option<String> {
     }
 }
 
-fn parse_sse_text(body: &str) -> anyhow::Result<Option<String>> {
-    let mut saw_delta = false;
-    let mut delta_accumulator = String::new();
-    let mut fallback_text = None;
-    let mut buffer = body.to_string();
+#[derive(Default)]
+struct CodexSseDecoder {
+    saw_delta: bool,
+    delta_accumulator: String,
+    fallback_text: Option<String>,
+    buffer: String,
+    saw_sse_framing: bool,
+}
 
-    let mut process_event = |event: Value| -> anyhow::Result<()> {
+impl CodexSseDecoder {
+    fn process_event(&mut self, event: Value) -> anyhow::Result<Option<String>> {
         if let Some(message) = extract_stream_error_message(&event) {
             return Err(anyhow::anyhow!("OpenAI Codex stream error: {message}"));
         }
-        if let Some(text) = extract_stream_event_text(&event, saw_delta) {
+        if let Some(text) = extract_stream_event_text(&event, self.saw_delta) {
             let event_type = event.get("type").and_then(Value::as_str);
             if event_type == Some("response.output_text.delta") {
-                saw_delta = true;
-                delta_accumulator.push_str(&text);
-            } else if fallback_text.is_none() {
-                fallback_text = Some(text);
+                self.saw_delta = true;
+                self.delta_accumulator.push_str(&text);
+                return Ok(Some(text));
+            } else if self.fallback_text.is_none() {
+                self.fallback_text = Some(text);
             }
         }
-        Ok(())
-    };
+        Ok(None)
+    }
 
-    let mut process_chunk = |chunk: &str| -> anyhow::Result<()> {
+    fn process_chunk_collect_deltas(&mut self, chunk: &str) -> anyhow::Result<Vec<String>> {
         let data_lines: Vec<String> = chunk
             .lines()
-            .filter_map(|line| line.strip_prefix("data:"))
-            .map(|line| line.trim().to_string())
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                if trimmed.starts_with("event:") || trimmed.starts_with(':') {
+                    self.saw_sse_framing = true;
+                }
+                trimmed.strip_prefix("data:").map(|value| {
+                    self.saw_sse_framing = true;
+                    value.trim().to_string()
+                })
+            })
             .collect();
         if data_lines.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let joined = data_lines.join("\n");
         let trimmed = joined.trim();
         if trimmed.is_empty() || trimmed == "[DONE]" {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
+        let mut deltas = Vec::new();
+
         if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
-            return process_event(event);
+            if let Some(delta) = self.process_event(event)? {
+                deltas.push(delta);
+            }
+            return Ok(deltas);
         }
 
         for line in data_lines {
@@ -413,32 +492,63 @@ fn parse_sse_text(body: &str) -> anyhow::Result<Option<String>> {
                 continue;
             }
             if let Ok(event) = serde_json::from_str::<Value>(line) {
-                process_event(event)?;
+                if let Some(delta) = self.process_event(event)? {
+                    deltas.push(delta);
+                }
             }
         }
 
+        Ok(deltas)
+    }
+
+    fn feed_text_collect_deltas(&mut self, input: &str) -> anyhow::Result<Vec<String>> {
+        // Normalize CRLF to simplify SSE frame splitting.
+        let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
+        self.buffer.push_str(&normalized);
+        let mut deltas = Vec::new();
+
+        loop {
+            let Some(idx) = self.buffer.find("\n\n") else {
+                break;
+            };
+
+            let chunk = self.buffer[..idx].to_string();
+            self.buffer = self.buffer[idx + 2..].to_string();
+            deltas.extend(self.process_chunk_collect_deltas(&chunk)?);
+        }
+
+        Ok(deltas)
+    }
+
+    fn feed_text(&mut self, input: &str) -> anyhow::Result<()> {
+        let _ = self.feed_text_collect_deltas(input)?;
         Ok(())
-    };
-
-    loop {
-        let Some(idx) = buffer.find("\n\n") else {
-            break;
-        };
-
-        let chunk = buffer[..idx].to_string();
-        buffer = buffer[idx + 2..].to_string();
-        process_chunk(&chunk)?;
     }
 
-    if !buffer.trim().is_empty() {
-        process_chunk(&buffer)?;
+    fn looks_like_sse(&self) -> bool {
+        self.saw_sse_framing
+            || self.buffer.trim_start().starts_with("event:")
+            || self.buffer.trim_start().starts_with("data:")
     }
 
-    if saw_delta {
-        return Ok(nonempty_preserve(Some(&delta_accumulator)));
-    }
+    fn finish(mut self) -> anyhow::Result<Option<String>> {
+        if !self.buffer.trim().is_empty() {
+            let tail = std::mem::take(&mut self.buffer);
+            let _ = self.process_chunk_collect_deltas(&tail)?;
+        }
 
-    Ok(fallback_text)
+        if self.saw_delta {
+            return Ok(nonempty_preserve(Some(&self.delta_accumulator)));
+        }
+
+        Ok(self.fallback_text)
+    }
+}
+
+fn parse_sse_text(body: &str) -> anyhow::Result<Option<String>> {
+    let mut decoder = CodexSseDecoder::default();
+    decoder.feed_text(body)?;
+    decoder.finish()
 }
 
 fn extract_stream_error_message(event: &Value) -> Option<String> {
@@ -473,14 +583,49 @@ fn extract_stream_error_message(event: &Value) -> Option<String> {
 }
 
 async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<String> {
-    let body = response.text().await?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let force_sse = content_type.contains("text/event-stream");
+    let idle_timeout_secs = codex_stream_idle_timeout_secs();
 
-    if let Some(text) = parse_sse_text(&body)? {
+    let mut body = String::new();
+    let mut decoder = CodexSseDecoder::default();
+    let mut bytes_stream = response.bytes_stream();
+
+    loop {
+        let next_chunk = if force_sse || decoder.looks_like_sse() {
+            tokio::time::timeout(Duration::from_secs(idle_timeout_secs), bytes_stream.next())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "OpenAI Codex stream idle timeout after {idle_timeout_secs}s without data"
+                    )
+                })?
+        } else {
+            bytes_stream.next().await
+        };
+
+        let Some(chunk) = next_chunk else {
+            break;
+        };
+
+        let bytes = chunk?;
+        let text = String::from_utf8_lossy(&bytes);
+        body.push_str(&text);
+        decoder.feed_text(&text)?;
+    }
+
+    if let Some(text) = decoder.finish()? {
         return Ok(text);
     }
 
     let body_trimmed = body.trim_start();
-    let looks_like_sse = body_trimmed.starts_with("event:") || body_trimmed.starts_with("data:");
+    let looks_like_sse =
+        force_sse || body_trimmed.starts_with("event:") || body_trimmed.starts_with("data:");
     if looks_like_sse {
         return Err(anyhow::anyhow!(
             "No response from OpenAI Codex stream payload: {}",
@@ -498,12 +643,7 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<St
 }
 
 impl OpenAiCodexProvider {
-    async fn send_responses_request(
-        &self,
-        input: Vec<ResponsesInput>,
-        instructions: String,
-        model: &str,
-    ) -> anyhow::Result<String> {
+    async fn authenticated_request_builder(&self) -> anyhow::Result<reqwest::RequestBuilder> {
         let use_gateway_api_key_auth = self.custom_endpoint && self.gateway_api_key.is_some();
         let profile = match self
             .auth
@@ -559,25 +699,6 @@ impl OpenAiCodexProvider {
                 )
             })?)
         };
-        let normalized_model = normalize_model_id(model);
-
-        let request = ResponsesRequest {
-            model: normalized_model.to_string(),
-            input,
-            instructions,
-            store: false,
-            stream: true,
-            text: ResponsesTextOptions {
-                verbosity: "medium".to_string(),
-            },
-            reasoning: ResponsesReasoningOptions {
-                effort: resolve_reasoning_effort(normalized_model),
-                summary: "auto".to_string(),
-            },
-            include: vec!["reasoning.encrypted_content".to_string()],
-            tool_choice: "auto".to_string(),
-            parallel_tool_calls: true,
-        };
 
         let bearer_token = if use_gateway_api_key_auth {
             self.gateway_api_key.as_deref().unwrap_or_default()
@@ -607,13 +728,218 @@ impl OpenAiCodexProvider {
             }
         }
 
-        let response = request_builder.json(&request).send().await?;
+        Ok(request_builder)
+    }
+
+    async fn send_responses_request(
+        &self,
+        input: Vec<ResponsesInput>,
+        instructions: String,
+        model: &str,
+    ) -> anyhow::Result<String> {
+        let request = build_responses_request(input, instructions, model);
+        let response = self
+            .authenticated_request_builder()
+            .await?
+            .json(&request)
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI Codex", response).await);
         }
 
         decode_responses_body(response).await
+    }
+
+    async fn stream_responses_request(
+        &self,
+        input: Vec<ResponsesInput>,
+        instructions: String,
+        model: &str,
+        count_tokens: bool,
+        tx: &tokio::sync::mpsc::Sender<StreamResult<StreamChunk>>,
+    ) -> anyhow::Result<()> {
+        let request = build_responses_request(input, instructions, model);
+        let response = self
+            .authenticated_request_builder()
+            .await?
+            .json(&request)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenAI Codex", response).await);
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
+        let force_sse = content_type.contains("text/event-stream");
+        let idle_timeout_secs = codex_stream_idle_timeout_secs();
+
+        let mut body = String::new();
+        let mut decoder = CodexSseDecoder::default();
+        let mut bytes_stream = response.bytes_stream();
+        let mut sent_delta = false;
+
+        loop {
+            let next_chunk = if force_sse || decoder.looks_like_sse() {
+                match tokio::time::timeout(
+                    Duration::from_secs(idle_timeout_secs),
+                    bytes_stream.next(),
+                )
+                .await
+                {
+                    Ok(chunk) => chunk,
+                    Err(_) if sent_delta => {
+                        tracing::warn!(
+                            idle_timeout_secs,
+                            "OpenAI Codex stream idle timeout after partial output; returning partial response"
+                        );
+                        break;
+                    }
+                    Err(_) => {
+                        return Err(anyhow::anyhow!(
+                            "OpenAI Codex stream idle timeout after {idle_timeout_secs}s without data"
+                        ));
+                    }
+                }
+            } else {
+                bytes_stream.next().await
+            };
+
+            let Some(chunk) = next_chunk else {
+                break;
+            };
+
+            let bytes = match chunk {
+                Ok(bytes) => bytes,
+                Err(err) if sent_delta => {
+                    tracing::warn!(
+                        error = %err,
+                        "OpenAI Codex stream transport interrupted after partial output; returning partial response"
+                    );
+                    break;
+                }
+                Err(err) => return Err(err.into()),
+            };
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            body.push_str(&text);
+            let deltas = match decoder.feed_text_collect_deltas(&text) {
+                Ok(deltas) => deltas,
+                Err(err) if sent_delta => {
+                    tracing::warn!(
+                        error = %err,
+                        "OpenAI Codex SSE parse error after partial output; returning partial response"
+                    );
+                    break;
+                }
+                Err(err) => return Err(err),
+            };
+            for delta in deltas {
+                let mut stream_chunk = StreamChunk::delta(delta);
+                if count_tokens {
+                    stream_chunk = stream_chunk.with_token_estimate();
+                }
+                if tx.send(Ok(stream_chunk)).await.is_err() {
+                    return Ok(());
+                }
+                sent_delta = true;
+            }
+        }
+
+        let final_text = match decoder.finish() {
+            Ok(text) => text,
+            Err(err) if sent_delta => {
+                tracing::warn!(
+                    error = %err,
+                    "OpenAI Codex SSE finalization failed after partial output; returning partial response"
+                );
+                None
+            }
+            Err(err) => return Err(err),
+        };
+        if !sent_delta {
+            let text = if let Some(text) = final_text {
+                Some(text)
+            } else {
+                let body_trimmed = body.trim_start();
+                let looks_like_sse = force_sse
+                    || body_trimmed.starts_with("event:")
+                    || body_trimmed.starts_with("data:");
+                if looks_like_sse {
+                    return Err(anyhow::anyhow!(
+                        "No response from OpenAI Codex stream payload: {}",
+                        super::sanitize_api_error(&body)
+                    ));
+                }
+                let parsed: ResponsesResponse = serde_json::from_str(&body).map_err(|err| {
+                    anyhow::anyhow!(
+                        "OpenAI Codex JSON parse failed: {err}. Payload: {}",
+                        super::sanitize_api_error(&body)
+                    )
+                })?;
+                extract_responses_text(&parsed)
+            };
+
+            if let Some(text) = text {
+                let mut stream_chunk = StreamChunk::delta(text);
+                if count_tokens {
+                    stream_chunk = stream_chunk.with_token_estimate();
+                }
+                if tx.send(Ok(stream_chunk)).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn stream_chat_with_history_owned(
+        &self,
+        messages: Vec<ChatMessage>,
+        model: String,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        if !options.enabled {
+            return stream::once(async move { Ok(StreamChunk::final_chunk()) }).boxed();
+        }
+
+        let provider = self.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(128);
+
+        tokio::spawn(async move {
+            let config = crate::config::MultimodalConfig::default();
+            let prepared =
+                match crate::multimodal::prepare_messages_for_provider(&messages, &config).await {
+                    Ok(prepared) => prepared,
+                    Err(err) => {
+                        let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
+                        return;
+                    }
+                };
+            let (instructions, input) = build_responses_input(&prepared.messages);
+
+            if let Err(err) = provider
+                .stream_responses_request(input, instructions, &model, options.count_tokens, &tx)
+                .await
+            {
+                let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
+                return;
+            }
+
+            let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+        });
+
+        stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|chunk| (chunk, rx))
+        })
+        .boxed()
     }
 }
 
@@ -663,11 +989,43 @@ impl Provider for OpenAiCodexProvider {
         self.send_responses_request(input, instructions, model)
             .await
     }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        _temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let mut messages = Vec::new();
+        if let Some(sys) = system_prompt {
+            messages.push(ChatMessage::system(sys));
+        }
+        messages.push(ChatMessage::user(message));
+        self.stream_chat_with_history_owned(messages, model.to_string(), options)
+    }
+
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        _temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        self.stream_chat_with_history_owned(messages.to_vec(), model.to_string(), options)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_TIMEOUT_ENV: &str = "ZEROCLAW_CODEX_TEST_TIMEOUT_SECS";
 
     struct EnvGuard {
         key: &'static str,
@@ -795,6 +1153,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_timeout_env_secs_parses_positive_numbers() {
+        let _guard = EnvGuard::set(TEST_TIMEOUT_ENV, Some("450"));
+        assert_eq!(parse_timeout_env_secs(TEST_TIMEOUT_ENV), Some(450));
+    }
+
+    #[test]
+    fn parse_timeout_env_secs_rejects_invalid_values() {
+        {
+            let _guard = EnvGuard::set(TEST_TIMEOUT_ENV, Some("0"));
+            assert_eq!(parse_timeout_env_secs(TEST_TIMEOUT_ENV), None);
+        }
+
+        {
+            let _guard = EnvGuard::set(TEST_TIMEOUT_ENV, Some("oops"));
+            assert_eq!(parse_timeout_env_secs(TEST_TIMEOUT_ENV), None);
+        }
+    }
+
+    #[test]
     fn resolve_instructions_uses_default_when_missing() {
         assert_eq!(
             resolve_instructions(None),
@@ -881,6 +1258,42 @@ data: [DONE]
 "#;
 
         assert_eq!(parse_sse_text(payload).unwrap().as_deref(), Some("Done"));
+    }
+
+    #[test]
+    fn sse_decoder_handles_chunk_boundaries_incrementally() {
+        let mut decoder = CodexSseDecoder::default();
+        decoder
+            .feed_text(r#"data: {"type":"response.output_text.delta","delta":"Hel"#)
+            .unwrap();
+        decoder.feed_text("lo\"}\n").unwrap();
+        decoder
+            .feed_text("data: {\"type\":\"response.output_text.delta\",\"delta\":\" world\"}\n")
+            .unwrap();
+        decoder.feed_text("data: [DONE]\n\n").unwrap();
+
+        assert_eq!(decoder.finish().unwrap().as_deref(), Some("Hello world"));
+    }
+
+    #[test]
+    fn parse_sse_text_supports_crlf_framing() {
+        let payload = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"Done\"}}\r\n",
+            "\r\n",
+            "data: [DONE]\r\n",
+            "\r\n"
+        );
+
+        assert_eq!(parse_sse_text(payload).unwrap().as_deref(), Some("Done"));
+    }
+
+    #[test]
+    fn parse_sse_text_surfaces_response_failed_error() {
+        let payload = r#"data: {"type":"response.failed","response":{"error":{"message":"boom"}}}
+
+"#;
+        let err = parse_sse_text(payload).unwrap_err().to_string();
+        assert!(err.contains("boom"));
     }
 
     #[test]
@@ -1027,5 +1440,13 @@ data: [DONE]
 
         assert!(!caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn provider_reports_streaming_support() {
+        let options = ProviderRuntimeOptions::default();
+        let provider =
+            OpenAiCodexProvider::new(&options, None).expect("provider should initialize");
+        assert!(provider.supports_streaming());
     }
 }
