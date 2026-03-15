@@ -190,3 +190,52 @@ All schemas validated with jq:
 - Must import `SinkExt` and `StreamExt` from `futures-util` for `.send()` and `.next()`
 - Recursive async functions require boxing or loop pattern
 - `Message::Text(text)` extraction returns `Utf8Bytes`, need `.to_string()`
+
+## Task 6: Message Transformation Logic (2026-03-15)
+
+### Implementation Details
+- Created `crates/zeroclaw-bridge/src/transform.rs` with stateless conversion functions
+- Added `serde_json` dependency to bridge Cargo.toml
+- Implemented bidirectional MQTT ↔ WebSocket message transformation
+
+### Key Patterns
+- **Stateless design**: Pure functions with no internal state
+- **Type safety**: Separate enums for MQTT and WebSocket message formats
+- **Error propagation**: Uses `anyhow::Result` for conversion failures
+- **Field alignment**: Exact match with protocol spec and gateway types
+
+### API Surface
+- `mqtt_to_ws(mqtt_json: &str) -> Result<String>` - MQTT → WebSocket (register/result)
+- `ws_to_mqtt(ws_json: &str) -> Result<String>` - WebSocket → MQTT (invoke)
+- `MqttNodeMessage` enum - register, result
+- `MqttGatewayMessage` enum - invoke
+- `WsNodeMessage` enum - register, result
+- `WsGatewayMessage` enum - invoke
+
+### Test Coverage
+- 6 tests passing:
+  - `test_mqtt_to_ws_register` - capability registration
+  - `test_mqtt_to_ws_result_success` - successful execution
+  - `test_mqtt_to_ws_result_error` - error handling
+  - `test_ws_to_mqtt_invoke` - tool invocation
+  - `test_mqtt_to_ws_invalid_json` - error case
+  - `test_ws_to_mqtt_invalid_json` - error case
+
+### Message Type Support
+- ✅ Register (MQTT → WS): node_id + capabilities array
+- ✅ Result (MQTT → WS): call_id + success + output + optional error
+- ✅ Invoke (WS → MQTT): call_id + capability + args
+
+### Alignment Verification
+- Field names match `docs/architecture/mqtt-bridge-protocol.md` exactly
+- Types match `src/gateway/nodes.rs` NodeMessage/GatewayMessage enums
+- JSON serialization uses snake_case (serde default)
+- Optional error field uses `#[serde(skip_serializing_if = "Option::is_none")]`
+
+### Dependencies Added
+- `serde_json = "1.0"` for JSON parsing/serialization
+
+### Notes
+- Heartbeat messages not included (not part of gateway protocol)
+- Pure transformation layer - no business logic or state
+- Ready for integration with MQTT/WS client layers

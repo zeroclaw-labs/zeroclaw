@@ -206,7 +206,7 @@ Max Concurrent: 5 (Wave 1)
 
 ## TODOs
 
-- [ ] 1. MQTT Topic 结构和消息 Schema 定义
+- [x] 1. MQTT Topic 结构和消息 Schema 定义
 
   **What to do**:
   - 定义 MQTT topic 结构（register/invoke/result/heartbeat）
@@ -266,7 +266,7 @@ Max Concurrent: 5 (Wave 1)
   - Message: `docs(bridge): add MQTT bridge protocol specification`
   - Files: `docs/architecture/mqtt-bridge-protocol.md`
 
-- [ ] 2. Bridge 项目脚手架和配置加载
+- [x] 2. Bridge 项目脚手架和配置加载
 
   **What to do**:
   - 创建 `crates/zeroclaw-bridge/` 子项目
@@ -320,7 +320,7 @@ Max Concurrent: 5 (Wave 1)
   - Message: `feat(bridge): add project scaffold and config loading`
   - Files: `crates/zeroclaw-bridge/**`
 
-- [ ] 3. MQTT Client 封装（rumqttc）
+- [x] 3. MQTT Client 封装（rumqttc）
 
   **What to do**:
   - 创建 `src/mqtt_client.rs`
@@ -359,7 +359,7 @@ Max Concurrent: 5 (Wave 1)
   - Message: `feat(bridge): add MQTT client wrapper`
   - Files: `crates/zeroclaw-bridge/src/mqtt_client.rs`
 
-- [ ] 4. WebSocket Client 封装（tokio-tungstenite）
+- [x] 4. WebSocket Client 封装（tokio-tungstenite）
 
   **What to do**:
   - 创建 `src/ws_client.rs`
@@ -398,7 +398,7 @@ Max Concurrent: 5 (Wave 1)
   - Message: `feat(bridge): add WebSocket client wrapper`
   - Files: `crates/zeroclaw-bridge/src/ws_client.rs`
 
-- [ ] 5. ESP32 固件项目脚手架（Arduino + QEMU）
+- [x] 5. ESP32 固件项目脚手架（Arduino + QEMU）
 
   **What to do**:
   - 创建 `firmware/esp32-node/` 目录
@@ -456,7 +456,7 @@ Max Concurrent: 5 (Wave 1)
   - Message: `feat(firmware): add ESP32 node firmware scaffold with QEMU support`
   - Files: `firmware/esp32-node/**`
 
-- [ ] 6. 消息转换逻辑（MQTT ↔ WebSocket）
+- [x] 6. 消息转换逻辑（MQTT ↔ WebSocket）
 
   **What to do**:
   - 创建 `src/transform.rs`

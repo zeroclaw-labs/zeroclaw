@@ -8145,6 +8145,7 @@ dependencies = [
  "futures-util",
  "rumqttc",
  "serde",
+ "serde_json",
  "shellexpand",
  "tempfile",
  "tokio",
