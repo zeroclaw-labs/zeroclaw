@@ -57,6 +57,16 @@
 
 ---
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.3.1 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| ci | add Termux (aarch64-linux-android) release target |
+
+<!-- END:WHATS_NEW -->
+
 ## Mikä on ZeroClaw?
 
 ZeroClaw on kevyt, muokattava ja laajennettava AI-assistentti-infrastruktuuri, joka on rakennettu Rustilla. Se yhdistää eri LLM-palveluntarjoajat (Anthropic, OpenAI, Google, Ollama jne.) yhtenäisen käyttöliittymän kautta ja tukee useita kanavia (Telegram, Matrix, CLI jne.).
@@ -177,3 +187,17 @@ Katso [LICENSE-APACHE](LICENSE-APACHE) ja [LICENSE-MIT](LICENSE-MIT) yksityiskoh
 Jos ZeroClaw on hyödyllinen sinulle, harkitse kahvin ostamista meille:
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee)](https://buymeacoffee.com/argenistherose)
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.3.1)
+
+3 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+- **argenis de la rosa**
+- **Claude Opus 4.6**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->

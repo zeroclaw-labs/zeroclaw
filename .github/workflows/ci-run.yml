@@ -105,6 +105,8 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: macos-14
             target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -112,6 +114,7 @@ jobs:
           toolchain: 1.92.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        if: runner.os != 'Windows'
 
       - name: Install mold linker
         if: runner.os == 'Linux'
@@ -120,11 +123,12 @@ jobs:
           sudo apt-get install -y mold
 
       - name: Ensure web/dist placeholder exists
+        shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
 
       - name: Build release
         shell: bash
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --profile ci --locked --target ${{ matrix.target }}
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"

@@ -53,7 +53,7 @@
 </p>
 
 <p align="center">
-  <a href="install.sh">ワンクリック導入</a> |
+  <a href="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh">ワンクリック導入</a> |
   <a href="docs/setup-guides/README.md">導入ガイド</a> |
   <a href="docs/README.ja.md">ドキュメントハブ</a> |
   <a href="docs/SUMMARY.md">Docs TOC</a>
@@ -74,6 +74,16 @@
 > コマンド名、設定キー、API パス、Trait 名などの技術識別子は英語のまま維持しています。
 >
 > 最終同期日: **2026-02-19**。
+
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.3.1 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| ci | add Termux (aarch64-linux-android) release target |
+
+<!-- END:WHATS_NEW -->
 
 ## 📢 お知らせボード
 
@@ -163,7 +173,7 @@ cargo build --release --locked
 cargo install --path . --force --locked
 
 zeroclaw onboard --api-key sk-... --provider openrouter
-zeroclaw onboard --interactive
+zeroclaw onboard
 
 zeroclaw agent -m "Hello, ZeroClaw!"
 
@@ -218,110 +228,26 @@ zeroclaw agent --provider openai-codex --auth-profile openai-codex:work -m "hell
 zeroclaw agent --provider anthropic -m "hello"
 ```
 
-## アーキテクチャ
-
-すべてのサブシステムは **Trait** — 設定変更だけで実装を差し替え可能、コード変更不要。
-
-<p align="center">
-  <img src="docs/assets/architecture.svg" alt="ZeroClaw アーキテクチャ" width="900" />
-</p>
-
-| サブシステム | Trait | 内蔵実装 | 拡張方法 |
-|-------------|-------|----------|----------|
-| **AI モデル** | `Provider` | `zeroclaw providers` で確認（現在 28 個の組み込み + エイリアス、カスタムエンドポイント対応） | `custom:https://your-api.com`（OpenAI 互換）または `anthropic-custom:https://your-api.com` |
-| **チャネル** | `Channel` | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, Signal, WhatsApp, Linq, Email, IRC, Lark, DingTalk, QQ, Webhook | 任意のメッセージ API |
-| **メモリ** | `Memory` | SQLite ハイブリッド検索, PostgreSQL バックエンド, Lucid ブリッジ, Markdown ファイル, 明示的 `none` バックエンド, スナップショット/復元, オプション応答キャッシュ | 任意の永続化バックエンド |
-| **ツール** | `Tool` | shell/file/memory, cron/schedule, git, pushover, browser, http_request, screenshot/image_info, composio (opt-in), delegate, ハードウェアツール | 任意の機能 |
-| **オブザーバビリティ** | `Observer` | Noop, Log, Multi | Prometheus, OTel |
-| **ランタイム** | `RuntimeAdapter` | Native, Docker（サンドボックス） | adapter 経由で追加可能；未対応の kind は即座にエラー |
-| **セキュリティ** | `SecurityPolicy` | Gateway ペアリング, サンドボックス, allowlist, レート制限, ファイルシステムスコープ, 暗号化シークレット | — |
-| **アイデンティティ** | `IdentityConfig` | OpenClaw (markdown), AIEOS v1.1 (JSON) | 任意の ID フォーマット |
-| **トンネル** | `Tunnel` | None, Cloudflare, Tailscale, ngrok, Custom | 任意のトンネルバイナリ |
-| **ハートビート** | Engine | HEARTBEAT.md 定期タスク | — |
-| **スキル** | Loader | TOML マニフェスト + SKILL.md インストラクション | コミュニティスキルパック |
-| **インテグレーション** | Registry | 9 カテゴリ、70 件以上の連携 | プラグインシステム |
-
-### ランタイムサポート（現状）
-
-- ✅ 現在サポート: `runtime.kind = "native"` または `runtime.kind = "docker"`
-- 🚧 計画中（未実装）: WASM / エッジランタイム
-
-未対応の `runtime.kind` が設定された場合、ZeroClaw は native へのサイレントフォールバックではなく、明確なエラーで終了します。
-
-### メモリシステム（フルスタック検索エンジン）
-
-すべて自社実装、外部依存ゼロ — Pinecone、Elasticsearch、LangChain 不要:
-
-| レイヤー | 実装 |
-|---------|------|
-| **ベクトル DB** | Embeddings を SQLite に BLOB として保存、コサイン類似度検索 |
-| **キーワード検索** | FTS5 仮想テーブル、BM25 スコアリング |
-| **ハイブリッドマージ** | カスタム重み付きマージ関数（`vector.rs`） |
-| **Embeddings** | `EmbeddingProvider` trait — OpenAI、カスタム URL、または noop |
-| **チャンキング** | 行ベースの Markdown チャンカー（見出し構造保持） |
-| **キャッシュ** | SQLite `embedding_cache` テーブル、LRU エビクション |
-| **安全な再インデックス** | FTS5 再構築 + 欠落ベクトルの再埋め込みをアトミックに実行 |
-
-Agent はツール経由でメモリの呼び出し・保存・管理を自動的に行います。
-
-```toml
-[memory]
-backend = "sqlite"             # "sqlite", "lucid", "postgres", "markdown", "none"
-auto_save = true
-embedding_provider = "none"    # "none", "openai", "custom:https://..."
-vector_weight = 0.7
-keyword_weight = 0.3
-```
-
-## セキュリティのデフォルト
-
-- Gateway の既定バインド: `127.0.0.1:42617`
-- 既定でペアリング必須: `require_pairing = true`
-- 既定で公開バインド禁止: `allow_public_bind = false`
-- Channel allowlist:
-  - `[]` は deny-by-default
-  - `["*"]` は allow all（意図的に使う場合のみ）
-
-## 設定例
-
-```toml
-api_key = "sk-..."
-default_provider = "openrouter"
-default_model = "anthropic/claude-sonnet-4-6"
-default_temperature = 0.7
-
-[memory]
-backend = "sqlite"
-auto_save = true
-embedding_provider = "none"
-
-[gateway]
-host = "127.0.0.1"
-port = 42617
-require_pairing = true
-allow_public_bind = false
-```
-
-## ドキュメント入口
-
-- ドキュメントハブ（英語）: [`docs/README.md`](docs/README.md)
-- 統合 TOC: [`docs/SUMMARY.md`](docs/SUMMARY.md)
-- ドキュメントハブ（日本語）: [`docs/README.ja.md`](docs/README.ja.md)
-- コマンドリファレンス: [`docs/reference/cli/commands-reference.md`](docs/reference/cli/commands-reference.md)
-- 設定リファレンス: [`docs/reference/api/config-reference.md`](docs/reference/api/config-reference.md)
-- Provider リファレンス: [`docs/reference/api/providers-reference.md`](docs/reference/api/providers-reference.md)
-- Channel リファレンス: [`docs/reference/api/channels-reference.md`](docs/reference/api/channels-reference.md)
-- 運用ガイド（Runbook）: [`docs/ops/operations-runbook.md`](docs/ops/operations-runbook.md)
-- トラブルシューティング: [`docs/ops/troubleshooting.md`](docs/ops/troubleshooting.md)
-- ドキュメント一覧 / 分類: [`docs/maintainers/docs-inventory.md`](docs/maintainers/docs-inventory.md)
-- プロジェクト triage スナップショット: [`docs/maintainers/project-triage-snapshot-2026-02-18.md`](docs/maintainers/project-triage-snapshot-2026-02-18.md)
-
 ## コントリビュート / ライセンス
 
 - Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md)
 - PR Workflow: [`docs/contributing/pr-workflow.md`](docs/contributing/pr-workflow.md)
 - Reviewer Playbook: [`docs/contributing/reviewer-playbook.md`](docs/contributing/reviewer-playbook.md)
 - License: MIT or Apache 2.0（[`LICENSE-MIT`](LICENSE-MIT), [`LICENSE-APACHE`](LICENSE-APACHE), [`NOTICE`](NOTICE)）
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.3.1)
+
+3 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+- **argenis de la rosa**
+- **Claude Opus 4.6**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ---
 

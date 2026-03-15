@@ -7,6 +7,7 @@ pub mod cli;
 pub mod cortex_backend;
 #[cfg(feature = "memory-cortex")]
 pub mod cortex_config_resolver;
+pub mod consolidation;
 pub mod embeddings;
 pub mod hygiene;
 pub mod lucid;

@@ -53,27 +53,37 @@
 </p>
 
 <p align="center">
-  <a href="install.sh">一键部署</a> |
-  <a href="docs/setup-guides/README.md">安装入门</a> |
+  <a href="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh">一键部署</a> |
+  <a href="docs/i18n/zh-CN/setup-guides/README.zh-CN.md">安装入门</a> |
   <a href="docs/README.zh-CN.md">文档总览</a> |
-  <a href="docs/SUMMARY.md">文档目录</a>
+  <a href="docs/SUMMARY.zh-CN.md">文档目录</a>
 </p>
 
 <p align="center">
   <strong>场景分流：</strong>
-  <a href="docs/reference/README.md">参考手册</a> ·
-  <a href="docs/ops/README.md">运维部署</a> ·
-  <a href="docs/ops/troubleshooting.md">故障排查</a> ·
-  <a href="docs/security/README.md">安全专题</a> ·
-  <a href="docs/hardware/README.md">硬件外设</a> ·
-  <a href="docs/contributing/README.md">贡献与 CI</a>
+  <a href="docs/i18n/zh-CN/reference/README.zh-CN.md">参考手册</a> ·
+  <a href="docs/i18n/zh-CN/ops/README.zh-CN.md">运维部署</a> ·
+  <a href="docs/i18n/zh-CN/ops/troubleshooting.zh-CN.md">故障排查</a> ·
+  <a href="docs/i18n/zh-CN/security/README.zh-CN.md">安全专题</a> ·
+  <a href="docs/i18n/zh-CN/hardware/README.zh-CN.md">硬件外设</a> ·
+  <a href="docs/i18n/zh-CN/contributing/README.zh-CN.md">贡献与 CI</a>
 </p>
 
 > 本文是对 `README.md` 的人工对齐翻译（强调可读性与准确性，不做逐字直译）。
-> 
+>
 > 技术标识（命令、配置键、API 路径、Trait 名称）保持英文，避免语义漂移。
-> 
-> 最后对齐时间：**2026-02-22**。
+>
+> 最后对齐时间：**2026-03-14**。
+
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.3.1 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| ci | add Termux (aarch64-linux-android) release target |
+
+<!-- END:WHATS_NEW -->
 
 ## 📢 公告板
 
@@ -146,7 +156,7 @@ cd zeroclaw
 
 可选环境初始化：`./install.sh --install-system-deps --install-rust`（可能需要 `sudo`）。
 
-详细说明见：[`docs/setup-guides/one-click-bootstrap.md`](docs/setup-guides/one-click-bootstrap.md)。
+详细说明见：[`docs/setup-guides/one-click-bootstrap.md`](docs/i18n/zh-CN/setup-guides/one-click-bootstrap.zh-CN.md)。
 
 ## 快速开始
 
@@ -165,8 +175,8 @@ cargo install --path . --force --locked
 # 快速初始化（无交互）
 zeroclaw onboard --api-key sk-... --provider openrouter
 
-# 或使用交互式向导
-zeroclaw onboard --interactive
+# 或使用引导式向导
+zeroclaw onboard
 
 # 单次对话
 zeroclaw agent -m "Hello, ZeroClaw!"
@@ -223,110 +233,26 @@ zeroclaw agent --provider openai-codex --auth-profile openai-codex:work -m "hell
 zeroclaw agent --provider anthropic -m "hello"
 ```
 
-## 架构
-
-每个子系统都是一个 **Trait** — 通过配置切换即可更换实现，无需修改代码。
-
-<p align="center">
-  <img src="docs/assets/architecture.svg" alt="ZeroClaw 架构图" width="900" />
-</p>
-
-| 子系统 | Trait | 内置实现 | 扩展方式 |
-|--------|-------|----------|----------|
-| **AI 模型** | `Provider` | 通过 `zeroclaw providers` 查看（当前 28 个内置 + 别名，以及自定义端点） | `custom:https://your-api.com`（OpenAI 兼容）或 `anthropic-custom:https://your-api.com` |
-| **通道** | `Channel` | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, Signal, WhatsApp, Linq, Email, IRC, Lark, DingTalk, QQ, Webhook | 任意消息 API |
-| **记忆** | `Memory` | SQLite 混合搜索, PostgreSQL 后端, Lucid 桥接, Markdown 文件, 显式 `none` 后端, 快照/恢复, 可选响应缓存 | 任意持久化后端 |
-| **工具** | `Tool` | shell/file/memory, cron/schedule, git, pushover, browser, http_request, screenshot/image_info, composio (opt-in), delegate, 硬件工具 | 任意能力 |
-| **可观测性** | `Observer` | Noop, Log, Multi | Prometheus, OTel |
-| **运行时** | `RuntimeAdapter` | Native, Docker（沙箱） | 通过 adapter 添加；不支持的类型会快速失败 |
-| **安全** | `SecurityPolicy` | Gateway 配对, 沙箱, allowlist, 速率限制, 文件系统作用域, 加密密钥 | — |
-| **身份** | `IdentityConfig` | OpenClaw (markdown), AIEOS v1.1 (JSON) | 任意身份格式 |
-| **隧道** | `Tunnel` | None, Cloudflare, Tailscale, ngrok, Custom | 任意隧道工具 |
-| **心跳** | Engine | HEARTBEAT.md 定期任务 | — |
-| **技能** | Loader | TOML 清单 + SKILL.md 指令 | 社区技能包 |
-| **集成** | Registry | 9 个分类下 70+ 集成 | 插件系统 |
-
-### 运行时支持（当前）
-
-- ✅ 当前支持：`runtime.kind = "native"` 或 `runtime.kind = "docker"`
-- 🚧 计划中，尚未实现：WASM / 边缘运行时
-
-配置了不支持的 `runtime.kind` 时，ZeroClaw 会以明确的错误退出，而非静默回退到 native。
-
-### 记忆系统（全栈搜索引擎）
-
-全部自研，零外部依赖 — 无需 Pinecone、Elasticsearch、LangChain：
-
-| 层级 | 实现 |
-|------|------|
-| **向量数据库** | Embeddings 以 BLOB 存储于 SQLite，余弦相似度搜索 |
-| **关键词搜索** | FTS5 虚拟表，BM25 评分 |
-| **混合合并** | 自定义加权合并函数（`vector.rs`） |
-| **Embeddings** | `EmbeddingProvider` trait — OpenAI、自定义 URL 或 noop |
-| **分块** | 基于行的 Markdown 分块器，保留标题结构 |
-| **缓存** | SQLite `embedding_cache` 表，LRU 淘汰策略 |
-| **安全重索引** | 原子化重建 FTS5 + 重新嵌入缺失向量 |
-
-Agent 通过工具自动进行记忆的回忆、保存和管理。
-
-```toml
-[memory]
-backend = "sqlite"             # "sqlite", "lucid", "postgres", "markdown", "none"
-auto_save = true
-embedding_provider = "none"    # "none", "openai", "custom:https://..."
-vector_weight = 0.7
-keyword_weight = 0.3
-```
-
-## 安全默认行为（关键）
-
-- Gateway 默认绑定：`127.0.0.1:42617`
-- Gateway 默认要求配对：`require_pairing = true`
-- 默认拒绝公网绑定：`allow_public_bind = false`
-- Channel allowlist 语义：
-  - 空列表 `[]` => deny-by-default
-  - `"*"` => allow all（仅在明确知道风险时使用）
-
-## 常用配置片段
-
-```toml
-api_key = "sk-..."
-default_provider = "openrouter"
-default_model = "anthropic/claude-sonnet-4-6"
-default_temperature = 0.7
-
-[memory]
-backend = "sqlite"             # sqlite | lucid | markdown | none
-auto_save = true
-embedding_provider = "none"    # none | openai | custom:https://...
-
-[gateway]
-host = "127.0.0.1"
-port = 42617
-require_pairing = true
-allow_public_bind = false
-```
-
-## 文档导航（推荐从这里开始）
-
-- 文档总览（英文）：[`docs/README.md`](docs/README.md)
-- 统一目录（TOC）：[`docs/SUMMARY.md`](docs/SUMMARY.md)
-- 文档总览（简体中文）：[`docs/README.zh-CN.md`](docs/README.zh-CN.md)
-- 命令参考：[`docs/reference/cli/commands-reference.md`](docs/reference/cli/commands-reference.md)
-- 配置参考：[`docs/reference/api/config-reference.md`](docs/reference/api/config-reference.md)
-- Provider 参考：[`docs/reference/api/providers-reference.md`](docs/reference/api/providers-reference.md)
-- Channel 参考：[`docs/reference/api/channels-reference.md`](docs/reference/api/channels-reference.md)
-- 运维手册：[`docs/ops/operations-runbook.md`](docs/ops/operations-runbook.md)
-- 故障排查：[`docs/ops/troubleshooting.md`](docs/ops/troubleshooting.md)
-- 文档清单与分类：[`docs/maintainers/docs-inventory.md`](docs/maintainers/docs-inventory.md)
-- 项目 triage 快照（2026-02-18）：[`docs/maintainers/project-triage-snapshot-2026-02-18.md`](docs/maintainers/project-triage-snapshot-2026-02-18.md)
-
 ## 贡献与许可证
 
 - 贡献指南：[`CONTRIBUTING.md`](CONTRIBUTING.md)
-- PR 工作流：[`docs/contributing/pr-workflow.md`](docs/contributing/pr-workflow.md)
-- Reviewer 指南：[`docs/contributing/reviewer-playbook.md`](docs/contributing/reviewer-playbook.md)
+- PR 工作流：[`docs/contributing/pr-workflow.md`](docs/i18n/zh-CN/contributing/pr-workflow.zh-CN.md)
+- Reviewer 指南：[`docs/contributing/reviewer-playbook.md`](docs/i18n/zh-CN/contributing/reviewer-playbook.zh-CN.md)
 - 许可证：MIT 或 Apache 2.0（见 [`LICENSE-MIT`](LICENSE-MIT)、[`LICENSE-APACHE`](LICENSE-APACHE) 与 [`NOTICE`](NOTICE)）
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.3.1)
+
+3 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+- **argenis de la rosa**
+- **Claude Opus 4.6**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ---
 
