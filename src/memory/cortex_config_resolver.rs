@@ -36,34 +36,35 @@ pub fn resolve_cortex_config(
     workspace_dir: &std::path::Path,
 ) -> Result<ResolvedCortexConfig> {
     let cortex_config = &memory_config.cortex;
-    
+
     // 1. Resolve data directory
-    let data_dir = cortex_config.data_dir.clone()
-        .unwrap_or_else(|| {
-            workspace_dir
-                .join("cortex-data")
-                .to_string_lossy()
-                .to_string()
-        });
-    
+    let data_dir = cortex_config.data_dir.clone().unwrap_or_else(|| {
+        workspace_dir
+            .join("cortex-data")
+            .to_string_lossy()
+            .to_string()
+    });
+
     // 2. Resolve tenant ID
     let tenant_id = cortex_config.tenant_id.clone();
-    
+
     // 3. Resolve Qdrant configuration
-    let qdrant_url = cortex_config.qdrant_url.clone()
+    let qdrant_url = cortex_config
+        .qdrant_url
+        .clone()
         .unwrap_or_else(|| "http://localhost:6334".to_string());
     let qdrant_collection = cortex_config.qdrant_collection.clone();
     let qdrant_api_key = cortex_config.qdrant_api_key.clone();
-    
+
     // 4. Resolve LLM configuration (auto-derive from zeroclaw settings)
-    let (llm_api_base_url, llm_api_key, llm_model) = 
+    let (llm_api_base_url, llm_api_key, llm_model) =
         resolve_llm_config(zeroclaw_config, cortex_config)?;
     let llm_temperature = cortex_config.llm_temperature;
-    
+
     // 5. Resolve Embedding configuration (support hint: routing)
-    let (embedding_api_base_url, embedding_api_key, embedding_model, embedding_dimensions) = 
+    let (embedding_api_base_url, embedding_api_key, embedding_model, embedding_dimensions) =
         resolve_embedding_config(zeroclaw_config, memory_config, cortex_config)?;
-    
+
     Ok(ResolvedCortexConfig {
         data_dir,
         tenant_id,
@@ -100,23 +101,26 @@ fn resolve_llm_config(
     );
 
     // Get API key (required)
-    let llm_api_key = zeroclaw_config.api_key.clone()
+    let llm_api_key = zeroclaw_config
+        .api_key
+        .clone()
         .context("Cortex-Memory requires api_key in zeroclaw config")?;
 
     // Get API base URL
-    let llm_api_base_url = zeroclaw_config.api_url.clone()
-        .unwrap_or_else(|| {
-            let derived = derive_provider_base_url(zeroclaw_config.default_provider.as_deref());
-            tracing::debug!(
-                "LLM API base URL derived from provider {:?}: {}",
-                zeroclaw_config.default_provider,
-                derived
-            );
+    let llm_api_base_url = zeroclaw_config.api_url.clone().unwrap_or_else(|| {
+        let derived = derive_provider_base_url(zeroclaw_config.default_provider.as_deref());
+        tracing::debug!(
+            "LLM API base URL derived from provider {:?}: {}",
+            zeroclaw_config.default_provider,
             derived
-        });
+        );
+        derived
+    });
 
     // Get model
-    let llm_model = cortex_config.llm_model_override.clone()
+    let llm_model = cortex_config
+        .llm_model_override
+        .clone()
         .or_else(|| zeroclaw_config.default_model.clone())
         .unwrap_or_else(|| "gpt-3.5-turbo".to_string());
 
@@ -156,11 +160,20 @@ fn resolve_embedding_config(
     );
 
     // API key: cortex override > global api_key
-    let embedding_api_key = cortex_config.embedding_api_key_override.clone()
+    let embedding_api_key = cortex_config
+        .embedding_api_key_override
+        .clone()
         .or_else(|| zeroclaw_config.api_key.clone())
-        .context("Embedding requires api_key (set globally or via cortex.embedding_api_key_override)")?;
+        .context(
+            "Embedding requires api_key (set globally or via cortex.embedding_api_key_override)",
+        )?;
 
-    Ok((embedding_api_base_url, embedding_api_key, embedding_model, embedding_dimensions))
+    Ok((
+        embedding_api_base_url,
+        embedding_api_key,
+        embedding_model,
+        embedding_dimensions,
+    ))
 }
 
 /// Resolve embedding config from embedding_routes
@@ -169,22 +182,30 @@ fn resolve_embedding_from_route(
     hint: &str,
     cortex_config: &CortexMemConfig,
 ) -> Result<(String, String, String, usize)> {
-    let route = zeroclaw_config.embedding_routes
+    let route = zeroclaw_config
+        .embedding_routes
         .iter()
         .find(|r| r.hint == hint)
         .with_context(|| format!("No matching embedding_route for hint: {}", hint))?;
-    
+
     let embedding_api_base_url = provider_to_base_url(&route.provider);
     let embedding_model = route.model.clone();
     let embedding_dimensions = route.dimensions.unwrap_or(1536);
-    
+
     // API key: route override > cortex override > global
-    let embedding_api_key = route.api_key.clone()
+    let embedding_api_key = route
+        .api_key
+        .clone()
         .or_else(|| cortex_config.embedding_api_key_override.clone())
         .or_else(|| zeroclaw_config.api_key.clone())
         .context("Embedding route requires api_key")?;
-    
-    Ok((embedding_api_base_url, embedding_api_key, embedding_model, embedding_dimensions))
+
+    Ok((
+        embedding_api_base_url,
+        embedding_api_key,
+        embedding_model,
+        embedding_dimensions,
+    ))
 }
 
 /// Convert provider name to base URL
@@ -227,7 +248,7 @@ fn derive_provider_base_url(provider: Option<&str>) -> String {
 mod tests {
     use super::*;
     use crate::config::schema::CortexMemConfig;
-    
+
     fn make_test_config() -> Config {
         let mut config = Config::default();
         config.api_key = Some("test-api-key".to_string());
@@ -236,19 +257,20 @@ mod tests {
         config.default_temperature = 0.7;
         config
     }
-    
+
     #[test]
     fn test_resolve_llm_config_from_global() {
         let zeroclaw_config = make_test_config();
         let cortex_config = CortexMemConfig::default();
-        
-        let (base_url, api_key, model) = resolve_llm_config(&zeroclaw_config, &cortex_config).unwrap();
-        
+
+        let (base_url, api_key, model) =
+            resolve_llm_config(&zeroclaw_config, &cortex_config).unwrap();
+
         assert_eq!(base_url, "https://api.openai.com/v1");
         assert_eq!(api_key, "test-api-key");
         assert_eq!(model, "gpt-4o-mini");
     }
-    
+
     #[test]
     fn test_resolve_llm_config_with_override() {
         let zeroclaw_config = make_test_config();
@@ -257,24 +279,30 @@ mod tests {
             llm_temperature: 0.3,
             ..CortexMemConfig::default()
         };
-        
+
         let (_, _, model) = resolve_llm_config(&zeroclaw_config, &cortex_config).unwrap();
-        
+
         assert_eq!(model, "gpt-4");
     }
-    
+
     #[test]
     fn test_provider_to_base_url() {
         assert_eq!(provider_to_base_url("openai"), "https://api.openai.com/v1");
-        assert_eq!(provider_to_base_url("anthropic"), "https://api.anthropic.com/v1");
+        assert_eq!(
+            provider_to_base_url("anthropic"),
+            "https://api.anthropic.com/v1"
+        );
         assert_eq!(provider_to_base_url("ollama"), "http://localhost:11434/v1");
-        assert_eq!(provider_to_base_url("openrouter"), "https://openrouter.ai/api/v1");
+        assert_eq!(
+            provider_to_base_url("openrouter"),
+            "https://openrouter.ai/api/v1"
+        );
         assert_eq!(
             provider_to_base_url("custom:http://localhost:8080/v1"),
             "http://localhost:8080/v1"
         );
     }
-    
+
     #[test]
     fn test_derive_provider_base_url() {
         assert_eq!(

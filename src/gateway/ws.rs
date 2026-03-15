@@ -240,8 +240,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<S
         };
 
         // 🔧 Recall memory and inject context
-        let mem_context =
-            build_memory_context(&*state.mem, &content, min_relevance_score).await;
+        let mem_context = build_memory_context(&*state.mem, &content, min_relevance_score).await;
         let enriched_content = if mem_context.is_empty() {
             content.clone()
         } else {

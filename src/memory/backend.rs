@@ -68,7 +68,8 @@ const QDRANT_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
 
 const CORTEX_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "cortex",
-    label: "Cortex-Memory — advanced L0/L1/L2 layered memory with semantic search via [memory.cortex]",
+    label:
+        "Cortex-Memory — advanced L0/L1/L2 layered memory with semantic search via [memory.cortex]",
     auto_save_default: true,
     uses_sqlite_hygiene: false,
     sqlite_based: false,

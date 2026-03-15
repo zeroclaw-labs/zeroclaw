@@ -20,8 +20,8 @@ use async_trait::async_trait;
 use cortex_mem_core::FilesystemOperations;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
@@ -49,8 +49,8 @@ pub struct AutoProcessConfig {
 impl Default for AutoProcessConfig {
     fn default() -> Self {
         Self {
-            message_count_threshold: 10,       // Trigger after n messages
-            min_process_interval_secs: 600,    // At most once ever n minutes
+            message_count_threshold: 10,    // Trigger after n messages
+            min_process_interval_secs: 600, // At most once ever n minutes
             enable_threshold_trigger: true,
             periodic_flush_interval_secs: 600, // Periodic flush every n minutes
         }
@@ -109,7 +109,8 @@ impl CortexMemory {
             workspace_dir,
             zeroclaw_config,
             AutoProcessConfig::default(),
-        ).await
+        )
+        .await
     }
 
     /// Create a new Cortex-Memory backend with custom auto-process config
@@ -261,7 +262,11 @@ impl CortexMemory {
                             user_id: user_id.clone(),
                             agent_id: agent_id.clone(),
                         }) {
-                            tracing::warn!("Failed to send SessionClosed event for {}: {}", session_id, e);
+                            tracing::warn!(
+                                "Failed to send SessionClosed event for {}: {}",
+                                session_id,
+                                e
+                            );
                         }
                     }
                 }
@@ -272,15 +277,14 @@ impl CortexMemory {
                 if completed {
                     tracing::debug!("Periodic flush completed successfully");
                 } else {
-                    tracing::warn!("Periodic flush initiated but some tasks may still be in progress");
+                    tracing::warn!(
+                        "Periodic flush initiated but some tasks may still be in progress"
+                    );
                 }
             }
         });
 
-        tracing::debug!(
-            "Started periodic flush task (interval: {}s)",
-            interval_secs
-        );
+        tracing::debug!("Started periodic flush task (interval: {}s)", interval_secs);
     }
 
     /// Check if threshold-based processing should be triggered
@@ -342,10 +346,7 @@ impl CortexMemory {
                 return false;
             }
 
-            tracing::debug!(
-                "Threshold-triggered processing for session {}",
-                thread_id
-            );
+            tracing::debug!("Threshold-triggered processing for session {}", thread_id);
 
             // Spawn async task to wait for completion
             let operations = self.operations.clone();
@@ -399,7 +400,8 @@ impl Memory for CortexMemory {
         );
 
         // Use MemoryOperations to add message
-        let message_uri = self.operations
+        let message_uri = self
+            .operations
             .add_message(thread_id, role, content)
             .await
             .context("Failed to store memory in Cortex-Memory")?;
@@ -436,7 +438,8 @@ impl Memory for CortexMemory {
         };
 
         // Execute semantic search
-        let results = self.operations
+        let results = self
+            .operations
             .vector_engine()
             .layered_semantic_search(query, &options)
             .await
@@ -500,7 +503,8 @@ impl Memory for CortexMemory {
         };
 
         // List files using cortex filesystem
-        let entries = self.operations
+        let entries = self
+            .operations
             .filesystem()
             .list(&scope_uri)
             .await
@@ -544,7 +548,8 @@ impl Memory for CortexMemory {
     }
 
     async fn count(&self) -> Result<usize> {
-        let sessions = self.operations
+        let sessions = self
+            .operations
             .list_sessions()
             .await
             .context("Failed to count Cortex-Memory sessions")?;
