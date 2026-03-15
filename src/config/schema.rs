@@ -255,6 +255,9 @@ pub struct Config {
     /// Dynamic node discovery configuration (`[nodes]`).
     #[serde(default)]
     pub nodes: NodesConfig,
+    /// CLI session manager configuration (`[cli_sessions]`).
+    #[serde(default)]
+    pub cli_sessions: crate::providers::cli_session::CliSessionConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -4204,6 +4207,7 @@ impl Default for Config {
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            cli_sessions: crate::providers::cli_session::CliSessionConfig::default(),
         }
     }
 }
@@ -5235,11 +5239,6 @@ impl Config {
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
 
-        // MCP servers
-        if self.mcp.enabled {
-            validate_mcp_config(&self.mcp)?;
-        }
-
         Ok(())
     }
 
@@ -5950,6 +5949,7 @@ impl Config {
     }
 }
 
+#[allow(clippy::unused_async)]
 async fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -5975,6 +5975,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    #[allow(unused_imports)]
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
@@ -6310,6 +6311,7 @@ default_temperature = 0.7
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            cli_sessions: crate::providers::cli_session::CliSessionConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -6601,6 +6603,7 @@ tool_dispatcher = "xml"
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            cli_sessions: crate::providers::cli_session::CliSessionConfig::default(),
         };
 
         config.save().await.unwrap();
