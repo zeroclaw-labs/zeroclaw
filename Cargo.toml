@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/robot-kit"]
+members = [".", "crates/robot-kit", "crates/aardvark-sys"]
 resolver = "2"
 
 [package]
@@ -85,6 +85,9 @@ fantoccini = { version = "0.22.1", optional = true, default-features = false, fe
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
+
+# Aardvark I2C/SPI/GPIO USB adapter (Total Phase) — stub when SDK absent
+aardvark-sys = { path = "crates/aardvark-sys" }
 
 # UUID generation
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }

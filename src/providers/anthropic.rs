@@ -52,6 +52,8 @@ struct NativeChatRequest<'a> {
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -585,13 +587,26 @@ impl Provider for AnthropicProvider {
             Self::apply_cache_to_last_message(&mut messages);
         }
 
+        // Check for tool_choice override from the agent loop (e.g. "any"
+        // to force tool use for hardware requests).
+        let tool_choice_override = crate::agent::loop_::TOOL_CHOICE_OVERRIDE
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+        let native_tools = Self::convert_tools(request.tools);
+        let tool_choice = if native_tools.is_some() {
+            tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
+        } else {
+            None
+        };
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: 4096,
             system: system_prompt,
             messages,
             temperature,
-            tools: Self::convert_tools(request.tools),
+            tools: native_tools,
+            tool_choice,
         };
 
         let req = self
@@ -1263,6 +1278,7 @@ mod tests {
             }],
             temperature: 0.7,
             tools: None,
+            tool_choice: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
