@@ -166,6 +166,10 @@ enum Commands {
         #[arg(long)]
         reinit: bool,
 
+        /// Run the full interactive setup wizard
+        #[arg(long)]
+        interactive: bool,
+
         /// Reconfigure channels only (fast repair flow)
         #[arg(long)]
         channels_only: bool,
@@ -726,6 +730,7 @@ async fn main() -> Result<()> {
     if let Commands::Onboard {
         force,
         reinit,
+        interactive,
         channels_only,
         api_key,
         provider,
@@ -735,6 +740,7 @@ async fn main() -> Result<()> {
     {
         let force = *force;
         let reinit = *reinit;
+        let interactive = *interactive;
         let channels_only = *channels_only;
         let api_key = api_key.clone();
         let provider = provider.clone();
@@ -743,6 +749,14 @@ async fn main() -> Result<()> {
 
         if reinit && channels_only {
             bail!("--reinit and --channels-only cannot be used together");
+        }
+        if interactive && channels_only {
+            bail!("--interactive and --channels-only cannot be used together");
+        }
+        if interactive
+            && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
+        {
+            bail!("--interactive does not accept --api-key, --provider, --model, or --memory");
         }
         if channels_only
             && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
@@ -796,6 +810,8 @@ async fn main() -> Result<()> {
 
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
+        } else if interactive {
+            Box::pin(onboard::run_wizard(force)).await
         } else {
             onboard::run_quick_setup(
                 api_key.as_deref(),
@@ -2203,6 +2219,17 @@ mod tests {
 
         match cli.command {
             Commands::Onboard { force, .. } => assert!(force),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn onboard_cli_accepts_interactive_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"])
+            .expect("onboard --interactive should parse");
+
+        match cli.command {
+            Commands::Onboard { interactive, .. } => assert!(interactive),
             other => panic!("expected onboard command, got {other:?}"),
         }
     }

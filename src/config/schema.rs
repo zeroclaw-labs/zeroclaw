@@ -232,6 +232,10 @@ pub struct Config {
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
 
+    /// Swarm configurations for multi-agent orchestration.
+    #[serde(default)]
+    pub swarms: HashMap<String, SwarmConfig>,
+
     /// Hooks configuration (lifecycle hooks and built-in hook toggles).
     #[serde(default)]
     pub hooks: HooksConfig,
@@ -317,6 +321,44 @@ pub struct DelegateAgentConfig {
     /// Maximum tool-call iterations in agentic mode.
     #[serde(default = "default_max_tool_iterations")]
     pub max_iterations: usize,
+}
+
+// ── Swarms ──────────────────────────────────────────────────────
+
+/// Orchestration strategy for a swarm of agents.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmStrategy {
+    /// Run agents sequentially; each agent's output feeds into the next.
+    Sequential,
+    /// Run agents in parallel; collect all outputs.
+    Parallel,
+    /// Use the LLM to pick the best agent for the task.
+    Router,
+}
+
+/// Configuration for a swarm of coordinated agents.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SwarmConfig {
+    /// Ordered list of agent names (must reference keys in `agents`).
+    pub agents: Vec<String>,
+    /// Orchestration strategy.
+    pub strategy: SwarmStrategy,
+    /// System prompt for router strategy (used to pick the best agent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_prompt: Option<String>,
+    /// Optional description shown to the LLM when choosing swarms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Maximum total timeout for the swarm execution in seconds.
+    #[serde(default = "default_swarm_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+const DEFAULT_SWARM_TIMEOUT_SECS: u64 = 300;
+
+fn default_swarm_timeout_secs() -> u64 {
+    DEFAULT_SWARM_TIMEOUT_SECS
 }
 
 /// Valid temperature range for all paths (config, CLI, env override).
@@ -4202,6 +4244,7 @@ impl Default for Config {
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            swarms: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
@@ -6309,6 +6352,7 @@ default_temperature = 0.7
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            swarms: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
@@ -6600,6 +6644,7 @@ tool_dispatcher = "xml"
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            swarms: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
@@ -9351,5 +9396,73 @@ require_otp_to_resume = true
                 serde_json::from_str(expected_json).expect("deserialize");
             assert_eq!(&deserialized, variant);
         }
+    }
+
+    #[test]
+    async fn swarm_strategy_roundtrip() {
+        let cases = vec![
+            (SwarmStrategy::Sequential, "\"sequential\""),
+            (SwarmStrategy::Parallel, "\"parallel\""),
+            (SwarmStrategy::Router, "\"router\""),
+        ];
+        for (variant, expected_json) in &cases {
+            let serialized = serde_json::to_string(variant).expect("serialize");
+            assert_eq!(&serialized, expected_json, "variant: {variant:?}");
+            let deserialized: SwarmStrategy =
+                serde_json::from_str(expected_json).expect("deserialize");
+            assert_eq!(&deserialized, variant);
+        }
+    }
+
+    #[test]
+    async fn swarm_config_deserializes_with_defaults() {
+        let toml_str = r#"
+            agents = ["researcher", "writer"]
+            strategy = "sequential"
+        "#;
+        let config: SwarmConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(config.agents, vec!["researcher", "writer"]);
+        assert_eq!(config.strategy, SwarmStrategy::Sequential);
+        assert!(config.router_prompt.is_none());
+        assert!(config.description.is_none());
+        assert_eq!(config.timeout_secs, 300);
+    }
+
+    #[test]
+    async fn swarm_config_deserializes_full() {
+        let toml_str = r#"
+            agents = ["a", "b", "c"]
+            strategy = "router"
+            router_prompt = "Pick the best."
+            description = "Multi-agent router"
+            timeout_secs = 120
+        "#;
+        let config: SwarmConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(config.agents.len(), 3);
+        assert_eq!(config.strategy, SwarmStrategy::Router);
+        assert_eq!(config.router_prompt.as_deref(), Some("Pick the best."));
+        assert_eq!(config.description.as_deref(), Some("Multi-agent router"));
+        assert_eq!(config.timeout_secs, 120);
+    }
+
+    #[test]
+    async fn config_with_swarms_section_deserializes() {
+        let toml_str = r#"
+            [agents.researcher]
+            provider = "ollama"
+            model = "llama3"
+
+            [agents.writer]
+            provider = "openrouter"
+            model = "claude-sonnet"
+
+            [swarms.pipeline]
+            agents = ["researcher", "writer"]
+            strategy = "sequential"
+        "#;
+        let config: Config = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(config.agents.len(), 2);
+        assert_eq!(config.swarms.len(), 1);
+        assert!(config.swarms.contains_key("pipeline"));
     }
 }

@@ -57,6 +57,7 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
+pub mod swarm;
 pub mod tool_search;
 pub mod traits;
 pub mod web_fetch;
@@ -103,6 +104,7 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
+pub use swarm::SwarmTool;
 pub use tool_search::ToolSearchTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
@@ -358,6 +360,24 @@ pub fn all_tools_with_runtime(
     }
 
     // Add delegation tool when agents are configured
+    let delegate_fallback_credential = fallback_api_key.and_then(|value| {
+        let trimmed_value = value.trim();
+        (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
+    });
+    let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
+        auth_profile_override: None,
+        provider_api_url: root_config.api_url.clone(),
+        zeroclaw_dir: root_config
+            .config_path
+            .parent()
+            .map(std::path::PathBuf::from),
+        secrets_encrypt: root_config.secrets.encrypt,
+        reasoning_enabled: root_config.runtime.reasoning_enabled,
+        provider_timeout_secs: Some(root_config.provider_timeout_secs),
+        extra_headers: root_config.extra_headers.clone(),
+        api_path: root_config.api_path.clone(),
+    };
+
     let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {
         None
     } else {
@@ -365,34 +385,33 @@ pub fn all_tools_with_runtime(
             .iter()
             .map(|(name, cfg)| (name.clone(), cfg.clone()))
             .collect();
-        let delegate_fallback_credential = fallback_api_key.and_then(|value| {
-            let trimmed_value = value.trim();
-            (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
-        });
         let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
         let delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
-            delegate_fallback_credential,
+            delegate_fallback_credential.clone(),
             security.clone(),
-            crate::providers::ProviderRuntimeOptions {
-                auth_profile_override: None,
-                provider_api_url: root_config.api_url.clone(),
-                zeroclaw_dir: root_config
-                    .config_path
-                    .parent()
-                    .map(std::path::PathBuf::from),
-                secrets_encrypt: root_config.secrets.encrypt,
-                reasoning_enabled: root_config.runtime.reasoning_enabled,
-                provider_timeout_secs: Some(root_config.provider_timeout_secs),
-                extra_headers: root_config.extra_headers.clone(),
-                api_path: root_config.api_path.clone(),
-            },
+            provider_runtime_options.clone(),
         )
         .with_parent_tools(Arc::clone(&parent_tools))
         .with_multimodal_config(root_config.multimodal.clone());
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };
+
+    // Add swarm tool when swarms are configured
+    if !root_config.swarms.is_empty() {
+        let swarm_agents: HashMap<String, DelegateAgentConfig> = agents
+            .iter()
+            .map(|(name, cfg)| (name.clone(), cfg.clone()))
+            .collect();
+        tool_arcs.push(Arc::new(SwarmTool::new(
+            root_config.swarms.clone(),
+            swarm_agents,
+            delegate_fallback_credential,
+            security.clone(),
+            provider_runtime_options,
+        )));
+    }
 
     (boxed_registry_from_arcs(tool_arcs), delegate_handle)
 }
