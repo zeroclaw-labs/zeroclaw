@@ -791,6 +791,11 @@ pub struct AgentConfig {
     /// Maximum conversation history messages retained per session. Default: `50`.
     #[serde(default = "default_agent_max_history_messages")]
     pub max_history_messages: usize,
+    /// Maximum estimated tokens for conversation history before compaction triggers.
+    /// Uses ~4 chars/token heuristic. When this threshold is exceeded, older messages
+    /// are summarized to preserve context while staying within budget. Default: `32000`.
+    #[serde(default = "default_agent_max_context_tokens")]
+    pub max_context_tokens: usize,
     /// Enable parallel tool execution within a single iteration. Default: `false`.
     #[serde(default)]
     pub parallel_tools: bool,
@@ -817,6 +822,10 @@ fn default_agent_max_history_messages() -> usize {
     50
 }
 
+fn default_agent_max_context_tokens() -> usize {
+    32_000
+}
+
 fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
@@ -827,6 +836,7 @@ impl Default for AgentConfig {
             compact_context: false,
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
+            max_context_tokens: default_agent_max_context_tokens(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             tool_call_dedup_exempt: Vec::new(),
@@ -3052,6 +3062,7 @@ impl<T: ChannelConfig> crate::config::traits::ConfigHandle for ConfigWrapper<T> 
 ///
 /// Each channel sub-section (e.g. `telegram`, `discord`) is optional;
 /// setting it to `Some(...)` enables that channel.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ChannelsConfig {
     /// Enable the CLI interactive channel. Default: `true`.
@@ -3114,6 +3125,10 @@ pub struct ChannelsConfig {
     /// not forwarded as individual channel messages. Default: `true`.
     #[serde(default = "default_true")]
     pub show_tool_calls: bool,
+    /// Persist channel conversation history to JSONL files so sessions survive
+    /// daemon restarts. Files are stored in `{workspace}/sessions/`. Default: `true`.
+    #[serde(default = "default_true")]
+    pub session_persistence: bool,
 }
 
 impl ChannelsConfig {
@@ -3248,6 +3263,7 @@ impl Default for ChannelsConfig {
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
             show_tool_calls: true,
+            session_persistence: true,
         }
     }
 }
@@ -6269,6 +6285,7 @@ default_temperature = 0.7
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
+                session_persistence: true,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -6983,6 +7000,7 @@ allowed_users = ["@ops:matrix.org"]
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
+            session_persistence: true,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -7210,6 +7228,7 @@ channel_id = "C123"
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
+            session_persistence: true,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
