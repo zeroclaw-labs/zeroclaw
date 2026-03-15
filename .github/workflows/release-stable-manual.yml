@@ -171,6 +171,11 @@ jobs:
             target: aarch64-apple-darwin
             artifact: zeroclaw
             ext: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+            artifact: zeroclaw
+            ext: tar.gz
+            ndk: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: zeroclaw.exe
@@ -194,6 +199,10 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ${{ matrix.cross_compiler }}
+
+      - name: Setup Android NDK
+        if: matrix.ndk
+        run: echo "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
 
       - name: Build release
         shell: bash
@@ -239,19 +248,74 @@ jobs:
           find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec sha256sum {} + | sed 's|  \./[^/]*/|  |' > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe # v2.4.2
-        with:
-          tag_name: ${{ needs.validate.outputs.tag }}
-          name: ${{ needs.validate.outputs.tag }}
-          prerelease: false
-          body: ${{ needs.release-notes.outputs.notes }}
-          files: |
-            artifacts/**/*
-            install.sh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name 'SHA256SUMS' \) -exec cp {} release-assets/ \;
+          cp install.sh release-assets/
+          echo "--- Assets ---"
+          ls -lh release-assets/
 
+      - name: Write release notes
+        env:
+          NOTES: ${{ needs.release-notes.outputs.notes }}
+        run: printf '%s\n' "$NOTES" > release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          gh release create "$TAG" release-assets/* \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --notes-file release-notes.md \
+            --latest
+
+  crates-io:
+    name: Publish to crates.io
+    needs: [validate, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web dashboard
+        run: cd web && npm ci && npm run build
+
+      - name: Clean web build artifacts
+        run: rm -rf web/node_modules web/src web/package.json web/package-lock.json web/tsconfig*.json web/vite.config.ts web/index.html
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Skip if this version is already on crates.io (auto-sync may have published it)
+          CRATE_NAME=$(sed -n 's/^name = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          if curl -sfL "https://crates.io/api/v1/crates/${CRATE_NAME}/${VERSION}" | grep -q '"version"'; then
+            echo "::notice::${CRATE_NAME}@${VERSION} already published on crates.io — skipping"
+          else
+            cargo publish --locked --allow-dirty --no-verify
+          fi
+
+  redeploy-website:
+    name: Trigger Website Redeploy
+    needs: [publish]
+    runs-on: ubuntu-latest
+    steps:
       - name: Trigger website redeploy
         env:
           PAT: ${{ secrets.WEBSITE_REPO_PAT }}
@@ -266,7 +330,7 @@ jobs:
     name: Push Docker Image
     needs: [validate, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -289,3 +353,13 @@ jobs:
           platforms: linux/amd64,linux/arm64
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ── Post-publish: only run after ALL artifacts are live ──────────────
+  tweet:
+    name: Tweet Release
+    needs: [validate, publish, docker, crates-io, redeploy-website]
+    uses: ./.github/workflows/tweet-release.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+      release_url: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/${{ needs.validate.outputs.tag }}
+    secrets: inherit

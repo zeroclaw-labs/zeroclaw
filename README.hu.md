@@ -57,6 +57,16 @@
 
 ---
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.3.1 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| ci | add Termux (aarch64-linux-android) release target |
+
+<!-- END:WHATS_NEW -->
+
 ## Mi az a ZeroClaw?
 
 A ZeroClaw egy könnyűsúlyú, változtatható és bővíthető AI asszisztens infrastruktúra, amely Rust nyelven készült. Különböző LLM szolgáltatókat (Anthropic, OpenAI, Google, Ollama stb.) köt össze egy egységes felületen keresztül, és több csatornát támogat (Telegram, Matrix, CLI stb.).
@@ -177,3 +187,17 @@ Részletekért lásd a [LICENSE-APACHE](LICENSE-APACHE) és [LICENSE-MIT](LICENS
 Ha a ZeroClaw hasznos az Ön számára, kérjük, fontolja meg, hogy vesz nekünk egy kávét:
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee)](https://buymeacoffee.com/argenistherose)
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.3.1)
+
+3 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+- **argenis de la rosa**
+- **Claude Opus 4.6**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
