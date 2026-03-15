@@ -48,9 +48,7 @@ fn source_does_not_use_legacy_reply_to_field() {
 
         for (line_idx, line) in content.lines().enumerate() {
             for pattern in FORBIDDEN_PATTERNS {
-                if line.contains(pattern)
-                    && !ALLOWED_PATTERNS.iter().any(|a| line.contains(a))
-                {
+                if line.contains(pattern) && !ALLOWED_PATTERNS.iter().any(|a| line.contains(a)) {
                     let rel = file_path
                         .strip_prefix(root)
                         .unwrap_or(&file_path)
