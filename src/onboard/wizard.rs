@@ -1779,8 +1779,22 @@ pub async fn run_models_refresh(
     }
 
     let api_key = config.api_key.clone().unwrap_or_default();
+    let api_url = config.api_url.clone();
 
-    match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()) {
+    // Run fetch in separate thread to avoid "Cannot drop a runtime" panic
+    // (reqwest::blocking creates its own Tokio runtime internally)
+    let provider_name_for_thread = provider_name.clone();
+    let fetch_result = std::thread::spawn(move || {
+        fetch_live_models_for_provider(&provider_name_for_thread, &api_key, api_url.as_deref())
+    })
+    .join();
+
+    // Convert thread panic to anyhow::Error and route through existing error branch
+    // for consistent fallback behavior
+    let fetch_result: Result<Vec<String>, anyhow::Error> =
+        fetch_result.unwrap_or_else(|_| Err(anyhow::anyhow!("model refresh thread panicked")));
+
+    match fetch_result {
         Ok(models) if !models.is_empty() => {
             cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models).await?;
             println!(
@@ -2724,11 +2738,26 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 .interact()?;
 
             if should_fetch_now {
-                match fetch_live_models_for_provider(
-                    provider_name,
-                    &api_key,
-                    provider_api_url.as_deref(),
-                ) {
+                // Run fetch in separate thread to avoid "Cannot drop a runtime" panic
+                // (reqwest::blocking creates its own Tokio runtime internally)
+                let provider_name_for_thread = provider_name.to_string();
+                let api_key = api_key.clone();
+                let provider_api_url = provider_api_url.clone();
+                let fetch_result = std::thread::spawn(move || {
+                    fetch_live_models_for_provider(
+                        &provider_name_for_thread,
+                        &api_key,
+                        provider_api_url.as_deref(),
+                    )
+                })
+                .join();
+
+                // Convert thread panic to anyhow::Error and route through existing error branch
+                // for consistent fallback behavior
+                let fetch_result: Result<Vec<String>, anyhow::Error> = fetch_result
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("live fetch thread panicked")));
+
+                match fetch_result {
                     Ok(live_model_ids) if !live_model_ids.is_empty() => {
                         cache_live_models_for_provider(
                             workspace_dir,
