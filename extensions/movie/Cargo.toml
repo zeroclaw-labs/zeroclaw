@@ -1,0 +1,61 @@
+[package]
+name = "zeroclaw-movie"
+version = "0.1.0"
+edition = "2021"
+autobins = false
+authors = ["Your Name <your.email@example.com>"]
+description = "Movie showtimes query extension for ZeroClaw - supports China (Maoyan) and US (MovieGlu) cinemas"
+license = "Apache-2.0"
+repository = "https://github.com/yourusername/zeroclaw-movie"
+keywords = ["movie", "cinema", "showtimes", "zeroclaw", "ai-agent"]
+categories = ["api-bindings", "multimedia"]
+
+[lib]
+name = "zeroclaw_movie"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# HTTP client
+reqwest = { version = "0.11", features = ["json"] }
+
+# URL encoding
+urlencoding = "2"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.10"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Regex for parsing
+regex = "1"
+
+# Optional: ZeroClaw integration (when used as part of ZeroClaw)
+# zeroclaw = { path = "../zeroclaw", optional = true }
+
+[features]
+default = []
+zeroclaw-integration = []
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[example]]
+name = "basic_usage"
+path = "examples/basic_usage.rs"
+
+[workspace]
