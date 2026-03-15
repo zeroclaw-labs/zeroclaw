@@ -64,6 +64,8 @@ pub struct WhatsAppWebChannel {
     client: Arc<Mutex<Option<Arc<wa_rs::Client>>>>,
     /// Message sender channel
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
+    /// Voice transcription configuration (Whisper API via Groq)
+    transcription: Option<crate::config::TranscriptionConfig>,
 }
 
 impl WhatsAppWebChannel {
@@ -90,7 +92,17 @@ impl WhatsAppWebChannel {
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
+            transcription: None,
         }
+    }
+
+    /// Configure voice transcription.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        if config.enabled {
+            self.transcription = Some(config);
+        }
+        self
     }
 
     /// Check if a phone number is allowed (E.164 format: +1234567890)
@@ -275,6 +287,151 @@ impl WhatsAppWebChannel {
             format!("{expanded_session_path}-shm"),
         ]
     }
+
+    // ── Media message handlers ──
+
+    /// Handle an audio/voice note message: download and transcribe if configured.
+    #[cfg(feature = "whatsapp-web")]
+    async fn handle_audio_message(
+        audio: &wa_rs_proto::whatsapp::message::AudioMessage,
+        client: &wa_rs::Client,
+        transcription_config: Option<&crate::config::TranscriptionConfig>,
+    ) -> Option<String> {
+        let is_voice_note = audio.ptt.unwrap_or(false);
+        let duration = audio.seconds.unwrap_or(0);
+
+        let Some(config) = transcription_config else {
+            // Transcription not configured — send a placeholder for voice notes,
+            // skip pure audio attachments (no actionable content without transcription).
+            if is_voice_note {
+                tracing::debug!(
+                    "WhatsApp Web: voice note received ({}s) but transcription is not configured",
+                    duration
+                );
+                return Some(
+                    "[Voice note received, but transcription is not configured]".to_string(),
+                );
+            }
+            return Some(format!("[Audio message, {}s]", duration));
+        };
+
+        if duration as u64 > config.max_duration_secs {
+            tracing::info!(
+                "WhatsApp Web: skipping voice note ({}s) — exceeds max duration ({}s)",
+                duration,
+                config.max_duration_secs
+            );
+            return Some(format!(
+                "[Voice note too long ({}s, limit {}s) — skipped transcription]",
+                duration, config.max_duration_secs
+            ));
+        }
+
+        // Download the audio via wa-rs client
+        use wa_rs::download::Downloadable;
+        let audio_data = match client.download(audio as &dyn Downloadable).await {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!("WhatsApp Web: failed to download audio: {e}");
+                return Some("[Voice note received, but download failed]".to_string());
+            }
+        };
+
+        // Determine file extension from MIME type
+        let file_name =
+            Self::audio_filename_from_mime(audio.mimetype.as_deref().unwrap_or("audio/ogg"));
+
+        match super::transcription::transcribe_audio(audio_data, &file_name, config).await {
+            Ok(text) if text.trim().is_empty() => {
+                tracing::info!("WhatsApp Web: voice transcription returned empty text");
+                Some("[Voice note received, but transcription was empty]".to_string())
+            }
+            Ok(text) => {
+                tracing::debug!(
+                    "WhatsApp Web: transcribed voice note ({}s): {}",
+                    duration,
+                    text
+                );
+                Some(format!("[Voice] {text}"))
+            }
+            Err(e) => {
+                tracing::warn!("WhatsApp Web: voice transcription failed: {e}");
+                Some("[Voice note received, but transcription failed]".to_string())
+            }
+        }
+    }
+
+    /// Handle an image message: extract caption or provide a tag.
+    #[cfg(feature = "whatsapp-web")]
+    fn handle_image_message(
+        image: &wa_rs_proto::whatsapp::message::ImageMessage,
+    ) -> Option<String> {
+        let caption = image.caption.as_deref().unwrap_or("").trim();
+        if caption.is_empty() {
+            Some("[Image]".to_string())
+        } else {
+            Some(format!("[Image] {caption}"))
+        }
+    }
+
+    /// Handle a video message: extract caption or provide a tag.
+    #[cfg(feature = "whatsapp-web")]
+    fn handle_video_message(
+        video: &wa_rs_proto::whatsapp::message::VideoMessage,
+    ) -> Option<String> {
+        let caption = video.caption.as_deref().unwrap_or("").trim();
+        if caption.is_empty() {
+            Some("[Video]".to_string())
+        } else {
+            Some(format!("[Video] {caption}"))
+        }
+    }
+
+    /// Handle a document message: extract filename/title or provide a tag.
+    #[cfg(feature = "whatsapp-web")]
+    fn handle_document_message(
+        doc: &wa_rs_proto::whatsapp::message::DocumentMessage,
+    ) -> Option<String> {
+        let name = doc
+            .file_name
+            .as_deref()
+            .or(doc.title.as_deref())
+            .unwrap_or("")
+            .trim();
+        let caption = doc.caption.as_deref().unwrap_or("").trim();
+        if name.is_empty() && caption.is_empty() {
+            Some("[Document]".to_string())
+        } else if caption.is_empty() {
+            Some(format!("[Document: {name}]"))
+        } else if name.is_empty() {
+            Some(format!("[Document] {caption}"))
+        } else {
+            Some(format!("[Document: {name}] {caption}"))
+        }
+    }
+
+    /// Derive a filename with appropriate extension from an audio MIME type.
+    #[cfg(feature = "whatsapp-web")]
+    fn audio_filename_from_mime(mime: &str) -> String {
+        let ext = match mime {
+            "audio/ogg" | "audio/ogg; codecs=opus" => "ogg",
+            "audio/opus" => "opus",
+            "audio/mpeg" | "audio/mp3" => "mp3",
+            "audio/mp4" | "audio/m4a" | "audio/aac" => "m4a",
+            "audio/wav" | "audio/x-wav" => "wav",
+            "audio/webm" => "webm",
+            "audio/flac" => "flac",
+            other => {
+                // Try to extract subtype as extension fallback
+                other
+                    .split('/')
+                    .nth(1)
+                    .and_then(|s| s.split(';').next())
+                    .unwrap_or("ogg")
+            }
+        };
+        format!("voice.{ext}")
+    }
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -380,6 +537,7 @@ impl Channel for WhatsAppWebChannel {
             let logout_tx_clone = logout_tx.clone();
             let retry_count_clone = retry_count.clone();
             let session_revoked_clone = session_revoked.clone();
+            let transcription_config = self.transcription.clone();
 
             let mut builder = Bot::builder()
                 .with_backend(backend)
@@ -391,15 +549,18 @@ impl Channel for WhatsAppWebChannel {
                     let logout_tx = logout_tx_clone.clone();
                     let retry_count = retry_count_clone.clone();
                     let session_revoked = session_revoked_clone.clone();
+                    let transcription_config = transcription_config.clone();
                     async move {
                         match event {
                             Event::Message(msg, info) => {
-                                // Extract message content
-                                let text = msg.text_content().unwrap_or("");
                                 let sender_jid = info.source.sender.clone();
                                 let sender_alt = info.source.sender_alt.clone();
                                 let sender = sender_jid.user().to_string();
                                 let chat = info.source.chat.to_string();
+
+                                // Extract text content from the base message
+                                let base = msg.get_base_message();
+                                let text = msg.text_content().unwrap_or("");
 
                                 tracing::info!(
                                     "WhatsApp Web message received (sender_len={}, chat_len={}, text_len={})",
@@ -430,14 +591,38 @@ impl Channel for WhatsAppWebChannel {
                                     })
                                     .cloned()
                                 {
+                                    // Try text content first
                                     let trimmed = text.trim();
-                                    if trimmed.is_empty() {
+                                    let content = if !trimmed.is_empty() {
+                                        Some(trimmed.to_string())
+                                    } else if let Some(ref audio) = base.audio_message {
+                                        // Voice note / audio message: download and transcribe
+                                        Self::handle_audio_message(
+                                            audio,
+                                            &_client,
+                                            transcription_config.as_ref(),
+                                        )
+                                        .await
+                                    } else if let Some(ref image) = base.image_message {
+                                        // Image message: extract caption or tag
+                                        Self::handle_image_message(image)
+                                    } else if let Some(ref video) = base.video_message {
+                                        // Video message: extract caption or tag
+                                        Self::handle_video_message(video)
+                                    } else if let Some(ref doc) = base.document_message {
+                                        // Document message: extract filename/title
+                                        Self::handle_document_message(doc)
+                                    } else {
+                                        None
+                                    };
+
+                                    let Some(content) = content else {
                                         tracing::debug!(
-                                            "WhatsApp Web: ignoring empty or non-text message from {}",
+                                            "WhatsApp Web: ignoring empty or unsupported message from {}",
                                             normalized
                                         );
                                         return;
-                                    }
+                                    };
 
                                     if let Err(e) = tx_inner
                                         .send(ChannelMessage {
@@ -446,7 +631,7 @@ impl Channel for WhatsAppWebChannel {
                                             sender: normalized.clone(),
                                             // Reply to the originating chat JID (DM or group).
                                             reply_target: chat,
-                                            content: trimmed.to_string(),
+                                            content,
                                             timestamp: chrono::Utc::now().timestamp() as u64,
                                             thread_ts: None,
                                         })
@@ -948,5 +1133,160 @@ mod tests {
                 "/tmp/test.db-shm".to_string(),
             ]
         );
+    }
+
+    // ── Media message handler tests ──
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn handle_image_message_with_caption() {
+        use wa_rs_proto::whatsapp::message::ImageMessage;
+        let img = ImageMessage {
+            caption: Some("Check this out!".to_string()),
+            ..Default::default()
+        };
+        let result = WhatsAppWebChannel::handle_image_message(&img);
+        assert_eq!(result, Some("[Image] Check this out!".to_string()));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn handle_image_message_without_caption() {
+        use wa_rs_proto::whatsapp::message::ImageMessage;
+        let img = ImageMessage::default();
+        let result = WhatsAppWebChannel::handle_image_message(&img);
+        assert_eq!(result, Some("[Image]".to_string()));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn handle_video_message_with_caption() {
+        use wa_rs_proto::whatsapp::message::VideoMessage;
+        let vid = VideoMessage {
+            caption: Some("Watch this".to_string()),
+            ..Default::default()
+        };
+        let result = WhatsAppWebChannel::handle_video_message(&vid);
+        assert_eq!(result, Some("[Video] Watch this".to_string()));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn handle_video_message_without_caption() {
+        use wa_rs_proto::whatsapp::message::VideoMessage;
+        let vid = VideoMessage::default();
+        let result = WhatsAppWebChannel::handle_video_message(&vid);
+        assert_eq!(result, Some("[Video]".to_string()));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn handle_document_message_with_filename() {
+        use wa_rs_proto::whatsapp::message::DocumentMessage;
+        let doc = DocumentMessage {
+            file_name: Some("report.pdf".to_string()),
+            ..Default::default()
+        };
+        let result = WhatsAppWebChannel::handle_document_message(&doc);
+        assert_eq!(result, Some("[Document: report.pdf]".to_string()));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn handle_document_message_with_title_fallback() {
+        use wa_rs_proto::whatsapp::message::DocumentMessage;
+        let doc = DocumentMessage {
+            title: Some("Quarterly Report".to_string()),
+            ..Default::default()
+        };
+        let result = WhatsAppWebChannel::handle_document_message(&doc);
+        assert_eq!(result, Some("[Document: Quarterly Report]".to_string()));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn handle_document_message_with_filename_and_caption() {
+        use wa_rs_proto::whatsapp::message::DocumentMessage;
+        let doc = DocumentMessage {
+            file_name: Some("notes.txt".to_string()),
+            caption: Some("My notes".to_string()),
+            ..Default::default()
+        };
+        let result = WhatsAppWebChannel::handle_document_message(&doc);
+        assert_eq!(result, Some("[Document: notes.txt] My notes".to_string()));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn handle_document_message_empty() {
+        use wa_rs_proto::whatsapp::message::DocumentMessage;
+        let doc = DocumentMessage::default();
+        let result = WhatsAppWebChannel::handle_document_message(&doc);
+        assert_eq!(result, Some("[Document]".to_string()));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn audio_filename_from_mime_ogg() {
+        assert_eq!(
+            WhatsAppWebChannel::audio_filename_from_mime("audio/ogg"),
+            "voice.ogg"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_filename_from_mime("audio/ogg; codecs=opus"),
+            "voice.ogg"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn audio_filename_from_mime_common_formats() {
+        assert_eq!(
+            WhatsAppWebChannel::audio_filename_from_mime("audio/mpeg"),
+            "voice.mp3"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_filename_from_mime("audio/mp4"),
+            "voice.m4a"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_filename_from_mime("audio/opus"),
+            "voice.opus"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_filename_from_mime("audio/wav"),
+            "voice.wav"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::audio_filename_from_mime("audio/webm"),
+            "voice.webm"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn audio_filename_from_mime_unknown_fallback() {
+        // Unknown MIME should extract subtype as extension
+        assert_eq!(
+            WhatsAppWebChannel::audio_filename_from_mime("audio/amr"),
+            "voice.amr"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn with_transcription_sets_config_when_enabled() {
+        let mut tc = crate::config::TranscriptionConfig::default();
+        tc.enabled = true;
+        let ch = make_channel().with_transcription(tc);
+        assert!(ch.transcription.is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn with_transcription_skips_when_disabled() {
+        let tc = crate::config::TranscriptionConfig::default(); // enabled = false
+        let ch = make_channel().with_transcription(tc);
+        assert!(ch.transcription.is_none());
     }
 }
