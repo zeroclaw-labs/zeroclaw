@@ -212,6 +212,10 @@ pub struct Config {
     #[serde(default)]
     pub web_search: WebSearchConfig,
 
+    /// Project delivery intelligence configuration (`[project_intel]`).
+    #[serde(default)]
+    pub project_intel: ProjectIntelConfig,
+
     /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]`).
     #[serde(default)]
     pub proxy: ProxyConfig,
@@ -1537,6 +1541,64 @@ impl Default for WebSearchConfig {
             brave_api_key: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
+        }
+    }
+}
+
+// ── Project Intelligence ────────────────────────────────────────
+
+/// Project delivery intelligence configuration (`[project_intel]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectIntelConfig {
+    /// Enable the project_intel tool. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Default report language (en, de, fr, it). Default: "en".
+    #[serde(default = "default_project_intel_language")]
+    pub default_language: String,
+    /// Output directory for generated reports.
+    #[serde(default = "default_project_intel_report_dir")]
+    pub report_output_dir: String,
+    /// Optional custom templates directory.
+    #[serde(default)]
+    pub templates_dir: Option<String>,
+    /// Risk detection sensitivity: low, medium, high. Default: "medium".
+    #[serde(default = "default_project_intel_risk_sensitivity")]
+    pub risk_sensitivity: String,
+    /// Include git log data in reports. Default: true.
+    #[serde(default = "default_true")]
+    pub include_git_data: bool,
+    /// Include Jira data in reports. Default: false.
+    #[serde(default)]
+    pub include_jira_data: bool,
+    /// Jira instance base URL (required if include_jira_data is true).
+    #[serde(default)]
+    pub jira_base_url: Option<String>,
+}
+
+fn default_project_intel_language() -> String {
+    "en".into()
+}
+
+fn default_project_intel_report_dir() -> String {
+    "~/.zeroclaw/project-reports".into()
+}
+
+fn default_project_intel_risk_sensitivity() -> String {
+    "medium".into()
+}
+
+impl Default for ProjectIntelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_language: default_project_intel_language(),
+            report_output_dir: default_project_intel_report_dir(),
+            templates_dir: None,
+            risk_sensitivity: default_project_intel_risk_sensitivity(),
+            include_git_data: true,
+            include_jira_data: false,
+            jira_base_url: None,
         }
     }
 }
@@ -4192,6 +4254,7 @@ impl Default for Config {
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
+            project_intel: ProjectIntelConfig::default(),
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
@@ -5232,13 +5295,30 @@ impl Config {
             validate_mcp_config(&self.mcp)?;
         }
 
+        // Project intelligence
+        if self.project_intel.enabled {
+            let lang = &self.project_intel.default_language;
+            if !["en", "de", "fr", "it"].contains(&lang.as_str()) {
+                anyhow::bail!(
+                    "project_intel.default_language must be one of: en, de, fr, it (got '{lang}')"
+                );
+            }
+            let sens = &self.project_intel.risk_sensitivity;
+            if !["low", "medium", "high"].contains(&sens.as_str()) {
+                anyhow::bail!(
+                    "project_intel.risk_sensitivity must be one of: low, medium, high (got '{sens}')"
+                );
+            }
+            if let Some(ref tpl_dir) = self.project_intel.templates_dir {
+                let path = std::path::Path::new(tpl_dir);
+                if !path.exists() {
+                    anyhow::bail!("project_intel.templates_dir path does not exist: {tpl_dir}");
+                }
+            }
+        }
+
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
-
-        // MCP servers
-        if self.mcp.enabled {
-            validate_mcp_config(&self.mcp)?;
-        }
 
         Ok(())
     }
@@ -5950,6 +6030,7 @@ impl Config {
     }
 }
 
+#[allow(clippy::unused_async)]
 async fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -5975,6 +6056,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    #[allow(unused_imports)]
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
@@ -6298,6 +6380,7 @@ default_temperature = 0.7
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
+            project_intel: ProjectIntelConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
@@ -6589,6 +6672,7 @@ tool_dispatcher = "xml"
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
+            project_intel: ProjectIntelConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
