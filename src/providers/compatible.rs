@@ -512,7 +512,11 @@ struct ToolCall {
     arguments: Option<String>,
 
     // Compatibility: DeepSeek sometimes wraps arguments differently
-    #[serde(rename = "parameters", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "parameters",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     parameters: Option<serde_json::Value>,
 }
 
