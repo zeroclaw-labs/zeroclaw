@@ -888,7 +888,7 @@ impl Channel for MatrixChannel {
                     sender: sender.clone(),
                     reply_target: format!("{}||{}", sender, room.room_id()),
                     content: body,
-                    channel: format!("matrix:{}", room.room_id()),
+                    channel: "matrix".to_string(),
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
