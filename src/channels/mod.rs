@@ -19,17 +19,20 @@ pub mod cli;
 pub mod dingtalk;
 pub mod discord;
 pub mod email_channel;
+pub mod gotify;
 pub mod imessage;
 pub mod irc;
 #[cfg(feature = "channel-lark")]
 pub mod lark;
 pub mod linq;
+pub mod mastodon;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 pub mod mattermost;
 pub mod nextcloud_talk;
 #[cfg(feature = "channel-nostr")]
 pub mod nostr;
+pub mod ntfy;
 pub mod qq;
 pub mod session_store;
 pub mod signal;
@@ -51,17 +54,20 @@ pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
 pub use email_channel::EmailChannel;
+pub use gotify::GotifyChannel;
 pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 #[cfg(feature = "channel-lark")]
 pub use lark::LarkChannel;
 pub use linq::LinqChannel;
+pub use mastodon::MastodonChannel;
 #[cfg(feature = "channel-matrix")]
 pub use matrix::MatrixChannel;
 pub use mattermost::MattermostChannel;
 pub use nextcloud_talk::NextcloudTalkChannel;
 #[cfg(feature = "channel-nostr")]
 pub use nostr::NostrChannel;
+pub use ntfy::NtfyChannel;
 pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
@@ -3377,6 +3383,46 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "ClawdTalk",
             channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
+        });
+    }
+
+    if let Some(ref mdn) = config.channels_config.mastodon {
+        channels.push(ConfiguredChannel {
+            display_name: "Mastodon",
+            channel: Arc::new(MastodonChannel::new(mastodon::MastodonChannelConfig {
+                instance_url: mdn.instance_url.clone(),
+                access_token: mdn.access_token.clone(),
+                default_visibility: mdn.default_visibility.clone(),
+                char_limit: mdn.char_limit,
+                spoiler_text: mdn.spoiler_text.clone(),
+            })),
+        });
+    }
+
+    if let Some(ref nf) = config.channels_config.ntfy {
+        channels.push(ConfiguredChannel {
+            display_name: "ntfy",
+            channel: Arc::new(NtfyChannel::new(ntfy::NtfyChannelConfig {
+                server: nf.server.clone(),
+                topic: nf.topic.clone(),
+                auth_token: nf.auth_token.clone(),
+                default_priority: nf.default_priority,
+                default_tags: nf.default_tags.clone(),
+                default_click: nf.default_click.clone(),
+            })),
+        });
+    }
+
+    if let Some(ref gf) = config.channels_config.gotify {
+        channels.push(ConfiguredChannel {
+            display_name: "Gotify",
+            channel: Arc::new(GotifyChannel::new(gotify::GotifyChannelConfig {
+                server_url: gf.server_url.clone(),
+                app_token: gf.app_token.clone(),
+                client_token: gf.client_token.clone(),
+                default_priority: gf.default_priority,
+                use_markdown: gf.use_markdown.unwrap_or(false),
+            })),
         });
     }
 
