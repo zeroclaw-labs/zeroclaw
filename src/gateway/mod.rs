@@ -1678,17 +1678,15 @@ async fn handle_admin_reload_config(
     require_localhost(&peer)?;
     tracing::info!("🔄 Admin config reload request received");
 
-    let mut new_config = crate::config::Config::load_or_init()
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to load config from disk: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("Failed to load config: {e}")
-                })),
-            )
-        })?;
+    let mut new_config = crate::config::Config::load_or_init().await.map_err(|e| {
+        tracing::error!("Failed to load config from disk: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to load config: {e}")
+            })),
+        )
+    })?;
     new_config.apply_env_overrides();
 
     *state.config.lock() = new_config;
