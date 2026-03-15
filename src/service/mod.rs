@@ -1253,8 +1253,7 @@ mod tests {
     #[test]
     fn systemd_unit_contains_home_and_pass_environment() {
         // Verify the unit template includes Environment=HOME and PassEnvironment
-        let unit = format!(
-            "[Unit]\n\
+        let unit = "[Unit]\n\
              Description=ZeroClaw daemon\n\
              After=network.target\n\
              \n\
@@ -1271,7 +1270,7 @@ mod tests {
              \n\
              [Install]\n\
              WantedBy=default.target\n"
-        );
+            .to_string();
 
         assert!(
             unit.contains("Environment=HOME=%h"),
