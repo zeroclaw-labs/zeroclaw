@@ -14,6 +14,7 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
+pub mod bluesky;
 pub mod clawdtalk;
 pub mod cli;
 pub mod dingtalk;
@@ -31,6 +32,7 @@ pub mod nextcloud_talk;
 #[cfg(feature = "channel-nostr")]
 pub mod nostr;
 pub mod qq;
+pub mod reddit;
 pub mod session_store;
 pub mod signal;
 pub mod slack;
@@ -39,6 +41,7 @@ pub mod traits;
 pub mod transcription;
 pub mod tts;
 pub mod wati;
+pub mod webhook;
 pub mod wecom;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
@@ -46,6 +49,7 @@ pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
+pub use bluesky::BlueskyChannel;
 pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
@@ -63,6 +67,7 @@ pub use nextcloud_talk::NextcloudTalkChannel;
 #[cfg(feature = "channel-nostr")]
 pub use nostr::NostrChannel;
 pub use qq::QQChannel;
+pub use reddit::RedditChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
@@ -70,6 +75,7 @@ pub use traits::{Channel, SendMessage};
 #[allow(unused_imports)]
 pub use tts::{TtsManager, TtsProvider};
 pub use wati::WatiChannel;
+pub use webhook::WebhookChannel;
 pub use wecom::WeComChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
@@ -3377,6 +3383,43 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "ClawdTalk",
             channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
+        });
+    }
+
+    if let Some(ref rd) = config.channels_config.reddit {
+        channels.push(ConfiguredChannel {
+            display_name: "Reddit",
+            channel: Arc::new(RedditChannel::new(
+                rd.client_id.clone(),
+                rd.client_secret.clone(),
+                rd.refresh_token.clone(),
+                rd.username.clone(),
+                rd.subreddit.clone(),
+            )),
+        });
+    }
+
+    if let Some(ref bs) = config.channels_config.bluesky {
+        channels.push(ConfiguredChannel {
+            display_name: "Bluesky",
+            channel: Arc::new(BlueskyChannel::new(
+                bs.handle.clone(),
+                bs.app_password.clone(),
+            )),
+        });
+    }
+
+    if let Some(ref wh) = config.channels_config.webhook {
+        channels.push(ConfiguredChannel {
+            display_name: "Webhook",
+            channel: Arc::new(WebhookChannel::new(
+                wh.port,
+                wh.listen_path.clone(),
+                wh.send_url.clone(),
+                wh.send_method.clone(),
+                wh.auth_header.clone(),
+                wh.secret.clone(),
+            )),
         });
     }
 
