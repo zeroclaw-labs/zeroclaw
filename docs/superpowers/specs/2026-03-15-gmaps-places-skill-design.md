@@ -43,7 +43,7 @@ Uses **Text Search** (`POST /v1/places:searchText`) exclusively. Nearby Search d
 | `limit` | no | Max results to return (default: 20, max: 60 via automatic pagination) |
 | `sort_by` | no | Client-side sort: relevance (default, API-native), rating, reviews_count. Note: rating/reviews_count sorting is applied post-fetch on the returned set only |
 | `page_token` | no | Pagination token from previous response to fetch next page |
-| `language` | no | Language for results: en (default), ru, th |
+| `language` | no | Language for results: en (default), ru, or local language of target country (es for Spain, vi for Vietnam, th for Thailand, etc.). Agent should pick local language based on search zone |
 
 **Returns:**
 ```json
@@ -86,7 +86,7 @@ Full place details by place_id.
 | `reviews` | no | Include review texts (default: true) |
 | `photos` | no | Include photo URLs — resolved to direct URLs internally, costs ~$0.007/photo (default: false) |
 | `max_photos` | no | Max photos to resolve (default: 3) |
-| `language` | no | Language for results: en (default), ru, th |
+| `language` | no | Language for results: en (default), ru, or local language of target country (es for Spain, vi for Vietnam, th for Thailand, etc.). Agent should pick local language based on search zone |
 
 **Returns:**
 ```json
@@ -163,6 +163,11 @@ prompts = [
   2. Use gmaps_details for specific places when user needs contacts, reviews, or photos
   3. Combine with erp_sales/erp_expenses for competitive analysis against own data
 
+  LANGUAGE: Set `language` based on the TARGET COUNTRY of the search:
+  - Spain → es, Vietnam → vi, Thailand → th, Japan → ja, France → fr, etc.
+  - Always keep en and ru available (user speaks both)
+  - Default: en. Override with local language to get local business names/addresses.
+
   COST AWARENESS: Every call costs real money. Prefer search over details when possible.
   Do not call gmaps_details in a loop for all search results — only for places the user cares about.
 
@@ -187,7 +192,7 @@ min_rating = "Min rating filter, client-side (default: 0)"
 limit = "Max results (default: 20, max: 60)"
 sort_by = "Sort: relevance (default), rating, reviews_count"
 page_token = "Pagination token from previous response (optional)"
-language = "Result language: en (default), ru, th"
+language = "Result language: en (default), ru, or local (es/vi/th/ja/fr/etc. — pick by target country)"
 
 [[tools]]
 name = "gmaps_details"
@@ -202,7 +207,7 @@ place_id = "Google Place ID from search results (required)"
 reviews = "Include reviews: true (default) or false"
 photos = "Include photo URLs: true or false (default). Costs ~$0.007/photo extra"
 max_photos = "Max photos to fetch (default: 3)"
-language = "Result language: en (default), ru, th"
+language = "Result language: en (default), ru, or local (es/vi/th/ja/fr/etc. — pick by target country)"
 ```
 
 ### API: Google Places API (New)
