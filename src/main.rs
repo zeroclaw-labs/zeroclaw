@@ -670,6 +670,8 @@ enum MemoryCommands {
     Get { key: String },
     /// Show memory backend statistics and health
     Stats,
+    /// Rebuild indexes and re-sync derived data (FTS5, embeddings, vector stores)
+    Reindex,
     /// Clear memories by category, by key, or clear all
     Clear {
         /// Delete a single entry by key (supports prefix match)

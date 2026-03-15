@@ -1,7 +1,7 @@
 use super::traits::{Memory, MemoryCategory};
 use super::{
-    classify_memory_backend, create_memory_for_migration, effective_memory_backend_name,
-    MemoryBackendKind,
+    classify_memory_backend, create_memory_for_migration, create_memory_with_storage,
+    effective_memory_backend_name, MemoryBackendKind,
 };
 use crate::config::Config;
 #[cfg(feature = "memory-postgres")]
@@ -20,6 +20,7 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
         } => handle_list(config, category, session, limit, offset).await,
         crate::MemoryCommands::Get { key } => handle_get(config, &key).await,
         crate::MemoryCommands::Stats => handle_stats(config).await,
+        crate::MemoryCommands::Reindex => handle_reindex(config).await,
         crate::MemoryCommands::Clear { key, category, yes } => {
             handle_clear(config, key, category, yes).await
         }
@@ -194,6 +195,31 @@ async fn handle_stats(config: &Config) -> Result<()> {
             println!("    {cat:<20} {count}");
         }
     }
+
+    Ok(())
+}
+
+async fn handle_reindex(config: &Config) -> Result<()> {
+    // Reindex needs the full backend (with embeddings) rather than the
+    // lightweight CLI/migration factory.
+    let mem = create_memory_with_storage(
+        &config.memory,
+        Some(&config.storage.provider.config),
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+    )?;
+
+    println!(
+        "Reindexing {} backend...\n",
+        style(mem.name()).white().bold()
+    );
+
+    let count = mem.reindex().await?;
+
+    println!(
+        "\n{} Reindex complete: {count} entries processed.",
+        style("✓").green().bold()
+    );
 
     Ok(())
 }

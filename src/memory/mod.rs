@@ -3,6 +3,7 @@ pub mod chunker;
 pub mod cli;
 pub mod consolidation;
 pub mod embeddings;
+pub mod hybrid;
 pub mod hygiene;
 pub mod lucid;
 pub mod markdown;
@@ -21,6 +22,7 @@ pub use backend::{
     classify_memory_backend, default_memory_backend_key, memory_backend_profile,
     selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
 };
+pub use hybrid::SqliteQdrantHybridMemory;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
@@ -58,6 +60,11 @@ where
         MemoryBackendKind::Postgres => postgres_builder(),
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
+        }
+        MemoryBackendKind::SqliteQdrantHybrid => {
+            // In simplified builder contexts (e.g. migration), fall back to
+            // sqlite-only since the full hybrid requires Qdrant config.
+            Ok(Box::new(sqlite_builder()?))
         }
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
         MemoryBackendKind::Unknown => {
@@ -359,6 +366,46 @@ pub fn create_memory_with_storage_and_routes(
             qdrant_api_key,
             embedder,
         )));
+    }
+
+    if matches!(backend_kind, MemoryBackendKind::SqliteQdrantHybrid) {
+        let sqlite = build_sqlite_memory(config, workspace_dir, &resolved_embedding)?;
+
+        let url = config
+            .qdrant
+            .url
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::var("QDRANT_URL").ok())
+            .filter(|s| !s.trim().is_empty())
+            .context(
+                "sqlite_qdrant_hybrid backend requires url in [memory.qdrant] or QDRANT_URL env var",
+            )?;
+        let collection = std::env::var("QDRANT_COLLECTION")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| config.qdrant.collection.clone());
+        let qdrant_api_key = config
+            .qdrant
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("QDRANT_API_KEY").ok())
+            .filter(|s| !s.trim().is_empty());
+        let qdrant_embedder: Arc<dyn embeddings::EmbeddingProvider> =
+            Arc::from(embeddings::create_embedding_provider(
+                &resolved_embedding.provider,
+                resolved_embedding.api_key.as_deref(),
+                &resolved_embedding.model,
+                resolved_embedding.dimensions,
+            ));
+        let qdrant = QdrantMemory::new_lazy(&url, &collection, qdrant_api_key, qdrant_embedder);
+
+        tracing::info!(
+            "📦 sqlite_qdrant_hybrid memory backend configured (qdrant url: {}, collection: {})",
+            url,
+            collection
+        );
+        return Ok(Box::new(SqliteQdrantHybridMemory::new(sqlite, qdrant)));
     }
 
     create_memory_with_builders(

@@ -92,6 +92,14 @@ pub trait Memory: Send + Sync {
 
     /// Health check
     async fn health_check(&self) -> bool;
+
+    /// Rebuild indexes and re-sync derived data (FTS5, embeddings, vector stores).
+    ///
+    /// Returns the number of entries processed. The default implementation
+    /// returns an error; backends that support reindexing override this.
+    async fn reindex(&self) -> anyhow::Result<usize> {
+        anyhow::bail!("Reindex not supported by {} backend", self.name())
+    }
 }
 
 #[cfg(test)]

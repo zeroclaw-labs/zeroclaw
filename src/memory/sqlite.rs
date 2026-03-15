@@ -779,6 +779,11 @@ impl Memory for SqliteMemory {
             .await
             .unwrap_or(false)
     }
+
+    async fn reindex(&self) -> anyhow::Result<usize> {
+        // Delegate to the inherent reindex implementation.
+        SqliteMemory::reindex(self).await
+    }
 }
 
 #[cfg(test)]

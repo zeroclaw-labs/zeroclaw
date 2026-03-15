@@ -4,6 +4,7 @@ pub enum MemoryBackendKind {
     Lucid,
     Postgres,
     Qdrant,
+    SqliteQdrantHybrid,
     Markdown,
     None,
     Unknown,
@@ -65,6 +66,15 @@ const QDRANT_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     optional_dependency: false,
 };
 
+const SQLITE_QDRANT_HYBRID_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
+    key: "sqlite_qdrant_hybrid",
+    label: "SQLite + Qdrant Hybrid — SQLite authoritative store with Qdrant vector sync",
+    auto_save_default: true,
+    uses_sqlite_hygiene: true,
+    sqlite_based: true,
+    optional_dependency: false,
+};
+
 const NONE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "none",
     label: "None — disable persistent memory",
@@ -104,6 +114,7 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
         "lucid" => MemoryBackendKind::Lucid,
         "postgres" => MemoryBackendKind::Postgres,
         "qdrant" => MemoryBackendKind::Qdrant,
+        "sqlite_qdrant_hybrid" => MemoryBackendKind::SqliteQdrantHybrid,
         "markdown" => MemoryBackendKind::Markdown,
         "none" => MemoryBackendKind::None,
         _ => MemoryBackendKind::Unknown,
@@ -116,6 +127,7 @@ pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
         MemoryBackendKind::Lucid => LUCID_PROFILE,
         MemoryBackendKind::Postgres => POSTGRES_PROFILE,
         MemoryBackendKind::Qdrant => QDRANT_PROFILE,
+        MemoryBackendKind::SqliteQdrantHybrid => SQLITE_QDRANT_HYBRID_PROFILE,
         MemoryBackendKind::Markdown => MARKDOWN_PROFILE,
         MemoryBackendKind::None => NONE_PROFILE,
         MemoryBackendKind::Unknown => CUSTOM_PROFILE,
@@ -139,6 +151,10 @@ mod tests {
             MemoryBackendKind::Markdown
         );
         assert_eq!(classify_memory_backend("none"), MemoryBackendKind::None);
+        assert_eq!(
+            classify_memory_backend("sqlite_qdrant_hybrid"),
+            MemoryBackendKind::SqliteQdrantHybrid
+        );
     }
 
     #[test]
@@ -162,6 +178,15 @@ mod tests {
         assert!(profile.sqlite_based);
         assert!(profile.optional_dependency);
         assert!(profile.uses_sqlite_hygiene);
+    }
+
+    #[test]
+    fn sqlite_qdrant_hybrid_profile_is_sqlite_based() {
+        let profile = memory_backend_profile("sqlite_qdrant_hybrid");
+        assert_eq!(profile.key, "sqlite_qdrant_hybrid");
+        assert!(profile.sqlite_based);
+        assert!(profile.uses_sqlite_hygiene);
+        assert!(profile.auto_save_default);
     }
 
     #[test]
