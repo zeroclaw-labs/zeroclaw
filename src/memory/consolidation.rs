@@ -43,8 +43,10 @@ pub async fn consolidate_turn(
     let turn_text = format!("User: {user_message}\nAssistant: {assistant_response}");
 
     // Truncate very long turns to avoid wasting tokens on consolidation.
+    // Use char boundary to avoid panicking on UTF-8 multi-byte characters.
     let truncated = if turn_text.len() > 4000 {
-        format!("{}…", &turn_text[..4000])
+        let idx = turn_text.char_indices().nth(4000).map(|(i, _)| i).unwrap_or(turn_text.len());
+        format!("{}…", &turn_text[..idx])
     } else {
         turn_text.clone()
     };
@@ -92,8 +94,10 @@ fn parse_consolidation_response(raw: &str, fallback_text: &str) -> Consolidation
 
     serde_json::from_str(cleaned).unwrap_or_else(|_| {
         // Fallback: use truncated turn text as history entry.
+        // Use char boundary to avoid panicking on UTF-8 multi-byte characters.
         let summary = if fallback_text.len() > 200 {
-            format!("{}…", &fallback_text[..200])
+            let idx = fallback_text.char_indices().nth(200).map(|(i, _)| i).unwrap_or(fallback_text.len());
+            format!("{}…", &fallback_text[..idx])
         } else {
             fallback_text.to_string()
         };
