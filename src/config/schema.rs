@@ -3807,6 +3807,10 @@ pub struct SecurityConfig {
     /// Emergency-stop state machine configuration.
     #[serde(default)]
     pub estop: EstopConfig,
+
+    /// Compliance and audit automation configuration.
+    #[serde(default)]
+    pub compliance: ComplianceConfig,
 }
 
 /// OTP validation strategy.
@@ -3914,6 +3918,78 @@ impl Default for EstopConfig {
             enabled: false,
             state_file: default_estop_state_file(),
             require_otp_to_resume: true,
+        }
+    }
+}
+
+/// Compliance and audit automation configuration for regulated industries.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ComplianceConfig {
+    /// Enable compliance module (default false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Active regulatory frameworks (e.g. `["FINMA", "GDPR"]`).
+    #[serde(default)]
+    pub frameworks: Vec<String>,
+
+    /// Enable tamper-evident hash-chained audit logging (default true when enabled).
+    #[serde(default = "default_true")]
+    pub tamper_evident_logging: bool,
+
+    /// Hash algorithm for chain integrity (default "sha256").
+    #[serde(default = "default_compliance_hash_algorithm")]
+    pub hash_algorithm: String,
+
+    /// ISO 3166-1 alpha-2 data residency region (e.g. "CH", "EU").
+    #[serde(default)]
+    pub data_residency_region: Option<String>,
+
+    /// Block actions that violate residency rules (default true).
+    #[serde(default = "default_true")]
+    pub block_on_residency_violation: bool,
+
+    /// Directory for compliance report output.
+    #[serde(default = "default_compliance_report_output_dir")]
+    pub report_output_dir: String,
+
+    /// Audit log retention in days (default 365).
+    #[serde(default = "default_compliance_audit_retention_days")]
+    pub audit_retention_days: u64,
+
+    /// SIEM export format: "json", "csv", or "cef" (default "json").
+    #[serde(default = "default_compliance_siem_export_format")]
+    pub siem_export_format: String,
+}
+
+fn default_compliance_hash_algorithm() -> String {
+    "sha256".to_string()
+}
+
+fn default_compliance_report_output_dir() -> String {
+    "~/.zeroclaw/compliance-reports".to_string()
+}
+
+fn default_compliance_audit_retention_days() -> u64 {
+    365
+}
+
+fn default_compliance_siem_export_format() -> String {
+    "json".to_string()
+}
+
+impl Default for ComplianceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            frameworks: Vec::new(),
+            tamper_evident_logging: true,
+            hash_algorithm: default_compliance_hash_algorithm(),
+            data_residency_region: None,
+            block_on_residency_violation: true,
+            report_output_dir: default_compliance_report_output_dir(),
+            audit_retention_days: default_compliance_audit_retention_days(),
+            siem_export_format: default_compliance_siem_export_format(),
         }
     }
 }
@@ -5233,6 +5309,87 @@ impl Config {
         }
 
         // Proxy (delegate to existing validation)
+        // Compliance
+        if self.security.compliance.enabled {
+            if self.security.compliance.frameworks.is_empty() {
+                anyhow::bail!(
+                    "security.compliance.frameworks must not be empty when compliance is enabled"
+                );
+            }
+            let allowed_hash = ["sha256", "sha384", "sha512", "blake3"];
+            let hash = self
+                .security
+                .compliance
+                .hash_algorithm
+                .trim()
+                .to_ascii_lowercase();
+            if !allowed_hash.contains(&hash.as_str()) {
+                anyhow::bail!(
+                    "security.compliance.hash_algorithm must be one of: {}",
+                    allowed_hash.join(", ")
+                );
+            }
+            let allowed_siem = ["json", "csv", "cef"];
+            let siem = self
+                .security
+                .compliance
+                .siem_export_format
+                .trim()
+                .to_ascii_lowercase();
+            if !allowed_siem.contains(&siem.as_str()) {
+                anyhow::bail!(
+                    "security.compliance.siem_export_format must be one of: {}",
+                    allowed_siem.join(", ")
+                );
+            }
+            if self.security.compliance.audit_retention_days == 0 {
+                anyhow::bail!("security.compliance.audit_retention_days must be greater than 0");
+            }
+            // Validate data_residency_region format when present.
+            if let Some(ref region) = self.security.compliance.data_residency_region {
+                let trimmed = region.trim();
+                if trimmed.is_empty() {
+                    anyhow::bail!(
+                        "security.compliance.data_residency_region must not be empty/whitespace when set"
+                    );
+                }
+                // Expect ISO 3166-1 alpha-2 style: 2-3 uppercase ASCII letters.
+                if !(2..=3).contains(&trimmed.len())
+                    || !trimmed.chars().all(|c| c.is_ascii_uppercase())
+                {
+                    anyhow::bail!(
+                        "security.compliance.data_residency_region '{}' is not a valid \
+                         ISO 3166-1 alpha-2/alpha-3 code (expected 2-3 uppercase letters)",
+                        trimmed
+                    );
+                }
+            }
+            let known_frameworks = ["FINMA", "DORA", "GDPR", "SOC2", "ISO27001"];
+            for (i, fw) in self.security.compliance.frameworks.iter().enumerate() {
+                let trimmed = fw.trim();
+                if trimmed.is_empty() {
+                    anyhow::bail!("security.compliance.frameworks[{i}] must not be empty");
+                }
+                if !trimmed
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    anyhow::bail!(
+                        "security.compliance.frameworks[{i}] contains invalid characters: '{trimmed}'. \
+                         Use alphanumeric, underscore, or hyphen only"
+                    );
+                }
+                let upper = trimmed.to_ascii_uppercase();
+                if !known_frameworks.contains(&upper.as_str()) {
+                    tracing::warn!(
+                        "security.compliance.frameworks[{i}] = '{trimmed}' is not a \
+                         recognized framework ({}); treating as custom",
+                        known_frameworks.join(", ")
+                    );
+                }
+            }
+        }
+
         self.proxy.validate()?;
 
         // MCP servers
@@ -5950,6 +6107,7 @@ impl Config {
     }
 }
 
+#[allow(clippy::unused_async)]
 async fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -5975,6 +6133,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    #[cfg(unix)]
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;

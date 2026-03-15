@@ -19,8 +19,10 @@
 //! change guidelines.
 
 pub mod audit;
+pub mod audit_enhanced;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
+pub mod compliance;
 pub mod detect;
 pub mod docker;
 
@@ -41,6 +43,13 @@ pub mod traits;
 
 #[allow(unused_imports)]
 pub use audit::{AuditEvent, AuditEventType, AuditLogger};
+#[allow(unused_imports)]
+pub use audit_enhanced::{AuditEntry, ExportFormat, TamperEvidentLog};
+#[allow(unused_imports)]
+pub use compliance::{
+    ComplianceClassifier, ComplianceFramework, DataClassification, DataResidencyPolicy,
+    ResidencyCheckResult, ResidencyEnforcementMode,
+};
 #[allow(unused_imports)]
 pub use detect::create_sandbox;
 pub use domain_matcher::DomainMatcher;
