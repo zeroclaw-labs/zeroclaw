@@ -155,7 +155,7 @@ export class MoAClient {
   // ── Auth API ───────────────────────────────────────────────────
 
   async register(username: string, password: string): Promise<RegisterResponse> {
-    const res = await fetch(`${this.relayUrl}/api/auth/register`, {
+    const res = await fetch(`${this.serverUrl}/api/auth/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username, password }),
@@ -171,7 +171,7 @@ export class MoAClient {
 
   async login(username: string, password: string): Promise<LoginResponse> {
     const deviceName = await this.getDeviceName();
-    const res = await fetch(`${this.relayUrl}/api/auth/login`, {
+    const res = await fetch(`${this.serverUrl}/api/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
