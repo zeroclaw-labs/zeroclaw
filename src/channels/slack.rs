@@ -2426,6 +2426,7 @@ impl Channel for SlackChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: Some(thread_ts.clone()),
+                        is_voice: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {

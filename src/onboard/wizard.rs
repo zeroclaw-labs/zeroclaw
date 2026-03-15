@@ -3879,7 +3879,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     },
                     allowed_users,
                     interrupt_on_new_message: false,
-                    voice_loop: Default::default(),
+                    voice_loop: VoiceLoopConfig::default(),
                 });
             }
             ChannelMenuChoice::IMessage => {
