@@ -810,7 +810,7 @@ impl SecurityPolicy {
         let risk = self.command_risk_level(command);
 
         if risk == CommandRiskLevel::High {
-            if self.block_high_risk_commands {
+            if self.block_high_risk_commands && !self.is_explicitly_allowed_by_name(command) {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
             }
             if self.autonomy == AutonomyLevel::Supervised && !approved {
@@ -832,6 +832,34 @@ impl SecurityPolicy {
         }
 
         Ok(risk)
+    }
+
+    /// Check if the primary command is explicitly named (not via wildcard `*`)
+    /// in `allowed_commands`. Used to let operators override `block_high_risk_commands`
+    /// for specific commands they have consciously opted in.
+    fn is_explicitly_allowed_by_name(&self, command: &str) -> bool {
+        let segments = split_unquoted_segments(command);
+        let Some(segment) = segments.first() else {
+            return false;
+        };
+        let cmd_part = skip_env_assignments(segment);
+        let executable =
+            strip_wrapping_quotes(cmd_part.split_whitespace().next().unwrap_or("")).trim();
+        let base_owned = command_basename(executable).to_ascii_lowercase();
+        let base = strip_windows_exe_suffix(&base_owned);
+        if base.is_empty() {
+            return false;
+        }
+        self.allowed_commands.iter().any(|entry| {
+            let entry_trimmed = strip_wrapping_quotes(entry.trim()).trim().to_string();
+            // Wildcard does NOT count as an explicit entry
+            if entry_trimmed == "*" {
+                return false;
+            }
+            let entry_base_owned = command_basename(&entry_trimmed).to_ascii_lowercase();
+            let entry_base = strip_windows_exe_suffix(&entry_base_owned);
+            entry_base == base
+        })
     }
 
     // ── Layered Command Allowlist ──────────────────────────────────────────
@@ -1411,6 +1439,51 @@ mod tests {
     }
 
     #[test]
+    fn explicit_allowed_overrides_high_risk_block() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["curl".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+        // curl is explicitly allowed, so it should bypass the high-risk block
+        let result = p.validate_command_execution("curl https://api.example.com", true);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), CommandRiskLevel::High);
+    }
+
+    #[test]
+    fn wildcard_does_not_override_high_risk_block() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+        // Wildcard should NOT bypass high-risk block
+        let result = p.validate_command_execution("rm -rf /tmp/test", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("high-risk"));
+    }
+
+    #[test]
+    fn explicit_allowed_high_risk_still_requires_approval_in_supervised() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["curl".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+        // Explicitly allowed, bypasses block_high_risk, but still needs approval
+        let denied = p.validate_command_execution("curl https://api.example.com", false);
+        assert!(denied.is_err());
+        assert!(denied.unwrap_err().contains("approval"));
+
+        let approved = p.validate_command_execution("curl https://api.example.com", true);
+        assert!(approved.is_ok());
+    }
+
+    #[test]
     fn empty_command_blocked() {
         let p = default_policy();
         assert!(!p.is_command_allowed(""));
@@ -1503,16 +1576,36 @@ mod tests {
     }
 
     #[test]
-    fn validate_command_blocks_high_risk_by_default() {
+    fn validate_command_blocks_high_risk_by_default_without_explicit_entry() {
+        // When block_high_risk_commands is true and the command is NOT in
+        // allowed_commands, it should still be blocked (fails at allowlist).
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        };
+
+        let result = p.validate_command_execution("rm -rf /tmp/test", true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_command_explicit_allowed_bypasses_high_risk_block() {
+        // When a command IS explicitly in allowed_commands, it bypasses the
+        // high-risk block — the operator has consciously opted in.
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             allowed_commands: vec!["rm".into()],
             ..SecurityPolicy::default()
         };
 
-        let result = p.validate_command_execution("rm -rf /tmp/test", true);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("high-risk"));
+        // Still requires approval in supervised mode
+        let denied = p.validate_command_execution("rm -rf /tmp/test", false);
+        assert!(denied.is_err());
+        assert!(denied.unwrap_err().contains("approval"));
+
+        let approved = p.validate_command_execution("rm -rf /tmp/test", true);
+        assert!(approved.is_ok());
+        assert_eq!(approved.unwrap(), CommandRiskLevel::High);
     }
 
     #[test]
