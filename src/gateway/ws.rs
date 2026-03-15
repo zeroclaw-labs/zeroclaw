@@ -18,8 +18,48 @@ use axum::{
     http::{header, HeaderMap},
     response::IntoResponse,
 };
+use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::fmt::Write;
+
+/// Build memory context by recalling relevant memories.
+/// Extracted from agent/loop_.rs build_context pattern.
+async fn build_memory_context(
+    mem: &dyn crate::memory::Memory,
+    user_msg: &str,
+    min_relevance_score: f64,
+) -> String {
+    let mut context = String::new();
+
+    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+        let relevant: Vec<_> = entries
+            .iter()
+            .filter(|e| match e.score {
+                Some(score) => score >= min_relevance_score,
+                None => true,
+            })
+            .collect();
+
+        if !relevant.is_empty() {
+            context.push_str("[Memory context]\n");
+            for entry in &relevant {
+                // Skip legacy assistant autosave entries
+                if crate::memory::is_assistant_autosave_key(&entry.key) {
+                    continue;
+                }
+                let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
+            }
+            if context == "[Memory context]\n" {
+                context.clear();
+            } else {
+                context.push('\n');
+            }
+        }
+    }
+
+    context
+}
 
 /// The sub-protocol we support for the chat WebSocket.
 const WS_PROTOCOL: &str = "zeroclaw.v1";
@@ -157,6 +197,17 @@ async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<S
             continue;
         }
 
+        // 🔧 Auto-save user message to memory (mimics webhook pattern)
+        if state.auto_save && content.chars().count() >= 20 {
+            use crate::memory::traits::MemoryCategory;
+            let key = format!("ws_msg_{}", Utc::now().timestamp());
+            let _ = state
+                .mem
+                .store(&key, &content, MemoryCategory::Conversation, None)
+                .await;
+            tracing::info!("WebSocket message auto-saved to memory: key={}", key);
+        }
+
         // Process message with the LLM provider
         let provider_label = state
             .config
@@ -172,8 +223,60 @@ async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<S
             "model": state.model,
         }));
 
-        // Multi-turn chat via persistent Agent (history is maintained across turns)
-        match agent.turn(&content).await {
+        // Simple single-turn chat (no streaming for now — use provider.chat_with_system)
+        let (system_prompt, min_relevance_score) = {
+            let config_guard = state.config.lock();
+            (
+                crate::channels::build_system_prompt(
+                    &config_guard.workspace_dir,
+                    &state.model,
+                    &[],
+                    &[],
+                    Some(&config_guard.identity),
+                    None,
+                ),
+                config_guard.memory.min_relevance_score,
+            )
+        };
+
+        // 🔧 Recall memory and inject context
+        let mem_context = build_memory_context(&*state.mem, &content, min_relevance_score).await;
+        let enriched_content = if mem_context.is_empty() {
+            content.clone()
+        } else {
+            tracing::debug!(
+                context_len = mem_context.len(),
+                "WebSocket: Injecting memory context"
+            );
+            format!("{}{}", mem_context, content)
+        };
+
+        let messages = vec![
+            crate::providers::ChatMessage::system(system_prompt),
+            crate::providers::ChatMessage::user(&enriched_content),
+        ];
+
+        let multimodal_config = state.config.lock().multimodal.clone();
+        let prepared =
+            match crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config)
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": format!("Multimodal prep failed: {e}")
+                    });
+                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                    continue;
+                }
+            };
+
+        match state
+            .provider
+            .chat_with_history(&prepared.messages, &state.model, state.temperature)
+            .await
+        {
             Ok(response) => {
                 // Send the full response as a done message
                 let done = serde_json::json!({

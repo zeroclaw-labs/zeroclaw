@@ -1,7 +1,13 @@
+#![allow(unused_imports)]
+
 pub mod backend;
 pub mod chunker;
 pub mod cli;
 pub mod consolidation;
+#[cfg(feature = "memory-cortex")]
+pub mod cortex_backend;
+#[cfg(feature = "memory-cortex")]
+pub mod cortex_config_resolver;
 pub mod embeddings;
 pub mod hygiene;
 pub mod lucid;
@@ -21,6 +27,8 @@ pub use backend::{
     classify_memory_backend, default_memory_backend_key, memory_backend_profile,
     selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
 };
+#[cfg(feature = "memory-cortex")]
+pub use cortex_backend::CortexMemory;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
@@ -58,6 +66,9 @@ where
         MemoryBackendKind::Postgres => postgres_builder(),
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
+        }
+        MemoryBackendKind::Cortex => {
+            anyhow::bail!("memory backend 'cortex' requires feature flag, rebuild with --features memory-cortex")
         }
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
         MemoryBackendKind::Unknown => {
@@ -197,7 +208,7 @@ pub fn create_memory(
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes(config, &[], None, workspace_dir, api_key)
+    create_memory_with_storage_and_routes(config, &[], None, workspace_dir, api_key, None)
 }
 
 /// Factory: create memory with optional storage-provider override.
@@ -207,16 +218,27 @@ pub fn create_memory_with_storage(
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes(config, &[], storage_provider, workspace_dir, api_key)
+    create_memory_with_storage_and_routes(
+        config,
+        &[],
+        storage_provider,
+        workspace_dir,
+        api_key,
+        None,
+    )
 }
 
 /// Factory: create memory with optional storage-provider override and embedding routes.
+///
+/// `zeroclaw_config` is required for cortex backend to derive LLM settings.
+/// Pass `None` for non-cortex backends or when no full config is available.
 pub fn create_memory_with_storage_and_routes(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
     storage_provider: Option<&StorageProviderConfig>,
     workspace_dir: &Path,
     api_key: Option<&str>,
+    zeroclaw_config: Option<&crate::config::Config>,
 ) -> anyhow::Result<Box<dyn Memory>> {
     let backend_name = effective_memory_backend_name(&config.backend, storage_provider);
     let backend_kind = classify_memory_backend(&backend_name);
@@ -225,6 +247,59 @@ pub fn create_memory_with_storage_and_routes(
     // Best-effort memory hygiene/retention pass (throttled by state file).
     if let Err(e) = hygiene::run_if_due(config, workspace_dir) {
         tracing::warn!("memory hygiene skipped: {e}");
+    }
+
+    // Cortex backend (requires memory-cortex feature)
+    #[cfg(feature = "memory-cortex")]
+    if matches!(backend_kind, MemoryBackendKind::Cortex) {
+        tracing::debug!(
+            "Cortex-Memory backend selected (tenant: {})",
+            config.cortex.tenant_id
+        );
+
+        let memory_config = config.clone();
+        let workspace_dir = workspace_dir.to_path_buf();
+
+        // Get the full zeroclaw config, or construct a minimal one from available params
+        let config_clone = if let Some(full_config) = zeroclaw_config {
+            full_config.clone()
+        } else {
+            // Fallback: build a minimal config from available parameters
+            // api_key priority: embedding route key > cortex override > passed api_key parameter
+            let resolved_api_key = embedding_routes
+                .iter()
+                .find(|r| r.hint == config.embedding_model.strip_prefix("hint:").unwrap_or(""))
+                .and_then(|r| r.api_key.clone())
+                .or_else(|| config.cortex.embedding_api_key_override.clone())
+                .or_else(|| api_key.map(|s| s.to_string()));
+
+            crate::config::Config {
+                memory: config.clone(),
+                embedding_routes: embedding_routes.to_vec(),
+                storage: crate::config::StorageConfig::default(),
+                workspace_dir: workspace_dir.clone(),
+                api_key: resolved_api_key,
+                default_provider: None,
+                default_model: None,
+                api_url: None,
+                ..crate::config::Config::default()
+            }
+        };
+
+        return tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                crate::memory::CortexMemory::new(&memory_config, workspace_dir, &config_clone)
+                    .await
+                    .map(|m| Box::new(m) as Box<dyn Memory>)
+            })
+        });
+    }
+
+    #[cfg(not(feature = "memory-cortex"))]
+    if matches!(backend_kind, MemoryBackendKind::Cortex) {
+        anyhow::bail!(
+            "memory backend 'cortex' requires feature flag, rebuild with --features memory-cortex"
+        )
     }
 
     // If snapshot_on_hygiene is enabled, export core memories during hygiene.

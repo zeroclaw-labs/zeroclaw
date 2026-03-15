@@ -2168,6 +2168,95 @@ impl Default for QdrantConfig {
     }
 }
 
+/// Cortex-Memory backend configuration
+///
+/// Cortex-Memory is an advanced memory system with L0/L1/L2 layered architecture
+/// and semantic vector search. Configuration auto-derives from zeroclaw's global
+/// settings (api_key, default_provider, embedding_provider) when not explicitly set.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CortexMemConfig {
+    /// Cortex data directory for memory storage.
+    /// Default: workspace_dir/cortex-data
+    #[serde(default)]
+    pub data_dir: Option<String>,
+
+    /// Qdrant vector database URL.
+    /// Required for cortex backend. Default: http://localhost:6334
+    #[serde(default)]
+    pub qdrant_url: Option<String>,
+
+    /// Qdrant collection name for memory vectors.
+    /// Default: zeroclaw-memory
+    #[serde(default = "default_cortex_qdrant_collection")]
+    pub qdrant_collection: String,
+
+    /// Qdrant API key (for Qdrant Cloud or secured instances).
+    #[serde(default)]
+    pub qdrant_api_key: Option<String>,
+
+    /// Tenant identifier for multi-tenancy isolation.
+    /// Default: "zeroclaw"
+    #[serde(default = "default_cortex_tenant")]
+    pub tenant_id: String,
+
+    /// Override LLM model for memory extraction.
+    /// If not set, uses zeroclaw's default_model.
+    #[serde(default)]
+    pub llm_model_override: Option<String>,
+
+    /// Override LLM temperature for memory extraction tasks.
+    /// Lower values (0.1-0.3) recommended for extraction. Default: 0.3
+    #[serde(default = "default_cortex_llm_temperature")]
+    pub llm_temperature: f32,
+
+    /// Override Embedding API key.
+    /// If not set, uses zeroclaw's api_key or embedding_routes key.
+    #[serde(default)]
+    pub embedding_api_key_override: Option<String>,
+
+    /// Enable automatic indexing of messages to vector database.
+    #[serde(default = "default_true")]
+    pub auto_index: bool,
+
+    /// Enable automatic memory extraction on session close.
+    #[serde(default = "default_true")]
+    pub auto_extract: bool,
+
+    /// Generate L0/L1 layer files when session closes.
+    #[serde(default = "default_true")]
+    pub generate_layers_on_close: bool,
+}
+
+fn default_cortex_qdrant_collection() -> String {
+    "zeroclaw-memory".into()
+}
+
+fn default_cortex_tenant() -> String {
+    "zeroclaw".into()
+}
+
+fn default_cortex_llm_temperature() -> f32 {
+    0.3
+}
+
+impl Default for CortexMemConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: None,
+            qdrant_url: None,
+            qdrant_collection: default_cortex_qdrant_collection(),
+            qdrant_api_key: None,
+            tenant_id: default_cortex_tenant(),
+            llm_model_override: None,
+            llm_temperature: default_cortex_llm_temperature(),
+            embedding_api_key_override: None,
+            auto_index: true,
+            auto_extract: true,
+            generate_layers_on_close: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
@@ -2250,6 +2339,13 @@ pub struct MemoryConfig {
     /// Only used when `backend = "qdrant"`.
     #[serde(default)]
     pub qdrant: QdrantConfig,
+
+    // ── Cortex-Memory backend options ─────────────────────────
+    /// Configuration for Cortex-Memory backend.
+    /// Only used when `backend = "cortex"`.
+    /// Cortex-Memory auto-derives LLM and Embedding config from zeroclaw global settings.
+    #[serde(default)]
+    pub cortex: CortexMemConfig,
 }
 
 fn default_embedding_provider() -> String {
@@ -2320,6 +2416,7 @@ impl Default for MemoryConfig {
             auto_hydrate: true,
             sqlite_open_timeout_secs: None,
             qdrant: QdrantConfig::default(),
+            cortex: CortexMemConfig::default(),
         }
     }
 }
@@ -4938,6 +5035,14 @@ impl Config {
 
             config.apply_env_overrides();
             config.validate()?;
+
+            tracing::info!(
+                "After load: api_url={:?}, default_provider={:?}, default_model={:?}",
+                config.api_url,
+                config.default_provider,
+                config.default_model
+            );
+
             tracing::info!(
                 path = %config.config_path.display(),
                 workspace = %config.workspace_dir.display(),

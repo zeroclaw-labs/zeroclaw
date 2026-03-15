@@ -115,6 +115,11 @@ async-trait = "0.1"
 # HMAC-SHA256 (Zhipu/GLM JWT auth)
 ring = "0.17"
 
+# Cortex-Memory integration (advanced L0/L1/L2 layered memory with semantic search)
+cortex-mem-tools = { version = "2.5", optional = true }
+cortex-mem-core = { version = "2.5", optional = true }
+cortex-mem-config = { version = "2.5", optional = true }
+
 # Protobuf encode/decode (Lark WS frame codec, WhatsApp storage)
 prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
 
@@ -212,6 +217,7 @@ channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
 channel-feishu = ["channel-lark"]  # Alias for Feishu users (Lark and Feishu are the same platform)
 memory-postgres = ["dep:postgres"]
+memory-cortex = ["dep:cortex-mem-tools", "dep:cortex-mem-core", "dep:cortex-mem-config"]
 observability-prometheus = ["dep:prometheus"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 peripheral-rpi = ["rppal"]

@@ -370,6 +370,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
+        Some(&config),
     )?);
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);

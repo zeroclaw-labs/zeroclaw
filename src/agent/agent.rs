@@ -256,6 +256,7 @@ impl Agent {
             Some(&config.storage.provider.config),
             &config.workspace_dir,
             config.api_key.as_deref(),
+            Some(config),
         )?);
 
         let composio_key = if config.composio.enabled {

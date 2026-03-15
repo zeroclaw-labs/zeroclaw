@@ -2985,6 +2985,7 @@ pub async fn run(
         Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
+        Some(&config),
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
@@ -3580,6 +3581,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
+        Some(&config),
     )?);
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {

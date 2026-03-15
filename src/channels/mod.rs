@@ -3504,6 +3504,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
+        Some(&config),
     )?);
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
