@@ -36,6 +36,7 @@ pub mod otp;
 pub mod pairing;
 pub mod policy;
 pub mod prompt_guard;
+pub mod rate_limiter;
 pub mod secrets;
 pub mod traits;
 

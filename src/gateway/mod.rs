@@ -315,6 +315,8 @@ pub struct AppState {
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// Registry of dynamically connected nodes
     pub node_registry: Arc<nodes::NodeRegistry>,
+    /// Optional per-key token-bucket rate limiter (from `[resilience]` config).
+    pub resilience_rate_limiter: Option<Arc<crate::security::rate_limiter::TokenBucketRateLimiter>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -664,6 +666,20 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         event_tx,
         shutdown_tx,
         node_registry,
+        resilience_rate_limiter: if config.resilience.rate_limit_enabled {
+            Some(Arc::new(
+                crate::security::rate_limiter::TokenBucketRateLimiter::new(
+                    crate::security::rate_limiter::RateLimiterConfig {
+                        requests_per_window: config.resilience.requests_per_minute,
+                        burst: config.resilience.burst,
+                        window: Duration::from_secs(60),
+                        max_keys: 10_000,
+                    },
+                ),
+            ))
+        } else {
+            None
+        },
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -935,6 +951,18 @@ async fn handle_webhook(
             "retry_after": RATE_LIMIT_WINDOW_SECS,
         });
         return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+    }
+
+    // Resilience token-bucket rate limiter (if enabled via [resilience] config).
+    if let Some(ref rl) = state.resilience_rate_limiter {
+        if let Err(limited) = rl.check(&rate_key) {
+            tracing::warn!("/webhook resilience rate limit exceeded");
+            let err = serde_json::json!({
+                "error": "Too many requests. Please retry later.",
+                "retry_after": limited.retry_after.as_secs(),
+            });
+            return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+        }
     }
 
     // ── Bearer token auth (pairing) ──
@@ -1753,6 +1781,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            resilience_rate_limiter: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1805,6 +1834,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            resilience_rate_limiter: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2181,6 +2211,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            resilience_rate_limiter: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2247,6 +2278,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            resilience_rate_limiter: None,
         };
 
         let headers = HeaderMap::new();
@@ -2325,6 +2357,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            resilience_rate_limiter: None,
         };
 
         let response = handle_webhook(
@@ -2375,6 +2408,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            resilience_rate_limiter: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2430,6 +2464,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            resilience_rate_limiter: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2490,6 +2525,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            resilience_rate_limiter: None,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2546,6 +2582,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            resilience_rate_limiter: None,
         };
 
         let mut headers = HeaderMap::new();
