@@ -507,7 +507,7 @@ Max Concurrent: 5 (Wave 1)
   - Message: `feat(bridge): add message transformation logic`
   - Files: `crates/zeroclaw-bridge/src/transform.rs`
 
-- [ ] 7. Bridge 核心事件循环
+- [x] 7. Bridge 核心事件循环
 
   **What to do**:
   - 创建 `src/bridge.rs`

@@ -239,3 +239,39 @@ All schemas validated with jq:
 - Heartbeat messages not included (not part of gateway protocol)
 - Pure transformation layer - no business logic or state
 - Ready for integration with MQTT/WS client layers
+
+## Task 7: Bridge Event Loop (2026-03-15)
+
+### Implementation Details
+- Created `crates/zeroclaw-bridge/src/bridge.rs` with dual-direction forwarding
+- Added `bridge` module to `src/lib.rs`
+- Uses `tokio::select!` for concurrent MQTT and WebSocket event handling
+
+### Key Patterns
+- **Stateless bridge**: No internal state, pure message forwarding
+- **tokio::select!**: Concurrent polling of MQTT event loop and WebSocket receive
+- **Error handling**: Logs errors but continues running (resilient to transient failures)
+- **Auto-reconnect**: WebSocket reconnects on close, MQTT has built-in retry in connect()
+
+### API Surface
+- `Bridge::new(mqtt, ws)` - constructor
+- `.run()` - main event loop (runs until WebSocket reconnect fails)
+
+### Message Flow
+- **MQTT → WS**: Poll MQTT events → extract Publish packets → transform → send to WebSocket
+- **WS → MQTT**: Receive WebSocket text → transform → publish to MQTT topic
+
+### Topic Routing
+- MQTT subscriptions: `zeroclaw/nodes/+/register`, `zeroclaw/nodes/+/result`
+- Invoke messages: Currently broadcast to `zeroclaw/nodes/+/invoke` (wildcard)
+- Production improvement: Extract target node_id from invocation context
+
+### Verification
+- `cargo build -p zeroclaw-bridge`: ✅ SUCCESS
+- Dead code warnings for `BridgeConfig` expected (not used in bridge.rs yet)
+
+### Integration Notes
+- Bridge connects both clients before entering event loop
+- MQTT uses QoS 1 for all publishes (from mqtt_client.rs)
+- WebSocket uses exponential backoff retry (from ws_client.rs)
+- Transform layer handles all JSON serialization/deserialization
