@@ -1,4 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::security::taint::TaintLabel;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -275,6 +276,7 @@ impl Channel for DingTalkChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: None,
+                        taint: TaintLabel::default(),
                     };
 
                     if tx.send(channel_msg).await.is_err() {

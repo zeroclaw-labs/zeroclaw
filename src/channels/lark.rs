@@ -823,6 +823,7 @@ impl LarkChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: None,
+                    taint: TaintLabel::default(),
                     };
 
                     tracing::debug!("Lark WS: message in {}", lark_msg.chat_id);
@@ -1120,6 +1121,7 @@ impl LarkChannel {
             channel: self.channel_name().to_string(),
             timestamp,
             thread_ts: None,
+            taint: TaintLabel::default(),
         });
 
         messages
@@ -2129,6 +2131,7 @@ mod tests {
     #[test]
     fn lark_from_feishu_config_sets_feishu_platform() {
         use crate::config::schema::{FeishuConfig, LarkReceiveMode};
+        use crate::security::taint::TaintLabel;
 
         let cfg = FeishuConfig {
             app_id: "cli_feishu_app123".into(),

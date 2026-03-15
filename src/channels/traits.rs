@@ -1,3 +1,4 @@
+use crate::security::taint::TaintLabel;
 use async_trait::async_trait;
 
 /// A message received from or sent to a channel
@@ -12,6 +13,9 @@ pub struct ChannelMessage {
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
+    /// Taint label indicating the origin of this message's content.
+    /// Channel messages are automatically tagged as `UserInput`.
+    pub taint: TaintLabel,
 }
 
 /// Message to send through a channel
@@ -182,6 +186,7 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
+                taint: TaintLabel::default(),
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -198,6 +203,7 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
+            taint: TaintLabel::default(),
         };
 
         let cloned = message.clone();

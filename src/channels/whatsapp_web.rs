@@ -28,6 +28,7 @@
 
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use super::whatsapp_storage::RusqliteStore;
+use crate::security::taint::TaintLabel;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -449,6 +450,7 @@ impl Channel for WhatsAppWebChannel {
                                             content: trimmed.to_string(),
                                             timestamp: chrono::Utc::now().timestamp() as u64,
                                             thread_ts: None,
+                                        taint: TaintLabel::default(),
                                         })
                                         .await
                                     {

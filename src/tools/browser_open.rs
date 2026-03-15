@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::security::taint::TaintLabel;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -87,6 +88,7 @@ impl Tool for BrowserOpenTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -95,6 +97,7 @@ impl Tool for BrowserOpenTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -105,6 +108,7 @@ impl Tool for BrowserOpenTool {
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),
+                    taint: TaintLabel::default(),
                 })
             }
         };
@@ -114,11 +118,13 @@ impl Tool for BrowserOpenTool {
                 success: true,
                 output: format!("Opened in system browser: {url}"),
                 error: None,
+                taint: TaintLabel::default(),
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to open system browser: {e}")),
+                taint: TaintLabel::default(),
             }),
         }
     }

@@ -35,6 +35,7 @@ impl Tool for EchoTool {
             success: true,
             output: msg,
             error: None,
+            taint: Default::default(),
         })
     }
 }
@@ -74,6 +75,7 @@ impl Tool for CountingTool {
             success: true,
             output: format!("call #{}", *c),
             error: None,
+            taint: Default::default(),
         })
     }
 }
@@ -97,6 +99,7 @@ impl Tool for FailingTool {
             success: false,
             output: String::new(),
             error: Some("Service unavailable: connection timeout".into()),
+            taint: Default::default(),
         })
     }
 }
@@ -147,6 +150,7 @@ impl Tool for RecordingTool {
             success: true,
             output,
             error: None,
+            taint: Default::default(),
         })
     }
 }

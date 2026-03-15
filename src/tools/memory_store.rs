@@ -1,6 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::memory::{Memory, MemoryCategory};
 use crate::security::policy::ToolOperation;
+use crate::security::taint::TaintLabel;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -75,6 +76,7 @@ impl Tool for MemoryStoreTool {
                 success: false,
                 output: String::new(),
                 error: Some(error),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -83,11 +85,13 @@ impl Tool for MemoryStoreTool {
                 success: true,
                 output: format!("Stored memory: {key}"),
                 error: None,
+                taint: TaintLabel::default(),
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to store memory: {e}")),
+                taint: TaintLabel::default(),
             }),
         }
     }

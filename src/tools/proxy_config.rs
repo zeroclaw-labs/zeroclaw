@@ -2,6 +2,7 @@ use super::traits::{Tool, ToolResult};
 use crate::config::{
     runtime_proxy_config, set_runtime_proxy_config, Config, ProxyConfig, ProxyScope,
 };
+use crate::security::taint::TaintLabel;
 use crate::security::SecurityPolicy;
 use crate::util::MaybeSet;
 use async_trait::async_trait;
@@ -44,6 +45,7 @@ impl ProxyConfigTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -52,6 +54,7 @@ impl ProxyConfigTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -149,6 +152,7 @@ impl ProxyConfigTool {
                 "environment": Self::env_snapshot(),
             }))?,
             error: None,
+            taint: TaintLabel::default(),
         })
     }
 
@@ -165,6 +169,7 @@ impl ProxyConfigTool {
                 }
             }))?,
             error: None,
+            taint: TaintLabel::default(),
         })
     }
 
@@ -262,6 +267,7 @@ impl ProxyConfigTool {
                 "environment": Self::env_snapshot(),
             }))?,
             error: None,
+            taint: TaintLabel::default(),
         })
     }
 
@@ -289,6 +295,7 @@ impl ProxyConfigTool {
                 "environment": Self::env_snapshot(),
             }))?,
             error: None,
+            taint: TaintLabel::default(),
         })
     }
 
@@ -319,6 +326,7 @@ impl ProxyConfigTool {
                 "environment": Self::env_snapshot(),
             }))?,
             error: None,
+            taint: TaintLabel::default(),
         })
     }
 
@@ -331,6 +339,7 @@ impl ProxyConfigTool {
                 "environment": Self::env_snapshot(),
             }))?,
             error: None,
+            taint: TaintLabel::default(),
         })
     }
 }
@@ -430,6 +439,7 @@ impl Tool for ProxyConfigTool {
                 success: false,
                 output: String::new(),
                 error: Some(error.to_string()),
+                taint: TaintLabel::default(),
             }),
         }
     }

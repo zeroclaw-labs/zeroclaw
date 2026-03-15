@@ -1,4 +1,5 @@
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
+use crate::security::taint::TaintLabel;
 use async_trait::async_trait;
 use directories::UserDirs;
 use rusqlite::{Connection, OpenFlags};
@@ -294,6 +295,7 @@ end tell"#
                                 .unwrap_or_default()
                                 .as_secs(),
                             thread_ts: None,
+                            taint: TaintLabel::default(),
                         };
 
                         if tx.send(msg).await.is_err() {

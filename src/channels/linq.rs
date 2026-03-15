@@ -1,4 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::security::taint::TaintLabel;
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -267,6 +268,7 @@ impl LinqChannel {
             channel: "linq".to_string(),
             timestamp,
             thread_ts: None,
+            taint: TaintLabel::default(),
         });
 
         messages
