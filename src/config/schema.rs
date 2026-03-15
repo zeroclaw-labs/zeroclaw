@@ -1912,6 +1912,11 @@ pub struct HttpRequestConfig {
     /// Default: false (deny private hosts for SSRF protection).
     #[serde(default)]
     pub allow_private_hosts: bool,
+    /// Named secrets for auth headers, resolved via SecretStore at execution time.
+    /// Keys are secret names, values are auth header values (e.g. `"Bearer sk-ant-..."`).
+    /// Referenced in tool calls via the `auth_secret` parameter.
+    #[serde(default)]
+    pub secrets: std::collections::HashMap<String, String>,
 }
 
 impl Default for HttpRequestConfig {
@@ -1922,6 +1927,7 @@ impl Default for HttpRequestConfig {
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
             allow_private_hosts: false,
+            secrets: std::collections::HashMap::new(),
         }
     }
 }

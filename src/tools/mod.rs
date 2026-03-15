@@ -355,12 +355,15 @@ pub fn all_tools_with_runtime(
     }
 
     if http_config.enabled {
-        tool_arcs.push(Arc::new(HttpRequestTool::new(
+        tool_arcs.push(Arc::new(HttpRequestTool::new_with_config(
             security.clone(),
             http_config.allowed_domains.clone(),
             http_config.max_response_size,
             http_config.timeout_secs,
             http_config.allow_private_hosts,
+            root_config.config_path.clone(),
+            root_config.secrets.encrypt,
+            http_config.secrets.clone(),
         )));
     }
 
