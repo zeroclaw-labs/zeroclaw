@@ -342,8 +342,28 @@ function App() {
             };
           }),
         );
-      } catch {
-        // Greeting failed silently — user can still chat normally
+      } catch (err) {
+        // If greeting fails, show a placeholder welcome message
+        const fallbackText = isFirstLogin
+          ? (locale === "ko"
+            ? "안녕하세요. 저는 MoA입니다. 현재 서버 연결을 확인 중입니다. 잠시 후 다시 시도해주세요."
+            : "Hello. I'm MoA. The server connection is being established. Please try again shortly.")
+          : (locale === "ko"
+            ? "안녕하세요. 현재 서버 연결을 확인 중입니다."
+            : "Hello. Checking server connection...");
+        const fallbackMsg = createMessage("assistant", fallbackText);
+
+        setChats((prev) =>
+          prev.map((c) => {
+            if (c.id !== chatId) return c;
+            return {
+              ...c,
+              title: t("app_title", locale),
+              messages: [fallbackMsg],
+              updatedAt: Date.now(),
+            };
+          }),
+        );
       }
     },
     [locale],
