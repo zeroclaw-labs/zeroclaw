@@ -68,6 +68,20 @@ pub enum ObserverEvent {
         /// Human-readable error description. Must not contain secrets or tokens.
         message: String,
     },
+    /// A hand has started execution.
+    HandStarted { hand_name: String },
+    /// A hand has completed execution successfully.
+    HandCompleted {
+        hand_name: String,
+        duration_ms: u64,
+        findings_count: usize,
+    },
+    /// A hand has failed during execution.
+    HandFailed {
+        hand_name: String,
+        error: String,
+        duration_ms: u64,
+    },
 }
 
 /// Numeric metrics emitted by the agent runtime.
@@ -84,6 +98,15 @@ pub enum ObserverMetric {
     ActiveSessions(u64),
     /// Current depth of the inbound message queue.
     QueueDepth(u64),
+    /// Duration of a single hand run.
+    HandRunDuration {
+        hand_name: String,
+        duration: Duration,
+    },
+    /// Number of findings produced by a hand run.
+    HandFindingsCount { hand_name: String, count: u64 },
+    /// Records a hand run outcome for success-rate tracking.
+    HandSuccessRate { hand_name: String, success: bool },
 }
 
 /// Core observability trait for recording agent runtime telemetry.
@@ -199,5 +222,68 @@ mod tests {
 
         assert!(matches!(cloned_event, ObserverEvent::ToolCall { .. }));
         assert!(matches!(cloned_metric, ObserverMetric::RequestLatency(_)));
+    }
+
+    #[test]
+    fn hand_events_recordable() {
+        let observer = DummyObserver::default();
+
+        observer.record_event(&ObserverEvent::HandStarted {
+            hand_name: "review".into(),
+        });
+        observer.record_event(&ObserverEvent::HandCompleted {
+            hand_name: "review".into(),
+            duration_ms: 1500,
+            findings_count: 3,
+        });
+        observer.record_event(&ObserverEvent::HandFailed {
+            hand_name: "review".into(),
+            error: "timeout".into(),
+            duration_ms: 5000,
+        });
+
+        assert_eq!(*observer.events.lock(), 3);
+    }
+
+    #[test]
+    fn hand_metrics_recordable() {
+        let observer = DummyObserver::default();
+
+        observer.record_metric(&ObserverMetric::HandRunDuration {
+            hand_name: "review".into(),
+            duration: Duration::from_millis(1500),
+        });
+        observer.record_metric(&ObserverMetric::HandFindingsCount {
+            hand_name: "review".into(),
+            count: 3,
+        });
+        observer.record_metric(&ObserverMetric::HandSuccessRate {
+            hand_name: "review".into(),
+            success: true,
+        });
+
+        assert_eq!(*observer.metrics.lock(), 3);
+    }
+
+    #[test]
+    fn hand_event_and_metric_are_cloneable() {
+        let event = ObserverEvent::HandCompleted {
+            hand_name: "review".into(),
+            duration_ms: 500,
+            findings_count: 2,
+        };
+        let metric = ObserverMetric::HandRunDuration {
+            hand_name: "review".into(),
+            duration: Duration::from_millis(500),
+        };
+
+        let cloned_event = event.clone();
+        let cloned_metric = metric.clone();
+
+        assert!(matches!(cloned_event, ObserverEvent::HandCompleted { .. }));
+        assert!(matches!(
+            cloned_metric,
+            ObserverMetric::HandRunDuration { .. }
+        ));
     }
 }
