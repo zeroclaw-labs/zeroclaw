@@ -348,7 +348,21 @@ export class MoAClient {
   // - If no local API key → chat via relay server (operator key, credits deducted)
 
   hasLocalApiKey(): boolean {
-    // Check all possible key storage names (anthropic = claude provider key)
+    // Check if the SELECTED provider has an API key configured.
+    // Only route to local gateway when the selected provider's key exists.
+    const provider = localStorage.getItem("zeroclaw_llm_provider") || "gemini";
+    const providerKeyMap: Record<string, string> = {
+      claude: "anthropic",
+      openai: "openai",
+      gemini: "gemini",
+    };
+    const keyStorageName = providerKeyMap[provider] || provider;
+    const key = localStorage.getItem(`zeroclaw_api_key_${keyStorageName}`);
+    return !!key && key.trim().length > 0;
+  }
+
+  hasAnyLocalApiKey(): boolean {
+    // Check if ANY provider has an API key configured (for Settings display).
     const keyNames = ["anthropic", "openai", "gemini"];
     return keyNames.some((p) => {
       const key = localStorage.getItem(`zeroclaw_api_key_${p}`);
@@ -366,8 +380,8 @@ export class MoAClient {
     }
 
     // Include user's selected provider/model preference
-    const provider = localStorage.getItem("zeroclaw_llm_provider") || "claude";
-    const model = localStorage.getItem("zeroclaw_llm_model") || "claude-opus-4-20250514";
+    const provider = localStorage.getItem("zeroclaw_llm_provider") || "gemini";
+    const model = localStorage.getItem("zeroclaw_llm_model") || "gemini-2.5-flash";
 
     // Map frontend provider names to API key storage names
     const providerKeyMap: Record<string, string> = {
@@ -378,24 +392,39 @@ export class MoAClient {
     const keyStorageName = providerKeyMap[provider] || provider;
     const apiKey = localStorage.getItem(`zeroclaw_api_key_${keyStorageName}`) || "";
 
+    const hasSelectedProviderKey = !!apiKey && apiKey.trim().length > 0;
     const chatBaseUrl = this.getChatUrl();
-    const isLocal = this.hasLocalApiKey();
 
-    const res = await fetch(`${chatBaseUrl}/api/chat`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.token}`,
-      },
-      body: JSON.stringify({
-        message,
-        context,
-        provider,
-        model,
-        // Only send API key to local gateway, not to relay
-        ...(isLocal && apiKey ? { api_key: apiKey } : {}),
-      }),
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${chatBaseUrl}/api/chat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.token}`,
+        },
+        body: JSON.stringify({
+          message,
+          context,
+          provider,
+          model,
+          // Send API key when we have one for the selected provider
+          ...(hasSelectedProviderKey ? { api_key: apiKey } : {}),
+        }),
+      });
+    } catch (err) {
+      if (err instanceof TypeError && err.message === "Failed to fetch") {
+        if (hasSelectedProviderKey) {
+          throw new Error(
+            "Cannot connect to local MoA server. Please check that the server is running.",
+          );
+        }
+        throw new Error(
+          "Cannot connect to server. Please check your network connection.",
+        );
+      }
+      throw err;
+    }
 
     if (!res.ok) {
       if (res.status === 401) {
@@ -404,7 +433,17 @@ export class MoAClient {
         throw new Error("Chat authentication failed. Please check your connection settings.");
       }
       const text = await res.text().catch(() => "Unknown error");
-      throw new Error(`Chat request failed (${res.status}): ${text}`);
+      // Extract user-friendly error from JSON response if available
+      let errorMessage = text;
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed.error) {
+          errorMessage = parsed.error;
+        }
+      } catch {
+        // JSON parse failed, use raw text
+      }
+      throw new Error(errorMessage || `Chat request failed (${res.status})`);
     }
 
     const data = await res.json();

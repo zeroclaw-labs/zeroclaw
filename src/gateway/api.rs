@@ -234,15 +234,15 @@ pub async fn handle_api_config_api_key_put(
 
     let mut config = state.config.lock().clone();
 
-    // Set the API key based on provider name
-    match provider {
-        "openai" | "openrouter" | "anthropic" | "google" | "gemini" => {
-            config.api_key = Some(api_key.to_string());
-        }
-        _ => {
-            config.api_key = Some(api_key.to_string());
-        }
-    }
+    // Map frontend provider names to backend provider names
+    let backend_provider = match provider {
+        "claude" => "anthropic",
+        p => p,
+    };
+
+    // Set the API key and default provider
+    config.api_key = Some(api_key.to_string());
+    config.default_provider = Some(backend_provider.to_string());
 
     if let Err(e) = config.save().await {
         return (
@@ -254,7 +254,7 @@ pub async fn handle_api_config_api_key_put(
 
     *state.config.lock() = config;
 
-    Json(serde_json::json!({"status": "ok", "provider": provider})).into_response()
+    Json(serde_json::json!({"status": "ok", "provider": backend_provider})).into_response()
 }
 
 /// GET /api/tools — list registered tool specs

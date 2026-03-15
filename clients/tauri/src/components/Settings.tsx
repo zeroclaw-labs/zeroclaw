@@ -64,11 +64,11 @@ function setStoredApiKey(provider: string, key: string): void {
 }
 
 function getStoredProvider(): string {
-  return localStorage.getItem(STORAGE_KEY_LLM_PROVIDER) || "claude";
+  return localStorage.getItem(STORAGE_KEY_LLM_PROVIDER) || "gemini";
 }
 
 function getStoredModel(): string {
-  return localStorage.getItem(STORAGE_KEY_LLM_MODEL) || "claude-opus-4-20250514";
+  return localStorage.getItem(STORAGE_KEY_LLM_MODEL) || "gemini-2.5-flash";
 }
 
 export function Settings({ locale, isConnected, onLocaleChange, onBack, onLogout }: SettingsProps) {
@@ -182,7 +182,7 @@ export function Settings({ locale, isConnected, onLocaleChange, onBack, onLogout
 
     try {
       // When user has no API key, check relay server; otherwise check local gateway
-      if (apiClient.hasLocalApiKey()) {
+      if (apiClient.hasAnyLocalApiKey()) {
         const result = await apiClient.healthCheck();
         if (result.status === "ok") {
           setMessage({ type: "success", text: t("server_healthy", locale) });
@@ -255,7 +255,7 @@ export function Settings({ locale, isConnected, onLocaleChange, onBack, onLogout
     clearMessage();
   }, [locale, clearMessage]);
 
-  const hasApiKey = apiClient.hasLocalApiKey();
+  const hasApiKey = apiClient.hasAnyLocalApiKey();
   const models = MODEL_OPTIONS[selectedProvider] || [];
 
   const formatLastSeen = (timestamp: number) => {

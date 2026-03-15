@@ -526,6 +526,34 @@ impl PaymentManager {
         }
     }
 
+    /// Add bonus credits to a user's balance (e.g., signup bonus).
+    ///
+    /// Unlike `complete_payment`, this does not require a payment transaction.
+    /// Used for promotional credits, signup bonuses, and referral rewards.
+    pub fn add_bonus_credits(&self, user_id: &str, amount: u32) -> anyhow::Result<u32> {
+        if !self.enabled {
+            anyhow::bail!("Payment features are disabled");
+        }
+
+        let Some(ref conn) = self.conn else {
+            anyhow::bail!("Payment database not initialized");
+        };
+
+        let now = now_epoch();
+
+        conn.execute(
+            "INSERT INTO credit_balances (user_id, balance, total_purchased, total_spent, updated_at)
+             VALUES (?1, ?2, ?2, 0, ?3)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 balance = balance + ?2,
+                 total_purchased = total_purchased + ?2,
+                 updated_at = ?3",
+            params![user_id, amount, now],
+        )?;
+
+        self.get_balance(user_id)
+    }
+
     /// Deduct credits from a user's balance (for usage).
     ///
     /// Returns the new balance, or an error if insufficient credits.

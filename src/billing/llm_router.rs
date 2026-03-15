@@ -22,6 +22,131 @@ pub enum KeySource {
     OperatorKey,
 }
 
+/// 3-tier provider access mode.
+///
+/// Determines how LLM calls are routed, billed, and which models are used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderAccessMode {
+    /// User provided their own API key → direct device→provider call,
+    /// no credit deduction. User chooses model freely.
+    UserKey,
+    /// No API key, but user explicitly selected a model →
+    /// Railway relay with operator key, credits deducted at 2.2×.
+    PlatformSelected,
+    /// No API key, no model selection (new/default users) →
+    /// Railway relay with operator key, task-based auto-routing,
+    /// credits deducted at 2.2×.
+    PlatformDefault,
+}
+
+/// Determine the provider access mode for a request.
+pub fn determine_access_mode(
+    user_has_key: bool,
+    user_selected_model: bool,
+) -> ProviderAccessMode {
+    if user_has_key {
+        ProviderAccessMode::UserKey
+    } else if user_selected_model {
+        ProviderAccessMode::PlatformSelected
+    } else {
+        ProviderAccessMode::PlatformDefault
+    }
+}
+
+/// Task category for default model routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskCategory {
+    /// 일반 채팅 (General chat / web search)
+    GeneralChat,
+    /// 추론/문서 (Reasoning / document analysis)
+    ReasoningDocument,
+    /// 코딩 (Coding)
+    Coding,
+    /// 코드 리뷰 (Code review)
+    CodeReview,
+    /// 이미지 (Image generation/analysis)
+    Image,
+    /// 음악 (Music)
+    Music,
+    /// 비디오 (Video)
+    Video,
+    /// 통역 (Voice interpretation)
+    Interpretation,
+}
+
+/// Default model assignment for each task category (Platform Default mode).
+///
+/// These are used when the user has no API key and has not selected a model.
+pub fn default_model_for_task(task: TaskCategory) -> (&'static str, &'static str) {
+    // Returns (provider, model_id)
+    match task {
+        TaskCategory::GeneralChat => ("gemini", "gemini-3.1-flash-lite-preview"),
+        TaskCategory::ReasoningDocument => ("gemini", "gemini-3.1-pro-preview"),
+        TaskCategory::Coding => ("anthropic", "claude-opus-4-20250514"),
+        TaskCategory::CodeReview => ("gemini", "gemini-3.1-pro-preview"),
+        TaskCategory::Image => ("gemini", "gemini-3.1-flash-lite-preview"),
+        TaskCategory::Music => ("gemini", "gemini-3.1-flash-lite-preview"),
+        TaskCategory::Video => ("gemini", "gemini-3.1-flash-lite-preview"),
+        TaskCategory::Interpretation => ("gemini", "gemini-2.5-flash"),
+    }
+}
+
+/// Low-balance warning threshold in credits.
+///
+/// When a user's balance drops to or below this threshold, a warning is shown
+/// prompting them to recharge credits or enter their own API keys.
+/// ~$1 worth of credits (1 credit ≈ $0.007 → ~143 credits).
+pub const LOW_BALANCE_WARNING_THRESHOLD: u32 = 143;
+
+/// Signup bonus credits granted to new users upon registration.
+///
+/// Equivalent to approximately $3–5 of usage at 2.2× billing,
+/// enough for the user to explore MoA before purchasing credits
+/// or entering their own API keys.
+pub const SIGNUP_BONUS_CREDITS: u32 = 500;
+
+/// Grant signup bonus credits to a new user.
+///
+/// Called once during user registration. The bonus is enough for
+/// initial exploration of general chat (Gemini 3.1 Flash Lite is very
+/// cost-effective) and a few coding/document tasks.
+pub fn grant_signup_bonus(
+    payment_manager: &PaymentManager,
+    user_id: &str,
+) -> anyhow::Result<u32> {
+    payment_manager.add_bonus_credits(user_id, SIGNUP_BONUS_CREDITS)?;
+    tracing::info!(
+        user_id,
+        credits = SIGNUP_BONUS_CREDITS,
+        "Signup bonus credits granted"
+    );
+    Ok(SIGNUP_BONUS_CREDITS)
+}
+
+/// Check credit balance and return a warning status.
+///
+/// Returns:
+/// - `Ok(None)` — balance is healthy, no warning needed
+/// - `Ok(Some(balance))` — balance is low, caller should show warning
+/// - `Err(_)` — balance is zero or lookup failed
+pub fn check_credit_warning(
+    payment_manager: &PaymentManager,
+    user_id: &str,
+) -> anyhow::Result<Option<u32>> {
+    let balance = payment_manager.get_balance(user_id)?;
+    if balance == 0 {
+        anyhow::bail!(
+            "크레딧이 소진되었습니다. 크레딧을 충전하시거나 설정에서 직접 API 키를 입력해 주세요. \
+             (Credits exhausted. Please recharge credits or enter your own API keys in Settings.)"
+        );
+    }
+    if balance <= LOW_BALANCE_WARNING_THRESHOLD {
+        Ok(Some(balance))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Operator API keys loaded from environment variables.
 ///
 /// These are set as Railway environment variables by the operator.
@@ -79,7 +204,10 @@ pub struct ResolvedKey {
 }
 
 /// Credit multiplier applied when using the operator's key.
-const OPERATOR_KEY_CREDIT_MULTIPLIER: u32 = 2;
+///
+/// 2.0× base operator margin + 10% VAT = 2.2× total.
+/// Expressed as a float to preserve the fractional VAT component.
+const OPERATOR_KEY_CREDIT_MULTIPLIER: f64 = 2.2;
 
 /// Resolve which API key to use for a given provider.
 ///
@@ -145,11 +273,21 @@ pub fn record_usage(
     // Deduct credits only when using operator key
     if key_source == KeySource::OperatorKey {
         // Convert USD cost to credits: 1 credit ≈ ₩10 ≈ $0.007
-        // Then multiply by 2 for operator key usage
-        let base_credits = ((cost_usd / 0.007) * 1.0).ceil() as u32;
-        let credits_to_deduct = base_credits
-            .saturating_mul(OPERATOR_KEY_CREDIT_MULTIPLIER)
-            .max(1); // Minimum 1 credit
+        // Then multiply by 2.2× (2.0× operator margin + 10% VAT)
+        let base_credits = (cost_usd / 0.007).ceil();
+        let credits_to_deduct = (base_credits * OPERATOR_KEY_CREDIT_MULTIPLIER)
+            .ceil() as u32;
+        let credits_to_deduct = credits_to_deduct.max(1); // Minimum 1 credit
+
+        // Check balance and warn before deduction
+        let current_balance = payment_manager.get_balance(user_id).unwrap_or(0);
+        if current_balance <= LOW_BALANCE_WARNING_THRESHOLD && current_balance > 0 {
+            tracing::warn!(
+                user_id,
+                balance = current_balance,
+                "Low credit balance — user should recharge or enter own API keys"
+            );
+        }
 
         if let Err(e) = payment_manager.deduct_credits(user_id, credits_to_deduct) {
             tracing::warn!(
@@ -168,7 +306,7 @@ pub fn record_usage(
             cost_usd,
             credits_deducted = credits_to_deduct,
             multiplier = OPERATOR_KEY_CREDIT_MULTIPLIER,
-            "Operator key used — credits deducted"
+            "Operator key used — credits deducted (2.2× = 2× margin + VAT)"
         );
     }
 
@@ -269,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn record_usage_operator_key_deducts_credits() {
+    fn record_usage_operator_key_deducts_credits_at_2_2x() {
         let tmp = TempDir::new().unwrap();
         let tracker = CostTracker::new(tmp.path(), true).unwrap();
         let payment =
@@ -284,7 +422,7 @@ mod tests {
         let balance_before = payment.get_balance("zeroclaw_user").unwrap();
         assert_eq!(balance_before, 1500);
 
-        // Operator key → deduct 2x credits
+        // Operator key → deduct 2.2x credits (2× margin + 10% VAT)
         let result = record_usage(
             KeySource::OperatorKey,
             "zeroclaw_user",
@@ -320,5 +458,118 @@ mod tests {
             &payment,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn determine_access_mode_user_key() {
+        assert_eq!(
+            determine_access_mode(true, false),
+            ProviderAccessMode::UserKey
+        );
+        assert_eq!(
+            determine_access_mode(true, true),
+            ProviderAccessMode::UserKey
+        );
+    }
+
+    #[test]
+    fn determine_access_mode_platform_selected() {
+        assert_eq!(
+            determine_access_mode(false, true),
+            ProviderAccessMode::PlatformSelected
+        );
+    }
+
+    #[test]
+    fn determine_access_mode_platform_default() {
+        assert_eq!(
+            determine_access_mode(false, false),
+            ProviderAccessMode::PlatformDefault
+        );
+    }
+
+    #[test]
+    fn default_model_for_general_chat() {
+        let (provider, model) = default_model_for_task(TaskCategory::GeneralChat);
+        assert_eq!(provider, "gemini");
+        assert_eq!(model, "gemini-3.1-flash-lite-preview");
+    }
+
+    #[test]
+    fn default_model_for_coding() {
+        let (provider, model) = default_model_for_task(TaskCategory::Coding);
+        assert_eq!(provider, "anthropic");
+        assert_eq!(model, "claude-opus-4-20250514");
+    }
+
+    #[test]
+    fn default_model_for_reasoning_document() {
+        let (provider, model) = default_model_for_task(TaskCategory::ReasoningDocument);
+        assert_eq!(provider, "gemini");
+        assert_eq!(model, "gemini-3.1-pro-preview");
+    }
+
+    #[test]
+    fn default_model_for_code_review() {
+        let (provider, model) = default_model_for_task(TaskCategory::CodeReview);
+        assert_eq!(provider, "gemini");
+        assert_eq!(model, "gemini-3.1-pro-preview");
+    }
+
+    #[test]
+    fn default_model_for_interpretation() {
+        let (provider, model) = default_model_for_task(TaskCategory::Interpretation);
+        assert_eq!(provider, "gemini");
+        assert_eq!(model, "gemini-2.5-flash");
+    }
+
+    #[test]
+    fn signup_bonus_grants_credits() {
+        let tmp = TempDir::new().unwrap();
+        let payment =
+            PaymentManager::new(tmp.path(), None, "https://zeroclaw.example.com", true).unwrap();
+
+        let balance_before = payment.get_balance("new_user").unwrap();
+        assert_eq!(balance_before, 0);
+
+        let bonus = grant_signup_bonus(&payment, "new_user").unwrap();
+        assert_eq!(bonus, SIGNUP_BONUS_CREDITS);
+
+        let balance_after = payment.get_balance("new_user").unwrap();
+        assert_eq!(balance_after, SIGNUP_BONUS_CREDITS);
+    }
+
+    #[test]
+    fn check_credit_warning_healthy_balance() {
+        let tmp = TempDir::new().unwrap();
+        let payment =
+            PaymentManager::new(tmp.path(), None, "https://zeroclaw.example.com", true).unwrap();
+
+        // Give user plenty of credits
+        payment.add_bonus_credits("zeroclaw_user", 1000).unwrap();
+        let result = check_credit_warning(&payment, "zeroclaw_user").unwrap();
+        assert!(result.is_none()); // No warning
+    }
+
+    #[test]
+    fn check_credit_warning_low_balance() {
+        let tmp = TempDir::new().unwrap();
+        let payment =
+            PaymentManager::new(tmp.path(), None, "https://zeroclaw.example.com", true).unwrap();
+
+        // Give user just above zero but below threshold
+        payment.add_bonus_credits("zeroclaw_user", 50).unwrap();
+        let result = check_credit_warning(&payment, "zeroclaw_user").unwrap();
+        assert_eq!(result, Some(50)); // Warning with balance
+    }
+
+    #[test]
+    fn check_credit_warning_zero_balance_errors() {
+        let tmp = TempDir::new().unwrap();
+        let payment =
+            PaymentManager::new(tmp.path(), None, "https://zeroclaw.example.com", true).unwrap();
+
+        let result = check_credit_warning(&payment, "zeroclaw_user");
+        assert!(result.is_err()); // Error: zero credits
     }
 }

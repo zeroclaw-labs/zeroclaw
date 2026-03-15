@@ -87,30 +87,129 @@ This "mixture of agents" philosophy applies everywhere:
    There is no separate "ZeroClaw" install step. See "Unified App
    Experience" section below for the full contract.
 
-### LLM API Key Model
+### LLM API Key Model — 3-Tier Provider Access
+
+MoA uses a **3-tier provider access model** that determines how LLM calls
+are routed, billed, and which models are used.
+
+#### Tier Overview
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ User has own API keys?                                      │
-│                                                             │
-│   YES → App uses user's keys directly                       │
-│         → Calls the most powerful latest model available     │
-│         → No credit deduction                               │
-│         → No server involvement                             │
-│                                                             │
-│   NO  → App fetches operator's keys from Railway server     │
-│         → User must pre-purchase credits                    │
-│         → Each API call costs 2x the actual API cost        │
-│         → Default model: Gemini 3.0 Flash (cost-effective)  │
-│         → Voice/interpretation: Gemini 2.5 Flash Live API   │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  3-Tier Provider Access Model                                       │
+│                                                                     │
+│  ① UserKey Mode (유저 자체 키 모드)                                 │
+│     Condition: User has provided their own API key(s)               │
+│     → App calls LLM provider directly from the device               │
+│     → User selects which model to use (latest top-tier available)   │
+│     → NO credit deduction (user pays provider directly)             │
+│     → NO Railway relay involvement for LLM calls                    │
+│                                                                     │
+│  ② Platform Selected Mode (플랫폼 모델 선택 모드)                   │
+│     Condition: No API key + user manually selected a model          │
+│     → LLM call routed through Railway relay (operator's API key)    │
+│     → User's selected model is used                                 │
+│     → Credits deducted at 2.2× actual API cost (2× + VAT)          │
+│                                                                     │
+│  ③ Platform Default Mode (플랫폼 기본 모드)                         │
+│     Condition: No API key + no model selection (new users)          │
+│     → LLM call routed through Railway relay (operator's API key)    │
+│     → Task-based automatic model routing (see table below)          │
+│     → Credits deducted at 2.2× actual API cost (2× + VAT)          │
+│     → New users receive signup bonus credits upon registration      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-| Scenario | API Key Source | Model Used | Billing |
-|----------|---------------|------------|---------|
-| User has key | User's own | Latest top-tier model for that provider | Free (user pays provider directly) |
-| User has no key | Operator's key (from Railway env) | Gemini 3.0 Flash (default) | 2x actual API cost in credits |
-| Voice interpretation | User's or operator's | Gemini 2.5 Flash Live API | Same rules as above |
+#### Access Mode Decision Table
+
+| Mode | Condition | LLM Call Route | Model Selection | Billing |
+|------|-----------|---------------|-----------------|---------|
+| **UserKey** | User provided API key | Direct from device to provider | User chooses (top-tier available) | Free (user pays provider) |
+| **Platform (Selected)** | No API key + model chosen | Railway relay (operator key) | User's chosen model | 2.2× actual API cost in credits |
+| **Platform (Default)** | No API key + no selection | Railway relay (operator key) | Auto-routed by task type | 2.2× actual API cost in credits |
+
+#### Task-Based Default Model Routing (Platform Default Mode)
+
+When a user has no API key and has not selected a specific model, the
+system automatically routes to the most appropriate model per task type:
+
+| Task Category | Provider | Default Model | Rationale |
+|---------------|----------|---------------|-----------|
+| **일반 채팅 (General Chat)** | Gemini | `gemini-3.1-flash-lite-preview` | Most cost-effective for casual conversation |
+| **추론/문서 (Reasoning/Document)** | Gemini | `gemini-3.1-pro-preview` | High-quality reasoning and document analysis |
+| **코딩 (Coding)** | Anthropic | `claude-opus-4-20250514` | Best-in-class code generation |
+| **코드 리뷰 (Code Review)** | Gemini | `gemini-3.1-pro-preview` | Architecture-aware review |
+| **이미지 (Image)** | Gemini | `gemini-3.1-flash-lite-preview` | Cost-effective vision tasks |
+| **음악 (Music)** | Gemini | `gemini-3.1-flash-lite-preview` | Lightweight orchestration |
+| **비디오 (Video)** | Gemini | `gemini-3.1-flash-lite-preview` | Lightweight orchestration |
+| **통역 (Interpretation)** | Gemini | Gemini 2.5 Flash Live API | Real-time voice streaming |
+
+#### Credit System & Billing Logic
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Credit Billing Flow (Platform modes only)                          │
+│                                                                     │
+│  1. New user registers → receives signup bonus credits              │
+│     (e.g., equivalent to several dollars of usage)                  │
+│                                                                     │
+│  2. Each LLM API call:                                              │
+│     actual_api_cost_usd = (input_tokens × input_price/1M)          │
+│                         + (output_tokens × output_price/1M)         │
+│     credits_to_deduct = actual_api_cost_usd × 2.2                  │
+│     (2.0× operator margin + 10% VAT = 2.2×)                        │
+│                                                                     │
+│  3. Before every deduction, check remaining balance:                │
+│     ├─ balance > warning_threshold  → proceed silently              │
+│     ├─ balance ≤ warning_threshold  → show warning alert:           │
+│     │   "크레딧이 부족합니다. 충전하시거나 직접 API 키를 입력하세요" │
+│     │   → Option A: Purchase more credits (결제)                    │
+│     │   → Option B: Enter own API keys (설정 → API 키)              │
+│     │     Supported: Claude, OpenAI, Gemini (3 providers)           │
+│     └─ balance = 0  → block request, require recharge or API key    │
+│                                                                     │
+│  4. Users can enter their own API keys at any time:                 │
+│     → Claude (Anthropic) API key                                    │
+│     → OpenAI API key                                                │
+│     → Gemini (Google) API key                                       │
+│     Once a key is entered, that provider's calls switch to          │
+│     UserKey mode (no credit deduction, direct device→provider)      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### Railway Relay vs Direct API Call
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  When is Railway relay used for LLM calls?                          │
+│                                                                     │
+│  Railway relay (operator API key):                                  │
+│  ├─ User has NO API key for the requested provider                  │
+│  ├─ LLM request is proxied through Railway server                   │
+│  ├─ Operator's API key (ADMIN_*_API_KEY env vars) is used           │
+│  ├─ Credits are deducted at 2.2× from user's balance                │
+│  └─ Operator's keys NEVER leave the server                          │
+│                                                                     │
+│  Direct device→provider (user's own key):                           │
+│  ├─ User has entered their own API key for that provider            │
+│  ├─ App calls the LLM API directly from the user's device           │
+│  ├─ NO Railway relay involvement                                    │
+│  ├─ NO credit deduction                                             │
+│  └─ User pays the provider directly at standard API rates           │
+│                                                                     │
+│  Important: Railway relay is ALWAYS used for:                       │
+│  ├─ Memory sync (E2E encrypted delta exchange) — regardless of key  │
+│  └─ Remote channel routing (KakaoTalk, Telegram, etc.)              │
+│  These are NOT LLM calls and do not consume credits.                │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+| Scenario | API Key Source | Route | Model Used | Billing |
+|----------|---------------|-------|------------|---------|
+| User has key for provider | User's own | Device → Provider directly | User's choice (top-tier) | Free (user pays provider) |
+| User has no key (default) | Operator's (Railway env) | Device → Railway relay → Provider | Task-based auto-routing | 2.2× actual API cost in credits |
+| User has no key (selected model) | Operator's (Railway env) | Device → Railway relay → Provider | User's selected model | 2.2× actual API cost in credits |
+| Voice interpretation | User's or operator's | Same rules as above | Gemini 2.5 Flash Live API | Same rules as above |
 
 ### Remote Access via Channels
 
@@ -1329,7 +1428,7 @@ These are **mandatory constraints**, not guidelines:
 | **CLI** | clap |
 | **Database** | SQLite (rusqlite) + sqlite-vec + FTS5 |
 | **AI Models** | Gemini (Google), Claude (Anthropic), OpenAI, Ollama |
-| **Default LLM** | Gemini 3.0 Flash (cost-effective default) |
+| **Default LLM** | Gemini 3.1 Flash Lite (cost-effective default for chat; task-based routing for other categories) |
 | **Voice/Interp** | Gemini 2.5 Flash Native Audio (Live API) |
 | **Coding review** | Claude Opus 4.6 + Gemini 3.1 Pro |
 | **Document viewer** | pdf2htmlEX (layout-preserving PDF→HTML) |
@@ -1401,7 +1500,7 @@ These are **mandatory constraints**, not guidelines:
 - [x] One-click installer with first-run GUI setup wizard — `zeroclaw_install.sh` CLI + `SetupWizard.tsx` 4-step GUI wizard
 - [x] Unified auto-updater (Tauri updater — frontend + sidecar atomically) — `tauri.conf.json` updater plugin configured with endpoint + dialog
 - [x] User settings page (API key input, device management) — `Settings.tsx` (558 lines) with API keys, device list, sync status, language
-- [x] Operator API key fallback with 2x credit billing — `src/billing/llm_router.rs` resolve_key() + 2x credit multiplier with tests
+- [x] Operator API key fallback with 2.2× credit billing — `src/billing/llm_router.rs` resolve_key() + 2.2× credit multiplier (2× margin + VAT) with tests
 - [x] Credit balance display in app UI — Settings component credit section with 4-tier purchase packages
 - [x] Gatekeeper SLM integration (Ollama-based local inference) — `src/gatekeeper/router.rs` GatekeeperRouter with Ollama API, keyword classification, offline queue
 - [x] Channel-specific voice features (KakaoTalk, Telegram, Discord) — `src/channels/voice_features.rs` with platform-specific parsers, downloaders, capability descriptors

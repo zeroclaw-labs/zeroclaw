@@ -22,7 +22,10 @@ pub use checkout::{
     UsdCreditPackage, USD_PACKAGES,
 };
 #[allow(unused_imports)]
-pub use llm_router::{AdminKeys, KeySource, ResolvedKey};
+pub use llm_router::{
+    AdminKeys, KeySource, ProviderAccessMode, ResolvedKey, TaskCategory,
+    LOW_BALANCE_WARNING_THRESHOLD, SIGNUP_BONUS_CREDITS,
+};
 #[allow(unused_imports)]
 pub use payment::{CreditPackage, PaymentManager, PaymentRecord, PaymentStatus};
 #[allow(unused_imports)]

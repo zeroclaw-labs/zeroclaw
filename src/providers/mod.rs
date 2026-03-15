@@ -1977,6 +1977,27 @@ pub fn list_providers() -> Vec<ProviderInfo> {
     ]
 }
 
+/// Returns `true` when the named provider typically requires an API key
+/// (i.e. it is a cloud/remote provider, not a local runtime like Ollama or
+/// LM Studio). Custom providers (`custom:…`) are assumed to need a key
+/// unless they target localhost.
+pub fn provider_requires_credential(name: &str) -> bool {
+    // Custom providers — local endpoints don't need a key
+    if let Some(url) = name.strip_prefix("custom:") {
+        let lower = url.to_lowercase();
+        return !lower.contains("localhost") && !lower.contains("127.0.0.1");
+    }
+
+    for info in list_providers() {
+        if info.name == name || info.aliases.contains(&name) {
+            return !info.local;
+        }
+    }
+
+    // Unknown providers — assume they need a key
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
