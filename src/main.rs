@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 #![warn(clippy::all, clippy::pedantic)]
+#![recursion_limit = "256"]
 #![allow(
     clippy::assigning_clones,
     clippy::bool_to_int_with_if,
