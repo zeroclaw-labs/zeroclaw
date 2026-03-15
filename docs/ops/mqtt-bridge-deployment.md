@@ -1,367 +1,578 @@
 # MQTT Bridge Deployment
 
-## Installation
+This document covers deploying the ZeroClaw MQTT bridge for tethered nodes (ESP32, Raspberry Pi, Arduino) that communicate via MQTT instead of direct WebSocket connections.
 
-### Prerequisites
+## Overview
 
-- Rust 1.70+ and Cargo
-- MQTT broker (Mosquitto, EMQX, etc.)
-- Network access between ZeroClaw and broker
+The MQTT bridge enables resource-constrained devices to register capabilities and execute tools through an MQTT broker, with the bridge translating between MQTT and the ZeroClaw gateway WebSocket protocol.
 
-### Build from Source
+**Architecture:**
 
-```bash
-git clone https://github.com/your-org/zeroclaw-micro.git
-cd zeroclaw-micro
-cargo build --release --features mqtt
+```
+[ESP32/RPi Node] --MQTT--> [Mosquitto Broker] --MQTT--> [Bridge] --WebSocket--> [ZeroClaw Gateway]
 ```
 
-Binary location: `target/release/zeroclaw`
+**Key components:**
 
-### Quick Start
+- MQTT broker (mosquitto recommended)
+- zeroclaw-bridge binary
+- ZeroClaw gateway (running with node support)
+- Tethered nodes (ESP32, RPi, Arduino)
+
+## Prerequisites
+
+- Rust toolchain (for building from source)
+- MQTT broker (mosquitto 2.0+)
+- ZeroClaw gateway running and accessible
+- systemd (for service management)
+
+## Installation
+
+### 1. Build the Bridge
 
 ```bash
-# 1. Configure MQTT channel
-cat > config.toml <<EOF
-[channels.mqtt]
-enabled = true
-broker_url = "mqtt://localhost:1883"
-client_id = "zeroclaw-agent"
-topics = ["zeroclaw/commands"]
-qos = 1
-EOF
+cd /path/to/zeroclaw
+cargo build --release -p zeroclaw-bridge
+```
 
-# 2. Start agent
-./target/release/zeroclaw agent --config config.toml
+Binary location: `target/release/zeroclaw-bridge`
+
+### 2. Install as User Service
+
+```bash
+./scripts/install-bridge.sh
+```
+
+This script:
+- Copies binary to `~/.cargo/bin/zeroclaw-bridge`
+- Copies config template to `~/.zeroclaw/bridge.toml`
+- Installs systemd service to `~/.config/systemd/user/`
+- Enables service for auto-start
+
+### 3. Install MQTT Broker
+
+**Debian/Ubuntu:**
+
+```bash
+sudo apt update
+sudo apt install mosquitto mosquitto-clients
+sudo systemctl enable mosquitto
+sudo systemctl start mosquitto
+```
+
+**Alpine:**
+
+```bash
+sudo apk add mosquitto mosquitto-clients
+sudo rc-update add mosquitto default
+sudo rc-service mosquitto start
+```
+
+**macOS:**
+
+```bash
+brew install mosquitto
+brew services start mosquitto
 ```
 
 ## Configuration
 
-### Basic Config
+### Bridge Configuration
+
+Edit `~/.zeroclaw/bridge.toml`:
 
 ```toml
-[channels.mqtt]
-enabled = true
-broker_url = "mqtt://broker.example.com:1883"
-client_id = "zeroclaw-001"
-topics = ["agent/commands", "agent/tasks"]
-qos = 1
+# MQTT broker connection
+mqtt_broker_url = "mqtt://localhost:1883"
+
+# ZeroClaw gateway WebSocket endpoint
+websocket_url = "ws://localhost:42617"
+
+# Authentication token for gateway
+auth_token = "your-bearer-token-here"
 ```
 
-### TLS/SSL Config
+**Configuration keys:**
+
+- `mqtt_broker_url`: MQTT broker address (format: `mqtt://host:port`)
+- `websocket_url`: ZeroClaw gateway WebSocket endpoint
+- `auth_token`: Bearer token for gateway authentication (obtain via pairing)
+
+### Gateway Configuration
+
+Ensure the gateway is configured to accept node connections. In `~/.zeroclaw/config.toml`:
 
 ```toml
-[channels.mqtt]
-enabled = true
-broker_url = "mqtts://secure-broker.example.com:8883"
-client_id = "zeroclaw-secure"
-topics = ["secure/commands"]
-qos = 2
-tls_ca_cert = "/path/to/ca.crt"
-tls_client_cert = "/path/to/client.crt"
-tls_client_key = "/path/to/client.key"
+[gateway]
+port = 42617
+host = "127.0.0.1"
+require_pairing = true
 ```
 
-### Authentication
+### Mosquitto Broker Configuration
+
+Minimal `mosquitto.conf` for local testing:
+
+```conf
+listener 1883
+allow_anonymous true
+```
+
+For production, enable authentication:
+
+```conf
+listener 1883
+allow_anonymous false
+password_file /etc/mosquitto/passwd
+```
+
+Create password file:
+
+```bash
+sudo mosquitto_passwd -c /etc/mosquitto/passwd bridge_user
+sudo systemctl restart mosquitto
+```
+
+Update bridge config:
 
 ```toml
-[channels.mqtt]
-enabled = true
-broker_url = "mqtt://broker.example.com:1883"
-client_id = "zeroclaw-auth"
-username = "agent_user"
-password = "${MQTT_PASSWORD}"  # Use env var
-topics = ["private/commands"]
-qos = 1
+mqtt_broker_url = "mqtt://bridge_user:password@localhost:1883"
 ```
 
-### Config Options Reference
+## Service Management
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `enabled` | bool | false | Enable MQTT channel |
-| `broker_url` | string | required | Broker URL (mqtt:// or mqtts://) |
-| `client_id` | string | required | Unique client identifier |
-| `topics` | array | required | Topics to subscribe to |
-| `qos` | int | 1 | Quality of Service (0, 1, or 2) |
-| `username` | string | optional | Authentication username |
-| `password` | string | optional | Authentication password |
-| `tls_ca_cert` | string | optional | CA certificate path |
-| `tls_client_cert` | string | optional | Client certificate path |
-| `tls_client_key` | string | optional | Client private key path |
-| `keep_alive` | int | 60 | Keep-alive interval (seconds) |
-| `clean_session` | bool | true | Clean session on connect |
+### Start the Bridge
+
+```bash
+systemctl --user start zeroclaw-bridge
+```
+
+### Check Status
+
+```bash
+systemctl --user status zeroclaw-bridge
+```
+
+### View Logs
+
+```bash
+journalctl --user -u zeroclaw-bridge -f
+```
+
+### Stop the Bridge
+
+```bash
+systemctl --user stop zeroclaw-bridge
+```
+
+### Restart the Bridge
+
+```bash
+systemctl --user restart zeroclaw-bridge
+```
+
+### Disable Auto-Start
+
+```bash
+systemctl --user disable zeroclaw-bridge
+```
+
+## MQTT Topic Structure
+
+The bridge uses the following topic pattern:
+
+```
+zeroclaw/nodes/{node_id}/{message_type}
+```
+
+**Message types:**
+
+- `register`: Node advertises capabilities (Node → Gateway)
+- `invoke`: Gateway requests tool execution (Gateway → Node)
+- `result`: Node returns execution result (Node → Gateway)
+- `heartbeat`: Node liveness signal (Node → Gateway, optional)
+
+**QoS levels:**
+
+- Register, invoke, result: QoS 1 (at least once delivery)
+- Heartbeat: QoS 0 (at most once delivery)
+
+For full protocol specification, see [docs/architecture/mqtt-bridge-protocol.md](../architecture/mqtt-bridge-protocol.md).
+
+## Testing the Bridge
+
+### 1. Verify MQTT Broker
+
+```bash
+# Subscribe to all node topics
+mosquitto_sub -h localhost -t 'zeroclaw/nodes/#' -v
+```
+
+### 2. Test Node Registration
+
+Publish a test registration message:
+
+```bash
+mosquitto_pub -h localhost -t 'zeroclaw/nodes/test-node-01/register' -m '{
+  "type": "register",
+  "node_id": "test-node-01",
+  "capabilities": [
+    {
+      "name": "echo",
+      "description": "Echo test capability",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "message": {"type": "string"}
+        }
+      }
+    }
+  ]
+}'
+```
+
+### 3. Check Bridge Logs
+
+```bash
+journalctl --user -u zeroclaw-bridge -f
+```
+
+Expected output:
+
+```
+Bridge connected to MQTT broker
+Bridge connected to WebSocket gateway
+Forwarding register message from test-node-01
+```
+
+### 4. Verify Gateway Connection
+
+Check gateway logs for node registration:
+
+```bash
+zeroclaw status
+```
 
 ## Troubleshooting
 
-### 1. Connection Refused
+### Bridge Won't Start
 
-**Symptom**: `Error: Connection refused (os error 111)`
+**Symptom:** Service fails immediately after start
 
-**Causes**:
-- Broker not running
-- Wrong broker URL/port
-- Firewall blocking connection
+**Check:**
 
-**Solutions**:
 ```bash
-# Check broker is running
-systemctl status mosquitto
-
-# Test connectivity
-telnet broker.example.com 1883
-
-# Check firewall
-sudo ufw status
-sudo ufw allow 1883/tcp
+systemctl --user status zeroclaw-bridge
+journalctl --user -u zeroclaw-bridge -n 50
 ```
 
-### 2. Authentication Failed
+**Common causes:**
 
-**Symptom**: `Error: MQTT connection failed: Not authorized`
+1. **Missing config file**
+   - Verify `~/.zeroclaw/bridge.toml` exists
+   - Run `./scripts/install-bridge.sh` to create template
 
-**Causes**:
-- Invalid username/password
-- Missing credentials in config
-- Broker ACL restrictions
+2. **Invalid config syntax**
+   - Check TOML syntax with `cat ~/.zeroclaw/bridge.toml`
+   - Ensure URLs are quoted strings
 
-**Solutions**:
+3. **Binary not found**
+   - Verify `~/.cargo/bin/zeroclaw-bridge` exists
+   - Check `$PATH` includes `~/.cargo/bin`
+
+### Cannot Connect to MQTT Broker
+
+**Symptom:** Bridge logs show "Connection refused" or "Connection timeout"
+
+**Check broker status:**
+
 ```bash
-# Verify credentials with mosquitto_pub
-mosquitto_pub -h broker.example.com -u agent_user -P password -t test -m "hello"
+# systemd
+sudo systemctl status mosquitto
 
-# Check broker logs
-tail -f /var/log/mosquitto/mosquitto.log
+# OpenRC
+sudo rc-service mosquitto status
 
-# Update config with correct credentials
-export MQTT_PASSWORD="correct_password"
-./zeroclaw agent --config config.toml
+# Test connection
+mosquitto_pub -h localhost -t test -m "hello"
 ```
 
-### 3. TLS Certificate Errors
+**Solutions:**
 
-**Symptom**: `Error: SSL certificate verification failed`
+1. **Broker not running**
+   ```bash
+   sudo systemctl start mosquitto
+   ```
 
-**Causes**:
-- Invalid/expired certificate
-- Wrong CA certificate
-- Hostname mismatch
+2. **Wrong broker URL**
+   - Verify `mqtt_broker_url` in config
+   - Default: `mqtt://localhost:1883`
 
-**Solutions**:
+3. **Firewall blocking port 1883**
+   ```bash
+   sudo ufw allow 1883/tcp
+   ```
+
+4. **Authentication required**
+   - Add credentials to URL: `mqtt://user:pass@host:1883`
+
+### Cannot Connect to Gateway
+
+**Symptom:** Bridge logs show "WebSocket connection failed"
+
+**Check gateway status:**
+
 ```bash
-# Verify certificate
-openssl s_client -connect broker.example.com:8883 -CAfile ca.crt
-
-# Check certificate expiry
-openssl x509 -in client.crt -noout -dates
-
-# Test with mosquitto_sub
-mosquitto_sub -h broker.example.com -p 8883 \
-  --cafile ca.crt --cert client.crt --key client.key \
-  -t test
+zeroclaw status
 ```
 
-### 4. Messages Not Received
+**Solutions:**
 
-**Symptom**: Agent running but not processing messages
+1. **Gateway not running**
+   ```bash
+   zeroclaw daemon
+   # or
+   zeroclaw service start
+   ```
 
-**Causes**:
-- Wrong topic subscription
-- QoS mismatch
-- Message format issues
+2. **Wrong WebSocket URL**
+   - Verify `websocket_url` in config
+   - Default: `ws://localhost:42617`
 
-**Solutions**:
+3. **Invalid auth token**
+   - Obtain token via pairing flow
+   - Update `auth_token` in config
+
+4. **Gateway not accepting connections**
+   - Check `~/.zeroclaw/config.toml` gateway section
+   - Ensure `host` and `port` match bridge config
+
+### Node Registration Not Working
+
+**Symptom:** Node publishes register message but gateway doesn't see it
+
+**Debug steps:**
+
+1. **Verify MQTT message arrives at broker**
+   ```bash
+   mosquitto_sub -h localhost -t 'zeroclaw/nodes/#' -v
+   ```
+
+2. **Check bridge is subscribed**
+   - Bridge subscribes to `zeroclaw/nodes/+/register` on startup
+   - Check logs for "Subscribed to topic" messages
+
+3. **Verify message format**
+   - Must be valid JSON
+   - Must include `type`, `node_id`, `capabilities` fields
+   - See [mqtt-bridge-protocol.md](../architecture/mqtt-bridge-protocol.md) for schema
+
+4. **Check bridge transformation**
+   - Bridge logs should show "Forwarding register message"
+   - If not, message format may be invalid
+
+### Tool Invocation Not Reaching Node
+
+**Symptom:** Gateway sends invoke but node never receives it
+
+**Debug steps:**
+
+1. **Subscribe to invoke topic**
+   ```bash
+   mosquitto_sub -h localhost -t 'zeroclaw/nodes/+/invoke' -v
+   ```
+
+2. **Check bridge logs**
+   - Should show "Forwarding invoke message"
+   - If not, WebSocket receive may be failing
+
+3. **Verify node subscription**
+   - Node must subscribe to `zeroclaw/nodes/{node_id}/invoke`
+   - Check node logs for subscription confirmation
+
+4. **Check QoS level**
+   - Invoke messages use QoS 1
+   - Ensure node subscribes with QoS 1
+
+### Bridge Disconnects Frequently
+
+**Symptom:** Bridge reconnects every few minutes
+
+**Check logs:**
+
 ```bash
-# Monitor subscribed topics
-mosquitto_sub -h broker.example.com -t "zeroclaw/#" -v
-
-# Publish test message
-mosquitto_pub -h broker.example.com -t "zeroclaw/commands" \
-  -m '{"action":"test","data":"hello"}'
-
-# Check agent logs
-./zeroclaw agent --config config.toml --log-level debug
-
-# Verify topic in config matches publisher
-grep "topics" config.toml
+journalctl --user -u zeroclaw-bridge -f | grep -i "reconnect\|disconnect\|error"
 ```
 
-### 5. High Latency / Slow Response
+**Common causes:**
 
-**Symptom**: Delayed message processing, timeouts
+1. **Network instability**
+   - Check network connection
+   - Increase MQTT keepalive interval
 
-**Causes**:
-- Network congestion
-- Broker overload
-- QoS 2 overhead
-- Large message payloads
+2. **Broker restarting**
+   - Check broker logs: `sudo journalctl -u mosquitto -f`
 
-**Solutions**:
+3. **Gateway restarting**
+   - Check gateway status: `zeroclaw status`
+
+4. **Resource exhaustion**
+   - Check system resources: `top`, `free -h`
+
+**Solutions:**
+
+- Bridge has automatic reconnection with exponential backoff
+- Reconnection is normal for transient failures
+- If reconnections are frequent (>1/minute), investigate root cause
+
+### High Memory Usage
+
+**Symptom:** Bridge process uses excessive memory
+
+**Check memory:**
+
 ```bash
-# Check network latency
-ping broker.example.com
-
-# Monitor broker load
-mosquitto_sub -h broker.example.com -t '$SYS/broker/load/#' -v
-
-# Reduce QoS if reliability not critical
-[channels.mqtt]
-qos = 0  # Fastest, no guarantees
-
-# Split large payloads
-# Instead of one 10MB message, send 10x 1MB messages
-
-# Use local broker if possible
-broker_url = "mqtt://localhost:1883"
+ps aux | grep zeroclaw-bridge
 ```
 
-### 6. Reconnection Loops
+**Solutions:**
 
-**Symptom**: Agent repeatedly connecting/disconnecting
+1. **Restart bridge**
+   ```bash
+   systemctl --user restart zeroclaw-bridge
+   ```
 
-**Causes**:
-- Client ID conflict
-- Broker session limits
-- Network instability
+2. **Check for message backlog**
+   - Large number of queued messages can increase memory
+   - Verify nodes are processing invocations
 
-**Solutions**:
-```bash
-# Use unique client ID
-[channels.mqtt]
-client_id = "zeroclaw-$(hostname)-$(date +%s)"
-
-# Enable clean session
-clean_session = true
-
-# Increase keep-alive
-keep_alive = 120
-
-# Check broker connection limits
-# In mosquitto.conf:
-max_connections -1
-```
-
-### 7. Memory Leak / Resource Exhaustion
-
-**Symptom**: Agent memory usage grows over time
-
-**Causes**:
-- Message queue buildup
-- Unprocessed retained messages
-- Connection leak
-
-**Solutions**:
-```bash
-# Monitor memory usage
-ps aux | grep zeroclaw
-
-# Clear retained messages
-mosquitto_pub -h broker.example.com -t "zeroclaw/commands" -r -n
-
-# Restart agent periodically (systemd)
-[Service]
-Restart=always
-RuntimeMaxSec=86400  # Restart daily
-
-# Check for connection leaks in logs
-grep "connection" zeroclaw.log | wc -l
-```
+3. **Update to latest version**
+   - Memory leaks may be fixed in newer releases
 
 ## Production Deployment
 
-### Systemd Service
+### Security Hardening
 
-```ini
-[Unit]
-Description=ZeroClaw MQTT Agent
-After=network.target
+1. **Enable MQTT authentication**
+   ```conf
+   # mosquitto.conf
+   allow_anonymous false
+   password_file /etc/mosquitto/passwd
+   ```
 
-[Service]
-Type=simple
-User=zeroclaw
-WorkingDirectory=/opt/zeroclaw
-ExecStart=/opt/zeroclaw/zeroclaw agent --config /etc/zeroclaw/config.toml
-Restart=always
-RestartSec=10
-Environment="MQTT_PASSWORD=secret"
+2. **Enable TLS for MQTT**
+   ```conf
+   listener 8883
+   cafile /etc/mosquitto/ca.crt
+   certfile /etc/mosquitto/server.crt
+   keyfile /etc/mosquitto/server.key
+   ```
 
-[Install]
-WantedBy=multi-user.target
-```
+   Update bridge config:
+   ```toml
+   mqtt_broker_url = "mqtts://localhost:8883"
+   ```
 
-Enable and start:
+3. **Use secure WebSocket (wss://)**
+   - Deploy gateway behind reverse proxy with TLS
+   - Update bridge config: `websocket_url = "wss://gateway.example.com"`
+
+4. **Restrict broker access**
+   ```conf
+   # mosquitto ACL file
+   user bridge_user
+   topic readwrite zeroclaw/nodes/#
+   ```
+
+### High Availability
+
+1. **Run multiple bridge instances**
+   - Each bridge can handle different node groups
+   - Use different MQTT client IDs
+
+2. **Use clustered MQTT broker**
+   - Deploy mosquitto cluster or use managed MQTT service
+   - Configure bridge with cluster endpoint
+
+3. **Monitor bridge health**
+   - Use systemd service status
+   - Set up alerting on service failures
+
+### Monitoring
+
+**Key metrics to monitor:**
+
+- Bridge service status: `systemctl --user is-active zeroclaw-bridge`
+- MQTT broker connections: `mosquitto_sub -h localhost -t '$SYS/broker/clients/connected'`
+- Gateway node count: `zeroclaw status` (check registered nodes)
+- Bridge logs for errors: `journalctl --user -u zeroclaw-bridge | grep -i error`
+
+**Recommended monitoring setup:**
+
+1. **Service health check**
+   ```bash
+   #!/bin/bash
+   if ! systemctl --user is-active --quiet zeroclaw-bridge; then
+     echo "Bridge service is down"
+     systemctl --user restart zeroclaw-bridge
+   fi
+   ```
+
+2. **Log monitoring**
+   - Use journald or syslog forwarding
+   - Alert on error patterns: "Connection refused", "Authentication failed"
+
+## FAQ
+
+### Q: Can I run multiple bridges?
+
+Yes. Each bridge instance can connect to the same or different MQTT brokers and gateways. Use different systemd service names:
+
 ```bash
-sudo systemctl enable zeroclaw-mqtt
-sudo systemctl start zeroclaw-mqtt
-sudo systemctl status zeroclaw-mqtt
+cp ~/.config/systemd/user/zeroclaw-bridge.service ~/.config/systemd/user/zeroclaw-bridge-2.service
+# Edit service file to use different config path
+systemctl --user daemon-reload
+systemctl --user start zeroclaw-bridge-2
 ```
 
-### Docker Deployment
+### Q: What happens if the bridge crashes?
 
-```dockerfile
-FROM rust:1.70 as builder
-WORKDIR /build
-COPY . .
-RUN cargo build --release --features mqtt
+The systemd service is configured with `Restart=on-failure`, so it will automatically restart after 5 seconds.
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /build/target/release/zeroclaw /usr/local/bin/
-COPY config.toml /etc/zeroclaw/
-CMD ["zeroclaw", "agent", "--config", "/etc/zeroclaw/config.toml"]
-```
+### Q: Can nodes connect directly to the gateway?
 
-Run:
-```bash
-docker build -t zeroclaw-mqtt .
-docker run -d --name zeroclaw-agent \
-  -e MQTT_PASSWORD=secret \
-  -v /etc/zeroclaw:/etc/zeroclaw:ro \
-  zeroclaw-mqtt
-```
+Yes. Nodes can use WebSocket directly if they have sufficient resources. The bridge is for resource-constrained devices that prefer MQTT.
 
-## Monitoring
-
-### Health Check
+### Q: How do I update the bridge?
 
 ```bash
-# Check agent is running
-ps aux | grep zeroclaw
-
-# Check MQTT connection
-mosquitto_sub -h broker.example.com -t '$SYS/broker/clients/connected' -C 1
-
-# Test end-to-end
-mosquitto_pub -h broker.example.com -t "zeroclaw/commands" \
-  -m '{"action":"ping"}'
+cd /path/to/zeroclaw
+git pull
+cargo build --release -p zeroclaw-bridge
+cp target/release/zeroclaw-bridge ~/.cargo/bin/
+systemctl --user restart zeroclaw-bridge
 ```
 
-### Logs
+### Q: Does the bridge support MQTT v5?
 
-```bash
-# View agent logs
-journalctl -u zeroclaw-mqtt -f
+Currently the bridge uses MQTT v3.1.1 (rumqttc default). MQTT v5 support may be added in future releases.
 
-# Filter errors
-journalctl -u zeroclaw-mqtt -p err
+### Q: Can I use a cloud MQTT broker?
 
-# Export logs
-journalctl -u zeroclaw-mqtt --since "1 hour ago" > zeroclaw.log
-```
+Yes. Update `mqtt_broker_url` to point to your cloud broker (AWS IoT Core, HiveMQ Cloud, etc.). Ensure authentication credentials are included.
 
-## Security Best Practices
+### Q: How do I get the gateway auth token?
 
-1. **Use TLS** for production deployments
-2. **Rotate credentials** regularly
-3. **Restrict topics** with broker ACLs
-4. **Use unique client IDs** per agent
-5. **Store secrets** in environment variables, not config files
-6. **Enable authentication** on broker
-7. **Monitor connections** for anomalies
-8. **Update dependencies** regularly
+The token is obtained through the gateway pairing flow:
+
+1. Start gateway: `zeroclaw gateway`
+2. Note the 6-digit pairing code from logs
+3. Pair via API: `curl -X POST http://localhost:42617/pair -H "X-Pairing-Code: 123456"`
+4. Copy the returned bearer token to bridge config
 
 ## References
 
-- [MQTT Protocol Specification](http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/mqtt-v3.1.1.html)
-- [Mosquitto Broker Documentation](https://mosquitto.org/documentation/)
-- [ZeroClaw Configuration Reference](../reference/configuration.md)
+- MQTT protocol specification: [docs/architecture/mqtt-bridge-protocol.md](../architecture/mqtt-bridge-protocol.md)
+- Integration tests: [tests/integration/README.md](../../tests/integration/README.md)
+- Gateway configuration: [docs/reference/api/config-reference.md](../reference/api/config-reference.md)
+- Network deployment guide: [docs/ops/network-deployment.md](./network-deployment.md)

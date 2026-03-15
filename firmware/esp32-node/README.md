@@ -133,56 +133,139 @@ mosquitto_pub -t "esp32/cmd" -m "berry.load('script.be')"
 
 ## QEMU Testing
 
-Install QEMU for ESP32:
+QEMU allows testing firmware without physical hardware. Two environments are available:
+
+- `esp32dev` (Arduino framework) — for physical hardware
+- `qemu` (ESP-IDF framework) — for QEMU emulation
+
+### Install QEMU
+
+Install via ESP-IDF tools:
 
 ```bash
+# Requires ESP-IDF installed and $IDF_PATH set
 python $IDF_PATH/tools/idf_tools.py install qemu-xtensa
 ```
 
-Run in QEMU:
+Or use the automated test script:
 
 ```bash
 ./scripts/test-qemu.sh
 ```
 
-### QEMU Debugging Guide
+### Quick QEMU Test Commands
 
-1. **Build with debug symbols:**
+Build and run firmware in QEMU:
 
 ```bash
-platformio run -d firmware/esp32-node -e debug
+# Build for QEMU environment
+platformio run -d firmware/esp32-node -e qemu
+
+# Run in QEMU (basic)
+qemu-system-xtensa -nographic -machine esp32 \
+  -drive file=.pio/build/qemu/firmware.bin,if=mtd,format=raw
+
+# Run with serial monitor
+qemu-system-xtensa -nographic -machine esp32 \
+  -drive file=.pio/build/qemu/firmware.bin,if=mtd,format=raw \
+  -serial mon:stdio
+
+# Run with network (tap device)
+qemu-system-xtensa -nographic -machine esp32 \
+  -drive file=.pio/build/qemu/firmware.bin,if=mtd,format=raw \
+  -netdev user,id=net0 -device esp32_eth,netdev=net0
 ```
 
-2. **Start QEMU with GDB server:**
+### QEMU Debugging Guide
+
+QEMU supports GDB remote debugging for step-through execution and inspection.
+
+**1. Build with debug symbols:**
+
+```bash
+platformio run -d firmware/esp32-node -e qemu --build-flags "-DDEBUG"
+```
+
+**2. Start QEMU with GDB server:**
+
+The `-s` flag opens GDB server on port 1234, `-S` pauses execution at startup:
 
 ```bash
 qemu-system-xtensa -nographic -machine esp32 \
-  -drive file=.pio/build/esp32dev/firmware.bin,if=mtd,format=raw \
+  -drive file=.pio/build/qemu/firmware.bin,if=mtd,format=raw \
   -s -S
 ```
 
-3. **Connect GDB in another terminal:**
+**3. Connect GDB in another terminal:**
 
 ```bash
-xtensa-esp32-elf-gdb .pio/build/esp32dev/firmware.elf
+xtensa-esp32-elf-gdb .pio/build/qemu/firmware.elf
 (gdb) target remote :1234
 (gdb) break app_main
 (gdb) continue
 ```
 
-4. **Common GDB commands:**
+**4. Common GDB commands:**
 
 ```gdb
 (gdb) info registers          # View CPU registers
-(gdb) backtrace              # Stack trace
-(gdb) print variable_name    # Inspect variables
-(gdb) step                   # Step into functions
-(gdb) next                   # Step over
+(gdb) backtrace               # Stack trace
+(gdb) print variable_name     # Inspect variables
+(gdb) step                    # Step into functions
+(gdb) next                    # Step over
+(gdb) finish                  # Run until function returns
+(gdb) watch variable_name     # Break on variable change
+(gdb) info breakpoints        # List breakpoints
 ```
 
-5. **Monitor network traffic in QEMU:**
+**5. Debug MQTT protocol flow:**
+
+Set breakpoints on key functions:
+
+```gdb
+(gdb) break send_register
+(gdb) break callback
+(gdb) break publish_result
+(gdb) continue
+```
+
+**6. Monitor network traffic:**
+
+QEMU supports user-mode networking (no root required):
 
 ```bash
-# Enable QEMU network tap
-qemu-system-xtensa -netdev tap,id=net0 -device esp32_eth,netdev=net0
+qemu-system-xtensa -nographic -machine esp32 \
+  -drive file=.pio/build/qemu/firmware.bin,if=mtd,format=raw \
+  -netdev user,id=net0,hostfwd=tcp::1883-:1883 \
+  -device esp32_eth,netdev=net0 \
+  -s -S
 ```
+
+### QEMU Test Workflow
+
+Typical development cycle:
+
+```bash
+# 1. Edit code in src/main.cpp
+# 2. Build for QEMU
+platformio run -d firmware/esp32-node -e qemu
+
+# 3. Run automated test
+./scripts/test-qemu.sh
+
+# 4. Or run with GDB for debugging
+qemu-system-xtensa -nographic -machine esp32 \
+  -drive file=.pio/build/qemu/firmware.bin,if=mtd,format=raw \
+  -s -S &
+xtensa-esp32-elf-gdb .pio/build/qemu/firmware.elf
+```
+
+### QEMU Limitations
+
+- No WiFi emulation (network via tap/user-mode only)
+- No Bluetooth support
+- GPIO/ADC reads return simulated values
+- SPIFFS filesystem may behave differently than physical flash
+- Timing may differ from real hardware
+
+For full hardware validation, flash to physical ESP32 after QEMU testing.
