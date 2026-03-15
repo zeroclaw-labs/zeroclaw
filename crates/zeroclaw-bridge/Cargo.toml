@@ -1,0 +1,23 @@
+[package]
+name = "zeroclaw-bridge"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "zeroclaw_bridge"
+path = "src/lib.rs"
+
+[dependencies]
+rumqttc = "0.24"
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+anyhow = "1.0"
+shellexpand = "3.1"
+
+[dev-dependencies]
+tempfile = "3.26"

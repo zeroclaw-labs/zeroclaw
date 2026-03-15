@@ -1,0 +1,10 @@
+# ZeroClaw Bridge Configuration Example
+
+# MQTT broker connection
+mqtt_broker_url = "mqtt://localhost:1883"
+
+# ZeroClaw gateway WebSocket endpoint
+websocket_url = "ws://localhost:42617"
+
+# Authentication token for gateway
+auth_token = "your-bearer-token-here"
