@@ -23,6 +23,11 @@ What it does by default:
 1. `cargo build --release --locked`
 2. `cargo install --path . --force --locked`
 
+> **Note:** In an interactive terminal (TTY), `./install.sh` automatically runs the
+> guided installer with interactive onboarding (`--guided --interactive-onboard`).
+> The silent build-and-install described above only applies when the script is run
+> non-interactively (e.g., piped or in CI).
+
 ### Resource preflight and pre-built flow
 
 Source builds typically require at least:

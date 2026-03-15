@@ -11,6 +11,7 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use console::{style, Term};
 use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -201,6 +202,69 @@ pub(crate) const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
 /// Sentinel value sent through on_delta to signal the draft updater to clear accumulated text.
 /// Used before streaming the final answer so progress lines are replaced by the clean response.
 pub(crate) const DRAFT_CLEAR_SENTINEL: &str = "\x00CLEAR\x00";
+
+// ── Interactive agent UI helpers ─────────────────────────────────────
+
+fn agent_clear_screen() {
+    let _ = Term::stdout().clear_screen();
+}
+
+fn print_agent_banner(provider: &str, model: &str) {
+    println!(
+        "{}\n{} {} | {} {}\n{}\n",
+        style("ZeroClaw Agent").color256(39).bold(),
+        style("provider:").dim(),
+        style(provider).bold(),
+        style("model:").dim(),
+        style(model).bold(),
+        style("Type /help for commands.").dim(),
+    );
+}
+
+fn print_agent_prompt() {
+    print!("{} ", style("agent>").color256(45).bold());
+    let _ = std::io::stdout().flush();
+}
+
+fn print_agent_help() {
+    println!(
+        "{}\n  {}  Show this help message\n  {}  Clear conversation history\n  {}  Exit interactive mode\n",
+        style("Commands").color256(45).bold(),
+        style("/help").bold(),
+        style("/clear /new").bold(),
+        style("/quit /exit").bold(),
+    );
+}
+
+fn print_agent_response(response: &str) {
+    println!("\n{} {}\n", style("ZeroClaw").color256(39).bold(), response,);
+}
+
+fn print_agent_error(error: &str) {
+    eprintln!("{} {}", style("Error:").red().bold(), style(error).red());
+}
+
+fn print_agent_compaction() {
+    println!("{}", style("Context compacted.").dim());
+}
+
+fn print_tool_start(tool_name: &str) {
+    println!(
+        "{} {}",
+        style("[tool]").color256(111).bold(),
+        style(tool_name).bold(),
+    );
+}
+
+fn print_tool_complete(tool_name: &str, success: bool) {
+    let icon = if success { "done" } else { "failed" };
+    println!(
+        "{} {} {}",
+        style("[tool]").color256(111).bold(),
+        style(tool_name).bold(),
+        style(icon).dim(),
+    );
+}
 
 /// Extract a short hint from tool call arguments for progress display.
 fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len: usize) -> String {
@@ -2761,6 +2825,8 @@ pub(crate) async fn run_tool_call_loop(
                 };
                 tracing::debug!(tool = %tool_name, "Sending progress start to draft");
                 let _ = tx.send(progress).await;
+            } else if !silent {
+                print_tool_start(&tool_name);
             }
 
             executable_indices.push(idx);
@@ -2832,6 +2898,8 @@ pub(crate) async fn run_tool_call_loop(
                 };
                 tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
                 let _ = tx.send(format!("{icon} {} ({secs}s)\n", call.name)).await;
+            } else if !silent {
+                print_tool_complete(&call.name, outcome.success);
             }
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
@@ -3340,9 +3408,8 @@ pub async fn run(
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
-        println!("🦀 ZeroClaw Interactive Mode");
-        println!("Type /help for commands.\n");
-        let cli = crate::channels::CliChannel::new();
+        agent_clear_screen();
+        print_agent_banner(provider_name, model_name);
 
         // Persistent conversation history across turns
         let mut history = if let Some(path) = session_state_file.as_deref() {
@@ -3352,8 +3419,7 @@ pub async fn run(
         };
 
         loop {
-            print!("> ");
-            let _ = std::io::stdout().flush();
+            print_agent_prompt();
 
             // Read raw bytes to avoid UTF-8 validation errors when PTY
             // transport splits multi-byte characters at frame boundaries
@@ -3363,7 +3429,7 @@ pub async fn run(
                 Ok(0) => break,
                 Ok(_) => {}
                 Err(e) => {
-                    eprintln!("\nError reading input: {e}\n");
+                    print_agent_error(&format!("reading input: {e}"));
                     break;
                 }
             }
@@ -3374,20 +3440,28 @@ pub async fn run(
                 continue;
             }
             match user_input.as_str() {
-                "/quit" | "/exit" => break,
+                "/quit" | "/exit" => {
+                    println!("{}", style("Closing ZeroClaw agent.").dim());
+                    break;
+                }
                 "/help" => {
-                    println!("Available commands:");
-                    println!("  /help        Show this help message");
-                    println!("  /clear /new  Clear conversation history");
-                    println!("  /quit /exit  Exit interactive mode\n");
+                    print_agent_help();
                     continue;
                 }
                 "/clear" | "/new" => {
                     println!(
-                        "This will clear the current conversation and delete all session memory."
+                        "{}",
+                        style(
+                            "This will clear the current conversation and delete all session memory."
+                        )
+                        .yellow()
                     );
-                    println!("Core memories (long-term facts/preferences) will be preserved.");
-                    print!("Continue? [y/N] ");
+                    println!(
+                        "{}",
+                        style("Core memories (long-term facts/preferences) will be preserved.")
+                            .dim()
+                    );
+                    print!("{} ", style("Continue? [y/N]").bold());
                     let _ = std::io::stdout().flush();
 
                     let mut confirm_raw = Vec::new();
@@ -3402,7 +3476,7 @@ pub async fn run(
                     }
                     let confirm = String::from_utf8_lossy(&confirm_raw);
                     if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
-                        println!("Cancelled.\n");
+                        println!("{}", style("Cancelled.").dim());
                         continue;
                     }
 
@@ -3419,9 +3493,15 @@ pub async fn run(
                         }
                     }
                     if cleared > 0 {
-                        println!("Conversation cleared ({cleared} memory entries removed).\n");
+                        println!(
+                            "{}",
+                            style(format!(
+                                "Conversation cleared ({cleared} memory entries removed)."
+                            ))
+                            .green()
+                        );
                     } else {
-                        println!("Conversation cleared.\n");
+                        println!("{}", style("Conversation cleared.").green());
                     }
                     if let Some(path) = session_state_file.as_deref() {
                         save_interactive_session_history(path, &history)?;
@@ -3487,19 +3567,12 @@ pub async fn run(
             {
                 Ok(resp) => resp,
                 Err(e) => {
-                    eprintln!("\nError: {e}\n");
+                    print_agent_error(&e.to_string());
                     continue;
                 }
             };
             final_output = response.clone();
-            if let Err(e) = crate::channels::Channel::send(
-                &cli,
-                &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
-            )
-            .await
-            {
-                eprintln!("\nError sending CLI response: {e}\n");
-            }
+            print_agent_response(&response);
             observer.record_event(&ObserverEvent::TurnComplete);
 
             // Auto-compaction before hard trimming to preserve long-context signal.
@@ -3512,7 +3585,7 @@ pub async fn run(
             .await
             {
                 if compacted {
-                    println!("🧹 Auto-compaction complete");
+                    print_agent_compaction();
                 }
             }
 

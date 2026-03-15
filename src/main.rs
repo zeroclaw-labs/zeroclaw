@@ -103,6 +103,7 @@ mod service;
 mod skillforge;
 mod skills;
 mod tools;
+mod tui;
 mod tunnel;
 mod util;
 
@@ -237,6 +238,39 @@ Examples:
     Gateway {
         #[command(subcommand)]
         gateway_command: Option<zeroclaw::GatewayCommands>,
+    },
+
+    /// Open the terminal UI connected to the gateway
+    #[command(long_about = "\
+Open the terminal UI connected to the gateway.
+
+Connects to the ZeroClaw gateway websocket chat endpoint and opens a
+clean terminal-first chat session with blue ZeroClaw styling.
+
+If --token is not provided, ZeroClaw reuses the first paired gateway token
+from your config when one is available.
+
+Examples:
+  zeroclaw tui
+  zeroclaw tui --url ws://127.0.0.1:42617 --token <token>
+  zeroclaw tui --session main --deliver
+  zeroclaw tui --url https://zeroclawlabs.ai --session prod")]
+    Tui {
+        /// Gateway websocket or base URL; defaults to ws://<gateway.host>:<gateway.port>/ws/chat
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Gateway bearer token; falls back to first paired token from config when available
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Session label to show in the TUI and forward to the gateway metadata
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Forward delivery intent metadata for downstream gateways that honor it
+        #[arg(long)]
+        deliver: bool,
     },
 
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
@@ -709,10 +743,15 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Initialize logging - respects RUST_LOG env var, defaults to INFO
+    // Initialize logging - respects RUST_LOG env var.
+    // In interactive agent mode, default to "error" so tracing logs don't pollute the chat.
+    let default_filter = match &cli.command {
+        Commands::Agent { message: None, .. } => "error",
+        _ => "info",
+    };
     let subscriber = fmt::Subscriber::builder()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
         )
         .finish();
 
@@ -979,6 +1018,13 @@ async fn main() -> Result<()> {
                 }
             }
         }
+
+        Commands::Tui {
+            url,
+            token,
+            session,
+            deliver,
+        } => tui::run_tui(&config, url, token, session, deliver).await,
 
         Commands::Daemon { port, host } => {
             let port = port.unwrap_or(config.gateway.port);
@@ -2203,6 +2249,37 @@ mod tests {
         match cli.command {
             Commands::Onboard { force, .. } => assert!(force),
             other => panic!("expected onboard command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tui_cli_accepts_gateway_examples() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "tui",
+            "--url",
+            "ws://127.0.0.1:18789",
+            "--token",
+            "zc-token",
+            "--session",
+            "main",
+            "--deliver",
+        ])
+        .expect("tui invocation should parse");
+
+        match cli.command {
+            Commands::Tui {
+                url,
+                token,
+                session,
+                deliver,
+            } => {
+                assert_eq!(url.as_deref(), Some("ws://127.0.0.1:18789"));
+                assert_eq!(token.as_deref(), Some("zc-token"));
+                assert_eq!(session.as_deref(), Some("main"));
+                assert!(deliver);
+            }
+            other => panic!("expected tui command, got {other:?}"),
         }
     }
 
