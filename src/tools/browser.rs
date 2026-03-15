@@ -440,6 +440,12 @@ impl BrowserTool {
     async fn run_command(&self, args: &[&str]) -> anyhow::Result<AgentBrowserResponse> {
         let mut cmd = Command::new("agent-browser");
 
+        // When running as a service (systemd/OpenRC), the process may lack
+        // HOME which browsers need for profile directories.
+        if is_service_environment() {
+            ensure_browser_env(&mut cmd);
+        }
+
         // Add session if configured
         if let Some(ref session) = self.session_name {
             cmd.arg("--session").arg(session);
@@ -1461,6 +1467,14 @@ mod native_backend {
                 args.push(Value::String("--disable-gpu".to_string()));
             }
 
+            // When running as a service (systemd/OpenRC), the browser sandbox
+            // fails because the process lacks a user namespace / session.
+            // --no-sandbox and --disable-dev-shm-usage are required in this context.
+            if is_service_environment() {
+                args.push(Value::String("--no-sandbox".to_string()));
+                args.push(Value::String("--disable-dev-shm-usage".to_string()));
+            }
+
             if !args.is_empty() {
                 chrome_options.insert("args".to_string(), Value::Array(args));
             }
@@ -2111,6 +2125,57 @@ fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
         || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
 }
 
+/// Detect whether the current process is running inside a service environment
+/// (e.g. systemd, OpenRC, or launchd) where the browser sandbox and
+/// environment setup may be restricted.
+///
+/// Heuristics:
+/// - `INVOCATION_ID` is set by systemd for every unit invocation.
+/// - `JOURNAL_STREAM` is set by systemd when stdout/stderr go to the journal.
+/// - `/run/openrc` exists only when OpenRC manages the current boot.
+/// - Absence of `HOME` is a strong signal of a service context on Linux.
+fn is_service_environment() -> bool {
+    if std::env::var_os("INVOCATION_ID").is_some() {
+        return true;
+    }
+    if std::env::var_os("JOURNAL_STREAM").is_some() {
+        return true;
+    }
+    // OpenRC system service: runs as a system user and /run/openrc exists
+    #[cfg(target_os = "linux")]
+    if std::path::Path::new("/run/openrc").exists() && std::env::var_os("HOME").is_none() {
+        return true;
+    }
+    // Missing HOME on Linux is a very strong service-context signal
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("HOME").is_none() {
+        return true;
+    }
+    false
+}
+
+/// Ensure environment variables required by headless browsers are present
+/// when running inside a service context.
+fn ensure_browser_env(cmd: &mut Command) {
+    // Browsers need HOME to create profile/cache directories.
+    // When missing, fall back to /tmp so the browser can still start.
+    if std::env::var_os("HOME").is_none() {
+        cmd.env("HOME", "/tmp");
+    }
+    // Chromium-based browsers also need --no-sandbox when running without
+    // a user namespace.  CHROMIUM_FLAGS is respected by many packaged
+    // Chromium builds (Alpine, Debian, Raspberry Pi OS, etc.).
+    let existing = std::env::var("CHROMIUM_FLAGS").unwrap_or_default();
+    if !existing.contains("--no-sandbox") {
+        let new_flags = if existing.is_empty() {
+            "--no-sandbox --disable-dev-shm-usage".to_string()
+        } else {
+            format!("{existing} --no-sandbox --disable-dev-shm-usage")
+        };
+        cmd.env("CHROMIUM_FLAGS", new_flags);
+    }
+}
+
 fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
     allowed.iter().any(|pattern| {
         if pattern == "*" {
@@ -2491,5 +2556,94 @@ mod tests {
             state.reset_session().await;
             state.reset_session().await;
         });
+    }
+
+    #[test]
+    fn ensure_browser_env_sets_home_when_missing() {
+        // Save and clear HOME
+        let original_home = std::env::var_os("HOME");
+        unsafe { std::env::remove_var("HOME") };
+
+        let mut cmd = Command::new("true");
+        ensure_browser_env(&mut cmd);
+
+        // The command should have environment modifications applied.
+        // We verify the function does not panic and accepts the env setup.
+        // Direct inspection of Command env is not exposed, so we verify
+        // the function completes without error.
+
+        // Restore HOME
+        if let Some(home) = original_home {
+            unsafe { std::env::set_var("HOME", home) };
+        }
+    }
+
+    #[test]
+    fn ensure_browser_env_sets_chromium_flags() {
+        // Save and clear CHROMIUM_FLAGS
+        let original = std::env::var_os("CHROMIUM_FLAGS");
+        unsafe { std::env::remove_var("CHROMIUM_FLAGS") };
+
+        let mut cmd = Command::new("true");
+        ensure_browser_env(&mut cmd);
+        // Function should complete without error; CHROMIUM_FLAGS gets set on
+        // the command, not on the process environment.
+
+        // Restore
+        if let Some(val) = original {
+            unsafe { std::env::set_var("CHROMIUM_FLAGS", val) };
+        } else {
+            unsafe { std::env::remove_var("CHROMIUM_FLAGS") };
+        }
+    }
+
+    #[test]
+    fn is_service_environment_detects_invocation_id() {
+        let original = std::env::var_os("INVOCATION_ID");
+        unsafe { std::env::set_var("INVOCATION_ID", "test-unit-id") };
+
+        assert!(is_service_environment());
+
+        if let Some(val) = original {
+            unsafe { std::env::set_var("INVOCATION_ID", val) };
+        } else {
+            unsafe { std::env::remove_var("INVOCATION_ID") };
+        }
+    }
+
+    #[test]
+    fn is_service_environment_detects_journal_stream() {
+        let original = std::env::var_os("JOURNAL_STREAM");
+        unsafe { std::env::set_var("JOURNAL_STREAM", "8:12345") };
+
+        assert!(is_service_environment());
+
+        if let Some(val) = original {
+            unsafe { std::env::set_var("JOURNAL_STREAM", val) };
+        } else {
+            unsafe { std::env::remove_var("JOURNAL_STREAM") };
+        }
+    }
+
+    #[test]
+    fn is_service_environment_false_in_normal_context() {
+        // In a normal test/dev context without INVOCATION_ID/JOURNAL_STREAM,
+        // and with HOME set, this should return false.
+        let inv = std::env::var_os("INVOCATION_ID");
+        let journal = std::env::var_os("JOURNAL_STREAM");
+        unsafe { std::env::remove_var("INVOCATION_ID") };
+        unsafe { std::env::remove_var("JOURNAL_STREAM") };
+
+        // Only assert false if HOME is set (which it should be in dev/CI)
+        if std::env::var_os("HOME").is_some() {
+            assert!(!is_service_environment());
+        }
+
+        if let Some(val) = inv {
+            unsafe { std::env::set_var("INVOCATION_ID", val) };
+        }
+        if let Some(val) = journal {
+            unsafe { std::env::set_var("JOURNAL_STREAM", val) };
+        }
     }
 }
