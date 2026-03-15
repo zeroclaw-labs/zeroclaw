@@ -1,7 +1,10 @@
 #[allow(clippy::module_inception)]
 pub mod agent;
+pub mod analytics;
 pub mod classifier;
+pub mod conversation;
 pub mod dispatcher;
+pub mod handoff;
 pub mod loop_;
 pub mod memory_loader;
 pub mod prompt;

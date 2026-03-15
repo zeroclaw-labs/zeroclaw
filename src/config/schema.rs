@@ -255,6 +255,9 @@ pub struct Config {
     /// Dynamic node discovery configuration (`[nodes]`).
     #[serde(default)]
     pub nodes: NodesConfig,
+    /// Conversational AI agent builder configuration (`[conversational_ai]`).
+    #[serde(default)]
+    pub conversational_ai: ConversationalAiConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -3918,6 +3921,87 @@ impl Default for EstopConfig {
     }
 }
 
+// ── Conversational AI ──────────────────────────────────────────
+
+fn default_conversational_ai_language() -> String {
+    "en".into()
+}
+
+fn default_conversational_ai_supported_languages() -> Vec<String> {
+    vec!["en".into(), "de".into(), "fr".into(), "it".into()]
+}
+
+fn default_conversational_ai_escalation_threshold() -> f64 {
+    0.3
+}
+
+fn default_conversational_ai_max_turns() -> usize {
+    50
+}
+
+fn default_conversational_ai_timeout_secs() -> u64 {
+    1800
+}
+
+/// Conversational AI agent builder configuration (`[conversational_ai]` section).
+///
+/// Controls language detection, escalation behavior, conversation limits, and
+/// analytics for conversational agent workflows. Disabled by default.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ConversationalAiConfig {
+    /// Enable conversational AI features. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Default language for conversations (BCP-47 tag). Default: "en".
+    #[serde(default = "default_conversational_ai_language")]
+    pub default_language: String,
+
+    /// Supported languages for conversations. Default: `["en", "de", "fr", "it"]`.
+    #[serde(default = "default_conversational_ai_supported_languages")]
+    pub supported_languages: Vec<String>,
+
+    /// Automatically detect user language from message content. Default: true.
+    #[serde(default = "default_true")]
+    pub auto_detect_language: bool,
+
+    /// Intent confidence below this threshold triggers escalation. Default: 0.3.
+    #[serde(default = "default_conversational_ai_escalation_threshold")]
+    pub escalation_confidence_threshold: f64,
+
+    /// Maximum conversation turns before auto-ending. Default: 50.
+    #[serde(default = "default_conversational_ai_max_turns")]
+    pub max_conversation_turns: usize,
+
+    /// Conversation timeout in seconds (inactivity). Default: 1800.
+    #[serde(default = "default_conversational_ai_timeout_secs")]
+    pub conversation_timeout_secs: u64,
+
+    /// Enable conversation analytics tracking. Default: true.
+    #[serde(default = "default_true")]
+    pub analytics_enabled: bool,
+
+    /// Optional tool name for RAG-based knowledge base lookup during conversations.
+    #[serde(default)]
+    pub knowledge_base_tool: Option<String>,
+}
+
+impl Default for ConversationalAiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_language: default_conversational_ai_language(),
+            supported_languages: default_conversational_ai_supported_languages(),
+            auto_detect_language: true,
+            escalation_confidence_threshold: default_conversational_ai_escalation_threshold(),
+            max_conversation_turns: default_conversational_ai_max_turns(),
+            conversation_timeout_secs: default_conversational_ai_timeout_secs(),
+            analytics_enabled: true,
+            knowledge_base_tool: None,
+        }
+    }
+}
+
 /// Sandbox configuration for OS-level isolation
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxConfig {
@@ -4204,6 +4288,7 @@ impl Default for Config {
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            conversational_ai: ConversationalAiConfig::default(),
         }
     }
 }
@@ -5232,13 +5317,33 @@ impl Config {
             validate_mcp_config(&self.mcp)?;
         }
 
+        // Conversational AI
+        if self.conversational_ai.enabled {
+            let cai = &self.conversational_ai;
+            if !(0.0..=1.0).contains(&cai.escalation_confidence_threshold) {
+                anyhow::bail!(
+                    "conversational_ai.escalation_confidence_threshold must be between 0.0 and 1.0, got {}",
+                    cai.escalation_confidence_threshold
+                );
+            }
+            if cai.max_conversation_turns == 0 {
+                anyhow::bail!("conversational_ai.max_conversation_turns must be greater than 0");
+            }
+            if cai.conversation_timeout_secs == 0 {
+                anyhow::bail!("conversational_ai.conversation_timeout_secs must be greater than 0");
+            }
+            if cai.default_language.trim().is_empty() {
+                anyhow::bail!("conversational_ai.default_language must not be empty");
+            }
+            if cai.supported_languages.is_empty() {
+                anyhow::bail!(
+                    "conversational_ai.supported_languages must not be empty when conversational_ai is enabled"
+                );
+            }
+        }
+
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
-
-        // MCP servers
-        if self.mcp.enabled {
-            validate_mcp_config(&self.mcp)?;
-        }
 
         Ok(())
     }
@@ -5950,6 +6055,7 @@ impl Config {
     }
 }
 
+#[allow(clippy::unused_async)]
 async fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -5975,6 +6081,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    #[allow(unused_imports)]
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
@@ -6310,6 +6417,7 @@ default_temperature = 0.7
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            conversational_ai: ConversationalAiConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -6601,6 +6709,7 @@ tool_dispatcher = "xml"
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            conversational_ai: ConversationalAiConfig::default(),
         };
 
         config.save().await.unwrap();
