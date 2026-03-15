@@ -545,6 +545,7 @@ function App() {
         ) : (
           <Settings
             locale={locale}
+            isConnected={isConnected}
             onLocaleChange={handleLocaleChange}
             onBack={() => setPage("chat")}
             onLogout={handleLogout}

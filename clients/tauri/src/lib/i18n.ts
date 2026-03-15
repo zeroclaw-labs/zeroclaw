@@ -143,6 +143,20 @@ type TranslationKey =
   | "credit_package_premium"
   | "credit_package_pro"
   | "credit_operator_hint"
+  // LLM / Model selection
+  | "llm_settings"
+  | "llm_provider"
+  | "llm_model"
+  | "llm_provider_claude"
+  | "llm_provider_openai"
+  | "llm_provider_gemini"
+  | "connection_mode"
+  | "connection_mode_relay"
+  | "connection_mode_local"
+  | "connection_mode_relay_hint"
+  | "connection_mode_local_hint"
+  | "advanced_settings_toggle"
+  | "local_gateway_url"
   // Sidebar sections
   | "sidebar_devices"
   | "sidebar_channels"
@@ -284,6 +298,20 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     credit_package_premium: "Premium",
     credit_package_pro: "Pro",
     credit_operator_hint: "Credits are used when you don't have your own API key (2x actual cost).",
+    // LLM / Model selection
+    llm_settings: "AI Model",
+    llm_provider: "Provider",
+    llm_model: "Model",
+    llm_provider_claude: "Claude (Anthropic)",
+    llm_provider_openai: "OpenAI",
+    llm_provider_gemini: "Gemini (Google)",
+    connection_mode: "Connection",
+    connection_mode_relay: "Cloud (MoA Relay)",
+    connection_mode_local: "Local Gateway",
+    connection_mode_relay_hint: "Using MoA relay server. Credits are deducted per request.",
+    connection_mode_local_hint: "Using your own API key via local gateway.",
+    advanced_settings_toggle: "Advanced Settings",
+    local_gateway_url: "Local Gateway URL",
     // Sidebar sections
     sidebar_devices: "Devices",
     sidebar_channels: "Channels",
@@ -424,6 +452,20 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     credit_package_premium: "\uD504\uB9AC\uBBF8\uC5C4",
     credit_package_pro: "\uD504\uB85C",
     credit_operator_hint: "\uC790\uC2E0\uC758 API \uD0A4\uAC00 \uC5C6\uC744 \uB54C \uD06C\uB808\uB527\uC774 \uC0AC\uC6A9\uB429\uB2C8\uB2E4 (\uC2E4\uC81C \uBE44\uC6A9\uC758 2\uBC30).",
+    // LLM / Model selection
+    llm_settings: "AI \uBAA8\uB378",
+    llm_provider: "\uC81C\uACF5\uC5C5\uCCB4",
+    llm_model: "\uBAA8\uB378",
+    llm_provider_claude: "Claude (Anthropic)",
+    llm_provider_openai: "OpenAI",
+    llm_provider_gemini: "Gemini (Google)",
+    connection_mode: "\uC5F0\uACB0 \uBC29\uC2DD",
+    connection_mode_relay: "\uD074\uB77C\uC6B0\uB4DC (MoA \uB9B4\uB808\uC774)",
+    connection_mode_local: "\uB85C\uCEEC \uAC8C\uC774\uD2B8\uC6E8\uC774",
+    connection_mode_relay_hint: "MoA \uB9B4\uB808\uC774 \uC11C\uBC84\uB97C \uD1B5\uD574 \uC5F0\uACB0\uB429\uB2C8\uB2E4. \uC694\uCCAD\uB2F9 \uD06C\uB808\uB527\uC774 \uCC28\uAC10\uB429\uB2C8\uB2E4.",
+    connection_mode_local_hint: "\uC790\uCCB4 API \uD0A4\uB97C \uC0AC\uC6A9\uD558\uC5EC \uB85C\uCEEC \uAC8C\uC774\uD2B8\uC6E8\uC774\uB85C \uC5F0\uACB0\uB429\uB2C8\uB2E4.",
+    advanced_settings_toggle: "\uACE0\uAE09 \uC124\uC815",
+    local_gateway_url: "\uB85C\uCEEC \uAC8C\uC774\uD2B8\uC6E8\uC774 URL",
     // Sidebar sections
     sidebar_devices: "\uB514\uBC14\uC774\uC2A4",
     sidebar_channels: "\uCC44\uB110",

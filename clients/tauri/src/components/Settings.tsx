@@ -5,12 +5,45 @@ import { isTauri } from "../lib/tauri-bridge";
 
 interface SettingsProps {
   locale: Locale;
+  isConnected: boolean;
   onLocaleChange: (locale: Locale) => void;
   onBack: () => void;
   onLogout: () => void;
 }
 
 const API_KEY_STORAGE_PREFIX = "zeroclaw_api_key_";
+const STORAGE_KEY_LLM_PROVIDER = "zeroclaw_llm_provider";
+const STORAGE_KEY_LLM_MODEL = "zeroclaw_llm_model";
+
+interface ModelOption {
+  id: string;
+  label: string;
+  tier: string;
+}
+
+const MODEL_OPTIONS: Record<string, ModelOption[]> = {
+  claude: [
+    { id: "claude-opus-4-20250514", label: "Claude Opus 4", tier: "Premium" },
+    { id: "claude-sonnet-4-20250514", label: "Claude Sonnet 4", tier: "Standard" },
+    { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5", tier: "Fast" },
+  ],
+  openai: [
+    { id: "gpt-4o", label: "GPT-4o", tier: "Premium" },
+    { id: "gpt-4-turbo", label: "GPT-4 Turbo", tier: "Standard" },
+    { id: "gpt-3.5-turbo", label: "GPT-3.5 Turbo", tier: "Fast" },
+  ],
+  gemini: [
+    { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash", tier: "Premium" },
+    { id: "gemini-1.5-pro", label: "Gemini 1.5 Pro", tier: "Standard" },
+    { id: "gemini-1.5-flash", label: "Gemini 1.5 Flash", tier: "Fast" },
+  ],
+};
+
+const PROVIDER_LIST = [
+  { id: "claude", labelKey: "llm_provider_claude" as const },
+  { id: "openai", labelKey: "llm_provider_openai" as const },
+  { id: "gemini", labelKey: "llm_provider_gemini" as const },
+];
 
 function getStoredApiKey(provider: string): string {
   return localStorage.getItem(`${API_KEY_STORAGE_PREFIX}${provider}`) || "";
@@ -24,7 +57,15 @@ function setStoredApiKey(provider: string, key: string): void {
   }
 }
 
-export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsProps) {
+function getStoredProvider(): string {
+  return localStorage.getItem(STORAGE_KEY_LLM_PROVIDER) || "claude";
+}
+
+function getStoredModel(): string {
+  return localStorage.getItem(STORAGE_KEY_LLM_MODEL) || "claude-opus-4-20250514";
+}
+
+export function Settings({ locale, isConnected, onLocaleChange, onBack, onLogout }: SettingsProps) {
   const [serverUrl, setServerUrl] = useState(apiClient.getServerUrl());
   const [isHealthChecking, setIsHealthChecking] = useState(false);
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
@@ -38,6 +79,9 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
   const [openaiKey, setOpenaiKey] = useState(() => getStoredApiKey("openai"));
   const [geminiKey, setGeminiKey] = useState(() => getStoredApiKey("gemini"));
   const [creditBalance, setCreditBalance] = useState<number | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState(getStoredProvider);
+  const [selectedModel, setSelectedModel] = useState(getStoredModel);
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const inTauri = isTauri();
   const user = apiClient.getUser();
   const isLoggedIn = apiClient.isLoggedIn();
@@ -91,6 +135,20 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
     [],
   );
 
+  const handleProviderChange = useCallback((provider: string) => {
+    setSelectedProvider(provider);
+    localStorage.setItem(STORAGE_KEY_LLM_PROVIDER, provider);
+    // Set default model for this provider (first = highest tier)
+    const defaultModel = MODEL_OPTIONS[provider]?.[0]?.id || "";
+    setSelectedModel(defaultModel);
+    localStorage.setItem(STORAGE_KEY_LLM_MODEL, defaultModel);
+  }, []);
+
+  const handleModelChange = useCallback((model: string) => {
+    setSelectedModel(model);
+    localStorage.setItem(STORAGE_KEY_LLM_MODEL, model);
+  }, []);
+
   const handleTriggerSync = useCallback(async () => {
     setIsSyncing(true);
     setMessage(null);
@@ -117,11 +175,30 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
     setMessage(null);
 
     try {
-      const result = await apiClient.healthCheck();
-      if (result.status === "ok") {
-        setMessage({ type: "success", text: t("server_healthy", locale) });
+      // When user has no API key, check relay server; otherwise check local gateway
+      if (apiClient.hasLocalApiKey()) {
+        const result = await apiClient.healthCheck();
+        if (result.status === "ok") {
+          setMessage({ type: "success", text: t("server_healthy", locale) });
+        } else {
+          setMessage({ type: "error", text: t("server_unreachable", locale) });
+        }
       } else {
-        setMessage({ type: "error", text: t("server_unreachable", locale) });
+        // Check relay server health
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000);
+        try {
+          const res = await fetch(`${apiClient.getRelayUrl()}/health`, {
+            signal: controller.signal,
+          });
+          if (res.ok) {
+            setMessage({ type: "success", text: t("server_healthy", locale) });
+          } else {
+            setMessage({ type: "error", text: t("server_unreachable", locale) });
+          }
+        } finally {
+          clearTimeout(timeout);
+        }
       }
     } catch (err) {
       setMessage({
@@ -171,6 +248,9 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
     }
     clearMessage();
   }, [locale, clearMessage]);
+
+  const hasApiKey = apiClient.hasLocalApiKey();
+  const models = MODEL_OPTIONS[selectedProvider] || [];
 
   const formatLastSeen = (timestamp: number) => {
     const now = Date.now() / 1000;
@@ -298,6 +378,75 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
             </div>
           )}
 
+          {/* Connection Mode indicator */}
+          {isLoggedIn && (
+            <div className="settings-section">
+              <div className="settings-section-title">{t("connection_mode", locale)}</div>
+              <div className="settings-card">
+                <div className="settings-connection-mode">
+                  <div className={`settings-connection-badge ${hasApiKey ? "local" : "relay"}`}>
+                    <div className={`status-dot ${isConnected ? "connected" : ""}`} />
+                    <span>
+                      {hasApiKey
+                        ? t("connection_mode_local", locale)
+                        : t("connection_mode_relay", locale)}
+                    </span>
+                  </div>
+                  <p style={{ fontSize: 12, color: "var(--color-text-muted)", marginTop: 8 }}>
+                    {hasApiKey
+                      ? t("connection_mode_local_hint", locale)
+                      : t("connection_mode_relay_hint", locale)}
+                  </p>
+                  <button
+                    className="settings-btn settings-btn-secondary settings-btn-sm"
+                    onClick={handleHealthCheck}
+                    disabled={isHealthChecking}
+                    style={{ marginTop: 8 }}
+                  >
+                    {isHealthChecking ? t("checking", locale) : t("health_check", locale)}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* LLM Provider & Model selection */}
+          {isLoggedIn && (
+            <div className="settings-section">
+              <div className="settings-section-title">{t("llm_settings", locale)}</div>
+              <div className="settings-card">
+                <div className="settings-field">
+                  <label className="settings-label">{t("llm_provider", locale)}</label>
+                  <div className="settings-provider-selector">
+                    {PROVIDER_LIST.map((p) => (
+                      <button
+                        key={p.id}
+                        className={`settings-provider-btn ${selectedProvider === p.id ? "active" : ""}`}
+                        onClick={() => handleProviderChange(p.id)}
+                      >
+                        {t(p.labelKey, locale)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="settings-field" style={{ marginTop: 12 }}>
+                  <label className="settings-label">{t("llm_model", locale)}</label>
+                  <select
+                    className="settings-select"
+                    value={selectedModel}
+                    onChange={(e) => handleModelChange(e.target.value)}
+                  >
+                    {models.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.label} ({m.tier})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* API Keys section */}
           {isLoggedIn && (
             <div className="settings-section">
@@ -415,29 +564,43 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
             <div className={`settings-message ${message.type}`}>{message.text}</div>
           )}
 
-          {/* Server URL */}
+          {/* Advanced Settings (collapsible) */}
           <div className="settings-section">
-            <div className="settings-section-title">{t("server_url", locale)}</div>
-            <div className="settings-card">
-              <div className="settings-field">
-                <div className="settings-input-row">
-                  <input
-                    className="settings-input"
-                    type="url"
-                    value={serverUrl}
-                    onChange={(e) => handleServerUrlChange(e.target.value)}
-                    placeholder="http://127.0.0.1:3000"
-                  />
-                  <button
-                    className="settings-btn settings-btn-secondary"
-                    onClick={handleHealthCheck}
-                    disabled={isHealthChecking}
-                  >
-                    {isHealthChecking ? t("checking", locale) : t("health_check", locale)}
-                  </button>
+            <button
+              className="settings-advanced-toggle"
+              onClick={() => setShowAdvanced(!showAdvanced)}
+            >
+              <span>{t("advanced_settings_toggle", locale)}</span>
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                style={{ transform: showAdvanced ? "rotate(180deg)" : "rotate(0deg)", transition: "transform 0.2s" }}
+              >
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            </button>
+            {showAdvanced && (
+              <div className="settings-card" style={{ marginTop: 8 }}>
+                <div className="settings-field">
+                  <label className="settings-label">{t("local_gateway_url", locale)}</label>
+                  <div className="settings-input-row">
+                    <input
+                      className="settings-input"
+                      type="url"
+                      value={serverUrl}
+                      onChange={(e) => handleServerUrlChange(e.target.value)}
+                      placeholder="http://127.0.0.1:3000"
+                    />
+                  </div>
                 </div>
               </div>
-            </div>
+            )}
           </div>
 
           {/* Language section */}
