@@ -12,7 +12,7 @@ Use this with:
 
 ZeroClaw uses a single default branch: `master`. All contributor PRs target `master` directly. There is no `dev` or promotion branch.
 
-Current maintainers with PR approval authority: `theonlyhennygod`, `JordanTheJet`, and `SimianAstronaut7`.
+Current maintainers with PR approval authority: `theonlyhennygod` and `jordanthejet`.
 
 ## Active Workflows
 
@@ -43,7 +43,7 @@ Current maintainers with PR approval authority: `theonlyhennygod`, `JordanTheJet
    - `security` job: runs `cargo audit` and `cargo deny check licenses sources`.
    - Concurrency group cancels in-progress runs for the same PR on new pushes.
 3. All jobs must pass before merge.
-4. Maintainer (`theonlyhennygod`, `JordanTheJet`, or `SimianAstronaut7`) merges PR once checks and review policy are satisfied.
+4. Maintainer (`theonlyhennygod` or `jordanthejet`) merges PR once checks and review policy are satisfied.
 5. Merge emits a `push` event on `master` (see section 2).
 
 ### 2) Push to `master` (including after merge)

@@ -21,6 +21,8 @@ pub use schema::{
     TranscriptionConfig, TtsConfig, TunnelConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
 };
 
+pub use crate::tools::corporate_monitor::CorporateMonitorConfig;
+
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
     (T::name(), channel.is_some())
 }
