@@ -1,0 +1,18 @@
+warning: struct `BridgeConfig` is never constructed
+ --> crates/zeroclaw-bridge/src/config.rs:6:12
+  |
+6 | pub struct BridgeConfig {
+  |            ^^^^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `load` is never used
+  --> crates/zeroclaw-bridge/src/config.rs:13:12
+   |
+12 | impl BridgeConfig {
+   | ----------------- associated function in this implementation
+13 |     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+   |            ^^^^
+
+warning: `zeroclaw-bridge` (bin "zeroclaw-bridge") generated 2 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.37s

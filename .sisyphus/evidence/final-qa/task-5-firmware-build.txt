@@ -1,0 +1,1 @@
+/bin/bash: 行 1: platformio: 未找到命令

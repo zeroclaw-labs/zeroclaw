@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct BridgeConfig {
     pub mqtt_broker_url: String,
     pub websocket_url: String,
@@ -10,6 +11,7 @@ pub struct BridgeConfig {
 }
 
 impl BridgeConfig {
+    #[allow(dead_code)]
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content =
             std::fs::read_to_string(path.as_ref()).context("Failed to read config file")?;

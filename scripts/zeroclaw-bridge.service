@@ -1,0 +1,13 @@
+[Unit]
+Description=ZeroClaw Bridge Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/zeroclaw-bridge
+WorkingDirectory=%h/.zeroclaw
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

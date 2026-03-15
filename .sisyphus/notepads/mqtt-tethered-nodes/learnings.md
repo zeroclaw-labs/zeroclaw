@@ -347,3 +347,34 @@ All schemas validated with jq:
 - tests/integration/Dockerfile.qemu
 - tests/integration/test-e2e-berry.sh
 - tests/integration/README.md
+
+## Task 17: Systemd Service and Deployment Script
+
+### Implementation
+- Created user-level systemd service (not system-wide, no sudo required)
+- Service file: `scripts/zeroclaw-bridge.service`
+- Install script: `scripts/install-bridge.sh` (executable)
+- Config template already exists: `crates/zeroclaw-bridge/bridge.toml.example`
+
+### Key Patterns
+- **User-level systemd**: Uses `%h` (home directory) for paths, installs to `~/.config/systemd/user/`
+- **No sudo required**: All operations in user space (`systemctl --user`)
+- **Binary location**: `~/.cargo/bin/zeroclaw-bridge` (standard Rust install location)
+- **Config location**: `~/.zeroclaw/bridge.toml` (matches gateway convention)
+- **WorkingDirectory**: `%h/.zeroclaw` for config file resolution
+
+### Service Management Commands
+- Install: `./scripts/install-bridge.sh`
+- Start: `systemctl --user start zeroclaw-bridge`
+- Status: `systemctl --user status zeroclaw-bridge`
+- Stop: `systemctl --user stop zeroclaw-bridge`
+- Logs: `journalctl --user -u zeroclaw-bridge -f`
+
+### Files Created
+- `scripts/zeroclaw-bridge.service` - systemd unit file
+- `scripts/install-bridge.sh` - installation script (chmod +x)
+
+### Verification
+- Service uses `Restart=on-failure` for resilience
+- `WantedBy=default.target` for user session
+- Config template copied on first install only

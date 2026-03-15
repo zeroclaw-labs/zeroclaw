@@ -1,0 +1,1 @@
+/bin/bash: 行 1: docker-compose: 未找到命令

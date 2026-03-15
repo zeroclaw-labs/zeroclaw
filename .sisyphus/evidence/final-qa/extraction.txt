@@ -1,0 +1,65 @@
+QA SCENARIOS EXTRACTED FROM PLAN:
+
+Task 1: MQTT Topic Structure and Message Schema
+- Verify doc completeness (grep topics)
+- Validate JSON examples
+
+Task 2: Bridge Project Scaffold
+- Compile verification
+- Config file load test
+
+Task 3: MQTT Client Wrapper
+- MQTT connection test
+
+Task 4: WebSocket Client Wrapper
+- WebSocket connection test
+
+Task 5: ESP32 Firmware Scaffold
+- Firmware build verification
+- QEMU simulator test
+
+Task 6: Message Transformation
+- Register message conversion
+- Invoke message conversion
+
+Task 7: Bridge Core Event Loop
+- Event loop startup
+
+Task 8: Authentication and Token
+- Token passing verification
+
+Task 9: ESP32 Command Executor
+- QEMU GPIO write test
+- QEMU ADC read test
+
+Task 10: Auto-reconnection
+- MQTT reconnect test
+
+Task 11: Heartbeat
+- Heartbeat send verification
+
+Task 12: ESP32 Capability Registration
+- Registration message validation
+
+Task 13: Berry Script VM
+- Berry VM init test
+- Berry GPIO call test
+
+Task 14: Script Cache System
+- Script cache test
+- Script execute test
+
+Task 15: Berry Test Suite
+- Berry test suite execution
+
+Task 16: Integration Tests
+- End-to-end Berry script test
+
+Task 17: Systemd Service
+- Systemd service verification
+
+Task 18: Operations Documentation
+- Doc completeness check
+
+Task 19: ESP32 Firmware Documentation
+- README completeness with Berry examples

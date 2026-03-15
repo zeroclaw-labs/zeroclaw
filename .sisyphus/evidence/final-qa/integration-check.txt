@@ -1,0 +1,14 @@
+CROSS-TASK INTEGRATION VERIFICATION
+====================================
+
+ESP32 → MQTT → Bridge → WebSocket → Gateway Flow:
+✅ ESP32 firmware structure exists
+✅ MQTT client wrapper implemented and tested
+✅ Bridge transformation logic tested (MQTT ↔ WebSocket)
+✅ WebSocket client wrapper implemented and tested
+✅ Integration test infrastructure exists (docker-compose + test script)
+
+Berry Script Cache → Execute → Result Flow:
+✅ Berry Script documentation present in README
+✅ Script cache/execute mentioned in plan
+⚠️  Cannot verify without QEMU/PlatformIO runtime

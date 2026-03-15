@@ -1,7 +1,6 @@
 mod config;
 
 use anyhow::Result;
-use tracing_subscriber;
 
 #[tokio::main]
 async fn main() -> Result<()> {
