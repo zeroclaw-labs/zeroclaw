@@ -30,6 +30,7 @@ pub mod mattermost;
 pub mod nextcloud_talk;
 #[cfg(feature = "channel-nostr")]
 pub mod nostr;
+pub mod notion;
 pub mod qq;
 pub mod session_store;
 pub mod signal;
@@ -62,6 +63,7 @@ pub use mattermost::MattermostChannel;
 pub use nextcloud_talk::NextcloudTalkChannel;
 #[cfg(feature = "channel-nostr")]
 pub use nostr::NostrChannel;
+pub use notion::NotionChannel;
 pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
@@ -2950,6 +2952,12 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
                     channel.name()
                 );
             }
+            // Notion is a top-level config section, not part of ChannelsConfig
+            {
+                let notion_configured =
+                    config.notion.enabled && !config.notion.database_id.trim().is_empty();
+                println!("  {} Notion", if notion_configured { "✅" } else { "❌" });
+            }
             if !cfg!(feature = "channel-matrix") {
                 println!(
                     "  ℹ️ Matrix channel support is disabled in this build (enable `channel-matrix`)."
@@ -3378,6 +3386,34 @@ fn collect_configured_channels(
             display_name: "ClawdTalk",
             channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
         });
+    }
+
+    // Notion database poller channel
+    if config.notion.enabled && !config.notion.database_id.trim().is_empty() {
+        let notion_api_key = if config.notion.api_key.trim().is_empty() {
+            std::env::var("NOTION_API_KEY").unwrap_or_default()
+        } else {
+            config.notion.api_key.trim().to_string()
+        };
+        if notion_api_key.trim().is_empty() {
+            tracing::warn!(
+                "Notion channel enabled but no API key found (set notion.api_key or NOTION_API_KEY env var)"
+            );
+        } else {
+            channels.push(ConfiguredChannel {
+                display_name: "Notion",
+                channel: Arc::new(NotionChannel::new(
+                    notion_api_key,
+                    config.notion.database_id.clone(),
+                    config.notion.poll_interval_secs,
+                    config.notion.status_property.clone(),
+                    config.notion.input_property.clone(),
+                    config.notion.result_property.clone(),
+                    config.notion.max_concurrent,
+                    config.notion.recover_stale,
+                )),
+            });
+        }
     }
 
     channels
