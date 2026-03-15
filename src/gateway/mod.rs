@@ -1678,18 +1678,30 @@ async fn handle_admin_reload_config(
     require_localhost(&peer)?;
     tracing::info!(peer = %peer, "Admin config reload request received");
 
+    // Guard: make sure the config file still exists on disk before we attempt
+    // a reload. load_or_init() would silently create a default config if the
+    // file is missing, which would wipe the live configuration.
+    let config_path = state.config.lock().config_path.clone();
+    if !config_path.exists() {
+        tracing::error!(peer = %peer, path = %config_path.display(), "Config file not found on disk");
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Config file not found: {}", config_path.display())
+            })),
+        ));
+    }
+
     // load_or_init() resolves the config path from this process's env
     // (ZEROCLAW_CONFIG_DIR / active_workspace marker / default), then reads,
     // deserializes, decrypts secrets, applies env overrides, and validates.
-    // If the file is missing it creates a default — which is acceptable since
-    // the daemon must have loaded *some* config at startup via the same path.
     // A parse or validation failure is surfaced as 500 without touching live config.
     let new_config = crate::config::Config::load_or_init().await.map_err(|e| {
         tracing::error!(peer = %peer, "Config reload failed: {e}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
-                "error": format!("Config reload failed: {e}")
+                "error": "Config reload failed"
             })),
         )
     })?;
@@ -3059,5 +3071,18 @@ mod tests {
         let result = handle_admin_reload_config(State(state), ConnectInfo(peer)).await;
         let err = result.unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn reload_config_missing_file_returns_error() {
+        use std::path::PathBuf;
+
+        let state = test_app_state();
+        state.config.lock().config_path =
+            PathBuf::from("/tmp/nonexistent-zeroclaw-config-abc123.toml");
+        let peer = SocketAddr::from(([127, 0, 0, 1], 12345));
+        let result = handle_admin_reload_config(State(state), ConnectInfo(peer)).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 }
