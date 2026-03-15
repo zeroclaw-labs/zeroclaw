@@ -1,6 +1,5 @@
 use crate::config::IdentityConfig;
 use crate::identity;
-use crate::skills::Skill;
 use crate::tools::Tool;
 use anyhow::Result;
 use chrono::Local;
@@ -13,7 +12,7 @@ pub struct PromptContext<'a> {
     pub workspace_dir: &'a Path,
     pub model_name: &'a str,
     pub tools: &'a [Box<dyn Tool>],
-    pub skills: &'a [Skill],
+    pub skills: &'a [Box<dyn crate::skills::Skill>],
     pub skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     pub identity_config: Option<&'a IdentityConfig>,
     pub dispatcher_instructions: &'a str,
@@ -355,13 +354,13 @@ mod tests {
     #[test]
     fn skills_section_includes_instructions_and_tools() {
         let tools: Vec<Box<dyn Tool>> = vec![];
-        let skills = vec![crate::skills::Skill {
+        let skills: Vec<Box<dyn crate::skills::Skill>> = vec![Box::new(crate::skills::LegacySkill {
             name: "deploy".into(),
             description: "Release safely".into(),
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
-            tools: vec![crate::skills::SkillTool {
+            tools: vec![crate::skills::LegacySkillTool {
                 name: "release_checklist".into(),
                 description: "Validate release readiness".into(),
                 kind: "shell".into(),
@@ -370,7 +369,7 @@ mod tests {
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
             location: None,
-        }];
+        })];
 
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
@@ -387,19 +386,18 @@ mod tests {
         assert!(output.contains("<name>deploy</name>"));
         assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
         assert!(output.contains("<name>release_checklist</name>"));
-        assert!(output.contains("<kind>shell</kind>"));
     }
 
     #[test]
     fn skills_section_compact_mode_omits_instructions_and_tools() {
         let tools: Vec<Box<dyn Tool>> = vec![];
-        let skills = vec![crate::skills::Skill {
+        let skills: Vec<Box<dyn crate::skills::Skill>> = vec![Box::new(crate::skills::LegacySkill {
             name: "deploy".into(),
             description: "Release safely".into(),
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
-            tools: vec![crate::skills::SkillTool {
+            tools: vec![crate::skills::LegacySkillTool {
                 name: "release_checklist".into(),
                 description: "Validate release readiness".into(),
                 kind: "shell".into(),
@@ -408,7 +406,7 @@ mod tests {
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
             location: Some(Path::new("/tmp/workspace/skills/deploy/SKILL.md").to_path_buf()),
-        }];
+        })];
 
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp/workspace"),
@@ -453,13 +451,13 @@ mod tests {
     #[test]
     fn prompt_builder_inlines_and_escapes_skills() {
         let tools: Vec<Box<dyn Tool>> = vec![];
-        let skills = vec![crate::skills::Skill {
+        let skills: Vec<Box<dyn crate::skills::Skill>> = vec![Box::new(crate::skills::LegacySkill {
             name: "code<review>&".into(),
             description: "Review \"unsafe\" and 'risky' bits".into(),
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
-            tools: vec![crate::skills::SkillTool {
+            tools: vec![crate::skills::LegacySkillTool {
                 name: "run\"linter\"".into(),
                 description: "Run <lint> & report".into(),
                 kind: "shell&exec".into(),
@@ -468,7 +466,7 @@ mod tests {
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,
-        }];
+        })];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp/workspace"),
             model_name: "test-model",

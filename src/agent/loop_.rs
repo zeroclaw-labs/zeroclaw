@@ -21,6 +21,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use crate::hooks::HookRunner;
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
 const STREAM_CHUNK_MIN_CHARS: usize = 80;
@@ -3302,6 +3303,11 @@ pub async fn run(
     };
     let channel_name = if interactive { "cli" } else { "daemon" };
 
+    // ── Hooks (lifecycle events) ──────────────────────────────
+    let hooks_runner = HookRunner::new();
+    // Default system hooks (if any) could be registered here.
+    hooks_runner.fire_startup().await;
+
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
 
@@ -3341,7 +3347,7 @@ pub async fn run(
         let excluded_tools =
             compute_excluded_mcp_tools(&tools_registry, &config.agent.tool_filter_groups, &msg);
 
-        let response = run_tool_call_loop(
+        let response = match run_tool_call_loop(
             provider.as_ref(),
             &mut history,
             &tools_registry,
@@ -3356,11 +3362,17 @@ pub async fn run(
             config.agent.max_tool_iterations,
             None,
             None,
-            None,
+            Some(&hooks_runner),
             &excluded_tools,
             &config.agent.tool_call_dedup_exempt,
         )
-        .await?;
+        .await {
+            Ok(res) => res,
+            Err(e) => {
+                hooks_runner.fire_error(&e).await;
+                return Err(e);
+            }
+        };
         final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
@@ -3504,7 +3516,7 @@ pub async fn run(
                 config.agent.max_tool_iterations,
                 None,
                 None,
-                None,
+                Some(&hooks_runner),
                 &excluded_tools,
                 &config.agent.tool_call_dedup_exempt,
             )
@@ -3551,15 +3563,7 @@ pub async fn run(
         }
     }
 
-    let duration = start.elapsed();
-    observer.record_event(&ObserverEvent::AgentEnd {
-        provider: provider_name.to_string(),
-        model: model_name.to_string(),
-        duration,
-        tokens_used: None,
-        cost_usd: None,
-    });
-
+    hooks_runner.fire_shutdown().await;
     Ok(final_output)
 }
 

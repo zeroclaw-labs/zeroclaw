@@ -98,6 +98,39 @@ impl HookRunner {
         join_all(futs).await;
     }
 
+    pub async fn fire_startup(&self) {
+        let futs: Vec<_> = self.handlers.iter().map(|h| h.on_startup()).collect();
+        join_all(futs).await;
+    }
+
+    pub async fn fire_shutdown(&self) {
+        let futs: Vec<_> = self.handlers.iter().map(|h| h.on_shutdown()).collect();
+        join_all(futs).await;
+    }
+
+    pub async fn fire_error(&self, error: &anyhow::Error) {
+        let futs: Vec<_> = self.handlers.iter().map(|h| h.on_error(error)).collect();
+        join_all(futs).await;
+    }
+
+    pub async fn fire_skill_loaded(&self, skill_name: &str) {
+        let futs: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| h.on_skill_loaded(skill_name))
+            .collect();
+        join_all(futs).await;
+    }
+
+    pub async fn fire_skill_unloaded(&self, skill_name: &str) {
+        let futs: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| h.on_skill_unloaded(skill_name))
+            .collect();
+        join_all(futs).await;
+    }
+
     pub async fn fire_message_sent(&self, channel: &str, recipient: &str, content: &str) {
         let futs: Vec<_> = self
             .handlers
