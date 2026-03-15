@@ -1199,6 +1199,17 @@ fi
 
 if [[ "$SKIP_INSTALL" == false ]]; then
   step_dot "Installing zeroclaw to cargo bin"
+
+  # Clean up stale cargo install tracking from the old "zeroclaw" package name
+  # (renamed to "zeroclawlabs"). Without this, `cargo install zeroclawlabs` from
+  # crates.io fails with "binary already exists as part of `zeroclaw`".
+  if have_cmd cargo; then
+    if [[ -f "$HOME/.cargo/.crates.toml" ]] && grep -q '^"zeroclaw ' "$HOME/.cargo/.crates.toml" 2>/dev/null; then
+      step_dot "Removing stale cargo tracking for old 'zeroclaw' package name"
+      cargo uninstall zeroclaw 2>/dev/null || true
+    fi
+  fi
+
   cargo install --path "$WORK_DIR" --force --locked
   step_ok "ZeroClaw installed"
 else
