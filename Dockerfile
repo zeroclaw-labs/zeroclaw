@@ -33,6 +33,7 @@ COPY benches/ benches/
 COPY crates/ crates/
 COPY firmware/ firmware/
 COPY web/ web/
+COPY *.rs .
 # Keep release builds resilient when frontend dist assets are not prebuilt in Git.
 RUN mkdir -p web/dist && \
     if [ ! -f web/dist/index.html ]; then \
