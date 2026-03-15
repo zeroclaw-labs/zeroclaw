@@ -14,6 +14,10 @@ PubSubClient client(espClient);
 const char* ALLOWED_COMMANDS[] = {"gpio_read", "gpio_write", "adc_read"};
 const int ALLOWED_COMMANDS_COUNT = 3;
 
+bool registered = false;
+unsigned long last_heartbeat = 0;
+const unsigned long HEARTBEAT_INTERVAL = 30000;
+
 void setup_wifi() {
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
@@ -26,6 +30,63 @@ bool is_command_allowed(const char* cmd) {
     if (strcmp(cmd, ALLOWED_COMMANDS[i]) == 0) return true;
   }
   return false;
+}
+
+void send_heartbeat() {
+  StaticJsonDocument<128> doc;
+  doc["timestamp"] = millis();
+  
+  char buffer[128];
+  serializeJson(doc, buffer);
+  
+  char topic[64];
+  snprintf(topic, sizeof(topic), "zeroclaw/nodes/%s/heartbeat", node_id);
+  client.publish(topic, buffer, false);
+}
+
+void send_register() {
+  StaticJsonDocument<512> doc;
+  doc["type"] = "register";
+  doc["node_id"] = node_id;
+  
+  JsonArray caps = doc.createNestedArray("capabilities");
+  
+  JsonObject cap1 = caps.createNestedObject();
+  cap1["name"] = "gpio_read";
+  cap1["description"] = "Read digital GPIO pin state";
+  JsonObject params1 = cap1.createNestedObject("parameters");
+  params1["type"] = "object";
+  JsonObject props1 = params1.createNestedObject("properties");
+  JsonObject pin1 = props1.createNestedObject("pin");
+  pin1["type"] = "integer";
+  
+  JsonObject cap2 = caps.createNestedObject();
+  cap2["name"] = "gpio_write";
+  cap2["description"] = "Write digital GPIO pin state";
+  JsonObject params2 = cap2.createNestedObject("parameters");
+  params2["type"] = "object";
+  JsonObject props2 = params2.createNestedObject("properties");
+  JsonObject pin2 = props2.createNestedObject("pin");
+  pin2["type"] = "integer";
+  JsonObject val2 = props2.createNestedObject("value");
+  val2["type"] = "integer";
+  
+  JsonObject cap3 = caps.createNestedObject();
+  cap3["name"] = "adc_read";
+  cap3["description"] = "Read analog ADC value";
+  JsonObject params3 = cap3.createNestedObject("parameters");
+  params3["type"] = "object";
+  JsonObject props3 = params3.createNestedObject("properties");
+  JsonObject pin3 = props3.createNestedObject("pin");
+  pin3["type"] = "integer";
+  
+  char buffer[512];
+  serializeJson(doc, buffer);
+  
+  char topic[64];
+  snprintf(topic, sizeof(topic), "zeroclaw/nodes/%s/register", node_id);
+  client.publish(topic, buffer, false);
+  registered = true;
 }
 
 void publish_result(const char* request_id, bool success, const char* data, const char* error) {
@@ -125,6 +186,7 @@ void reconnect() {
       char topic[64];
       snprintf(topic, sizeof(topic), "zeroclaw/nodes/%s/invoke", node_id);
       client.subscribe(topic);
+      send_register();
     } else {
       delay(5000);
     }
@@ -143,4 +205,10 @@ void loop() {
     reconnect();
   }
   client.loop();
+  
+  unsigned long now = millis();
+  if (now - last_heartbeat >= HEARTBEAT_INTERVAL) {
+    send_heartbeat();
+    last_heartbeat = now;
+  }
 }

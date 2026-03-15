@@ -27,6 +27,7 @@ impl Bridge {
 
         self.mqtt.subscribe("zeroclaw/nodes/+/register").await?;
         self.mqtt.subscribe("zeroclaw/nodes/+/result").await?;
+        self.mqtt.subscribe("zeroclaw/nodes/+/heartbeat").await?;
 
         info!("Bridge connected and subscribed");
 
@@ -36,6 +37,9 @@ impl Bridge {
                     match mqtt_event {
                         Ok(Event::Incoming(Packet::Publish(publish))) => {
                             if let Ok(payload) = std::str::from_utf8(&publish.payload) {
+                                if publish.topic.ends_with("/heartbeat") {
+                                    info!("Heartbeat received: {}", payload);
+                                }
                                 match transform::mqtt_to_ws(payload) {
                                     Ok(ws_json) => {
                                         if let Err(e) = self.ws.send(ws_json).await {
@@ -58,6 +62,10 @@ impl Bridge {
                                 break;
                             }
                             if let Err(e) = self.mqtt.subscribe("zeroclaw/nodes/+/result").await {
+                                error!("MQTT resubscribe failed: {}", e);
+                                break;
+                            }
+                            if let Err(e) = self.mqtt.subscribe("zeroclaw/nodes/+/heartbeat").await {
                                 error!("MQTT resubscribe failed: {}", e);
                                 break;
                             }

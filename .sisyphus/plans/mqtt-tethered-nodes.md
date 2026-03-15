@@ -687,7 +687,7 @@ Max Concurrent: 5 (Wave 1)
   - Message: `feat(bridge): add auto-reconnection and error recovery`
   - Files: `crates/zeroclaw-bridge/src/bridge.rs`
 
-- [ ] 11. 心跳和健康检查
+- [x] 11. 心跳和健康检查
 
   **What to do**:
   - ESP32 每 30 秒发送心跳到 MQTT
@@ -726,7 +726,7 @@ Max Concurrent: 5 (Wave 1)
   - Message: `feat(bridge): add heartbeat and health check`
   - Files: `crates/zeroclaw-bridge/src/bridge.rs`, `firmware/esp32-node/src/main.cpp`
 
-- [ ] 12. ESP32 能力注册和生命周期
+- [x] 12. ESP32 能力注册和生命周期
 
   **What to do**:
   - ESP32 启动时发送 register 消息
