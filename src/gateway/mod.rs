@@ -677,6 +677,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/paircode", get(handle_admin_paircode))
         .route("/admin/paircode/new", post(handle_admin_paircode_new))
+        .route("/admin/reload-config", post(handle_admin_reload_config))
         // ── Existing routes ──
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
@@ -1667,6 +1668,58 @@ async fn handle_admin_paircode_new(
             Ok((StatusCode::BAD_REQUEST, Json(body)))
         }
     }
+}
+
+/// POST /admin/reload-config — hot-reload config from disk (localhost only)
+async fn handle_admin_reload_config(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+    tracing::info!(peer = %peer, "Admin config reload request received");
+
+    // Guard: make sure the config file still exists on disk before we attempt
+    // a reload. load_or_init() would silently create a default config if the
+    // file is missing, which would wipe the live configuration.
+    let config_path = state.config.lock().config_path.clone();
+    if !config_path.exists() {
+        tracing::error!(peer = %peer, path = %config_path.display(), "Config file not found on disk");
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Config file not found: {}", config_path.display())
+            })),
+        ));
+    }
+
+    // load_or_init() resolves the config path from this process's env
+    // (ZEROCLAW_CONFIG_DIR / active_workspace marker / default), then reads,
+    // deserializes, decrypts secrets, applies env overrides, and validates.
+    // A parse or validation failure is surfaced as 500 without touching live config.
+    let new_config = crate::config::Config::load_or_init().await.map_err(|e| {
+        tracing::error!(peer = %peer, "Config reload failed: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "Config reload failed"
+            })),
+        )
+    })?;
+
+    // Atomic swap via parking_lot::Mutex (no poisoning). In-flight requests
+    // that already cloned the config see old values until their next lock.
+    // Concurrent reloads are serialised — last writer wins, which is
+    // acceptable for CLI-driven reloads.
+    *state.config.lock() = new_config;
+    tracing::info!(peer = %peer, "Config reloaded from disk successfully");
+
+    Ok((
+        StatusCode::OK,
+        Json(AdminResponse {
+            success: true,
+            message: "Config reloaded from disk -- changes are now active".to_string(),
+        }),
+    ))
 }
 
 #[cfg(test)]
@@ -2980,5 +3033,60 @@ mod tests {
         ));
         let err = require_localhost(&peer).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    fn test_app_state() -> AppState {
+        AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_config_rejects_non_localhost() {
+        let state = test_app_state();
+        let peer = SocketAddr::from(([192, 168, 1, 100], 12345));
+        let result = handle_admin_reload_config(State(state), ConnectInfo(peer)).await;
+        let Err(err) = result else {
+            panic!("expected Err")
+        };
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn reload_config_missing_file_returns_error() {
+        use std::path::PathBuf;
+
+        let state = test_app_state();
+        state.config.lock().config_path =
+            PathBuf::from("/tmp/nonexistent-zeroclaw-config-abc123.toml");
+        let peer = SocketAddr::from(([127, 0, 0, 1], 12345));
+        let result = handle_admin_reload_config(State(state), ConnectInfo(peer)).await;
+        let Err(err) = result else {
+            panic!("expected Err")
+        };
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 }

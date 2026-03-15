@@ -482,6 +482,15 @@ Examples:
 enum ConfigCommands {
     /// Dump the full configuration JSON Schema to stdout
     Schema,
+    /// Hot-reload config from disk into the running gateway
+    Reload {
+        /// Gateway port (defaults to config gateway.port)
+        #[arg(short, long)]
+        port: Option<u16>,
+        /// Gateway host (defaults to config gateway.host)
+        #[arg(long)]
+        host: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1216,6 +1225,11 @@ async fn main() -> Result<()> {
                 );
                 Ok(())
             }
+            ConfigCommands::Reload { port, host } => {
+                let port = port.unwrap_or(config.gateway.port);
+                let host = host.as_deref().unwrap_or(&config.gateway.host);
+                reload_config(host, port).await
+            }
         },
     }
 }
@@ -1442,6 +1456,70 @@ async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
             response.status()
         )),
         Err(e) => Err(anyhow::anyhow!("Failed to connect to gateway: {e}")),
+    }
+}
+
+/// Hot-reload config on a running gateway via the admin endpoint.
+async fn reload_config(host: &str, port: u16) -> Result<()> {
+    // Admin endpoints are localhost-only (enforced server-side by
+    // require_localhost). This client-side check prevents accidentally
+    // sending credentials or config data to a non-loopback address when
+    // the user provides a bad --host value.
+    let is_loopback = host == "localhost"
+        || host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .or(Some(host))
+            .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback());
+    if !is_loopback {
+        anyhow::bail!(
+            "Refusing to send admin request to non-loopback host '{host}'. \
+             Only loopback addresses (127.0.0.0/8, ::1) and 'localhost' are allowed."
+        );
+    }
+
+    // Bracket bare IPv6 addresses for valid URL construction (http://[::1]:port).
+    let authority = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let url = format!("http://{authority}/admin/reload-config");
+    let client = reqwest::Client::new();
+
+    match client
+        .post(url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            let body: serde_json::Value = response.json().await?;
+            let msg = body
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Config reloaded");
+            println!("✅ {msg}");
+            Ok(())
+        }
+        Ok(response) => {
+            let status = response.status();
+            let err_msg = match response.json::<serde_json::Value>().await {
+                Ok(body) => body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error")
+                    .to_string(),
+                Err(_) => "non-JSON error response".to_string(),
+            };
+            Err(anyhow::anyhow!(
+                "Gateway responded with {status}: {err_msg}"
+            ))
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to connect to gateway at {authority}: {e}"
+        )),
     }
 }
 
