@@ -227,6 +227,16 @@ impl AgentBuilder {
     }
 }
 
+fn provider_runtime_options_from_config(config: &Config) -> providers::ProviderRuntimeOptions {
+    providers::ProviderRuntimeOptions {
+        auth_profile_override: None,
+        provider_api_url: config.api_url.clone(),
+        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        secrets_encrypt: config.secrets.encrypt,
+        reasoning_enabled: config.runtime.reasoning_enabled,
+    }
+}
+
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
@@ -293,13 +303,14 @@ impl Agent {
             .unwrap_or("anthropic/claude-sonnet-4-20250514")
             .to_string();
 
-        let provider: Box<dyn Provider> = providers::create_routed_provider(
+        let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
             provider_name,
             config.api_key.as_deref(),
             config.api_url.as_deref(),
             &config.reliability,
             &config.model_routes,
             &model_name,
+            &provider_runtime_options_from_config(config),
         )?;
 
         let dispatcher_choice = config.agent.tool_dispatcher.as_str();
@@ -751,6 +762,21 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    #[test]
+    fn provider_runtime_options_from_config_propagates_reasoning_enabled() {
+        let mut config = Config::default();
+        config.api_url = Some("https://ollama.example.com".into());
+        config.runtime.reasoning_enabled = Some(false);
+
+        let options = provider_runtime_options_from_config(&config);
+        assert_eq!(
+            options.provider_api_url.as_deref(),
+            Some("https://ollama.example.com")
+        );
+        assert_eq!(options.reasoning_enabled, Some(false));
+        assert!(options.secrets_encrypt);
     }
 
     #[tokio::test]
