@@ -201,9 +201,9 @@ impl PromptSection for DateTimeSection {
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
         let now = Local::now();
         Ok(format!(
-            "## Current Date & Time\n\n{} ({})",
-            now.format("%Y-%m-%d %H:%M:%S"),
-            now.format("%Z")
+            "## Current Date\n\n{} ({})",
+            now.format("%Y-%m-%d"),
+            now.format("%:z")
         ))
     }
 }
@@ -429,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn datetime_section_includes_timestamp_and_timezone() {
+    fn date_section_includes_date_and_offset() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
@@ -442,12 +442,18 @@ mod tests {
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
-        assert!(rendered.starts_with("## Current Date & Time\n\n"));
+        assert!(rendered.starts_with("## Current Date\n\n"));
 
-        let payload = rendered.trim_start_matches("## Current Date & Time\n\n");
-        assert!(payload.chars().any(|c| c.is_ascii_digit()));
-        assert!(payload.contains(" ("));
-        assert!(payload.ends_with(')'));
+        let payload = rendered.trim_start_matches("## Current Date\n\n");
+        let (date, offset) = payload
+            .split_once(" (")
+            .expect("date payload should include offset");
+        assert_eq!(date.len(), 10);
+        assert!(date.chars().all(|c| c.is_ascii_digit() || c == '-'));
+        assert!(offset.ends_with(')'));
+        let offset = offset.trim_end_matches(')');
+        assert!(offset.starts_with('+') || offset.starts_with('-'));
+        assert!(offset.contains(':'));
     }
 
     #[test]
