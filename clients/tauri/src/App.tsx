@@ -38,7 +38,7 @@ function App() {
   const [sidebarChannels, setSidebarChannels] = useState<string[]>([]);
   const [sidebarTools, setSidebarTools] = useState<ToolInfo[]>([]);
   const lifecycleCleanup = useRef<(() => void) | null>(null);
-  // In Tauri mode, wait for the ZeroClaw gateway to be ready before
+  // In Tauri mode, wait for the MoA gateway to be ready before
   // allowing the user to interact with auth/chat screens.
   const [gatewayReady, setGatewayReady] = useState(!isTauri());
   // Python environment setup status (shown as a banner during first launch)
@@ -279,7 +279,7 @@ function App() {
     [activeChatId, handleSendMessage],
   );
 
-  // Send an automatic greeting from ZeroClaw when chat opens after login
+  // Send an automatic greeting from MoA when chat opens after login
   const sendAutoGreeting = useCallback(
     async (isFirstLogin: boolean) => {
       const chat = createNewChat();
@@ -331,7 +331,7 @@ function App() {
     if (devices.length <= 1) {
       // 0 or 1 device → auto-connect
       if (devices.length === 0) {
-        apiClient.registerDevice("ZeroClaw Device").catch(() => {});
+        apiClient.registerDevice("MoA Device").catch(() => {});
       }
       proceedToChat();
     } else {

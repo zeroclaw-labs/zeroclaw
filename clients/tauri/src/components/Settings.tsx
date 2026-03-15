@@ -65,7 +65,7 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
     // Save to localStorage (for UI state persistence)
     setStoredApiKey(provider, key);
 
-    // Also sync the API key to the local ZeroClaw agent config.
+    // Also sync the API key to the local MoA agent config.
     // This tells the local agent to use this key for LLM calls.
     try {
       await apiClient.saveApiKeyToAgent(provider, key);
@@ -518,10 +518,10 @@ export function Settings({ locale, onLocaleChange, onBack, onLogout }: SettingsP
             <div className="settings-section-title">About</div>
             <div className="settings-card">
               <p style={{ fontSize: 13, color: "var(--color-text-secondary)", marginBottom: 4 }}>
-                <strong>ZeroClaw</strong>
+                <strong>MoA</strong>
               </p>
               <p style={{ fontSize: 12, color: "var(--color-text-muted)" }}>
-                Powered by ZeroClaw Agent Runtime
+                Powered by MoA Agent Runtime
               </p>
               <p style={{ fontSize: 12, color: "var(--color-text-muted)", marginTop: 4 }}>
                 Version 0.1.0

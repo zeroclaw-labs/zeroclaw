@@ -25,7 +25,13 @@ export function Login({ locale, onLoginSuccess, onGoToSignUp, onGoToSettings }: 
       const result = await apiClient.login(username.trim(), password);
       onLoginSuccess(result.devices || []);
     } catch (err) {
-      setError(err instanceof Error ? err.message : t("login_failed", locale));
+      if (err instanceof TypeError && err.message === "Failed to fetch") {
+        setError(locale === "ko" ? "\uC11C\uBC84\uC5D0 \uC5F0\uACB0\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4. \uC11C\uBC84 \uC8FC\uC18C\uB97C \uD655\uC778\uD574\uC8FC\uC138\uC694." : "Cannot connect to server. Please check the server URL.");
+      } else if (err instanceof Error && (err.message.includes("401") || err.message.toLowerCase().includes("invalid") || err.message.toLowerCase().includes("unauthorized"))) {
+        setError(locale === "ko" ? "\uD68C\uC6D0\uC815\uBCF4\uB97C \uCC3E\uC744 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4." : "Account not found. Please check your credentials.");
+      } else {
+        setError(err instanceof Error ? err.message : t("login_failed", locale));
+      }
     } finally {
       setIsLoading(false);
     }
@@ -42,7 +48,7 @@ export function Login({ locale, onLoginSuccess, onGoToSignUp, onGoToSettings }: 
     <div className="auth-container">
       <div className="auth-card">
         <div className="auth-logo">
-          <div className="auth-logo-icon">ZC</div>
+          <div className="auth-logo-icon">M</div>
           <h1 className="auth-title">{t("login_title", locale)}</h1>
           <p className="auth-subtitle">{t("login_subtitle", locale)}</p>
         </div>
@@ -53,12 +59,12 @@ export function Login({ locale, onLoginSuccess, onGoToSignUp, onGoToSettings }: 
           <label className="auth-label">{t("username", locale)}</label>
           <input
             className="auth-input"
-            type="text"
+            type="email"
             value={username}
             onChange={(e) => setUsername(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={t("username", locale)}
-            autoComplete="username"
+            placeholder={locale === "ko" ? "example@email.com" : "example@email.com"}
+            autoComplete="email"
             autoFocus
             disabled={isLoading}
           />

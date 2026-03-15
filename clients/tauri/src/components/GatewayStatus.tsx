@@ -11,7 +11,7 @@ interface GatewayStatusProps {
 }
 
 /**
- * Overlay shown while the ZeroClaw gateway is starting.
+ * Overlay shown while the MoA gateway is starting.
  * Listens for `gateway-status` events from the Rust backend
  * and displays progress to the user. Auto-dismisses on "ready"
  * or shows an error message on "failed".
@@ -61,7 +61,7 @@ export function GatewayStatus({ onReady }: GatewayStatusProps) {
   return (
     <div style={overlayStyle}>
       <div style={cardStyle}>
-        <div style={logoStyle}>ZeroClaw</div>
+        <div style={logoStyle}>MoA</div>
         {status === "starting" && (
           <>
             <div style={spinnerStyle} />
@@ -72,7 +72,7 @@ export function GatewayStatus({ onReady }: GatewayStatusProps) {
           <>
             <p style={{ ...messageStyle, color: "#e74c3c" }}>{message}</p>
             <p style={hintStyle}>
-              Please install ZeroClaw or start it manually, then restart the app.
+              Please install MoA or start it manually, then restart the app.
             </p>
           </>
         )}

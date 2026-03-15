@@ -35,7 +35,11 @@ export function SignUp({ locale, onSignUpSuccess, onGoToLogin }: SignUpProps) {
       await apiClient.register(username.trim(), password);
       onSignUpSuccess();
     } catch (err) {
-      setError(err instanceof Error ? err.message : t("signup_failed", locale));
+      if (err instanceof TypeError && err.message === "Failed to fetch") {
+        setError(locale === "ko" ? "\uC11C\uBC84\uC5D0 \uC5F0\uACB0\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4. \uC11C\uBC84 \uC8FC\uC18C\uB97C \uD655\uC778\uD574\uC8FC\uC138\uC694." : "Cannot connect to server. Please check the server URL.");
+      } else {
+        setError(err instanceof Error ? err.message : t("signup_failed", locale));
+      }
     } finally {
       setIsLoading(false);
     }
@@ -52,7 +56,7 @@ export function SignUp({ locale, onSignUpSuccess, onGoToLogin }: SignUpProps) {
     <div className="auth-container">
       <div className="auth-card">
         <div className="auth-logo">
-          <div className="auth-logo-icon">ZC</div>
+          <div className="auth-logo-icon">M</div>
           <h1 className="auth-title">{t("signup_title", locale)}</h1>
           <p className="auth-subtitle">{t("signup_subtitle", locale)}</p>
         </div>
@@ -63,12 +67,12 @@ export function SignUp({ locale, onSignUpSuccess, onGoToLogin }: SignUpProps) {
           <label className="auth-label">{t("username", locale)}</label>
           <input
             className="auth-input"
-            type="text"
+            type="email"
             value={username}
             onChange={(e) => setUsername(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={t("username", locale)}
-            autoComplete="username"
+            placeholder={locale === "ko" ? "example@email.com" : "example@email.com"}
+            autoComplete="email"
             autoFocus
             disabled={isLoading}
           />

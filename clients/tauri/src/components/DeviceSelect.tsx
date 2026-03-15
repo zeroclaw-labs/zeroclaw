@@ -26,7 +26,7 @@ export function DeviceSelect({ locale, devices, onDeviceSelected, onLogout }: De
     if (deviceList.length === 0) {
       // No devices registered → auto-register this device and proceed
       setAutoConnecting(true);
-      apiClient.registerDevice("ZeroClaw Device").then(() => {
+      apiClient.registerDevice("MoA Device").then(() => {
         apiClient.startHeartbeat();
         onDeviceSelected();
       }).catch(() => {

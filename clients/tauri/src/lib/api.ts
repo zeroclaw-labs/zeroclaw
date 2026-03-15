@@ -16,7 +16,7 @@ const STORAGE_KEY_USER = "zeroclaw_user";
 const STORAGE_KEY_DEVICE_ID = "zeroclaw_device_id";
 
 // Local-first architecture:
-// - LOCAL_GATEWAY_URL: ZeroClaw agent running on this device (chat, voice, tools)
+// - LOCAL_GATEWAY_URL: MoA agent running on this device (chat, voice, tools)
 // - RELAY_SERVER_URL: Railway relay for memory sync + operator key fallback only
 const DEFAULT_LOCAL_GATEWAY_URL =
   import.meta.env.VITE_LOCAL_GATEWAY_URL || "http://127.0.0.1:3000";
@@ -75,8 +75,8 @@ export type { SyncStatus, PlatformInfo };
 
 // ── Client ──────────────────────────────────────────────────────
 
-export class ZeroClawClient {
-  // Local ZeroClaw gateway URL (chat, voice, tools — runs on this device)
+export class MoAClient {
+  // Local MoA gateway URL (chat, voice, tools — runs on this device)
   private serverUrl: string;
   // Railway relay server URL (memory sync + operator API key fallback only)
   private relayUrl: string;
@@ -104,7 +104,7 @@ export class ZeroClawClient {
   }
 
   // ── Server URL ─────────────────────────────────────────────────
-  // serverUrl = local ZeroClaw gateway (chat, voice, AI operations)
+  // serverUrl = local MoA gateway (chat, voice, AI operations)
   // relayUrl  = Railway relay (memory sync + operator key fallback only)
 
   getServerUrl(): string {
@@ -155,7 +155,7 @@ export class ZeroClawClient {
   // ── Auth API ───────────────────────────────────────────────────
 
   async register(username: string, password: string): Promise<RegisterResponse> {
-    const res = await fetch(`${this.serverUrl}/api/auth/register`, {
+    const res = await fetch(`${this.relayUrl}/api/auth/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username, password }),
@@ -171,7 +171,7 @@ export class ZeroClawClient {
 
   async login(username: string, password: string): Promise<LoginResponse> {
     const deviceName = await this.getDeviceName();
-    const res = await fetch(`${this.serverUrl}/api/auth/login`, {
+    const res = await fetch(`${this.relayUrl}/api/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -343,7 +343,7 @@ export class ZeroClawClient {
   }
 
   // ── Chat ───────────────────────────────────────────────────────
-  // Uses /api/chat which routes through the full ZeroClaw agent loop
+  // Uses /api/chat which routes through the full MoA agent loop
   // (provider LLM + tools: shell, file, memory, browser, etc.)
 
   async chat(message: string, context: string[] = []): Promise<ChatResponse> {
@@ -452,9 +452,9 @@ export class ZeroClawClient {
   }
 
   // ── API Key Management ──────────────────────────────────────
-  // Save API keys to the local ZeroClaw agent config.
-  // When user provides their own keys, ZeroClaw uses them directly.
-  // When no key is set, ZeroClaw falls back to operator keys via relay.
+  // Save API keys to the local MoA agent config.
+  // When user provides their own keys, MoA uses them directly.
+  // When no key is set, MoA falls back to operator keys via relay.
 
   async saveApiKeyToAgent(provider: string, key: string): Promise<void> {
     try {
@@ -502,11 +502,11 @@ export class ZeroClawClient {
     if (isTauri()) {
       const info = await getPlatformInfo();
       if (info) {
-        return `ZeroClaw ${info.os} ${info.is_mobile ? "Mobile" : "Desktop"}`;
+        return `MoA ${info.os} ${info.is_mobile ? "Mobile" : "Desktop"}`;
       }
     }
-    return `ZeroClaw ${navigator.platform || "Web"}`;
+    return `MoA ${navigator.platform || "Web"}`;
   }
 }
 
-export const apiClient = new ZeroClawClient();
+export const apiClient = new MoAClient();

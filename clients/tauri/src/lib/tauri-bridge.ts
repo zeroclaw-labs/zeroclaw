@@ -115,7 +115,7 @@ export async function disconnectBackend(): Promise<void> {
   await invoke("disconnect");
 }
 
-/** Check if the local ZeroClaw gateway is running. */
+/** Check if the local MoA gateway is running. */
 export async function isGatewayRunning(): Promise<boolean | null> {
   const invoke = await getInvoke();
   if (!invoke) return null;
@@ -165,10 +165,10 @@ export async function authRegister(
   return invoke("auth_register", { username, password });
 }
 
-// ── ZeroClaw Config Commands ─────────────────────────────────────
+// ── MoA Config Commands ─────────────────────────────────────
 
-/** Write provider/API key to ZeroClaw's ~/.zeroclaw/config.toml. */
-export async function writeZeroClawConfig(
+/** Write provider/API key to MoA's ~/.zeroclaw/config.toml. */
+export async function writeMoAConfig(
   provider: string,
   apiKey?: string,
   model?: string,
@@ -182,8 +182,8 @@ export async function writeZeroClawConfig(
   }) as Promise<string>;
 }
 
-/** Check if ZeroClaw config.toml already exists. */
-export async function isZeroClawConfigured(): Promise<boolean | null> {
+/** Check if MoA config.toml already exists. */
+export async function isMoAConfigured(): Promise<boolean | null> {
   const invoke = await getInvoke();
   if (!invoke) return null;
   return invoke("is_zeroclaw_configured") as Promise<boolean>;
