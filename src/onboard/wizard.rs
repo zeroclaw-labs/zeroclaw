@@ -3353,6 +3353,7 @@ enum ChannelMenuChoice {
     Discord,
     Slack,
     IMessage,
+    InboxApi,
     Matrix,
     Signal,
     WhatsApp,
@@ -3374,6 +3375,7 @@ const CHANNEL_MENU_CHOICES: &[ChannelMenuChoice] = &[
     ChannelMenuChoice::Discord,
     ChannelMenuChoice::Slack,
     ChannelMenuChoice::IMessage,
+    ChannelMenuChoice::InboxApi,
     ChannelMenuChoice::Matrix,
     ChannelMenuChoice::Signal,
     ChannelMenuChoice::WhatsApp,
@@ -3437,6 +3439,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         "✅ configured"
                     } else {
                         "— macOS only"
+                    }
+                ),
+                ChannelMenuChoice::InboxApi => format!(
+                    "InboxAPI   {}",
+                    if config.inboxapi.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— agent-native email (no SMTP needed)"
                     }
                 ),
                 ChannelMenuChoice::Matrix => format!(
@@ -5064,6 +5074,62 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     style("✅").green().bold(),
                     style(relays.len()).cyan()
                 );
+            }
+            ChannelMenuChoice::InboxApi => {
+                // ── InboxAPI ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("InboxAPI Setup").white().bold(),
+                    style("— agent-native email, no SMTP/IMAP needed").dim()
+                );
+                print_bullet("InboxAPI gives your agent a dedicated email address");
+                print_bullet("Account is auto-created on first run (no signup needed)");
+                println!();
+
+                let account_name: String = Input::new()
+                    .with_prompt("  Account name (e.g., my-agent)")
+                    .interact_text()?;
+
+                if account_name.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                print_bullet("Allowlist email addresses/domains that can message your agent.");
+                print_bullet("Use '*' to allow anyone, '@domain.com' for domains.");
+
+                let senders_str: String = Input::new()
+                    .with_prompt("  Allowed senders (comma-separated, or * for all)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let allowed_senders = if senders_str.trim() == "*" {
+                    vec!["*".into()]
+                } else {
+                    senders_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+
+                if allowed_senders.is_empty() {
+                    print_bullet("⚠️  Empty allowlist — inbound emails will be denied.");
+                }
+
+                config.inboxapi = Some(crate::channels::inboxapi::InboxApiConfig {
+                    account_name: account_name.trim().to_string(),
+                    allowed_senders,
+                    ..Default::default()
+                });
+
+                println!(
+                    "  {} InboxAPI configured as '{}'",
+                    style("✅").green().bold(),
+                    style(account_name.trim()).cyan()
+                );
+                print_bullet("Email address will be provisioned on first run");
             }
             ChannelMenuChoice::Done => break,
         }

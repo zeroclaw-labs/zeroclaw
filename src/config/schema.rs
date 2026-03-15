@@ -3084,6 +3084,8 @@ pub struct ChannelsConfig {
     pub webhook: Option<WebhookConfig>,
     /// iMessage channel configuration (macOS only).
     pub imessage: Option<IMessageConfig>,
+    /// InboxAPI channel configuration (agent-native email).
+    pub inboxapi: Option<crate::channels::inboxapi::InboxApiConfig>,
     /// Matrix channel configuration.
     pub matrix: Option<MatrixConfig>,
     /// Signal channel configuration.
@@ -3160,6 +3162,10 @@ impl ChannelsConfig {
             (
                 Box::new(ConfigWrapper::new(self.imessage.as_ref())),
                 self.imessage.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(self.inboxapi.as_ref())),
+                self.inboxapi.is_some(),
             ),
             (
                 Box::new(ConfigWrapper::new(self.matrix.as_ref())),
@@ -3249,6 +3255,7 @@ impl Default for ChannelsConfig {
             mattermost: None,
             webhook: None,
             imessage: None,
+            inboxapi: None,
             matrix: None,
             signal: None,
             whatsapp: None,
@@ -6271,6 +6278,7 @@ default_temperature = 0.7
                 mattermost: None,
                 webhook: None,
                 imessage: None,
+                inboxapi: None,
                 matrix: None,
                 signal: None,
                 whatsapp: None,
@@ -6980,6 +6988,7 @@ allowed_users = ["@ops:matrix.org"]
             imessage: Some(IMessageConfig {
                 allowed_contacts: vec!["+1".into()],
             }),
+            inboxapi: None,
             matrix: Some(MatrixConfig {
                 homeserver: "https://m.org".into(),
                 access_token: "tok".into(),
@@ -7206,6 +7215,7 @@ channel_id = "C123"
             mattermost: None,
             webhook: None,
             imessage: None,
+            inboxapi: None,
             matrix: None,
             signal: None,
             whatsapp: Some(WhatsAppConfig {
