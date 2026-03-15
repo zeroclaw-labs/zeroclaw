@@ -363,9 +363,3 @@ jobs:
       release_tag: ${{ needs.validate.outputs.tag }}
       release_url: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/${{ needs.validate.outputs.tag }}
     secrets: inherit
-
-  sync-readme:
-    name: Sync README
-    needs: [publish, docker, crates-io, redeploy-website]
-    uses: ./.github/workflows/sync-readme.yml
-    secrets: inherit
