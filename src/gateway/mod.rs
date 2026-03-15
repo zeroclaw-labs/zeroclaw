@@ -677,6 +677,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/paircode", get(handle_admin_paircode))
         .route("/admin/paircode/new", post(handle_admin_paircode_new))
+        .route("/admin/reload-config", post(handle_admin_reload_config))
         // ── Existing routes ──
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
@@ -1667,6 +1668,39 @@ async fn handle_admin_paircode_new(
             Ok((StatusCode::BAD_REQUEST, Json(body)))
         }
     }
+}
+
+/// POST /admin/reload-config — hot-reload config from disk (localhost only)
+async fn handle_admin_reload_config(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+    tracing::info!("🔄 Admin config reload request received");
+
+    let mut new_config = crate::config::Config::load_or_init()
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to load config from disk: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Failed to load config: {e}")
+                })),
+            )
+        })?;
+    new_config.apply_env_overrides();
+
+    *state.config.lock() = new_config;
+    tracing::info!("✅ Config reloaded from disk successfully");
+
+    Ok((
+        StatusCode::OK,
+        Json(AdminResponse {
+            success: true,
+            message: "Config reloaded from disk — changes are now active".to_string(),
+        }),
+    ))
 }
 
 #[cfg(test)]

@@ -482,6 +482,8 @@ Examples:
 enum ConfigCommands {
     /// Dump the full configuration JSON Schema to stdout
     Schema,
+    /// Hot-reload config from disk into the running gateway
+    Reload,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1216,6 +1218,11 @@ async fn main() -> Result<()> {
                 );
                 Ok(())
             }
+            ConfigCommands::Reload => {
+                let port = config.gateway.port;
+                let host = &config.gateway.host;
+                reload_config(host, port).await
+            }
         },
     }
 }
@@ -1442,6 +1449,46 @@ async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
             response.status()
         )),
         Err(e) => Err(anyhow::anyhow!("Failed to connect to gateway: {e}")),
+    }
+}
+
+/// Hot-reload config on a running gateway via the admin endpoint.
+async fn reload_config(host: &str, port: u16) -> Result<()> {
+    let url = format!("http://{host}:{port}/admin/reload-config");
+    let client = reqwest::Client::new();
+
+    match client
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            let body: serde_json::Value = response.json().await?;
+            let msg = body
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Config reloaded");
+            println!("✅ {msg}");
+            Ok(())
+        }
+        Ok(response) => {
+            let status = response.status();
+            let body: serde_json::Value = response
+                .json()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let err_msg = body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            Err(anyhow::anyhow!(
+                "Gateway responded with {status}: {err_msg}"
+            ))
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to connect to gateway at {host}:{port}: {e}"
+        )),
     }
 }
 
