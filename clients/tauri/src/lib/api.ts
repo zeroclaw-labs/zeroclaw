@@ -364,6 +364,10 @@ export class MoAClient {
       throw new Error("Not authenticated. Please login first.");
     }
 
+    // Include user's selected provider/model preference
+    const provider = localStorage.getItem("zeroclaw_llm_provider") || "claude";
+    const model = localStorage.getItem("zeroclaw_llm_model") || "claude-opus-4-20250514";
+
     const chatBaseUrl = this.getChatUrl();
     const res = await fetch(`${chatBaseUrl}/api/chat`, {
       method: "POST",
@@ -371,7 +375,7 @@ export class MoAClient {
         "Content-Type": "application/json",
         Authorization: `Bearer ${this.token}`,
       },
-      body: JSON.stringify({ message, context }),
+      body: JSON.stringify({ message, context, provider, model }),
     });
 
     if (!res.ok) {
