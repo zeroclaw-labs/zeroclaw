@@ -313,3 +313,37 @@ All schemas validated with jq:
 2. WebSocket receive error/close → log event → connect_with_retry → log success or break
 3. Critical failure (reconnect fails) → break loop → log shutdown message → return Ok(())
 
+
+## Task 16: Integration Test Suite
+
+### Completed
+- Created docker-compose.yml with 4 services (mosquitto, gateway, bridge, esp32-qemu)
+- Created minimal mosquitto.conf (listener 1883, allow_anonymous)
+- Created bridge.toml for container networking
+- Created Dockerfile.bridge (multi-stage Rust build)
+- Created Dockerfile.qemu (ESP-IDF + QEMU)
+- Created test-e2e-berry.sh with 5 test scenarios
+- Created README.md documenting test usage
+
+### Key Patterns
+- Docker Compose v2 syntax validated successfully
+- Health checks on mosquitto and gateway ensure proper startup order
+- Bridge connects to gateway via container networking (ws://zeroclaw-gateway:42617)
+- MQTT topics follow zeroclaw/nodes/{node_id}/{message_type} pattern
+- Berry script tests cover cache → execute → GPIO flow
+
+### Test Coverage
+1. ESP32 QEMU registration via MQTT
+2. Berry script_cache capability
+3. Berry script_execute capability  
+4. GPIO control via Berry
+5. End-to-end message flow validation
+
+### Files Created
+- tests/integration/docker-compose.yml
+- tests/integration/mosquitto.conf
+- tests/integration/bridge.toml
+- tests/integration/Dockerfile.bridge
+- tests/integration/Dockerfile.qemu
+- tests/integration/test-e2e-berry.sh
+- tests/integration/README.md

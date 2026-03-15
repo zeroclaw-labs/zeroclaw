@@ -1,0 +1,7 @@
+FROM espressif/idf:release-v5.1
+WORKDIR /firmware
+COPY platformio.ini .
+COPY src src/
+COPY tests tests/
+RUN apt-get update && apt-get install -y qemu-system-xtensa && rm -rf /var/lib/apt/lists/*
+CMD ["qemu-system-xtensa", "-nographic", "-machine", "esp32", "-drive", "file=build/firmware.bin,if=mtd,format=raw"]

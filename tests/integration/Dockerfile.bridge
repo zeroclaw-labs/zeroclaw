@@ -1,0 +1,11 @@
+FROM rust:1.75-slim as builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/zeroclaw-bridge crates/zeroclaw-bridge
+RUN cargo build --release -p zeroclaw-bridge
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/zeroclaw-bridge /usr/local/bin/
+WORKDIR /app
+CMD ["zeroclaw-bridge"]

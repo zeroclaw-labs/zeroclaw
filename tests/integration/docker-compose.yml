@@ -1,0 +1,73 @@
+# ZeroClaw MQTT Bridge Integration Test Suite
+# Includes: mosquitto + zeroclaw-gateway + zeroclaw-bridge + ESP32 QEMU
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: test-mosquitto
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/#", "-C", "1", "-i", "healthcheck", "-W", "3"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  zeroclaw-gateway:
+    image: ghcr.io/zeroclaw-labs/zeroclaw:latest
+    container_name: test-gateway
+    environment:
+      - API_KEY=${API_KEY:-sk-test}
+      - PROVIDER=${PROVIDER:-openrouter}
+      - ZEROCLAW_ALLOW_PUBLIC_BIND=true
+      - ZEROCLAW_GATEWAY_PORT=42617
+    ports:
+      - "42617:42617"
+    volumes:
+      - gateway-data:/zeroclaw-data
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "zeroclaw", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  zeroclaw-bridge:
+    build:
+      context: ../../
+      dockerfile: tests/integration/Dockerfile.bridge
+    container_name: test-bridge
+    environment:
+      - MQTT_BROKER_URL=mqtt://mosquitto:1883
+      - WEBSOCKET_URL=ws://zeroclaw-gateway:42617
+      - AUTH_TOKEN=test-token
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+      zeroclaw-gateway:
+        condition: service_healthy
+    volumes:
+      - ./bridge.toml:/app/bridge.toml
+
+  esp32-qemu:
+    build:
+      context: ../../firmware/esp32-node
+      dockerfile: tests/integration/Dockerfile.qemu
+    container_name: test-esp32-qemu
+    environment:
+      - MQTT_BROKER=mosquitto
+      - MQTT_PORT=1883
+      - NODE_ID=esp32-qemu-test
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    volumes:
+      - ./qemu-scripts:/scripts
+
+volumes:
+  gateway-data:

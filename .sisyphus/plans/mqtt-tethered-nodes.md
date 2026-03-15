@@ -968,7 +968,7 @@ Max Concurrent: 5 (Wave 1)
   - Message: `test(firmware): add Berry Script test suite`
   - Files: `firmware/esp32-node/tests/berry/**`
 
-- [ ] 16. 集成测试套件（docker-compose + QEMU + Berry）
+- [x] 16. 集成测试套件（docker-compose + QEMU + Berry）
 
   **What to do**:
   - 创建 `tests/integration/docker-compose.yml`

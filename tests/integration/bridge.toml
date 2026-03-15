@@ -1,0 +1,3 @@
+mqtt_broker_url = "mqtt://mosquitto:1883"
+websocket_url = "ws://zeroclaw-gateway:42617"
+auth_token = "test-token"

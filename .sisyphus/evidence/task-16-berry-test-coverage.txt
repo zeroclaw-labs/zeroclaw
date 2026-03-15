@@ -1,0 +1,20 @@
+=== Task 16: Berry Script Test Coverage ===
+Date: 2026-03-15
+
+Test Script: test-e2e-berry.sh
+Executable: ✓ (755 permissions)
+
+Test Scenarios:
+1. ESP32 QEMU registration check
+2. Berry script cache (script_cache capability)
+3. Berry script execution (script_execute capability)
+4. GPIO control via Berry scripts
+5. End-to-end MQTT → Bridge → Gateway flow
+
+Berry Script Example Tested:
+```berry
+import gpio
+gpio.write(2, 1)
+```
+
+All required Berry integration points covered.
