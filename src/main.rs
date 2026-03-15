@@ -158,6 +158,10 @@ struct Cli {
 enum Commands {
     /// Initialize your workspace and configuration
     Onboard {
+        /// Run the full interactive wizard (default is quick setup)
+        #[arg(long)]
+        interactive: bool,
+
         /// Overwrite existing config without confirmation
         #[arg(long)]
         force: bool,
@@ -170,7 +174,7 @@ enum Commands {
         #[arg(long)]
         channels_only: bool,
 
-        /// API key for provider configuration
+        /// API key (used in quick mode, ignored with --interactive)
         #[arg(long)]
         api_key: Option<String>,
 
@@ -723,6 +727,7 @@ async fn main() -> Result<()> {
     // Tokio runtime. To avoid "Cannot drop a runtime in a context where blocking is
     // not allowed", we run the wizard on a blocking thread via spawn_blocking.
     if let Commands::Onboard {
+        interactive,
         force,
         reinit,
         channels_only,
@@ -732,6 +737,7 @@ async fn main() -> Result<()> {
         memory,
     } = &cli.command
     {
+        let interactive = *interactive;
         let force = *force;
         let reinit = *reinit;
         let channels_only = *channels_only;
@@ -740,8 +746,14 @@ async fn main() -> Result<()> {
         let model = model.clone();
         let memory = memory.clone();
 
+        if interactive && channels_only {
+            bail!("Use either --interactive or --channels-only, not both");
+        }
         if reinit && channels_only {
             bail!("--reinit and --channels-only cannot be used together");
+        }
+        if reinit && !interactive {
+            bail!("--reinit requires --interactive mode");
         }
         if channels_only
             && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
@@ -795,6 +807,8 @@ async fn main() -> Result<()> {
 
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
+        } else if interactive {
+            Box::pin(onboard::run_wizard(force)).await
         } else {
             onboard::run_quick_setup(
                 api_key.as_deref(),
