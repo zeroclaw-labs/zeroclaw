@@ -2961,9 +2961,8 @@ pub(crate) async fn run_tool_call_loop(
             if is_terminal && !outcome.output.is_empty() {
                 let output = outcome.output.trim();
                 // Skip trivial outputs (single words like "done", "ok") and raw JSON
-                let is_trivial = output.len() < 10
-                    || output.starts_with('{')
-                    || output.starts_with('[');
+                let is_trivial =
+                    output.len() < 10 || output.starts_with('{') || output.starts_with('[');
                 if !is_trivial {
                     return Ok(output.to_string());
                 }
