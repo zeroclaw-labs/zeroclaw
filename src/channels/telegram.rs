@@ -334,6 +334,13 @@ pub struct TelegramChannel {
     workspace_dir: Option<std::path::PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditMessageResult {
+    Success,
+    NotModified,
+    Failed(reqwest::StatusCode),
+}
+
 impl TelegramChannel {
     pub fn new(bot_token: String, allowed_users: Vec<String>, mention_only: bool) -> Self {
         let normalized_allowed = Self::normalize_allowed_users(allowed_users);
@@ -538,6 +545,20 @@ impl TelegramChannel {
 
     fn api_url(&self, method: &str) -> String {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
+    }
+
+    async fn classify_edit_message_response(resp: reqwest::Response) -> EditMessageResult {
+        if resp.status().is_success() {
+            return EditMessageResult::Success;
+        }
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if body.contains("message is not modified") {
+            return EditMessageResult::NotModified;
+        }
+
+        EditMessageResult::Failed(status)
     }
 
     async fn fetch_bot_username(&self) -> anyhow::Result<String> {
@@ -2374,11 +2395,17 @@ impl Channel for TelegramChannel {
             .send()
             .await?;
 
-        if resp.status().is_success() {
-            return Ok(());
+        match Self::classify_edit_message_response(resp).await {
+            EditMessageResult::Success | EditMessageResult::NotModified => return Ok(()),
+            EditMessageResult::Failed(status) => {
+                tracing::debug!(
+                    status = ?status,
+                    "Telegram finalize_draft HTML edit failed; retrying without parse_mode"
+                );
+            }
         }
 
-        // Markdown failed — retry without parse_mode
+        // HTML failed — retry without parse_mode
         let plain_body = serde_json::json!({
             "chat_id": chat_id,
             "message_id": id,
@@ -2392,14 +2419,45 @@ impl Channel for TelegramChannel {
             .send()
             .await?;
 
-        if resp.status().is_success() {
-            return Ok(());
+        match Self::classify_edit_message_response(resp).await {
+            EditMessageResult::Success | EditMessageResult::NotModified => return Ok(()),
+            EditMessageResult::Failed(status) => {
+                tracing::warn!(
+                    status = ?status,
+                    "Telegram finalize_draft plain edit failed; attempting delete+send fallback"
+                );
+            }
         }
 
-        // Edit failed entirely — fall back to new message
-        tracing::warn!("Telegram finalize_draft edit failed; falling back to sendMessage");
-        self.send_text_chunks(text, &chat_id, thread_id.as_deref())
-            .await
+        let delete_resp = self
+            .client
+            .post(self.api_url("deleteMessage"))
+            .json(&serde_json::json!({
+                "chat_id": chat_id,
+                "message_id": id,
+            }))
+            .send()
+            .await;
+
+        match delete_resp {
+            Ok(resp) if resp.status().is_success() => {
+                self.send_text_chunks(text, &chat_id, thread_id.as_deref())
+                    .await
+            }
+            Ok(resp) => {
+                tracing::warn!(
+                    status = ?resp.status(),
+                    "Telegram finalize_draft delete failed; skipping sendMessage to avoid duplicate"
+                );
+                Ok(())
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Telegram finalize_draft delete request failed: {err}; skipping sendMessage to avoid duplicate"
+                );
+                Ok(())
+            }
+        }
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
