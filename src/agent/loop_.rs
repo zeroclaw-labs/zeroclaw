@@ -3336,8 +3336,8 @@ pub async fn run(
             &config.agent.tool_call_dedup_exempt,
         )
         .await?;
-        final_output = response.clone();
-        println!("{response}");
+        final_output = response;
+        println!("{final_output}");
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
