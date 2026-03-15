@@ -823,7 +823,7 @@ Max Concurrent: 5 (Wave 1)
   - Message: `feat(firmware): integrate Berry Script VM`
   - Files: `firmware/esp32-node/src/berry_vm.cpp`, `platformio.ini`
 
-- [ ] 14. 脚本缓存系统（SPIFFS + script_cache/execute）
+- [x] 14. 脚本缓存系统（SPIFFS + script_cache/execute）
 
   **What to do**:
   - 实现 SPIFFS 文件系统初始化
@@ -873,7 +873,7 @@ Max Concurrent: 5 (Wave 1)
   - Message: `feat(firmware): add Berry script caching system`
   - Files: `firmware/esp32-node/src/script_cache.cpp`
 
-- [ ] 15. Berry Script QEMU 测试套件
+- [x] 15. Berry Script QEMU 测试套件
 
   **What to do**:
   - 编写完整 Berry 脚本测试用例

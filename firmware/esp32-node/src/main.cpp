@@ -2,7 +2,9 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <SPIFFS.h>
 #include "berry_vm.h"
+#include "script_cache.h"
 
 const char* ssid = "SSID";
 const char* password = "PASSWORD";
@@ -12,8 +14,8 @@ const char* node_id = "esp32-001";
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-const char* ALLOWED_COMMANDS[] = {"gpio_read", "gpio_write", "adc_read"};
-const int ALLOWED_COMMANDS_COUNT = 3;
+const char* ALLOWED_COMMANDS[] = {"gpio_read", "gpio_write", "adc_read", "script_cache", "script_execute", "script_list", "script_delete"};
+const int ALLOWED_COMMANDS_COUNT = 7;
 
 bool registered = false;
 unsigned long last_heartbeat = 0;
@@ -80,6 +82,22 @@ void send_register() {
   JsonObject props3 = params3.createNestedObject("properties");
   JsonObject pin3 = props3.createNestedObject("pin");
   pin3["type"] = "integer";
+  
+  JsonObject cap4 = caps.createNestedObject();
+  cap4["name"] = "script_cache";
+  cap4["description"] = "Cache Berry script to SPIFFS";
+  
+  JsonObject cap5 = caps.createNestedObject();
+  cap5["name"] = "script_execute";
+  cap5["description"] = "Execute cached Berry script";
+  
+  JsonObject cap6 = caps.createNestedObject();
+  cap6["name"] = "script_list";
+  cap6["description"] = "List cached scripts";
+  
+  JsonObject cap7 = caps.createNestedObject();
+  cap7["name"] = "script_delete";
+  cap7["description"] = "Delete cached script";
   
   char buffer[512];
   serializeJson(doc, buffer);
@@ -178,6 +196,22 @@ void callback(char* topic, byte* payload, unsigned int length) {
     handle_gpio_write(request_id, params);
   } else if (strcmp(cmd, "adc_read") == 0) {
     handle_adc_read(request_id, params);
+  } else if (strcmp(cmd, "script_cache") == 0) {
+    const char* script_id = params["script_id"];
+    const char* code = params["code"];
+    bool success = script_cache_save(script_id, code);
+    publish_result(request_id, success, success ? "cached" : nullptr, success ? nullptr : "save failed");
+  } else if (strcmp(cmd, "script_execute") == 0) {
+    const char* script_id = params["script_id"];
+    bool success = script_cache_execute(script_id);
+    publish_result(request_id, success, success ? "executed" : nullptr, success ? nullptr : "exec failed");
+  } else if (strcmp(cmd, "script_list") == 0) {
+    script_cache_list();
+    publish_result(request_id, true, "listed", nullptr);
+  } else if (strcmp(cmd, "script_delete") == 0) {
+    const char* script_id = params["script_id"];
+    bool success = script_cache_delete(script_id);
+    publish_result(request_id, success, success ? "deleted" : nullptr, success ? nullptr : "delete failed");
   }
 }
 
@@ -196,6 +230,10 @@ void reconnect() {
 
 void setup() {
   Serial.begin(115200);
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed");
+    return;
+  }
   berry_init();
   setup_wifi();
   client.setServer(mqtt_server, 1883);
