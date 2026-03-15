@@ -30,8 +30,9 @@ use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
     extract::{ConnectInfo, Query, State},
-    http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Json},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    middleware,
+    response::{IntoResponse, Json, Response},
     routing::{delete, get, post, put},
     Router,
 };
@@ -727,6 +728,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
         ))
+        // ── Security headers on every response (CWE-352 / defense-in-depth) ──
+        .layer(middleware::map_response(security_headers))
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback));
 
@@ -742,6 +745,33 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     .await?;
 
     Ok(())
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECURITY HEADERS MIDDLEWARE
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Middleware that injects security headers into every HTTP response.
+///
+/// Headers added:
+/// - `X-Content-Type-Options: nosniff` — prevents MIME-type sniffing
+/// - `X-Frame-Options: DENY` — prevents clickjacking via iframes
+/// - `Cache-Control: no-store` — prevents caching of API responses
+/// - `Content-Security-Policy: default-src 'none'` — restrictive CSP for API responses
+async fn security_headers(response: Response) -> Response {
+    let mut response = response;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'"),
+    );
+    response
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1696,6 +1726,43 @@ mod tests {
     #[test]
     fn security_timeout_is_30_seconds() {
         assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+    }
+
+    #[tokio::test]
+    async fn security_headers_are_injected() {
+        let inner = axum::http::Response::builder()
+            .status(200)
+            .body(axum::body::Body::from("ok"))
+            .unwrap();
+        let response = security_headers(inner).await;
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .map(|v| v.to_str().unwrap()),
+            Some("nosniff"),
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_FRAME_OPTIONS)
+                .map(|v| v.to_str().unwrap()),
+            Some("DENY"),
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .map(|v| v.to_str().unwrap()),
+            Some("no-store"),
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .map(|v| v.to_str().unwrap()),
+            Some("default-src 'none'"),
+        );
     }
 
     #[test]
