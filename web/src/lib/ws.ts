@@ -71,7 +71,9 @@ export class WebSocketClient {
     params.set('session_id', sessionId);
     const url = `${this.baseUrl}/ws/chat?${params.toString()}`;
 
-    this.ws = new WebSocket(url, ['zeroclaw.v1']);
+    const protocols: string[] = ['zeroclaw.v1'];
+    if (token) protocols.push(`bearer.${token}`);
+    this.ws = new WebSocket(url, protocols);
 
     this.ws.onopen = () => {
       this.currentDelay = this.reconnectDelay;
