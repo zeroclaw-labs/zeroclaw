@@ -711,6 +711,6 @@ mod tests {
 
     #[test]
     fn gws_timeout_is_reasonable() {
-        assert_eq!(GWS_TIMEOUT_SECS, 30);
+        assert_eq!(DEFAULT_GWS_TIMEOUT_SECS, 30);
     }
 }
