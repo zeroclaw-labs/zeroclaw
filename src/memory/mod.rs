@@ -238,6 +238,7 @@ pub fn create_memory_with_storage_and_routes(
     storage_provider: Option<&StorageProviderConfig>,
     workspace_dir: &Path,
     api_key: Option<&str>,
+    #[allow(unused_variables)]
     zeroclaw_config: Option<&crate::config::Config>,
 ) -> anyhow::Result<Box<dyn Memory>> {
     let backend_name = effective_memory_backend_name(&config.backend, storage_provider);
