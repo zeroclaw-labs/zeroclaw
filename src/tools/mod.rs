@@ -32,6 +32,7 @@ pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
 pub mod glob_search;
+pub mod google_workspace;
 #[cfg(feature = "hardware")]
 pub mod hardware_board_info;
 #[cfg(feature = "hardware")]
@@ -78,6 +79,7 @@ pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
+pub use google_workspace::GoogleWorkspaceTool;
 #[cfg(feature = "hardware")]
 pub use hardware_board_info::HardwareBoardInfoTool;
 #[cfg(feature = "hardware")]
@@ -249,6 +251,7 @@ pub fn all_tools_with_runtime(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> (Vec<Box<dyn Tool>>, Option<DelegateParentToolsHandle>) {
+    let has_shell_access = runtime.has_shell_access();
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ShellTool::new(security.clone(), runtime)),
         Arc::new(FileReadTool::new(security.clone())),
@@ -337,6 +340,23 @@ pub fn all_tools_with_runtime(
             root_config.config_path.clone(),
             root_config.secrets.encrypt,
         )));
+    }
+
+    // Google Workspace CLI (gws) integration — requires shell access
+    if root_config.google_workspace.enabled && has_shell_access {
+        tool_arcs.push(Arc::new(GoogleWorkspaceTool::new(
+            security.clone(),
+            root_config.google_workspace.allowed_services.clone(),
+            root_config.google_workspace.credentials_path.clone(),
+            root_config.google_workspace.default_account.clone(),
+            root_config.google_workspace.rate_limit_per_minute,
+            root_config.google_workspace.timeout_secs,
+            root_config.google_workspace.audit_log,
+        )));
+    } else if root_config.google_workspace.enabled {
+        tracing::warn!(
+            "google_workspace: skipped registration because shell access is unavailable"
+        );
     }
 
     // PDF extraction (feature-gated at compile time via rag-pdf)
