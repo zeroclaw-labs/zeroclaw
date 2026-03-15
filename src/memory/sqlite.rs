@@ -779,6 +779,63 @@ impl Memory for SqliteMemory {
             .await
             .unwrap_or(false)
     }
+
+    async fn reindex(
+        &self,
+        progress_callback: Option<Box<dyn Fn(usize, usize) + Send + Sync>>,
+    ) -> anyhow::Result<usize> {
+        // Step 1: Get all memory entries
+        let entries = self.list(None, None).await?;
+        let total = entries.len();
+
+        if total == 0 {
+            return Ok(0);
+        }
+
+        // Step 2: Clear embedding cache
+        {
+            let conn = self.conn.clone();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let conn = conn.lock();
+                conn.execute("DELETE FROM embedding_cache", [])?;
+                Ok(())
+            })
+            .await??;
+        }
+
+        // Step 3: Recompute embeddings for each memory
+        let mut reindexed = 0;
+        for (idx, entry) in entries.iter().enumerate() {
+            // Compute new embedding
+            let embedding = self.get_or_compute_embedding(&entry.content).await?;
+
+            if let Some(ref emb) = embedding {
+                // Update the embedding in the memories table
+                let conn = self.conn.clone();
+                let entry_id = entry.id.clone();
+                let emb_bytes = vector::vec_to_bytes(emb);
+
+                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let conn = conn.lock();
+                    conn.execute(
+                        "UPDATE memories SET embedding = ?1 WHERE id = ?2",
+                        params![emb_bytes, entry_id],
+                    )?;
+                    Ok(())
+                })
+                .await??;
+
+                reindexed += 1;
+            }
+
+            // Report progress
+            if let Some(ref cb) = progress_callback {
+                cb(idx + 1, total);
+            }
+        }
+
+        Ok(reindexed)
+    }
 }
 
 #[cfg(test)]

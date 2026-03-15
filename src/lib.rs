@@ -418,6 +418,15 @@ pub enum MemoryCommands {
         #[arg(long)]
         yes: bool,
     },
+    /// Rebuild embeddings for all memories (use after changing embedding model)
+    Reindex {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+        /// Show progress during reindex
+        #[arg(long, default_value = "true")]
+        progress: bool,
+    },
 }
 
 /// Integration subcommands

@@ -183,6 +183,10 @@ probe-rs = { version = "0.31", optional = true }
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.10", optional = true }
 
+# XLSX extraction (zip archive reading + XML parsing)
+zip = { version = "8.1", default-features = false, features = ["deflate"] }
+quick-xml = "0.37"
+
 # Terminal QR rendering for WhatsApp Web pairing flow.
 qrcode = { version = "0.14", optional = true }
 
