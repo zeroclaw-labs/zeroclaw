@@ -380,14 +380,20 @@ export class MoAClient {
 
     if (!res.ok) {
       if (res.status === 401) {
-        this.clearAuth();
-        throw new Error("Authentication expired. Please login again.");
+        // Don't clear auth — the JWT may still be valid for auth endpoints.
+        // Chat 401 can happen when relay server hasn't accepted the token yet.
+        throw new Error("Chat authentication failed. Please check your connection settings.");
       }
       const text = await res.text().catch(() => "Unknown error");
       throw new Error(`Chat request failed (${res.status}): ${text}`);
     }
 
-    return await res.json();
+    const data = await res.json();
+    // Server returns "reply", normalize to "response" for the client
+    return {
+      response: data.response || data.reply || "",
+      model: data.model || "",
+    };
   }
 
   // ── Health ─────────────────────────────────────────────────────

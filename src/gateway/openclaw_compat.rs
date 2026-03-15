@@ -91,28 +91,34 @@ pub async fn handle_api_chat(
     }
 
     // ── Auth: require at least one layer for non-loopback ──
-    if !state.pairing.require_pairing()
-        && state.webhook_secret_hash.is_none()
-        && !peer_addr.ip().is_loopback()
-    {
-        tracing::warn!("/api/chat: rejected unauthenticated non-loopback request");
-        let err = serde_json::json!({
-            "error": "Unauthorized — configure pairing or X-Webhook-Secret for non-local access"
-        });
-        return (StatusCode::UNAUTHORIZED, Json(err));
-    }
+    // Accept either pairing token or JWT session token for non-loopback requests
+    let is_loopback = peer_addr.ip().is_loopback();
 
-    // ── Bearer token auth (pairing) ──
-    if state.pairing.require_pairing() {
-        let auth = headers
+    if !is_loopback {
+        let auth_header = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let token = auth.strip_prefix("Bearer ").unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
-            tracing::warn!("/api/chat: rejected — not paired / invalid bearer token");
+        let bearer_token = auth_header.strip_prefix("Bearer ").unwrap_or("");
+
+        // Try JWT session auth first (from /api/auth/login)
+        let jwt_ok = state
+            .auth_store
+            .as_ref()
+            .and_then(|store| store.validate_session(bearer_token))
+            .is_some();
+
+        // Then try pairing auth
+        let pairing_ok = state.pairing.require_pairing()
+            && state.pairing.is_authenticated(bearer_token);
+
+        // Then try webhook secret
+        let webhook_ok = state.webhook_secret_hash.is_some();
+
+        if !jwt_ok && !pairing_ok && !webhook_ok {
+            tracing::warn!("/api/chat: rejected unauthenticated non-loopback request");
             let err = serde_json::json!({
-                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+                "error": "Unauthorized — please login or configure pairing"
             });
             return (StatusCode::UNAUTHORIZED, Json(err));
         }
