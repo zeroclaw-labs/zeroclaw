@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 // ── Error Classification ─────────────────────────────────────────────────
 // Errors are split into retryable (transient server/network failures) and
@@ -211,11 +212,44 @@ fn push_failure(
     ));
 }
 
+// ── Model–Provider Compatibility ─────────────────────────────────────────
+// Avoids wasting API calls on incompatible model–provider pairs (e.g.
+// sending `gemini-3-flash-preview` to an openai-codex provider).
+
+/// Returns model name prefixes accepted by a provider, based on its name.
+/// Returns None if unknown (accept any model).
+fn accepted_model_prefixes(provider_name: &str) -> Option<&[&str]> {
+    // Strip profile suffix: "gemini:gemini-api-1" → "gemini"
+    let base = provider_name.split(':').next().unwrap_or(provider_name);
+    match base {
+        "gemini" => Some(&["gemini-"]),
+        "openai-codex" => Some(&["gpt-", "o1-", "o3-", "o4-"]),
+        "openai" => Some(&["gpt-", "o1-", "o3-", "o4-", "chatgpt-"]),
+        "anthropic" => Some(&["claude-"]),
+        _ => None, // unknown provider — accept any model
+    }
+}
+
+fn is_model_compatible(provider_name: &str, model: &str) -> bool {
+    match accepted_model_prefixes(provider_name) {
+        None => true,
+        Some(prefixes) => prefixes.iter().any(|p| model.starts_with(p)),
+    }
+}
+
+/// Pick the first compatible model from the chain for a given provider.
+fn select_model_for_provider<'a>(provider_name: &str, models: &[&'a str]) -> Option<&'a str> {
+    models
+        .iter()
+        .copied()
+        .find(|m| is_model_compatible(provider_name, m))
+}
+
 // ── Resilient Provider Wrapper ────────────────────────────────────────────
-// Three-level failover strategy: model chain → provider chain → retry loop.
-//   Outer loop:  iterate model fallback chain (original model first, then
-//                configured alternatives).
-//   Middle loop: iterate registered providers in priority order.
+// Two-level failover strategy: provider chain → (compatible models + retry).
+//   Outer loop:  iterate registered providers in priority order.
+//   Middle loop: iterate compatible models from the model fallback chain
+//                (incompatible models for this provider are skipped).
 //   Inner loop:  retry the same (provider, model) pair with exponential
 //                backoff, rotating API keys on rate-limit errors.
 // Loop invariant: `failures` accumulates every failed attempt so the final
@@ -231,6 +265,9 @@ pub struct ReliableProvider {
     key_index: AtomicUsize,
     /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
     model_fallbacks: HashMap<String, Vec<String>>,
+    /// Rate-limit cooldown: provider_index → earliest retry time.
+    /// Providers are skipped until their cooldown expires (default 60s).
+    rate_limit_cooldowns: Mutex<HashMap<usize, Instant>>,
 }
 
 impl ReliableProvider {
@@ -239,6 +276,12 @@ impl ReliableProvider {
         max_retries: u32,
         base_backoff_ms: u64,
     ) -> Self {
+        let names: Vec<&str> = providers.iter().map(|(n, _)| n.as_str()).collect();
+        tracing::info!(
+            count = providers.len(),
+            providers = ?names,
+            "ReliableProvider chain created"
+        );
         Self {
             providers,
             max_retries,
@@ -246,6 +289,7 @@ impl ReliableProvider {
             api_keys: Vec::new(),
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
+            rate_limit_cooldowns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -288,6 +332,29 @@ impl ReliableProvider {
             base
         }
     }
+
+    /// Check if provider is in rate-limit cooldown. Returns true if should skip.
+    fn is_in_cooldown(&self, provider_idx: usize) -> bool {
+        let lock = self
+            .rate_limit_cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        lock.get(&provider_idx)
+            .is_some_and(|&deadline| Instant::now() < deadline)
+    }
+
+    /// Mark provider as rate-limited for the given duration.
+    fn set_cooldown(&self, provider_idx: usize, cooldown: Duration) {
+        let mut lock = self
+            .rate_limit_cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        lock.insert(provider_idx, Instant::now() + cooldown);
+    }
+
+    /// Default rate-limit cooldown: 10s. Short enough to retry gemini quickly
+    /// but long enough to skip wasted attempts within a single tool-loop iteration.
+    const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10);
 }
 
 #[async_trait]
@@ -312,12 +379,22 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
-        // Outer: model fallback chain. Middle: provider priority. Inner: retries.
-        // Each iteration: attempt one (provider, model) call. On success, return
-        // immediately. On non-retryable error, break to next provider. On
-        // retryable error, sleep with exponential backoff and retry.
-        for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+        // Outer: provider priority. Middle: compatible models. Inner: retries.
+        for (provider_idx, (provider_name, provider)) in self.providers.iter().enumerate() {
+            if self.is_in_cooldown(provider_idx) {
+                tracing::debug!(provider = %provider_name, "Skipping provider (rate-limit cooldown)");
+                continue;
+            }
+            for current_model in &models {
+                if !is_model_compatible(provider_name, current_model) {
+                    tracing::debug!(
+                        provider = provider_name,
+                        model = *current_model,
+                        "Skipping incompatible model for provider"
+                    );
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -326,7 +403,11 @@ impl Provider for ReliableProvider {
                         .await
                     {
                         Ok(resp) => {
-                            if attempt > 0 || *current_model != model {
+                            if attempt > 0
+                                || *current_model != model
+                                || self.providers.first().map(|(n, _)| n.as_str())
+                                    != Some(provider_name)
+                            {
                                 tracing::info!(
                                     provider = provider_name,
                                     model = *current_model,
@@ -354,8 +435,6 @@ impl Provider for ReliableProvider {
                                 &error_detail,
                             );
 
-                            // Rate-limit with rotatable keys: cycle to the next API key
-                            // so the retry hits a different quota bucket.
                             if rate_limited && !non_retryable_rate_limit {
                                 if let Some(new_key) = self.rotate_key() {
                                     tracing::warn!(
@@ -384,6 +463,20 @@ impl Provider for ReliableProvider {
                                     );
                                 }
 
+                                break; // try next model on this provider
+                            }
+
+                            // Rate-limited — skip to next provider (not just next model)
+                            if rate_limited && self.providers.len() > 1 {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    "Rate limited, skipping to next provider"
+                                );
+                                let cd = parse_retry_after_ms(&e)
+                                    .map(|ms| Duration::from_millis(ms.min(60_000)))
+                                    .unwrap_or(Self::RATE_LIMIT_COOLDOWN);
+                                self.set_cooldown(provider_idx, cd);
                                 break;
                             }
 
@@ -404,20 +497,6 @@ impl Provider for ReliableProvider {
                         }
                     }
                 }
-
-                tracing::warn!(
-                    provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next provider/model"
-                );
-            }
-
-            if *current_model != model {
-                tracing::warn!(
-                    original_model = model,
-                    fallback_model = *current_model,
-                    "Model fallback exhausted all providers, trying next fallback model"
-                );
             }
         }
 
@@ -436,8 +515,16 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
-        for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+        for (provider_idx, (provider_name, provider)) in self.providers.iter().enumerate() {
+            if self.is_in_cooldown(provider_idx) {
+                tracing::debug!(provider = %provider_name, "Skipping provider (rate-limit cooldown)");
+                continue;
+            }
+            for current_model in &models {
+                if !is_model_compatible(provider_name, current_model) {
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -446,7 +533,11 @@ impl Provider for ReliableProvider {
                         .await
                     {
                         Ok(resp) => {
-                            if attempt > 0 || *current_model != model {
+                            if attempt > 0
+                                || *current_model != model
+                                || self.providers.first().map(|(n, _)| n.as_str())
+                                    != Some(provider_name)
+                            {
                                 tracing::info!(
                                     provider = provider_name,
                                     model = *current_model,
@@ -505,6 +596,19 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
+                            if rate_limited && self.providers.len() > 1 {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    "Rate limited, skipping to next provider"
+                                );
+                                let cd = parse_retry_after_ms(&e)
+                                    .map(|ms| Duration::from_millis(ms.min(60_000)))
+                                    .unwrap_or(Self::RATE_LIMIT_COOLDOWN);
+                                self.set_cooldown(provider_idx, cd);
+                                break;
+                            }
+
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
@@ -522,12 +626,6 @@ impl Provider for ReliableProvider {
                         }
                     }
                 }
-
-                tracing::warn!(
-                    provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next provider/model"
-                );
             }
         }
 
@@ -560,8 +658,16 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
-        for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+        for (provider_idx, (provider_name, provider)) in self.providers.iter().enumerate() {
+            if self.is_in_cooldown(provider_idx) {
+                tracing::debug!(provider = %provider_name, "Skipping provider (rate-limit cooldown)");
+                continue;
+            }
+            for current_model in &models {
+                if !is_model_compatible(provider_name, current_model) {
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -570,7 +676,11 @@ impl Provider for ReliableProvider {
                         .await
                     {
                         Ok(resp) => {
-                            if attempt > 0 || *current_model != model {
+                            if attempt > 0
+                                || *current_model != model
+                                || self.providers.first().map(|(n, _)| n.as_str())
+                                    != Some(provider_name)
+                            {
                                 tracing::info!(
                                     provider = provider_name,
                                     model = *current_model,
@@ -629,6 +739,19 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
+                            if rate_limited && self.providers.len() > 1 {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    "Rate limited, skipping to next provider"
+                                );
+                                let cd = parse_retry_after_ms(&e)
+                                    .map(|ms| Duration::from_millis(ms.min(60_000)))
+                                    .unwrap_or(Self::RATE_LIMIT_COOLDOWN);
+                                self.set_cooldown(provider_idx, cd);
+                                break;
+                            }
+
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
@@ -646,12 +769,6 @@ impl Provider for ReliableProvider {
                         }
                     }
                 }
-
-                tracing::warn!(
-                    provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next provider/model"
-                );
             }
         }
 
@@ -670,8 +787,16 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
-        for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+        for (provider_idx, (provider_name, provider)) in self.providers.iter().enumerate() {
+            if self.is_in_cooldown(provider_idx) {
+                tracing::debug!(provider = %provider_name, "Skipping provider (rate-limit cooldown)");
+                continue;
+            }
+            for current_model in &models {
+                if !is_model_compatible(provider_name, current_model) {
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -681,7 +806,11 @@ impl Provider for ReliableProvider {
                     };
                     match provider.chat(req, current_model, temperature).await {
                         Ok(resp) => {
-                            if attempt > 0 || *current_model != model {
+                            if attempt > 0
+                                || *current_model != model
+                                || self.providers.first().map(|(n, _)| n.as_str())
+                                    != Some(provider_name)
+                            {
                                 tracing::info!(
                                     provider = provider_name,
                                     model = *current_model,
@@ -740,6 +869,19 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
+                            if rate_limited && self.providers.len() > 1 {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    "Rate limited, skipping to next provider"
+                                );
+                                let cd = parse_retry_after_ms(&e)
+                                    .map(|ms| Duration::from_millis(ms.min(60_000)))
+                                    .unwrap_or(Self::RATE_LIMIT_COOLDOWN);
+                                self.set_cooldown(provider_idx, cd);
+                                break;
+                            }
+
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
@@ -757,20 +899,6 @@ impl Provider for ReliableProvider {
                         }
                     }
                 }
-
-                tracing::warn!(
-                    provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next provider/model"
-                );
-            }
-
-            if *current_model != model {
-                tracing::warn!(
-                    original_model = model,
-                    fallback_model = *current_model,
-                    "Model fallback exhausted all providers, trying next fallback model"
-                );
             }
         }
 
@@ -794,7 +922,11 @@ impl Provider for ReliableProvider {
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         // Try each provider/model combination for streaming
         // For streaming, we use the first provider that supports it and has streaming enabled
-        for (provider_name, provider) in &self.providers {
+        for (provider_idx, (provider_name, provider)) in self.providers.iter().enumerate() {
+            if self.is_in_cooldown(provider_idx) {
+                tracing::debug!(provider = %provider_name, "Skipping provider (rate-limit cooldown)");
+                continue;
+            }
             if !provider.supports_streaming() || !options.enabled {
                 continue;
             }
@@ -1979,5 +2111,116 @@ mod tests {
         // Primary should have been called only once (no retries)
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ── Model–provider compatibility tests ──────────────────────
+
+    #[test]
+    fn model_compatibility_gemini_accepts_gemini_models() {
+        assert!(is_model_compatible("gemini", "gemini-3-flash-preview"));
+        assert!(is_model_compatible("gemini", "gemini-2.5-flash"));
+        assert!(is_model_compatible(
+            "gemini:gemini-api-1",
+            "gemini-3-flash-preview"
+        ));
+        assert!(!is_model_compatible("gemini", "gpt-5.1"));
+        assert!(!is_model_compatible("gemini", "claude-sonnet"));
+    }
+
+    #[test]
+    fn model_compatibility_codex_accepts_gpt_models() {
+        assert!(is_model_compatible("openai-codex", "gpt-5.1"));
+        assert!(is_model_compatible("openai-codex", "gpt-5.1-codex-mini"));
+        assert!(is_model_compatible("openai-codex:codex-1", "o4-mini"));
+        assert!(!is_model_compatible(
+            "openai-codex",
+            "gemini-3-flash-preview"
+        ));
+        assert!(!is_model_compatible("openai-codex", "claude-sonnet"));
+    }
+
+    #[test]
+    fn model_compatibility_unknown_accepts_any() {
+        assert!(is_model_compatible("custom-provider", "any-model"));
+        assert!(is_model_compatible("primary", "test"));
+        assert!(is_model_compatible("fallback", "gemini-3-flash-preview"));
+    }
+
+    #[test]
+    fn select_model_picks_first_compatible() {
+        let models = vec!["gemini-3-flash-preview", "gpt-5.1"];
+        assert_eq!(
+            select_model_for_provider("gemini", &models),
+            Some("gemini-3-flash-preview")
+        );
+        assert_eq!(
+            select_model_for_provider("openai-codex", &models),
+            Some("gpt-5.1")
+        );
+        assert_eq!(
+            select_model_for_provider("custom", &models),
+            Some("gemini-3-flash-preview")
+        );
+    }
+
+    #[test]
+    fn select_model_returns_none_for_incompatible() {
+        let models = vec!["gemini-3-flash-preview", "gemini-2.5-flash"];
+        assert_eq!(select_model_for_provider("openai-codex", &models), None);
+    }
+
+    #[tokio::test]
+    async fn provider_first_skips_incompatible_model() {
+        // Simulate gemini + openai-codex chain with gemini-3-flash-preview + gpt-5.1 models.
+        // Gemini provider should only see gemini-*, codex should only see gpt-*.
+        let gemini_mock = Arc::new(ModelAwareMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec!["gemini-3-flash-preview"], // gemini fails
+            response: "never",
+        });
+
+        let codex_mock = Arc::new(ModelAwareMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec![],
+            response: "codex ok",
+        });
+
+        let mut fallbacks = HashMap::new();
+        fallbacks.insert(
+            "gemini-3-flash-preview".to_string(),
+            vec!["gpt-5.1".to_string()],
+        );
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "gemini".into(),
+                    Box::new(gemini_mock.clone()) as Box<dyn Provider>,
+                ),
+                (
+                    "openai-codex".into(),
+                    Box::new(codex_mock.clone()) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            1,
+        )
+        .with_model_fallbacks(fallbacks);
+
+        let result = provider
+            .simple_chat("hello", "gemini-3-flash-preview", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "codex ok");
+
+        // Gemini should have tried only gemini-3-flash-preview (not gpt-5.1)
+        let gemini_seen = gemini_mock.models_seen.lock();
+        assert_eq!(gemini_seen.as_slice(), &["gemini-3-flash-preview"]);
+
+        // Codex should have tried only gpt-5.1 (not gemini-3-flash-preview)
+        let codex_seen = codex_mock.models_seen.lock();
+        assert_eq!(codex_seen.as_slice(), &["gpt-5.1"]);
     }
 }
