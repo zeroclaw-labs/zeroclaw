@@ -1461,11 +1461,30 @@ async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
 
 /// Hot-reload config on a running gateway via the admin endpoint.
 async fn reload_config(host: &str, port: u16) -> Result<()> {
-    let url = format!("http://{host}:{port}/admin/reload-config");
+    // Only allow loopback targets — this is an admin endpoint that must never
+    // be directed at arbitrary hosts (SSRF prevention).
+    let is_loopback = host == "127.0.0.1"
+        || host == "::1"
+        || host == "localhost"
+        || host == "[::1]";
+    if !is_loopback {
+        anyhow::bail!(
+            "Refusing to send admin request to non-loopback host '{host}'. \
+             Only localhost/127.0.0.1/::1 are allowed."
+        );
+    }
+
+    // Bracket IPv6 addresses for valid URL construction (http://[::1]:port).
+    let authority = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let url = format!("http://{authority}/admin/reload-config");
     let client = reqwest::Client::new();
 
     match client
-        .post(&url)
+        .post(url)
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
@@ -1481,20 +1500,20 @@ async fn reload_config(host: &str, port: u16) -> Result<()> {
         }
         Ok(response) => {
             let status = response.status();
-            let body: serde_json::Value = response
-                .json()
-                .await
-                .unwrap_or_else(|_| serde_json::json!({}));
-            let err_msg = body
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error");
+            let err_msg = match response.json::<serde_json::Value>().await {
+                Ok(body) => body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error")
+                    .to_string(),
+                Err(_) => "non-JSON error response".to_string(),
+            };
             Err(anyhow::anyhow!(
                 "Gateway responded with {status}: {err_msg}"
             ))
         }
         Err(e) => Err(anyhow::anyhow!(
-            "Failed to connect to gateway at {host}:{port}: {e}"
+            "Failed to connect to gateway at {authority}: {e}"
         )),
     }
 }

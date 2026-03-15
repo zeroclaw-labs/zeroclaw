@@ -1676,10 +1676,27 @@ async fn handle_admin_reload_config(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
-    tracing::info!("🔄 Admin config reload request received");
+    tracing::info!(peer = %peer, "Admin config reload request received");
 
-    let mut new_config = crate::config::Config::load_or_init().await.map_err(|e| {
-        tracing::error!("Failed to load config from disk: {e}");
+    // Guard: refuse to reload if the config file doesn't exist on disk.
+    // load_or_init() would silently create a default config and overwrite
+    // any existing one, which is not what we want during a hot-reload.
+    let config_path = state.config.lock().config_path.clone();
+    if !config_path.exists() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Config file not found: {}", config_path.display())
+            })),
+        ));
+    }
+
+    // load_or_init() reads, deserializes, decrypts secrets, applies env
+    // overrides, and validates (Config::validate()) before returning.
+    // A parse or validation failure here is surfaced as a 500 without
+    // touching the live config.
+    let new_config = crate::config::Config::load_or_init().await.map_err(|e| {
+        tracing::error!(peer = %peer, "Config reload failed: {e}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -1687,19 +1704,18 @@ async fn handle_admin_reload_config(
             })),
         )
     })?;
-    new_config.apply_env_overrides();
 
     // Atomic swap: in-flight requests that already hold a config clone see the
     // old values until their next lock. Concurrent reload requests are serialised
     // by the Mutex — last writer wins, which is acceptable for CLI-driven reloads.
     *state.config.lock() = new_config;
-    tracing::info!("✅ Config reloaded from disk successfully");
+    tracing::info!(peer = %peer, "Config reloaded from disk successfully");
 
     Ok((
         StatusCode::OK,
         Json(AdminResponse {
             success: true,
-            message: "Config reloaded from disk — changes are now active".to_string(),
+            message: "Config reloaded from disk -- changes are now active".to_string(),
         }),
     ))
 }
@@ -3015,5 +3031,80 @@ mod tests {
         ));
         let err = require_localhost(&peer).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn reload_config_rejects_non_localhost() {
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+        };
+
+        let peer = SocketAddr::from(([192, 168, 1, 100], 12345));
+        let result =
+            handle_admin_reload_config(State(state), ConnectInfo(peer)).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn reload_config_rejects_missing_config_file() {
+        let mut config = Config::default();
+        config.config_path = std::path::PathBuf::from("/tmp/nonexistent-zeroclaw-test/config.toml");
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+        };
+
+        let peer = SocketAddr::from(([127, 0, 0, 1], 12345));
+        let result =
+            handle_admin_reload_config(State(state), ConnectInfo(peer)).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 }
