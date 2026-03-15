@@ -255,6 +255,9 @@ pub struct Config {
     /// Dynamic node discovery configuration (`[nodes]`).
     #[serde(default)]
     pub nodes: NodesConfig,
+    /// Secure inter-node transport configuration (`[node_transport]`).
+    #[serde(default)]
+    pub node_transport: NodeTransportConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -1198,6 +1201,67 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
+}
+
+/// Secure transport configuration for inter-node communication (`[node_transport]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NodeTransportConfig {
+    /// Enable the secure transport layer.
+    #[serde(default = "default_node_transport_enabled")]
+    pub enabled: bool,
+    /// Shared secret for HMAC authentication between nodes.
+    #[serde(default)]
+    pub shared_secret: String,
+    /// Maximum age of signed requests in seconds (replay protection).
+    #[serde(default = "default_max_request_age")]
+    pub max_request_age_secs: i64,
+    /// Require HTTPS for all node communication.
+    #[serde(default = "default_require_https")]
+    pub require_https: bool,
+    /// Allow specific node IPs/CIDRs.
+    #[serde(default)]
+    pub allowed_peers: Vec<String>,
+    /// Path to TLS certificate file.
+    #[serde(default)]
+    pub tls_cert_path: Option<String>,
+    /// Path to TLS private key file.
+    #[serde(default)]
+    pub tls_key_path: Option<String>,
+    /// Require client certificates (mutual TLS).
+    #[serde(default)]
+    pub mutual_tls: bool,
+    /// Maximum number of connections per peer.
+    #[serde(default = "default_connection_pool_size")]
+    pub connection_pool_size: usize,
+}
+
+fn default_node_transport_enabled() -> bool {
+    true
+}
+fn default_max_request_age() -> i64 {
+    300
+}
+fn default_require_https() -> bool {
+    true
+}
+fn default_connection_pool_size() -> usize {
+    4
+}
+
+impl Default for NodeTransportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_node_transport_enabled(),
+            shared_secret: String::new(),
+            max_request_age_secs: default_max_request_age(),
+            require_https: default_require_https(),
+            allowed_peers: Vec::new(),
+            tls_cert_path: None,
+            tls_key_path: None,
+            mutual_tls: false,
+            connection_pool_size: default_connection_pool_size(),
+        }
+    }
 }
 
 fn default_gateway_port() -> u16 {
@@ -4204,6 +4268,7 @@ impl Default for Config {
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            node_transport: NodeTransportConfig::default(),
         }
     }
 }
@@ -5234,11 +5299,6 @@ impl Config {
 
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
-
-        // MCP servers
-        if self.mcp.enabled {
-            validate_mcp_config(&self.mcp)?;
-        }
 
         Ok(())
     }
@@ -6310,6 +6370,7 @@ default_temperature = 0.7
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            node_transport: NodeTransportConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -6601,6 +6662,7 @@ tool_dispatcher = "xml"
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            node_transport: NodeTransportConfig::default(),
         };
 
         config.save().await.unwrap();

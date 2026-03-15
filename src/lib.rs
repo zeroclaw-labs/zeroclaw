@@ -57,6 +57,7 @@ pub(crate) mod integrations;
 pub mod memory;
 pub(crate) mod migration;
 pub(crate) mod multimodal;
+pub mod nodes;
 pub mod observability;
 pub(crate) mod onboard;
 pub mod peripherals;
