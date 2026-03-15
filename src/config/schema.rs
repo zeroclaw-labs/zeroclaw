@@ -306,6 +306,10 @@ pub struct Config {
     /// API key for the selected provider. Always overridden by `ZEROCLAW_API_KEY` env var.
     /// `API_KEY` env var is only used as fallback when no config key is set.
     pub api_key: Option<String>,
+    /// Per-provider API keys (e.g. `{ "gemini": "AIza...", "anthropic": "sk-ant-..." }`).
+    /// When a provider-specific key exists here, it takes precedence over the generic `api_key`.
+    #[serde(default)]
+    pub provider_api_keys: HashMap<String, String>,
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
     pub api_url: Option<String>,
     /// Default provider ID or alias (e.g. `"gemini"`, `"anthropic"`, `"openai"`). Default: `"gemini"`.
@@ -6722,6 +6726,7 @@ impl Default for Config {
             workspace_dir: zeroclaw_dir.join("workspace"),
             config_path: zeroclaw_dir.join("config.toml"),
             api_key: None,
+            provider_api_keys: HashMap::new(),
             api_url: None,
             default_provider: Some(DEFAULT_PROVIDER_NAME.to_string()),
             provider_api: None,
@@ -10830,6 +10835,7 @@ ws_url = "ws://127.0.0.1:3002"
             workspace_dir: PathBuf::from("/tmp/test/workspace"),
             config_path: PathBuf::from("/tmp/test/config.toml"),
             api_key: Some("sk-test-key".into()),
+            provider_api_keys: HashMap::new(),
             api_url: None,
             default_provider: Some("openrouter".into()),
             provider_api: None,
@@ -11291,6 +11297,7 @@ tool_dispatcher = "xml"
             workspace_dir: dir.join("workspace"),
             config_path: config_path.clone(),
             api_key: Some("sk-roundtrip".into()),
+            provider_api_keys: HashMap::new(),
             api_url: None,
             default_provider: Some("openrouter".into()),
             provider_api: None,

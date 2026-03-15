@@ -211,22 +211,43 @@ pub async fn handle_api_chat(
         }
     }
 
-    // ── Validate API key for cloud providers ──
+    // ── Resolve provider-specific key from provider_api_keys map ──
+    // When the client doesn't send an api_key in the request body,
+    // look up the per-provider key stored via Settings → /api/config/api-key.
     let provider_name = config
         .default_provider
         .as_deref()
         .unwrap_or("gemini");
+
+    if config.api_key.as_ref().map_or(true, |k| k.trim().is_empty()) {
+        if let Some(stored_key) = config.provider_api_keys.get(provider_name) {
+            if !stored_key.trim().is_empty() {
+                config.api_key = Some(stored_key.clone());
+            }
+        }
+    }
+
+    // ── Validate API key for cloud providers ──
+    // Check both the config-level key (from request body or config.toml) AND
+    // provider-specific env vars (e.g. GEMINI_API_KEY, ANTHROPIC_API_KEY).
+    // The provider factory uses resolve_provider_credential() which checks
+    // env vars as fallback, so we mirror that logic here.
     if providers::provider_requires_credential(provider_name) {
-        let has_key = config
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|k| !k.is_empty());
+        let has_key = providers::has_provider_credential(
+            provider_name,
+            config.api_key.as_deref(),
+        );
         if !has_key {
+            let env_hint = match provider_name {
+                "anthropic" => "ANTHROPIC_API_KEY",
+                "openai" => "OPENAI_API_KEY",
+                "gemini" | "google" | "google-gemini" => "GEMINI_API_KEY",
+                _ => "<PROVIDER>_API_KEY",
+            };
             let err = serde_json::json!({
                 "error": format!(
-                    "No API key configured for provider '{}'. Please add your API key in Settings or use relay server.",
-                    provider_name
+                    "No API key configured for provider '{}'. Please add your API key in Settings or set {} env var.",
+                    provider_name, env_hint
                 ),
                 "code": "missing_api_key",
                 "fallback_to_relay": true

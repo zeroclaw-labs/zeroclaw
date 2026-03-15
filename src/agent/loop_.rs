@@ -752,6 +752,30 @@ async fn save_coding_memory_from_history(new_messages: &[ChatMessage], mem: &Arc
 /// When `CodingConfig.review_enabled` is true and the response contains
 /// code-related content, this function sends the response through a
 /// secondary review model (Gemini for architecture review, optionally
+/// Populate provider-specific env vars from the per-provider key map in config.
+/// This ensures `resolve_provider_credential()` can find keys saved via Settings
+/// even after process restart. Only sets env vars that are not already defined.
+fn hydrate_provider_env_vars(config: &Config) {
+    for (provider, key) in &config.provider_api_keys {
+        if key.trim().is_empty() {
+            continue;
+        }
+        let env_var = match provider.as_str() {
+            "anthropic" => "ANTHROPIC_API_KEY",
+            "openai" => "OPENAI_API_KEY",
+            "gemini" | "google" | "google-gemini" => "GEMINI_API_KEY",
+            "deepseek" => "DEEPSEEK_API_KEY",
+            "openrouter" => "OPENROUTER_API_KEY",
+            "groq" => "GROQ_API_KEY",
+            "mistral" => "MISTRAL_API_KEY",
+            _ => continue,
+        };
+        if std::env::var(env_var).map_or(true, |v| v.trim().is_empty()) {
+            std::env::set_var(env_var, key);
+        }
+    }
+}
+
 /// followed by a Claude validation pass).
 ///
 /// Delegates to `ReviewPipeline` for structured multi-model review with
@@ -2349,6 +2373,8 @@ pub async fn run(
         tracing::warn!("plugin registry initialization skipped: {error}");
     }
 
+    hydrate_provider_env_vars(&config);
+
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
     let observer: Arc<dyn Observer> = Arc::from(base_observer);
@@ -2460,6 +2486,26 @@ pub async fn run(
         &model_name,
         &provider_runtime_options,
     )?;
+
+    // Validate provider credentials early so misconfigured API keys are caught
+    // before heavy setup (memory, tools, RAG) instead of failing silently at chat time.
+    if !providers::has_provider_credential(provider_name, config.api_key.as_deref()) {
+        // Bedrock uses AWS AKSK, not a single API key — skip this check for it.
+        if provider_name != "bedrock" && provider_name != "aws-bedrock" && provider_name != "ollama" {
+            anyhow::bail!(
+                "No API key found for provider '{provider_name}'. Options:\n\
+                 1. Set the provider-specific env var (e.g. GEMINI_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY)\n\
+                 2. Set api_key in your config.toml\n\
+                 3. Run `zeroclaw onboard` to configure"
+            );
+        }
+    }
+
+    // Warm up the provider connection pool (TLS handshake, DNS, HTTP/2 setup)
+    // so the first real message doesn't hit a cold-start timeout.
+    if let Err(e) = provider.warmup().await {
+        tracing::warn!(provider = provider_name, "Provider warmup failed: {e}");
+    }
 
     observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.to_string(),
@@ -3028,6 +3074,9 @@ pub async fn process_message_with_session(
     if let Err(error) = crate::plugins::runtime::initialize_from_config(&config.plugins) {
         tracing::warn!("plugin registry initialization skipped: {error}");
     }
+
+    hydrate_provider_env_vars(&config);
+
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -3107,6 +3156,11 @@ pub async fn process_message_with_session(
         &model_name,
         &provider_runtime_options,
     )?;
+
+    // Warm up the provider connection pool (TLS handshake, DNS, HTTP/2 setup).
+    if let Err(e) = provider.warmup().await {
+        tracing::warn!(provider = provider_name, "Provider warmup failed: {e}");
+    }
 
     let hardware_rag: Option<crate::rag::HardwareRag> = config
         .peripherals

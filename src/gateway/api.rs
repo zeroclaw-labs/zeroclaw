@@ -240,7 +240,29 @@ pub async fn handle_api_config_api_key_put(
         p => p,
     };
 
-    // Set the API key and default provider
+    // Store the key in the per-provider map so multiple providers can each
+    // keep their own key instead of overwriting the single api_key field.
+    config
+        .provider_api_keys
+        .insert(backend_provider.to_string(), api_key.to_string());
+
+    // Also set the provider-specific env var so resolve_provider_credential()
+    // picks it up for the current process lifetime.
+    let env_var = match backend_provider {
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "openai" => "OPENAI_API_KEY",
+        "gemini" | "google" | "google-gemini" => "GEMINI_API_KEY",
+        "deepseek" => "DEEPSEEK_API_KEY",
+        "openrouter" => "OPENROUTER_API_KEY",
+        "groq" => "GROQ_API_KEY",
+        "mistral" => "MISTRAL_API_KEY",
+        _ => "",
+    };
+    if !env_var.is_empty() {
+        std::env::set_var(env_var, api_key);
+    }
+
+    // Set config-level api_key to this provider's key and update default_provider.
     config.api_key = Some(api_key.to_string());
     config.default_provider = Some(backend_provider.to_string());
 

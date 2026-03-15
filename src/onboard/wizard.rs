@@ -188,6 +188,7 @@ pub async fn run_wizard_with_migration(
         } else {
             Some(api_key)
         },
+        provider_api_keys: std::collections::HashMap::new(),
         api_url: provider_api_url,
         default_provider: Some(provider),
         provider_api: None,
@@ -715,6 +716,7 @@ async fn run_quick_setup_with_home(
             s.push_str(c);
             s
         }),
+        provider_api_keys: std::collections::HashMap::new(),
         api_url: None,
         default_provider: Some(provider_name.clone()),
         provider_api: None,

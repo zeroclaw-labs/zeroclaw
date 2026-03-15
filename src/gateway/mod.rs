@@ -394,6 +394,29 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         tracing::warn!("plugin registry initialization skipped: {error}");
     }
 
+    // ── Hydrate provider-specific env vars from saved provider_api_keys ──
+    // This ensures API keys saved via Settings persist across restarts.
+    for (provider, key) in &config.provider_api_keys {
+        if key.trim().is_empty() {
+            continue;
+        }
+        let env_var = match provider.as_str() {
+            "anthropic" => "ANTHROPIC_API_KEY",
+            "openai" => "OPENAI_API_KEY",
+            "gemini" | "google" | "google-gemini" => "GEMINI_API_KEY",
+            "deepseek" => "DEEPSEEK_API_KEY",
+            "openrouter" => "OPENROUTER_API_KEY",
+            "groq" => "GROQ_API_KEY",
+            "mistral" => "MISTRAL_API_KEY",
+            _ => continue,
+        };
+        // Only set if not already overridden by a real env var
+        if std::env::var(env_var).map_or(true, |v| v.trim().is_empty()) {
+            std::env::set_var(env_var, key);
+            tracing::info!(provider = provider, "Loaded API key from config");
+        }
+    }
+
     // ── Security: refuse public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
     {
