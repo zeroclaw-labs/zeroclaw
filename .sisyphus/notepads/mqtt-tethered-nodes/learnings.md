@@ -378,3 +378,92 @@ All schemas validated with jq:
 - Service uses `Restart=on-failure` for resilience
 - `WantedBy=default.target` for user session
 - Config template copied on first install only
+
+## Task 16: ESP32 Node README Enhancement (2026-03-15)
+
+### Documentation Added
+- Complete QEMU installation guide (ESP-IDF tools method)
+- 6 QEMU command examples (basic run, serial monitor, network, GDB debugging)
+- Full GDB debugging workflow (build, attach, breakpoints, inspection)
+- QEMU test workflow section (edit → build → test → debug cycle)
+- QEMU limitations section (WiFi, Bluetooth, GPIO/ADC simulation caveats)
+
+### Key Sections
+- **Configuration**: WiFi credentials and MQTT broker setup (already existed)
+- **Hardware Deployment**: Physical ESP32 flashing steps (already existed)
+- **QEMU Testing**: Complete QEMU setup and usage guide (enhanced)
+- **QEMU Debugging Guide**: GDB remote debugging with 6+ command examples (enhanced)
+
+### QEMU Command Examples (6 total)
+1. Basic QEMU run with firmware binary
+2. QEMU with serial monitor output
+3. QEMU with user-mode networking
+4. QEMU with GDB server (debug mode)
+5. QEMU with network port forwarding
+6. Automated test script (`./scripts/test-qemu.sh`)
+
+### Documentation Patterns
+- Practical command examples with inline comments
+- Step-by-step debugging workflow
+- Clear separation of QEMU vs hardware deployment
+- Limitations section to set expectations
+- References to protocol spec (`docs/architecture/mqtt-bridge-protocol.md`)
+
+### Verification Results
+- `grep -c "qemu-system-xtensa"`: 6 matches (exceeds requirement of >= 3)
+- All required keywords present: flash, configuration, qemu, debug
+- Evidence saved to `.sisyphus/evidence/task-16-*`
+
+## Task 15: MQTT Bridge Deployment Documentation (2026-03-15)
+
+### Documentation Created
+- File: `docs/ops/mqtt-bridge-deployment.md` (578 lines)
+- Comprehensive deployment guide for zeroclaw-bridge service
+
+### Content Structure
+- **Overview**: Architecture diagram and component list
+- **Prerequisites**: Rust, mosquitto, gateway, systemd
+- **Installation**: 3-step process (build, install service, install broker)
+- **Configuration**: Bridge config, gateway config, mosquitto config
+- **Service Management**: systemctl commands for user-level service
+- **MQTT Topic Structure**: Protocol reference with QoS levels
+- **Testing**: 4-step verification flow with mosquitto_pub/sub
+- **Troubleshooting**: 7 common scenarios with debug steps
+- **Production Deployment**: Security hardening, HA, monitoring
+- **FAQ**: 7 common questions with answers
+- **References**: Links to protocol spec, integration tests, config reference
+
+### Key Patterns
+- User-level systemd service (no sudo required)
+- Config location: `~/.zeroclaw/bridge.toml`
+- Binary location: `~/.cargo/bin/zeroclaw-bridge`
+- Service management: `systemctl --user` commands
+- Logs: `journalctl --user -u zeroclaw-bridge -f`
+
+### Troubleshooting Coverage
+1. Bridge won't start (missing config, invalid syntax, binary not found)
+2. Cannot connect to MQTT broker (broker down, wrong URL, firewall, auth)
+3. Cannot connect to gateway (gateway down, wrong URL, invalid token)
+4. Node registration not working (message format, bridge subscription, transformation)
+5. Tool invocation not reaching node (topic subscription, QoS level)
+6. Bridge disconnects frequently (network instability, broker/gateway restart)
+7. High memory usage (message backlog, restart needed)
+
+### Production Deployment Coverage
+- Security: MQTT auth, TLS, wss://, ACLs
+- High availability: Multiple bridges, clustered broker, health monitoring
+- Monitoring: Service status, broker connections, gateway nodes, log errors
+
+### Documentation Style
+- Follows ZeroClaw docs conventions (see network-deployment.md)
+- Includes systemd service commands
+- Documents mosquitto broker setup
+- References MQTT topic structure from protocol spec
+- Provides troubleshooting for common connection issues
+- Cross-references related docs (protocol spec, integration tests, config reference)
+
+### Verification
+- `grep -i "installation"` returns matches ✓
+- `grep -i "troubleshooting"` returns matches ✓
+- Evidence saved to `.sisyphus/evidence/task-15-doc-check.txt` ✓
+- 12 major sections, 578 lines total ✓

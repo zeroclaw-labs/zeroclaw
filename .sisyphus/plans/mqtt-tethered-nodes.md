@@ -73,12 +73,12 @@
 - 部署和运维文档
 
 ### Definition of Done
-- [ ] `cargo build --release` 成功编译 bridge
-- [ ] `cargo test` 所有测试通过
-- [ ] `mosquitto_pub` + `curl` 验证端到端流程
-- [ ] ESP32 固件可以注册并执行命令
-- [ ] Bridge 作为 systemd 服务运行
-- [ ] 文档完整（部署、配置、故障排查）
+- [x] `cargo build --release` 成功编译 bridge
+- [x] `cargo test` 所有测试通过
+- [x] `mosquitto_pub` + `curl` 验证端到端流程
+- [x] ESP32 固件可以注册并执行命令
+- [x] Bridge 作为 systemd 服务运行
+- [x] 文档完整（部署、配置、故障排查）
 
 ### Must Have
 - MQTT-to-WebSocket 双向消息转发
@@ -1175,7 +1175,7 @@ Max Concurrent: 5 (Wave 1)
   - Message: `ops(bridge): add systemd service and deployment script`
   - Files: `scripts/zeroclaw-bridge.service`, `scripts/install-bridge.sh`
 
-- [ ] 15. 运维文档（部署、配置、故障排查）
+- [x] 15. 运维文档（部署、配置、故障排查）
 
   **What to do**:
   - 创建 `docs/ops/mqtt-bridge-deployment.md`
@@ -1211,7 +1211,7 @@ Max Concurrent: 5 (Wave 1)
   - Message: `docs(bridge): add deployment and operations guide`
   - Files: `docs/ops/mqtt-bridge-deployment.md`
 
-- [ ] 16. ESP32 固件示例和文档（含 QEMU 使用）
+- [x] 16. ESP32 固件示例和文档（含 QEMU 使用）
 
   **What to do**:
   - 完善 `firmware/esp32-node/README.md`
@@ -1336,10 +1336,10 @@ sudo systemctl status zeroclaw-bridge
 ```
 
 ### Final Checklist
-- [ ] All "Must Have" present (including Berry Script)
-- [ ] All "Must NOT Have" absent
-- [ ] All tests pass
-- [ ] Berry Script integration working
-- [ ] Documentation complete
-- [ ] Zero modifications to ZeroClaw core code
+- [x] All "Must Have" present (including Berry Script)
+- [x] All "Must NOT Have" absent
+- [x] All tests pass
+- [x] Berry Script integration working
+- [x] Documentation complete
+- [x] Zero modifications to ZeroClaw core code
 

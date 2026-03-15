@@ -3,7 +3,8 @@
   "started_at": "2026-03-15T06:35:03.888Z",
   "session_ids": [
     "ses_30fcb6ba4ffePPM0az9R9JKCta",
-    "ses_30f29eed4ffeph56qnrXnqc5R5"
+    "ses_30f29eed4ffeph56qnrXnqc5R5",
+    "ses_30eadb5b3ffeF7SLB1VHUdvr3v"
   ],
   "plan_name": "mqtt-tethered-nodes",
   "agent": "atlas"
