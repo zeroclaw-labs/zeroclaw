@@ -1,8 +1,26 @@
 name: Tweet Release
 
 on:
-  release:
-    types: [published]
+  # Called by release workflows AFTER all publish steps (docker, crates, website) complete.
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Release tag (e.g. v0.3.0 or v0.3.0-beta.42)"
+        required: true
+        type: string
+      release_url:
+        description: "GitHub Release URL"
+        required: true
+        type: string
+    secrets:
+      TWITTER_CONSUMER_API_KEY:
+        required: false
+      TWITTER_CONSUMER_API_SECRET_KEY:
+        required: false
+      TWITTER_ACCESS_TOKEN:
+        required: false
+      TWITTER_ACCESS_TOKEN_SECRET:
+        required: false
   workflow_dispatch:
     inputs:
       tweet_text:
@@ -26,7 +44,7 @@ jobs:
         id: check
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name || '' }}
+          RELEASE_TAG: ${{ inputs.release_tag || '' }}
           MANUAL_TEXT: ${{ inputs.tweet_text || '' }}
         run: |
           # Manual dispatch always proceeds
@@ -62,8 +80,8 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name || '' }}
-          RELEASE_URL: ${{ github.event.release.html_url || '' }}
+          RELEASE_TAG: ${{ inputs.release_tag || '' }}
+          RELEASE_URL: ${{ inputs.release_url || '' }}
           MANUAL_TEXT: ${{ inputs.tweet_text || '' }}
         run: |
           set -euo pipefail

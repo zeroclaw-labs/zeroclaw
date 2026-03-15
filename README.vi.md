@@ -84,6 +84,16 @@
 
 <p align="center"><code>Kiến trúc trait-driven · mặc định bảo mật · provider/channel/tool hoán đổi tự do · mọi thứ đều dễ mở rộng</code></p>
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.3.1 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| ci | add Termux (aarch64-linux-android) release target |
+
+<!-- END:WHATS_NEW -->
+
 ### 📢 Thông báo
 
 Bảng này dành cho các thông báo quan trọng (thay đổi không tương thích, cảnh báo bảo mật, lịch bảo trì, vấn đề chặn release).
@@ -260,7 +270,7 @@ cd zeroclaw
 ./install.sh --prebuilt-only
 
 # Tùy chọn: chạy onboarding trong cùng luồng
-./install.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
+./install.sh --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
 
 # Tùy chọn: chạy bootstrap + onboarding hoàn toàn ở chế độ tương thích với Docker
 ./install.sh --docker
@@ -311,8 +321,8 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # Cài nhanh (không cần tương tác, có thể chỉ định model)
 zeroclaw onboard --api-key sk-... --provider openrouter [--model "openrouter/auto"]
 
-# Hoặc dùng trình hướng dẫn tương tác
-zeroclaw onboard --interactive
+# Hoặc dùng trình hướng dẫn
+zeroclaw onboard
 
 # Hoặc chỉ sửa nhanh channel/allowlist
 zeroclaw onboard --channels-only
@@ -455,6 +465,20 @@ Chân thành cảm ơn các cộng đồng và tổ chức đã truyền cảm h
 - **Thế giới & Xa hơn** 🌍✨ — gửi đến mọi người đóng góp, người dám mơ và người dám làm đang biến mã nguồn mở thành sức mạnh tích cực. Tất cả là dành cho các bạn.
 
 Chúng tôi xây dựng công khai vì ý tưởng hay đến từ khắp nơi. Nếu bạn đang đọc đến đây, bạn đã là một phần của chúng tôi. Chào mừng. 🦀❤️
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.3.1)
+
+3 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+- **argenis de la rosa**
+- **Claude Opus 4.6**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ Repository Chính thức & Cảnh báo Mạo danh
 

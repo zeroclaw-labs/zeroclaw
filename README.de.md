@@ -90,6 +90,16 @@ Erstellt von Studenten und Mitgliedern der Harvard, MIT und Sundai.Club Gemeinsc
 
 <p align="center"><code>Trait-basierte Architektur · sicheres Runtime standardmäßig · Provider/Channel/Tool austauschbar · alles ist steckbar</code></p>
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.3.1 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| ci | add Termux (aarch64-linux-android) release target |
+
+<!-- END:WHATS_NEW -->
+
 ### 📢 Ankündigungen
 
 Verwende diese Tabelle für wichtige Hinweise (Kompatibilitätsänderungen, Sicherheitshinweise, Wartungsfenster und Versionsblockierungen).
@@ -416,6 +426,20 @@ Ein herzliches Dankeschön an die Gemeinschaften und Institutionen, die diese Op
 - **Die Welt und Darüber Hinaus** 🌍✨ — an jeden Mitwirkenden, Träumer und Erbauer da draußen, der Open Source zu einer Kraft für das Gute macht. Das ist für dich.
 
 Wir bauen in Open Source, weil die besten Ideen von überall kommen. Wenn du das liest, bist du Teil davon. Willkommen. 🦀❤️
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.3.1)
+
+3 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+- **argenis de la rosa**
+- **Claude Opus 4.6**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ Offizielles Repository und Fälschungswarnung
 

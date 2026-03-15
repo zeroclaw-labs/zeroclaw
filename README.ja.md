@@ -75,6 +75,16 @@
 >
 > 最終同期日: **2026-02-19**。
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.3.1 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| ci | add Termux (aarch64-linux-android) release target |
+
+<!-- END:WHATS_NEW -->
+
 ## 📢 お知らせボード
 
 重要なお知らせ（互換性破壊変更、セキュリティ告知、メンテナンス時間、リリース阻害事項など）をここに掲載します。
@@ -163,7 +173,7 @@ cargo build --release --locked
 cargo install --path . --force --locked
 
 zeroclaw onboard --api-key sk-... --provider openrouter
-zeroclaw onboard --interactive
+zeroclaw onboard
 
 zeroclaw agent -m "Hello, ZeroClaw!"
 
@@ -224,6 +234,20 @@ zeroclaw agent --provider anthropic -m "hello"
 - PR Workflow: [`docs/contributing/pr-workflow.md`](docs/contributing/pr-workflow.md)
 - Reviewer Playbook: [`docs/contributing/reviewer-playbook.md`](docs/contributing/reviewer-playbook.md)
 - License: MIT or Apache 2.0（[`LICENSE-MIT`](LICENSE-MIT), [`LICENSE-APACHE`](LICENSE-APACHE), [`NOTICE`](NOTICE)）
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.3.1)
+
+3 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+- **argenis de la rosa**
+- **Claude Opus 4.6**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ---
 

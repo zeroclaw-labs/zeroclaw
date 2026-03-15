@@ -187,7 +187,12 @@ detect_release_target() {
       echo "x86_64-unknown-linux-gnu"
       ;;
     Linux:aarch64|Linux:arm64)
-      echo "aarch64-unknown-linux-gnu"
+      # Termux on Android needs the android target, not linux-gnu
+      if [[ -n "${TERMUX_VERSION:-}" || -d "/data/data/com.termux" ]]; then
+        echo "aarch64-linux-android"
+      else
+        echo "aarch64-unknown-linux-gnu"
+      fi
       ;;
     Linux:armv7l|Linux:armv6l)
       echo "armv7-unknown-linux-gnueabihf"
@@ -420,8 +425,15 @@ bool_to_word() {
 }
 
 guided_input_stream() {
-  if [[ -t 0 ]]; then
+  # Some constrained containers report interactive stdin (-t 0) but deny
+  # opening /dev/stdin directly. Probe readability before selecting it.
+  if [[ -t 0 ]] && (: </dev/stdin) 2>/dev/null; then
     echo "/dev/stdin"
+    return 0
+  fi
+
+  if [[ -t 0 ]] && (: </proc/self/fd/0) 2>/dev/null; then
+    echo "/proc/self/fd/0"
     return 0
   fi
 
@@ -527,6 +539,8 @@ install_system_deps() {
           openssl \
           perl \
           ca-certificates
+      elif have_cmd pkg && [[ -n "${TERMUX_VERSION:-}" ]]; then
+        pkg install -y build-essential pkg-config git curl openssl perl
       else
         warn "Unsupported Linux distribution. Install compiler toolchain + pkg-config + git + curl + OpenSSL headers + perl manually."
       fi
@@ -1185,6 +1199,17 @@ fi
 
 if [[ "$SKIP_INSTALL" == false ]]; then
   step_dot "Installing zeroclaw to cargo bin"
+
+  # Clean up stale cargo install tracking from the old "zeroclaw" package name
+  # (renamed to "zeroclawlabs"). Without this, `cargo install zeroclawlabs` from
+  # crates.io fails with "binary already exists as part of `zeroclaw`".
+  if have_cmd cargo; then
+    if [[ -f "$HOME/.cargo/.crates.toml" ]] && grep -q '^"zeroclaw ' "$HOME/.cargo/.crates.toml" 2>/dev/null; then
+      step_dot "Removing stale cargo tracking for old 'zeroclaw' package name"
+      cargo uninstall zeroclaw 2>/dev/null || true
+    fi
+  fi
+
   cargo install --path "$WORK_DIR" --force --locked
   step_ok "ZeroClaw installed"
 else

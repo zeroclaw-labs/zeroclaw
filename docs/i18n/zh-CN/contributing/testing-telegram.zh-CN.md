@@ -106,7 +106,7 @@ Pass Rate:     100%
 
 ```bash
 # 交互式设置
-zeroclaw onboard --interactive
+zeroclaw onboard
 
 # 或仅渠道设置
 zeroclaw onboard --channels-only

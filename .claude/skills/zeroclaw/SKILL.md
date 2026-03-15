@@ -53,7 +53,7 @@ If the user hasn't set up ZeroClaw yet (no `~/.zeroclaw/config.toml` exists), gu
 ```bash
 zeroclaw onboard                          # Quick mode — defaults to OpenRouter
 zeroclaw onboard --provider anthropic     # Use Anthropic directly
-zeroclaw onboard --interactive            # Step-by-step wizard
+zeroclaw onboard                          # Guided wizard (default)
 ```
 
 After onboarding, verify everything works:
