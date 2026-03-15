@@ -381,21 +381,36 @@ export class MoAClient {
     const chatBaseUrl = this.getChatUrl();
     const isLocal = this.hasLocalApiKey();
 
-    const res = await fetch(`${chatBaseUrl}/api/chat`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.token}`,
-      },
-      body: JSON.stringify({
-        message,
-        context,
-        provider,
-        model,
-        // Only send API key to local gateway, not to relay
-        ...(isLocal && apiKey ? { api_key: apiKey } : {}),
-      }),
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${chatBaseUrl}/api/chat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.token}`,
+        },
+        body: JSON.stringify({
+          message,
+          context,
+          provider,
+          model,
+          // Only send API key to local gateway, not to relay
+          ...(isLocal && apiKey ? { api_key: apiKey } : {}),
+        }),
+      });
+    } catch (err) {
+      if (err instanceof TypeError && err.message === "Failed to fetch") {
+        if (isLocal) {
+          throw new Error(
+            "Cannot connect to local MoA server. Please check that the server is running.",
+          );
+        }
+        throw new Error(
+          "Cannot connect to server. Please check your network connection.",
+        );
+      }
+      throw err;
+    }
 
     if (!res.ok) {
       if (res.status === 401) {
@@ -404,7 +419,17 @@ export class MoAClient {
         throw new Error("Chat authentication failed. Please check your connection settings.");
       }
       const text = await res.text().catch(() => "Unknown error");
-      throw new Error(`Chat request failed (${res.status}): ${text}`);
+      // Extract user-friendly error from JSON response if available
+      let errorMessage = text;
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed.error) {
+          errorMessage = parsed.error;
+        }
+      } catch {
+        // JSON parse failed, use raw text
+      }
+      throw new Error(errorMessage || `Chat request failed (${res.status})`);
     }
 
     const data = await res.json();

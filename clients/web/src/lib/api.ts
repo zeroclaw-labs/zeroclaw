@@ -131,14 +131,24 @@ export class ZeroClawClient {
     const body: Record<string, string> = { message };
     if (model) body.model = model;
 
-    const res = await fetch(`${this.serverUrl}/webhook`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.token}`,
-      },
-      body: JSON.stringify(body),
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${this.serverUrl}/webhook`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.token}`,
+        },
+        body: JSON.stringify(body),
+      });
+    } catch (err) {
+      if (err instanceof TypeError && err.message === "Failed to fetch") {
+        throw new Error(
+          "Cannot connect to server. Please check your network connection.",
+        );
+      }
+      throw err;
+    }
 
     if (!res.ok) {
       if (res.status === 401) {
@@ -148,7 +158,16 @@ export class ZeroClawClient {
         );
       }
       const text = await res.text().catch(() => "Unknown error");
-      throw new Error(`Chat request failed (${res.status}): ${text}`);
+      let errorMessage = text;
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed.error) {
+          errorMessage = parsed.error;
+        }
+      } catch {
+        // JSON parse failed, use raw text
+      }
+      throw new Error(errorMessage || `Chat request failed (${res.status})`);
     }
 
     return await res.json();

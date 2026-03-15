@@ -211,6 +211,28 @@ pub async fn handle_api_chat(
         }
     }
 
+    // ── Validate API key for cloud providers ──
+    let provider_name = config
+        .default_provider
+        .as_deref()
+        .unwrap_or("gemini");
+    if providers::provider_requires_credential(provider_name) {
+        let has_key = config
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|k| !k.is_empty());
+        if !has_key {
+            let err = serde_json::json!({
+                "error": format!(
+                    "No API key configured for provider '{}'. Please add your API key in Settings.",
+                    provider_name
+                )
+            });
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    }
+
     // ── Observability ──
     let provider_label = config
         .default_provider
