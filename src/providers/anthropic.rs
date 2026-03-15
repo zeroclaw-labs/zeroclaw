@@ -361,9 +361,7 @@ impl AnthropicProvider {
 
     /// Try to convert an MCP content-block array into `ToolResultContent`.
     /// Returns `None` if the array doesn't contain any MCP-typed blocks.
-    fn try_parse_mcp_content_blocks(
-        arr: &[serde_json::Value],
-    ) -> Option<ToolResultContent> {
+    fn try_parse_mcp_content_blocks(arr: &[serde_json::Value]) -> Option<ToolResultContent> {
         let mut blocks = Vec::new();
         let mut has_typed_block = false;
 
@@ -388,10 +386,7 @@ impl AnthropicProvider {
                     });
                 }
                 "text" => {
-                    let text = obj
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let text = obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
                     blocks.push(ToolResultBlock::Text {
                         text: text.to_string(),
                     });
