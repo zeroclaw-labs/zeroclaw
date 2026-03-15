@@ -86,6 +86,16 @@ Postaveno studenty a členy komunit Harvard, MIT a Sundai.Club.
 
 <p align="center"><code>Architektura založená na traitech · bezpečný runtime defaultně · vyměnitelný poskytovatel/kanál/nástroj · vše je připojitelné</code></p>
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.3.1 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| ci | add Termux (aarch64-linux-android) release target |
+
+<!-- END:WHATS_NEW -->
+
 ### 📢 Oznámení
 
 Použijte tuto tabulku pro důležitá oznámení (změny kompatibility, bezpečnostní upozornění, servisní okna a blokování verzí).
@@ -412,6 +422,20 @@ Upřímné poděkování komunitám a institucím které inspirují a živí tut
 - **Svět a Dál** 🌍✨ — každému přispěvateli, snílkovi, a staviteli tam venku který dělá z open source sílu pro dobro. To je pro tebe.
 
 Stavíme v open source protože nejlepší nápady přicházejí odkudkoliv. Pokud toto čtete, jste součástí toho. Vítejte. 🦀❤️
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.3.1)
+
+3 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+- **argenis de la rosa**
+- **Claude Opus 4.6**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ Oficiální Repoziťář a Varování před Vydáváním se
 

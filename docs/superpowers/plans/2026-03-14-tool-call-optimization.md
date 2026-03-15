@@ -2,9 +2,28 @@
 
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Eliminate infrastructure failures (session contention, token overflow, malformed tool calls, raw error dumps) and extract skill-specific logic into SKILL.toml config.
+**Goal:** Eliminate infrastructure failures (session contention, token overflow, malformed tool calls, raw error dumps), extract skill-specific logic into SKILL.toml config, and prevent LLM link hallucination.
 
-**Architecture:** 5 blocks executed in order 1→4→2→3→5. Blocks 1+4 are parallel limits + token budget (fix root cause). Block 2 fixes malformed XML tool calls. Block 3 sanitizes error output. Block 5 extracts config. Each block is independently testable.
+**Architecture:** 5 blocks executed in order 1→4→2→3→5, plus Block 6 (link hallucination). Blocks 1+4 are parallel limits + token budget (fix root cause). Block 2 fixes malformed XML tool calls. Block 3 sanitizes error output. Block 5 extracts config. Block 6 validates source_url against real search results. Each block is independently testable.
+
+## Status
+
+| Block | Task | Status | Commit |
+|-------|------|--------|--------|
+| 1+4 | Parallel limits + per-tool cap + token budget | **DONE** | `52713807` |
+| 2 | Malformed `<tool_call>` stripping | **DONE** | `cb0488bb` |
+| 3 | Provider error sanitization | **DONE** | `be961f84` |
+| 5 | Skill config extraction (env vars) | **DONE** | `fbc216bf` |
+| 6 | Link hallucination prevention | **DONE** | (Python-only, no Rust commit) |
+
+### E2E Validation (b1-b4, 2026-03-14)
+
+| Test | Before | After | Status |
+|------|--------|-------|--------|
+| b1 | 33s | 12.5s | PASS |
+| b2 | 50s | 50.5s | PASS |
+| b3 | 22s | 11.8s | PASS |
+| b4 | 900s+ timeout | 17.9s | PASS |
 
 **Tech Stack:** Rust (tokio semaphore, serde), Python (env var reads), TOML config
 
@@ -788,4 +807,61 @@ Run each with 60s pause. All 15 must pass.
 ```bash
 git add tests/telegram_search_quality.rs
 git commit -m "test: verify all 15 E2E tests pass with tool call optimization"
+```
+
+---
+
+## Chunk 5: Link Hallucination Prevention (Block 6)
+
+### Task 14: Validate source_url against real search results
+
+**Problem:** The LLM sometimes constructs `source_url` by combining a real channel username with a fabricated message_id (e.g. `t.me/samui_help/138985`). The link resolves (HTTP 200) because Telegram returns a page for any channel, but the message_id is invented — it doesn't come from search results.
+
+**Root cause:** `submit_contacts.py` trusts whatever `source_url` the LLM provides. It validates URL format and HTTP status, but cannot verify the message_id actually appeared in search results.
+
+**Approach:** Track real `message_link` values from search tools (search_global, search_messages) in the delegate agent's context, then cross-reference in submit_contacts.
+
+- [ ] **Step 1: Collect seen message_links in telegram_reader.py**
+
+In `search_global` and `search_messages` output, each result already contains `message_link`. Add a dedup file that accumulates all seen links during the agent session:
+
+```python
+# At end of search_global / search_messages, append links to session file
+seen_links_path = os.path.join(os.environ.get("SKILL_DIR", "/tmp"), ".seen_links")
+with open(seen_links_path, "a") as f:
+    for msg in results:
+        if msg.get("message_link"):
+            f.write(msg["message_link"] + "\n")
+```
+
+- [ ] **Step 2: Validate source_url in submit_contacts.py**
+
+```python
+# Load seen links
+seen_links_path = os.path.join(os.environ.get("SKILL_DIR", "/tmp"), ".seen_links")
+seen_links = set()
+if os.path.exists(seen_links_path):
+    with open(seen_links_path) as f:
+        seen_links = {line.strip() for line in f if line.strip()}
+
+# In contact validation:
+if source_url and seen_links and source_url not in seen_links:
+    # LLM hallucinated this link — strip it
+    log(f"HALLUCINATED link stripped: {source_url} (not in {len(seen_links)} seen links)")
+    source_url = None
+```
+
+- [ ] **Step 3: Clean up .seen_links after submit_contacts**
+
+Delete the file after submit_contacts runs so it doesn't leak across sessions.
+
+- [ ] **Step 4: Add E2E test for link hallucination**
+
+Add a test that verifies all `source_url` values in the bot's response actually come from search results (by checking they match t.me/channel/id format from known channels with real message IDs).
+
+- [ ] **Step 5: Commit**
+
+```bash
+cd ~/.zeroclaw && git add workspace/skills/telegram-reader/scripts/
+git commit -m "fix: strip hallucinated source_url links not from search results"
 ```

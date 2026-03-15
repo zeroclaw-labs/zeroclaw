@@ -63,14 +63,18 @@ impl NextcloudTalkChannel {
     /// Parse a Nextcloud Talk webhook payload into channel messages.
     ///
     /// Relevant payload fields:
-    /// - `type` (expects `message`)
+    /// - `type` (accepts `message` or `Create`)
     /// - `object.token` (room token for reply routing)
     /// - `message.actorType`, `message.actorId`, `message.message`, `message.timestamp`
     pub fn parse_webhook_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
         let mut messages = Vec::new();
 
         if let Some(event_type) = payload.get("type").and_then(|v| v.as_str()) {
-            if !event_type.eq_ignore_ascii_case("message") {
+            // Nextcloud Talk bot webhooks send "Create" for new chat messages,
+            // but some setups may use "message". Accept both.
+            let is_message_event = event_type.eq_ignore_ascii_case("message")
+                || event_type.eq_ignore_ascii_case("create");
+            if !is_message_event {
                 tracing::debug!("Nextcloud Talk: skipping non-message event: {event_type}");
                 return messages;
             }
@@ -337,6 +341,36 @@ mod tests {
         assert_eq!(messages[0].content, "Hello from Nextcloud");
         assert_eq!(messages[0].channel, "nextcloud_talk");
         assert_eq!(messages[0].timestamp, 1_735_701_200);
+    }
+
+    #[test]
+    fn nextcloud_talk_parse_create_event_type() {
+        let channel = make_channel();
+        let payload = serde_json::json!({
+            "type": "Create",
+            "object": {
+                "id": "42",
+                "token": "room-token-123",
+                "name": "Team Room",
+                "type": "room"
+            },
+            "message": {
+                "id": 88,
+                "token": "room-token-123",
+                "actorType": "users",
+                "actorId": "user_a",
+                "actorDisplayName": "User A",
+                "timestamp": 1_735_701_300,
+                "messageType": "comment",
+                "systemMessage": "",
+                "message": "Hello via Create event"
+            }
+        });
+
+        let messages = channel.parse_webhook_payload(&payload);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, "88");
+        assert_eq!(messages[0].content, "Hello via Create event");
     }
 
     #[test]

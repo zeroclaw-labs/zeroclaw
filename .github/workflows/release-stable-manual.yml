@@ -171,6 +171,11 @@ jobs:
             target: aarch64-apple-darwin
             artifact: zeroclaw
             ext: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+            artifact: zeroclaw
+            ext: tar.gz
+            ndk: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: zeroclaw.exe
@@ -194,6 +199,10 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ${{ matrix.cross_compiler }}
+
+      - name: Setup Android NDK
+        if: matrix.ndk
+        run: echo "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
 
       - name: Build release
         shell: bash
@@ -254,7 +263,7 @@ jobs:
 
       - name: Create GitHub Release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           TAG: ${{ needs.validate.outputs.tag }}
         run: |
           gh release create "$TAG" release-assets/* \
@@ -290,9 +299,17 @@ jobs:
         run: rm -rf web/node_modules web/src web/package.json web/package-lock.json web/tsconfig*.json web/vite.config.ts web/index.html
 
       - name: Publish to crates.io
-        run: cargo publish --locked --allow-dirty --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Skip if this version is already on crates.io (auto-sync may have published it)
+          CRATE_NAME=$(sed -n 's/^name = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          if curl -sfL "https://crates.io/api/v1/crates/${CRATE_NAME}/${VERSION}" | grep -q '"version"'; then
+            echo "::notice::${CRATE_NAME}@${VERSION} already published on crates.io — skipping"
+          else
+            cargo publish --locked --allow-dirty --no-verify
+          fi
 
   redeploy-website:
     name: Trigger Website Redeploy
@@ -313,7 +330,7 @@ jobs:
     name: Push Docker Image
     needs: [validate, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -336,3 +353,13 @@ jobs:
           platforms: linux/amd64,linux/arm64
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ── Post-publish: only run after ALL artifacts are live ──────────────
+  tweet:
+    name: Tweet Release
+    needs: [validate, publish, docker, crates-io, redeploy-website]
+    uses: ./.github/workflows/tweet-release.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+      release_url: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/${{ needs.validate.outputs.tag }}
+    secrets: inherit

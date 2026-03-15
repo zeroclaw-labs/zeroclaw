@@ -1,8 +1,26 @@
 name: Tweet Release
 
 on:
-  release:
-    types: [published]
+  # Called by release workflows AFTER all publish steps (docker, crates, website) complete.
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Release tag (e.g. v0.3.0 or v0.3.0-beta.42)"
+        required: true
+        type: string
+      release_url:
+        description: "GitHub Release URL"
+        required: true
+        type: string
+    secrets:
+      TWITTER_CONSUMER_API_KEY:
+        required: false
+      TWITTER_CONSUMER_API_SECRET_KEY:
+        required: false
+      TWITTER_ACCESS_TOKEN:
+        required: false
+      TWITTER_ACCESS_TOKEN_SECRET:
+        required: false
   workflow_dispatch:
     inputs:
       tweet_text:
@@ -26,7 +44,7 @@ jobs:
         id: check
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name || '' }}
+          RELEASE_TAG: ${{ inputs.release_tag || '' }}
           MANUAL_TEXT: ${{ inputs.tweet_text || '' }}
         run: |
           # Manual dispatch always proceeds
@@ -62,8 +80,8 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name || '' }}
-          RELEASE_URL: ${{ github.event.release.html_url || '' }}
+          RELEASE_TAG: ${{ inputs.release_tag || '' }}
+          RELEASE_URL: ${{ inputs.release_url || '' }}
           MANUAL_TEXT: ${{ inputs.tweet_text || '' }}
         run: |
           set -euo pipefail
@@ -120,14 +138,32 @@ jobs:
               "$RELEASE_TAG" "$FEATURES" "$TOTAL_COUNT" "$RELEASE_URL")
           fi
 
-          # Append release URL if not already present and we have one
-          if [ -n "$RELEASE_URL" ] && ! echo "$TWEET" | grep -q "$RELEASE_URL"; then
-            TWEET=$(printf "%s\n\n%s" "$TWEET" "$RELEASE_URL")
+          # X/Twitter counts any URL as 23 chars (t.co shortening).
+          # Extract the URL (if present), truncate the BODY to fit, then
+          # re-append the URL so it is never chopped.
+          URL=""
+          BODY="$TWEET"
+
+          # Pull URL out of existing tweet text or use RELEASE_URL
+          FOUND_URL=$(echo "$TWEET" | grep -oE 'https?://[^ ]+' | tail -1 || true)
+          if [ -n "$FOUND_URL" ]; then
+            URL="$FOUND_URL"
+            BODY=$(echo "$TWEET" | sed "s|${URL}||" | sed -e 's/[[:space:]]*$//')
+          elif [ -n "$RELEASE_URL" ]; then
+            URL="$RELEASE_URL"
           fi
 
-          # Truncate to 280 chars if needed
-          if [ ${#TWEET} -gt 280 ]; then
-            TWEET="${TWEET:0:277}..."
+          if [ -n "$URL" ]; then
+            # URL counts as 23 chars on X + 2 chars for \n\n separator = 25
+            MAX_BODY=$((280 - 25))
+            if [ ${#BODY} -gt $MAX_BODY ]; then
+              BODY="${BODY:0:$((MAX_BODY - 3))}..."
+            fi
+            TWEET=$(printf "%s\n\n%s" "$BODY" "$URL")
+          else
+            if [ ${#TWEET} -gt 280 ]; then
+              TWEET="${TWEET:0:277}..."
+            fi
           fi
 
           echo "--- Tweet preview ---"
@@ -140,8 +176,36 @@ jobs:
             echo "TWEET_EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Post to X
+      - name: Check for duplicate tweet
+        id: dedup
         if: steps.check.outputs.skip != 'true'
+        shell: bash
+        env:
+          TWEET_TEXT: ${{ steps.tweet.outputs.text }}
+        run: |
+          # Hash the tweet content (ignore whitespace differences)
+          TWEET_HASH=$(echo "$TWEET_TEXT" | tr -s '[:space:]' | sha256sum | cut -d' ' -f1)
+          echo "hash=${TWEET_HASH}" >> "$GITHUB_OUTPUT"
+
+          # Check if we already have a cache hit for this exact tweet
+          MARKER_FILE="/tmp/tweet-dedup-${TWEET_HASH}"
+          echo "$TWEET_HASH" > "$MARKER_FILE"
+
+      - uses: actions/cache@v4
+        if: steps.check.outputs.skip != 'true'
+        id: tweet-cache
+        with:
+          path: /tmp/tweet-dedup-${{ steps.dedup.outputs.hash }}
+          key: tweet-${{ steps.dedup.outputs.hash }}
+
+      - name: Skip duplicate tweet
+        if: steps.check.outputs.skip != 'true' && steps.tweet-cache.outputs.cache-hit == 'true'
+        run: |
+          echo "::warning::Duplicate tweet detected (hash=${{ steps.dedup.outputs.hash }}) — skipping"
+          echo "This exact tweet was already posted in a previous run."
+
+      - name: Post to X
+        if: steps.check.outputs.skip != 'true' && steps.tweet-cache.outputs.cache-hit != 'true'
         shell: bash
         env:
           TWITTER_CONSUMER_KEY: ${{ secrets.TWITTER_CONSUMER_API_KEY }}

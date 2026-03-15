@@ -63,7 +63,7 @@ body:
       label: Steps to reproduce
       description: Please provide exact commands/config.
       placeholder: |
-        1. zeroclaw onboard --interactive
+        1. zeroclaw onboard
         2. zeroclaw daemon
         3. Observe crash in logs
       render: bash
