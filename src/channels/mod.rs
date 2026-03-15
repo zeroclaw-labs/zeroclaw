@@ -356,10 +356,13 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
 }
 
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
-    // Include thread_ts for per-topic session isolation in forum groups
+    // Include reply_target for per-channel isolation (e.g. distinct Discord/Slack
+    // channels) and thread_ts for per-topic isolation in forum groups.
     match &msg.thread_ts {
-        Some(tid) => format!("{}_{}_{}", msg.channel, tid, msg.sender),
-        None => format!("{}_{}", msg.channel, msg.sender),
+        Some(tid) => format!(
+            "{}_{}_{}_{}", msg.channel, msg.reply_target, tid, msg.sender
+        ),
+        None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
     }
 }
 
@@ -4845,7 +4848,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("telegram_alice")
+            .get("telegram_chat-telegram_alice")
             .expect("telegram history should be stored");
         let assistant_turn = turns
             .iter()
@@ -5062,7 +5065,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(sent.len(), 1);
         assert!(sent[0].contains("Provider switched to `openrouter`"));
 
-        let route_key = "telegram_alice";
+        let route_key = "telegram_chat-1_alice";
         let route = runtime_ctx
             .route_overrides
             .lock()
@@ -5094,7 +5097,7 @@ BTC is currently around $65,000 based on latest tool output."#
         provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
         provider_cache_seed.insert("openrouter".to_string(), routed_provider);
 
-        let route_key = "telegram_alice".to_string();
+        let route_key = "telegram_chat-1_alice".to_string();
         let mut route_overrides = HashMap::new();
         route_overrides.insert(
             route_key,
@@ -6817,7 +6820,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("test-channel_alice")
+            .get("test-channel_chat-ctx_alice")
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].content, "hello");
@@ -6835,7 +6838,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(HistoryCaptureProvider::default());
         let mut histories = HashMap::new();
         histories.insert(
-            "telegram_alice".to_string(),
+            "telegram_chat-telegram_alice".to_string(),
             vec![
                 ChatMessage::assistant("stale assistant"),
                 ChatMessage::user("earlier user question"),
@@ -7556,7 +7559,7 @@ This is an example JSON object for profile settings."#;
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("test-channel_zeroclaw_user")
+            .get("test-channel_chat-photo_zeroclaw_user")
             .expect("history should exist for sender");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
