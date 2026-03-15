@@ -13,7 +13,7 @@ use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -215,6 +215,44 @@ fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len
     match hint {
         Some(s) => truncate_with_ellipsis(s, max_len),
         None => String::new(),
+    }
+}
+
+/// Truncate a tool result to `max_chars`, preserving UTF-8 boundaries.
+fn truncate_tool_result(output: &str, max_chars: usize) -> String {
+    if output.len() <= max_chars {
+        return output.to_string();
+    }
+    let boundary = output
+        .char_indices()
+        .nth(max_chars)
+        .map_or(output.len(), |(idx, _)| idx);
+    format!(
+        "{}\n...(truncated, {} chars total)",
+        &output[..boundary],
+        output.len()
+    )
+}
+
+/// Emergency compaction: truncate tool results in history and keep only recent messages.
+fn compact_history_for_budget(
+    history: &mut Vec<ChatMessage>,
+    max_result_chars: usize,
+    keep_recent: usize,
+) {
+    // Drop old messages, keep system prompt (first) + recent
+    if history.len() > keep_recent + 1 {
+        let system = history.remove(0);
+        let tail_start = history.len().saturating_sub(keep_recent);
+        *history = std::iter::once(system)
+            .chain(history.drain(tail_start..))
+            .collect();
+    }
+    // Truncate tool results in remaining history
+    for msg in history.iter_mut() {
+        if msg.role == "tool" && msg.content.len() > max_result_chars {
+            msg.content = truncate_tool_result(&msg.content, max_result_chars);
+        }
     }
 }
 
@@ -2101,6 +2139,9 @@ pub(crate) async fn agent_turn(
         None,
         &[],
         &[],
+        5,
+        4000,
+        0,
     )
     .await
 }
@@ -2294,6 +2335,9 @@ pub(crate) async fn run_tool_call_loop(
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
+    max_parallel_tool_calls: usize,
+    max_tool_result_chars: usize,
+    iteration_cooldown_ms: u64,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2309,6 +2353,9 @@ pub(crate) async fn run_tool_call_loop(
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
+    // Per-tool call counter for max_calls_per_turn enforcement.
+    let mut tool_call_counts: HashMap<String, usize> = HashMap::new();
+    let mut llm_last_response_at = Instant::now();
 
     for iteration in 0..max_iterations {
         if cancellation_token
@@ -2316,6 +2363,20 @@ pub(crate) async fn run_tool_call_loop(
             .is_some_and(CancellationToken::is_cancelled)
         {
             return Err(ToolLoopCancelled.into());
+        }
+
+        // Iteration cooldown: avoid hammering the LLM when rate-limited.
+        if iteration > 0 && iteration_cooldown_ms > 0 {
+            let elapsed = llm_last_response_at.elapsed();
+            let cooldown = Duration::from_millis(iteration_cooldown_ms);
+            if elapsed < cooldown {
+                let wait = cooldown.saturating_sub(elapsed);
+                tracing::info!(
+                    wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                    "Iteration cooldown"
+                );
+                tokio::time::sleep(wait).await;
+            }
         }
 
         let image_marker_count = multimodal::count_image_markers(history);
@@ -2531,6 +2592,7 @@ pub(crate) async fn run_tool_call_loop(
         let display_text =
             resolve_display_text(&response_text, &parsed_text, !tool_calls.is_empty());
         let display_text = strip_tool_result_blocks(&display_text);
+        llm_last_response_at = Instant::now();
 
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -2654,6 +2716,31 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
 
+            // ── Per-tool call cap ────────────────────────────
+            if let Some(tool_impl) = tools_registry.iter().find(|t| t.name() == tool_name) {
+                if let Some(max) = tool_impl.max_calls_per_turn() {
+                    let count = tool_call_counts.entry(tool_name.clone()).or_insert(0);
+                    if *count >= max {
+                        let skip_msg = format!(
+                            "Tool '{}' already called {max} time(s) this turn (cap reached)",
+                            tool_name
+                        );
+                        ordered_results[idx] = Some((
+                            call.name.clone(),
+                            call.tool_call_id.clone(),
+                            ToolExecutionOutcome {
+                                output: skip_msg,
+                                success: false,
+                                error_reason: Some("per-tool call cap".into()),
+                                duration: Duration::ZERO,
+                            },
+                        ));
+                        continue;
+                    }
+                    *count += 1;
+                }
+            }
+
             // ── Approval hook ────────────────────────────────
             if let Some(mgr) = approval {
                 if mgr.needs_approval(&tool_name) {
@@ -2772,13 +2859,29 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         let executed_outcomes = if allow_parallel_execution && executable_calls.len() > 1 {
-            execute_tools_parallel(
-                &executable_calls,
-                tools_registry,
-                observer,
-                cancellation_token.as_ref(),
-            )
-            .await?
+            // Batch parallel calls to respect max_parallel_tool_calls limit.
+            if max_parallel_tool_calls > 0 && executable_calls.len() > max_parallel_tool_calls {
+                let mut all_outcomes = Vec::with_capacity(executable_calls.len());
+                for chunk in executable_calls.chunks(max_parallel_tool_calls) {
+                    let chunk_outcomes = execute_tools_parallel(
+                        chunk,
+                        tools_registry,
+                        observer,
+                        cancellation_token.as_ref(),
+                    )
+                    .await?;
+                    all_outcomes.extend(chunk_outcomes);
+                }
+                all_outcomes
+            } else {
+                execute_tools_parallel(
+                    &executable_calls,
+                    tools_registry,
+                    observer,
+                    cancellation_token.as_ref(),
+                )
+                .await?
+            }
         } else {
             execute_tools_sequential(
                 &executable_calls,
@@ -2837,7 +2940,34 @@ pub(crate) async fn run_tool_call_loop(
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
-        for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
+        for (tool_name, tool_call_id, mut outcome) in ordered_results.into_iter().flatten() {
+            // Per-tool max_result_chars override, then global default
+            let tool_max_chars = tools_registry
+                .iter()
+                .find(|t| t.name() == tool_name)
+                .and_then(|t| t.max_result_chars())
+                .unwrap_or(max_tool_result_chars);
+            if tool_max_chars > 0 && outcome.output.len() > tool_max_chars {
+                outcome.output = truncate_tool_result(&outcome.output, tool_max_chars);
+            }
+
+            // Terminal tool early-return: if the tool is marked terminal and
+            // produced non-trivial output, return it directly without another
+            // LLM turn. This avoids re-paraphrasing structured results.
+            let is_terminal = tools_registry
+                .iter()
+                .find(|t| t.name() == tool_name)
+                .is_some_and(|t| t.is_terminal());
+            if is_terminal && !outcome.output.is_empty() {
+                let output = outcome.output.trim();
+                // Skip trivial outputs (single words like "done", "ok") and raw JSON
+                let is_trivial =
+                    output.len() < 10 || output.starts_with('{') || output.starts_with('[');
+                if !is_trivial {
+                    return Ok(output.to_string());
+                }
+            }
+
             individual_results.push((tool_call_id, outcome.output.clone()));
             let _ = writeln!(
                 tool_results,
@@ -3334,6 +3464,9 @@ pub async fn run(
             None,
             &excluded_tools,
             &config.agent.tool_call_dedup_exempt,
+            config.agent.max_parallel_tool_calls,
+            config.agent.max_tool_result_chars,
+            config.agent.iteration_cooldown_ms,
         )
         .await?;
         final_output = response.clone();
@@ -3482,6 +3615,9 @@ pub async fn run(
                 None,
                 &excluded_tools,
                 &config.agent.tool_call_dedup_exempt,
+                config.agent.max_parallel_tool_calls,
+                config.agent.max_tool_result_chars,
+                config.agent.iteration_cooldown_ms,
             )
             .await
             {
@@ -4140,6 +4276,9 @@ mod tests {
             None,
             &[],
             &[],
+            5,
+            4000,
+            0,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -4187,6 +4326,9 @@ mod tests {
             None,
             &[],
             &[],
+            5,
+            4000,
+            0,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -4228,6 +4370,9 @@ mod tests {
             None,
             &[],
             &[],
+            5,
+            4000,
+            0,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -4355,6 +4500,9 @@ mod tests {
             None,
             &[],
             &[],
+            5,
+            4000,
+            0,
         )
         .await
         .expect("parallel execution should complete");
@@ -4425,6 +4573,9 @@ mod tests {
             None,
             &[],
             &[],
+            5,
+            4000,
+            0,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4487,6 +4638,9 @@ mod tests {
             None,
             &[],
             &exempt,
+            5,
+            4000,
+            0,
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -4564,6 +4718,9 @@ mod tests {
             None,
             &[],
             &exempt,
+            5,
+            4000,
+            0,
         )
         .await
         .expect("loop should complete");
@@ -4618,6 +4775,9 @@ mod tests {
             None,
             &[],
             &[],
+            5,
+            4000,
+            0,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -6448,5 +6608,70 @@ Let me check the result."#;
         }];
         let result = filter_tool_specs_for_turn(specs, &groups, "BROWSE the site");
         assert_eq!(result.len(), 1);
+    }
+
+    // ── truncate_tool_result tests ────────────────────────────────────────
+
+    #[test]
+    fn truncate_tool_result_noop_for_short_output() {
+        let input = "hello world";
+        let result = truncate_tool_result(input, 100);
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn truncate_tool_result_truncates_long_output() {
+        let input = "a".repeat(5000);
+        let result = truncate_tool_result(&input, 100);
+        assert!(result.len() < 200);
+        assert!(result.contains("...(truncated, 5000 chars total)"));
+        assert!(result.starts_with("aaaa"));
+    }
+
+    #[test]
+    fn truncate_tool_result_respects_utf8_boundaries() {
+        // Cyrillic chars are 2 bytes each
+        let input = "\u{0411}".repeat(500); // 1000 bytes, 500 chars
+        let result = truncate_tool_result(&input, 200);
+        assert!(result.contains("...(truncated,"));
+        // Must not panic on UTF-8 boundary
+        assert!(result.starts_with("\u{0411}"));
+    }
+
+    // ── compact_history_for_budget tests ──────────────────────────────────
+
+    #[test]
+    fn compact_history_for_budget_keeps_system_and_recent() {
+        let mut history: Vec<ChatMessage> = Vec::new();
+        history.push(ChatMessage::system("system prompt"));
+        for i in 0..20 {
+            history.push(ChatMessage::user(format!("msg {i}")));
+        }
+        assert_eq!(history.len(), 21);
+
+        compact_history_for_budget(&mut history, 4000, 5);
+
+        // system + 5 recent = 6
+        assert_eq!(history.len(), 6);
+        assert_eq!(history[0].role, "system");
+        assert_eq!(history[0].content, "system prompt");
+        // Last message should be the most recent
+        assert!(history[5].content.contains("msg 19"));
+    }
+
+    #[test]
+    fn compact_history_for_budget_truncates_tool_results() {
+        let mut history: Vec<ChatMessage> = Vec::new();
+        history.push(ChatMessage::system("sys"));
+        history.push(ChatMessage::tool("x".repeat(10000)));
+        history.push(ChatMessage::user("last"));
+
+        compact_history_for_budget(&mut history, 100, 10);
+
+        // All 3 messages kept (< keep_recent + 1)
+        assert_eq!(history.len(), 3);
+        // Tool result should be truncated
+        assert!(history[1].content.len() < 200);
+        assert!(history[1].content.contains("...(truncated,"));
     }
 }
