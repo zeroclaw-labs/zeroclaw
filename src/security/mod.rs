@@ -67,7 +67,13 @@ pub fn redact(value: &str) -> String {
     if value.len() <= 4 {
         "***".to_string()
     } else {
-        format!("{}***", &value[..4])
+        // Use char-boundary-safe slicing to prevent panic on multi-byte UTF-8.
+        let prefix = value
+            .char_indices()
+            .nth(4)
+            .map(|(byte_idx, _)| &value[..byte_idx])
+            .unwrap_or(value);
+        format!("{}***", prefix)
     }
 }
 
@@ -101,5 +107,14 @@ mod tests {
         assert_eq!(redact("ab"), "***");
         assert_eq!(redact(""), "***");
         assert_eq!(redact("12345"), "1234***");
+    }
+
+    #[test]
+    fn redact_handles_multibyte_utf8_without_panic() {
+        // CJK characters are 3 bytes each; slicing at byte 4 would panic
+        // without char-boundary-safe handling.
+        let result = redact("密码是很长的秘密");
+        assert!(result.ends_with("***"));
+        assert!(result.is_char_boundary(result.len()));
     }
 }
