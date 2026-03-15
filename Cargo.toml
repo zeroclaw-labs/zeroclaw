@@ -199,6 +199,9 @@ wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = f
 [target.'cfg(target_os = "linux")'.dependencies]
 rppal = { version = "0.22", optional = true }
 landlock = { version = "0.4", optional = true }
+nix = { version = "0.30", default-features = false, features = ["poll"] }
+portable-pty = "0.9"
+strip-ansi-escapes = "0.2"
 
 # Unix-specific dependencies (for root check, etc.)
 [target.'cfg(unix)'.dependencies]

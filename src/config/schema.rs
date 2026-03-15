@@ -3866,6 +3866,7 @@ fn default_otp_cache_valid_secs() -> u64 {
 fn default_otp_gated_actions() -> Vec<String> {
     vec![
         "shell".to_string(),
+        "tty_shell".to_string(),
         "file_write".to_string(),
         "browser_open".to_string(),
         "browser".to_string(),

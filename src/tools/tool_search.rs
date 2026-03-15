@@ -152,7 +152,7 @@ impl ToolSearchTool {
                 Some(spec) => {
                     if !guard.is_activated(name) {
                         if let Some(tool) = self.deferred.activate(name) {
-                            guard.activate(name.to_string(), tool);
+                            guard.activate((*name).to_string(), tool);
                             activated_count += 1;
                         }
                     }

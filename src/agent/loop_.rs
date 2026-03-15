@@ -217,7 +217,7 @@ pub(crate) const DRAFT_CLEAR_SENTINEL: &str = "\x00CLEAR\x00";
 /// Extract a short hint from tool call arguments for progress display.
 fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len: usize) -> String {
     let hint = match name {
-        "shell" => args.get("command").and_then(|v| v.as_str()),
+        "shell" | "tty_shell" => args.get("command").and_then(|v| v.as_str()),
         "file_read" | "file_write" => args.get("path").and_then(|v| v.as_str()),
         _ => args
             .get("action")
@@ -3164,6 +3164,10 @@ pub async fn run(
             "Execute terminal commands. Use when: running local checks, build/test commands, diagnostics. Don't use when: a safer dedicated tool exists, or command is destructive without approval.",
         ),
         (
+            "tty_shell",
+            "Execute Linux terminal commands inside a pseudo-terminal. Use when: the program requires a TTY or interactive terminal semantics. Don't use when: plain shell output is enough or the runtime is not native Linux.",
+        ),
+        (
             "file_read",
             "Read file contents. Use when: inspecting project files, configs, logs. Don't use when: a targeted search is enough.",
         ),
@@ -3693,6 +3697,10 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
     let mut tool_descs: Vec<(&str, &str)> = vec![
         ("shell", "Execute terminal commands."),
+        (
+            "tty_shell",
+            "Execute Linux interactive terminal commands through a pseudo-terminal.",
+        ),
         ("file_read", "Read file contents."),
         ("file_write", "Write file contents."),
         ("memory_store", "Save to memory."),
