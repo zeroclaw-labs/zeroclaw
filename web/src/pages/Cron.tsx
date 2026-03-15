@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import {
   Clock,
   Plus,
@@ -20,128 +20,16 @@ function formatDate(iso: string | null): string {
   return d.toLocaleString();
 }
 
-function formatDuration(ms: number | null): string {
-  if (ms === null || ms === undefined) return '-';
-  if (ms < 1000) return `${ms}ms`;
-  const secs = ms / 1000;
-  if (secs < 60) return `${secs.toFixed(1)}s`;
-  return `${(secs / 60).toFixed(1)}m`;
-}
-
-function RunHistoryPanel({ jobId }: { jobId: string }) {
-  const [runs, setRuns] = useState<CronRun[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const fetchRuns = useCallback(() => {
-    setLoading(true);
-    setError(null);
-    getCronRuns(jobId, 20)
-      .then(setRuns)
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false));
-  }, [jobId]);
-
-  useEffect(() => {
-    fetchRuns();
-  }, [fetchRuns]);
-
-  if (loading) {
-    return (
-      <div className="flex items-center gap-2 px-4 py-3 text-[#556080] text-xs">
-        <div className="animate-spin rounded-full h-4 w-4 border border-[#0080ff30] border-t-[#0080ff]" />
-        Loading run history...
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="px-4 py-3">
-        <div className="flex items-center justify-between">
-          <span className="text-xs text-[#ff6680]">
-            Failed to load run history: {error}
-          </span>
-          <button
-            onClick={fetchRuns}
-            className="text-[#556080] hover:text-white transition-colors duration-300"
-          >
-            <RefreshCw className="h-3.5 w-3.5" />
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  if (runs.length === 0) {
-    return (
-      <div className="px-4 py-3 flex items-center justify-between">
-        <span className="text-xs text-[#334060]">No runs recorded yet.</span>
-        <button
-          onClick={fetchRuns}
-          className="text-[#556080] hover:text-white transition-colors duration-300"
-        >
-          <RefreshCw className="h-3.5 w-3.5" />
-        </button>
-      </div>
-    );
-  }
-
-  return (
-    <div className="px-4 py-3">
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-xs font-medium text-[#8892a8]">
-          Recent Runs ({runs.length})
-        </span>
-        <button
-          onClick={fetchRuns}
-          className="text-[#556080] hover:text-white transition-colors duration-300"
-          title="Refresh runs"
-        >
-          <RefreshCw className="h-3.5 w-3.5" />
-        </button>
-      </div>
-      <div className="space-y-1.5 max-h-60 overflow-y-auto">
-        {runs.map((run) => (
-          <div
-            key={run.id}
-            className="bg-[#0a0a2060] rounded-lg px-3 py-2 text-xs border border-[#1a1a3e]/30"
-          >
-            <div className="flex items-center justify-between mb-1">
-              <div className="flex items-center gap-2">
-                {run.status === 'ok' ? (
-                  <CheckCircle className="h-3.5 w-3.5 text-[#00e68a]" />
-                ) : (
-                  <XCircle className="h-3.5 w-3.5 text-[#ff4466]" />
-                )}
-                <span className="text-[#8892a8] capitalize">{run.status}</span>
-              </div>
-              <span className="text-[#556080]">
-                {formatDuration(run.duration_ms)}
-              </span>
-            </div>
-            <div className="flex items-center gap-3 text-[#556080]">
-              <span>{formatDate(run.started_at)}</span>
-            </div>
-            {run.output && (
-              <pre className="mt-1.5 bg-[#050510]/70 rounded p-2 text-[#8892a8] text-xs overflow-x-auto max-h-24 whitespace-pre-wrap break-words">
-                {run.output}
-              </pre>
-            )}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
 export default function Cron() {
   const [jobs, setJobs] = useState<CronJob[]>([]);
+  const [runsByJob, setRunsByJob] = useState<Record<string, CronRun[]>>({});
+  const [runsLoadingByJob, setRunsLoadingByJob] = useState<Record<string, boolean>>({});
+  const [runsErrorByJob, setRunsErrorByJob] = useState<Record<string, string | null>>({});
+  const [expandedJob, setExpandedJob] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
-  const [expandedJob, setExpandedJob] = useState<string | null>(null);
 
   // Form state
   const [formName, setFormName] = useState('');
@@ -162,6 +50,26 @@ export default function Cron() {
     fetchJobs();
   }, []);
 
+  const fetchRuns = async (jobId: string, force = false) => {
+    if (runsLoadingByJob[jobId]) return;
+    if (!force && runsByJob[jobId]) return;
+
+    setRunsLoadingByJob((prev) => ({ ...prev, [jobId]: true }));
+    setRunsErrorByJob((prev) => ({ ...prev, [jobId]: null }));
+
+    try {
+      const runs = await getCronRuns(jobId, 10);
+      setRunsByJob((prev) => ({ ...prev, [jobId]: runs }));
+    } catch (err: unknown) {
+      setRunsErrorByJob((prev) => ({
+        ...prev,
+        [jobId]: err instanceof Error ? err.message : 'Failed to load run history',
+      }));
+    } finally {
+      setRunsLoadingByJob((prev) => ({ ...prev, [jobId]: false }));
+    }
+  };
+
   const handleAdd = async () => {
     if (!formSchedule.trim() || !formCommand.trim()) {
       setFormError('Schedule and command are required.');
@@ -170,12 +78,12 @@ export default function Cron() {
     setSubmitting(true);
     setFormError(null);
     try {
-      const job = await addCronJob({
+      await addCronJob({
         name: formName.trim() || undefined,
         schedule: formSchedule.trim(),
         command: formCommand.trim(),
       });
-      setJobs((prev) => [...prev, job]);
+      fetchJobs();
       setShowForm(false);
       setFormName('');
       setFormSchedule('');
@@ -203,13 +111,27 @@ export default function Cron() {
     switch (status.toLowerCase()) {
       case 'ok':
       case 'success':
-        return <CheckCircle className="h-4 w-4 text-[#00e68a]" />;
+        return <CheckCircle className="h-4 w-4 text-green-400" />;
       case 'error':
       case 'failed':
-        return <XCircle className="h-4 w-4 text-[#ff4466]" />;
+        return <XCircle className="h-4 w-4 text-red-400" />;
       default:
-        return <AlertCircle className="h-4 w-4 text-[#ffaa00]" />;
+        return <AlertCircle className="h-4 w-4 text-yellow-400" />;
     }
+  };
+
+  const toggleRuns = async (jobId: string) => {
+    const nextExpanded = expandedJob === jobId ? null : jobId;
+    setExpandedJob(nextExpanded);
+    if (nextExpanded) {
+      await fetchRuns(jobId);
+    }
+  };
+
+  const formatDuration = (durationMs: number | null): string => {
+    if (durationMs === null) return '-';
+    if (durationMs < 1000) return `${durationMs} ms`;
+    return `${(durationMs / 1000).toFixed(durationMs < 10_000 ? 1 : 0)} s`;
   };
 
   if (error) {
@@ -343,103 +265,181 @@ export default function Cron() {
         <div className="glass-card overflow-x-auto">
           <table className="table-electric">
             <thead>
-              <tr>
-                <th className="text-left">ID</th>
-                <th className="text-left">Name</th>
-                <th className="text-left">Command</th>
-                <th className="text-left">Next Run</th>
-                <th className="text-left">Last Status</th>
-                <th className="text-left">Enabled</th>
-                <th className="text-right">Actions</th>
+              <tr className="border-b border-gray-800">
+                <th className="text-left px-4 py-3 text-gray-400 font-medium">
+                  ID
+                </th>
+                <th className="text-left px-4 py-3 text-gray-400 font-medium">
+                  Name
+                </th>
+                <th className="text-left px-4 py-3 text-gray-400 font-medium">
+                  Command
+                </th>
+                <th className="text-left px-4 py-3 text-gray-400 font-medium">
+                  Next Run
+                </th>
+                <th className="text-left px-4 py-3 text-gray-400 font-medium">
+                  Last Status
+                </th>
+                <th className="text-left px-4 py-3 text-gray-400 font-medium">
+                  Enabled
+                </th>
+                <th className="text-left px-4 py-3 text-gray-400 font-medium">
+                  Runs
+                </th>
+                <th className="text-right px-4 py-3 text-gray-400 font-medium">
+                  Actions
+                </th>
               </tr>
             </thead>
             <tbody>
-              {jobs.map((job) => (
-                <React.Fragment key={job.id}>
-                  <tr>
-                    <td className="px-4 py-3 text-[#556080] font-mono text-xs">
-                      <button
-                        onClick={() =>
-                          setExpandedJob((prev) =>
-                            prev === job.id ? null : job.id,
-                          )
-                        }
-                        className="flex items-center gap-1 text-[#556080] hover:text-white transition-colors duration-300"
-                        title="Toggle run history"
-                      >
-                        {expandedJob === job.id ? (
-                          <ChevronDown className="h-3.5 w-3.5" />
-                        ) : (
-                          <ChevronRight className="h-3.5 w-3.5" />
-                        )}
+              {jobs.map((job) => {
+                const isExpanded = expandedJob === job.id;
+                const runs = runsByJob[job.id] ?? [];
+                const runsLoading = runsLoadingByJob[job.id];
+                const runsError = runsErrorByJob[job.id];
+
+                return (
+                  <Fragment key={job.id}>
+                    <tr className="border-b border-gray-800/50 hover:bg-gray-800/30 transition-colors">
+                      <td className="px-4 py-3 text-gray-400 font-mono text-xs">
                         {job.id.slice(0, 8)}
-                      </button>
-                    </td>
-                    <td className="px-4 py-3 text-white font-medium text-sm">
-                      {job.name ?? '-'}
-                    </td>
-                    <td className="px-4 py-3 text-[#8892a8] font-mono text-xs max-w-[200px] truncate">
-                      {job.command}
-                    </td>
-                    <td className="px-4 py-3 text-[#556080] text-xs">
-                      {formatDate(job.next_run)}
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-1.5">
-                        {statusIcon(job.last_status)}
-                        <span className="text-[#8892a8] text-xs capitalize">
-                          {job.last_status ?? '-'}
-                        </span>
-                      </div>
-                    </td>
-                    <td className="px-4 py-3">
-                      <span
-                        className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-semibold border ${
-                          job.enabled
-                            ? 'text-[#00e68a] border-[#00e68a30]'
-                            : 'text-[#334060] border-[#1a1a3e]'
-                        }`}
-                        style={{ background: job.enabled ? 'rgba(0,230,138,0.06)' : 'rgba(26,26,62,0.3)' }}
-                      >
-                        {job.enabled ? 'Enabled' : 'Disabled'}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 text-right">
-                      {confirmDelete === job.id ? (
-                        <div className="flex items-center justify-end gap-2 animate-fade-in">
-                          <span className="text-xs text-[#ff4466]">Delete?</span>
-                          <button
-                            onClick={() => handleDelete(job.id)}
-                            className="text-[#ff4466] hover:text-[#ff6680] text-xs font-medium"
-                          >
-                            Yes
-                          </button>
-                          <button
-                            onClick={() => setConfirmDelete(null)}
-                            className="text-[#556080] hover:text-white text-xs font-medium"
-                          >
-                            No
-                          </button>
+                      </td>
+                      <td className="px-4 py-3 text-white font-medium">
+                        {job.name ?? '-'}
+                      </td>
+                      <td className="px-4 py-3 text-gray-300 font-mono text-xs max-w-[200px] truncate">
+                        {job.command}
+                      </td>
+                      <td className="px-4 py-3 text-gray-400 text-xs">
+                        {formatDate(job.next_run)}
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-1.5">
+                          {statusIcon(job.last_status)}
+                          <span className="text-gray-300 text-xs capitalize">
+                            {job.last_status ?? '-'}
+                          </span>
                         </div>
-                      ) : (
-                        <button
-                          onClick={() => setConfirmDelete(job.id)}
-                          className="text-[#334060] hover:text-[#ff4466] transition-all duration-300"
+                      </td>
+                      <td className="px-4 py-3">
+                        <span
+                          className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
+                            job.enabled
+                              ? 'bg-green-900/40 text-green-400 border border-green-700/50'
+                              : 'bg-gray-800 text-gray-500 border border-gray-700'
+                          }`}
                         >
-                          <Trash2 className="h-4 w-4" />
+                          {job.enabled ? 'Enabled' : 'Disabled'}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3">
+                        <button
+                          onClick={() => void toggleRuns(job.id)}
+                          className="inline-flex items-center gap-1.5 text-sm text-blue-300 hover:text-blue-200 transition-colors"
+                        >
+                          {isExpanded ? (
+                            <ChevronDown className="h-4 w-4" />
+                          ) : (
+                            <ChevronRight className="h-4 w-4" />
+                          )}
+                          History
                         </button>
-                      )}
-                    </td>
-                  </tr>
-                  {expandedJob === job.id && (
-                    <tr className="bg-[#0a0a2080]">
-                      <td colSpan={7}>
-                        <RunHistoryPanel jobId={job.id} />
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        {confirmDelete === job.id ? (
+                          <div className="flex items-center justify-end gap-2">
+                            <span className="text-xs text-red-400">Delete?</span>
+                            <button
+                              onClick={() => handleDelete(job.id)}
+                              className="text-red-400 hover:text-red-300 text-xs font-medium"
+                            >
+                              Yes
+                            </button>
+                            <button
+                              onClick={() => setConfirmDelete(null)}
+                              className="text-gray-400 hover:text-white text-xs font-medium"
+                            >
+                              No
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={() => setConfirmDelete(job.id)}
+                            className="text-gray-400 hover:text-red-400 transition-colors"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        )}
                       </td>
                     </tr>
-                  )}
-                </React.Fragment>
-              ))}
+                    {isExpanded && (
+                      <tr className="border-b border-gray-800/50 bg-gray-950/50">
+                        <td colSpan={8} className="px-4 py-4">
+                          <div className="mb-3 flex items-center justify-between">
+                            <div>
+                              <h3 className="text-sm font-semibold text-white">Recent Runs</h3>
+                              <p className="text-xs text-gray-500">
+                                Last 10 recorded executions for this job
+                              </p>
+                            </div>
+                            <button
+                              onClick={() => void fetchRuns(job.id, true)}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-gray-700 px-2.5 py-1.5 text-xs text-gray-300 transition-colors hover:bg-gray-800 hover:text-white"
+                            >
+                              <RefreshCw className="h-3.5 w-3.5" />
+                              Refresh
+                            </button>
+                          </div>
+
+                          {runsLoading ? (
+                            <div className="text-sm text-gray-400">Loading run history...</div>
+                          ) : runsError ? (
+                            <div className="rounded-lg border border-red-700 bg-red-900/30 p-3 text-sm text-red-300">
+                              {runsError}
+                            </div>
+                          ) : runs.length === 0 ? (
+                            <div className="text-sm text-gray-500">No runs recorded yet.</div>
+                          ) : (
+                            <div className="space-y-3">
+                              {runs.map((run) => (
+                                <div
+                                  key={run.id}
+                                  className="rounded-xl border border-gray-800 bg-gray-900/70 p-4"
+                                >
+                                  <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                                    <div className="min-w-0 space-y-2">
+                                      <div className="flex items-center gap-2">
+                                        {statusIcon(run.status)}
+                                        <span className="text-sm font-medium capitalize text-white">
+                                          {run.status}
+                                        </span>
+                                        <span className="text-xs text-gray-500">
+                                          Run #{run.id}
+                                        </span>
+                                      </div>
+                                      <div className="grid grid-cols-1 gap-2 text-xs text-gray-400 sm:grid-cols-3">
+                                        <span>Started: {formatDate(run.started_at)}</span>
+                                        <span>Finished: {formatDate(run.finished_at)}</span>
+                                        <span>Duration: {formatDuration(run.duration_ms)}</span>
+                                      </div>
+                                    </div>
+                                    {run.output && (
+                                      <pre className="max-h-40 w-full overflow-auto rounded-lg bg-gray-950 p-3 text-xs text-gray-300 whitespace-pre-wrap break-words lg:w-[28rem]">
+                                        {run.output}
+                                      </pre>
+                                    )}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })}
             </tbody>
           </table>
         </div>

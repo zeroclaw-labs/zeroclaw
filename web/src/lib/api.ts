@@ -175,13 +175,10 @@ export function deleteCronJob(id: string): Promise<void> {
   });
 }
 
-export function getCronRuns(
-  jobId: string,
-  limit: number = 20,
-): Promise<CronRun[]> {
+export function getCronRuns(id: string, limit = 10): Promise<CronRun[]> {
   const params = new URLSearchParams({ limit: String(limit) });
   return apiFetch<CronRun[] | { runs: CronRun[] }>(
-    `/api/cron/${encodeURIComponent(jobId)}/runs?${params}`,
+    `/api/cron/${encodeURIComponent(id)}/runs?${params.toString()}`,
   ).then((data) => unwrapField(data, 'runs'));
 }
 
