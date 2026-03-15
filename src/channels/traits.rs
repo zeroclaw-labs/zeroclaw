@@ -12,6 +12,9 @@ pub struct ChannelMessage {
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
+    /// Platform-specific message ID for reply-to (e.g. Telegram `message_id`).
+    /// Filled by the channel's `listen()` so callers don't need to parse the `id` field.
+    pub reply_to_message_id: Option<String>,
 }
 
 /// Message to send through a channel
@@ -22,6 +25,8 @@ pub struct SendMessage {
     pub subject: Option<String>,
     /// Platform thread identifier for threaded replies (e.g. Slack `thread_ts`).
     pub thread_ts: Option<String>,
+    /// Platform-specific message ID to reply to (e.g. Telegram `message_id`).
+    pub reply_to_message_id: Option<String>,
 }
 
 impl SendMessage {
@@ -32,6 +37,7 @@ impl SendMessage {
             recipient: recipient.into(),
             subject: None,
             thread_ts: None,
+            reply_to_message_id: None,
         }
     }
 
@@ -46,12 +52,19 @@ impl SendMessage {
             recipient: recipient.into(),
             subject: Some(subject.into()),
             thread_ts: None,
+            reply_to_message_id: None,
         }
     }
 
     /// Set the thread identifier for threaded replies.
     pub fn in_thread(mut self, thread_ts: Option<String>) -> Self {
         self.thread_ts = thread_ts;
+        self
+    }
+
+    /// Set the platform-specific message ID this message replies to.
+    pub fn reply_to(mut self, reply_to_message_id: Option<String>) -> Self {
+        self.reply_to_message_id = reply_to_message_id;
         self
     }
 }
@@ -182,6 +195,7 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
+                reply_to_message_id: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -198,6 +212,7 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
+            reply_to_message_id: None,
         };
 
         let cloned = message.clone();
