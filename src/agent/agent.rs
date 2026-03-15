@@ -300,19 +300,97 @@ impl Agent {
             config,
         );
 
-        let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+        // ── Provider access mode resolution ──────────────────────────
+        //
+        // Three scenarios:
+        // A) UserKey: user supplied API key → use their provider directly
+        // B) Platform + user selected model: proxy via platform, charge credits
+        // C) Platform + no selection: task-specific defaults (chat/reasoning/coding/review)
+        let access_mode = crate::config::resolve_provider_access_mode(config);
 
-        let model_name = crate::config::resolve_default_model_id(
-            config.default_model.as_deref(),
-            Some(provider_name),
-        );
+        let (provider_name, model_name, effective_routes, effective_classification) =
+            match access_mode {
+                crate::config::ProviderAccessMode::UserKey => {
+                    // User has their own API key — use their provider and best model
+                    let pname = config.default_provider.as_deref().unwrap_or("gemini");
+                    let mname = crate::config::resolve_default_model_id(
+                        config.default_model.as_deref(),
+                        Some(pname),
+                    );
+                    tracing::info!(
+                        provider = pname,
+                        model = mname.as_str(),
+                        "Provider access: UserKey mode"
+                    );
+                    (
+                        pname.to_string(),
+                        mname,
+                        config.model_routes.clone(),
+                        config.query_classification.clone(),
+                    )
+                }
+                crate::config::ProviderAccessMode::Platform => {
+                    if let Some(user_model) = config
+                        .default_model
+                        .as_ref()
+                        .filter(|m| !m.trim().is_empty())
+                    {
+                        // User selected a specific model but has no API key →
+                        // platform proxies, credits charged at multiplier rate
+                        let pname = config
+                            .default_provider
+                            .as_deref()
+                            .unwrap_or("gemini")
+                            .to_string();
+                        let charge = config.platform_routing.credit_charge(1.0);
+                        tracing::info!(
+                            provider = pname.as_str(),
+                            model = user_model.as_str(),
+                            credit_multiplier_with_vat = charge,
+                            "Provider access: Platform mode (user-selected model)"
+                        );
+                        (
+                            pname,
+                            user_model.clone(),
+                            config.model_routes.clone(),
+                            config.query_classification.clone(),
+                        )
+                    } else {
+                        // No API key, no model selection → task-specific platform defaults
+                        // chat → Gemini 3.1 Flash-Lite (fast, cheap)
+                        // reasoning → Gemini 3.1 Pro
+                        // coding → Claude Opus 4.6
+                        // code_review → Gemini 3.1 Pro
+                        let platform = &config.platform_routing;
+                        let (default_provider, default_model) =
+                            platform.route_for_task(crate::config::TaskCategory::Chat);
+                        let platform_routes =
+                            crate::config::platform_default_model_routes(platform);
+                        let platform_classification =
+                            crate::config::platform_default_classification_rules();
+
+                        tracing::info!(
+                            default_provider = default_provider,
+                            default_model = default_model,
+                            routes = platform_routes.len(),
+                            "Provider access: Platform mode (task-specific defaults)"
+                        );
+                        (
+                            default_provider.to_string(),
+                            default_model.to_string(),
+                            platform_routes,
+                            platform_classification,
+                        )
+                    }
+                }
+            };
 
         let provider: Box<dyn Provider> = providers::create_routed_provider(
-            provider_name,
+            &provider_name,
             config.api_key.as_deref(),
             config.api_url.as_deref(),
             &config.reliability,
-            &config.model_routes,
+            &effective_routes,
             &model_name,
         )?;
 
@@ -324,8 +402,7 @@ impl Agent {
             _ => Box::new(XmlToolDispatcher),
         };
 
-        let route_model_by_hint: HashMap<String, String> = config
-            .model_routes
+        let route_model_by_hint: HashMap<String, String> = effective_routes
             .iter()
             .map(|route| (route.hint.clone(), route.model.clone()))
             .collect();
@@ -346,7 +423,7 @@ impl Agent {
             .model_name(model_name)
             .temperature(config.default_temperature)
             .workspace_dir(config.workspace_dir.clone())
-            .classification_config(config.query_classification.clone())
+            .classification_config(effective_classification)
             .available_hints(available_hints)
             .route_model_by_hint(route_model_by_hint)
             .identity_config(config.identity.clone())
@@ -723,7 +800,7 @@ pub async fn run(
     let provider_name = effective_config
         .default_provider
         .as_deref()
-        .unwrap_or("openrouter")
+        .unwrap_or("gemini")
         .to_string();
     let model_name = effective_config
         .default_model

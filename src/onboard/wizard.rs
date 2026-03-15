@@ -243,6 +243,7 @@ pub async fn run_wizard_with_migration(
         telemetry: Default::default(),
         voice: Default::default(),
         coding: Default::default(),
+        platform_routing: Default::default(),
         stripe_secret_key: None,
         stripe_webhook_secret: None,
         toss_secret_key: None,
@@ -695,7 +696,7 @@ async fn run_quick_setup_with_home(
         .await
         .context("Failed to create workspace directory")?;
 
-    let provider_name = provider.unwrap_or("openrouter").to_string();
+    let provider_name = provider.unwrap_or("gemini").to_string();
     let model = model_override
         .map(str::to_string)
         .unwrap_or_else(|| default_model_for_provider(&provider_name));
@@ -769,6 +770,7 @@ async fn run_quick_setup_with_home(
         telemetry: Default::default(),
         voice: Default::default(),
         coding: Default::default(),
+        platform_routing: Default::default(),
         stripe_secret_key: None,
         stripe_webhook_secret: None,
         toss_secret_key: None,
@@ -2080,7 +2082,7 @@ pub async fn run_models_refresh(
 ) -> Result<()> {
     let provider_name = provider_override
         .or(config.default_provider.as_deref())
-        .unwrap_or("openrouter")
+        .unwrap_or("gemini")
         .trim()
         .to_string();
 
@@ -2164,7 +2166,7 @@ pub async fn run_models_refresh(
 pub async fn run_models_list(config: &Config, provider_override: Option<&str>) -> Result<()> {
     let provider_name = provider_override
         .or(config.default_provider.as_deref())
-        .unwrap_or("openrouter");
+        .unwrap_or("gemini");
 
     let cached = load_any_cached_models_for_provider(&config.workspace_dir, provider_name).await?;
 
@@ -2214,7 +2216,7 @@ pub async fn run_models_set(config: &Config, model: &str) -> Result<()> {
 }
 
 pub async fn run_models_status(config: &Config) -> Result<()> {
-    let provider = config.default_provider.as_deref().unwrap_or("openrouter");
+    let provider = config.default_provider.as_deref().unwrap_or("gemini");
     let model = config.default_model.as_deref().unwrap_or("(not set)");
 
     println!();
@@ -6533,7 +6535,7 @@ fn print_summary(config: &Config) {
     println!(
         "    {} Provider:      {}",
         style("🤖").cyan(),
-        config.default_provider.as_deref().unwrap_or("openrouter")
+        config.default_provider.as_deref().unwrap_or("gemini")
     );
     println!(
         "    {} Model:         {}",
@@ -6653,7 +6655,7 @@ fn print_summary(config: &Config) {
 
     let mut step = 1u8;
 
-    let provider = config.default_provider.as_deref().unwrap_or("openrouter");
+    let provider = config.default_provider.as_deref().unwrap_or("gemini");
     let canonical_provider = canonical_provider_name(provider);
     if config.api_key.is_none() && !provider_supports_keyless_local_usage(provider) {
         if canonical_provider == "copilot" {

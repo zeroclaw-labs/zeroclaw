@@ -19,7 +19,7 @@ use tokio::io::AsyncWriteExt;
 /// Default fallback model when none is configured. Uses a format compatible with
 /// OpenRouter and other multi-provider gateways. For Anthropic direct API, this
 /// model ID will be normalized by the provider layer.
-pub const DEFAULT_MODEL_FALLBACK: &str = "anthropic/claude-sonnet-4.6";
+pub const DEFAULT_MODEL_FALLBACK: &str = "gemini-3.1-flash-lite-preview";
 
 fn canonical_provider_for_model_defaults(provider_name: &str) -> String {
     if let Some(canonical) = canonical_china_provider_name(provider_name) {
@@ -47,7 +47,7 @@ fn canonical_provider_for_model_defaults(provider_name: &str) -> String {
 /// Returns a provider-aware fallback model ID when `default_model` is missing.
 pub fn default_model_fallback_for_provider(provider_name: Option<&str>) -> &'static str {
     let normalized_provider = provider_name
-        .unwrap_or("openrouter")
+        .unwrap_or("gemini")
         .trim()
         .to_ascii_lowercase()
         .replace('_', "-");
@@ -87,7 +87,7 @@ pub fn default_model_fallback_for_provider(provider_name: Option<&str>) -> &'sta
         "ollama" => "llama3.2",
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF",
         "sglang" | "vllm" | "osaurus" | "copilot" => "default",
-        "gemini" => "gemini-2.5-pro",
+        "gemini" => "gemini-3.1-flash-lite-preview",
         "kimi-code" => "kimi-for-coding",
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0",
         "nvidia" => "meta/llama-3.3-70b-instruct",
@@ -263,8 +263,8 @@ const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
 static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
 static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> =
     OnceLock::new();
-const DEFAULT_PROVIDER_NAME: &str = "openrouter";
-const DEFAULT_MODEL_NAME: &str = "anthropic/claude-sonnet-4.6";
+const DEFAULT_PROVIDER_NAME: &str = "gemini";
+const DEFAULT_MODEL_NAME: &str = "gemini-3.1-flash-lite-preview";
 
 // ── Top-level config ──────────────────────────────────────────────
 
@@ -308,7 +308,7 @@ pub struct Config {
     pub api_key: Option<String>,
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
     pub api_url: Option<String>,
-    /// Default provider ID or alias (e.g. `"openrouter"`, `"ollama"`, `"anthropic"`). Default: `"openrouter"`.
+    /// Default provider ID or alias (e.g. `"gemini"`, `"anthropic"`, `"openai"`). Default: `"gemini"`.
     #[serde(alias = "model_provider")]
     pub default_provider: Option<String>,
     /// Optional API protocol mode for `custom:` providers.
@@ -521,6 +521,10 @@ pub struct Config {
     /// Multi-model coding review pipeline settings.
     #[serde(default)]
     pub coding: CodingConfig,
+
+    /// Platform-managed LLM routing and credit billing (`[platform_routing]`).
+    #[serde(default)]
+    pub platform_routing: PlatformRoutingConfig,
 
     /// Stripe secret key for international credit card payments.
     #[serde(default)]
@@ -1553,8 +1557,325 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
             output: 5.0,
         },
     );
+    // Gemini 3.1 models (platform defaults)
+    prices.insert(
+        "gemini-3.1-flash-lite-preview".into(),
+        ModelPricing {
+            input: 0.05,
+            output: 0.20,
+        },
+    );
+    prices.insert(
+        "gemini-3.1-pro-preview".into(),
+        ModelPricing {
+            input: 1.50,
+            output: 6.0,
+        },
+    );
+    // Claude Opus 4.6 (platform coding default)
+    prices.insert(
+        "claude-opus-4-20250514".into(),
+        ModelPricing {
+            input: 15.0,
+            output: 75.0,
+        },
+    );
 
     prices
+}
+
+// ── Platform routing (managed LLM access) ────────────────────────────────
+
+/// How the user accesses LLM providers.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAccessMode {
+    /// User supplies their own API key — no credit charge.
+    UserKey,
+    /// Platform proxies the request — credits charged at multiplier rate.
+    Platform,
+}
+
+/// Task category for automatic model routing in platform mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCategory {
+    /// General chat / Q&A — fast, cost-effective model.
+    Chat,
+    /// Reasoning, document drafting, analysis — capable mid-tier model.
+    Reasoning,
+    /// Code generation, debugging, architecture — top-tier coding model.
+    Coding,
+    /// Code review — reasoning model (optional, user-triggered).
+    CodeReview,
+}
+
+/// Platform-managed LLM routing configuration (`[platform_routing]`).
+///
+/// When the user does not provide their own API key, the platform proxies
+/// requests through its own keys and charges credits at a multiplier rate.
+/// Task-specific defaults route different workloads to the best-fit model.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PlatformRoutingConfig {
+    /// Credit cost multiplier applied to API token costs (before tax).
+    /// Default: `2.0` (user pays 2× the raw API cost in credits).
+    #[serde(default = "default_credit_multiplier")]
+    pub credit_multiplier: f64,
+
+    /// VAT / consumption tax rate applied on top of the multiplied cost.
+    /// Default: `0.1` (10% VAT → effective total = multiplier × 1.1).
+    #[serde(default = "default_vat_rate")]
+    pub vat_rate: f64,
+
+    /// Default model for general chat (platform mode, no user selection).
+    /// Default: `"gemini-3.1-flash-lite-preview"`.
+    #[serde(default = "default_platform_chat_model")]
+    pub chat_model: String,
+
+    /// Default provider for general chat.
+    /// Default: `"gemini"`.
+    #[serde(default = "default_platform_chat_provider")]
+    pub chat_provider: String,
+
+    /// Default model for reasoning / document work (platform mode).
+    /// Default: `"gemini-3.1-pro-preview"`.
+    #[serde(default = "default_platform_reasoning_model")]
+    pub reasoning_model: String,
+
+    /// Default provider for reasoning / document work.
+    /// Default: `"gemini"`.
+    #[serde(default = "default_platform_reasoning_provider")]
+    pub reasoning_provider: String,
+
+    /// Default model for coding tasks (platform mode).
+    /// Default: `"claude-opus-4-20250514"`.
+    #[serde(default = "default_platform_coding_model")]
+    pub coding_model: String,
+
+    /// Default provider for coding tasks.
+    /// Default: `"anthropic"`.
+    #[serde(default = "default_platform_coding_provider")]
+    pub coding_provider: String,
+
+    /// Default model for code review (platform mode).
+    /// Default: `"gemini-3.1-pro-preview"`.
+    #[serde(default = "default_platform_code_review_model")]
+    pub code_review_model: String,
+
+    /// Default provider for code review.
+    /// Default: `"gemini"`.
+    #[serde(default = "default_platform_code_review_provider")]
+    pub code_review_provider: String,
+}
+
+fn default_credit_multiplier() -> f64 {
+    2.0
+}
+fn default_vat_rate() -> f64 {
+    0.1
+}
+fn default_platform_chat_model() -> String {
+    "gemini-3.1-flash-lite-preview".to_string()
+}
+fn default_platform_chat_provider() -> String {
+    "gemini".to_string()
+}
+fn default_platform_reasoning_model() -> String {
+    "gemini-3.1-pro-preview".to_string()
+}
+fn default_platform_reasoning_provider() -> String {
+    "gemini".to_string()
+}
+fn default_platform_coding_model() -> String {
+    "claude-opus-4-20250514".to_string()
+}
+fn default_platform_coding_provider() -> String {
+    "anthropic".to_string()
+}
+fn default_platform_code_review_model() -> String {
+    "gemini-3.1-pro-preview".to_string()
+}
+fn default_platform_code_review_provider() -> String {
+    "gemini".to_string()
+}
+
+impl Default for PlatformRoutingConfig {
+    fn default() -> Self {
+        Self {
+            credit_multiplier: default_credit_multiplier(),
+            vat_rate: default_vat_rate(),
+            chat_model: default_platform_chat_model(),
+            chat_provider: default_platform_chat_provider(),
+            reasoning_model: default_platform_reasoning_model(),
+            reasoning_provider: default_platform_reasoning_provider(),
+            coding_model: default_platform_coding_model(),
+            coding_provider: default_platform_coding_provider(),
+            code_review_model: default_platform_code_review_model(),
+            code_review_provider: default_platform_code_review_provider(),
+        }
+    }
+}
+
+impl PlatformRoutingConfig {
+    /// Return (provider, model) for the given task category.
+    pub fn route_for_task(&self, task: TaskCategory) -> (&str, &str) {
+        match task {
+            TaskCategory::Chat => (&self.chat_provider, &self.chat_model),
+            TaskCategory::Reasoning => (&self.reasoning_provider, &self.reasoning_model),
+            TaskCategory::Coding => (&self.coding_provider, &self.coding_model),
+            TaskCategory::CodeReview => (&self.code_review_provider, &self.code_review_model),
+        }
+    }
+
+    /// Compute the credit cost for a given raw API cost (USD).
+    /// Returns the total credit charge including VAT.
+    /// Formula: raw_cost × multiplier × (1 + vat_rate)
+    pub fn credit_charge(&self, raw_api_cost_usd: f64) -> f64 {
+        raw_api_cost_usd * self.credit_multiplier * (1.0 + self.vat_rate)
+    }
+}
+
+/// Determine the provider access mode based on configuration.
+///
+/// - If the user has set an API key (via config or provider-specific env var) → `UserKey`.
+/// - Otherwise → `Platform` (managed access with credit billing).
+pub fn resolve_provider_access_mode(config: &Config) -> ProviderAccessMode {
+    // Check explicit API key in config
+    if config
+        .api_key
+        .as_ref()
+        .is_some_and(|k| !k.trim().is_empty())
+    {
+        return ProviderAccessMode::UserKey;
+    }
+    // Check provider-specific env vars
+    if detect_user_provider_from_env().is_some() {
+        return ProviderAccessMode::UserKey;
+    }
+    ProviderAccessMode::Platform
+}
+
+/// Build default `[[model_routes]]` for platform mode based on task-specific defaults.
+///
+/// These routes are injected when the user has no API key and no explicit model selection,
+/// so that the query classifier can route to the right model per task type.
+pub fn platform_default_model_routes(
+    platform: &PlatformRoutingConfig,
+) -> Vec<ModelRouteConfig> {
+    vec![
+        ModelRouteConfig {
+            hint: "chat".to_string(),
+            provider: platform.chat_provider.clone(),
+            model: platform.chat_model.clone(),
+            max_tokens: None,
+            api_key: None,
+            transport: None,
+        },
+        ModelRouteConfig {
+            hint: "reasoning".to_string(),
+            provider: platform.reasoning_provider.clone(),
+            model: platform.reasoning_model.clone(),
+            max_tokens: None,
+            api_key: None,
+            transport: None,
+        },
+        ModelRouteConfig {
+            hint: "coding".to_string(),
+            provider: platform.coding_provider.clone(),
+            model: platform.coding_model.clone(),
+            max_tokens: None,
+            api_key: None,
+            transport: None,
+        },
+        ModelRouteConfig {
+            hint: "code_review".to_string(),
+            provider: platform.code_review_provider.clone(),
+            model: platform.code_review_model.clone(),
+            max_tokens: None,
+            api_key: None,
+            transport: None,
+        },
+    ]
+}
+
+/// Default query classification rules for platform mode.
+///
+/// These classify user messages into task categories so each task type
+/// routes to its designated model automatically.
+pub fn platform_default_classification_rules() -> QueryClassificationConfig {
+    QueryClassificationConfig {
+        enabled: true,
+        rules: vec![
+            // Coding — highest priority
+            ClassificationRule {
+                hint: "coding".to_string(),
+                keywords: vec![
+                    "code".into(), "implement".into(), "function".into(),
+                    "debug".into(), "refactor".into(), "compile".into(),
+                    "build".into(), "deploy".into(), "api".into(),
+                    "bug".into(), "error".into(), "fix".into(),
+                    "class".into(), "module".into(), "test".into(),
+                    "코드".into(), "구현".into(), "함수".into(),
+                    "디버그".into(), "리팩터".into(), "빌드".into(),
+                    "배포".into(), "버그".into(), "에러".into(),
+                ],
+                patterns: vec![
+                    "```".into(), "fn ".into(), "def ".into(),
+                    "class ".into(), "import ".into(), "from ".into(),
+                    "const ".into(), "let ".into(), "var ".into(),
+                    "async ".into(), "pub ".into(), "struct ".into(),
+                ],
+                min_length: None,
+                max_length: None,
+                priority: 20,
+            },
+            // Code review — user explicitly asks
+            ClassificationRule {
+                hint: "code_review".to_string(),
+                keywords: vec![
+                    "review".into(), "코드 리뷰".into(), "code review".into(),
+                    "리뷰".into(), "검토".into(),
+                ],
+                patterns: vec![],
+                min_length: None,
+                max_length: None,
+                priority: 25,
+            },
+            // Reasoning / document work
+            ClassificationRule {
+                hint: "reasoning".to_string(),
+                keywords: vec![
+                    "explain".into(), "analyze".into(), "design".into(),
+                    "architecture".into(), "document".into(), "write".into(),
+                    "draft".into(), "plan".into(), "strategy".into(),
+                    "compare".into(), "evaluate".into(), "report".into(),
+                    "설명".into(), "분석".into(), "설계".into(),
+                    "문서".into(), "작성".into(), "초안".into(),
+                    "계획".into(), "전략".into(), "비교".into(),
+                    "보고서".into(),
+                ],
+                patterns: vec![],
+                min_length: Some(20),
+                max_length: None,
+                priority: 10,
+            },
+            // Chat — lowest priority, short messages
+            ClassificationRule {
+                hint: "chat".to_string(),
+                keywords: vec![
+                    "hi".into(), "hello".into(), "hey".into(),
+                    "thanks".into(), "thank you".into(), "ok".into(),
+                    "yes".into(), "no".into(), "sure".into(),
+                    "안녕".into(), "감사".into(), "네".into(),
+                    "아니요".into(), "좋아".into(),
+                ],
+                patterns: vec![],
+                min_length: None,
+                max_length: Some(200),
+                priority: 1,
+            },
+        ],
+    }
 }
 
 // ── Peripherals (hardware: STM32, RPi GPIO, etc.) ────────────────────────
@@ -6456,6 +6777,7 @@ impl Default for Config {
             sync: SyncConfig::default(),
             voice: VoiceConfig::default(),
             coding: CodingConfig::default(),
+            platform_routing: PlatformRoutingConfig::default(),
             stripe_secret_key: None,
             stripe_webhook_secret: None,
             toss_secret_key: None,
@@ -10060,8 +10382,8 @@ mod tests {
     #[test]
     async fn config_default_has_sane_values() {
         let c = Config::default();
-        assert_eq!(c.default_provider.as_deref(), Some("openrouter"));
-        assert!(c.default_model.as_deref().unwrap().contains("claude"));
+        assert_eq!(c.default_provider.as_deref(), Some("gemini"));
+        assert!(c.default_model.as_deref().unwrap().contains("gemini"));
         assert!((c.default_temperature - 0.7).abs() < f64::EPSILON);
         assert!(c.api_key.is_none());
         assert!(!c.skills.open_skills_enabled);
@@ -10638,6 +10960,7 @@ ws_url = "ws://127.0.0.1:3002"
             mcp: McpConfig::default(),
             model_support_vision: None,
             wasm: WasmConfig::default(),
+            platform_routing: PlatformRoutingConfig::default(),
             stripe_secret_key: None,
             stripe_webhook_secret: None,
             toss_secret_key: None,
@@ -11023,6 +11346,7 @@ tool_dispatcher = "xml"
             mcp: McpConfig::default(),
             model_support_vision: None,
             wasm: WasmConfig::default(),
+            platform_routing: PlatformRoutingConfig::default(),
             stripe_secret_key: None,
             stripe_webhook_secret: None,
             toss_secret_key: None,
@@ -12918,7 +13242,7 @@ provider_api = "not-a-real-mode"
         assert_eq!(qwen_coding_plan, "qwen3-coder-plus");
 
         let google_alias = resolve_default_model_id(None, Some("google-gemini"));
-        assert_eq!(google_alias, "gemini-2.5-pro");
+        assert_eq!(google_alias, "gemini-3.1-flash-lite-preview");
     }
 
     #[test]
