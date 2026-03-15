@@ -2958,6 +2958,38 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
 // and hard trimming to keep the context window bounded.
 
 #[allow(clippy::too_many_lines)]
+fn resolve_provider_and_model(
+    config: &Config,
+    provider_override: Option<&str>,
+    model_override: Option<&str>,
+) -> (String, String) {
+    let provider_name = provider_override
+        .or(config.default_provider.as_deref())
+        .unwrap_or("openrouter");
+
+    let provider_changed = match (provider_override, config.default_provider.as_deref()) {
+        (Some(override_provider), Some(config_provider)) => {
+            crate::onboard::wizard::canonical_provider_name(override_provider)
+                != crate::onboard::wizard::canonical_provider_name(config_provider)
+        }
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+
+    let model_name = if let Some(model) = model_override {
+        model.to_string()
+    } else if provider_changed {
+        crate::onboard::wizard::default_model_for_provider(provider_name)
+    } else {
+        config
+            .default_model
+            .clone()
+            .unwrap_or_else(|| crate::onboard::wizard::default_model_for_provider(provider_name))
+    };
+
+    (provider_name.to_string(), model_name)
+}
+
 pub async fn run(
     config: Config,
     message: Option<String>,
@@ -3100,15 +3132,11 @@ pub async fn run(
     }
 
     // ── Resolve provider ─────────────────────────────────────────
-    let provider_name = provider_override
-        .as_deref()
-        .or(config.default_provider.as_deref())
-        .unwrap_or("openrouter");
-
-    let model_name = model_override
-        .as_deref()
-        .or(config.default_model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4");
+    let (provider_name, model_name) = resolve_provider_and_model(
+        &config,
+        provider_override.as_deref(),
+        model_override.as_deref(),
+    );
 
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -3122,18 +3150,18 @@ pub async fn run(
     };
 
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
-        provider_name,
+        &provider_name,
         config.api_key.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
         &config.model_routes,
-        model_name,
+        &model_name,
         &provider_runtime_options,
     )?;
 
     observer.record_event(&ObserverEvent::AgentStart {
-        provider: provider_name.to_string(),
-        model: model_name.to_string(),
+        provider: provider_name.clone(),
+        model: model_name.clone(),
     });
 
     // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
@@ -3274,7 +3302,7 @@ pub async fn run(
     let native_tools = provider.supports_native_tools();
     let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
-        model_name,
+        &model_name,
         &tool_descs,
         &skills,
         Some(&config.identity),
@@ -3346,8 +3374,8 @@ pub async fn run(
             &mut history,
             &tools_registry,
             observer.as_ref(),
-            provider_name,
-            model_name,
+            &provider_name,
+            &model_name,
             temperature,
             false,
             approval_manager.as_ref(),
@@ -3494,8 +3522,8 @@ pub async fn run(
                 &mut history,
                 &tools_registry,
                 observer.as_ref(),
-                provider_name,
-                model_name,
+                &provider_name,
+                &model_name,
                 temperature,
                 false,
                 approval_manager.as_ref(),
@@ -3531,7 +3559,7 @@ pub async fn run(
             if let Ok(compacted) = auto_compact_history(
                 &mut history,
                 provider.as_ref(),
-                model_name,
+                &model_name,
                 config.agent.max_history_messages,
                 config.agent.max_context_tokens,
             )
@@ -3782,7 +3810,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &mut history,
         &tools_registry,
         observer.as_ref(),
-        provider_name,
+        &provider_name,
         &model_name,
         config.default_temperature,
         true,
@@ -6296,6 +6324,49 @@ Let me check the result."#;
     // ═══════════════════════════════════════════════════════════════════════
     // reasoning_content pass-through tests for history builders
     // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn resolve_provider_and_model_uses_provider_default_when_cli_provider_changes() {
+        let config = Config {
+            default_provider: Some("openrouter".into()),
+            default_model: Some("anthropic/claude-sonnet-4.6".into()),
+            ..Config::default()
+        };
+
+        let (provider, model) = resolve_provider_and_model(&config, Some("openai-codex"), None);
+
+        assert_eq!(provider, "openai-codex");
+        assert_eq!(model, "gpt-5-codex");
+    }
+
+    #[test]
+    fn resolve_provider_and_model_keeps_config_model_when_provider_is_same_alias() {
+        let config = Config {
+            default_provider: Some("openai-codex".into()),
+            default_model: Some("gpt-5.4".into()),
+            ..Config::default()
+        };
+
+        let (provider, model) = resolve_provider_and_model(&config, Some("codex"), None);
+
+        assert_eq!(provider, "codex");
+        assert_eq!(model, "gpt-5.4");
+    }
+
+    #[test]
+    fn resolve_provider_and_model_prefers_explicit_model_override() {
+        let config = Config {
+            default_provider: Some("openrouter".into()),
+            default_model: Some("anthropic/claude-sonnet-4.6".into()),
+            ..Config::default()
+        };
+
+        let (provider, model) =
+            resolve_provider_and_model(&config, Some("openai-codex"), Some("gpt-5.4"));
+
+        assert_eq!(provider, "openai-codex");
+        assert_eq!(model, "gpt-5.4");
+    }
 
     #[test]
     fn build_native_assistant_history_includes_reasoning_content() {

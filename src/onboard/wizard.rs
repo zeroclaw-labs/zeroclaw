@@ -654,7 +654,7 @@ async fn run_quick_setup_with_home(
     Ok(config)
 }
 
-fn canonical_provider_name(provider_name: &str) -> &str {
+pub(crate) fn canonical_provider_name(provider_name: &str) -> &str {
     if is_qwen_oauth_alias(provider_name) {
         return "qwen-code";
     }
@@ -701,7 +701,7 @@ const MINIMAX_ONBOARD_MODELS: [(&str, &str); 5] = [
     ("MiniMax-M2", "MiniMax M2 (legacy)"),
 ];
 
-fn default_model_for_provider(provider: &str) -> String {
+pub(crate) fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
         "openai" => "gpt-5.2".into(),
