@@ -78,6 +78,10 @@ pub async fn transcribe_audio(
         form = form.text("language", lang.clone());
     }
 
+    if let Some(ref prompt) = config.initial_prompt {
+        form = form.text("prompt", prompt.clone());
+    }
+
     let resp = client
         .post(&config.api_url)
         .bearer_auth(&api_key)
