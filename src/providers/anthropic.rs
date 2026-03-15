@@ -90,10 +90,42 @@ enum NativeContentOut {
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: ToolResultContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+}
+
+/// Content payload for a `tool_result` block.
+///
+/// Anthropic accepts `content` as either a plain string or an array of typed
+/// content blocks (text / image).  When the MCP tool result contains image
+/// data we must send the array form so the model receives a proper image
+/// block instead of a gigantic base64 string that explodes the token count.
+#[derive(Debug)]
+enum ToolResultContent {
+    /// Plain text — serialises as a JSON string.
+    Plain(String),
+    /// Mixed text + image blocks — serialises as a JSON array.
+    Blocks(Vec<ToolResultBlock>),
+}
+
+impl serde::Serialize for ToolResultContent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Plain(s) => serializer.serialize_str(s),
+            Self::Blocks(blocks) => blocks.serialize(serializer),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum ToolResultBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
 }
 
 #[derive(Debug, Serialize)]
@@ -287,19 +319,97 @@ impl AnthropicProvider {
             .get("tool_call_id")
             .and_then(serde_json::Value::as_str)?
             .to_string();
-        let result = value
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let result_content = Self::extract_tool_result_content(&value);
         Some(NativeMessage {
             role: "user".to_string(),
             content: vec![NativeContentOut::ToolResult {
                 tool_use_id,
-                content: result,
+                content: result_content,
                 cache_control: None,
             }],
         })
+    }
+
+    /// Extract tool result content, converting MCP image blocks to Anthropic
+    /// native image blocks when present.
+    ///
+    /// MCP tools return image data as:
+    /// ```json
+    /// {"content": [{"type":"image","data":"<base64>","mimeType":"image/jpeg"}]}
+    /// ```
+    /// or mixed with text:
+    /// ```json
+    /// {"content": [{"type":"text","text":"caption"},{"type":"image","data":"...","mimeType":"..."}]}
+    /// ```
+    /// We detect this structure and emit `ToolResultContent::Blocks` so that
+    /// Anthropic receives proper `image` content blocks instead of a huge
+    /// base64 string that would blow up the token count.
+    fn extract_tool_result_content(value: &serde_json::Value) -> ToolResultContent {
+        // Try to interpret `content` as an MCP content-block array.
+        if let Some(arr) = value.get("content").and_then(|v| v.as_array()) {
+            if let Some(blocks) = Self::try_parse_mcp_content_blocks(arr) {
+                return blocks;
+            }
+        }
+        // Fallback: plain string.
+        let text = value
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        ToolResultContent::Plain(text.to_string())
+    }
+
+    /// Try to convert an MCP content-block array into `ToolResultContent`.
+    /// Returns `None` if the array doesn't contain any MCP-typed blocks.
+    fn try_parse_mcp_content_blocks(
+        arr: &[serde_json::Value],
+    ) -> Option<ToolResultContent> {
+        let mut blocks = Vec::new();
+        let mut has_typed_block = false;
+
+        for item in arr {
+            let obj = item.as_object()?;
+            let block_type = obj.get("type").and_then(|v| v.as_str())?;
+            has_typed_block = true;
+
+            match block_type {
+                "image" => {
+                    let data = obj.get("data").and_then(|v| v.as_str())?;
+                    let mime = obj
+                        .get("mimeType")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("image/png");
+                    blocks.push(ToolResultBlock::Image {
+                        source: ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: mime.to_string(),
+                            data: data.to_string(),
+                        },
+                    });
+                }
+                "text" => {
+                    let text = obj
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    blocks.push(ToolResultBlock::Text {
+                        text: text.to_string(),
+                    });
+                }
+                // Unknown block type — stringify it as text to avoid data loss.
+                _ => {
+                    blocks.push(ToolResultBlock::Text {
+                        text: item.to_string(),
+                    });
+                }
+            }
+        }
+
+        if !has_typed_block {
+            return None;
+        }
+
+        Some(ToolResultContent::Blocks(blocks))
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> (Option<SystemPrompt>, Vec<NativeMessage>) {
@@ -987,7 +1097,7 @@ mod tests {
     fn native_content_tool_result_with_cache_control() {
         let content = NativeContentOut::ToolResult {
             tool_use_id: "tool_123".to_string(),
-            content: "Result data".to_string(),
+            content: ToolResultContent::Plain("Result data".to_string()),
             cache_control: Some(CacheControl::ephemeral()),
         };
         let json = serde_json::to_string(&content).unwrap();
@@ -1128,7 +1238,7 @@ mod tests {
             role: "user".to_string(),
             content: vec![NativeContentOut::ToolResult {
                 tool_use_id: "tool_123".to_string(),
-                content: "Result".to_string(),
+                content: ToolResultContent::Plain("Result".to_string()),
                 cache_control: None,
             }],
         }];
