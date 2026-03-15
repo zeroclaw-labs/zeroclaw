@@ -255,7 +255,7 @@ pub struct Config {
     /// Dynamic node discovery configuration (`[nodes]`).
     #[serde(default)]
     pub nodes: NodesConfig,
-/// LinkedIn integration configuration (`[linkedin]`).
+    /// LinkedIn integration configuration (`[linkedin]`).
     #[serde(default)]
     pub linkedin: LinkedInConfig,
 }
@@ -4478,7 +4478,7 @@ impl Default for Config {
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
-linkedin: LinkedInConfig::default(),
+            linkedin: LinkedInConfig::default(),
         }
     }
 }
@@ -6225,6 +6225,7 @@ impl Config {
     }
 }
 
+#[allow(clippy::unused_async)]
 async fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -6250,6 +6251,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    #[cfg(unix)]
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
@@ -6585,7 +6587,7 @@ default_temperature = 0.7
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
-linkedin: LinkedInConfig::default(),
+            linkedin: LinkedInConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -6877,7 +6879,7 @@ tool_dispatcher = "xml"
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
-linkedin: LinkedInConfig::default(),
+            linkedin: LinkedInConfig::default(),
         };
 
         config.save().await.unwrap();

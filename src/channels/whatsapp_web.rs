@@ -71,7 +71,8 @@ pub struct WhatsAppWebChannel {
     /// Chats awaiting a voice reply — maps chat JID to the latest substantive
     /// reply text. A background task debounces and sends the voice note after
     /// the agent finishes its turn (no new send() for 3 seconds).
-    pending_voice: Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
+    pending_voice:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Chats whose last incoming message was a voice note.
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
@@ -410,20 +411,18 @@ impl WhatsAppWebChannel {
         let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
 
         let voice_msg = wa_rs_proto::whatsapp::Message {
-            audio_message: Some(Box::new(
-                wa_rs_proto::whatsapp::message::AudioMessage {
-                    url: Some(upload.url),
-                    direct_path: Some(upload.direct_path),
-                    media_key: Some(upload.media_key),
-                    file_enc_sha256: Some(upload.file_enc_sha256),
-                    file_sha256: Some(upload.file_sha256),
-                    file_length: Some(upload.file_length),
-                    mimetype: Some("audio/ogg; codecs=opus".to_string()),
-                    ptt: Some(true),
-                    seconds: Some(estimated_seconds),
-                    ..Default::default()
-                },
-            )),
+            audio_message: Some(Box::new(wa_rs_proto::whatsapp::message::AudioMessage {
+                url: Some(upload.url),
+                direct_path: Some(upload.direct_path),
+                media_key: Some(upload.media_key),
+                file_enc_sha256: Some(upload.file_enc_sha256),
+                file_sha256: Some(upload.file_sha256),
+                file_length: Some(upload.file_length),
+                mimetype: Some("audio/ogg; codecs=opus".to_string()),
+                ptt: Some(true),
+                seconds: Some(estimated_seconds),
+                ..Default::default()
+            })),
             ..Default::default()
         };
 

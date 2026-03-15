@@ -258,7 +258,11 @@ impl Tool for LinkedInTool {
                             // Clean up temp file
                             let _ = ImageGenerator::cleanup(&image_path).await;
 
-                            let action_word = if scheduled_at.is_some() { "scheduled" } else { "published" };
+                            let action_word = if scheduled_at.is_some() {
+                                "scheduled"
+                            } else {
+                                "published"
+                            };
                             return Ok(ToolResult {
                                 success: true,
                                 output: format!(
@@ -278,7 +282,11 @@ impl Tool for LinkedInTool {
                     .create_post(&text, visibility, article_url, article_title, scheduled_at)
                     .await?;
 
-                let action_word = if scheduled_at.is_some() { "scheduled" } else { "published" };
+                let action_word = if scheduled_at.is_some() {
+                    "scheduled"
+                } else {
+                    "published"
+                };
                 Ok(ToolResult {
                     success: true,
                     output: format!("Post {action_word} successfully. Post ID: {post_id}"),
