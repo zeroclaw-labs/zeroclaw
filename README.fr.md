@@ -86,7 +86,7 @@ Construit par des étudiants et membres des communautés Harvard, MIT et Sundai.
 
 <!-- BEGIN:WHATS_NEW -->
 
-### 🚀 What's New in v0.3.1-beta.205 (March 2026)
+### 🚀 What's New in v0.3.1 (March 2026)
 
 | Area | Highlights |
 |---|---|
@@ -423,7 +423,7 @@ Nous construisons en open source parce que les meilleures idées viennent de par
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
 
-### 🌟 Recent Contributors (v0.3.1-beta.205)
+### 🌟 Recent Contributors (v0.3.1)
 
 3 contributors shipped features, fixes, and improvements in this release cycle:
 

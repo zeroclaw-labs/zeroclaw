@@ -88,7 +88,7 @@ Postaveno studenty a členy komunit Harvard, MIT a Sundai.Club.
 
 <!-- BEGIN:WHATS_NEW -->
 
-### 🚀 What's New in v0.3.1-beta.205 (March 2026)
+### 🚀 What's New in v0.3.1 (March 2026)
 
 | Area | Highlights |
 |---|---|
@@ -425,7 +425,7 @@ Stavíme v open source protože nejlepší nápady přicházejí odkudkoliv. Pok
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
 
-### 🌟 Recent Contributors (v0.3.1-beta.205)
+### 🌟 Recent Contributors (v0.3.1)
 
 3 contributors shipped features, fixes, and improvements in this release cycle:
 
