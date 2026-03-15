@@ -746,7 +746,7 @@ impl Channel for MatrixChannel {
                     MessageType::Notice(content) => (content.body.clone(), None),
                     MessageType::Image(content) => {
                         let dl = media_info(&content.source, &content.body);
-                        (format!("[image: {}]", content.body), dl)
+                        (format!("[IMAGE:{}]", content.body), dl)
                     }
                     MessageType::File(content) => {
                         let dl = media_info(&content.source, &content.body);
