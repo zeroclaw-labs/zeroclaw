@@ -5772,6 +5772,9 @@ mod tests {
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
             session_store: Some(Arc::clone(&store)),
             autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -9998,6 +10001,9 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
             session_store: None,
             autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -10113,6 +10119,9 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
             session_store: None,
             autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -10220,6 +10229,9 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
             session_store: None,
             autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -10347,6 +10359,9 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
             session_store: None,
             autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(

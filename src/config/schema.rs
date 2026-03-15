@@ -1192,14 +1192,6 @@ pub struct AgentConfig {
     /// Default: `[]` (no filtering — all tools included).
     #[serde(default)]
     pub tool_filter_groups: Vec<ToolFilterGroup>,
-    /// Maximum number of tool calls executed in parallel per iteration. Default: `5`.
-    /// If the LLM requests more calls, they are batched into sequential groups.
-    #[serde(default = "default_max_parallel_tool_calls")]
-    pub max_parallel_tool_calls: usize,
-    /// Maximum chars kept per tool result in conversation history. Default: `4000`.
-    /// Results exceeding this are truncated with a `...(truncated)` suffix.
-    #[serde(default = "default_max_tool_result_chars")]
-    pub max_tool_result_chars: usize,
     /// Minimum milliseconds between tool loop iterations. Default: `0` (no cooldown).
     /// Useful to avoid rate-limit storms on free-tier APIs.
     #[serde(default)]
@@ -1230,14 +1222,6 @@ fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
 
-fn default_max_parallel_tool_calls() -> usize {
-    5
-}
-
-fn default_max_tool_result_chars() -> usize {
-    4000
-}
-
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -1251,8 +1235,6 @@ impl Default for AgentConfig {
             max_parallel_tool_calls: default_max_parallel_tool_calls(),
             max_tool_result_chars: default_max_tool_result_chars(),
             tool_filter_groups: Vec::new(),
-            max_parallel_tool_calls: default_max_parallel_tool_calls(),
-            max_tool_result_chars: default_max_tool_result_chars(),
             iteration_cooldown_ms: 0,
         }
     }
