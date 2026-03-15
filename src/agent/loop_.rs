@@ -2696,11 +2696,13 @@ pub(crate) async fn run_tool_call_loop(
                         arguments: tool_args.clone(),
                     };
 
-                    // Only prompt interactively on CLI; auto-approve on other channels.
-                    let decision = if channel_name == "cli" {
-                        mgr.prompt_cli(&request)
+                    // Interactive CLI: prompt the operator.
+                    // Non-interactive (channels): auto-deny since no operator
+                    // is present to approve.
+                    let decision = if mgr.is_non_interactive() {
+                        ApprovalResponse::No
                     } else {
-                        ApprovalResponse::Yes
+                        mgr.prompt_cli(&request)
                     };
 
                     mgr.record_decision(&tool_name, &tool_args, decision, channel_name);
