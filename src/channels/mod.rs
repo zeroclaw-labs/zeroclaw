@@ -312,6 +312,9 @@ struct ChannelRuntimeContext {
     model_routes: Arc<Vec<crate::config::ModelRouteConfig>>,
     ack_reactions: bool,
     show_tool_calls: bool,
+    max_parallel_tool_calls: usize,
+    max_tool_result_chars: usize,
+    iteration_cooldown_ms: u64,
 }
 
 #[derive(Clone)]
@@ -2029,6 +2032,9 @@ async fn process_channel_message(
                     ctx.non_cli_excluded_tools.as_ref()
                 },
                 ctx.tool_call_dedup_exempt.as_ref(),
+                ctx.max_parallel_tool_calls,
+                ctx.max_tool_result_chars,
+                ctx.iteration_cooldown_ms,
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -3805,6 +3811,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         model_routes: Arc::new(config.model_routes.clone()),
         ack_reactions: config.channels_config.ack_reactions,
         show_tool_calls: config.channels_config.show_tool_calls,
+        max_parallel_tool_calls: config.agent.max_parallel_tool_calls,
+        max_tool_result_chars: config.agent.max_tool_result_chars,
+        iteration_cooldown_ms: config.agent.iteration_cooldown_ms,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -4072,6 +4081,9 @@ mod tests {
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -4175,6 +4187,9 @@ mod tests {
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -4234,6 +4249,9 @@ mod tests {
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4751,6 +4769,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         process_channel_message(
@@ -4818,6 +4839,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         process_channel_message(
@@ -4899,6 +4923,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         process_channel_message(
@@ -4965,6 +4992,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         process_channel_message(
@@ -5041,6 +5071,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         process_channel_message(
@@ -5137,6 +5170,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         process_channel_message(
@@ -5215,6 +5251,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         process_channel_message(
@@ -5308,6 +5347,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         process_channel_message(
@@ -5386,6 +5428,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         process_channel_message(
@@ -5454,6 +5499,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         process_channel_message(
@@ -5633,6 +5681,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -5720,6 +5771,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5817,6 +5871,9 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -5921,6 +5978,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -6002,6 +6062,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         process_channel_message(
@@ -6068,6 +6131,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         process_channel_message(
@@ -6692,6 +6758,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         process_channel_message(
@@ -6784,6 +6853,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         process_channel_message(
@@ -6876,6 +6948,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         process_channel_message(
@@ -7432,6 +7507,9 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -7505,6 +7583,9 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(Vec::new()),
             ack_reactions: true,
             show_tool_calls: true,
+            max_parallel_tool_calls: 5,
+            max_tool_result_chars: 4000,
+            iteration_cooldown_ms: 0,
         });
 
         process_channel_message(
