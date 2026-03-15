@@ -3109,6 +3109,12 @@ pub struct ChannelsConfig {
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
     pub clawdtalk: Option<crate::channels::ClawdTalkConfig>,
+    /// Mastodon channel configuration.
+    pub mastodon: Option<MastodonConfig>,
+    /// ntfy push notification channel configuration.
+    pub ntfy: Option<NtfyConfig>,
+    /// Gotify push server channel configuration.
+    pub gotify: Option<GotifyConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -3217,6 +3223,18 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.clawdtalk.as_ref())),
                 self.clawdtalk.is_some(),
             ),
+            (
+                Box::new(ConfigWrapper::new(self.mastodon.as_ref())),
+                self.mastodon.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(self.ntfy.as_ref())),
+                self.ntfy.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(self.gotify.as_ref())),
+                self.gotify.is_some(),
+            ),
         ]
     }
 
@@ -3260,6 +3278,9 @@ impl Default for ChannelsConfig {
             #[cfg(feature = "channel-nostr")]
             nostr: None,
             clawdtalk: None,
+            mastodon: None,
+            ntfy: None,
+            gotify: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
             show_tool_calls: true,
@@ -4146,6 +4167,81 @@ pub fn default_nostr_relays() -> Vec<String> {
         "wss://relay.primal.net".to_string(),
         "wss://relay.snort.social".to_string(),
     ]
+}
+
+/// Mastodon channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MastodonConfig {
+    /// Mastodon instance URL (e.g., `https://mastodon.social`)
+    pub instance_url: String,
+    /// OAuth2 access token for the Mastodon application
+    pub access_token: String,
+    /// Default visibility for posted statuses (public/unlisted/private/direct)
+    pub default_visibility: Option<String>,
+    /// Character limit per status (default: 500)
+    pub char_limit: Option<usize>,
+    /// Default content warning / spoiler text
+    pub spoiler_text: Option<String>,
+}
+
+impl ChannelConfig for MastodonConfig {
+    fn name() -> &'static str {
+        "Mastodon"
+    }
+    fn desc() -> &'static str {
+        "Mastodon/Fediverse"
+    }
+}
+
+/// ntfy channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NtfyConfig {
+    /// ntfy server URL (default: `https://ntfy.sh`)
+    pub server: Option<String>,
+    /// Topic to subscribe/publish to
+    pub topic: String,
+    /// Authentication token (optional, for protected topics)
+    pub auth_token: Option<String>,
+    /// Default priority (1-5, default: 3)
+    pub default_priority: Option<u8>,
+    /// Default tags for outbound messages
+    #[serde(default)]
+    pub default_tags: Vec<String>,
+    /// Default click action URL
+    pub default_click: Option<String>,
+}
+
+impl ChannelConfig for NtfyConfig {
+    fn name() -> &'static str {
+        "ntfy"
+    }
+    fn desc() -> &'static str {
+        "ntfy push notifications"
+    }
+}
+
+/// Gotify channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GotifyConfig {
+    /// Gotify server URL (e.g., `http://localhost:8080`)
+    pub server_url: String,
+    /// Application token for sending messages
+    pub app_token: String,
+    /// Client token for receiving messages via WebSocket
+    pub client_token: String,
+    /// Default message priority (default: 5)
+    pub default_priority: Option<u8>,
+    /// Enable markdown rendering in clients that support it
+    pub use_markdown: Option<bool>,
+}
+
+impl ChannelConfig for GotifyConfig {
+    fn name() -> &'static str {
+        "Gotify"
+    }
+    fn desc() -> &'static str {
+        "Gotify push server"
+    }
 }
 
 // ── Config impl ──────────────────────────────────────────────────
@@ -6282,6 +6378,9 @@ default_temperature = 0.7
                 #[cfg(feature = "channel-nostr")]
                 nostr: None,
                 clawdtalk: None,
+                mastodon: None,
+                ntfy: None,
+                gotify: None,
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
@@ -6997,6 +7096,9 @@ allowed_users = ["@ops:matrix.org"]
             qq: None,
             nostr: None,
             clawdtalk: None,
+            mastodon: None,
+            ntfy: None,
+            gotify: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
@@ -7225,6 +7327,9 @@ channel_id = "C123"
             qq: None,
             nostr: None,
             clawdtalk: None,
+            mastodon: None,
+            ntfy: None,
+            gotify: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
