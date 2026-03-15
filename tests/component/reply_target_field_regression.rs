@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 const SCAN_PATHS: &[&str] = &["src"];
 const FORBIDDEN_PATTERNS: &[&str] = &[".reply_to", "reply_to:"];
+/// Legitimate uses of `reply_to` that are not the legacy field.
+const ALLOWED_PATTERNS: &[&str] = &["reply_to_message_id", "fn reply_to(", ".reply_to("];
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = fs::read_dir(dir)
@@ -46,7 +48,7 @@ fn source_does_not_use_legacy_reply_to_field() {
 
         for (line_idx, line) in content.lines().enumerate() {
             for pattern in FORBIDDEN_PATTERNS {
-                if line.contains(pattern) {
+                if line.contains(pattern) && !ALLOWED_PATTERNS.iter().any(|a| line.contains(a)) {
                     let rel = file_path
                         .strip_prefix(root)
                         .unwrap_or(&file_path)
