@@ -32,6 +32,29 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 
+    /// Semantic tags for tool classification (e.g. `["search-phase"]`).
+    fn tags(&self) -> &[String] {
+        &[]
+    }
+
+    /// Whether this tool is a terminal action whose output can be returned
+    /// directly without an additional LLM turn.
+    fn is_terminal(&self) -> bool {
+        false
+    }
+
+    /// Maximum chars to keep in tool result for conversation history.
+    /// Returns None to use the global default.
+    fn max_result_chars(&self) -> Option<usize> {
+        None
+    }
+
+    /// Maximum times this tool may be called in a single agent turn.
+    /// Returns None for unlimited.
+    fn max_calls_per_turn(&self) -> Option<usize> {
+        None
+    }
+
     /// Get the full spec for LLM registration
     fn spec(&self) -> ToolSpec {
         ToolSpec {
@@ -117,5 +140,15 @@ mod tests {
 
         assert!(!parsed.success);
         assert_eq!(parsed.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn tool_trait_defaults_are_nonbreaking() {
+        let tool = DummyTool;
+        // All new trait methods have default impls that return safe values
+        assert!(!tool.is_terminal());
+        assert!(tool.max_calls_per_turn().is_none());
+        assert!(tool.max_result_chars().is_none());
+        assert!(tool.tags().is_empty());
     }
 }
