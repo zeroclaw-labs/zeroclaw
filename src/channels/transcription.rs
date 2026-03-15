@@ -31,6 +31,33 @@ fn normalize_audio_filename(file_name: &str) -> String {
     }
 }
 
+fn transcription_form_fields(config: &TranscriptionConfig) -> Vec<(&'static str, String)> {
+    let mut fields = vec![
+        ("model", config.model.clone()),
+        ("response_format", "json".to_string()),
+    ];
+
+    if let Some(lang) = config
+        .language
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        fields.push(("language", lang.to_string()));
+    }
+
+    if let Some(prompt) = config
+        .initial_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        fields.push(("prompt", prompt.to_string()));
+    }
+
+    fields
+}
+
 /// Transcribe audio bytes via a Whisper-compatible transcription API.
 ///
 /// Returns the transcribed text on success.  Requires `GROQ_API_KEY` in the
@@ -69,13 +96,9 @@ pub async fn transcribe_audio(
         .file_name(normalized_name)
         .mime_str(mime)?;
 
-    let mut form = Form::new()
-        .part("file", file_part)
-        .text("model", config.model.clone())
-        .text("response_format", "json");
-
-    if let Some(ref lang) = config.language {
-        form = form.text("language", lang.clone());
+    let mut form = Form::new().part("file", file_part);
+    for (key, value) in transcription_form_fields(config) {
+        form = form.text(key, value);
     }
 
     let resp = client
@@ -195,6 +218,34 @@ mod tests {
     #[test]
     fn normalize_audio_filename_no_extension() {
         assert_eq!(normalize_audio_filename("voice"), "voice");
+    }
+
+    #[test]
+    fn transcription_form_fields_include_optional_prompt_and_language() {
+        let config = TranscriptionConfig {
+            language: Some("en".into()),
+            initial_prompt: Some("customer support call".into()),
+            ..TranscriptionConfig::default()
+        };
+
+        let fields = transcription_form_fields(&config);
+        assert!(fields.contains(&("model", config.model.clone())));
+        assert!(fields.contains(&("response_format", "json".to_string())));
+        assert!(fields.contains(&("language", "en".to_string())));
+        assert!(fields.contains(&("prompt", "customer support call".to_string())));
+    }
+
+    #[test]
+    fn transcription_form_fields_skip_blank_optional_values() {
+        let config = TranscriptionConfig {
+            language: Some("   ".into()),
+            initial_prompt: Some(String::new()),
+            ..TranscriptionConfig::default()
+        };
+
+        let fields = transcription_form_fields(&config);
+        assert!(!fields.iter().any(|(key, _)| *key == "language"));
+        assert!(!fields.iter().any(|(key, _)| *key == "prompt"));
     }
 
     #[tokio::test]
