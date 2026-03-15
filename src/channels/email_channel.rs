@@ -8,6 +8,7 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::unnecessary_map_or)]
 
+use crate::security::taint::TaintLabel;
 use anyhow::{anyhow, Result};
 use async_imap::extensions::idle::IdleResponse;
 use async_imap::types::Fetch;
@@ -467,6 +468,7 @@ impl EmailChannel {
                 channel: "email".to_string(),
                 timestamp: email.timestamp,
                 thread_ts: None,
+                taint: TaintLabel::default(),
             };
 
             if tx.send(msg).await.is_err() {

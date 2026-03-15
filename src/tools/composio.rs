@@ -1,3 +1,4 @@
+use crate::security::taint::TaintLabel;
 // Composio Tool Provider — optional managed tool surface with 1000+ OAuth integrations.
 //
 // When enabled, ZeroClaw can execute actions on Gmail, Notion, GitHub, Slack, etc.
@@ -702,12 +703,14 @@ impl Tool for ComposioTool {
                             success: true,
                             output,
                             error: None,
+                        taint: TaintLabel::default(),
                         })
                     }
                     Err(e) => Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(format!("Failed to list actions: {e}")),
+                    taint: TaintLabel::default(),
                     }),
                 }
             }
@@ -727,6 +730,7 @@ impl Tool for ComposioTool {
                                     "No connected accounts found{app_hint} for entity '{entity_id}'. Run action='connect' first."
                                 ),
                                 error: None,
+                                taint: TaintLabel::default(),
                             });
                         }
 
@@ -752,12 +756,14 @@ impl Tool for ComposioTool {
                             success: true,
                             output,
                             error: None,
+                        taint: TaintLabel::default(),
                         })
                     }
                     Err(e) => Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(format!("Failed to list connected accounts: {e}")),
+                    taint: TaintLabel::default(),
                     }),
                 }
             }
@@ -771,6 +777,7 @@ impl Tool for ComposioTool {
                         success: false,
                         output: String::new(),
                         error: Some(error),
+                    taint: TaintLabel::default(),
                     });
                 }
 
@@ -805,6 +812,7 @@ impl Tool for ComposioTool {
                             success: true,
                             output,
                             error: None,
+                        taint: TaintLabel::default(),
                         })
                     }
                     Err(e) => {
@@ -822,6 +830,7 @@ impl Tool for ComposioTool {
                             error: Some(format!(
                                 "Action execution failed: {e}{schema_hint}"
                             )),
+                            taint: TaintLabel::default(),
                         })
                     }
                 }
@@ -836,6 +845,7 @@ impl Tool for ComposioTool {
                         success: false,
                         output: String::new(),
                         error: Some(error),
+                    taint: TaintLabel::default(),
                     });
                 }
 
@@ -867,12 +877,14 @@ impl Tool for ComposioTool {
                             success: true,
                             output,
                             error: None,
+                        taint: TaintLabel::default(),
                         })
                     }
                     Err(e) => Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(format!("Failed to get connection URL: {e}")),
+                    taint: TaintLabel::default(),
                     }),
                 }
             }
@@ -883,6 +895,7 @@ impl Tool for ComposioTool {
                 error: Some(format!(
                     "Unknown action '{action}'. Use 'list', 'list_accounts', 'execute', or 'connect'."
                 )),
+                taint: TaintLabel::default(),
             }),
         }
     }

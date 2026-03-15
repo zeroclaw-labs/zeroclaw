@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::security::taint::TaintLabel;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -117,6 +118,7 @@ impl Tool for PushoverTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -125,6 +127,7 @@ impl Tool for PushoverTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -147,6 +150,7 @@ impl Tool for PushoverTool {
                     error: Some(format!(
                         "Invalid 'priority': {value}. Expected integer in range -2..=2"
                     )),
+                    taint: TaintLabel::default(),
                 })
             }
             None => None,
@@ -188,6 +192,7 @@ impl Tool for PushoverTool {
                 success: false,
                 output: body,
                 error: Some(format!("Pushover API returned status {}", status)),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -203,12 +208,14 @@ impl Tool for PushoverTool {
                     body
                 ),
                 error: None,
+                taint: TaintLabel::default(),
             })
         } else {
             Ok(ToolResult {
                 success: false,
                 output: body,
                 error: Some("Pushover API returned an application-level error".into()),
+                taint: TaintLabel::default(),
             })
         }
     }

@@ -6,6 +6,7 @@
 
 use crate::config::PeripheralBoardConfig;
 use crate::peripherals::Peripheral;
+use crate::security::taint::TaintLabel;
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use portable_atomic::{AtomicU64, Ordering};
@@ -94,6 +95,7 @@ impl SerialTransport {
             success: ok,
             output: result,
             error,
+            taint: TaintLabel::default(),
         })
     }
 

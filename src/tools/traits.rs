@@ -1,3 +1,4 @@
+use crate::security::taint::TaintLabel;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -7,6 +8,10 @@ pub struct ToolResult {
     pub success: bool,
     pub output: String,
     pub error: Option<String>,
+    /// Taint label indicating the origin of this tool's output data.
+    /// Defaults to untainted (empty) for backward compatibility.
+    #[serde(default, skip_serializing_if = "TaintLabel::is_empty")]
+    pub taint: TaintLabel,
 }
 
 /// Description of a tool for the LLM
@@ -76,6 +81,7 @@ mod tests {
                     .unwrap_or_default()
                     .to_string(),
                 error: None,
+                taint: TaintLabel::default(),
             })
         }
     }
@@ -110,6 +116,7 @@ mod tests {
             success: false,
             output: String::new(),
             error: Some("boom".into()),
+            taint: TaintLabel::default(),
         };
 
         let json = serde_json::to_string(&result).unwrap();

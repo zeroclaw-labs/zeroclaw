@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::security::taint::TaintLabel;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -118,6 +119,7 @@ impl Tool for WebFetchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -126,6 +128,7 @@ impl Tool for WebFetchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -136,6 +139,7 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),
+                    taint: TaintLabel::default(),
                 })
             }
         };
@@ -183,6 +187,7 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to build HTTP client: {e}")),
+                    taint: TaintLabel::default(),
                 })
             }
         };
@@ -194,6 +199,7 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("HTTP request failed: {e}")),
+                    taint: TaintLabel::default(),
                 })
             }
         };
@@ -208,6 +214,7 @@ impl Tool for WebFetchTool {
                     status.as_u16(),
                     status.canonical_reason().unwrap_or("Unknown")
                 )),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -234,6 +241,7 @@ impl Tool for WebFetchTool {
                     "Unsupported content type: {content_type}. \
                      web_fetch supports text/html, text/plain, text/markdown, and application/json."
                 )),
+                taint: TaintLabel::default(),
             });
         };
 
@@ -244,6 +252,7 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to read response body: {e}")),
+                    taint: TaintLabel::default(),
                 })
             }
         };
@@ -260,6 +269,7 @@ impl Tool for WebFetchTool {
             success: true,
             output,
             error: None,
+            taint: TaintLabel::default(),
         })
     }
 }

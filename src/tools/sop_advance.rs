@@ -94,6 +94,7 @@ impl Tool for SopAdvanceTool {
                     error: Some(format!(
                         "Invalid status '{other}'. Must be: completed, failed, or skipped"
                     )),
+                    taint: TaintLabel::default(),
                 });
             }
         };
@@ -186,12 +187,14 @@ impl Tool for SopAdvanceTool {
                     success: true,
                     output: result_output,
                     error: None,
+                taint: TaintLabel::default(),
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to advance step: {e}")),
+            taint: TaintLabel::default(),
             }),
         }
     }
@@ -206,6 +209,7 @@ mod tests {
     use crate::memory::Memory;
     use crate::sop::engine::SopEngine;
     use crate::sop::types::*;
+use crate::security::taint::TaintLabel;
 
     fn test_sop() -> Sop {
         Sop {

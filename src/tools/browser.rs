@@ -6,6 +6,7 @@
 //! Computer-use (OS-level) actions are supported via an optional sidecar endpoint.
 
 use super::traits::{Tool, ToolResult};
+use crate::security::taint::TaintLabel;
 use crate::security::SecurityPolicy;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -666,6 +667,7 @@ impl BrowserTool {
                 success: true,
                 output: serde_json::to_string_pretty(&output).unwrap_or_default(),
                 error: None,
+                taint: TaintLabel::default(),
             })
         }
 
@@ -813,6 +815,7 @@ impl BrowserTool {
                     success: true,
                     output,
                     error: None,
+                    taint: TaintLabel::default(),
                 });
             }
 
@@ -830,6 +833,7 @@ impl BrowserTool {
                 success: false,
                 output: String::new(),
                 error,
+                taint: TaintLabel::default(),
             });
         }
 
@@ -838,6 +842,7 @@ impl BrowserTool {
                 success: true,
                 output: body,
                 error: None,
+                taint: TaintLabel::default(),
             });
         }
 
@@ -848,6 +853,7 @@ impl BrowserTool {
                 "computer-use sidecar request failed with status {status}: {}",
                 body.trim()
             )),
+            taint: TaintLabel::default(),
         })
     }
 
@@ -876,12 +882,14 @@ impl BrowserTool {
                 success: true,
                 output,
                 error: None,
+                taint: TaintLabel::default(),
             })
         } else {
             Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: resp.error,
+                taint: TaintLabel::default(),
             })
         }
     }
@@ -1023,6 +1031,7 @@ impl Tool for BrowserTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -1031,6 +1040,7 @@ impl Tool for BrowserTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -1041,6 +1051,7 @@ impl Tool for BrowserTool {
                     success: false,
                     output: String::new(),
                     error: Some(error.to_string()),
+                    taint: TaintLabel::default(),
                 });
             }
         };
@@ -1056,6 +1067,7 @@ impl Tool for BrowserTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Unknown action: {action_str}")),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -1068,6 +1080,7 @@ impl Tool for BrowserTool {
                 success: false,
                 output: String::new(),
                 error: Some(unavailable_action_for_backend_error(action_str, backend)),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -1078,6 +1091,7 @@ impl Tool for BrowserTool {
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),
+                    taint: TaintLabel::default(),
                 });
             }
         };

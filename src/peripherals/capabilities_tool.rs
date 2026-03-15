@@ -1,6 +1,7 @@
 //! Hardware capabilities tool — Phase C: query device for reported GPIO pins.
 
 use super::serial::SerialTransport;
+use crate::security::taint::TaintLabel;
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
@@ -94,6 +95,7 @@ impl Tool for HardwareCapabilitiesTool {
             success: !outputs.is_empty(),
             output,
             error: None,
+            taint: TaintLabel::default(),
         })
     }
 }

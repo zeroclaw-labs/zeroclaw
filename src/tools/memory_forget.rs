@@ -1,6 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::memory::Memory;
 use crate::security::policy::ToolOperation;
+use crate::security::taint::TaintLabel;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -55,6 +56,7 @@ impl Tool for MemoryForgetTool {
                 success: false,
                 output: String::new(),
                 error: Some(error),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -63,16 +65,19 @@ impl Tool for MemoryForgetTool {
                 success: true,
                 output: format!("Forgot memory: {key}"),
                 error: None,
+                taint: TaintLabel::default(),
             }),
             Ok(false) => Ok(ToolResult {
                 success: true,
                 output: format!("No memory found with key: {key}"),
                 error: None,
+                taint: TaintLabel::default(),
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to forget memory: {e}")),
+                taint: TaintLabel::default(),
             }),
         }
     }

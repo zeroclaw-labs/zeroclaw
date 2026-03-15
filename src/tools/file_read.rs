@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::security::taint::TaintLabel;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -59,6 +60,7 @@ impl Tool for FileReadTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -68,6 +70,7 @@ impl Tool for FileReadTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Path not allowed by security policy: {path}")),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -79,6 +82,7 @@ impl Tool for FileReadTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -92,6 +96,7 @@ impl Tool for FileReadTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to resolve file path: {e}")),
+                    taint: TaintLabel::default(),
                 });
             }
         };
@@ -104,6 +109,7 @@ impl Tool for FileReadTool {
                     self.security
                         .resolved_path_violation_message(&resolved_path),
                 ),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -118,6 +124,7 @@ impl Tool for FileReadTool {
                             "File too large: {} bytes (limit: {MAX_FILE_SIZE_BYTES} bytes)",
                             meta.len()
                         )),
+                        taint: TaintLabel::default(),
                     });
                 }
             }
@@ -126,6 +133,7 @@ impl Tool for FileReadTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to read file metadata: {e}")),
+                    taint: TaintLabel::default(),
                 });
             }
         }
@@ -140,6 +148,7 @@ impl Tool for FileReadTool {
                         success: true,
                         output: String::new(),
                         error: None,
+                        taint: TaintLabel::default(),
                     });
                 }
 
@@ -167,6 +176,7 @@ impl Tool for FileReadTool {
                         success: true,
                         output: format!("[No lines in range, file has {total} lines]"),
                         error: None,
+                        taint: TaintLabel::default(),
                     });
                 }
 
@@ -188,6 +198,7 @@ impl Tool for FileReadTool {
                     success: true,
                     output: format!("{numbered}{summary}"),
                     error: None,
+                    taint: TaintLabel::default(),
                 })
             }
             Err(_) => {
@@ -201,6 +212,7 @@ impl Tool for FileReadTool {
                         success: true,
                         output: text,
                         error: None,
+                        taint: TaintLabel::default(),
                     });
                 }
 
@@ -210,6 +222,7 @@ impl Tool for FileReadTool {
                     success: true,
                     output: lossy,
                     error: None,
+                    taint: TaintLabel::default(),
                 })
             }
         }

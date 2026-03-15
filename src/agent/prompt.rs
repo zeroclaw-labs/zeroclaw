@@ -260,6 +260,7 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::taint::TaintLabel;
     use crate::tools::traits::Tool;
     use async_trait::async_trait;
 
@@ -287,6 +288,7 @@ mod tests {
                 success: true,
                 output: "ok".into(),
                 error: None,
+                taint: TaintLabel::default(),
             })
         }
     }

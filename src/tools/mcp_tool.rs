@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::security::taint::TaintLabel;
 use crate::tools::mcp_client::McpRegistry;
 use crate::tools::mcp_protocol::McpToolDef;
 use crate::tools::traits::{Tool, ToolResult};
@@ -69,11 +70,13 @@ impl Tool for McpToolWrapper {
                 success: true,
                 output,
                 error: None,
+                taint: TaintLabel::default(),
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(e.to_string()),
+                taint: TaintLabel::default(),
             }),
         }
     }
@@ -155,7 +158,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_returns_non_fatal_error_for_unknown_tool() {
-        // An empty registry has no tools — execute must return Ok(ToolResult { success: false })
+        // An empty registry has no tools — execute must return Ok(ToolResult { success: false, .. })
         // rather than propagating an Err (non-fatal by design).
         let registry = empty_registry().await;
         let def = make_def("ghost", Some("Ghost tool"), json!({}));
@@ -181,6 +184,7 @@ mod tests {
             success: true,
             output: "hello".to_string(),
             error: None,
+            taint: TaintLabel::default(),
         };
     }
 

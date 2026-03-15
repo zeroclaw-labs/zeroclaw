@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::security::taint::TaintLabel;
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
@@ -313,6 +314,7 @@ impl Tool for WebSearchTool {
             success: true,
             output: result,
             error: None,
+            taint: TaintLabel::default(),
         })
     }
 }

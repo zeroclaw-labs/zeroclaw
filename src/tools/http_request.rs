@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::security::taint::TaintLabel;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -211,6 +212,7 @@ impl Tool for HttpRequestTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -219,6 +221,7 @@ impl Tool for HttpRequestTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -229,6 +232,7 @@ impl Tool for HttpRequestTool {
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),
+                    taint: TaintLabel::default(),
                 })
             }
         };
@@ -240,6 +244,7 @@ impl Tool for HttpRequestTool {
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),
+                    taint: TaintLabel::default(),
                 })
             }
         };
@@ -290,12 +295,14 @@ impl Tool for HttpRequestTool {
                     } else {
                         None
                     },
+                    taint: TaintLabel::default(),
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("HTTP request failed: {e}")),
+                taint: TaintLabel::default(),
             }),
         }
     }

@@ -1,5 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
+use crate::security::taint::TaintLabel;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -123,6 +124,7 @@ impl Tool for ShellTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -133,6 +135,7 @@ impl Tool for ShellTool {
                     success: false,
                     output: String::new(),
                     error: Some(reason),
+                    taint: TaintLabel::default(),
                 });
             }
         }
@@ -142,6 +145,7 @@ impl Tool for ShellTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Path blocked by security policy: {path}")),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -150,6 +154,7 @@ impl Tool for ShellTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -166,6 +171,7 @@ impl Tool for ShellTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to build runtime command: {e}")),
+                    taint: TaintLabel::default(),
                 });
             }
         };
@@ -211,12 +217,14 @@ impl Tool for ShellTool {
                     } else {
                         Some(stderr)
                     },
+                    taint: TaintLabel::default(),
                 })
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to execute command: {e}")),
+                taint: TaintLabel::default(),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -224,6 +232,7 @@ impl Tool for ShellTool {
                 error: Some(format!(
                     "Command timed out after {SHELL_TIMEOUT_SECS}s and was killed"
                 )),
+                taint: TaintLabel::default(),
             }),
         }
     }

@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::security::taint::TaintLabel;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -109,6 +110,7 @@ impl Tool for ContentSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Empty pattern is not allowed.".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -126,6 +128,7 @@ impl Tool for ContentSearchTool {
                 error: Some(format!(
                     "Invalid output_mode '{output_mode}'. Allowed values: content, files_with_matches, count."
                 )),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -167,6 +170,7 @@ impl Tool for ContentSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -179,6 +183,7 @@ impl Tool for ContentSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Absolute paths are not allowed. Use a relative path.".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -187,6 +192,7 @@ impl Tool for ContentSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Path traversal ('..') is not allowed.".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -197,6 +203,7 @@ impl Tool for ContentSearchTool {
                 error: Some(format!(
                     "Path '{search_path}' is not allowed by security policy."
                 )),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -206,6 +213,7 @@ impl Tool for ContentSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -219,6 +227,7 @@ impl Tool for ContentSearchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Cannot resolve path '{search_path}': {e}")),
+                    taint: TaintLabel::default(),
                 });
             }
         };
@@ -230,6 +239,7 @@ impl Tool for ContentSearchTool {
                 error: Some(format!(
                     "Resolved path for '{search_path}' is outside the allowed workspace."
                 )),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -241,6 +251,7 @@ impl Tool for ContentSearchTool {
                 error: Some(
                     "Multiline matching requires ripgrep (rg), which is not available.".into(),
                 ),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -291,6 +302,7 @@ impl Tool for ContentSearchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to execute search command: {e}")),
+                    taint: TaintLabel::default(),
                 });
             }
             Err(_) => {
@@ -298,6 +310,7 @@ impl Tool for ContentSearchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Search timed out after {TIMEOUT_SECS} seconds.")),
+                    taint: TaintLabel::default(),
                 });
             }
         };
@@ -310,6 +323,7 @@ impl Tool for ContentSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Search error: {}", stderr.trim())),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -339,6 +353,7 @@ impl Tool for ContentSearchTool {
             success: true,
             output: final_output,
             error: None,
+            taint: TaintLabel::default(),
         })
     }
 }

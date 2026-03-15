@@ -49,6 +49,7 @@ impl HookHandler for CommandLoggerHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::taint::TaintLabel;
 
     #[tokio::test]
     async fn logs_tool_calls() {
@@ -57,6 +58,7 @@ mod tests {
             success: true,
             output: "ok".into(),
             error: None,
+            taint: TaintLabel::default(),
         };
         hook.on_after_tool_call("shell", &result, Duration::from_millis(42))
             .await;

@@ -1675,6 +1675,7 @@ mod tests {
     use crate::channels::traits::ChannelMessage;
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
     use crate::providers::Provider;
+    use crate::security::taint::TaintLabel;
     use async_trait::async_trait;
     use axum::http::HeaderValue;
     use axum::response::IntoResponse;
@@ -2011,6 +2012,7 @@ mod tests {
             channel: "whatsapp".into(),
             timestamp: 1,
             thread_ts: None,
+            taint: TaintLabel::default(),
         };
 
         let key = whatsapp_memory_key(&msg);

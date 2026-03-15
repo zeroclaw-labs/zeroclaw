@@ -172,12 +172,14 @@ impl Tool for SopStatusTool {
                         success: true,
                         output,
                         error: None,
+                    taint: TaintLabel::default(),
                     })
                 }
                 None => Ok(ToolResult {
                     success: true,
                     output: format!("No run found with ID '{run_id}'."),
                     error: None,
+                    taint: TaintLabel::default(),
                 }),
             };
         }
@@ -247,6 +249,7 @@ impl Tool for SopStatusTool {
             success: true,
             output,
             error: None,
+        taint: TaintLabel::default(),
         })
     }
 }
@@ -294,6 +297,7 @@ mod tests {
     use crate::config::SopConfig;
     use crate::sop::engine::SopEngine;
     use crate::sop::types::*;
+use crate::security::taint::TaintLabel;
 
     fn test_sop(name: &str) -> Sop {
         Sop {

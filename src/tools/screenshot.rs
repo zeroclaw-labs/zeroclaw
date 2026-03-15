@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::security::taint::TaintLabel;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -77,6 +78,7 @@ impl ScreenshotTool {
                 success: false,
                 output: String::new(),
                 error: Some("Filename contains characters unsafe for shell execution".into()),
+                taint: TaintLabel::default(),
             });
         }
 
@@ -88,6 +90,7 @@ impl ScreenshotTool {
                 success: false,
                 output: String::new(),
                 error: Some("Screenshot not supported on this platform".into()),
+                taint: TaintLabel::default(),
             });
         };
 
@@ -123,12 +126,14 @@ impl ScreenshotTool {
                                 "No screenshot tool found. Install gnome-screenshot, scrot, or ImageMagick."
                                     .into(),
                             ),
+                            taint: TaintLabel::default(),
                         });
                     }
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(format!("Screenshot command failed: {stderr}")),
+                        taint: TaintLabel::default(),
                     });
                 }
 
@@ -138,6 +143,7 @@ impl ScreenshotTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to execute screenshot command: {e}")),
+                taint: TaintLabel::default(),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -145,6 +151,7 @@ impl ScreenshotTool {
                 error: Some(format!(
                     "Screenshot timed out after {SCREENSHOT_TIMEOUT_SECS}s"
                 )),
+                taint: TaintLabel::default(),
             }),
         }
     }
@@ -163,6 +170,7 @@ impl ScreenshotTool {
                         meta.len(),
                     ),
                     error: None,
+                    taint: TaintLabel::default(),
                 });
             }
         }
@@ -204,12 +212,14 @@ impl ScreenshotTool {
                     success: true,
                     output: output_msg,
                     error: None,
+                    taint: TaintLabel::default(),
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: format!("Screenshot saved to: {}", output_path.display()),
                 error: Some(format!("Failed to read screenshot file: {e}")),
+                taint: TaintLabel::default(),
             }),
         }
     }
@@ -247,6 +257,7 @@ impl Tool for ScreenshotTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                taint: TaintLabel::default(),
             });
         }
         self.capture(args).await

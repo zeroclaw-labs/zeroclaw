@@ -55,6 +55,7 @@ impl Tool for SopListTool {
                 success: true,
                 output: "No SOPs loaded.".into(),
                 error: None,
+            taint: TaintLabel::default(),
             });
         }
 
@@ -74,6 +75,7 @@ impl Tool for SopListTool {
                 success: true,
                 output: format!("No SOPs match filter '{filter}'."),
                 error: None,
+                taint: TaintLabel::default(),
             });
         }
 
@@ -111,6 +113,7 @@ impl Tool for SopListTool {
             success: true,
             output,
             error: None,
+        taint: TaintLabel::default(),
         })
     }
 }
@@ -121,6 +124,7 @@ mod tests {
     use crate::config::SopConfig;
     use crate::sop::engine::SopEngine;
     use crate::sop::types::*;
+use crate::security::taint::TaintLabel;
     use std::sync::Arc;
 
     fn test_sop(name: &str, priority: SopPriority) -> Sop {

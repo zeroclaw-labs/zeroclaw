@@ -123,12 +123,14 @@ impl Tool for SopExecuteTool {
                     success: true,
                     output,
                     error: None,
+                taint: TaintLabel::default(),
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to start SOP: {e}")),
+            taint: TaintLabel::default(),
             }),
         }
     }
@@ -152,6 +154,7 @@ mod tests {
     use crate::config::SopConfig;
     use crate::sop::engine::SopEngine;
     use crate::sop::types::*;
+use crate::security::taint::TaintLabel;
 
     fn test_sop(name: &str, mode: SopExecutionMode) -> Sop {
         Sop {

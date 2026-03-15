@@ -1,4 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::security::taint::TaintLabel;
 use anyhow::Context;
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -1776,6 +1777,7 @@ impl SlackChannel {
                         .unwrap_or_default()
                         .as_secs(),
                     thread_ts: Self::inbound_thread_ts(event, ts),
+                    taint: TaintLabel::default(),
                 };
 
                 if tx.send(channel_msg).await.is_err() {
@@ -2340,6 +2342,7 @@ impl Channel for SlackChannel {
                                 .unwrap_or_default()
                                 .as_secs(),
                             thread_ts: Self::inbound_thread_ts(msg, ts),
+                            taint: TaintLabel::default(),
                         };
 
                         if tx.send(channel_msg).await.is_err() {
@@ -2424,6 +2427,7 @@ impl Channel for SlackChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: Some(thread_ts.clone()),
+                        taint: TaintLabel::default(),
                     };
 
                     if tx.send(channel_msg).await.is_err() {
