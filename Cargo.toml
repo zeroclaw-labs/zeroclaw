@@ -232,6 +232,10 @@ probe = ["dep:probe-rs"]
 rag-pdf = ["dep:pdf-extract"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost", "dep:qrcode"]
+# SOP engine modules (audit, dispatch, engine, metrics, CLI handler)
+sop-engine = []
+# Ampersona gate evaluation support in SOP
+ampersona-gates = []
 
 [profile.release]
 opt-level = "z"      # Optimize for size

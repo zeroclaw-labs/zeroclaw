@@ -1,16 +1,30 @@
+// ── SOP core modules (gated until SOP engine is wired into config) ──
+//
+// The SOP engine, dispatch, audit, and metrics modules reference types
+// (`SopConfig`, `SopCommands`) that are not yet wired into the main
+// config/CLI surface. They compile in isolation but are gated here to
+// avoid breaking the crate build until that wiring lands.
+#[cfg(feature = "sop-engine")]
 pub mod audit;
 pub mod condition;
+#[cfg(feature = "sop-engine")]
 pub mod dispatch;
+#[cfg(feature = "sop-engine")]
 pub mod engine;
 #[cfg(feature = "ampersona-gates")]
 pub mod gates;
+#[cfg(feature = "sop-engine")]
 pub mod metrics;
 pub mod types;
+pub mod workflow;
 
+#[cfg(feature = "sop-engine")]
 pub use audit::SopAuditLogger;
+#[cfg(feature = "sop-engine")]
 pub use engine::SopEngine;
 #[cfg(feature = "ampersona-gates")]
 pub use gates::GateEvalState;
+#[cfg(feature = "sop-engine")]
 pub use metrics::SopMetricsCollector;
 #[allow(unused_imports)]
 pub use types::{
@@ -18,10 +32,14 @@ pub use types::{
     SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource,
 };
 
+#[cfg(feature = "sop-engine")]
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+
+#[cfg(feature = "sop-engine")]
 use tracing::warn;
 
+#[cfg(feature = "sop-engine")]
 use types::{SopManifest, SopMeta};
 
 // ── SOP directory helpers ───────────────────────────────────────
@@ -81,7 +99,7 @@ fn load_sops_from_directory(sops_dir: &Path, default_execution_mode: SopExecutio
         match load_sop(&path, default_execution_mode) {
             Ok(sop) => sops.push(sop),
             Err(e) => {
-                warn!("Failed to load SOP from {}: {e}", path.display());
+                tracing::warn!("Failed to load SOP from {}: {e}", path.display());
             }
         }
     }
@@ -91,10 +109,10 @@ fn load_sops_from_directory(sops_dir: &Path, default_execution_mode: SopExecutio
 }
 
 /// Load a single SOP from a directory containing SOP.toml and optionally SOP.md.
-fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<Sop> {
+fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> anyhow::Result<Sop> {
     let toml_path = sop_dir.join("SOP.toml");
     let toml_content = std::fs::read_to_string(&toml_path)?;
-    let manifest: SopManifest = toml::from_str(&toml_content)?;
+    let manifest: types::SopManifest = toml::from_str(&toml_content)?;
 
     let md_path = sop_dir.join("SOP.md");
     let steps = if md_path.exists() {
@@ -104,7 +122,7 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
         Vec::new()
     };
 
-    let SopMeta {
+    let types::SopMeta {
         name,
         description,
         version,
@@ -338,8 +356,9 @@ pub fn validate_sop(sop: &Sop) -> Vec<String> {
     warnings
 }
 
-// ── CLI handler ─────────────────────────────────────────────────
+// ── CLI handler (gated — requires SopCommands + config.sop) ─────
 
+#[cfg(feature = "sop-engine")]
 /// Handle the `sop` CLI subcommand.
 pub fn handle_command(command: crate::SopCommands, config: &crate::config::Config) -> Result<()> {
     let sops_dir_override = config.sop.sops_dir.as_deref();
@@ -801,7 +820,7 @@ condition = "> 0"
 [[triggers]]
 type = "manual"
 "#;
-        let manifest: SopManifest = toml::from_str(toml_str).unwrap();
+        let manifest: types::SopManifest = toml::from_str(toml_str).unwrap();
         assert_eq!(manifest.triggers.len(), 5);
 
         assert!(matches!(manifest.triggers[0], SopTrigger::Mqtt { .. }));
