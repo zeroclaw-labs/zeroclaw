@@ -1165,9 +1165,9 @@ dependencies = [
 
 [[package]]
 name = "cortex-mem-config"
-version = "2.5.0"
+version = "2.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48b0d2566a817c6cb30ec19b87c40da1c549c09ca399adf871f6f547d213509d"
+checksum = "4b008aebaf394c2d8026991fe4a44d95486cc27786e52de04192c0b568d658ef"
 dependencies = [
  "anyhow",
  "directories 5.0.1",
@@ -1178,9 +1178,9 @@ dependencies = [
 
 [[package]]
 name = "cortex-mem-core"
-version = "2.5.0"
+version = "2.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aed0a884ed93528efb28edc22e9ce1627374110b2bdd3e84fe526f4759f01468"
+checksum = "ee908c0e9232d01f1b0e8e13c98e1e7ccd67dec5f3671250d387a0b20c674624"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1188,7 +1188,6 @@ dependencies = [
  "cortex-mem-config",
  "dyn-clone",
  "futures",
- "log",
  "qdrant-client",
  "regex",
  "reqwest 0.12.28",
@@ -1207,15 +1206,14 @@ dependencies = [
 
 [[package]]
 name = "cortex-mem-tools"
-version = "2.5.0"
+version = "2.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c546635ace5d5985a54573c5a123747824061109a3907875542acd53b4abee5a"
+checksum = "7aa8ab884d66b788e55ddfcea6ed90e7f2fd9b1f10dc09669f9c70e7754b3c76"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
  "cortex-mem-core",
- "log",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2760,7 +2758,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -4333,9 +4331,9 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openssl"
-version = "0.10.75"
+version = "0.10.76"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08838db121398ad17ab8531ce9de97b244589089e290a384c900cb9ff7434328"
+checksum = "951c002c75e16ea2c65b8c7e4d3d51d5530d8dfa7d060b4776828c88cfb18ecf"
 dependencies = [
  "bitflags 2.11.0",
  "cfg-if",
@@ -4365,9 +4363,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "openssl-sys"
-version = "0.9.111"
+version = "0.9.112"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82cab2d520aa75e3c58898289429321eb788c3106963d0dc886ec7a5f4adc321"
+checksum = "57d55af3b3e226502be1526dfdba67ab0e9c96fc293004e79576b2b9edb0dbdb"
 dependencies = [
  "cc",
  "libc",
@@ -5168,7 +5166,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -5206,7 +5204,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -8760,9 +8758,9 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
- "directories",
+ "directories 6.0.0",
  "portable-atomic",
- "reqwest",
+ "reqwest 0.12.28",
  "rppal",
  "serde",
  "serde_json",
@@ -8865,27 +8863,6 @@ dependencies = [
  "webpki-roots 1.0.6",
  "which",
  "wiremock",
-]
-
-[[package]]
-name = "zeroclaw-robot-kit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "chrono",
- "directories 6.0.0",
- "reqwest 0.12.28",
- "rppal",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "toml 1.0.6+spec-1.1.0",
- "tracing",
 ]
 
 [[package]]
