@@ -141,4 +141,14 @@ mod tests {
         assert!(!parsed.success);
         assert_eq!(parsed.error.as_deref(), Some("boom"));
     }
+
+    #[test]
+    fn tool_trait_defaults_are_nonbreaking() {
+        let tool = DummyTool;
+        // All new trait methods have default impls that return safe values
+        assert!(!tool.is_terminal());
+        assert!(tool.max_calls_per_turn().is_none());
+        assert!(tool.max_result_chars().is_none());
+        assert!(tool.tags().is_empty());
+    }
 }
