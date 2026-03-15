@@ -1,8 +1,11 @@
 name: Sync README
 
 on:
-  release:
-    types: [published]
+  # Called by release workflows AFTER all publish steps complete.
+  workflow_call:
+    secrets:
+      RELEASE_TOKEN:
+        required: true
   workflow_dispatch:
 
 permissions:

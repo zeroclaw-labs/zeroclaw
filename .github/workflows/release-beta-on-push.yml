@@ -313,3 +313,19 @@ jobs:
           platforms: linux/amd64,linux/arm64
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ── Post-publish: only run after ALL artifacts are live ──────────────
+  tweet:
+    name: Tweet Release
+    needs: [version, publish, docker, redeploy-website]
+    uses: ./.github/workflows/tweet-release.yml
+    with:
+      release_tag: ${{ needs.version.outputs.tag }}
+      release_url: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/${{ needs.version.outputs.tag }}
+    secrets: inherit
+
+  sync-readme:
+    name: Sync README
+    needs: [publish, docker, redeploy-website]
+    uses: ./.github/workflows/sync-readme.yml
+    secrets: inherit
