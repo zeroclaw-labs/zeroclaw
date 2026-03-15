@@ -12,6 +12,8 @@ pub struct ChannelMessage {
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
+    /// Whether this message originated from a voice/audio input.
+    pub is_voice: Option<bool>,
 }
 
 /// Message to send through a channel
@@ -22,6 +24,8 @@ pub struct SendMessage {
     pub subject: Option<String>,
     /// Platform thread identifier for threaded replies (e.g. Slack `thread_ts`).
     pub thread_ts: Option<String>,
+    /// Whether this message originated from a voice/audio input.
+    pub is_voice: Option<bool>,
 }
 
 impl SendMessage {
@@ -32,6 +36,7 @@ impl SendMessage {
             recipient: recipient.into(),
             subject: None,
             thread_ts: None,
+            is_voice: None,
         }
     }
 
@@ -46,6 +51,7 @@ impl SendMessage {
             recipient: recipient.into(),
             subject: Some(subject.into()),
             thread_ts: None,
+            is_voice: None,
         }
     }
 
@@ -182,6 +188,7 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
+                is_voice: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -198,6 +205,7 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
+            is_voice: None,
         };
 
         let cloned = message.clone();

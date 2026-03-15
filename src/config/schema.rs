@@ -3304,6 +3304,9 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// Voice-loop configuration. Disabled by default (opt-in).
+    #[serde(default)]
+    pub voice_loop: crate::channels::voice_loop::VoiceLoopConfig,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -3361,6 +3364,9 @@ pub struct SlackConfig {
     /// cancels the in-flight request and starts a fresh response with preserved history.
     #[serde(default)]
     pub interrupt_on_new_message: bool,
+    /// Voice-loop configuration. Disabled by default (opt-in).
+    #[serde(default)]
+    pub voice_loop: crate::channels::voice_loop::VoiceLoopConfig,
 }
 
 impl ChannelConfig for SlackConfig {
@@ -3533,6 +3539,9 @@ pub struct WhatsAppConfig {
     /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
+    /// Voice-loop configuration. Disabled by default (opt-in).
+    #[serde(default)]
+    pub voice_loop: crate::channels::voice_loop::VoiceLoopConfig,
 }
 
 impl ChannelConfig for WhatsAppConfig {
@@ -5950,6 +5959,7 @@ impl Config {
     }
 }
 
+#[allow(clippy::unused_async)]
 async fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -5972,9 +5982,11 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::voice_loop::VoiceLoopConfig;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    #[allow(unused_imports)]
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
@@ -6260,6 +6272,7 @@ default_temperature = 0.7
                     draft_update_interval_ms: default_draft_update_interval_ms(),
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    voice_loop: VoiceLoopConfig::default(),
                 }),
                 discord: None,
                 slack: None,
@@ -6783,6 +6796,7 @@ tool_dispatcher = "xml"
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
             mention_only: false,
+            voice_loop: VoiceLoopConfig::default(),
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -7108,6 +7122,7 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1234567890".into(), "+9876543210".into()],
+            voice_loop: VoiceLoopConfig::default(),
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -7128,6 +7143,7 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1".into()],
+            voice_loop: VoiceLoopConfig::default(),
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -7153,6 +7169,7 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["*".into()],
+            voice_loop: VoiceLoopConfig::default(),
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -7170,6 +7187,7 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1".into()],
+            voice_loop: VoiceLoopConfig::default(),
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -7186,6 +7204,7 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec![],
+            voice_loop: VoiceLoopConfig::default(),
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
@@ -7212,6 +7231,7 @@ channel_id = "C123"
                 pair_phone: None,
                 pair_code: None,
                 allowed_numbers: vec!["+1".into()],
+                voice_loop: VoiceLoopConfig::default(),
             }),
             linq: None,
             wati: None,
@@ -9043,6 +9063,7 @@ require_otp_to_resume = true
             draft_update_interval_ms: default_draft_update_interval_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
+            voice_loop: VoiceLoopConfig::default(),
         });
 
         // Save (triggers encryption)

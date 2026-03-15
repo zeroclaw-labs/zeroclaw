@@ -25,6 +25,7 @@ fn channel_message_sender_field_holds_platform_user_id() {
         channel: "telegram".into(),
         timestamp: 1700000000,
         thread_ts: None,
+        is_voice: None,
     };
 
     assert_eq!(msg.sender, "123456789");
@@ -47,6 +48,7 @@ fn channel_message_reply_target_distinct_from_sender() {
         channel: "discord".into(),
         timestamp: 1700000000,
         thread_ts: None,
+        is_voice: None,
     };
 
     assert_ne!(
@@ -67,6 +69,7 @@ fn channel_message_fields_not_swapped() {
         channel: "test".into(),
         timestamp: 1700000000,
         thread_ts: None,
+        is_voice: None,
     };
 
     assert_eq!(
@@ -93,6 +96,7 @@ fn channel_message_preserves_all_fields_on_clone() {
         channel: "test_channel".into(),
         timestamp: 1700000001,
         thread_ts: None,
+        is_voice: None,
     };
 
     let cloned = original.clone();
@@ -186,6 +190,7 @@ impl Channel for CapturingChannel {
             channel: "capturing".into(),
             timestamp: 1700000000,
             thread_ts: None,
+            is_voice: None,
         })
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))

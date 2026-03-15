@@ -2011,6 +2011,7 @@ mod tests {
             channel: "whatsapp".into(),
             timestamp: 1,
             thread_ts: None,
+            is_voice: None,
         };
 
         let key = whatsapp_memory_key(&msg);
