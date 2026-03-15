@@ -3069,7 +3069,7 @@ mod tests {
         let state = test_app_state();
         let peer = SocketAddr::from(([192, 168, 1, 100], 12345));
         let result = handle_admin_reload_config(State(state), ConnectInfo(peer)).await;
-        let err = result.unwrap_err();
+        let Err(err) = result else { panic!("expected Err") };
         assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 
@@ -3082,7 +3082,7 @@ mod tests {
             PathBuf::from("/tmp/nonexistent-zeroclaw-config-abc123.toml");
         let peer = SocketAddr::from(([127, 0, 0, 1], 12345));
         let result = handle_admin_reload_config(State(state), ConnectInfo(peer)).await;
-        let err = result.unwrap_err();
+        let Err(err) = result else { panic!("expected Err") };
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 }
