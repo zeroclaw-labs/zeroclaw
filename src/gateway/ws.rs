@@ -81,6 +81,7 @@ fn extract_ws_token<'a>(headers: &'a HeaderMap, query_token: Option<&'a str>) ->
 }
 
 /// GET /ws/chat — WebSocket upgrade for agent chat
+/// GET /ws/chat — WebSocket upgrade for agent chat
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
     Query(params): Query<WsQuery>,
@@ -99,20 +100,19 @@ pub async fn handle_ws_chat(
         }
     }
 
-    // Echo Sec-WebSocket-Protocol if the client requests our sub-protocol.
-    let ws = if headers
+    let session_id = params.session_id.clone();
+    
+    // Echo Sec-WebSocket-Protocol headers to satisfy the handshake requirements.
+    // This is necessary because some browsers (like Chrome) strictly require
+    // that the server echoes back the sub-protocols requested by the client.
+    let protocols = headers
         .get("sec-websocket-protocol")
         .and_then(|v| v.to_str().ok())
-        .map_or(false, |protos| {
-            protos.split(',').any(|p| p.trim() == WS_PROTOCOL)
-        }) {
-        ws.protocols([WS_PROTOCOL])
-    } else {
-        ws
-    };
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+        .unwrap_or_default();
 
-    let session_id = params.session_id.clone();
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id))
+    ws.protocols(protocols)
+        .on_upgrade(move |socket| handle_socket(socket, state, session_id))
         .into_response()
 }
 
