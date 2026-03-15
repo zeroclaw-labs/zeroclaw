@@ -212,14 +212,16 @@ impl AnthropicProvider {
         messages.iter().filter(|m| m.role != "system").count() > 4
     }
 
-    /// Apply cache control to the last message content block
+    /// Apply cache control to the last cacheable content block in the last message.
+    /// Walks backwards so trailing non-cacheable blocks (Image, ToolUse) are skipped.
     fn apply_cache_to_last_message(messages: &mut [NativeMessage]) {
         if let Some(last_msg) = messages.last_mut() {
-            if let Some(last_content) = last_msg.content.last_mut() {
-                match last_content {
+            for block in last_msg.content.iter_mut().rev() {
+                match block {
                     NativeContentOut::Text { cache_control, .. }
                     | NativeContentOut::ToolResult { cache_control, .. } => {
                         *cache_control = Some(CacheControl::ephemeral());
+                        return;
                     }
                     NativeContentOut::ToolUse { .. } | NativeContentOut::Image { .. } => {}
                 }
@@ -364,6 +366,11 @@ impl AnthropicProvider {
                     let (text, image_refs) = crate::multimodal::parse_image_markers(&msg.content);
                     let mut content_blocks: Vec<NativeContentOut> = Vec::new();
 
+                    // Image MIME types accepted by the Anthropic Vision API.
+                    // See: https://docs.anthropic.com/en/docs/build-with-claude/vision#faq
+                    const SUPPORTED_IMAGE_MEDIA_TYPES: [&str; 4] =
+                        ["image/jpeg", "image/png", "image/gif", "image/webp"];
+
                     // Add image content blocks for each image reference
                     for img_ref in &image_refs {
                         let (media_type, data) = if img_ref.starts_with("data:") {
@@ -372,6 +379,9 @@ impl AnthropicProvider {
                                 let header = &img_ref[5..comma];
                                 let mime =
                                     header.split(';').next().unwrap_or("image/jpeg").to_string();
+                                if !SUPPORTED_IMAGE_MEDIA_TYPES.contains(&mime.as_str()) {
+                                    continue;
+                                }
                                 let b64 = img_ref[comma + 1..].trim().to_string();
                                 (mime, b64)
                             } else {
@@ -530,40 +540,66 @@ impl Provider for AnthropicProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
+        let mut messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: message.to_string(),
+        }];
+        if let Some(sys) = system_prompt {
+            messages.insert(
+                0,
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: sys.to_string(),
+                },
+            );
+        }
+        self.chat_with_history(&messages, model, temperature).await
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
             )
         })?;
 
-        let request = ChatRequest {
+        let (system_prompt, mut native_messages) = Self::convert_messages(messages);
+
+        if Self::should_cache_conversation(messages) {
+            Self::apply_cache_to_last_message(&mut native_messages);
+        }
+
+        let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: 4096,
-            system: system_prompt.map(ToString::to_string),
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: message.to_string(),
-            }],
+            system: system_prompt,
+            messages: native_messages,
             temperature,
+            tools: None,
         };
 
-        let mut request = self
+        let req = self
             .http_client()
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&request);
+            .json(&native_request);
 
-        request = self.apply_auth(request, credential);
-
-        let response = request.send().await?;
-
+        let response = self.apply_auth(req, credential).send().await?;
         if !response.status().is_success() {
             return Err(super::api_error("Anthropic", response).await);
         }
 
-        let chat_response: ChatResponse = response.json().await?;
-        Self::parse_text_response(chat_response)
+        let native_response: NativeChatResponse = response.json().await?;
+        let parsed = Self::parse_native_response(native_response);
+        parsed
+            .text
+            .ok_or_else(|| anyhow::anyhow!("No text response from Anthropic"))
     }
 
     async fn chat(
