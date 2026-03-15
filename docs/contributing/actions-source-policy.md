@@ -62,6 +62,10 @@ gh api repos/zeroclaw-labs/zeroclaw/actions/permissions/selected-actions
 
 ## Change Log
 
+- 2026-03-12: Added musl cross-compilation dependencies for `aarch64-unknown-linux-musl` builds:
+    - Added PyPI dependency: `ziglang==0.15.2` (Zig toolchain for musl cross-compilation)
+    - Added crates.io dependency: `cargo-zigbuild==0.22.1` (Cargo subcommand wrapping Zig linker)
+    - Both pinned to exact versions in workflow matrix
 - 2026-03-10: Renamed workflows — CI → Quality Gate (`checks-on-pr.yml`), Beta Release → Release Beta (`release-beta-on-push.yml`), Promote Release → Release Stable (`release-stable-manual.yml`). Added `lint` and `security` jobs to Quality Gate. Added Cross-Platform Build (`cross-platform-build-manual.yml`).
 - 2026-03-05: Complete workflow overhaul — replaced 22 workflows with 3 (CI, Beta Release, Promote Release)
     - Removed patterns no longer in use: `DavidAnson/markdownlint-cli2-action@*`, `lycheeverse/lychee-action@*`, `EmbarkStudios/cargo-deny-action@*`, `rustsec/audit-check@*`, `rhysd/actionlint@*`, `sigstore/cosign-installer@*`, `Checkmarx/vorpal-reviewdog-github-action@*`, `useblacksmith/*`

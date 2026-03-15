@@ -167,6 +167,11 @@ jobs:
             cross_compiler: gcc-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
             linker: aarch64-linux-gnu-gcc
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact: zeroclaw
+            ext: tar.gz
+            use_zigbuild: true
           - os: macos-14
             target: aarch64-apple-darwin
             artifact: zeroclaw
@@ -200,6 +205,12 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ${{ matrix.cross_compiler }}
 
+      - name: Install cargo-zigbuild
+        if: matrix.use_zigbuild
+        run: |
+          pip3 install ziglang==0.15.2
+          cargo install cargo-zigbuild --version 0.22.1
+
       - name: Setup Android NDK
         if: matrix.ndk
         run: echo "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
@@ -207,10 +218,14 @@ jobs:
       - name: Build release
         shell: bash
         run: |
-          if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
-            export "${{ matrix.linker_env }}=${{ matrix.linker }}"
+          if [ "${{ matrix.use_zigbuild || '' }}" = "true" ]; then
+            cargo zigbuild --release --locked --target ${{ matrix.target }}
+          else
+            if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
+              export "${{ matrix.linker_env }}=${{ matrix.linker }}"
+            fi
+            cargo build --release --locked --target ${{ matrix.target }}
           fi
-          cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
