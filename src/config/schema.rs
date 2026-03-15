@@ -1423,6 +1423,10 @@ pub struct HttpRequestConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_http_timeout_secs")]
     pub timeout_secs: u64,
+    /// Allow requests to private/LAN hosts (RFC 1918, loopback, link-local, .local).
+    /// Default: false (deny private hosts for SSRF protection).
+    #[serde(default)]
+    pub allow_private_hosts: bool,
 }
 
 impl Default for HttpRequestConfig {
@@ -1432,6 +1436,7 @@ impl Default for HttpRequestConfig {
             allowed_domains: vec![],
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
+            allow_private_hosts: false,
         }
     }
 }
