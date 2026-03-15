@@ -312,6 +312,7 @@ struct ChannelRuntimeContext {
     non_cli_excluded_tools: Arc<Vec<String>>,
     tool_call_dedup_exempt: Arc<Vec<String>>,
     model_routes: Arc<Vec<crate::config::ModelRouteConfig>>,
+    query_classification: crate::config::QueryClassificationConfig,
     ack_reactions: bool,
     show_tool_calls: bool,
     session_store: Option<Arc<session_store::SessionStore>>,
@@ -1792,7 +1793,31 @@ async fn process_channel_message(
     }
 
     let history_key = conversation_history_key(&msg);
-    let route = get_route_selection(ctx.as_ref(), &history_key);
+    let mut route = get_route_selection(ctx.as_ref(), &history_key);
+
+    // ── Query classification: override route when a rule matches ──
+    if let Some(hint) = crate::agent::classifier::classify(&ctx.query_classification, &msg.content)
+    {
+        if let Some(matched_route) = ctx
+            .model_routes
+            .iter()
+            .find(|r| r.hint.eq_ignore_ascii_case(&hint))
+        {
+            tracing::info!(
+                target: "query_classification",
+                hint = hint.as_str(),
+                provider = matched_route.provider.as_str(),
+                model = matched_route.model.as_str(),
+                channel = %msg.channel,
+                "Channel message classified — overriding route"
+            );
+            route = ChannelRouteSelection {
+                provider: matched_route.provider.clone(),
+                model: matched_route.model.clone(),
+            };
+        }
+    }
+
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
         Ok(provider) => provider,
@@ -3843,6 +3868,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
         tool_call_dedup_exempt: Arc::new(config.agent.tool_call_dedup_exempt.clone()),
         model_routes: Arc::new(config.model_routes.clone()),
+        query_classification: config.query_classification.clone(),
         ack_reactions: config.channels_config.ack_reactions,
         show_tool_calls: config.channels_config.show_tool_calls,
         session_store: if config.channels_config.session_persistence {
@@ -4145,6 +4171,7 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -4252,6 +4279,7 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -4315,6 +4343,7 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -4836,6 +4865,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -4907,6 +4937,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -4992,6 +5023,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -5062,6 +5094,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -5142,6 +5175,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -5242,6 +5276,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -5324,6 +5359,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -5421,6 +5457,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -5503,6 +5540,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -5575,6 +5613,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -5758,6 +5797,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -5849,6 +5889,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -5961,6 +6002,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            query_classification: crate::config::QueryClassificationConfig::default(),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -6058,6 +6100,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -6143,6 +6186,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -6213,6 +6257,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -6841,6 +6886,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -6937,6 +6983,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -7033,6 +7080,7 @@ BTC is currently around $65,000 based on latest tool output."#
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -7593,6 +7641,7 @@ This is an example JSON object for profile settings."#;
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -7670,6 +7719,7 @@ This is an example JSON object for profile settings."#;
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
@@ -7753,6 +7803,408 @@ This is an example JSON object for profile settings."#;
             }
             Ok(_) => panic!("should fail for unknown channel"),
         }
+    }
+
+    // ── Query classification in channel message processing ─────────
+
+    #[tokio::test]
+    async fn process_channel_message_applies_query_classification_route() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let default_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let default_provider: Arc<dyn Provider> = default_provider_impl.clone();
+        let vision_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let vision_provider: Arc<dyn Provider> = vision_provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
+        provider_cache_seed.insert("vision-provider".to_string(), vision_provider);
+
+        let classification_config = crate::config::QueryClassificationConfig {
+            enabled: true,
+            rules: vec![crate::config::schema::ClassificationRule {
+                hint: "vision".into(),
+                keywords: vec!["analyze-image".into()],
+                ..Default::default()
+            }],
+        };
+
+        let model_routes = vec![crate::config::ModelRouteConfig {
+            hint: "vision".into(),
+            provider: "vision-provider".into(),
+            model: "gpt-4-vision".into(),
+            api_key: None,
+        }];
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&default_provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(model_routes),
+            query_classification: classification_config,
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-qc-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "please analyze-image from the dataset".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        // Vision provider should have been called instead of the default.
+        assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
+        assert_eq!(vision_provider_impl.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            vision_provider_impl
+                .models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &["gpt-4-vision".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_classification_disabled_uses_default_route() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let default_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let default_provider: Arc<dyn Provider> = default_provider_impl.clone();
+        let vision_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let vision_provider: Arc<dyn Provider> = vision_provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
+        provider_cache_seed.insert("vision-provider".to_string(), vision_provider);
+
+        // Classification is disabled — matching keyword should NOT trigger reroute.
+        let classification_config = crate::config::QueryClassificationConfig {
+            enabled: false,
+            rules: vec![crate::config::schema::ClassificationRule {
+                hint: "vision".into(),
+                keywords: vec!["analyze-image".into()],
+                ..Default::default()
+            }],
+        };
+
+        let model_routes = vec![crate::config::ModelRouteConfig {
+            hint: "vision".into(),
+            provider: "vision-provider".into(),
+            model: "gpt-4-vision".into(),
+            api_key: None,
+        }];
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&default_provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(model_routes),
+            query_classification: classification_config,
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-qc-disabled".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "please analyze-image from the dataset".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        // Default provider should be used since classification is disabled.
+        assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(vision_provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_classification_no_match_uses_default_route() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let default_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let default_provider: Arc<dyn Provider> = default_provider_impl.clone();
+        let vision_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let vision_provider: Arc<dyn Provider> = vision_provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
+        provider_cache_seed.insert("vision-provider".to_string(), vision_provider);
+
+        // Classification enabled with a rule that won't match the message.
+        let classification_config = crate::config::QueryClassificationConfig {
+            enabled: true,
+            rules: vec![crate::config::schema::ClassificationRule {
+                hint: "vision".into(),
+                keywords: vec!["analyze-image".into()],
+                ..Default::default()
+            }],
+        };
+
+        let model_routes = vec![crate::config::ModelRouteConfig {
+            hint: "vision".into(),
+            provider: "vision-provider".into(),
+            model: "gpt-4-vision".into(),
+            api_key: None,
+        }];
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&default_provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(model_routes),
+            query_classification: classification_config,
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-qc-nomatch".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "just a regular text message".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        // Default provider should be used since no classification rule matched.
+        assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(vision_provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_classification_priority_selects_highest() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let default_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let default_provider: Arc<dyn Provider> = default_provider_impl.clone();
+        let fast_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let fast_provider: Arc<dyn Provider> = fast_provider_impl.clone();
+        let code_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let code_provider: Arc<dyn Provider> = code_provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
+        provider_cache_seed.insert("fast-provider".to_string(), fast_provider);
+        provider_cache_seed.insert("code-provider".to_string(), code_provider);
+
+        // Both rules match "code" keyword, but "code" rule has higher priority.
+        let classification_config = crate::config::QueryClassificationConfig {
+            enabled: true,
+            rules: vec![
+                crate::config::schema::ClassificationRule {
+                    hint: "fast".into(),
+                    keywords: vec!["code".into()],
+                    priority: 1,
+                    ..Default::default()
+                },
+                crate::config::schema::ClassificationRule {
+                    hint: "code".into(),
+                    keywords: vec!["code".into()],
+                    priority: 10,
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let model_routes = vec![
+            crate::config::ModelRouteConfig {
+                hint: "fast".into(),
+                provider: "fast-provider".into(),
+                model: "fast-model".into(),
+                api_key: None,
+            },
+            crate::config::ModelRouteConfig {
+                hint: "code".into(),
+                provider: "code-provider".into(),
+                model: "code-model".into(),
+                api_key: None,
+            },
+        ];
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&default_provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(model_routes),
+            query_classification: classification_config,
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-qc-prio".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "write some code for me".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        // Higher-priority "code" rule (priority=10) should win over "fast" (priority=1).
+        assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
+        assert_eq!(fast_provider_impl.call_count.load(Ordering::SeqCst), 0);
+        assert_eq!(code_provider_impl.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            code_provider_impl
+                .models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &["code-model".to_string()]
+        );
     }
 
     #[test]
