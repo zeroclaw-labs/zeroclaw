@@ -201,7 +201,7 @@ export class MoAClient {
   async logout(): Promise<void> {
     if (this.token) {
       try {
-        await fetch(`${this.serverUrl}/api/auth/logout`, {
+        await fetch(`${this.relayUrl}/api/auth/logout`, {
           method: "POST",
           headers: { Authorization: `Bearer ${this.token}` },
         });
@@ -231,7 +231,7 @@ export class MoAClient {
   async getDevices(): Promise<DeviceInfo[]> {
     if (!this.token) return [];
 
-    const res = await fetch(`${this.serverUrl}/api/auth/devices`, {
+    const res = await fetch(`${this.relayUrl}/api/auth/devices`, {
       headers: { Authorization: `Bearer ${this.token}` },
     });
 
@@ -250,7 +250,7 @@ export class MoAClient {
   async registerDevice(deviceName: string, platform?: string): Promise<void> {
     if (!this.token) return;
 
-    await fetch(`${this.serverUrl}/api/auth/devices`, {
+    await fetch(`${this.relayUrl}/api/auth/devices`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -267,7 +267,7 @@ export class MoAClient {
   async setDevicePairingCode(deviceId: string, code: string | null): Promise<void> {
     if (!this.token) throw new Error("Not authenticated");
 
-    const res = await fetch(`${this.serverUrl}/api/auth/devices/${deviceId}/pairing-code`, {
+    const res = await fetch(`${this.relayUrl}/api/auth/devices/${deviceId}/pairing-code`, {
       method: "PUT",
       headers: {
         "Content-Type": "application/json",
@@ -285,7 +285,7 @@ export class MoAClient {
   async verifyDevicePairing(deviceId: string, code: string): Promise<boolean> {
     if (!this.token) throw new Error("Not authenticated");
 
-    const res = await fetch(`${this.serverUrl}/api/auth/devices/${deviceId}/verify-pairing`, {
+    const res = await fetch(`${this.relayUrl}/api/auth/devices/${deviceId}/verify-pairing`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -329,7 +329,7 @@ export class MoAClient {
   private async sendHeartbeat(): Promise<void> {
     if (!this.token) return;
     try {
-      await fetch(`${this.serverUrl}/api/auth/heartbeat`, {
+      await fetch(`${this.relayUrl}/api/auth/heartbeat`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -351,7 +351,7 @@ export class MoAClient {
       throw new Error("Not authenticated. Please login first.");
     }
 
-    const res = await fetch(`${this.serverUrl}/api/chat`, {
+    const res = await fetch(`${this.relayUrl}/api/chat`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
