@@ -22,10 +22,24 @@ if [ "$(id -u)" = "0" ]; then
 
     # Seed default config if none exists (first deploy with fresh volume).
     if [ ! -f "${ZEROCLAW_DIR}/config.toml" ]; then
-        printf 'default_temperature = 0.7\n\n[gateway]\nallow_public_bind = true\n' \
-            > "${ZEROCLAW_DIR}/config.toml"
+        cat > "${ZEROCLAW_DIR}/config.toml" <<'TOML'
+default_temperature = 0.7
+
+[gateway]
+allow_public_bind = true
+
+[auth]
+enabled = true
+allow_registration = true
+TOML
         chown zeroclaw:zeroclaw "${ZEROCLAW_DIR}/config.toml"
         chmod 600 "${ZEROCLAW_DIR}/config.toml"
+    fi
+
+    # Ensure [auth] section exists in config (upgrade path for existing deploys).
+    if ! grep -q '^\[auth\]' "${ZEROCLAW_DIR}/config.toml" 2>/dev/null; then
+        printf '\n[auth]\nenabled = true\nallow_registration = true\n' \
+            >> "${ZEROCLAW_DIR}/config.toml"
     fi
 
     # Drop to zeroclaw user and exec the command.
