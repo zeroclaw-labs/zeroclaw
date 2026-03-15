@@ -765,7 +765,7 @@ Max Concurrent: 5 (Wave 1)
   - Message: `feat(firmware): add capability registration and lifecycle`
   - Files: `firmware/esp32-node/src/main.cpp`
 
-- [ ] 13. Berry Script VM 集成（ESP32）
+- [x] 13. Berry Script VM 集成（ESP32）
 
   **What to do**:
   - 集成 Berry Script VM 到 ESP32 固件

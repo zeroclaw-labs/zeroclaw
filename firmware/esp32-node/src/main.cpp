@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include "berry_vm.h"
 
 const char* ssid = "SSID";
 const char* password = "PASSWORD";
@@ -195,6 +196,7 @@ void reconnect() {
 
 void setup() {
   Serial.begin(115200);
+  berry_init();
   setup_wifi();
   client.setServer(mqtt_server, 1883);
   client.setCallback(callback);
