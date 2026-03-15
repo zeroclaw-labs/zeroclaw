@@ -483,7 +483,14 @@ enum ConfigCommands {
     /// Dump the full configuration JSON Schema to stdout
     Schema,
     /// Hot-reload config from disk into the running gateway
-    Reload,
+    Reload {
+        /// Gateway port (defaults to config gateway.port)
+        #[arg(short, long)]
+        port: Option<u16>,
+        /// Gateway host (defaults to config gateway.host)
+        #[arg(long)]
+        host: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1218,9 +1225,9 @@ async fn main() -> Result<()> {
                 );
                 Ok(())
             }
-            ConfigCommands::Reload => {
-                let port = config.gateway.port;
-                let host = &config.gateway.host;
+            ConfigCommands::Reload { port, host } => {
+                let port = port.unwrap_or(config.gateway.port);
+                let host = host.as_deref().unwrap_or(&config.gateway.host);
                 reload_config(host, port).await
             }
         },

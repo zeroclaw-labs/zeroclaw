@@ -1689,6 +1689,9 @@ async fn handle_admin_reload_config(
     })?;
     new_config.apply_env_overrides();
 
+    // Atomic swap: in-flight requests that already hold a config clone see the
+    // old values until their next lock. Concurrent reload requests are serialised
+    // by the Mutex — last writer wins, which is acceptable for CLI-driven reloads.
     *state.config.lock() = new_config;
     tracing::info!("✅ Config reloaded from disk successfully");
 
