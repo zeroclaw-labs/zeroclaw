@@ -1461,20 +1461,25 @@ async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
 
 /// Hot-reload config on a running gateway via the admin endpoint.
 async fn reload_config(host: &str, port: u16) -> Result<()> {
-    // Only allow loopback targets — this is an admin endpoint that must never
-    // be directed at arbitrary hosts (SSRF prevention).
-    let is_loopback = host == "127.0.0.1"
-        || host == "::1"
-        || host == "localhost"
-        || host == "[::1]";
+    // Admin endpoints are localhost-only (enforced server-side by
+    // require_localhost). This client-side check prevents accidentally
+    // sending credentials or config data to a non-loopback address when
+    // the user provides a bad --host value.
+    let is_loopback = host == "localhost"
+        || host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .or(Some(host))
+            .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback());
     if !is_loopback {
         anyhow::bail!(
             "Refusing to send admin request to non-loopback host '{host}'. \
-             Only localhost/127.0.0.1/::1 are allowed."
+             Only loopback addresses (127.0.0.0/8, ::1) and 'localhost' are allowed."
         );
     }
 
-    // Bracket IPv6 addresses for valid URL construction (http://[::1]:port).
+    // Bracket bare IPv6 addresses for valid URL construction (http://[::1]:port).
     let authority = if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]:{port}")
     } else {
