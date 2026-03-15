@@ -826,7 +826,9 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
         mask_optional_secret(&mut webhook.secret);
     }
     if let Some(matrix) = masked.channels_config.matrix.as_mut() {
-        mask_required_secret(&mut matrix.access_token);
+        mask_optional_secret(&mut matrix.access_token);
+        mask_optional_secret(&mut matrix.password);
+        mask_optional_secret(&mut matrix.recovery_key);
     }
     if let Some(whatsapp) = masked.channels_config.whatsapp.as_mut() {
         mask_optional_secret(&mut whatsapp.access_token);
@@ -965,7 +967,9 @@ fn restore_masked_sensitive_fields(
         incoming.channels_config.matrix.as_mut(),
         current.channels_config.matrix.as_ref(),
     ) {
-        restore_required_secret(&mut incoming_ch.access_token, &current_ch.access_token);
+        restore_optional_secret(&mut incoming_ch.access_token, &current_ch.access_token);
+        restore_optional_secret(&mut incoming_ch.password, &current_ch.password);
+        restore_optional_secret(&mut incoming_ch.recovery_key, &current_ch.recovery_key);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.whatsapp.as_mut(),

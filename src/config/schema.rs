@@ -3415,7 +3415,9 @@ pub struct MatrixConfig {
     /// Matrix homeserver URL (e.g. `"https://matrix.org"`).
     pub homeserver: String,
     /// Matrix access token for the bot account.
-    pub access_token: String,
+    /// Required when using access-token login; auto-populated when using password login.
+    #[serde(default)]
+    pub access_token: Option<String>,
     /// Optional Matrix user ID (e.g. `"@bot:matrix.org"`).
     #[serde(default)]
     pub user_id: Option<String>,
@@ -3426,6 +3428,16 @@ pub struct MatrixConfig {
     pub room_id: String,
     /// Allowed Matrix user IDs. Empty = deny all.
     pub allowed_users: Vec<String>,
+    /// Optional Matrix account password for password-based login.
+    /// When set (along with `user_id`), the bot logs in with password instead of a
+    /// pre-existing access token. The resulting access token is managed automatically.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Optional E2EE recovery key (also called "security key") for decrypting
+    /// room history in encrypted rooms. When provided, the bot imports the key
+    /// backup after login so it can read messages from before its session started.
+    #[serde(default)]
+    pub recovery_key: Option<String>,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -4750,10 +4762,20 @@ impl Config {
                 )?;
             }
             if let Some(ref mut mx) = config.channels_config.matrix {
-                decrypt_secret(
+                decrypt_optional_secret(
                     &store,
                     &mut mx.access_token,
                     "config.channels_config.matrix.access_token",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut mx.password,
+                    "config.channels_config.matrix.password",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut mx.recovery_key,
+                    "config.channels_config.matrix.recovery_key",
                 )?;
             }
             if let Some(ref mut wa) = config.channels_config.whatsapp {
@@ -5677,10 +5699,20 @@ impl Config {
             )?;
         }
         if let Some(ref mut mx) = config_to_save.channels_config.matrix {
-            encrypt_secret(
+            encrypt_optional_secret(
                 &store,
                 &mut mx.access_token,
                 "config.channels_config.matrix.access_token",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut mx.password,
+                "config.channels_config.matrix.password",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut mx.recovery_key,
+                "config.channels_config.matrix.recovery_key",
             )?;
         }
         if let Some(ref mut wa) = config_to_save.channels_config.whatsapp {
@@ -6838,16 +6870,18 @@ tool_dispatcher = "xml"
     async fn matrix_config_serde() {
         let mc = MatrixConfig {
             homeserver: "https://matrix.org".into(),
-            access_token: "syt_token_abc".into(),
+            access_token: Some("syt_token_abc".into()),
             user_id: Some("@bot:matrix.org".into()),
             device_id: Some("DEVICE123".into()),
             room_id: "!room123:matrix.org".into(),
             allowed_users: vec!["@user:matrix.org".into()],
+            password: None,
+            recovery_key: None,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.homeserver, "https://matrix.org");
-        assert_eq!(parsed.access_token, "syt_token_abc");
+        assert_eq!(parsed.access_token.as_deref(), Some("syt_token_abc"));
         assert_eq!(parsed.user_id.as_deref(), Some("@bot:matrix.org"));
         assert_eq!(parsed.device_id.as_deref(), Some("DEVICE123"));
         assert_eq!(parsed.room_id, "!room123:matrix.org");
@@ -6858,11 +6892,13 @@ tool_dispatcher = "xml"
     async fn matrix_config_toml_roundtrip() {
         let mc = MatrixConfig {
             homeserver: "https://synapse.local:8448".into(),
-            access_token: "tok".into(),
+            access_token: Some("tok".into()),
             user_id: None,
             device_id: None,
             room_id: "!abc:synapse.local".into(),
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
+            password: None,
+            recovery_key: None,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -6883,6 +6919,27 @@ allowed_users = ["@ops:matrix.org"]
         assert_eq!(parsed.homeserver, "https://matrix.org");
         assert!(parsed.user_id.is_none());
         assert!(parsed.device_id.is_none());
+        assert!(parsed.password.is_none());
+        assert!(parsed.recovery_key.is_none());
+    }
+
+    #[test]
+    async fn matrix_config_password_login_fields() {
+        let mc = MatrixConfig {
+            homeserver: "https://matrix.org".into(),
+            access_token: None,
+            user_id: Some("@bot:matrix.org".into()),
+            device_id: None,
+            room_id: "!room:matrix.org".into(),
+            allowed_users: vec!["*".into()],
+            password: Some("hunter2".into()),
+            recovery_key: Some("EsT0 Abcd Efgh Ijkl".into()),
+        };
+        let json = serde_json::to_string(&mc).unwrap();
+        let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
+        assert!(parsed.access_token.is_none());
+        assert_eq!(parsed.password.as_deref(), Some("hunter2"));
+        assert_eq!(parsed.recovery_key.as_deref(), Some("EsT0 Abcd Efgh Ijkl"));
     }
 
     #[test]
@@ -6947,11 +7004,13 @@ allowed_users = ["@ops:matrix.org"]
             }),
             matrix: Some(MatrixConfig {
                 homeserver: "https://m.org".into(),
-                access_token: "tok".into(),
+                access_token: Some("tok".into()),
                 user_id: None,
                 device_id: None,
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
+                password: None,
+                recovery_key: None,
             }),
             signal: None,
             whatsapp: None,

@@ -29,11 +29,13 @@ use tokio::sync::{mpsc, Mutex, OnceCell, RwLock};
 #[derive(Clone)]
 pub struct MatrixChannel {
     homeserver: String,
-    access_token: String,
+    access_token: Option<String>,
     room_id: String,
     allowed_users: Vec<String>,
     session_owner_hint: Option<String>,
     session_device_id_hint: Option<String>,
+    password: Option<String>,
+    recovery_key: Option<String>,
     zeroclaw_dir: Option<PathBuf>,
     resolved_room_id_cache: Arc<RwLock<Option<String>>>,
     sdk_client: Arc<OnceCell<MatrixSdkClient>>,
@@ -117,7 +119,7 @@ impl MatrixChannel {
 
     pub fn new(
         homeserver: String,
-        access_token: String,
+        access_token: Option<String>,
         room_id: String,
         allowed_users: Vec<String>,
     ) -> Self {
@@ -126,13 +128,13 @@ impl MatrixChannel {
 
     pub fn new_with_session_hint(
         homeserver: String,
-        access_token: String,
+        access_token: Option<String>,
         room_id: String,
         allowed_users: Vec<String>,
         owner_hint: Option<String>,
         device_id_hint: Option<String>,
     ) -> Self {
-        Self::new_with_session_hint_and_zeroclaw_dir(
+        Self::new_full(
             homeserver,
             access_token,
             room_id,
@@ -140,20 +142,49 @@ impl MatrixChannel {
             owner_hint,
             device_id_hint,
             None,
+            None,
+            None,
         )
     }
 
     pub fn new_with_session_hint_and_zeroclaw_dir(
         homeserver: String,
-        access_token: String,
+        access_token: Option<String>,
         room_id: String,
         allowed_users: Vec<String>,
         owner_hint: Option<String>,
         device_id_hint: Option<String>,
         zeroclaw_dir: Option<PathBuf>,
     ) -> Self {
+        Self::new_full(
+            homeserver,
+            access_token,
+            room_id,
+            allowed_users,
+            owner_hint,
+            device_id_hint,
+            None,
+            None,
+            zeroclaw_dir,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_full(
+        homeserver: String,
+        access_token: Option<String>,
+        room_id: String,
+        allowed_users: Vec<String>,
+        owner_hint: Option<String>,
+        device_id_hint: Option<String>,
+        password: Option<String>,
+        recovery_key: Option<String>,
+        zeroclaw_dir: Option<PathBuf>,
+    ) -> Self {
         let homeserver = homeserver.trim_end_matches('/').to_string();
-        let access_token = access_token.trim().to_string();
+        let access_token = access_token
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
         let room_id = room_id.trim().to_string();
         let allowed_users = allowed_users
             .into_iter()
@@ -168,6 +199,8 @@ impl MatrixChannel {
             allowed_users,
             session_owner_hint: Self::normalize_optional_field(owner_hint),
             session_device_id_hint: Self::normalize_optional_field(device_id_hint),
+            password: Self::normalize_optional_field(password),
+            recovery_key: Self::normalize_optional_field(recovery_key),
             zeroclaw_dir,
             resolved_room_id_cache: Arc::new(RwLock::new(None)),
             sdk_client: Arc::new(OnceCell::new()),
@@ -199,7 +232,16 @@ impl MatrixChannel {
     }
 
     fn auth_header_value(&self) -> String {
-        format!("Bearer {}", self.access_token)
+        match self.access_token.as_deref() {
+            Some(token) => format!("Bearer {token}"),
+            None => String::new(),
+        }
+    }
+
+    /// Returns true when the channel is configured for password-based login
+    /// (user_id + password present, no access_token).
+    fn uses_password_login(&self) -> bool {
+        self.access_token.is_none() && self.password.is_some() && self.session_owner_hint.is_some()
     }
 
     fn matrix_store_dir(&self) -> Option<PathBuf> {
@@ -287,106 +329,233 @@ impl MatrixChannel {
         Ok(self.get_my_identity().await?.user_id)
     }
 
+    /// Build (or reuse) the SDK client.
+    ///
+    /// Two login strategies are supported:
+    ///
+    /// 1. **Access-token restore** (legacy) — requires `access_token` plus
+    ///    user_id/device_id from config hints or whoami.
+    /// 2. **Password login** — requires `user_id` + `password`.  An optional
+    ///    `device_id` hint reuses an existing device; otherwise the homeserver
+    ///    allocates a new one.  After login an optional `recovery_key` is used
+    ///    to import E2EE room-key backups.
     async fn matrix_client(&self) -> anyhow::Result<MatrixSdkClient> {
         let client = self
             .sdk_client
             .get_or_try_init(|| async {
-                let identity = self.get_my_identity().await;
-                let whoami = match identity {
-                    Ok(whoami) => Some(whoami),
-                    Err(error) => {
-                        if self.session_owner_hint.is_some() && self.session_device_id_hint.is_some()
-                        {
-                            tracing::warn!(
-                                "Matrix whoami failed; falling back to configured session hints for E2EE session restore: {error}"
-                            );
-                            None
-                        } else {
-                            return Err(error);
-                        }
-                    }
-                };
-
-                let resolved_user_id = if let Some(whoami) = whoami.as_ref() {
-                    if let Some(hinted) = self.session_owner_hint.as_ref() {
-                        if hinted != &whoami.user_id {
-                            tracing::warn!(
-                                "Matrix configured user_id '{}' does not match whoami '{}'; using whoami.",
-                                crate::security::redact(hinted),
-                                crate::security::redact(&whoami.user_id)
-                            );
-                        }
-                    }
-                    whoami.user_id.clone()
+                if self.uses_password_login() {
+                    self.init_client_password_login().await
                 } else {
-                    self.session_owner_hint.clone().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Matrix session restore requires user_id when whoami is unavailable"
-                        )
-                    })?
-                };
-
-                let resolved_device_id = match (whoami.as_ref(), self.session_device_id_hint.as_ref()) {
-                    (Some(whoami), Some(hinted)) => {
-                        if let Some(whoami_device_id) = whoami.device_id.as_ref() {
-                            if whoami_device_id != hinted {
-                                tracing::warn!(
-                                    "Matrix configured device_id '{}' does not match whoami '{}'; using whoami.",
-                                    crate::security::redact(hinted),
-                                    crate::security::redact(whoami_device_id)
-                                );
-                            }
-                            whoami_device_id.clone()
-                        } else {
-                            hinted.clone()
-                        }
-                    }
-                    (Some(whoami), None) => whoami.device_id.clone().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Matrix whoami response did not include device_id. Set channels.matrix.device_id to enable E2EE session restore."
-                        )
-                    })?,
-                    (None, Some(hinted)) => hinted.clone(),
-                    (None, None) => {
-                        return Err(anyhow::anyhow!(
-                            "Matrix E2EE session restore requires device_id when whoami is unavailable"
-                        ));
-                    }
-                };
-
-                let mut client_builder = MatrixSdkClient::builder().homeserver_url(&self.homeserver);
-
-                if let Some(store_dir) = self.matrix_store_dir() {
-                    tokio::fs::create_dir_all(&store_dir).await.map_err(|error| {
-                        anyhow::anyhow!(
-                            "Matrix failed to initialize persistent store directory at '{}': {error}",
-                            store_dir.display()
-                        )
-                    })?;
-                    client_builder = client_builder.sqlite_store(&store_dir, None);
+                    self.init_client_access_token().await
                 }
-
-                let client = client_builder.build().await?;
-
-                let user_id: OwnedUserId = resolved_user_id.parse()?;
-                let session = MatrixSession {
-                    meta: SessionMeta {
-                        user_id,
-                        device_id: resolved_device_id.into(),
-                    },
-                    tokens: SessionTokens {
-                        access_token: self.access_token.clone(),
-                        refresh_token: None,
-                    },
-                };
-
-                client.restore_session(session).await?;
-
-                Ok::<MatrixSdkClient, anyhow::Error>(client)
             })
             .await?;
 
         Ok(client.clone())
+    }
+
+    /// Password-based login: `user_id` + `password` are required.
+    /// Optionally reuses a `device_id` from config; the homeserver allocates
+    /// one when absent.  After login the recovery key (if provided) is used
+    /// to pull E2EE room-key backups.
+    async fn init_client_password_login(&self) -> anyhow::Result<MatrixSdkClient> {
+        let user_id_str = self.session_owner_hint.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("Matrix password login requires user_id to be set in the config")
+        })?;
+        let password = self.password.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("Matrix password login requires password to be set in the config")
+        })?;
+
+        let mut client_builder = MatrixSdkClient::builder().homeserver_url(&self.homeserver);
+        if let Some(store_dir) = self.matrix_store_dir() {
+            tokio::fs::create_dir_all(&store_dir)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Matrix failed to initialize persistent store directory at '{}': {error}",
+                        store_dir.display()
+                    )
+                })?;
+            client_builder = client_builder.sqlite_store(&store_dir, None);
+        }
+        let client = client_builder.build().await?;
+
+        // Extract the localpart from a full user_id (@user:server) for the
+        // login call; matrix-sdk expects the localpart only.
+        let localpart = user_id_str
+            .strip_prefix('@')
+            .and_then(|rest| rest.split(':').next())
+            .unwrap_or(user_id_str);
+
+        let mut login_builder = client.matrix_auth().login_username(localpart, password);
+
+        // Reuse an existing device_id when the user configured one.
+        let device_id_hint = self.session_device_id_hint.clone();
+        if let Some(ref device_id) = device_id_hint {
+            login_builder = login_builder.device_id(device_id);
+        }
+
+        let login_response = login_builder
+            .initial_device_display_name("ZeroClaw")
+            .await
+            .map_err(|error| anyhow::anyhow!("Matrix password login failed: {error}"))?;
+
+        tracing::info!(
+            "Matrix password login succeeded for user '{}', device '{}'",
+            crate::security::redact(login_response.user_id.as_str()),
+            crate::security::redact(login_response.device_id.as_str()),
+        );
+
+        if let Some(ref hinted) = device_id_hint {
+            if hinted != login_response.device_id.as_str() {
+                tracing::warn!(
+                    "Matrix password login returned a different device_id ('{}') than the configured hint ('{}'); a new device was created. Update channels.matrix.device_id to '{}' to reuse this device on next restart.",
+                    crate::security::redact(login_response.device_id.as_str()),
+                    crate::security::redact(hinted),
+                    crate::security::redact(login_response.device_id.as_str()),
+                );
+            }
+        }
+
+        // Recovery key: import E2EE room-key backups so the bot can decrypt
+        // historical messages in encrypted rooms.
+        if let Some(ref recovery_key) = self.recovery_key {
+            tracing::info!("Matrix recovery key provided; importing E2EE room-key backup...");
+            match client.encryption().recovery().recover(recovery_key).await {
+                Ok(()) => {
+                    tracing::info!(
+                        "Matrix E2EE room-key backup imported successfully via recovery key."
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Matrix recovery key import failed (E2EE history may be incomplete): {error}"
+                    );
+                }
+            }
+        }
+
+        Ok(client)
+    }
+
+    /// Access-token-based session restore (the original flow).
+    async fn init_client_access_token(&self) -> anyhow::Result<MatrixSdkClient> {
+        let access_token = self.access_token.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Matrix channel requires either an access_token or a user_id + password for login"
+            )
+        })?;
+
+        let identity = self.get_my_identity().await;
+        let whoami = match identity {
+            Ok(whoami) => Some(whoami),
+            Err(error) => {
+                if self.session_owner_hint.is_some() && self.session_device_id_hint.is_some() {
+                    tracing::warn!(
+                        "Matrix whoami failed; falling back to configured session hints for E2EE session restore: {error}"
+                    );
+                    None
+                } else {
+                    return Err(error);
+                }
+            }
+        };
+
+        let resolved_user_id = if let Some(whoami) = whoami.as_ref() {
+            if let Some(hinted) = self.session_owner_hint.as_ref() {
+                if hinted != &whoami.user_id {
+                    tracing::warn!(
+                        "Matrix configured user_id '{}' does not match whoami '{}'; using whoami.",
+                        crate::security::redact(hinted),
+                        crate::security::redact(&whoami.user_id)
+                    );
+                }
+            }
+            whoami.user_id.clone()
+        } else {
+            self.session_owner_hint.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Matrix session restore requires user_id when whoami is unavailable"
+                )
+            })?
+        };
+
+        let resolved_device_id = match (whoami.as_ref(), self.session_device_id_hint.as_ref()) {
+            (Some(whoami), Some(hinted)) => {
+                if let Some(whoami_device_id) = whoami.device_id.as_ref() {
+                    if whoami_device_id != hinted {
+                        tracing::warn!(
+                            "Matrix configured device_id '{}' does not match whoami '{}'; using whoami.",
+                            crate::security::redact(hinted),
+                            crate::security::redact(whoami_device_id)
+                        );
+                    }
+                    whoami_device_id.clone()
+                } else {
+                    hinted.clone()
+                }
+            }
+            (Some(whoami), None) => whoami.device_id.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Matrix whoami response did not include device_id. Set channels.matrix.device_id to enable E2EE session restore."
+                )
+            })?,
+            (None, Some(hinted)) => hinted.clone(),
+            (None, None) => {
+                return Err(anyhow::anyhow!(
+                    "Matrix E2EE session restore requires device_id when whoami is unavailable"
+                ));
+            }
+        };
+
+        let mut client_builder = MatrixSdkClient::builder().homeserver_url(&self.homeserver);
+
+        if let Some(store_dir) = self.matrix_store_dir() {
+            tokio::fs::create_dir_all(&store_dir)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Matrix failed to initialize persistent store directory at '{}': {error}",
+                        store_dir.display()
+                    )
+                })?;
+            client_builder = client_builder.sqlite_store(&store_dir, None);
+        }
+
+        let client = client_builder.build().await?;
+
+        let user_id: OwnedUserId = resolved_user_id.parse()?;
+        let session = MatrixSession {
+            meta: SessionMeta {
+                user_id,
+                device_id: resolved_device_id.into(),
+            },
+            tokens: SessionTokens {
+                access_token,
+                refresh_token: None,
+            },
+        };
+
+        client.restore_session(session).await?;
+
+        // Recovery key: also supported in access-token mode.
+        if let Some(ref recovery_key) = self.recovery_key {
+            tracing::info!("Matrix recovery key provided; importing E2EE room-key backup...");
+            match client.encryption().recovery().recover(recovery_key).await {
+                Ok(()) => {
+                    tracing::info!(
+                        "Matrix E2EE room-key backup imported successfully via recovery key."
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Matrix recovery key import failed (E2EE history may be incomplete): {error}"
+                    );
+                }
+            }
+        }
+
+        Ok(client)
     }
 
     async fn resolve_room_id(&self) -> anyhow::Result<String> {
@@ -777,7 +946,10 @@ impl Channel for MatrixChannel {
                     let client = reqwest::Client::new();
                     match client
                         .get(&url)
-                        .header("Authorization", format!("Bearer {}", access_token))
+                        .header(
+                            "Authorization",
+                            format!("Bearer {}", access_token.as_deref().unwrap_or_default()),
+                        )
                         .send()
                         .await
                     {
@@ -1115,7 +1287,7 @@ mod tests {
     fn make_channel() -> MatrixChannel {
         MatrixChannel::new(
             "https://matrix.org".to_string(),
-            "syt_test_token".to_string(),
+            Some("syt_test_token".to_string()),
             "!room:matrix.org".to_string(),
             vec!["@user:matrix.org".to_string()],
         )
@@ -1125,7 +1297,7 @@ mod tests {
     fn creates_with_correct_fields() {
         let ch = make_channel();
         assert_eq!(ch.homeserver, "https://matrix.org");
-        assert_eq!(ch.access_token, "syt_test_token");
+        assert_eq!(ch.access_token.as_deref(), Some("syt_test_token"));
         assert_eq!(ch.room_id, "!room:matrix.org");
         assert_eq!(ch.allowed_users.len(), 1);
     }
@@ -1134,7 +1306,7 @@ mod tests {
     fn strips_trailing_slash() {
         let ch = MatrixChannel::new(
             "https://matrix.org/".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec![],
         );
@@ -1145,7 +1317,7 @@ mod tests {
     fn no_trailing_slash_unchanged() {
         let ch = MatrixChannel::new(
             "https://matrix.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec![],
         );
@@ -1156,7 +1328,7 @@ mod tests {
     fn multiple_trailing_slashes_strip_all() {
         let ch = MatrixChannel::new(
             "https://matrix.org//".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec![],
         );
@@ -1167,18 +1339,29 @@ mod tests {
     fn trims_access_token() {
         let ch = MatrixChannel::new(
             "https://matrix.org".to_string(),
-            "  syt_test_token  ".to_string(),
+            Some("  syt_test_token  ".to_string()),
             "!r:m".to_string(),
             vec![],
         );
-        assert_eq!(ch.access_token, "syt_test_token");
+        assert_eq!(ch.access_token.as_deref(), Some("syt_test_token"));
+    }
+
+    #[test]
+    fn empty_access_token_becomes_none() {
+        let ch = MatrixChannel::new(
+            "https://matrix.org".to_string(),
+            Some("   ".to_string()),
+            "!r:m".to_string(),
+            vec![],
+        );
+        assert!(ch.access_token.is_none());
     }
 
     #[test]
     fn session_hints_are_normalized() {
         let ch = MatrixChannel::new_with_session_hint(
             "https://matrix.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec![],
             Some("  @bot:matrix.org ".to_string()),
@@ -1193,7 +1376,7 @@ mod tests {
     fn empty_session_hints_are_ignored() {
         let ch = MatrixChannel::new_with_session_hint(
             "https://matrix.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec![],
             Some("   ".to_string()),
@@ -1208,7 +1391,7 @@ mod tests {
     fn matrix_store_dir_is_derived_from_zeroclaw_dir() {
         let ch = MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
             "https://matrix.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec![],
             None,
@@ -1226,7 +1409,7 @@ mod tests {
     fn matrix_store_dir_absent_without_zeroclaw_dir() {
         let ch = MatrixChannel::new_with_session_hint(
             "https://matrix.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec![],
             None,
@@ -1234,6 +1417,73 @@ mod tests {
         );
 
         assert!(ch.matrix_store_dir().is_none());
+    }
+
+    #[test]
+    fn password_login_detection() {
+        // Password login: no access_token, has password + user_id
+        let ch = MatrixChannel::new_full(
+            "https://matrix.org".to_string(),
+            None,
+            "!r:m".to_string(),
+            vec![],
+            Some("@bot:matrix.org".to_string()),
+            None,
+            Some("hunter2".to_string()),
+            None,
+            None,
+        );
+        assert!(ch.uses_password_login());
+
+        // Access token login: has access_token
+        let ch2 = make_channel();
+        assert!(!ch2.uses_password_login());
+
+        // Incomplete password config: no user_id
+        let ch3 = MatrixChannel::new_full(
+            "https://matrix.org".to_string(),
+            None,
+            "!r:m".to_string(),
+            vec![],
+            None,
+            None,
+            Some("hunter2".to_string()),
+            None,
+            None,
+        );
+        assert!(!ch3.uses_password_login());
+    }
+
+    #[test]
+    fn recovery_key_is_normalized() {
+        let ch = MatrixChannel::new_full(
+            "https://matrix.org".to_string(),
+            Some("tok".to_string()),
+            "!r:m".to_string(),
+            vec![],
+            None,
+            None,
+            None,
+            Some("  EsT0 Abcd Efgh  ".to_string()),
+            None,
+        );
+        assert_eq!(ch.recovery_key.as_deref(), Some("EsT0 Abcd Efgh"));
+    }
+
+    #[test]
+    fn empty_recovery_key_becomes_none() {
+        let ch = MatrixChannel::new_full(
+            "https://matrix.org".to_string(),
+            Some("tok".to_string()),
+            "!r:m".to_string(),
+            vec![],
+            None,
+            None,
+            None,
+            Some("   ".to_string()),
+            None,
+        );
+        assert!(ch.recovery_key.is_none());
     }
 
     #[test]
@@ -1319,7 +1569,7 @@ mod tests {
     fn trims_room_id_and_allowed_users() {
         let ch = MatrixChannel::new(
             "https://matrix.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "  !room:matrix.org  ".to_string(),
             vec![
                 "  @user:matrix.org  ".to_string(),
@@ -1338,7 +1588,7 @@ mod tests {
     fn wildcard_allows_anyone() {
         let ch = MatrixChannel::new(
             "https://m.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec!["*".to_string()],
         );
@@ -1363,7 +1613,7 @@ mod tests {
     fn user_case_insensitive() {
         let ch = MatrixChannel::new(
             "https://m.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec!["@User:Matrix.org".to_string()],
         );
@@ -1375,7 +1625,7 @@ mod tests {
     fn empty_allowlist_denies_all() {
         let ch = MatrixChannel::new(
             "https://m.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!r:m".to_string(),
             vec![],
         );
@@ -1498,7 +1748,7 @@ mod tests {
     async fn invalid_room_reference_fails_fast() {
         let ch = MatrixChannel::new(
             "https://matrix.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "room_without_prefix".to_string(),
             vec![],
         );
@@ -1513,7 +1763,7 @@ mod tests {
     async fn target_room_id_keeps_canonical_room_id_without_lookup() {
         let ch = MatrixChannel::new(
             "https://matrix.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "!canonical:matrix.org".to_string(),
             vec![],
         );
@@ -1526,7 +1776,7 @@ mod tests {
     async fn target_room_id_uses_cached_alias_resolution() {
         let ch = MatrixChannel::new(
             "https://matrix.org".to_string(),
-            "tok".to_string(),
+            Some("tok".to_string()),
             "#ops:matrix.org".to_string(),
             vec![],
         );
