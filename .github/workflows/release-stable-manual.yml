@@ -152,6 +152,10 @@ jobs:
     needs: [validate, web]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
+    env:
+      # Bump this to invalidate stale Rust build artifacts tied to an older/newer glibc.
+      # Prevents cached build-script binaries (e.g., libc) from being reused across runner image changes.
+      RUST_CACHE_VERSION: v2
     strategy:
       fail-fast: false
       matrix:
