@@ -255,6 +255,10 @@ pub struct Config {
     /// Dynamic node discovery configuration (`[nodes]`).
     #[serde(default)]
     pub nodes: NodesConfig,
+
+    /// Provider behavior overrides (`[provider]` section).
+    #[serde(default)]
+    pub provider: ProviderConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -285,6 +289,47 @@ pub struct ModelProviderConfig {
     /// Azure OpenAI API version (defaults to "2024-08-01-preview").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azure_openai_api_version: Option<String>,
+}
+
+/// Provider behavior overrides (`[provider]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct ProviderConfig {
+    /// Optional reasoning level override for providers that support explicit levels
+    /// (e.g. OpenAI Codex `/responses` reasoning effort).
+    #[serde(default)]
+    pub reasoning_level: Option<String>,
+    /// Optional transport override for providers that support multiple transports.
+    /// Supported values: "auto", "websocket", "sse".
+    ///
+    /// Resolution order:
+    /// 1) `model_routes[].transport` (route-specific)
+    /// 2) env overrides (`PROVIDER_TRANSPORT`, `ZEROCLAW_PROVIDER_TRANSPORT`, `ZEROCLAW_CODEX_TRANSPORT`)
+    /// 3) `provider.transport`
+    /// 4) runtime default (`auto`, WebSocket-first with SSE fallback for OpenAI Codex)
+    ///
+    /// Note: env overrides replace configured `provider.transport` when set.
+    ///
+    /// Existing configs that omit `provider.transport` remain valid and fall back to defaults.
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// Vertex AI specific configuration (`[provider.vertex]`).
+    #[serde(default)]
+    pub vertex: VertexConfig,
+}
+
+/// Vertex AI specific configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct VertexConfig {
+    /// Google Cloud project ID.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Google Cloud location (region), e.g. "us-central1".
+    #[serde(default)]
+    pub location: Option<String>,
+    /// Path to a service account key JSON file (optional).
+    /// If unset, falls back to Application Default Credentials (ADC).
+    #[serde(default)]
+    pub key_path: Option<String>,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -4209,6 +4254,7 @@ impl Default for Config {
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            provider: ProviderConfig::default(),
         }
     }
 }

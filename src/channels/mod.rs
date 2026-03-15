@@ -3456,6 +3456,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         provider_timeout_secs: Some(config.provider_timeout_secs),
         extra_headers: config.extra_headers.clone(),
         api_path: config.api_path.clone(),
+        vertex_project: config.provider.vertex.project.clone(),
+        vertex_location: config.provider.vertex.location.clone(),
+        vertex_key_path: config.provider.vertex.key_path.clone(),
     };
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(

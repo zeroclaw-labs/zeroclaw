@@ -218,6 +218,22 @@ Notes:
 - `reasoning_enabled = true` explicitly requests reasoning for supported providers (`think: true` on `ollama`).
 - Unset keeps provider defaults.
 
+## `[provider.vertex]`
+
+Vertex AI (Google Cloud) specific configuration.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `project` | unset | Google Cloud project ID |
+| `location` | `global` | Google Cloud location (region), e.g. `"us-central1"` |
+| `key_path` | unset | Path to a service account key JSON file (optional) |
+
+Notes:
+
+- If `key_path` is unset, ZeroClaw falls back to Application Default Credentials (ADC).
+- Project ID resolution order: `project` config > `ZEROCLAW_API_KEY` > `GOOGLE_CLOUD_PROJECT` > `VERTEX_PROJECT_ID`.
+- Location resolution order: `location` config > `GOOGLE_CLOUD_LOCATION` > `VERTEX_LOCATION` > default `"global"`.
+
 ## `[skills]`
 
 | Key | Default | Purpose |

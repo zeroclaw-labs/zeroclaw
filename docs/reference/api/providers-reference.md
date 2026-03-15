@@ -40,6 +40,7 @@ credential is not reused for fallback providers.
 | `opencode` | `opencode-zen` | No | `OPENCODE_API_KEY` |
 | `opencode-go` | — | No | `OPENCODE_GO_API_KEY` |
 | `zai` | `z.ai` | No | `ZAI_API_KEY` |
+| `vertex` | `vertex-ai` | No | `VERTEX_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT` |
 | `glm` | `zhipu` | No | `GLM_API_KEY` |
 | `minimax` | `minimax-intl`, `minimax-io`, `minimax-global`, `minimax-cn`, `minimaxi`, `minimax-oauth`, `minimax-oauth-cn`, `minimax-portal`, `minimax-portal-cn` | No | `MINIMAX_OAUTH_TOKEN`, `MINIMAX_API_KEY` |
 | `bedrock` | `aws-bedrock` | No | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (optional: `AWS_REGION`) |
@@ -70,6 +71,15 @@ credential is not reused for fallback providers.
 - Authentication: `VERCEL_API_KEY`
 - Vercel AI Gateway usage does not require a project deployment.
 - If you see `DEPLOYMENT_NOT_FOUND`, verify the provider is targeting the gateway endpoint above instead of `https://api.vercel.ai`.
+
+### Vertex AI Notes
+
+- Provider ID: `vertex` (alias: `vertex-ai`)
+- Authentication: Application Default Credentials (ADC). Set `GOOGLE_APPLICATION_CREDENTIALS` to your service account key file, or use `gcloud auth application-default login`.
+- Configuration: Requires `[provider.vertex]` section with `project` and optionally `location`.
+- Project ID resolution: `project` config > `ZEROCLAW_API_KEY` > `GOOGLE_CLOUD_PROJECT` > `VERTEX_PROJECT_ID`.
+- Location: Defaults to `global`. Override with `location` config, `GOOGLE_CLOUD_LOCATION`, or `VERTEX_LOCATION`.
+- Supports Gemini models (e.g. `gemini-2.5-pro`, `gemini-2.5-flash`).
 
 ### Gemini Notes
 

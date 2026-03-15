@@ -386,6 +386,9 @@ pub fn all_tools_with_runtime(
                 provider_timeout_secs: Some(root_config.provider_timeout_secs),
                 extra_headers: root_config.extra_headers.clone(),
                 api_path: root_config.api_path.clone(),
+                vertex_project: root_config.provider.vertex.project.clone(),
+                vertex_location: root_config.provider.vertex.location.clone(),
+                vertex_key_path: root_config.provider.vertex.key_path.clone(),
             },
         )
         .with_parent_tools(Arc::clone(&parent_tools))
