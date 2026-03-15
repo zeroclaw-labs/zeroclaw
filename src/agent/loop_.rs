@@ -2660,6 +2660,15 @@ pub(crate) async fn run_tool_call_loop(
                                 "arguments": scrub_credentials(&tool_args.to_string()),
                             }),
                         );
+                        if let Some(ref tx) = on_delta {
+                            let _ = tx
+                                .send(format!(
+                                    "\u{274c} {}: {}\n",
+                                    call.name,
+                                    truncate_with_ellipsis(&scrub_credentials(&cancelled), 200)
+                                ))
+                                .await;
+                        }
                         ordered_results[idx] = Some((
                             call.name.clone(),
                             call.tool_call_id.clone(),
@@ -2712,6 +2721,11 @@ pub(crate) async fn run_tool_call_loop(
                                 "arguments": scrub_credentials(&tool_args.to_string()),
                             }),
                         );
+                        if let Some(ref tx) = on_delta {
+                            let _ = tx
+                                .send(format!("\u{274c} {}: {}\n", tool_name, denied))
+                                .await;
+                        }
                         ordered_results[idx] = Some((
                             tool_name.clone(),
                             call.tool_call_id.clone(),
@@ -2748,6 +2762,11 @@ pub(crate) async fn run_tool_call_loop(
                         "deduplicated": true,
                     }),
                 );
+                if let Some(ref tx) = on_delta {
+                    let _ = tx
+                        .send(format!("\u{274c} {}: {}\n", tool_name, duplicate))
+                        .await;
+                }
                 ordered_results[idx] = Some((
                     tool_name.clone(),
                     call.tool_call_id.clone(),
@@ -2850,13 +2869,19 @@ pub(crate) async fn run_tool_call_loop(
             // ── Progress: tool completion ───────────────────────
             if let Some(ref tx) = on_delta {
                 let secs = outcome.duration.as_secs();
-                let icon = if outcome.success {
-                    "\u{2705}"
+                let progress_msg = if outcome.success {
+                    format!("\u{2705} {} ({secs}s)\n", call.name)
+                } else if let Some(ref reason) = outcome.error_reason {
+                    format!(
+                        "\u{274c} {} ({secs}s): {}\n",
+                        call.name,
+                        truncate_with_ellipsis(reason, 200)
+                    )
                 } else {
-                    "\u{274c}"
+                    format!("\u{274c} {} ({secs}s)\n", call.name)
                 };
                 tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
-                let _ = tx.send(format!("{icon} {} ({secs}s)\n", call.name)).await;
+                let _ = tx.send(progress_msg).await;
             }
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
@@ -4131,6 +4156,52 @@ mod tests {
                 success: true,
                 output: format!("ok:{value}"),
                 error: None,
+            })
+        }
+    }
+
+    /// A tool that always returns a failure with a given error reason.
+    struct FailingTool {
+        tool_name: String,
+        error_reason: String,
+    }
+
+    impl FailingTool {
+        fn new(name: &str, error_reason: &str) -> Self {
+            Self {
+                tool_name: name.to_string(),
+                error_reason: error_reason.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for FailingTool {
+        fn name(&self) -> &str {
+            &self.tool_name
+        }
+
+        fn description(&self) -> &str {
+            "A tool that always fails for testing failure surfacing"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(self.error_reason.clone()),
             })
         }
     }
@@ -6500,5 +6571,72 @@ Let me check the result."#;
         ];
         let tokens = super::estimate_history_tokens(&history);
         assert_eq!(tokens, 23);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_surfaces_tool_failure_reason_in_on_delta() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"failing_shell","arguments":{"command":"rm -rf /"}}
+</tool_call>"#,
+            "I could not execute that command.",
+        ]);
+
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(FailingTool::new(
+            "failing_shell",
+            "Command not allowed by security policy: rm -rf /",
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("delete everything"),
+        ];
+        let observer = NoopObserver;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+        )
+        .await
+        .expect("tool loop should complete");
+
+        // Collect all messages sent to the on_delta channel.
+        let mut deltas = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            deltas.push(msg);
+        }
+
+        let all_deltas = deltas.join("");
+
+        // The failure reason should appear in the progress messages.
+        assert!(
+            all_deltas.contains("Command not allowed by security policy"),
+            "on_delta messages should include the tool failure reason, got: {all_deltas}"
+        );
+
+        // Should also contain the cross mark (❌) icon to indicate failure.
+        assert!(
+            all_deltas.contains('\u{274c}'),
+            "on_delta messages should include ❌ for failed tool calls, got: {all_deltas}"
+        );
+
+        assert_eq!(result, "I could not execute that command.");
     }
 }
