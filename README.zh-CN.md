@@ -77,11 +77,11 @@
 
 <!-- BEGIN:WHATS_NEW -->
 
-### 🚀 What's New in v0.3.0-beta.201 (March 2026)
+### 🚀 What's New in v0.3.1-beta.205 (March 2026)
 
 | Area | Highlights |
 |---|---|
-| General | Incremental improvements and polish |
+| ci | add Termux (aarch64-linux-android) release target |
 
 <!-- END:WHATS_NEW -->
 
@@ -242,11 +242,13 @@ zeroclaw agent --provider anthropic -m "hello"
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
 
-### 🌟 Recent Contributors (v0.3.0-beta.201)
+### 🌟 Recent Contributors (v0.3.1-beta.205)
 
-1 contributors shipped features, fixes, and improvements in this release cycle:
+3 contributors shipped features, fixes, and improvements in this release cycle:
 
 - **Argenis**
+- **argenis de la rosa**
+- **Claude Opus 4.6**
 
 Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
 
