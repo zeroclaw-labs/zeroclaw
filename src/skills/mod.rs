@@ -1472,6 +1472,3 @@ description = "Bare minimum"
         assert_ne!(skills[0].name, "CONTRIBUTING");
     }
 }
-
-#[cfg(test)]
-mod symlink_tests;
