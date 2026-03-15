@@ -507,6 +507,11 @@ pub struct TranscriptionConfig {
     /// Optional language hint (ISO-639-1, e.g. "en", "ru").
     #[serde(default)]
     pub language: Option<String>,
+    /// Optional initial prompt to bias transcription toward expected vocabulary
+    /// (proper nouns, technical terms, etc.). Sent as the `prompt` field in the
+    /// Whisper API request.
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
     /// Maximum voice duration in seconds (messages longer than this are skipped).
     #[serde(default = "default_transcription_max_duration_secs")]
     pub max_duration_secs: u64,
@@ -519,6 +524,7 @@ impl Default for TranscriptionConfig {
             api_url: default_transcription_api_url(),
             model: default_transcription_model(),
             language: None,
+            initial_prompt: None,
             max_duration_secs: default_transcription_max_duration_secs(),
         }
     }
