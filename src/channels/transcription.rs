@@ -31,11 +31,53 @@ fn normalize_audio_filename(file_name: &str) -> String {
     }
 }
 
+/// Resolve the API key for voice transcription.
+///
+/// Priority order:
+/// 1. Explicit `config.api_key` (if set and non-empty).
+/// 2. Provider-specific env var based on `api_url`:
+///    - URL contains "openai.com" → `OPENAI_API_KEY`
+///    - URL contains "groq.com"   → `GROQ_API_KEY`
+/// 3. Fallback chain: `TRANSCRIPTION_API_KEY` → `GROQ_API_KEY` → `OPENAI_API_KEY`.
+fn resolve_transcription_api_key(config: &TranscriptionConfig) -> Result<String> {
+    // 1. Explicit config key
+    if let Some(ref key) = config.api_key {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    // 2. Provider-specific env var based on API URL
+    if config.api_url.contains("openai.com") {
+        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+            return Ok(key);
+        }
+    } else if config.api_url.contains("groq.com") {
+        if let Ok(key) = std::env::var("GROQ_API_KEY") {
+            return Ok(key);
+        }
+    }
+
+    // 3. Fallback chain
+    for var in ["TRANSCRIPTION_API_KEY", "GROQ_API_KEY", "OPENAI_API_KEY"] {
+        if let Ok(key) = std::env::var(var) {
+            return Ok(key);
+        }
+    }
+
+    bail!(
+        "No API key found for voice transcription — set one of: \
+         transcription.api_key in config, TRANSCRIPTION_API_KEY, GROQ_API_KEY, or OPENAI_API_KEY"
+    );
+}
+
 /// Transcribe audio bytes via a Whisper-compatible transcription API.
 ///
-/// Returns the transcribed text on success.  Requires `GROQ_API_KEY` in the
-/// environment.  The caller is responsible for enforcing duration limits
-/// *before* downloading the file; this function enforces the byte-size cap.
+/// Returns the transcribed text on success. The API key is resolved from config
+/// or environment variables based on the provider URL. The caller is responsible
+/// for enforcing duration limits *before* downloading the file; this function
+/// enforces the byte-size cap.
 pub async fn transcribe_audio(
     audio_data: Vec<u8>,
     file_name: &str,
@@ -59,11 +101,14 @@ pub async fn transcribe_audio(
         )
     })?;
 
-    let api_key = std::env::var("GROQ_API_KEY").context(
-        "GROQ_API_KEY environment variable is not set — required for voice transcription",
-    )?;
+    let api_key = resolve_transcription_api_key(config)?;
 
-    let client = crate::config::build_runtime_proxy_client("transcription.groq");
+    let proxy_service = if config.api_url.contains("openai.com") {
+        "transcription.openai"
+    } else {
+        "transcription.groq"
+    };
+    let client = crate::config::build_runtime_proxy_client(proxy_service);
 
     let file_part = Part::bytes(audio_data)
         .file_name(normalized_name)
@@ -125,8 +170,10 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_missing_api_key() {
-        // Ensure the key is absent for this test
+        // Ensure all candidate keys are absent for this test
         std::env::remove_var("GROQ_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("TRANSCRIPTION_API_KEY");
 
         let data = vec![0u8; 100];
         let config = TranscriptionConfig::default();
@@ -135,7 +182,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("GROQ_API_KEY"),
+            err.to_string().contains("No API key found"),
             "expected missing-key error, got: {err}"
         );
     }

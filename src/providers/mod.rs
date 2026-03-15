@@ -815,6 +815,26 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
                 if let Some(credential) = resolve_minimax_oauth_refresh_token(name) {
                     return Some(credential);
                 }
+            } else if name == "anthropic" || name == "openai" || name == "groq" {
+                // For well-known providers, prefer provider-specific env vars over the
+                // global api_key override, since the global key may belong to a different
+                // provider (e.g. a custom: gateway). This enables multi-provider setups
+                // where the primary uses a custom gateway and fallbacks use named providers.
+                let env_candidates: &[&str] = match name {
+                    "anthropic" => &["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+                    "openai" => &["OPENAI_API_KEY"],
+                    "groq" => &["GROQ_API_KEY"],
+                    _ => &[],
+                };
+                for env_var in env_candidates {
+                    if let Ok(val) = std::env::var(env_var) {
+                        let trimmed = val.trim().to_string();
+                        if !trimmed.is_empty() {
+                            return Some(trimmed);
+                        }
+                    }
+                }
+                return Some(trimmed_override.to_owned());
             } else {
                 return Some(trimmed_override.to_owned());
             }

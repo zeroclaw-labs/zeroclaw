@@ -40,6 +40,8 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod linkedin;
+pub mod linkedin_client;
 pub mod mcp_client;
 pub mod mcp_deferred;
 pub mod mcp_protocol;
@@ -86,6 +88,7 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+pub use linkedin::LinkedInTool;
 pub use mcp_client::McpRegistry;
 pub use mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
 pub use mcp_tool::McpToolWrapper;
@@ -345,6 +348,17 @@ pub fn all_tools_with_runtime(
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
+
+    // LinkedIn integration (config-gated)
+    if root_config.linkedin.enabled {
+        tool_arcs.push(Arc::new(LinkedInTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+            root_config.linkedin.api_version.clone(),
+            root_config.linkedin.content.clone(),
+            root_config.linkedin.image.clone(),
+        )));
+    }
 
     if let Some(key) = composio_key {
         if !key.is_empty() {
