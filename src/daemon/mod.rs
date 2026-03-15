@@ -203,14 +203,17 @@ where
 }
 
 async fn run_heartbeat_worker(config: Config) -> Result<()> {
+    use crate::heartbeat::engine::HeartbeatEngine;
+
     let observer: std::sync::Arc<dyn crate::observability::Observer> =
         std::sync::Arc::from(crate::observability::create_observer(&config.observability));
-    let engine = crate::heartbeat::engine::HeartbeatEngine::new(
+    let engine = HeartbeatEngine::new(
         config.heartbeat.clone(),
         config.workspace_dir.clone(),
         observer,
     );
-    let delivery = heartbeat_delivery_target(&config)?;
+    let delivery = resolve_heartbeat_delivery(&config)?;
+    let two_phase = config.heartbeat.two_phase;
 
     let interval_mins = config.heartbeat.interval_minutes.max(5);
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
@@ -218,14 +221,71 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     loop {
         interval.tick().await;
 
-        let file_tasks = engine.collect_tasks().await?;
-        let tasks = heartbeat_tasks_for_tick(file_tasks, config.heartbeat.message.as_deref());
+        // Collect runnable tasks (active only, sorted by priority)
+        let mut tasks = engine.collect_runnable_tasks().await?;
         if tasks.is_empty() {
-            continue;
+            // Try fallback message
+            if let Some(fallback) = config
+                .heartbeat
+                .message
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+            {
+                tasks.push(crate::heartbeat::engine::HeartbeatTask {
+                    text: fallback.to_string(),
+                    priority: crate::heartbeat::engine::TaskPriority::Medium,
+                    status: crate::heartbeat::engine::TaskStatus::Active,
+                });
+            } else {
+                continue;
+            }
         }
 
-        for task in tasks {
-            let prompt = format!("[Heartbeat Task] {task}");
+        // ── Phase 1: LLM decision (two-phase mode) ──────────────
+        let tasks_to_run = if two_phase {
+            let decision_prompt = HeartbeatEngine::build_decision_prompt(&tasks);
+            match crate::agent::run(
+                config.clone(),
+                Some(decision_prompt),
+                None,
+                None,
+                0.0, // Low temperature for deterministic decision
+                vec![],
+                false,
+                None,
+            )
+            .await
+            {
+                Ok(response) => {
+                    let indices = HeartbeatEngine::parse_decision_response(&response, tasks.len());
+                    if indices.is_empty() {
+                        tracing::info!("💓 Heartbeat Phase 1: skip (nothing to do)");
+                        crate::health::mark_component_ok("heartbeat");
+                        continue;
+                    }
+                    tracing::info!(
+                        "💓 Heartbeat Phase 1: run {} of {} tasks",
+                        indices.len(),
+                        tasks.len()
+                    );
+                    indices
+                        .into_iter()
+                        .filter_map(|i| tasks.get(i).cloned())
+                        .collect()
+                }
+                Err(e) => {
+                    tracing::warn!("💓 Heartbeat Phase 1 failed, running all tasks: {e}");
+                    tasks
+                }
+            }
+        } else {
+            tasks
+        };
+
+        // ── Phase 2: Execute selected tasks ─────────────────────
+        for task in &tasks_to_run {
+            let prompt = format!("[Heartbeat Task | {}] {}", task.priority, task.text);
             let temp = config.default_temperature;
             match crate::agent::run(
                 config.clone(),
@@ -242,7 +302,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 Ok(output) => {
                     crate::health::mark_component_ok("heartbeat");
                     let announcement = if output.trim().is_empty() {
-                        "heartbeat task executed".to_string()
+                        format!("💓 heartbeat task completed: {}", task.text)
                     } else {
                         output
                     };
@@ -272,22 +332,8 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     }
 }
 
-fn heartbeat_tasks_for_tick(
-    file_tasks: Vec<String>,
-    fallback_message: Option<&str>,
-) -> Vec<String> {
-    if !file_tasks.is_empty() {
-        return file_tasks;
-    }
-
-    fallback_message
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-        .map(|message| vec![message.to_string()])
-        .unwrap_or_default()
-}
-
-fn heartbeat_delivery_target(config: &Config) -> Result<Option<(String, String)>> {
+/// Resolve delivery target: explicit config > auto-detect first configured channel.
+fn resolve_heartbeat_delivery(config: &Config) -> Result<Option<(String, String)>> {
     let channel = config
         .heartbeat
         .target
@@ -302,14 +348,43 @@ fn heartbeat_delivery_target(config: &Config) -> Result<Option<(String, String)>
         .filter(|value| !value.is_empty());
 
     match (channel, target) {
-        (None, None) => Ok(None),
-        (Some(_), None) => anyhow::bail!("heartbeat.to is required when heartbeat.target is set"),
-        (None, Some(_)) => anyhow::bail!("heartbeat.target is required when heartbeat.to is set"),
+        // Both explicitly set — validate and use.
         (Some(channel), Some(target)) => {
             validate_heartbeat_channel_config(config, channel)?;
             Ok(Some((channel.to_string(), target.to_string())))
         }
+        // Only one set — error.
+        (Some(_), None) => anyhow::bail!("heartbeat.to is required when heartbeat.target is set"),
+        (None, Some(_)) => anyhow::bail!("heartbeat.target is required when heartbeat.to is set"),
+        // Neither set — try auto-detect the first configured channel.
+        (None, None) => Ok(auto_detect_heartbeat_channel(config)),
     }
+}
+
+/// Auto-detect the best channel for heartbeat delivery by checking which
+/// channels are configured. Returns the first match in priority order.
+fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
+    // Priority order: telegram > discord > slack > mattermost
+    if let Some(tg) = &config.channels_config.telegram {
+        // Use the first allowed_user as target, or fall back to empty (broadcast)
+        let target = tg.allowed_users.first().cloned().unwrap_or_default();
+        if !target.is_empty() {
+            return Some(("telegram".to_string(), target));
+        }
+    }
+    if config.channels_config.discord.is_some() {
+        // Discord requires explicit target — can't auto-detect
+        return None;
+    }
+    if config.channels_config.slack.is_some() {
+        // Slack requires explicit target
+        return None;
+    }
+    if config.channels_config.mattermost.is_some() {
+        // Mattermost requires explicit target
+        return None;
+    }
+    None
 }
 
 fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<()> {
@@ -487,75 +562,56 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_tasks_use_file_tasks_when_available() {
-        let tasks =
-            heartbeat_tasks_for_tick(vec!["From file".to_string()], Some("Fallback from config"));
-        assert_eq!(tasks, vec!["From file".to_string()]);
-    }
-
-    #[test]
-    fn heartbeat_tasks_fall_back_to_config_message() {
-        let tasks = heartbeat_tasks_for_tick(vec![], Some("  check london time  "));
-        assert_eq!(tasks, vec!["check london time".to_string()]);
-    }
-
-    #[test]
-    fn heartbeat_tasks_ignore_empty_fallback_message() {
-        let tasks = heartbeat_tasks_for_tick(vec![], Some("   "));
-        assert!(tasks.is_empty());
-    }
-
-    #[test]
-    fn heartbeat_delivery_target_none_when_unset() {
+    fn resolve_delivery_none_when_unset() {
         let config = Config::default();
-        let target = heartbeat_delivery_target(&config).unwrap();
+        let target = resolve_heartbeat_delivery(&config).unwrap();
         assert!(target.is_none());
     }
 
     #[test]
-    fn heartbeat_delivery_target_requires_to_field() {
+    fn resolve_delivery_requires_to_field() {
         let mut config = Config::default();
         config.heartbeat.target = Some("telegram".into());
-        let err = heartbeat_delivery_target(&config).unwrap_err();
+        let err = resolve_heartbeat_delivery(&config).unwrap_err();
         assert!(err
             .to_string()
             .contains("heartbeat.to is required when heartbeat.target is set"));
     }
 
     #[test]
-    fn heartbeat_delivery_target_requires_target_field() {
+    fn resolve_delivery_requires_target_field() {
         let mut config = Config::default();
         config.heartbeat.to = Some("123456".into());
-        let err = heartbeat_delivery_target(&config).unwrap_err();
+        let err = resolve_heartbeat_delivery(&config).unwrap_err();
         assert!(err
             .to_string()
             .contains("heartbeat.target is required when heartbeat.to is set"));
     }
 
     #[test]
-    fn heartbeat_delivery_target_rejects_unsupported_channel() {
+    fn resolve_delivery_rejects_unsupported_channel() {
         let mut config = Config::default();
         config.heartbeat.target = Some("email".into());
         config.heartbeat.to = Some("ops@example.com".into());
-        let err = heartbeat_delivery_target(&config).unwrap_err();
+        let err = resolve_heartbeat_delivery(&config).unwrap_err();
         assert!(err
             .to_string()
             .contains("unsupported heartbeat.target channel"));
     }
 
     #[test]
-    fn heartbeat_delivery_target_requires_channel_configuration() {
+    fn resolve_delivery_requires_channel_configuration() {
         let mut config = Config::default();
         config.heartbeat.target = Some("telegram".into());
         config.heartbeat.to = Some("123456".into());
-        let err = heartbeat_delivery_target(&config).unwrap_err();
+        let err = resolve_heartbeat_delivery(&config).unwrap_err();
         assert!(err
             .to_string()
             .contains("channels_config.telegram is not configured"));
     }
 
     #[test]
-    fn heartbeat_delivery_target_accepts_telegram_configuration() {
+    fn resolve_delivery_accepts_telegram_configuration() {
         let mut config = Config::default();
         config.heartbeat.target = Some("telegram".into());
         config.heartbeat.to = Some("123456".into());
@@ -568,7 +624,33 @@ mod tests {
             mention_only: false,
         });
 
-        let target = heartbeat_delivery_target(&config).unwrap();
+        let target = resolve_heartbeat_delivery(&config).unwrap();
         assert_eq!(target, Some(("telegram".to_string(), "123456".to_string())));
+    }
+
+    #[test]
+    fn auto_detect_telegram_when_configured() {
+        let mut config = Config::default();
+        config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            bot_token: "bot-token".into(),
+            allowed_users: vec!["user123".into()],
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+
+        let target = resolve_heartbeat_delivery(&config).unwrap();
+        assert_eq!(
+            target,
+            Some(("telegram".to_string(), "user123".to_string()))
+        );
+    }
+
+    #[test]
+    fn auto_detect_none_when_no_channels() {
+        let config = Config::default();
+        let target = auto_detect_heartbeat_channel(&config);
+        assert!(target.is_none());
     }
 }

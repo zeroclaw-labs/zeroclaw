@@ -2895,15 +2895,26 @@ pub struct HeartbeatConfig {
     pub enabled: bool,
     /// Interval in minutes between heartbeat pings. Default: `30`.
     pub interval_minutes: u32,
+    /// Enable two-phase heartbeat: Phase 1 asks LLM whether to run, Phase 2
+    /// executes only when the LLM decides there is work to do. Saves API cost
+    /// during quiet periods. Default: `true`.
+    #[serde(default = "default_two_phase")]
+    pub two_phase: bool,
     /// Optional fallback task text when `HEARTBEAT.md` has no task entries.
     #[serde(default)]
     pub message: Option<String>,
     /// Optional delivery channel for heartbeat output (for example: `telegram`).
+    /// When omitted, auto-selects the first configured channel.
     #[serde(default, alias = "channel")]
     pub target: Option<String>,
-    /// Optional delivery recipient/chat identifier (required when `target` is set).
+    /// Optional delivery recipient/chat identifier (required when `target` is
+    /// explicitly set).
     #[serde(default, alias = "recipient")]
     pub to: Option<String>,
+}
+
+fn default_two_phase() -> bool {
+    true
 }
 
 impl Default for HeartbeatConfig {
@@ -2911,6 +2922,7 @@ impl Default for HeartbeatConfig {
         Self {
             enabled: false,
             interval_minutes: 30,
+            two_phase: true,
             message: None,
             target: None,
             to: None,
@@ -6217,6 +6229,7 @@ default_temperature = 0.7
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
+                two_phase: true,
                 message: Some("Check London time".into()),
                 target: Some("telegram".into()),
                 to: Some("123456".into()),
