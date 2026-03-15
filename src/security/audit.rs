@@ -438,14 +438,14 @@ mod tests {
         let event = AuditEvent::new(AuditEventType::CommandExecution).with_actor(
             "telegram".to_string(),
             Some("123".to_string()),
-            Some("@alice".to_string()),
+            Some("@zeroclaw_user".to_string()),
         );
 
         assert!(event.actor.is_some());
         let actor = event.actor.as_ref().unwrap();
         assert_eq!(actor.channel, "telegram");
         assert_eq!(actor.user_id, Some("123".to_string()));
-        assert_eq!(actor.username, Some("@alice".to_string()));
+        assert_eq!(actor.username, Some("@zeroclaw_user".to_string()));
     }
 
     #[test]
