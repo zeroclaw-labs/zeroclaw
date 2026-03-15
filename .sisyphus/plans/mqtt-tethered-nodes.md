@@ -548,7 +548,7 @@ Max Concurrent: 5 (Wave 1)
   - Message: `feat(bridge): add core event loop`
   - Files: `crates/zeroclaw-bridge/src/bridge.rs`
 
-- [ ] 8. 认证和 Token 传递
+- [x] 8. 认证和 Token 传递
 
   **What to do**:
   - 在 WebSocket 连接时添加 Bearer token
@@ -587,7 +587,7 @@ Max Concurrent: 5 (Wave 1)
   - Message: `feat(bridge): add authentication and token passing`
   - Files: `crates/zeroclaw-bridge/src/bridge.rs`, `src/config.rs`
 
-- [ ] 9. ESP32 命令执行器（GPIO/ADC）+ QEMU 测试
+- [x] 9. ESP32 命令执行器（GPIO/ADC）+ QEMU 测试
 
   **What to do**:
   - 实现 GPIO 读写命令处理

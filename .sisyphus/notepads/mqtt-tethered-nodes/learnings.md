@@ -275,3 +275,20 @@ All schemas validated with jq:
 - MQTT uses QoS 1 for all publishes (from mqtt_client.rs)
 - WebSocket uses exponential backoff retry (from ws_client.rs)
 - Transform layer handles all JSON serialization/deserialization
+
+## Task 8: Authentication and Token Passing
+
+### Implementation
+- Added `config` module to `lib.rs` exports
+- Modified `Bridge::new()` to accept `&BridgeConfig` and return `Result<Self>`
+- Token flow: `BridgeConfig.auth_token` → `WsClient::with_token()` → `Authorization: Bearer {token}` header
+- WsClient already had `with_token()` builder method that formats Bearer token correctly
+
+### Token Format
+- Gateway expects: `Authorization: Bearer {token}` (from `src/gateway/nodes.rs:196-203`)
+- WsClient formats it correctly in `ws_client.rs:40`: `format!("Bearer {}", token)`
+
+### Verification
+- Build successful with warnings (unused code in main.rs, expected for MVP)
+- Token will be included in WebSocket connection headers when bridge connects
+

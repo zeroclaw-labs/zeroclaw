@@ -2,6 +2,7 @@ use anyhow::Result;
 use rumqttc::{Event, Packet};
 use tracing::{error, info};
 
+use crate::config::BridgeConfig;
 use crate::mqtt_client::MqttClient;
 use crate::transform;
 use crate::ws_client::WsClient;
@@ -12,8 +13,10 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    pub fn new(mqtt: MqttClient, ws: WsClient) -> Self {
-        Self { mqtt, ws }
+    pub fn new(config: &BridgeConfig) -> Result<Self> {
+        let mqtt = MqttClient::new("localhost", 1883, "zeroclaw-bridge")?;
+        let ws = WsClient::new(&config.websocket_url).with_token(&config.auth_token);
+        Ok(Self { mqtt, ws })
     }
 
     pub async fn run(&mut self) -> Result<()> {
