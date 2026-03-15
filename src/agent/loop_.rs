@@ -2461,6 +2461,26 @@ pub async fn run(
         &provider_runtime_options,
     )?;
 
+    // Validate provider credentials early so misconfigured API keys are caught
+    // before heavy setup (memory, tools, RAG) instead of failing silently at chat time.
+    if !providers::has_provider_credential(provider_name, config.api_key.as_deref()) {
+        // Bedrock uses AWS AKSK, not a single API key — skip this check for it.
+        if provider_name != "bedrock" && provider_name != "aws-bedrock" && provider_name != "ollama" {
+            anyhow::bail!(
+                "No API key found for provider '{provider_name}'. Options:\n\
+                 1. Set the provider-specific env var (e.g. GEMINI_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY)\n\
+                 2. Set api_key in your config.toml\n\
+                 3. Run `zeroclaw onboard` to configure"
+            );
+        }
+    }
+
+    // Warm up the provider connection pool (TLS handshake, DNS, HTTP/2 setup)
+    // so the first real message doesn't hit a cold-start timeout.
+    if let Err(e) = provider.warmup().await {
+        tracing::warn!(provider = provider_name, "Provider warmup failed: {e}");
+    }
+
     observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.to_string(),
         model: model_name.to_string(),
