@@ -5340,12 +5340,13 @@ impl Config {
                 );
             }
         }
-        if self.resilience.rate_limit_enabled {
-            if self.resilience.requests_per_minute == 0 && self.resilience.burst == 0 {
-                anyhow::bail!(
-                    "resilience: requests_per_minute and burst cannot both be 0 when rate limiting is enabled (all requests would be rejected)"
-                );
-            }
+        if self.resilience.rate_limit_enabled
+            && self.resilience.requests_per_minute == 0
+            && self.resilience.burst == 0
+        {
+            anyhow::bail!(
+                "resilience: requests_per_minute and burst cannot both be 0 when rate limiting is enabled (all requests would be rejected)"
+            );
         }
         if self.resilience.backpressure_enabled && self.resilience.backpressure_max_queue_depth == 0
         {
