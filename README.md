@@ -85,13 +85,6 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 <p align="center"><code>Trait-driven architecture · secure-by-default runtime · provider/channel/tool swappable · pluggable everything</code></p>
 
 <!-- BEGIN:WHATS_NEW -->
-
-### 🚀 What's New in v0.3.0-beta.200 (March 2026)
-
-| Area | Highlights |
-|---|---|
-| General | Incremental improvements and polish |
-
 <!-- END:WHATS_NEW -->
 
 ### 📢 Announcements
@@ -481,15 +474,6 @@ A heartfelt thank you to the communities and institutions that inspire and fuel 
 We're building in the open because the best ideas come from everywhere. If you're reading this, you're part of it. Welcome. 🦀❤️
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
-
-### 🌟 Recent Contributors (v0.3.0-beta.200)
-
-1 contributors shipped features, fixes, and improvements in this release cycle:
-
-- **Argenis**
-
-Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
-
 <!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ Official Repository & Impersonation Warning
