@@ -16,6 +16,7 @@
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 pub mod browser;
+pub mod browser_delegate;
 pub mod browser_open;
 pub mod cli_discovery;
 pub mod composio;
@@ -63,6 +64,8 @@ pub mod web_fetch;
 pub mod web_search_tool;
 
 pub use browser::{BrowserTool, ComputerUseConfig};
+#[allow(unused_imports)]
+pub use browser_delegate::{BrowserDelegateConfig, BrowserDelegateTool};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
@@ -249,6 +252,7 @@ pub fn all_tools_with_runtime(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> (Vec<Box<dyn Tool>>, Option<DelegateParentToolsHandle>) {
+    let has_shell_access = runtime.has_shell_access();
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ShellTool::new(security.clone(), runtime)),
         Arc::new(FileReadTool::new(security.clone())),
@@ -306,6 +310,20 @@ pub fn all_tools_with_runtime(
                 max_coordinate_y: browser_config.computer_use.max_coordinate_y,
             },
         )));
+    }
+
+    // Browser delegation tool (conditionally registered; requires shell access)
+    if root_config.browser_delegate.enabled {
+        if has_shell_access {
+            tool_arcs.push(Arc::new(BrowserDelegateTool::new(
+                security.clone(),
+                root_config.browser_delegate.clone(),
+            )));
+        } else {
+            tracing::warn!(
+                "browser_delegate: skipped registration because the current runtime does not allow shell access"
+            );
+        }
     }
 
     if http_config.enabled {
