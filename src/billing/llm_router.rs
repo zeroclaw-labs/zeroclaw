@@ -82,7 +82,7 @@ pub fn default_model_for_task(task: TaskCategory) -> (&'static str, &'static str
     match task {
         TaskCategory::GeneralChat => ("gemini", "gemini-3.1-flash-lite-preview"),
         TaskCategory::ReasoningDocument => ("gemini", "gemini-3.1-pro-preview"),
-        TaskCategory::Coding => ("anthropic", "claude-opus-4-20250514"),
+        TaskCategory::Coding => ("anthropic", "claude-opus-4-6"),
         TaskCategory::CodeReview => ("gemini", "gemini-3.1-pro-preview"),
         TaskCategory::Image => ("gemini", "gemini-3.1-flash-lite-preview"),
         TaskCategory::Music => ("gemini", "gemini-3.1-flash-lite-preview"),
@@ -499,7 +499,7 @@ mod tests {
     fn default_model_for_coding() {
         let (provider, model) = default_model_for_task(TaskCategory::Coding);
         assert_eq!(provider, "anthropic");
-        assert_eq!(model, "claude-opus-4-20250514");
+        assert_eq!(model, "claude-opus-4-6");
     }
 
     #[test]

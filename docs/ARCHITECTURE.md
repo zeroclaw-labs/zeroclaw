@@ -137,7 +137,7 @@ system automatically routes to the most appropriate model per task type:
 |---------------|----------|---------------|-----------|
 | **일반 채팅 (General Chat)** | Gemini | `gemini-3.1-flash-lite-preview` | Most cost-effective for casual conversation |
 | **추론/문서 (Reasoning/Document)** | Gemini | `gemini-3.1-pro-preview` | High-quality reasoning and document analysis |
-| **코딩 (Coding)** | Anthropic | `claude-opus-4-20250514` | Best-in-class code generation |
+| **코딩 (Coding)** | Anthropic | `claude-opus-4-6` | Best-in-class code generation |
 | **코드 리뷰 (Code Review)** | Gemini | `gemini-3.1-pro-preview` | Architecture-aware review |
 | **이미지 (Image)** | Gemini | `gemini-3.1-flash-lite-preview` | Cost-effective vision tasks |
 | **음악 (Music)** | Gemini | `gemini-3.1-flash-lite-preview` | Lightweight orchestration |

@@ -300,7 +300,7 @@ impl Tool for SwitchProviderTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Specific model (optional, e.g., 'gemini-2.5-flash', 'claude-opus-4')"
+                    "description": "Specific model (optional, e.g., 'gemini-2.5-flash', 'claude-opus-4-6')"
                 },
                 "reason": {
                     "type": "string",

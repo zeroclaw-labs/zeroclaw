@@ -367,7 +367,7 @@ You can route model calls by hint using `[[model_routes]]`:
 [[model_routes]]
 hint = "reasoning"
 provider = "openrouter"
-model = "anthropic/claude-opus-4-20250514"
+model = "anthropic/claude-opus-4-6"
 max_tokens = 8192
 
 [[model_routes]]

@@ -32,7 +32,7 @@ pub struct ModelPrice {
 
 /// The full pricing registry, keyed by canonical model ID.
 ///
-/// Model IDs use the format from the provider's API (e.g. "claude-opus-4-20250514",
+/// Model IDs use the format from the provider's API (e.g. "claude-opus-4-6",
 /// "gpt-4.1", "gemini-3.1-pro-preview"). The key is case-sensitive and must match
 /// exactly what the provider returns in usage responses.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -53,7 +53,7 @@ impl PricingRegistry {
 
         // ── Anthropic (Claude) ─────────────────────────────────────
         // Source: Anthropic API pricing, Feb 2026
-        models.insert("claude-opus-4-20250514".into(), ModelPrice {
+        models.insert("claude-opus-4-6".into(), ModelPrice {
             provider: "anthropic".into(),
             display_name: "Claude Opus 4.6/4.5".into(),
             input_per_million: 5.0,
@@ -467,7 +467,7 @@ mod tests {
     fn defaults_has_all_major_models() {
         let reg = PricingRegistry::defaults();
         // Anthropic
-        assert!(reg.models.contains_key("claude-opus-4-20250514"));
+        assert!(reg.models.contains_key("claude-opus-4-6"));
         assert!(reg.models.contains_key("claude-sonnet-4-20250514"));
         assert!(reg.models.contains_key("claude-haiku-4-5-20251001"));
         // OpenAI
@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn exact_lookup() {
         let reg = PricingRegistry::defaults();
-        let price = reg.lookup("claude-opus-4-20250514").unwrap();
+        let price = reg.lookup("claude-opus-4-6").unwrap();
         assert_eq!(price.input_per_million, 5.0);
         assert_eq!(price.output_per_million, 25.0);
     }
@@ -598,7 +598,7 @@ mod tests {
     #[test]
     fn claude_opus_pricing_matches_spec() {
         let reg = PricingRegistry::defaults();
-        let opus = reg.lookup("claude-opus-4-20250514").unwrap();
+        let opus = reg.lookup("claude-opus-4-6").unwrap();
         assert_eq!(opus.input_per_million, 5.0);
         assert_eq!(opus.output_per_million, 25.0);
     }

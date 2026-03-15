@@ -23,7 +23,7 @@ interface ModelOption {
 
 const MODEL_OPTIONS: Record<string, ModelOption[]> = {
   claude: [
-    { id: "claude-opus-4-20250514", label: "Claude Opus 4.6", tier: "Premium" },
+    { id: "claude-opus-4-6", label: "Claude Opus 4.6", tier: "Premium" },
     { id: "claude-sonnet-4-20250514", label: "Claude Sonnet 4.6", tier: "Standard" },
     { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5", tier: "Fast" },
   ],

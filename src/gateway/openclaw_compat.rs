@@ -68,7 +68,7 @@ pub struct ApiChatBody {
     #[serde(default)]
     pub provider: Option<String>,
 
-    /// Optional model ID override (e.g. "claude-opus-4-20250514", "gpt-4o").
+    /// Optional model ID override (e.g. "claude-opus-4-6", "gpt-4o").
     /// When provided, overrides the server's default_model for this request.
     #[serde(default)]
     pub model: Option<String>,
@@ -851,14 +851,14 @@ mod tests {
             "session_id": "sess-123",
             "context": ["User: hi", "Assistant: hello"],
             "provider": "anthropic",
-            "model": "claude-opus-4-20250514"
+            "model": "claude-opus-4-6"
         }"#;
         let body: ApiChatBody = serde_json::from_str(json).unwrap();
         assert_eq!(body.message, "What's my schedule?");
         assert_eq!(body.session_id.as_deref(), Some("sess-123"));
         assert_eq!(body.context.len(), 2);
         assert_eq!(body.provider.as_deref(), Some("anthropic"));
-        assert_eq!(body.model.as_deref(), Some("claude-opus-4-20250514"));
+        assert_eq!(body.model.as_deref(), Some("claude-opus-4-6"));
     }
 
     #[test]

@@ -164,7 +164,7 @@ fn best_models_for_provider(provider: &str) -> (&'static str, &'static str) {
     match provider {
         "anthropic" => (
             "claude-sonnet-4-20250514",     // fast + capable
-            "claude-opus-4-20250514",       // best reasoning/code
+            "claude-opus-4-6",              // best reasoning/code
         ),
         "openai" => (
             "gpt-4.1",                      // fast + capable
@@ -176,7 +176,7 @@ fn best_models_for_provider(provider: &str) -> (&'static str, &'static str) {
         ),
         "openrouter" => (
             "anthropic/claude-sonnet-4-20250514",
-            "anthropic/claude-opus-4-20250514",
+            "anthropic/claude-opus-4-6",
         ),
         "deepseek" => (
             "deepseek-chat",                // fast chat
@@ -212,7 +212,7 @@ fn best_models_for_provider(provider: &str) -> (&'static str, &'static str) {
         ),
         _ => (
             "anthropic/claude-sonnet-4-20250514",
-            "anthropic/claude-opus-4-20250514",
+            "anthropic/claude-opus-4-6",
         ),
     }
 }
@@ -1498,7 +1498,7 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         },
     );
     prices.insert(
-        "anthropic/claude-opus-4-20250514".into(),
+        "anthropic/claude-opus-4-6".into(),
         ModelPricing {
             input: 15.0,
             output: 75.0,
@@ -1574,7 +1574,7 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
     );
     // Claude Opus 4.6 (platform coding default)
     prices.insert(
-        "claude-opus-4-20250514".into(),
+        "claude-opus-4-6".into(),
         ModelPricing {
             input: 15.0,
             output: 75.0,
@@ -1648,7 +1648,7 @@ pub struct PlatformRoutingConfig {
     pub reasoning_provider: String,
 
     /// Default model for coding tasks (platform mode).
-    /// Default: `"claude-opus-4-20250514"`.
+    /// Default: `"claude-opus-4-6"`.
     #[serde(default = "default_platform_coding_model")]
     pub coding_model: String,
 
@@ -1687,7 +1687,7 @@ fn default_platform_reasoning_provider() -> String {
     "gemini".to_string()
 }
 fn default_platform_coding_model() -> String {
-    "claude-opus-4-20250514".to_string()
+    "claude-opus-4-6".to_string()
 }
 fn default_platform_coding_provider() -> String {
     "anthropic".to_string()
@@ -4271,7 +4271,7 @@ pub struct ReliabilityConfig {
     #[serde(default)]
     pub api_keys: Vec<String>,
     /// Per-model fallback chains. When a model fails, try these alternatives in order.
-    /// Example: `{ "claude-opus-4-20250514" = ["claude-sonnet-4-20250514", "gpt-4o"] }`
+    /// Example: `{ "claude-opus-4-6" = ["claude-sonnet-4-20250514", "gpt-4o"] }`
     ///
     /// Compatibility behavior: keys matching configured provider names are treated
     /// as provider-scoped remap chains during provider fallback.
@@ -4377,7 +4377,7 @@ impl Default for SchedulerConfig {
 /// [[model_routes]]
 /// hint = "reasoning"
 /// provider = "openrouter"
-/// model = "anthropic/claude-opus-4-20250514"
+/// model = "anthropic/claude-opus-4-6"
 ///
 /// [[model_routes]]
 /// hint = "fast"
