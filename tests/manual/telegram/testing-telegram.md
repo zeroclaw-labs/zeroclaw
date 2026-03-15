@@ -179,7 +179,7 @@ Solution: Verify code changes
 ./tests/telegram/test_telegram_integration.sh
 
 # 2. Configure Telegram
-zeroclaw onboard --interactive
+zeroclaw onboard
 # Select Telegram channel
 # Enter bot token (from @BotFather)
 # Enter your user ID

@@ -233,7 +233,7 @@ Traits never import concrete implementations.
 
 ```
 zeroclaw
-├── onboard [--interactive] [--force]     # First-run setup
+├── onboard [--force] [--reinit] [--channels-only]     # First-run setup
 ├── agent [-m "msg"] [-p provider]        # Start agent loop
 ├── daemon [-p port]                      # Full runtime (gateway+channels+cron+heartbeat)
 ├── gateway [-p port]                     # HTTP API server only

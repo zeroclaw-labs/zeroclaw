@@ -86,6 +86,16 @@ Zbudowany przez studentów i członków społeczności Harvard, MIT i Sundai.Clu
 
 <p align="center"><code>Architektura oparta na traitach · bezpieczny runtime domyślnie · wymienny dostawca/kanał/narzędzie · wszystko jest podłączalne</code></p>
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.3.1 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| ci | add Termux (aarch64-linux-android) release target |
+
+<!-- END:WHATS_NEW -->
+
 ### 📢 Ogłoszenia
 
 Użyj tej tabeli dla ważnych ogłoszeń (zmiany kompatybilności, powiadomienia bezpieczeństwa, okna serwisowe i blokady wersji).
@@ -412,6 +422,20 @@ Serdeczne podziękowania dla społeczności i instytucji które inspirują i zas
 - **Świat i Dalej** 🌍✨ — dla każdego kontrybutora, marzyciela, i budowniczego tam na zewnątrz który czyni open source siłą dla dobra. To dla ciebie.
 
 Budujemy w open source ponieważ najlepsze pomysły przychodzą zewsząd. Jeśli to czytasz, jesteś tego częścią. Witamy. 🦀❤️
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.3.1)
+
+3 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+- **argenis de la rosa**
+- **Claude Opus 4.6**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ Oficjalne Repozytorium i Ostrzeżenie o Podszywaniu Się
 
