@@ -3072,6 +3072,8 @@ impl<T: ChannelConfig> crate::config::traits::ConfigHandle for ConfigWrapper<T> 
 pub struct ChannelsConfig {
     /// Enable the CLI interactive channel. Default: `true`.
     pub cli: bool,
+    /// Local bridge websocket channel configuration.
+    pub bridge: Option<BridgeConfig>,
     /// Telegram bot channel configuration.
     pub telegram: Option<TelegramConfig>,
     /// Discord bot channel configuration.
@@ -3141,6 +3143,10 @@ impl ChannelsConfig {
     #[rustfmt::skip]
     pub fn channels_except_webhook(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
         vec![
+            (
+                Box::new(ConfigWrapper::new(self.bridge.as_ref())),
+                self.bridge.is_some(),
+            ),
             (
                 Box::new(ConfigWrapper::new(self.telegram.as_ref())),
                 self.telegram.is_some(),
@@ -3243,6 +3249,7 @@ impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
             cli: true,
+            bridge: None,
             telegram: None,
             discord: None,
             slack: None,
@@ -3286,6 +3293,89 @@ pub enum StreamMode {
 
 fn default_draft_update_interval_ms() -> u64 {
     1000
+}
+
+fn default_bridge_bind_host() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_bridge_bind_port() -> u16 {
+    8765
+}
+
+fn default_bridge_path() -> String {
+    "/ws".into()
+}
+
+fn default_bridge_auth_token() -> String {
+    String::new()
+}
+
+fn default_bridge_max_connections() -> usize {
+    64
+}
+
+/// Bridge WebSocket channel configuration.
+///
+/// This listener is local-only by default (`127.0.0.1`) for safety.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BridgeConfig {
+    /// Local bind host for the bridge listener.
+    #[serde(default = "default_bridge_bind_host")]
+    pub bind_host: String,
+    /// TCP port for incoming websocket bridge clients.
+    #[serde(default = "default_bridge_bind_port")]
+    pub bind_port: u16,
+    /// HTTP path for websocket upgrade requests.
+    #[serde(default = "default_bridge_path")]
+    pub path: String,
+    /// Shared bearer token required from bridge websocket clients.
+    ///
+    /// Empty default means bridge auth is not configured yet; listener startup
+    /// will fail fast until this is explicitly set.
+    #[serde(default = "default_bridge_auth_token")]
+    pub auth_token: String,
+    /// Allowlisted sender IDs that can authenticate over bridge.
+    ///
+    /// Empty list is deny-by-default.
+    #[serde(default)]
+    pub allowed_senders: Vec<String>,
+    /// Allow non-localhost binds.
+    ///
+    /// Defaults to `false`; public bind addresses require an explicit opt-in.
+    #[serde(default)]
+    pub allow_public_bind: bool,
+    /// Maximum concurrent websocket bridge connections.
+    #[serde(default = "default_bridge_max_connections")]
+    pub max_connections: usize,
+    /// Streaming mode for progressive response delivery via draft edits.
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+}
+
+impl Default for BridgeConfig {
+    fn default() -> Self {
+        Self {
+            bind_host: default_bridge_bind_host(),
+            bind_port: default_bridge_bind_port(),
+            path: default_bridge_path(),
+            auth_token: default_bridge_auth_token(),
+            allowed_senders: Vec::new(),
+            allow_public_bind: false,
+            max_connections: default_bridge_max_connections(),
+            stream_mode: StreamMode::default(),
+        }
+    }
+}
+
+impl ChannelConfig for BridgeConfig {
+    fn name() -> &'static str {
+        "Bridge"
+    }
+
+    fn desc() -> &'static str {
+        "Local websocket bridge"
+    }
 }
 
 /// Telegram bot channel configuration.
@@ -4923,6 +5013,15 @@ impl Config {
                     "config.channels_config.webhook.secret",
                 )?;
             }
+            if let Some(ref mut bridge) = config.channels_config.bridge {
+                if !bridge.auth_token.trim().is_empty() {
+                    decrypt_secret(
+                        &store,
+                        &mut bridge.auth_token,
+                        "config.channels_config.bridge.auth_token",
+                    )?;
+                }
+            }
             if let Some(ref mut ct) = config.channels_config.clawdtalk {
                 decrypt_secret(
                     &store,
@@ -5850,6 +5949,15 @@ impl Config {
                 "config.channels_config.webhook.secret",
             )?;
         }
+        if let Some(ref mut bridge) = config_to_save.channels_config.bridge {
+            if !bridge.auth_token.trim().is_empty() {
+                encrypt_secret(
+                    &store,
+                    &mut bridge.auth_token,
+                    "config.channels_config.bridge.auth_token",
+                )?;
+            }
+        }
         if let Some(ref mut ct) = config_to_save.channels_config.clawdtalk {
             encrypt_secret(
                 &store,
@@ -6258,6 +6366,7 @@ default_temperature = 0.7
             cron: CronConfig::default(),
             channels_config: ChannelsConfig {
                 cli: true,
+                bridge: None,
                 telegram: Some(TelegramConfig {
                     bot_token: "123:ABC".into(),
                     allowed_users: vec!["user1".into()],
@@ -6780,6 +6889,54 @@ tool_dispatcher = "xml"
     // ── Telegram / Discord config ────────────────────────────
 
     #[test]
+    async fn bridge_config_deserializes_with_safe_defaults() {
+        let parsed: BridgeConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.bind_host, "127.0.0.1");
+        assert_eq!(parsed.bind_port, 8765);
+        assert_eq!(parsed.path, "/ws");
+        assert!(parsed.auth_token.is_empty());
+        assert!(parsed.allowed_senders.is_empty());
+        assert!(!parsed.allow_public_bind);
+        assert_eq!(parsed.max_connections, 64);
+        assert_eq!(parsed.stream_mode, StreamMode::Off);
+    }
+
+    #[test]
+    async fn bridge_config_stream_mode_deserializes() {
+        let json = r#"{"auth_token":"tok","stream_mode":"partial"}"#;
+        let parsed: BridgeConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.stream_mode, StreamMode::Partial);
+        assert_eq!(parsed.auth_token, "tok");
+    }
+
+    #[test]
+    async fn channels_config_supports_bridge_section() {
+        let toml_str = r#"
+cli = true
+
+[bridge]
+bind_host = "127.0.0.1"
+bind_port = 9010
+path = "/bridge"
+auth_token = "test-token"
+allowed_senders = ["sender_a", "sender_b"]
+allow_public_bind = false
+max_connections = 16
+stream_mode = "partial"
+"#;
+        let parsed: ChannelsConfig = toml::from_str(toml_str).unwrap();
+        let bridge = parsed.bridge.expect("bridge should be present");
+        assert_eq!(bridge.bind_host, "127.0.0.1");
+        assert_eq!(bridge.bind_port, 9010);
+        assert_eq!(bridge.path, "/bridge");
+        assert_eq!(bridge.auth_token, "test-token");
+        assert_eq!(bridge.allowed_senders, vec!["sender_a", "sender_b"]);
+        assert!(!bridge.allow_public_bind);
+        assert_eq!(bridge.max_connections, 16);
+        assert_eq!(bridge.stream_mode, StreamMode::Partial);
+    }
+
+    #[test]
     async fn telegram_config_serde() {
         let tc = TelegramConfig {
             bot_token: "123:XYZ".into(),
@@ -6972,6 +7129,7 @@ allowed_users = ["@ops:matrix.org"]
     async fn channels_config_with_imessage_and_matrix() {
         let c = ChannelsConfig {
             cli: true,
+            bridge: None,
             telegram: None,
             discord: None,
             slack: None,
@@ -7200,6 +7358,7 @@ channel_id = "C123"
     async fn channels_config_with_whatsapp() {
         let c = ChannelsConfig {
             cli: true,
+            bridge: None,
             telegram: None,
             discord: None,
             slack: None,
