@@ -29,9 +29,11 @@ pub mod domain_matcher;
 pub mod estop;
 #[cfg(target_os = "linux")]
 pub mod firejail;
+pub mod iam_policy;
 #[cfg(feature = "sandbox-landlock")]
 pub mod landlock;
 pub mod leak_detector;
+pub mod nevis;
 pub mod otp;
 pub mod pairing;
 pub mod policy;
@@ -55,19 +57,27 @@ pub use policy::{AutonomyLevel, SecurityPolicy};
 pub use secrets::SecretStore;
 #[allow(unused_imports)]
 pub use traits::{NoopSandbox, Sandbox};
+// Nevis IAM integration
+#[allow(unused_imports)]
+pub use iam_policy::{IamPolicy, PolicyDecision};
+#[allow(unused_imports)]
+pub use nevis::{NevisAuthProvider, NevisIdentity};
 // Prompt injection defense exports
 #[allow(unused_imports)]
 pub use leak_detector::{LeakDetector, LeakResult};
 #[allow(unused_imports)]
 pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
 
-/// Redact sensitive values for safe logging. Shows first 4 chars + "***" suffix.
+/// Redact sensitive values for safe logging. Shows first 4 characters + "***" suffix.
+/// Uses char-boundary-safe indexing to avoid panics on multi-byte UTF-8 strings.
 /// This function intentionally breaks the data-flow taint chain for static analysis.
 pub fn redact(value: &str) -> String {
-    if value.len() <= 4 {
+    let char_count = value.chars().count();
+    if char_count <= 4 {
         "***".to_string()
     } else {
-        format!("{}***", &value[..4])
+        let prefix: String = value.chars().take(4).collect();
+        format!("{prefix}***")
     }
 }
 
