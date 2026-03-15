@@ -644,7 +644,7 @@ Max Concurrent: 5 (Wave 1)
   - Message: `feat(firmware): add command executor for GPIO/ADC with QEMU tests`
   - Files: `firmware/esp32-node/src/executor.cpp`, `firmware/esp32-node/scripts/test-qemu-*.sh`
 
-- [ ] 10. 自动重连和错误恢复
+- [x] 10. 自动重连和错误恢复
 
   **What to do**:
   - 实现 MQTT 断线重连（指数退避）

@@ -47,7 +47,22 @@ impl Bridge {
                             }
                         }
                         Ok(_) => {}
-                        Err(e) => error!("MQTT poll error: {}", e),
+                        Err(e) => {
+                            error!("MQTT poll error: {}, reconnecting...", e);
+                            if let Err(e) = self.mqtt.connect().await {
+                                error!("MQTT reconnect failed: {}", e);
+                                break;
+                            }
+                            if let Err(e) = self.mqtt.subscribe("zeroclaw/nodes/+/register").await {
+                                error!("MQTT resubscribe failed: {}", e);
+                                break;
+                            }
+                            if let Err(e) = self.mqtt.subscribe("zeroclaw/nodes/+/result").await {
+                                error!("MQTT resubscribe failed: {}", e);
+                                break;
+                            }
+                            info!("MQTT reconnected successfully");
+                        }
                     }
                 }
 
@@ -74,13 +89,22 @@ impl Bridge {
                                 error!("WebSocket reconnect failed: {}", e);
                                 break;
                             }
+                            info!("WebSocket reconnected successfully");
                         }
-                        Err(e) => error!("WebSocket receive error: {}", e),
+                        Err(e) => {
+                            error!("WebSocket receive error: {}, reconnecting...", e);
+                            if let Err(e) = self.ws.connect_with_retry().await {
+                                error!("WebSocket reconnect failed: {}", e);
+                                break;
+                            }
+                            info!("WebSocket reconnected successfully");
+                        }
                     }
                 }
             }
         }
 
+        error!("Bridge shutting down due to critical error");
         Ok(())
     }
 }

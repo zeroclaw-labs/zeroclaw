@@ -292,3 +292,24 @@ All schemas validated with jq:
 - Build successful with warnings (unused code in main.rs, expected for MVP)
 - Token will be included in WebSocket connection headers when bridge connects
 
+
+## Task 10: Auto-reconnection and Error Recovery
+
+### Implementation
+- Added MQTT reconnection on poll errors with automatic resubscription to topics
+- Added WebSocket reconnection on both close (None) and receive errors
+- Both use existing client backoff logic (MqttClient::connect has exponential backoff, WsClient::connect_with_retry has 5 retries)
+- Added graceful shutdown: bridge breaks event loop on critical reconnection failures
+- Added success logging after reconnection for observability
+
+### Key Patterns
+- MQTT reconnection requires resubscribing to topics after successful connect
+- WebSocket errors (Err) need same reconnection flow as close (None)
+- Break event loop on reconnection failure to trigger graceful shutdown
+- Log reconnection success for operational visibility
+
+### Reconnection Flow
+1. MQTT poll error → log error → reconnect → resubscribe both topics → log success or break
+2. WebSocket receive error/close → log event → connect_with_retry → log success or break
+3. Critical failure (reconnect fails) → break loop → log shutdown message → return Ok(())
+
