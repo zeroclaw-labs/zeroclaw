@@ -2376,6 +2376,21 @@ pub struct ObservabilityConfig {
     /// Maximum entries retained when runtime_trace_mode = "rolling".
     #[serde(default = "default_runtime_trace_max_entries")]
     pub runtime_trace_max_entries: usize,
+
+    /// Directory for session report JSON files.
+    /// If None (default), no reports are written.
+    #[serde(default)]
+    pub session_report_dir: Option<String>,
+
+    /// Max session report files to keep. 0 = unlimited. Default: 500.
+    #[serde(default = "default_session_report_max_files")]
+    pub session_report_max_files: usize,
+
+    /// Enable verbose session recording (all tool args/outputs).
+    /// When false, only records metadata (tool names, durations, success).
+    /// Default: false.
+    #[serde(default)]
+    pub session_report_debug: bool,
 }
 
 impl Default for ObservabilityConfig {
@@ -2387,6 +2402,9 @@ impl Default for ObservabilityConfig {
             runtime_trace_mode: default_runtime_trace_mode(),
             runtime_trace_path: default_runtime_trace_path(),
             runtime_trace_max_entries: default_runtime_trace_max_entries(),
+            session_report_dir: None,
+            session_report_max_files: default_session_report_max_files(),
+            session_report_debug: false,
         }
     }
 }
@@ -2401,6 +2419,10 @@ fn default_runtime_trace_path() -> String {
 
 fn default_runtime_trace_max_entries() -> usize {
     200
+}
+
+fn default_session_report_max_files() -> usize {
+    500
 }
 
 // ── Hooks ────────────────────────────────────────────────────────
@@ -6089,6 +6111,9 @@ mod tests {
         assert_eq!(o.runtime_trace_mode, "none");
         assert_eq!(o.runtime_trace_path, "state/runtime-trace.jsonl");
         assert_eq!(o.runtime_trace_max_entries, 200);
+        assert!(o.session_report_dir.is_none());
+        assert_eq!(o.session_report_max_files, 500);
+        assert!(!o.session_report_debug);
     }
 
     #[test]

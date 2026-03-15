@@ -7922,30 +7922,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "zeroclaw-robot-kit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "chrono",
- "directories",
- "portable-atomic",
- "reqwest",
- "rppal",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "toml 1.0.6+spec-1.1.0",
- "tracing",
-]
-
-[[package]]
-name = "zeroclawlabs"
-version = "0.2.1"
+name = "zeroclaw"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "async-imap",
@@ -8031,6 +8009,28 @@ dependencies = [
  "webpki-roots 1.0.6",
  "which",
  "wiremock",
+]
+
+[[package]]
+name = "zeroclaw-robot-kit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "chrono",
+ "directories",
+ "portable-atomic",
+ "reqwest",
+ "rppal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "toml 1.0.6+spec-1.1.0",
+ "tracing",
 ]
 
 [[package]]

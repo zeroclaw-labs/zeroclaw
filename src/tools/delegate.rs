@@ -482,6 +482,8 @@ impl DelegateTool {
                 agent_config.max_parallel_tool_calls.unwrap_or(5),
                 agent_config.max_tool_result_chars.unwrap_or(4000),
                 agent_config.iteration_cooldown_ms.unwrap_or(0),
+                None,
+                false,
             ),
         )
         .await;

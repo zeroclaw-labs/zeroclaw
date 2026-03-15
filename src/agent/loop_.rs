@@ -186,6 +186,28 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
 /// used when callers omit the parameter.
 const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 
+tokio::task_local! {
+    pub(crate) static TOOL_LOOP_SESSION_REPORT_DIR: Option<String>;
+    pub(crate) static TOOL_LOOP_SESSION_REPORT_MAX_FILES: usize;
+}
+
+/// Run a future with the session report directory set in task-local storage.
+pub(crate) async fn scope_session_report_dir<F>(
+    dir: Option<String>,
+    max_files: usize,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    TOOL_LOOP_SESSION_REPORT_DIR
+        .scope(
+            dir,
+            TOOL_LOOP_SESSION_REPORT_MAX_FILES.scope(max_files, future),
+        )
+        .await
+}
+
 /// Keep this many most-recent non-system messages after compaction.
 const COMPACTION_KEEP_RECENT_MESSAGES: usize = 20;
 
@@ -2158,6 +2180,8 @@ pub(crate) async fn agent_turn(
         5,
         4000,
         0,
+        None,
+        false,
     )
     .await
 }
@@ -2354,12 +2378,20 @@ pub(crate) async fn run_tool_call_loop(
     max_parallel_tool_calls: usize,
     max_tool_result_chars: usize,
     iteration_cooldown_ms: u64,
+    session_recorder: Option<&crate::observability::session_recorder::SessionRecorder>,
+    session_debug: bool,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
         max_tool_iterations
     };
+
+    let session_start = Instant::now();
+    let session_report_dir = TOOL_LOOP_SESSION_REPORT_DIR
+        .try_with(|d| d.clone())
+        .ok()
+        .flatten();
 
     let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
         .iter()
@@ -2419,6 +2451,19 @@ pub(crate) async fn run_tool_call_loop(
                 format!("\u{1f914} Thinking (round {})...\n", iteration + 1)
             };
             let _ = tx.send(phase).await;
+        }
+
+        // ── Session recorder: prompt ──────────────────────────
+        if let Some(rec) = session_recorder {
+            rec.init_turn(iteration);
+            let prompt_preview: String = prepared_messages
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .map(|m| m.content.chars().take(500).collect::<String>())
+                .unwrap_or_default();
+            rec.record_prompt(iteration, &prompt_preview);
         }
 
         observer.record_event(&ObserverEvent::LlmRequest {
@@ -2549,6 +2594,20 @@ pub(crate) async fn run_tool_call_loop(
                         }),
                     );
 
+                    // ── Session recorder: LLM response ─────────────
+                    if let Some(rec) = session_recorder {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let llm_elapsed_ms = llm_started_at.elapsed().as_millis() as u64;
+                        rec.record_llm_response(
+                            iteration,
+                            &response_text,
+                            resp_input_tokens,
+                            resp_output_tokens,
+                            llm_elapsed_ms,
+                            session_debug,
+                        );
+                    }
+
                     // Preserve native tool call IDs in assistant history so role=tool
                     // follow-up messages can reference the exact call id.
                     let reasoning_content = resp.reasoning_content.clone();
@@ -2611,6 +2670,14 @@ pub(crate) async fn run_tool_call_loop(
         let display_text =
             resolve_display_text(&response_text, &parsed_text, !tool_calls.is_empty());
         let display_text = strip_tool_result_blocks(&display_text);
+
+        // ── Session recorder: selected tools ────────────────
+        if let Some(rec) = session_recorder {
+            if !tool_calls.is_empty() {
+                let tool_names: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
+                rec.record_selected_tools(iteration, &tool_names);
+            }
+        }
 
         // Log tool calls or final response
         if tool_calls.is_empty() {
@@ -2704,6 +2771,19 @@ pub(crate) async fn run_tool_call_loop(
                 }
                 if !chunk.is_empty() {
                     let _ = tx.send(chunk).await;
+                }
+            }
+            // ── Session recorder: finalize on success ──────────
+            if let Some(rec) = session_recorder {
+                if let Some(ref dir_str) = session_report_dir {
+                    let max_files = TOOL_LOOP_SESSION_REPORT_MAX_FILES
+                        .try_with(|m| *m)
+                        .unwrap_or(500);
+                    rec.finalize_and_write(
+                        std::path::Path::new(dir_str),
+                        session_start,
+                        max_files,
+                    );
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
@@ -3145,6 +3225,19 @@ pub(crate) async fn run_tool_call_loop(
                         "output_preview": scrub_credentials(&output).chars().take(200).collect::<String>(),
                     }),
                 );
+                // ── Session recorder: finalize on terminal early return ──
+                if let Some(rec) = session_recorder {
+                    if let Some(ref dir_str) = session_report_dir {
+                        let max_files = TOOL_LOOP_SESSION_REPORT_MAX_FILES
+                            .try_with(|m| *m)
+                            .unwrap_or(500);
+                        rec.finalize_and_write(
+                            std::path::Path::new(dir_str),
+                            session_start,
+                            max_files,
+                        );
+                    }
+                }
                 if let Some(ref tx) = on_delta {
                     let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
                     let _ = tx.send(output.clone()).await;
@@ -3663,6 +3756,8 @@ pub async fn run(
             config.agent.max_parallel_tool_calls,
             config.agent.max_tool_result_chars,
             0,
+            None,
+            false,
         )
         .await?;
         final_output = response.clone();
@@ -3814,6 +3909,8 @@ pub async fn run(
                 config.agent.max_parallel_tool_calls,
                 config.agent.max_tool_result_chars,
                 0,
+                None,
+                false,
             )
             .await
             {
@@ -4475,6 +4572,8 @@ mod tests {
             5,
             4000,
             0,
+            None,
+            false,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -4525,6 +4624,8 @@ mod tests {
             5,
             4000,
             0,
+            None,
+            false,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -4569,6 +4670,8 @@ mod tests {
             5,
             4000,
             0,
+            None,
+            false,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -4699,6 +4802,8 @@ mod tests {
             5,
             4000,
             0,
+            None,
+            false,
         )
         .await
         .expect("parallel execution should complete");
@@ -4772,6 +4877,8 @@ mod tests {
             5,
             4000,
             0,
+            None,
+            false,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4837,6 +4944,8 @@ mod tests {
             5,
             4000,
             0,
+            None,
+            false,
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -4917,6 +5026,8 @@ mod tests {
             5,
             4000,
             0,
+            None,
+            false,
         )
         .await
         .expect("loop should complete");
@@ -4974,6 +5085,8 @@ mod tests {
             5,
             4000,
             0,
+            None,
+            false,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -6857,6 +6970,8 @@ Let me check the result."#;
             2, // max_parallel_tool_calls = 2
             4000,
             0,
+            None,
+            false,
         )
         .await
         .expect("tool loop should succeed");
@@ -6930,6 +7045,8 @@ Let me check the result."#;
             5,
             50, // max_tool_result_chars = 50
             0,
+            None,
+            false,
         )
         .await
         .expect("should succeed");
@@ -7046,6 +7163,8 @@ Let me check the result."#;
             5,
             4000,
             0,
+            None,
+            false,
         )
         .await
         .expect("tool loop should succeed");

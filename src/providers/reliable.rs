@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 // ── Error Classification ─────────────────────────────────────────────────
 // Errors are split into retryable (transient server/network failures) and
@@ -264,6 +265,9 @@ pub struct ReliableProvider {
     key_index: AtomicUsize,
     /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
     model_fallbacks: HashMap<String, Vec<String>>,
+    /// Rate-limit cooldown: provider_index → earliest retry time.
+    /// Providers are skipped until their cooldown expires (default 60s).
+    rate_limit_cooldowns: Mutex<HashMap<usize, Instant>>,
 }
 
 impl ReliableProvider {
@@ -285,6 +289,7 @@ impl ReliableProvider {
             api_keys: Vec::new(),
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
+            rate_limit_cooldowns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -327,6 +332,22 @@ impl ReliableProvider {
             base
         }
     }
+
+    /// Check if provider is in rate-limit cooldown. Returns true if should skip.
+    fn is_in_cooldown(&self, provider_idx: usize) -> bool {
+        let lock = self.rate_limit_cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+        lock.get(&provider_idx).is_some_and(|&deadline| Instant::now() < deadline)
+    }
+
+    /// Mark provider as rate-limited for the given duration.
+    fn set_cooldown(&self, provider_idx: usize, cooldown: Duration) {
+        let mut lock = self.rate_limit_cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+        lock.insert(provider_idx, Instant::now() + cooldown);
+    }
+
+    /// Default rate-limit cooldown: 10s. Short enough to retry gemini quickly
+    /// but long enough to skip wasted attempts within a single tool-loop iteration.
+    const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10);
 }
 
 #[async_trait]
@@ -352,7 +373,11 @@ impl Provider for ReliableProvider {
         let mut failures = Vec::new();
 
         // Outer: provider priority. Middle: compatible models. Inner: retries.
-        for (provider_name, provider) in &self.providers {
+        for (provider_idx, (provider_name, provider)) in self.providers.iter().enumerate() {
+            if self.is_in_cooldown(provider_idx) {
+                tracing::debug!(provider = %provider_name, "Skipping provider (rate-limit cooldown)");
+                continue;
+            }
             for current_model in &models {
                 if !is_model_compatible(provider_name, current_model) {
                     tracing::debug!(
@@ -441,7 +466,10 @@ impl Provider for ReliableProvider {
                                     model = *current_model,
                                     "Rate limited, skipping to next provider"
                                 );
-                                // Break both model and retry loops for this provider
+                                let cd = parse_retry_after_ms(&e)
+                                    .map(|ms| Duration::from_millis(ms.min(60_000)))
+                                    .unwrap_or(Self::RATE_LIMIT_COOLDOWN);
+                                self.set_cooldown(provider_idx, cd);
                                 break;
                             }
 
@@ -480,7 +508,11 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
-        for (provider_name, provider) in &self.providers {
+        for (provider_idx, (provider_name, provider)) in self.providers.iter().enumerate() {
+            if self.is_in_cooldown(provider_idx) {
+                tracing::debug!(provider = %provider_name, "Skipping provider (rate-limit cooldown)");
+                continue;
+            }
             for current_model in &models {
                 if !is_model_compatible(provider_name, current_model) {
                     continue;
@@ -563,6 +595,10 @@ impl Provider for ReliableProvider {
                                     model = *current_model,
                                     "Rate limited, skipping to next provider"
                                 );
+                                let cd = parse_retry_after_ms(&e)
+                                    .map(|ms| Duration::from_millis(ms.min(60_000)))
+                                    .unwrap_or(Self::RATE_LIMIT_COOLDOWN);
+                                self.set_cooldown(provider_idx, cd);
                                 break;
                             }
 
@@ -615,7 +651,11 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
-        for (provider_name, provider) in &self.providers {
+        for (provider_idx, (provider_name, provider)) in self.providers.iter().enumerate() {
+            if self.is_in_cooldown(provider_idx) {
+                tracing::debug!(provider = %provider_name, "Skipping provider (rate-limit cooldown)");
+                continue;
+            }
             for current_model in &models {
                 if !is_model_compatible(provider_name, current_model) {
                     continue;
@@ -698,6 +738,10 @@ impl Provider for ReliableProvider {
                                     model = *current_model,
                                     "Rate limited, skipping to next provider"
                                 );
+                                let cd = parse_retry_after_ms(&e)
+                                    .map(|ms| Duration::from_millis(ms.min(60_000)))
+                                    .unwrap_or(Self::RATE_LIMIT_COOLDOWN);
+                                self.set_cooldown(provider_idx, cd);
                                 break;
                             }
 
@@ -736,7 +780,11 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
-        for (provider_name, provider) in &self.providers {
+        for (provider_idx, (provider_name, provider)) in self.providers.iter().enumerate() {
+            if self.is_in_cooldown(provider_idx) {
+                tracing::debug!(provider = %provider_name, "Skipping provider (rate-limit cooldown)");
+                continue;
+            }
             for current_model in &models {
                 if !is_model_compatible(provider_name, current_model) {
                     continue;
@@ -820,6 +868,10 @@ impl Provider for ReliableProvider {
                                     model = *current_model,
                                     "Rate limited, skipping to next provider"
                                 );
+                                let cd = parse_retry_after_ms(&e)
+                                    .map(|ms| Duration::from_millis(ms.min(60_000)))
+                                    .unwrap_or(Self::RATE_LIMIT_COOLDOWN);
+                                self.set_cooldown(provider_idx, cd);
                                 break;
                             }
 
@@ -863,7 +915,11 @@ impl Provider for ReliableProvider {
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         // Try each provider/model combination for streaming
         // For streaming, we use the first provider that supports it and has streaming enabled
-        for (provider_name, provider) in &self.providers {
+        for (provider_idx, (provider_name, provider)) in self.providers.iter().enumerate() {
+            if self.is_in_cooldown(provider_idx) {
+                tracing::debug!(provider = %provider_name, "Skipping provider (rate-limit cooldown)");
+                continue;
+            }
             if !provider.supports_streaming() || !options.enabled {
                 continue;
             }

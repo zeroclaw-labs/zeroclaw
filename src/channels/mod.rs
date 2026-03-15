@@ -334,6 +334,9 @@ struct ChannelRuntimeDefaults {
     api_key: Option<String>,
     api_url: Option<String>,
     reliability: crate::config::ReliabilityConfig,
+    session_report_dir: Option<String>,
+    session_report_max_files: usize,
+    session_report_debug: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -843,6 +846,9 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         api_key: config.api_key.clone(),
         api_url: config.api_url.clone(),
         reliability: config.reliability.clone(),
+        session_report_dir: config.observability.session_report_dir.clone(),
+        session_report_max_files: config.observability.session_report_max_files,
+        session_report_debug: config.observability.session_report_debug,
     }
 }
 
@@ -870,6 +876,9 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         api_key: ctx.api_key.clone(),
         api_url: ctx.api_url.clone(),
         reliability: (*ctx.reliability).clone(),
+        session_report_dir: None,
+        session_report_max_files: 500,
+        session_report_debug: false,
     }
 }
 
@@ -2145,6 +2154,28 @@ async fn process_channel_message(
     // Record history length before tool loop so we can extract tool context after.
     let history_len_before_tools = history.len();
 
+    // Session recorder: create when session_report_dir is configured.
+    let session_recorder = runtime_defaults.session_report_dir.as_ref().map(|_| {
+        let user_query = history
+            .iter()
+            .rfind(|m| m.role == "user")
+            .map(|m| m.content.chars().take(500).collect::<String>())
+            .unwrap_or_default();
+        crate::observability::session_recorder::SessionRecorder::new(
+            crate::observability::session_recorder::SessionData {
+                session_id: msg.id.clone(),
+                start_time: chrono::Utc::now().to_rfc3339(),
+                channel: msg.channel.clone(),
+                provider: route.provider.clone(),
+                model: route.model.clone(),
+                user_query,
+                ..Default::default()
+            },
+        )
+    });
+    let session_start = std::time::Instant::now();
+    let session_debug = runtime_defaults.session_report_debug;
+
     enum LlmExecutionResult {
         Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
         Cancelled,
@@ -2181,6 +2212,8 @@ async fn process_channel_message(
                 ctx.max_parallel_tool_calls,
                 ctx.max_tool_result_chars,
                 0,
+                session_recorder.as_ref(),
+                session_debug,
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -2377,6 +2410,16 @@ async fn process_channel_message(
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                 }
             }
+            // Finalize session report on success
+            if let (Some(ref rec), Some(ref dir)) =
+                (&session_recorder, &runtime_defaults.session_report_dir)
+            {
+                rec.finalize_and_write(
+                    std::path::Path::new(dir),
+                    session_start,
+                    runtime_defaults.session_report_max_files,
+                );
+            }
         }
         LlmExecutionResult::Completed(Ok(Err(e))) => {
             if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled()
@@ -2500,6 +2543,17 @@ async fn process_channel_message(
                     }
                 }
             }
+            // Finalize session report on error
+            if let (Some(ref rec), Some(ref dir)) =
+                (&session_recorder, &runtime_defaults.session_report_dir)
+            {
+                rec.finalize_and_write_error(
+                    std::path::Path::new(dir),
+                    session_start,
+                    &e.to_string(),
+                    runtime_defaults.session_report_max_files,
+                );
+            }
         }
         LlmExecutionResult::Completed(Err(_)) => {
             let timeout_msg = format!(
@@ -2547,6 +2601,17 @@ async fn process_channel_message(
                         )
                         .await;
                 }
+            }
+            // Finalize session report on timeout
+            if let (Some(ref rec), Some(ref dir)) =
+                (&session_recorder, &runtime_defaults.session_report_dir)
+            {
+                rec.finalize_and_write_error(
+                    std::path::Path::new(dir),
+                    session_start,
+                    "timeout",
+                    runtime_defaults.session_report_max_files,
+                );
             }
         }
     }
@@ -5483,6 +5548,9 @@ BTC is currently around $65,000 based on latest tool output."#
                         api_key: None,
                         api_url: None,
                         reliability: crate::config::ReliabilityConfig::default(),
+                        session_report_dir: None,
+                        session_report_max_files: 500,
+                        session_report_debug: false,
                     },
                     last_applied_stamp: None,
                 },

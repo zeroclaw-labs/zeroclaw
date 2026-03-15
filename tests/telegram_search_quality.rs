@@ -876,6 +876,10 @@ fn zverozabr_session_path() -> String {
 async fn send_to_bot(bot_username: &str, text: &str) -> i64 {
     let (api_id, api_hash, _) = load_credentials();
     let session = zverozabr_session_path();
+    // Append a unique nonce so the bot always gets a fresh message
+    // (prevents wait_for_bot_reply from matching stale replies).
+    let nonce: u32 = rand::random();
+    let text = format!("{text} [#{nonce:08x}]");
 
     let script = r#"
 import asyncio, json, os, sys
@@ -893,8 +897,15 @@ async def main():
     if not await client.is_user_authorized():
         print(json.dumps({"success": False, "error": "zverozabr_session not authorized"}))
         sys.exit(1)
+    # Get latest message id BEFORE sending — so wait_for_bot_reply can skip
+    # any pending bot responses to previous queries that arrive after our send.
+    latest = await client.get_messages(BOT, limit=1)
+    latest_id = latest[0].id if latest else 0
     msg = await client.send_message(BOT, TEXT)
-    print(json.dumps({"success": True, "message_id": msg.id}))
+    # Return max(sent_id, latest_id) to ensure wait_for_bot_reply only sees
+    # messages that arrived AFTER both our send AND any pending responses.
+    after_id = max(msg.id, latest_id)
+    print(json.dumps({"success": True, "message_id": after_id}))
     await client.disconnect()
 
 asyncio.run(main())
@@ -1148,9 +1159,8 @@ fn assert_full_message_if_no_link(text: &str) {
     );
     let lower = text.to_lowercase();
     // When source is unavailable (personal chat), author info is acceptable
-    let has_author_or_source = lower.contains("автор")
-        || lower.contains("источник")
-        || lower.contains("author");
+    let has_author_or_source =
+        lower.contains("автор") || lower.contains("источник") || lower.contains("author");
     if has_author_or_source {
         return;
     }

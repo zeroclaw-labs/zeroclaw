@@ -6,6 +6,7 @@ pub mod otel;
 #[cfg(feature = "observability-prometheus")]
 pub mod prometheus;
 pub mod runtime_trace;
+pub mod session_recorder;
 pub mod traits;
 pub mod verbose;
 
