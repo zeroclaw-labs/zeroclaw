@@ -169,7 +169,12 @@ impl NextcloudTalkChannel {
             .get("content")
             .and_then(|v| v.as_str())
             .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::trim).map(str::to_string))
+            .and_then(|v| {
+                v.get("message")
+                    .and_then(|m| m.as_str())
+                    .map(str::trim)
+                    .map(str::to_string)
+            })
             .filter(|s| !s.is_empty());
 
         let Some(content) = content else {
@@ -177,8 +182,8 @@ impl NextcloudTalkChannel {
             return messages;
         };
 
-        let message_id = Self::value_to_string(obj.get("id"))
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let message_id =
+            Self::value_to_string(obj.get("id")).unwrap_or_else(|| Uuid::new_v4().to_string());
 
         messages.push(ChannelMessage {
             id: message_id,
