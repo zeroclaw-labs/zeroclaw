@@ -84,7 +84,7 @@ impl NextcloudTalkChannel {
     /// }
     /// ```
     pub fn parse_webhook_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
-        let mut messages = Vec::new();
+        let messages = Vec::new();
 
         let event_type = match payload.get("type").and_then(|v| v.as_str()) {
             Some(t) => t,
