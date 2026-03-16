@@ -128,27 +128,12 @@ impl ToolDispatcher for XmlToolDispatcher {
         ConversationMessage::Chat(ChatMessage::user(format!("[Tool results]\n{content}")))
     }
 
-    fn prompt_instructions(&self, tools: &[Box<dyn Tool>]) -> String {
-        let mut instructions = String::new();
-        instructions.push_str("## Tool Use Protocol\n\n");
-        instructions
-            .push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
-        instructions.push_str(
-            "```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n",
-        );
-        instructions.push_str("### Available Tools\n\n");
-
-        for tool in tools {
-            let _ = writeln!(
-                instructions,
-                "- **{}**: {}\n  Parameters: `{}`",
-                tool.name(),
-                tool.description(),
-                tool.parameters_schema()
-            );
-        }
-
-        instructions
+    fn prompt_instructions(&self, _tools: &[Box<dyn Tool>]) -> String {
+        // Do NOT enumerate tools here. ToolsSection in prompt.rs already lists
+        // every tool's name, description, and parameters schema. Repeating them
+        // here would inject the full tool catalogue twice into the system prompt
+        // (see issue #3643).
+        "## Tool Use Protocol\n\nTo use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n".to_string()
     }
 
     fn to_provider_messages(&self, history: &[ConversationMessage]) -> Vec<ChatMessage> {
@@ -346,6 +331,52 @@ mod tests {
             }
             _ => panic!("expected tool results"),
         }
+    }
+
+    #[test]
+    fn xml_prompt_instructions_does_not_duplicate_tool_schemas() {
+        use crate::tools::{Tool, ToolResult};
+        use async_trait::async_trait;
+
+        struct DummyTool;
+
+        #[async_trait]
+        impl Tool for DummyTool {
+            fn name(&self) -> &str {
+                "dummy"
+            }
+            fn description(&self) -> &str {
+                "does nothing"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: "ok".into(),
+                    error: None,
+                })
+            }
+        }
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(DummyTool)];
+        let dispatcher = XmlToolDispatcher;
+        let instructions = dispatcher.prompt_instructions(&tools);
+
+        // Protocol preamble must be present.
+        assert!(instructions.contains("## Tool Use Protocol"));
+        assert!(instructions.contains("<tool_call>"));
+
+        // Tool schemas must NOT appear — ToolsSection owns that listing.
+        assert!(
+            !instructions.contains("dummy"),
+            "tool name must not appear in prompt_instructions; ToolsSection already lists tools"
+        );
+        assert!(
+            !instructions.contains("Available Tools"),
+            "### Available Tools must not appear in prompt_instructions"
+        );
     }
 
     #[test]
