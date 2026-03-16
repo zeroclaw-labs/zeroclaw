@@ -7628,6 +7628,17 @@ reasoning_enabled = false
     async fn agent_config_deserializes() {
         let raw = r#"
 default_temperature = 0.7
+
+[data_retention]
+
+[cloud_ops]
+
+[conversational_ai]
+
+[security]
+
+[security_ops]
+
 [agent]
 compact_context = true
 max_tool_iterations = 20
@@ -8657,6 +8668,16 @@ default_temperature = 0.7
 workspace_dir = "/tmp/ws"
 config_path = "/tmp/config.toml"
 default_temperature = 0.7
+
+[data_retention]
+
+[cloud_ops]
+
+[conversational_ai]
+
+[security]
+
+[security_ops]
 "#;
         let parsed: Config = toml::from_str(minimal).unwrap();
         assert!(!parsed.browser.enabled);
