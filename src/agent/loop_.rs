@@ -1281,15 +1281,6 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
                 }
             }
         }
-
-        // Plain URL
-        if let Some(command) = build_curl_command(line) {
-            calls.push((
-                "shell".to_string(),
-                serde_json::json!({ "command": command }),
-                Some(line.to_string()),
-            ));
-        }
     }
 
     calls
@@ -5916,12 +5907,15 @@ Final answer."#;
     }
 
     #[test]
-    fn parse_glm_style_plain_url() {
+    fn parse_glm_style_ignores_plain_url() {
+        // A bare URL should NOT be interpreted as a tool call — this was
+        // causing false positives when LLMs included URLs in normal text.
         let response = "https://example.com/api";
         let calls = parse_glm_style_tool_calls(response);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "shell");
-        assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
+        assert!(
+            calls.is_empty(),
+            "plain URL must not be parsed as tool call"
+        );
     }
 
     #[test]
