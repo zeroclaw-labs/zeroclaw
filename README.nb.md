@@ -57,6 +57,16 @@
 
 ---
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.3.1 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| ci | add Termux (aarch64-linux-android) release target |
+
+<!-- END:WHATS_NEW -->
+
 ## Hva er ZeroClaw?
 
 ZeroClaw er en lettvektig, foranderlig og utvidbar AI-assistent-infrastruktur bygget i Rust. Den kobler sammen ulike LLM-leverandører (Anthropic, OpenAI, Google, Ollama osv.) via et samlet grensesnitt og støtter flere kanaler (Telegram, Matrix, CLI osv.).
@@ -177,3 +187,17 @@ Se [LICENSE-APACHE](LICENSE-APACHE) og [LICENSE-MIT](LICENSE-MIT) for detaljer.
 Hvis ZeroClaw er nyttig for deg, vennligst vurder å kjøpe oss en kaffe:
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee)](https://buymeacoffee.com/argenistherose)
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.3.1)
+
+3 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+- **argenis de la rosa**
+- **Claude Opus 4.6**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
