@@ -158,6 +158,10 @@ struct Cli {
 enum Commands {
     /// Initialize your workspace and configuration
     Onboard {
+        /// Run the full interactive setup wizard (auto-detected when in a TTY)
+        #[arg(long)]
+        interactive: bool,
+
         /// Overwrite existing config without confirmation
         #[arg(long)]
         force: bool,
@@ -724,7 +728,11 @@ async fn main() -> Result<()> {
     // it runs the quick (scriptable) setup.  This means `curl … | bash` and
     // `zeroclaw onboard --api-key …` both take the fast path, while a bare
     // `zeroclaw onboard` in a terminal launches the wizard.
+    //
+    // Passing `--interactive` explicitly forces the wizard even when TTY
+    // detection fails (e.g. certain terminal emulators or Docker setups).
     if let Commands::Onboard {
+        interactive,
         force,
         reinit,
         channels_only,
@@ -734,6 +742,7 @@ async fn main() -> Result<()> {
         memory,
     } = &cli.command
     {
+        let interactive = *interactive;
         let force = *force;
         let reinit = *reinit;
         let channels_only = *channels_only;
@@ -744,6 +753,14 @@ async fn main() -> Result<()> {
 
         if reinit && channels_only {
             bail!("--reinit and --channels-only cannot be used together");
+        }
+        if interactive && channels_only {
+            bail!("--interactive and --channels-only cannot be used together");
+        }
+        if interactive
+            && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
+        {
+            bail!("--interactive does not accept --api-key, --provider, --model, or --memory");
         }
         if channels_only
             && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
@@ -797,13 +814,16 @@ async fn main() -> Result<()> {
 
         // Auto-detect: run the interactive wizard when in a TTY with no
         // provider flags, quick setup otherwise (scriptable path).
+        // `--interactive` overrides auto-detection for environments where
+        // `is_terminal()` returns false despite a real terminal being present.
         let has_provider_flags =
             api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some();
         let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        let use_wizard = interactive || (is_tty && !has_provider_flags);
 
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
-        } else if is_tty && !has_provider_flags {
+        } else if use_wizard {
             Box::pin(onboard::run_wizard(force)).await
         } else {
             onboard::run_quick_setup(
@@ -2218,9 +2238,14 @@ mod tests {
     }
 
     #[test]
-    fn onboard_cli_rejects_removed_interactive_flag() {
-        // --interactive was removed; onboard auto-detects TTY instead.
-        assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"]).is_err());
+    fn onboard_cli_accepts_interactive_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"])
+            .expect("onboard --interactive should parse");
+
+        match cli.command {
+            Commands::Onboard { interactive, .. } => assert!(interactive),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2228,7 +2253,25 @@ mod tests {
         let cli = Cli::try_parse_from(["zeroclaw", "onboard"]).expect("bare onboard should parse");
 
         match cli.command {
-            Commands::Onboard { .. } => {}
+            Commands::Onboard { interactive, .. } => {
+                assert!(!interactive, "bare onboard should not set --interactive");
+            }
+            other => panic!("expected onboard command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn onboard_interactive_and_force_combine() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--interactive", "--force"])
+            .expect("--interactive --force should parse");
+
+        match cli.command {
+            Commands::Onboard {
+                interactive, force, ..
+            } => {
+                assert!(interactive);
+                assert!(force);
+            }
             other => panic!("expected onboard command, got {other:?}"),
         }
     }
