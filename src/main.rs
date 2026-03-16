@@ -880,7 +880,7 @@ async fn main() -> Result<()> {
         } => {
             let final_temperature = temperature.unwrap_or(config.default_temperature);
 
-            agent::run(
+            Box::pin(agent::run(
                 config,
                 message,
                 provider,
@@ -890,7 +890,7 @@ async fn main() -> Result<()> {
                 true,
                 session_state_file,
                 None,
-            )
+            ))
             .await
             .map(|_| ())
         }
