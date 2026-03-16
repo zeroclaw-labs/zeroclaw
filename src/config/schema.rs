@@ -3630,6 +3630,13 @@ pub struct ChannelsConfig {
     /// daemon restarts. Files are stored in `{workspace}/sessions/`. Default: `true`.
     #[serde(default = "default_true")]
     pub session_persistence: bool,
+    /// Session persistence backend: `"jsonl"` (legacy) or `"sqlite"` (new default).
+    /// SQLite provides FTS5 search, metadata tracking, and TTL cleanup.
+    #[serde(default = "default_session_backend")]
+    pub session_backend: String,
+    /// Auto-archive stale sessions older than this many hours. `0` disables. Default: `0`.
+    #[serde(default)]
+    pub session_ttl_hours: u32,
 }
 
 impl ChannelsConfig {
@@ -3735,6 +3742,10 @@ fn default_channel_message_timeout_secs() -> u64 {
     300
 }
 
+fn default_session_backend() -> String {
+    "sqlite".into()
+}
+
 impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
@@ -3765,6 +3776,8 @@ impl Default for ChannelsConfig {
             ack_reactions: true,
             show_tool_calls: true,
             session_persistence: true,
+            session_backend: default_session_backend(),
+            session_ttl_hours: 0,
         }
     }
 }
@@ -7439,6 +7452,8 @@ default_temperature = 0.7
                 ack_reactions: true,
                 show_tool_calls: true,
                 session_persistence: true,
+                session_backend: default_session_backend(),
+                session_ttl_hours: 0,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -8171,6 +8186,8 @@ allowed_users = ["@ops:matrix.org"]
             ack_reactions: true,
             show_tool_calls: true,
             session_persistence: true,
+            session_backend: default_session_backend(),
+            session_ttl_hours: 0,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -8399,6 +8416,8 @@ channel_id = "C123"
             ack_reactions: true,
             show_tool_calls: true,
             session_persistence: true,
+            session_backend: default_session_backend(),
+            session_ttl_hours: 0,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
