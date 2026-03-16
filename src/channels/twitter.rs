@@ -87,10 +87,14 @@ impl TwitterChannel {
     }
 
     /// Send a reply tweet.
-    async fn create_tweet(&self, text: &str, in_reply_to: Option<&str>) -> anyhow::Result<String> {
+    async fn create_tweet(
+        &self,
+        text: &str,
+        reply_tweet_id: Option<&str>,
+    ) -> anyhow::Result<String> {
         let mut body = json!({ "text": text });
 
-        if let Some(reply_id) = in_reply_to {
+        if let Some(reply_id) = reply_tweet_id {
             body["reply"] = json!({ "in_reply_to_tweet_id": reply_id });
         }
 
