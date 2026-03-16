@@ -7631,6 +7631,14 @@ default_temperature = 0.7
 
 [data_retention]
 
+[cloud_ops]
+
+[conversational_ai]
+
+[security]
+
+[security_ops]
+
 [agent]
 compact_context = true
 max_tool_iterations = 20
@@ -8662,6 +8670,14 @@ config_path = "/tmp/config.toml"
 default_temperature = 0.7
 
 [data_retention]
+
+[cloud_ops]
+
+[conversational_ai]
+
+[security]
+
+[security_ops]
 "#;
         let parsed: Config = toml::from_str(minimal).unwrap();
         assert!(!parsed.browser.enabled);
