@@ -2478,7 +2478,7 @@ fn default_web_fetch_timeout_secs() -> u64 {
 impl Default for WebFetchConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             provider: default_web_fetch_provider(),
             api_key: None,
             api_url: None,
@@ -2660,7 +2660,7 @@ fn normalize_web_search_provider(raw: &str) -> Option<&'static str> {
 impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             provider: default_web_search_provider(),
             api_key: None,
             api_url: None,

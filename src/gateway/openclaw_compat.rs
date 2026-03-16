@@ -204,7 +204,14 @@ pub async fn handle_api_chat(
     };
 
     // ── Build config with client-provided overrides ──
+    // Reload tool/feature config from disk so runtime changes (e.g. web_search_config
+    // enabling search) take effect without a gateway restart.
     let mut config = state.config.lock().clone();
+    if let Ok(disk_cfg) = super::reload_disk_config(&config) {
+        config.web_search = disk_cfg.web_search;
+        config.web_fetch = disk_cfg.web_fetch;
+        config.model_routes = disk_cfg.model_routes;
+    }
 
     // Map frontend provider names to backend provider names
     if let Some(ref client_provider) = chat_body.provider {

@@ -1453,8 +1453,29 @@ pub(super) async fn run_gateway_chat_with_tools(
     message: &str,
     session_id: Option<&str>,
 ) -> anyhow::Result<String> {
-    let config = state.config.lock().clone();
+    // Reload config from disk so that runtime config-tool changes (e.g. web_search_config
+    // enabling web search, setting API keys) take effect on subsequent requests.
+    let mut config = state.config.lock().clone();
+    if let Ok(disk_config) = reload_disk_config(&config) {
+        // Merge disk-saved tool/feature config into in-memory config while
+        // preserving runtime-only fields that are only set in memory.
+        config.web_search = disk_config.web_search;
+        config.web_fetch = disk_config.web_fetch;
+        config.model_routes = disk_config.model_routes;
+        // Update the in-memory state so the gateway stays consistent.
+        *state.config.lock() = config.clone();
+    }
     crate::agent::process_message_with_session(config, message, session_id).await
+}
+
+/// Reload config from the on-disk TOML file without applying env-var overrides.
+/// Returns the raw parsed config for selective field merging.
+pub(super) fn reload_disk_config(current: &crate::config::Config) -> anyhow::Result<crate::config::Config> {
+    let contents = std::fs::read_to_string(&current.config_path)?;
+    let mut parsed: crate::config::Config = toml::from_str(&contents)?;
+    parsed.config_path = current.config_path.clone();
+    parsed.workspace_dir = current.workspace_dir.clone();
+    Ok(parsed)
 }
 
 fn gateway_outbound_leak_guard_snapshot(

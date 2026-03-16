@@ -1610,11 +1610,17 @@ pub async fn handle_api_document_process(
             let _ = std::fs::remove_file(&tmp_path);
 
             if result.success {
-                Json(serde_json::json!({
-                    "success": true,
-                    "result": result.output,
-                }))
-                .into_response()
+                // The tool output is a JSON string with html, markdown, doc_type, etc.
+                // Parse it and return the structured fields directly so the frontend
+                // can access result.html, result.markdown without an extra wrapper.
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&result.output).unwrap_or_else(|_| {
+                        serde_json::json!({
+                            "markdown": result.output,
+                            "html": "",
+                        })
+                    });
+                Json(parsed).into_response()
             } else {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,

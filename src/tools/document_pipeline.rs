@@ -720,6 +720,7 @@ impl Tool for DocumentPipelineTool {
                     "page_count": output.page_count,
                     "html_length": output.html.len(),
                     "markdown_length": output.markdown.len(),
+                    "html": output.html,
                     "markdown": if output.markdown.len() > 50000 {
                         let end = output.markdown
                             .char_indices()
