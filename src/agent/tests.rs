@@ -1280,10 +1280,11 @@ fn xml_dispatcher_generates_tool_instructions() {
     let dispatcher = XmlToolDispatcher;
     let instructions = dispatcher.prompt_instructions(&tools);
 
+    // XmlToolDispatcher only outputs protocol instructions now (tool listing moved to ToolsSection)
     assert!(instructions.contains("## Tool Use Protocol"));
     assert!(instructions.contains("<tool_call>"));
-    assert!(instructions.contains("echo"));
-    assert!(instructions.contains("Echoes the input"));
+    // Tool listing is handled by ToolsSection to avoid duplication
+    assert!(!instructions.contains("echo"));
 }
 
 #[test]
