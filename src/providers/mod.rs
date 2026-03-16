@@ -2607,6 +2607,19 @@ mod tests {
         assert_eq!(resolved, Some("osaurus-test-key".to_string()));
     }
 
+    #[test]
+    fn factory_codex_oauth_aliases() {
+        // Codex uses OAuth so the factory path differs from simple providers.
+        // Verify all aliases resolve to the correct entry point.
+        let options = ProviderRuntimeOptions::default();
+        for alias in &["codex", "openai-codex", "openai_codex"] {
+            assert!(
+                create_provider_with_options(alias, None, &options).is_ok(),
+                "codex alias '{alias}' should produce a provider"
+            );
+        }
+    }
+
     // ── Extended ecosystem ───────────────────────────────────
 
     #[test]
