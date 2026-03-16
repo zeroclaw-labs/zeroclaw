@@ -2,8 +2,8 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { Send, Bot, User, AlertCircle, Copy, Check } from 'lucide-react';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
-
-const AGENT_DRAFT_STORAGE_KEY = 'zeroclaw_agent_chat_draft';
+import { generateUUID } from '@/lib/uuid';
+import { useDraft } from '@/hooks/useDraft';
 
 interface ChatMessage {
   id: string;
@@ -12,14 +12,12 @@ interface ChatMessage {
   timestamp: Date;
 }
 
+const DRAFT_KEY = 'agent-chat';
+
 export default function AgentChat() {
+  const { draft, saveDraft, clearDraft } = useDraft(DRAFT_KEY);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [input, setInput] = useState(() => {
-    if (typeof window === 'undefined') {
-      return '';
-    }
-    return window.sessionStorage.getItem(AGENT_DRAFT_STORAGE_KEY) ?? '';
-  });
+  const [input, setInput] = useState(draft);
   const [typing, setTyping] = useState(false);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -60,7 +58,7 @@ export default function AgentChat() {
             setMessages((prev) => [
               ...prev,
               {
-                id: crypto.randomUUID(),
+                id: generateUUID(),
                 role: 'agent',
                 content,
                 timestamp: new Date(),
@@ -76,7 +74,7 @@ export default function AgentChat() {
           setMessages((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: generateUUID(),
               role: 'agent',
               content: `[Tool Call] ${msg.name ?? 'unknown'}(${JSON.stringify(msg.args ?? {})})`,
               timestamp: new Date(),
@@ -88,7 +86,7 @@ export default function AgentChat() {
           setMessages((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: generateUUID(),
               role: 'agent',
               content: `[Tool Result] ${msg.output ?? ''}`,
               timestamp: new Date(),
@@ -100,7 +98,7 @@ export default function AgentChat() {
           setMessages((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: generateUUID(),
               role: 'agent',
               content: `[Error] ${msg.message ?? 'Unknown error'}`,
               timestamp: new Date(),
@@ -125,13 +123,27 @@ export default function AgentChat() {
   }, [messages, typing]);
 
   useEffect(() => {
+    saveDraft(input);
+  }, [input, saveDraft]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    const storedDraft = window.sessionStorage.getItem('zeroclaw_agent_chat_draft');
+    if (storedDraft !== null) {
+      setInput(storedDraft);
+    }
+  }, []);
+
+  useEffect(() => {
     if (typeof window === 'undefined') {
       return;
     }
     if (input) {
-      window.sessionStorage.setItem(AGENT_DRAFT_STORAGE_KEY, input);
+      window.sessionStorage.setItem('zeroclaw_agent_chat_draft', input);
     } else {
-      window.sessionStorage.removeItem(AGENT_DRAFT_STORAGE_KEY);
+      window.sessionStorage.removeItem('zeroclaw_agent_chat_draft');
     }
   }, [input]);
 
@@ -150,7 +162,7 @@ export default function AgentChat() {
     setMessages((prev) => [
       ...prev,
       {
-        id: crypto.randomUUID(),
+        id: generateUUID(),
         role: 'user',
         content: trimmed,
         timestamp: new Date(),
@@ -166,6 +178,7 @@ export default function AgentChat() {
     }
 
     setInput('');
+    clearDraft();
     if (inputRef.current) {
       inputRef.current.style.height = 'auto';
       inputRef.current.focus();
