@@ -24,6 +24,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, OnceCell, RwLock};
 
+const MATRIX_TYPING_TIMEOUT_MS: u64 = 5_000;
+
 /// Matrix channel for Matrix Client-Server API.
 /// Uses matrix-sdk for reliable sync and encrypted-room decryption.
 #[derive(Clone)]
@@ -202,6 +204,22 @@ impl MatrixChannel {
         format!("Bearer {}", self.access_token)
     }
 
+    async fn request_user_id(&self) -> anyhow::Result<String> {
+        match self.get_my_user_id().await {
+            Ok(user_id) => Ok(user_id),
+            Err(error) => {
+                if let Some(hinted) = self.session_owner_hint.as_ref() {
+                    tracing::warn!(
+                        "Matrix whoami failed while resolving request user_id; using configured user_id hint: {error}"
+                    );
+                    Ok(hinted.clone())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     fn matrix_store_dir(&self) -> Option<PathBuf> {
         self.zeroclaw_dir
             .as_ref()
@@ -285,6 +303,69 @@ impl MatrixChannel {
 
     async fn get_my_user_id(&self) -> anyhow::Result<String> {
         Ok(self.get_my_identity().await?.user_id)
+    }
+
+    async fn send_read_markers(&self, room_id: &str, event_id: &str) -> anyhow::Result<()> {
+        let encoded_room = Self::encode_path_segment(room_id);
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/read_markers",
+            self.homeserver, encoded_room
+        );
+        let body = serde_json::json!({
+            "m.fully_read": event_id,
+            "m.read": event_id,
+        });
+        let response = self
+            .http_client
+            .post(&url)
+            .header("Authorization", self.auth_header_value())
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error = response.text().await.unwrap_or_default();
+            anyhow::bail!("Matrix read_markers failed: {error}");
+        }
+
+        Ok(())
+    }
+
+    async fn set_typing_state(&self, recipient: &str, typing: bool) -> anyhow::Result<()> {
+        let room_id = if let Some((_, room_id)) = recipient.split_once("||") {
+            room_id.to_string()
+        } else {
+            self.target_room_id().await?
+        };
+        let user_id = self.request_user_id().await?;
+        let encoded_room = Self::encode_path_segment(&room_id);
+        let encoded_user = Self::encode_path_segment(&user_id);
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/typing/{}",
+            self.homeserver, encoded_room, encoded_user
+        );
+        let body = if typing {
+            serde_json::json!({
+                "typing": true,
+                "timeout": MATRIX_TYPING_TIMEOUT_MS,
+            })
+        } else {
+            serde_json::json!({ "typing": false })
+        };
+        let response = self
+            .http_client
+            .put(&url)
+            .header("Authorization", self.auth_header_value())
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error = response.text().await.unwrap_or_default();
+            anyhow::bail!("Matrix typing update failed: {error}");
+        }
+
+        Ok(())
     }
 
     async fn matrix_client(&self) -> anyhow::Result<MatrixSdkClient> {
@@ -698,11 +779,13 @@ impl Channel for MatrixChannel {
         let my_user_id_for_handler = my_user_id.clone();
         let allowed_users_for_handler = self.allowed_users.clone();
         let dedupe_for_handler = Arc::clone(&recent_event_cache);
+        let channel_for_handler = self.clone();
         let homeserver_for_handler = self.homeserver.clone();
         let access_token_for_handler = self.access_token.clone();
         let voice_mode_for_handler = Arc::clone(&self.voice_mode);
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
+            let channel = channel_for_handler.clone();
             let tx = tx_handler.clone();
             let _target_room = target_room_for_handler.clone();
             let my_user_id = my_user_id_for_handler.clone();
@@ -874,6 +957,13 @@ impl Channel for MatrixChannel {
                     tracing::warn!("Matrix failed to send read receipt: {error}");
                 }
 
+                if let Err(error) = channel
+                    .send_read_markers(room.room_id().as_str(), event.event_id.as_str())
+                    .await
+                {
+                    tracing::debug!("Matrix failed to send read markers: {error}");
+                }
+
                 // Start typing notification while processing begins
                 if let Err(error) = room.typing_notice(true).await {
                     tracing::warn!("Matrix failed to start typing notification: {error}");
@@ -932,6 +1022,14 @@ impl Channel for MatrixChannel {
         }
 
         self.matrix_client().await.is_ok()
+    }
+
+    async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        self.set_typing_state(recipient, true).await
+    }
+
+    async fn stop_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        self.set_typing_state(recipient, false).await
     }
 
     async fn add_reaction(
@@ -1111,6 +1209,8 @@ impl Channel for MatrixChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{body_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn make_channel() -> MatrixChannel {
         MatrixChannel::new(
@@ -1470,6 +1570,99 @@ mod tests {
         let json = r#"{"user_id":"@bot:matrix.org"}"#;
         let resp: WhoAmIResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.user_id, "@bot:matrix.org");
+    }
+
+    #[tokio::test]
+    async fn send_read_markers_posts_read_and_fully_read() {
+        let server = MockServer::start().await;
+        let channel = MatrixChannel::new(
+            server.uri(),
+            "syt_test_token".to_string(),
+            "!room:matrix.org".to_string(),
+            vec!["@user:matrix.org".to_string()],
+        );
+
+        Mock::given(method("POST"))
+            .and(path(
+                "/_matrix/client/v3/rooms/%21room%3Amatrix.org/read_markers",
+            ))
+            .and(body_json(serde_json::json!({
+                "m.fully_read": "$event:matrix.org",
+                "m.read": "$event:matrix.org",
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        channel
+            .send_read_markers("!room:matrix.org", "$event:matrix.org")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_typing_posts_typing_true_with_timeout() {
+        let server = MockServer::start().await;
+        let channel = MatrixChannel::new(
+            server.uri(),
+            "syt_test_token".to_string(),
+            "!room:matrix.org".to_string(),
+            vec!["@user:matrix.org".to_string()],
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/v3/account/whoami"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user_id": "@bot:matrix.org"
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path(
+                "/_matrix/client/v3/rooms/%21room%3Amatrix.org/typing/%40bot%3Amatrix.org",
+            ))
+            .and(body_json(serde_json::json!({
+                "typing": true,
+                "timeout": MATRIX_TYPING_TIMEOUT_MS,
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        channel.start_typing("ignored").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_typing_posts_typing_false() {
+        let server = MockServer::start().await;
+        let channel = MatrixChannel::new(
+            server.uri(),
+            "syt_test_token".to_string(),
+            "!room:matrix.org".to_string(),
+            vec!["@user:matrix.org".to_string()],
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/v3/account/whoami"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user_id": "@bot:matrix.org"
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path(
+                "/_matrix/client/v3/rooms/%21room%3Amatrix.org/typing/%40bot%3Amatrix.org",
+            ))
+            .and(body_json(serde_json::json!({
+                "typing": false,
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        channel.stop_typing("ignored").await.unwrap();
     }
 
     #[test]
