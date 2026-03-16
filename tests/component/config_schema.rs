@@ -354,9 +354,8 @@ access_token = "syt_test_token"
 room_id = "!abc123:example.com"
 allowed_users = ["@user:example.com"]
 "#;
-    let parsed: Config = toml::from_str(toml_str).expect(
-        "channels_config with only a Matrix section (no explicit cli field) should parse",
-    );
+    let parsed: Config = toml::from_str(toml_str)
+        .expect("channels_config with only a Matrix section (no explicit cli field) should parse");
     assert!(
         parsed.channels_config.cli,
         "cli should default to true when omitted"
