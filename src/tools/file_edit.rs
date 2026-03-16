@@ -147,6 +147,17 @@ impl Tool for FileEditTool {
 
         let resolved_target = resolved_parent.join(file_name);
 
+        if self.security.is_runtime_config_path(&resolved_target) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    self.security
+                        .runtime_config_violation_message(&resolved_target),
+                ),
+            });
+        }
+
         // ── 7. Symlink check ───────────────────────────────────────
         if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await {
             if meta.file_type().is_symlink() {
@@ -761,5 +772,43 @@ mod tests {
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_blocks_runtime_config_path() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_edit_runtime_config");
+        let workspace = root.join("workspace");
+        let config_path = root.join("config.toml");
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::write(&config_path, "always_ask = [\"cron_add\"]")
+            .await
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.clone(),
+            workspace_only: false,
+            allowed_roots: vec![root.clone()],
+            forbidden_paths: vec![],
+            ..SecurityPolicy::default()
+        });
+        let tool = FileEditTool::new(security);
+        let result = tool
+            .execute(json!({
+                "path": config_path.to_string_lossy(),
+                "old_string": "always_ask",
+                "new_string": "auto_approve"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("runtime config/state file"));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 }
