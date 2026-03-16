@@ -314,32 +314,37 @@ pub fn all_tools_with_runtime(
         }
     }
 
+    let delegate_fallback_credential = fallback_api_key.and_then(|value| {
+        let trimmed_value = value.trim();
+        (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
+    });
+    let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
+        auth_profile_override: None,
+        provider_api_url: root_config.api_url.clone(),
+        zeroclaw_dir: root_config
+            .config_path
+            .parent()
+            .map(std::path::PathBuf::from),
+        secrets_encrypt: root_config.secrets.encrypt,
+        reasoning_enabled: root_config.runtime.reasoning_enabled,
+        reasoning_effort: root_config.runtime.reasoning_effort.clone(),
+        provider_timeout_secs: Some(root_config.provider_timeout_secs),
+        extra_headers: root_config.extra_headers.clone(),
+        api_path: root_config.api_path.clone(),
+    };
+
     // Add delegation tool when agents are configured
     if !agents.is_empty() {
         let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
             .iter()
             .map(|(name, cfg)| (name.clone(), cfg.clone()))
             .collect();
-        let delegate_fallback_credential = fallback_api_key.and_then(|value| {
-            let trimmed_value = value.trim();
-            (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
-        });
         let parent_tools = Arc::new(tool_arcs.clone());
         let delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
             delegate_fallback_credential,
             security.clone(),
-            crate::providers::ProviderRuntimeOptions {
-                auth_profile_override: None,
-                provider_api_url: root_config.api_url.clone(),
-                zeroclaw_dir: root_config
-                    .config_path
-                    .parent()
-                    .map(std::path::PathBuf::from),
-                secrets_encrypt: root_config.secrets.encrypt,
-                reasoning_enabled: root_config.runtime.reasoning_enabled,
-                reasoning_effort: root_config.runtime.reasoning_effort.clone(),
-            },
+            provider_runtime_options.clone(),
         )
         .with_parent_tools(parent_tools)
         .with_multimodal_config(root_config.multimodal.clone());

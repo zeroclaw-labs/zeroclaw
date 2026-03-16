@@ -1042,6 +1042,9 @@ data: [DONE]
             auth_profile_override: None,
             reasoning_enabled: None,
             reasoning_effort: None,
+            provider_timeout_secs: None,
+            extra_headers: std::collections::HashMap::new(),
+            api_path: None,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");

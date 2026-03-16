@@ -678,6 +678,9 @@ pub struct ProviderRuntimeOptions {
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
     pub reasoning_effort: Option<String>,
+    pub provider_timeout_secs: Option<u64>,
+    pub extra_headers: std::collections::HashMap<String, String>,
+    pub api_path: Option<String>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -689,6 +692,9 @@ impl Default for ProviderRuntimeOptions {
             secrets_encrypt: true,
             reasoning_enabled: None,
             reasoning_effort: None,
+            provider_timeout_secs: None,
+            extra_headers: std::collections::HashMap::new(),
+            api_path: None,
         }
     }
 }
