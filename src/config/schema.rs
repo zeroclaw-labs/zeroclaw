@@ -125,17 +125,27 @@ pub struct Config {
     /// Backup tool configuration (`[backup]`).
     pub backup: BackupConfig,
 
+    /// Security subsystem configuration (`[security]`).
+    #[serde(default)]
     /// Data retention and purge configuration (`[data_retention]`).
     pub data_retention: DataRetentionConfig,
 
+    /// Security subsystem configuration (`[security]`).
+    #[serde(default)]
     /// Cloud transformation accelerator configuration (`[cloud_ops]`).
     pub cloud_ops: CloudOpsConfig,
 
+    /// Security subsystem configuration (`[security]`).
+    #[serde(default)]
     /// Conversational AI agent builder configuration (`[conversational_ai]`).
     pub conversational_ai: ConversationalAiConfig,
 
+    /// Security subsystem configuration (`[security]`).
+    #[serde(default)]
     pub security: SecurityConfig,
 
+    /// Security subsystem configuration (`[security]`).
+    #[serde(default)]
     /// Managed cybersecurity service configuration (`[security_ops]`).
     pub security_ops: SecurityOpsConfig,
 
