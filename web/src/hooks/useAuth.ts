@@ -24,7 +24,7 @@ export interface AuthState {
   token: string | null;
   /** Whether the user is currently authenticated. */
   isAuthenticated: boolean;
-  /** Whether the server requires pairing before the UI can be used. */
+  /** Whether the server requires pairing. Defaults to true (safe fallback). */
   requiresPairing: boolean;
   /** True while the initial auth check is in progress. */
   loading: boolean;
