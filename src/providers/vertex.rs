@@ -78,7 +78,7 @@ impl VertexProvider {
                 Ok(Arc::new(client))
             })
             .await
-            .map(|c| c.clone())
+            .cloned()
     }
 
     fn model_path(&self, model: &str) -> String {
@@ -93,11 +93,9 @@ impl VertexProvider {
 
         for msg in messages {
             let role = match msg.role.as_str() {
-                "user" => "user",
                 "assistant" => "model",
-                "tool" => "user", // Tool results are part of user turn in Gemini/Vertex
                 "system" => continue, // Handled separately in system_instruction
-                _ => "user",
+                _ => "user",          // Includes "user" and "tool"
             };
 
             let parts = if msg.role == "tool" {
@@ -142,7 +140,7 @@ impl VertexProvider {
                     let mut s = google_cloud_wkt::Struct::default();
                     s.insert(
                         "content".to_string(),
-                        serde_json::Value::String(msg.content.clone()).into(),
+                        google_cloud_wkt::Value::String(msg.content.clone()),
                     );
 
                     let mut func_resp = FunctionResponse::default();
@@ -153,10 +151,6 @@ impl VertexProvider {
                     part.data = Some(Data::FunctionResponse(Box::new(func_resp)));
                     vec![part]
                 }
-            } else if msg.role == "assistant" {
-                let mut part = Part::default();
-                part.data = Some(Data::Text(msg.content.clone()));
-                vec![part]
             } else {
                 let mut part = Part::default();
                 part.data = Some(Data::Text(msg.content.clone()));
@@ -240,7 +234,10 @@ impl Provider for VertexProvider {
         req.tool_config = tool_config;
 
         let mut gen_config = GenerationConfig::default();
-        gen_config.temperature = Some(temperature as f32);
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            gen_config.temperature = Some(temperature as f32);
+        }
         gen_config.max_output_tokens = Some(8192);
         req.generation_config = Some(gen_config);
 
@@ -251,10 +248,13 @@ impl Provider for VertexProvider {
         let mut usage = None;
 
         if let Some(meta) = response.usage_metadata {
-            usage = Some(TokenUsage {
-                input_tokens: Some(meta.prompt_token_count as u64),
-                output_tokens: Some(meta.candidates_token_count as u64),
-            });
+            #[allow(clippy::cast_sign_loss)]
+            {
+                usage = Some(TokenUsage {
+                    input_tokens: Some(meta.prompt_token_count as u64),
+                    output_tokens: Some(meta.candidates_token_count as u64),
+                });
+            }
         }
 
         if let Some(candidate) = response.candidates.first() {
@@ -327,7 +327,10 @@ impl Provider for VertexProvider {
         req.system_instruction = system_instruction;
 
         let mut gen_config = GenerationConfig::default();
-        gen_config.temperature = Some(temperature as f32);
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            gen_config.temperature = Some(temperature as f32);
+        }
         gen_config.max_output_tokens = Some(8192);
         req.generation_config = Some(gen_config);
 
