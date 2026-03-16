@@ -1,6 +1,20 @@
 name: Pub Scoop Manifest
 
 on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Existing release tag (vX.Y.Z)"
+        required: true
+        type: string
+      dry_run:
+        description: "Generate manifest only (no push)"
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      SCOOP_BUCKET_TOKEN:
+        required: false
   workflow_dispatch:
     inputs:
       release_tag:
