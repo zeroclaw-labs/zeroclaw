@@ -3225,6 +3225,18 @@ pub async fn run(
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+
+    // Register read_skill tool in Compact mode so the LLM can load skill
+    // instructions on demand without relying on shell+cat.
+    if matches!(
+        config.skills.prompt_injection_mode,
+        crate::config::SkillsPromptInjectionMode::Compact
+    ) && !skills.is_empty()
+    {
+        let skill_index = tools::SkillIndex::from_skills(&skills, &config.workspace_dir);
+        tools_registry.push(Box::new(tools::ReadSkillTool::new(skill_index)));
+    }
+
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (
             "shell",
@@ -3791,6 +3803,17 @@ pub async fn process_message(
         .collect();
 
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+
+    // Register read_skill tool in Compact mode (process_message path).
+    if matches!(
+        config.skills.prompt_injection_mode,
+        crate::config::SkillsPromptInjectionMode::Compact
+    ) && !skills.is_empty()
+    {
+        let skill_index = tools::SkillIndex::from_skills(&skills, &config.workspace_dir);
+        tools_registry.push(Box::new(tools::ReadSkillTool::new(skill_index)));
+    }
+
     let mut tool_descs: Vec<(&str, &str)> = vec![
         ("shell", "Execute terminal commands."),
         ("file_read", "Read file contents."),

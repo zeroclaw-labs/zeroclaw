@@ -543,7 +543,7 @@ pub fn skills_to_prompt_with_mode(
         crate::config::SkillsPromptInjectionMode::Compact => String::from(
             "## Available Skills\n\n\
              Skill summaries are preloaded below to keep context compact.\n\
-             Skill instructions are loaded on demand: read the skill file in `location` only when needed.\n\n\
+             Skill instructions are loaded on demand: use `read_skill(name: \"<skill_name>\")` to load a skill's full content when needed.\n\n\
              <available_skills>\n",
         ),
     };
@@ -1110,7 +1110,7 @@ command = "echo hello"
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("<name>test</name>"));
         assert!(prompt.contains("<location>skills/test/SKILL.md</location>"));
-        assert!(prompt.contains("loaded on demand"));
+        assert!(prompt.contains("read_skill"));
         assert!(!prompt.contains("<instructions>"));
         assert!(!prompt.contains("<instruction>Do the thing.</instruction>"));
         assert!(!prompt.contains("<tools>"));

@@ -60,6 +60,7 @@ pub mod pdf_read;
 pub mod project_intel;
 pub mod proxy_config;
 pub mod pushover;
+pub mod read_skill;
 pub mod report_templates;
 pub mod schedule;
 pub mod schema;
@@ -116,6 +117,7 @@ pub use pdf_read::PdfReadTool;
 pub use project_intel::ProjectIntelTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
+pub use read_skill::{ReadSkillTool, SkillIndex};
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
