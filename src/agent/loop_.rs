@@ -2125,6 +2125,7 @@ pub(crate) async fn agent_turn(
     silent: bool,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    native_tool_calls_only: bool,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -2144,6 +2145,7 @@ pub(crate) async fn agent_turn(
         None,
         &[],
         &[],
+        native_tool_calls_only,
     )
     .await
 }
@@ -2337,6 +2339,7 @@ pub(crate) async fn run_tool_call_loop(
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
+    native_tool_calls_only: bool,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2465,7 +2468,7 @@ pub(crate) async fn run_tool_call_loop(
                     let mut calls = parse_structured_tool_calls(&resp.tool_calls);
                     let mut parsed_text = String::new();
 
-                    if calls.is_empty() {
+                    if calls.is_empty() && !native_tool_calls_only {
                         let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
                         if !fallback_text.is_empty() {
                             parsed_text = fallback_text;
@@ -3418,6 +3421,7 @@ pub async fn run(
             None,
             &excluded_tools,
             &config.agent.tool_call_dedup_exempt,
+            config.agent.native_tool_calls_only,
         )
         .await?;
         final_output = response.clone();
@@ -3566,6 +3570,7 @@ pub async fn run(
                 None,
                 &excluded_tools,
                 &config.agent.tool_call_dedup_exempt,
+                config.agent.native_tool_calls_only,
             )
             .await
             {
@@ -3847,6 +3852,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         true,
         &config.multimodal,
         config.agent.max_tool_iterations,
+        config.agent.native_tool_calls_only,
     )
     .await
 }
@@ -4271,6 +4277,7 @@ mod tests {
             None,
             &[],
             &[],
+            false,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -4318,6 +4325,7 @@ mod tests {
             None,
             &[],
             &[],
+            false,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -4359,6 +4367,7 @@ mod tests {
             None,
             &[],
             &[],
+            false,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -4486,6 +4495,7 @@ mod tests {
             None,
             &[],
             &[],
+            false,
         )
         .await
         .expect("parallel execution should complete");
@@ -4556,6 +4566,7 @@ mod tests {
             None,
             &[],
             &[],
+            false,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4618,6 +4629,7 @@ mod tests {
             None,
             &[],
             &exempt,
+            false,
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -4695,6 +4707,7 @@ mod tests {
             None,
             &[],
             &exempt,
+            false,
         )
         .await
         .expect("loop should complete");
@@ -4749,6 +4762,7 @@ mod tests {
             None,
             &[],
             &[],
+            false,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -4766,6 +4780,50 @@ mod tests {
                 .iter()
                 .all(|msg| !(msg.role == "user" && msg.content.starts_with("[Tool results]"))),
             "native mode should use role=tool history instead of prompt fallback wrapper"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_tool_calls_only_skips_text_fallback() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"echo pwned\"}}</tool_call>",
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> =
+            vec![Box::new(CountingTool::new("shell", Arc::clone(&invocations)))];
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("hi"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            true, // native_tool_calls_only = true
+        )
+        .await
+        .expect("should return text without error");
+
+        assert_eq!(invocations.load(Ordering::SeqCst), 0, "no tool should have been invoked");
+        assert!(
+            result.contains("tool_call"),
+            "raw text with <tool_call> tag should be returned as-is: {result}"
         );
     }
 
@@ -6647,6 +6705,7 @@ Let me check the result."#;
             None,
             &[],
             &[],
+            false,
         )
         .await
         .expect("tool loop should complete");

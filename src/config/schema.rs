@@ -937,6 +937,11 @@ pub struct AgentConfig {
     /// Default: `[]` (no filtering — all tools included).
     #[serde(default)]
     pub tool_filter_groups: Vec<ToolFilterGroup>,
+    /// When true, only native structured tool calls from the provider API are
+    /// recognized. Text-based fallback parsing (XML tags, markdown blocks,
+    /// GLM-style formats) is completely disabled. Default: `false`.
+    #[serde(default)]
+    pub native_tool_calls_only: bool,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -966,6 +971,7 @@ impl Default for AgentConfig {
             tool_dispatcher: default_agent_tool_dispatcher(),
             tool_call_dedup_exempt: Vec::new(),
             tool_filter_groups: Vec::new(),
+            native_tool_calls_only: false,
         }
     }
 }
