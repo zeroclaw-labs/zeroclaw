@@ -1041,6 +1041,10 @@ fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
         return true;
     }
 
+    if memory::should_skip_autosave_content(content) {
+        return true;
+    }
+
     if key.trim().to_ascii_lowercase().ends_with("_history") {
         return true;
     }
@@ -1332,10 +1336,11 @@ async fn build_memory_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
+    session_id: Option<&str>,
 ) -> String {
     let mut context = String::new();
 
-    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+    if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
         let mut included = 0usize;
         let mut used_chars = 0usize;
 
@@ -1855,7 +1860,10 @@ async fn process_channel_message(
             return;
         }
     };
-    if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+    if ctx.auto_save_memory
+        && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !memory::should_skip_autosave_content(&msg.content)
+    {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
             .memory
@@ -1863,7 +1871,7 @@ async fn process_channel_message(
                 &autosave_key,
                 &msg.content,
                 crate::memory::MemoryCategory::Conversation,
-                None,
+                Some(&history_key),
             )
             .await;
     }
@@ -1939,8 +1947,13 @@ async fn process_channel_message(
     // Only enrich with memory context when there is no prior conversation
     // history. Follow-up turns already include context from previous messages.
     if !had_prior_history {
-        let memory_context =
-            build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
+        let memory_context = build_memory_context(
+            ctx.memory.as_ref(),
+            &msg.content,
+            ctx.min_relevance_score,
+            Some(&history_key),
+        )
+        .await;
         if let Some(last_turn) = prior_turns.last_mut() {
             if last_turn.role == "user" && !memory_context.is_empty() {
                 last_turn.content = format!("{memory_context}{}", msg.content);
@@ -6989,7 +7002,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .await
             .unwrap();
 
-        let context = build_memory_context(&mem, "age", 0.0).await;
+        let context = build_memory_context(&mem, "age", 0.0, None).await;
         assert!(context.contains("[Memory context]"));
         assert!(context.contains("Age is 45"));
     }
@@ -7021,7 +7034,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await
         .unwrap();
 
-        let context = build_memory_context(&mem, "screenshot", 0.0).await;
+        let context = build_memory_context(&mem, "screenshot", 0.0, None).await;
 
         // The image-marker entry must be excluded to prevent duplication.
         assert!(

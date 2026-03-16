@@ -269,6 +269,15 @@ fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4())
 }
 
+fn memory_session_id_from_state_file(path: &Path) -> Option<String> {
+    let raw = path.to_string_lossy().trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+
+    Some(format!("cli:{raw}"))
+}
+
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
 fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
@@ -419,11 +428,16 @@ fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Res
 /// Build context preamble by searching memory for relevant entries.
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
-async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> String {
+async fn build_context(
+    mem: &dyn Memory,
+    user_msg: &str,
+    min_relevance_score: f64,
+    session_id: Option<&str>,
+) -> String {
     let mut context = String::new();
 
     // Pull relevant memories for this message
-    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+    if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
         let relevant: Vec<_> = entries
             .iter()
             .filter(|e| match e.score {
@@ -436,6 +450,9 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
             context.push_str("[Memory context]\n");
             for entry in &relevant {
                 if memory::is_assistant_autosave_key(&entry.key) {
+                    continue;
+                }
+                if memory::should_skip_autosave_content(&entry.content) {
                     continue;
                 }
                 // Skip entries containing tool_result blocks — they can leak
@@ -3351,6 +3368,9 @@ pub async fn run(
         None
     };
     let channel_name = if interactive { "cli" } else { "daemon" };
+    let memory_session_id = session_state_file
+        .as_deref()
+        .and_then(memory_session_id_from_state_file);
 
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
@@ -3359,16 +3379,29 @@ pub async fn run(
 
     if let Some(msg) = message {
         // Auto-save user message to memory (skip short/trivial messages)
-        if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+        if config.memory.auto_save
+            && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+            && !memory::should_skip_autosave_content(&msg)
+        {
             let user_key = autosave_memory_key("user_msg");
             let _ = mem
-                .store(&user_key, &msg, MemoryCategory::Conversation, None)
+                .store(
+                    &user_key,
+                    &msg,
+                    MemoryCategory::Conversation,
+                    memory_session_id.as_deref(),
+                )
                 .await;
         }
 
         // Inject memory + hardware RAG context into user message
-        let mem_context =
-            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
+        let mem_context = build_context(
+            mem.as_ref(),
+            &msg,
+            config.memory.min_relevance_score,
+            memory_session_id.as_deref(),
+        )
+        .await;
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
@@ -3507,16 +3540,29 @@ pub async fn run(
             }
 
             // Auto-save conversation turns (skip short/trivial messages)
-            if config.memory.auto_save && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+            if config.memory.auto_save
+                && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+                && !memory::should_skip_autosave_content(&user_input)
+            {
                 let user_key = autosave_memory_key("user_msg");
                 let _ = mem
-                    .store(&user_key, &user_input, MemoryCategory::Conversation, None)
+                    .store(
+                        &user_key,
+                        &user_input,
+                        MemoryCategory::Conversation,
+                        memory_session_id.as_deref(),
+                    )
                     .await;
             }
 
             // Inject memory + hardware RAG context into user message
-            let mem_context =
-                build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
+            let mem_context = build_context(
+                mem.as_ref(),
+                &user_input,
+                config.memory.min_relevance_score,
+                memory_session_id.as_deref(),
+            )
+            .await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
@@ -3615,7 +3661,11 @@ pub async fn run(
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
-pub async fn process_message(config: Config, message: &str) -> Result<String> {
+pub async fn process_message(
+    config: Config,
+    message: &str,
+    session_id: Option<&str>,
+) -> Result<String> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -3808,7 +3858,13 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
-    let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
+    let mem_context = build_context(
+        mem.as_ref(),
+        message,
+        config.memory.min_relevance_score,
+        session_id,
+    )
+    .await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
     let hw_context = hardware_rag
         .as_ref()
@@ -5481,7 +5537,7 @@ Tail"#;
         .await
         .unwrap();
 
-        let context = build_context(&mem, "status updates", 0.0).await;
+        let context = build_context(&mem, "status updates", 0.0, None).await;
         assert!(context.contains("user_msg_real"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));
