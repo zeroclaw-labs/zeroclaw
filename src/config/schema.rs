@@ -10617,11 +10617,11 @@ default_model = "persisted-profile"
             .with_writer(capture.clone())
             .finish();
         let dispatch = tracing::Dispatch::new(subscriber);
-        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let guard = tracing::dispatcher::set_default(&dispatch);
 
         let config = Config::load_or_init().await.unwrap();
 
-        drop(_guard);
+        drop(guard);
         let logs = capture.captured();
 
         assert_eq!(config.workspace_dir, workspace_dir.join("workspace"));
