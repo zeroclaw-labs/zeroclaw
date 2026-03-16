@@ -1276,6 +1276,38 @@ async fn create_resilient_provider_nonblocking(
     .context("failed to join provider initialization task")?
 }
 
+/// For each model in model_routes, add other models of the same provider as fallback
+/// (only if no explicit fallback already exists for that model).
+fn enrich_model_fallbacks_from_routes(
+    fallbacks: &mut HashMap<String, Vec<String>>,
+    model_routes: &[crate::config::ModelRouteConfig],
+) {
+    // Group models by provider
+    let mut by_provider: HashMap<&str, Vec<&str>> = HashMap::new();
+    for route in model_routes {
+        by_provider
+            .entry(route.provider.as_str())
+            .or_default()
+            .push(route.model.as_str());
+    }
+
+    for models in by_provider.values() {
+        for model in models {
+            if fallbacks.contains_key(*model) {
+                continue; // explicit fallback already set
+            }
+            let others: Vec<String> = models
+                .iter()
+                .filter(|m| **m != *model)
+                .map(|m| m.to_string())
+                .collect();
+            if !others.is_empty() {
+                fallbacks.insert(model.to_string(), others);
+            }
+        }
+    }
+}
+
 fn collect_active_providers(
     default_provider: Option<&str>,
     model_routes: &[crate::config::ModelRouteConfig],
@@ -3941,12 +3973,17 @@ pub async fn start_channels(config: Config) -> Result<()> {
         extra_headers: config.extra_headers.clone(),
         api_path: config.api_path.clone(),
     };
+    // Enrich model_fallbacks from model_routes: for each model in routes,
+    // add other models of the same provider as fallback (if no explicit fallback exists).
+    let mut reliability = config.reliability.clone();
+    enrich_model_fallbacks_from_routes(&mut reliability.model_fallbacks, &config.model_routes);
+
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(
             &provider_name,
             config.api_key.clone(),
             config.api_url.clone(),
-            config.reliability.clone(),
+            reliability,
             provider_runtime_options.clone(),
         )
         .await?,
@@ -8335,5 +8372,70 @@ This is an example JSON object for profile settings."#;
         let input = "(continued)\n\nprovider=gemini attempt 1/4: rate_limited";
         let result = sanitize_provider_errors(input);
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn enrich_model_fallbacks_adds_siblings() {
+        let routes = vec![
+            crate::config::ModelRouteConfig {
+                hint: "flash".into(),
+                provider: "gemini".into(),
+                model: "gemini-3-flash".into(),
+                api_key: None,
+            },
+            crate::config::ModelRouteConfig {
+                hint: "pro".into(),
+                provider: "gemini".into(),
+                model: "gemini-3-pro".into(),
+                api_key: None,
+            },
+            crate::config::ModelRouteConfig {
+                hint: "codex".into(),
+                provider: "openai".into(),
+                model: "gpt-5".into(),
+                api_key: None,
+            },
+        ];
+        let mut fallbacks = HashMap::new();
+        enrich_model_fallbacks_from_routes(&mut fallbacks, &routes);
+
+        // gemini-3-flash falls back to gemini-3-pro and vice versa
+        assert_eq!(fallbacks.get("gemini-3-flash").unwrap(), &["gemini-3-pro"]);
+        assert_eq!(fallbacks.get("gemini-3-pro").unwrap(), &["gemini-3-flash"]);
+
+        // gpt-5 has no siblings — no fallback entry
+        assert!(!fallbacks.contains_key("gpt-5"));
+    }
+
+    #[test]
+    fn enrich_model_fallbacks_does_not_overwrite_explicit() {
+        let routes = vec![
+            crate::config::ModelRouteConfig {
+                hint: "flash".into(),
+                provider: "gemini".into(),
+                model: "gemini-3-flash".into(),
+                api_key: None,
+            },
+            crate::config::ModelRouteConfig {
+                hint: "pro".into(),
+                provider: "gemini".into(),
+                model: "gemini-3-pro".into(),
+                api_key: None,
+            },
+        ];
+        let mut fallbacks = HashMap::new();
+        fallbacks.insert(
+            "gemini-3-flash".to_string(),
+            vec!["custom-fallback".to_string()],
+        );
+        enrich_model_fallbacks_from_routes(&mut fallbacks, &routes);
+
+        // Explicit fallback preserved
+        assert_eq!(
+            fallbacks.get("gemini-3-flash").unwrap(),
+            &["custom-fallback"]
+        );
+        // Sibling still gets auto-fallback
+        assert_eq!(fallbacks.get("gemini-3-pro").unwrap(), &["gemini-3-flash"]);
     }
 }
