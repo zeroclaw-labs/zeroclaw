@@ -31,7 +31,6 @@ async fn wait_for_shutdown_signal() -> Result<()> {
                 }
                 _ = sighup.recv() => {
                     tracing::info!("Received SIGHUP, ignoring (daemon stays running)");
-                    continue;
                 }
             }
         }
