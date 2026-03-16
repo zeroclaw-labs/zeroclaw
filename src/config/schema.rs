@@ -122,6 +122,12 @@ pub struct Config {
 
     /// Security subsystem configuration (`[security]`).
     #[serde(default)]
+    /// Backup tool configuration (`[backup]`).
+    pub backup: BackupConfig,
+
+    /// Data retention and purge configuration (`[data_retention]`).
+    pub data_retention: DataRetentionConfig,
+
     pub security: SecurityConfig,
 
     /// Managed cybersecurity service configuration (`[security_ops]`).
@@ -1846,6 +1852,103 @@ impl Default for ProjectIntelConfig {
             include_git_data: true,
             include_jira_data: false,
             jira_base_url: None,
+        }
+    }
+}
+
+// ── Backup ──────────────────────────────────────────────────────
+
+/// Backup tool configuration (`[backup]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BackupConfig {
+    /// Enable the `backup` tool.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Maximum number of backups to keep (oldest are pruned).
+    #[serde(default = "default_backup_max_keep")]
+    pub max_keep: usize,
+    /// Workspace subdirectories to include in backups.
+    #[serde(default = "default_backup_include_dirs")]
+    pub include_dirs: Vec<String>,
+    /// Output directory for backup archives (relative to workspace root).
+    #[serde(default = "default_backup_destination_dir")]
+    pub destination_dir: String,
+    /// Optional cron expression for scheduled automatic backups.
+    #[serde(default)]
+    pub schedule_cron: Option<String>,
+    /// IANA timezone for `schedule_cron`.
+    #[serde(default)]
+    pub schedule_timezone: Option<String>,
+    /// Compress backup archives.
+    #[serde(default = "default_true")]
+    pub compress: bool,
+    /// Encrypt backup archives (requires a configured secret store key).
+    #[serde(default)]
+    pub encrypt: bool,
+}
+
+fn default_backup_max_keep() -> usize {
+    10
+}
+
+fn default_backup_include_dirs() -> Vec<String> {
+    vec![
+        "config".into(),
+        "memory".into(),
+        "audit".into(),
+        "knowledge".into(),
+    ]
+}
+
+fn default_backup_destination_dir() -> String {
+    "state/backups".into()
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_keep: default_backup_max_keep(),
+            include_dirs: default_backup_include_dirs(),
+            destination_dir: default_backup_destination_dir(),
+            schedule_cron: None,
+            schedule_timezone: None,
+            compress: true,
+            encrypt: false,
+        }
+    }
+}
+
+// ── Data Retention ──────────────────────────────────────────────
+
+/// Data retention and purge configuration (`[data_retention]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DataRetentionConfig {
+    /// Enable the `data_management` tool.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Days of data to retain before purge eligibility.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u64,
+    /// Preview what would be deleted without actually removing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Limit retention enforcement to specific data categories (empty = all).
+    #[serde(default)]
+    pub categories: Vec<String>,
+}
+
+fn default_retention_days() -> u64 {
+    90
+}
+
+impl Default for DataRetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            retention_days: default_retention_days(),
+            dry_run: false,
+            categories: Vec::new(),
         }
     }
 }
@@ -4798,6 +4901,8 @@ impl Default for Config {
             extra_headers: HashMap::new(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
+            backup: BackupConfig::default(),
+            data_retention: DataRetentionConfig::default(),
             security: SecurityConfig::default(),
             security_ops: SecurityOpsConfig::default(),
             runtime: RuntimeConfig::default(),
@@ -7046,6 +7151,8 @@ default_temperature = 0.7
                 allowed_roots: vec![],
                 non_cli_excluded_tools: vec![],
             },
+            backup: BackupConfig::default(),
+            data_retention: DataRetentionConfig::default(),
             security: SecurityConfig::default(),
             security_ops: SecurityOpsConfig::default(),
             runtime: RuntimeConfig {
@@ -7389,6 +7496,8 @@ tool_dispatcher = "xml"
             extra_headers: HashMap::new(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
+            backup: BackupConfig::default(),
+            data_retention: DataRetentionConfig::default(),
             security: SecurityConfig::default(),
             security_ops: SecurityOpsConfig::default(),
             runtime: RuntimeConfig::default(),

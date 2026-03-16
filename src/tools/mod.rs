@@ -15,6 +15,7 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod backup_tool;
 pub mod browser;
 pub mod browser_open;
 pub mod cli_discovery;
@@ -26,6 +27,7 @@ pub mod cron_remove;
 pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
+pub mod data_management;
 pub mod delegate;
 pub mod file_edit;
 pub mod file_read;
@@ -69,6 +71,7 @@ pub mod web_fetch;
 pub mod web_search_tool;
 pub mod workspace_tool;
 
+pub use backup_tool::BackupTool;
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
@@ -79,6 +82,7 @@ pub use cron_remove::CronRemoveTool;
 pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
+pub use data_management::DataManagementTool;
 pub use delegate::DelegateTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
@@ -381,6 +385,23 @@ pub fn all_tools_with_runtime(
     if root_config.security_ops.enabled {
         tool_arcs.push(Arc::new(SecurityOpsTool::new(
             root_config.security_ops.clone(),
+        )));
+    }
+
+    // Backup tool (enabled by default)
+    if root_config.backup.enabled {
+        tool_arcs.push(Arc::new(BackupTool::new(
+            workspace_dir.to_path_buf(),
+            root_config.backup.include_dirs.clone(),
+            root_config.backup.max_keep,
+        )));
+    }
+
+    // Data management tool (disabled by default)
+    if root_config.data_retention.enabled {
+        tool_arcs.push(Arc::new(DataManagementTool::new(
+            workspace_dir.to_path_buf(),
+            root_config.data_retention.retention_days,
         )));
     }
 
