@@ -220,6 +220,12 @@ pub async fn handle_api_chat(
         }
     }
 
+    let client_sent_api_key = chat_body
+        .api_key
+        .as_ref()
+        .filter(|k| !k.trim().is_empty())
+        .is_some();
+
     if let Some(ref client_key) = chat_body.api_key {
         if !client_key.trim().is_empty() {
             config.api_key = Some(client_key.clone());
@@ -227,14 +233,17 @@ pub async fn handle_api_chat(
     }
 
     // ── Resolve provider-specific key from provider_api_keys map ──
-    // When the client doesn't send an api_key in the request body,
-    // look up the per-provider key stored via Settings → /api/config/api-key.
+    // When the client doesn't send an explicit api_key, always look up
+    // the per-provider key stored via Settings → /api/config/api-key.
+    // This is critical because config.api_key may hold a DIFFERENT
+    // provider's key (e.g. Gemini key when the user switches to Anthropic),
+    // which would cause a 401 Unauthorized error.
     let provider_name = config
         .default_provider
         .as_deref()
         .unwrap_or("gemini");
 
-    if config.api_key.as_ref().map_or(true, |k| k.trim().is_empty()) {
+    if !client_sent_api_key {
         if let Some(stored_key) = config.provider_api_keys.get(provider_name) {
             if !stored_key.trim().is_empty() {
                 config.api_key = Some(stored_key.clone());

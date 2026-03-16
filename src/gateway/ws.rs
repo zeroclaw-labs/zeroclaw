@@ -518,6 +518,10 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
 
         // ── Apply client-provided overrides (provider, model, api_key) ──
         // This mirrors the logic in openclaw_compat.rs for the HTTP /api/chat handler.
+        let client_sent_api_key = parsed["api_key"]
+            .as_str()
+            .filter(|k| !k.trim().is_empty())
+            .is_some();
         {
             let mut config_guard = state.config.lock();
 
@@ -539,20 +543,21 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
         }
 
         // ── Resolve provider-specific key from provider_api_keys map ──
-        // When the client doesn't send an api_key, look up the per-provider
-        // key stored via Settings → /api/config/api-key.
-        {
+        // When the client doesn't send an explicit api_key, always look up
+        // the per-provider key stored via Settings → /api/config/api-key.
+        // This is critical because config.api_key may hold a DIFFERENT
+        // provider's key (e.g. Gemini key when the user switches to Anthropic),
+        // which would cause a 401 Unauthorized error.
+        if !client_sent_api_key {
             let mut config_guard = state.config.lock();
             let provider_name = config_guard
                 .default_provider
                 .clone()
                 .unwrap_or_else(|| "gemini".to_string());
 
-            if config_guard.api_key.as_ref().map_or(true, |k| k.trim().is_empty()) {
-                if let Some(stored_key) = config_guard.provider_api_keys.get(&provider_name).cloned() {
-                    if !stored_key.trim().is_empty() {
-                        config_guard.api_key = Some(stored_key);
-                    }
+            if let Some(stored_key) = config_guard.provider_api_keys.get(&provider_name).cloned() {
+                if !stored_key.trim().is_empty() {
+                    config_guard.api_key = Some(stored_key);
                 }
             }
         }
