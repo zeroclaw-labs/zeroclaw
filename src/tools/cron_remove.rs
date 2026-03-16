@@ -166,10 +166,10 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.level = AutonomyLevel::ReadOnly;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        config.autonomy.level = AutonomyLevel::ReadOnly;
         let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
         let tool = CronRemoveTool::new(cfg.clone(), test_security(&cfg));
 
         let result = tool.execute(json!({"job_id": job.id})).await.unwrap();

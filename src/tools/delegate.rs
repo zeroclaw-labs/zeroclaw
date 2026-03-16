@@ -114,6 +114,12 @@ impl DelegateTool {
         self.multimodal_config = config;
         self
     }
+
+    /// Return a shared handle to the parent tools list.
+    /// Callers can push additional tools (e.g. MCP wrappers) after construction.
+    pub fn parent_tools_handle(&self) -> Arc<RwLock<Vec<Arc<dyn Tool>>>> {
+        Arc::clone(&self.parent_tools)
+    }
 }
 
 #[async_trait]
@@ -413,6 +419,7 @@ impl DelegateTool {
                 None,
                 None,
                 None,
+                &[],
                 &[],
             ),
         )
@@ -1101,5 +1108,115 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("provider boom"));
+    }
+
+    /// MCP tools pushed into the shared parent_tools handle after DelegateTool
+    /// construction must be visible to the sub-agent tool list.
+    #[derive(Default)]
+    struct FakeMcpTool;
+
+    #[async_trait]
+    impl Tool for FakeMcpTool {
+        fn name(&self) -> &str {
+            "mcp_fake"
+        }
+
+        fn description(&self) -> &str {
+            "Fake MCP tool for testing."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "mcp_fake_output".into(),
+                error: None,
+            })
+        }
+    }
+
+    struct McpToolThenFinalProvider;
+
+    #[async_trait]
+    impl Provider for McpToolThenFinalProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let has_tool_message = request.messages.iter().any(|m| m.role == "tool");
+            if has_tool_message {
+                Ok(ChatResponse {
+                    text: Some("mcp done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_mcp".to_string(),
+                        name: "mcp_fake".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_included_in_subagent_tool_list() {
+        // Build DelegateTool with NO parent tools initially
+        let config = agentic_config(vec!["mcp_fake".to_string()], 10);
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        // Simulate late MCP tool injection via the shared handle
+        let handle = tool.parent_tools_handle();
+        handle.write().push(Arc::new(FakeMcpTool));
+
+        let provider = McpToolThenFinalProvider;
+        let result = tool
+            .execute_agentic("agentic", &config, &provider, "run mcp", 0.2)
+            .await
+            .unwrap();
+
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+        assert!(
+            result.output.contains("mcp done"),
+            "Expected output containing 'mcp done', got: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn parent_tools_handle_returns_shared_reference() {
+        let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
+            Arc::new(RwLock::new(vec![Arc::new(EchoTool) as Arc<dyn Tool>])),
+        );
+
+        let handle = tool.parent_tools_handle();
+        assert_eq!(handle.read().len(), 1);
+
+        // Push a new tool via the handle
+        handle.write().push(Arc::new(FakeMcpTool));
+        assert_eq!(handle.read().len(), 2);
     }
 }

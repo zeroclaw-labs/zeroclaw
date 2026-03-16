@@ -351,10 +351,10 @@ Nostr supports both NIP-04 (legacy encrypted DMs) and NIP-17 (gift-wrapped priva
 Replies automatically use the same protocol the sender used. The private key is encrypted at rest
 via the `SecretStore` when `secrets.encrypt = true` (the default).
 
-Interactive onboarding support:
+Guided onboarding support:
 
 ```bash
-zeroclaw onboard --interactive
+zeroclaw onboard
 ```
 
 The wizard now includes dedicated **Lark** and **Feishu** steps with:

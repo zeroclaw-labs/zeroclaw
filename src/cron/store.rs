@@ -179,7 +179,10 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
 
         let mut jobs = Vec::new();
         for row in rows {
-            jobs.push(row?);
+            match row {
+                Ok(job) => jobs.push(job),
+                Err(e) => tracing::warn!("Skipping cron job with unparseable row data: {e}"),
+            }
         }
         Ok(jobs)
     })
@@ -450,6 +453,7 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         },
         last_status: row.get(15)?,
         last_output: row.get(16)?,
+        allowed_tools: None,
     })
 }
 

@@ -4,6 +4,7 @@ use crate::multimodal;
 use crate::providers::traits::{ChatMessage, Provider, ProviderCapabilities};
 use crate::providers::ProviderRuntimeOptions;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -475,8 +476,24 @@ fn extract_stream_error_message(event: &Value) -> Option<String> {
     None
 }
 
+/// Read the response body incrementally via `bytes_stream()` to avoid
+/// buffering the entire SSE payload in memory.  The previous implementation
+/// used `response.text().await?` which holds the HTTP connection open until
+/// every byte has arrived — on high-latency links the long-lived connection
+/// often drops mid-read, producing the "error decoding response body" failure
+/// reported in #3544.
 async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<String> {
-    let body = response.text().await?;
+    let mut body = String::new();
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk
+            .map_err(|err| anyhow::anyhow!("error reading OpenAI Codex response stream: {err}"))?;
+        let text = std::str::from_utf8(&bytes).map_err(|err| {
+            anyhow::anyhow!("OpenAI Codex response contained invalid UTF-8: {err}")
+        })?;
+        body.push_str(text);
+    }
 
     if let Some(text) = parse_sse_text(&body)? {
         return Ok(text);

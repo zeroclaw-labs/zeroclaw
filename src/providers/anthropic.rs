@@ -319,7 +319,7 @@ impl AnthropicProvider {
                             role: "assistant".to_string(),
                             content: blocks,
                         });
-                    } else {
+                    } else if !msg.content.trim().is_empty() {
                         native_messages.push(NativeMessage {
                             role: "assistant".to_string(),
                             content: vec![NativeContentOut::Text {
@@ -330,16 +330,33 @@ impl AnthropicProvider {
                     }
                 }
                 "tool" => {
-                    if let Some(tool_result) = Self::parse_tool_result_message(&msg.content) {
-                        native_messages.push(tool_result);
-                    } else {
-                        native_messages.push(NativeMessage {
+                    let tool_msg = if let Some(tr) = Self::parse_tool_result_message(&msg.content) {
+                        tr
+                    } else if !msg.content.trim().is_empty() {
+                        NativeMessage {
                             role: "user".to_string(),
                             content: vec![NativeContentOut::Text {
                                 text: msg.content.clone(),
                                 cache_control: None,
                             }],
-                        });
+                        }
+                    } else {
+                        continue;
+                    };
+                    // Tool results map to role "user"; merge consecutive ones
+                    // into a single message so Anthropic doesn't reject the
+                    // request for having adjacent same-role messages.
+                    if native_messages
+                        .last()
+                        .is_some_and(|m| m.role == tool_msg.role)
+                    {
+                        native_messages
+                            .last_mut()
+                            .unwrap()
+                            .content
+                            .extend(tool_msg.content);
+                    } else {
+                        native_messages.push(tool_msg);
                     }
                 }
                 _ => {
@@ -394,21 +411,34 @@ impl AnthropicProvider {
                         });
                     }
 
-                    // Add text content block
-                    let display_text = if text.is_empty() && !image_refs.is_empty() {
-                        "[image]".to_string()
-                    } else {
-                        text
-                    };
-                    content_blocks.push(NativeContentOut::Text {
-                        text: display_text,
-                        cache_control: None,
-                    });
+                    // Add text content block (skip empty text when images are present)
+                    if text.is_empty() && !image_refs.is_empty() {
+                        content_blocks.push(NativeContentOut::Text {
+                            text: "[image]".to_string(),
+                            cache_control: None,
+                        });
+                    } else if !text.trim().is_empty() {
+                        content_blocks.push(NativeContentOut::Text {
+                            text,
+                            cache_control: None,
+                        });
+                    }
 
-                    native_messages.push(NativeMessage {
-                        role: "user".to_string(),
-                        content: content_blocks,
-                    });
+                    // Merge into previous user message if present (e.g.
+                    // when a user message immediately follows tool results
+                    // which are also role "user" in Anthropic's format).
+                    if native_messages.last().is_some_and(|m| m.role == "user") {
+                        native_messages
+                            .last_mut()
+                            .unwrap()
+                            .content
+                            .extend(content_blocks);
+                    } else {
+                        native_messages.push(NativeMessage {
+                            role: "user".to_string(),
+                            content: content_blocks,
+                        });
+                    }
                 }
             }
         }
@@ -1549,5 +1579,114 @@ mod tests {
             json
         );
         assert!(json.contains(r#""data":"testdata""#), "JSON: {}", json);
+    }
+
+    #[test]
+    fn convert_messages_merges_consecutive_tool_results() {
+        // Simulate a multi-tool-call turn: assistant with two tool_use blocks
+        // followed by two separate tool result messages.
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: "You are helpful.".to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Do two things.".to_string(),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "call_1", "name": "shell", "arguments": "{\"command\":\"ls\"}"},
+                        {"id": "call_2", "name": "shell", "arguments": "{\"command\":\"pwd\"}"}
+                    ]
+                })
+                .to_string(),
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({
+                    "tool_call_id": "call_1",
+                    "content": "file1.txt\nfile2.txt"
+                })
+                .to_string(),
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({
+                    "tool_call_id": "call_2",
+                    "content": "/home/user"
+                })
+                .to_string(),
+            },
+        ];
+
+        let (system, native_msgs) = AnthropicProvider::convert_messages(&messages);
+
+        assert!(system.is_some());
+        // Should be: user, assistant, user (merged tool results)
+        // NOT: user, assistant, user, user (which Anthropic rejects)
+        assert_eq!(
+            native_msgs.len(),
+            3,
+            "Expected 3 messages (user, assistant, merged tool results), got {}.\nRoles: {:?}",
+            native_msgs.len(),
+            native_msgs.iter().map(|m| &m.role).collect::<Vec<_>>()
+        );
+        assert_eq!(native_msgs[0].role, "user");
+        assert_eq!(native_msgs[1].role, "assistant");
+        assert_eq!(native_msgs[2].role, "user");
+        // The merged user message should contain both tool results
+        assert_eq!(
+            native_msgs[2].content.len(),
+            2,
+            "Expected 2 tool_result blocks in merged message"
+        );
+    }
+
+    #[test]
+    fn convert_messages_no_adjacent_same_role() {
+        // Verify that convert_messages never produces adjacent messages with the
+        // same role, regardless of input ordering.
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!({
+                    "content": "I'll run a command",
+                    "tool_calls": [
+                        {"id": "tc1", "name": "shell", "arguments": "{\"command\":\"echo hi\"}"}
+                    ]
+                })
+                .to_string(),
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({
+                    "tool_call_id": "tc1",
+                    "content": "hi"
+                })
+                .to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Thanks!".to_string(),
+            },
+        ];
+
+        let (_system, native_msgs) = AnthropicProvider::convert_messages(&messages);
+
+        for window in native_msgs.windows(2) {
+            assert_ne!(
+                window[0].role, window[1].role,
+                "Adjacent messages must not share the same role: found two '{}' messages in a row",
+                window[0].role
+            );
+        }
     }
 }

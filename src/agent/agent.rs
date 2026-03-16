@@ -37,6 +37,7 @@ pub struct Agent {
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
     route_model_by_hint: HashMap<String, String>,
+    allowed_tools: Option<Vec<String>>,
 }
 
 pub struct AgentBuilder {
@@ -58,6 +59,7 @@ pub struct AgentBuilder {
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
     route_model_by_hint: Option<HashMap<String, String>>,
+    allowed_tools: Option<Vec<String>>,
 }
 
 impl AgentBuilder {
@@ -81,6 +83,7 @@ impl AgentBuilder {
             classification_config: None,
             available_hints: None,
             route_model_by_hint: None,
+            allowed_tools: None,
         }
     }
 
@@ -180,10 +183,19 @@ impl AgentBuilder {
         self
     }
 
+    pub fn allowed_tools(mut self, allowed_tools: Option<Vec<String>>) -> Self {
+        self.allowed_tools = allowed_tools;
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
-        let tools = self
+        let mut tools = self
             .tools
             .ok_or_else(|| anyhow::anyhow!("tools are required"))?;
+        let allowed = self.allowed_tools.clone();
+        if let Some(ref allow_list) = allowed {
+            tools.retain(|t| allow_list.iter().any(|name| name == t.name()));
+        }
         let tool_specs = tools.iter().map(|tool| tool.spec()).collect();
 
         Ok(Agent {
@@ -223,6 +235,7 @@ impl AgentBuilder {
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
+            allowed_tools: allowed,
         })
     }
 }
@@ -269,7 +282,7 @@ impl Agent {
             None
         };
 
-        let tools = tools::all_tools_with_runtime(
+        let (tools, _delegate_handle) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             runtime,
@@ -891,5 +904,69 @@ mod tests {
         assert_eq!(response, "classified");
         let seen = seen_models.lock();
         assert_eq!(seen.as_slice(), &["hint:fast".to_string()]);
+    }
+
+    #[test]
+    fn builder_allowed_tools_none_keeps_all_tools() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .allowed_tools(None)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        assert_eq!(agent.tool_specs.len(), 1);
+        assert_eq!(agent.tool_specs[0].name, "echo");
+    }
+
+    #[test]
+    fn builder_allowed_tools_some_filters_tools() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .allowed_tools(Some(vec!["nonexistent".to_string()]))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        assert!(
+            agent.tool_specs.is_empty(),
+            "No tools should match a non-existent allowlist entry"
+        );
     }
 }
