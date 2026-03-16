@@ -50,7 +50,7 @@ First-time setup or reconfiguration.
 ```bash
 zeroclaw onboard                                 # Quick mode (default: openrouter)
 zeroclaw onboard --provider anthropic            # Quick mode with specific provider
-zeroclaw onboard --interactive                   # Interactive wizard
+zeroclaw onboard                                 # Guided wizard (default)
 zeroclaw onboard --memory sqlite                 # Set memory backend
 zeroclaw onboard --force                         # Overwrite existing config
 zeroclaw onboard --channels-only                 # Repair channels only
@@ -62,7 +62,7 @@ zeroclaw onboard --channels-only                 # Repair channels only
 - `--memory <backend>` — sqlite, markdown, lucid, none
 - `--force` — overwrite existing config.toml
 - `--channels-only` — only repair channel configuration
-- `--interactive` — step-by-step wizard
+- `--reinit` — start fresh (backs up existing config)
 
 Creates `~/.zeroclaw/config.toml` with `0600` permissions.
 

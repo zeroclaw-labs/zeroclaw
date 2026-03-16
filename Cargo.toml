@@ -3,8 +3,8 @@ members = [".", "crates/robot-kit"]
 resolver = "2"
 
 [package]
-name = "zeroclaw"
-version = "0.1.9"
+name = "zeroclawlabs"
+version = "0.3.4"
 edition = "2021"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
@@ -14,6 +14,24 @@ readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]
 rust-version = "1.87"
+
+[[bin]]
+name = "zeroclaw"
+path = "src/main.rs"
+
+[lib]
+name = "zeroclaw"
+path = "src/lib.rs"
+
+include = [
+  "/src/**/*",
+  "/build.rs",
+  "/Cargo.toml",
+  "/Cargo.lock",
+  "/LICENSE*",
+  "/README.md",
+  "/web/dist/**/*",
+]
 
 [dependencies]
 # CLI - minimal and fast

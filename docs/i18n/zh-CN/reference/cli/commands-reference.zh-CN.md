@@ -33,22 +33,21 @@
 ### `onboard`
 
 - `zeroclaw onboard`
-- `zeroclaw onboard --interactive`
 - `zeroclaw onboard --channels-only`
 - `zeroclaw onboard --force`
+- `zeroclaw onboard --reinit`
 - `zeroclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
 - `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
 - `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none> --force`
-- `zeroclaw onboard --reinit --interactive`
 
 `onboard` 安全行为：
 
-- 如果 `config.toml` 已存在且你运行 `--interactive`，引导程序现在提供两种模式：
+- 如果 `config.toml` 已存在，引导程序提供两种模式：
   - 完整引导（覆盖 `config.toml`）
   - 仅更新提供商（更新提供商/模型/API 密钥，同时保留现有渠道、隧道、内存、钩子和其他设置）
 - 在非交互式环境中，现有 `config.toml` 会导致安全拒绝，除非传递 `--force`。
 - 当你只需要轮换渠道令牌/白名单时，使用 `zeroclaw onboard --channels-only`。
-- 使用 `zeroclaw onboard --reinit --interactive` 重新开始。这会备份现有配置目录并添加时间戳后缀，然后从头创建新配置。需要 `--interactive`。
+- 使用 `zeroclaw onboard --reinit` 重新开始。这会备份现有配置目录并添加时间戳后缀，然后从头创建新配置。
 
 ### `agent`
 

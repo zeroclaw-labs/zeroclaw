@@ -40,6 +40,7 @@ impl SystemPromptBuilder {
                 Box::new(WorkspaceSection),
                 Box::new(DateTimeSection),
                 Box::new(RuntimeSection),
+                Box::new(ChannelMediaSection),
             ],
         }
     }
@@ -70,6 +71,7 @@ pub struct SkillsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct DateTimeSection;
+pub struct ChannelMediaSection;
 
 impl PromptSection for IdentitySection {
     fn name(&self) -> &str {
@@ -203,6 +205,21 @@ impl PromptSection for DateTimeSection {
             now.format("%Y-%m-%d %H:%M:%S"),
             now.format("%Z")
         ))
+    }
+}
+
+impl PromptSection for ChannelMediaSection {
+    fn name(&self) -> &str {
+        "channel_media"
+    }
+
+    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
+        Ok("## Channel Media Markers\n\n\
+            Messages from channels may contain media markers:\n\
+            - `[Voice] <text>` — The user sent a voice/audio message that has already been transcribed to text. Respond to the transcribed content directly.\n\
+            - `[IMAGE:<path>]` — An image attachment, processed by the vision pipeline.\n\
+            - `[Document: <name>] <path>` — A file attachment saved to the workspace."
+            .into())
     }
 }
 

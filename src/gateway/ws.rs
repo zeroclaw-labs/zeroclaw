@@ -119,6 +119,17 @@ pub async fn handle_ws_chat(
 async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<String>) {
     let (mut sender, mut receiver) = socket.split();
 
+    // Build a persistent Agent for this connection so history is maintained across turns.
+    let config = state.config.lock().clone();
+    let mut agent = match crate::agent::Agent::from_config(&config) {
+        Ok(a) => a,
+        Err(e) => {
+            let err = serde_json::json!({"type": "error", "message": format!("Failed to initialise agent: {e}")});
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            return;
+        }
+    };
+
     while let Some(msg) = receiver.next().await {
         let msg = match msg {
             Ok(Message::Text(text)) => text,
@@ -161,45 +172,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<S
             "model": state.model,
         }));
 
-        // Simple single-turn chat (no streaming for now — use provider.chat_with_system)
-        let system_prompt = {
-            let config_guard = state.config.lock();
-            crate::channels::build_system_prompt(
-                &config_guard.workspace_dir,
-                &state.model,
-                &[],
-                &[],
-                Some(&config_guard.identity),
-                None,
-            )
-        };
-
-        let messages = vec![
-            crate::providers::ChatMessage::system(system_prompt),
-            crate::providers::ChatMessage::user(&content),
-        ];
-
-        let multimodal_config = state.config.lock().multimodal.clone();
-        let prepared =
-            match crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config)
-                .await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    let err = serde_json::json!({
-                        "type": "error",
-                        "message": format!("Multimodal prep failed: {e}")
-                    });
-                    let _ = sender.send(Message::Text(err.to_string().into())).await;
-                    continue;
-                }
-            };
-
-        match state
-            .provider
-            .chat_with_history(&prepared.messages, &state.model, state.temperature)
-            .await
-        {
+        // Multi-turn chat via persistent Agent (history is maintained across turns)
+        match agent.turn(&content).await {
             Ok(response) => {
                 // Send the full response as a done message
                 let done = serde_json::json!({

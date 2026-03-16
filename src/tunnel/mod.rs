@@ -2,6 +2,7 @@ mod cloudflare;
 mod custom;
 mod ngrok;
 mod none;
+mod openvpn;
 mod tailscale;
 
 pub use cloudflare::CloudflareTunnel;
@@ -9,6 +10,7 @@ pub use custom::CustomTunnel;
 pub use ngrok::NgrokTunnel;
 #[allow(unused_imports)]
 pub use none::NoneTunnel;
+pub use openvpn::OpenVpnTunnel;
 pub use tailscale::TailscaleTunnel;
 
 use crate::config::schema::{TailscaleTunnelConfig, TunnelConfig};
@@ -104,6 +106,20 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
             ))))
         }
 
+        "openvpn" => {
+            let ov = config
+                .openvpn
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("tunnel.provider = \"openvpn\" but [tunnel.openvpn] section is missing"))?;
+            Ok(Some(Box::new(OpenVpnTunnel::new(
+                ov.config_file.clone(),
+                ov.auth_file.clone(),
+                ov.advertise_address.clone(),
+                ov.connect_timeout_secs,
+                ov.extra_args.clone(),
+            ))))
+        }
+
         "custom" => {
             let cu = config
                 .custom
@@ -116,7 +132,7 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
             ))))
         }
 
-        other => bail!("Unknown tunnel provider: \"{other}\". Valid: none, cloudflare, tailscale, ngrok, custom"),
+        other => bail!("Unknown tunnel provider: \"{other}\". Valid: none, cloudflare, tailscale, ngrok, openvpn, custom"),
     }
 }
 
@@ -126,7 +142,8 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
 mod tests {
     use super::*;
     use crate::config::schema::{
-        CloudflareTunnelConfig, CustomTunnelConfig, NgrokTunnelConfig, TunnelConfig,
+        CloudflareTunnelConfig, CustomTunnelConfig, NgrokTunnelConfig, OpenVpnTunnelConfig,
+        TunnelConfig,
     };
     use tokio::process::Command;
 
@@ -313,6 +330,46 @@ mod tests {
         let t = CustomTunnel::new("echo hi".into(), None, None);
         assert_eq!(t.name(), "custom");
         assert!(t.public_url().is_none());
+    }
+
+    #[test]
+    fn factory_openvpn_missing_config_errors() {
+        let cfg = TunnelConfig {
+            provider: "openvpn".into(),
+            ..TunnelConfig::default()
+        };
+        assert_tunnel_err(&cfg, "[tunnel.openvpn]");
+    }
+
+    #[test]
+    fn factory_openvpn_with_config_ok() {
+        let cfg = TunnelConfig {
+            provider: "openvpn".into(),
+            openvpn: Some(OpenVpnTunnelConfig {
+                config_file: "client.ovpn".into(),
+                auth_file: None,
+                advertise_address: None,
+                connect_timeout_secs: 30,
+                extra_args: vec![],
+            }),
+            ..TunnelConfig::default()
+        };
+        let t = create_tunnel(&cfg).unwrap();
+        assert!(t.is_some());
+        assert_eq!(t.unwrap().name(), "openvpn");
+    }
+
+    #[test]
+    fn openvpn_tunnel_name() {
+        let t = OpenVpnTunnel::new("client.ovpn".into(), None, None, 30, vec![]);
+        assert_eq!(t.name(), "openvpn");
+        assert!(t.public_url().is_none());
+    }
+
+    #[tokio::test]
+    async fn openvpn_health_false_before_start() {
+        let tunnel = OpenVpnTunnel::new("client.ovpn".into(), None, None, 30, vec![]);
+        assert!(!tunnel.health_check().await);
     }
 
     #[tokio::test]
