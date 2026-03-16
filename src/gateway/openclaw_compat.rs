@@ -127,8 +127,23 @@ pub async fn handle_api_chat(
         let pairing_ok = state.pairing.require_pairing()
             && state.pairing.is_authenticated(bearer_token);
 
-        // Then try webhook secret
-        let webhook_ok = state.webhook_secret_hash.is_some();
+        // Then try webhook secret (verify X-Webhook-Secret header against stored hash)
+        let webhook_ok = if let Some(ref secret_hash) = state.webhook_secret_hash {
+            headers
+                .get("X-Webhook-Secret")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|v| {
+                    use sha2::{Digest, Sha256};
+                    let digest = Sha256::digest(v.as_bytes());
+                    let hashed = hex::encode(digest);
+                    crate::security::pairing::constant_time_eq(&hashed, secret_hash.as_ref())
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
 
         if !jwt_ok && !pairing_ok && !webhook_ok {
             tracing::warn!("/api/chat: rejected unauthenticated non-loopback request");
@@ -352,7 +367,9 @@ pub async fn handle_api_chat(
                 });
 
             tracing::error!("/api/chat provider error: {sanitized}");
-            let err = serde_json::json!({"error": "LLM request failed"});
+            let err = serde_json::json!({
+                "error": format!("LLM request failed: {sanitized}"),
+            });
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
     }

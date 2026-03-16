@@ -14,6 +14,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Default session duration: 30 days (seconds).
 const DEFAULT_SESSION_TTL_SECS: u64 = 30 * 24 * 3600;
 
+/// Web remote session duration: 24 hours (seconds).
+/// Shorter TTL for web chat sessions to limit token-theft exposure.
+pub const WEB_SESSION_TTL_SECS: u64 = 24 * 3600;
+
 /// Token byte length before hex encoding (32 bytes = 64 hex chars).
 const TOKEN_BYTES: usize = 32;
 
@@ -235,10 +239,22 @@ impl AuthStore {
         device_id: Option<&str>,
         device_name: Option<&str>,
     ) -> Result<String> {
+        self.create_session_with_ttl(user_id, device_id, device_name, self.session_ttl_secs)
+    }
+
+    /// Create a session token with a custom TTL (seconds).
+    /// Use for web remote sessions that need shorter lifetimes.
+    pub fn create_session_with_ttl(
+        &self,
+        user_id: &str,
+        device_id: Option<&str>,
+        device_name: Option<&str>,
+        ttl_secs: u64,
+    ) -> Result<String> {
         let token = generate_token();
         let token_hash = hash_token(&token);
         let now = epoch_secs();
-        let expires_at = now + self.session_ttl_secs;
+        let expires_at = now + ttl_secs;
 
         let conn = self.conn.lock();
         conn.execute(

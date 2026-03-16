@@ -1157,8 +1157,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/node-control", post(handle_node_control))
         // ── LLM proxy (hybrid architecture: keys stay on server) ──
         .route("/api/llm/proxy", post(llm_proxy::handle_llm_proxy))
-        .route("/api/llm/upload-token", post(llm_proxy::handle_upload_token))
-        .route("/api/llm/upload-complete", post(llm_proxy::handle_upload_complete))
         // ── Document processing ──
         .route("/api/document/process", post(api::handle_api_document_process))
         // ── R2-based document upload (secure image PDF flow) ──

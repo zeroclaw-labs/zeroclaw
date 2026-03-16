@@ -478,11 +478,12 @@ pub async fn handle_remote_login(
         .into_response();
     }
 
-    // 4b. No email verification — create session token directly
-    let session_token = match auth_store.create_session(
+    // 4b. No email verification — create session token with 24h TTL for web access
+    let session_token = match auth_store.create_session_with_ttl(
         &user.id,
         Some(&body.device_id),
         Some(&device.device_name),
+        crate::auth::store::WEB_SESSION_TTL_SECS,
     ) {
         Ok(token) => token,
         Err(e) => {
@@ -1108,6 +1109,8 @@ pub struct EmailVerifyRequest {
 
 pub async fn handle_remote_verify_email(
     State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer_addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
     Json(body): Json<EmailVerifyRequest>,
 ) -> impl IntoResponse {
     let email_svc = match state.email_verify_service.as_ref() {
@@ -1149,10 +1152,25 @@ pub async fn handle_remote_verify_email(
         }
     };
 
+    // Rate limit check (reuse login rate limiter to prevent brute-force on OTP)
+    let client_key =
+        super::client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if let Err(remaining) = device_router.check_login_rate(&client_key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "Too many verification attempts. Please try again later.",
+                "retry_after": remaining,
+            })),
+        )
+            .into_response();
+    }
+
     // Verify the email code
     let device_id = match email_svc.verify_code(&body.user_id, &body.code) {
         Ok(did) => did,
         Err(e) => {
+            device_router.record_login_failure(&client_key);
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
@@ -1162,6 +1180,9 @@ pub async fn handle_remote_verify_email(
                 .into_response();
         }
     };
+
+    // Clear rate limit on successful verification
+    device_router.clear_login_attempts(&client_key);
 
     // Look up device info
     let devices = match auth_store.list_devices(&body.user_id) {
@@ -1184,11 +1205,12 @@ pub async fn handle_remote_verify_email(
         .map(|d| d.device_name.clone())
         .unwrap_or_else(|| "Unknown".to_string());
 
-    // Create session token (email code verified = full 3-factor auth complete)
-    let session_token = match auth_store.create_session(
+    // Create session token with 24h TTL (email code verified = full 3-factor auth complete)
+    let session_token = match auth_store.create_session_with_ttl(
         &body.user_id,
         Some(&device_id),
         Some(&device_name),
+        crate::auth::store::WEB_SESSION_TTL_SECS,
     ) {
         Ok(token) => token,
         Err(e) => {

@@ -36,13 +36,16 @@ use crate::config::schema::EmailVerificationConfig;
 const DEFAULT_CODE_TTL_SECS: u64 = 300;
 
 /// Default maximum verification attempts per pending code.
-const DEFAULT_MAX_ATTEMPTS: u32 = 5;
+const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+
+/// Minimum interval between OTP sends for the same user (seconds).
+const OTP_SEND_COOLDOWN_SECS: u64 = 60;
 
 // ── Types ─────────────────────────────────────────────────────────
 
 /// A pending email verification entry.
 struct PendingVerification {
-    /// SHA-256 hash of the 6-digit code.
+    /// SHA-256 hash of the 6-digit code (salted with user_id).
     code_hash: String,
     /// User ID this verification belongs to.
     user_id: String,
@@ -54,6 +57,8 @@ struct PendingVerification {
     failed_attempts: u32,
     /// Maximum allowed attempts.
     max_attempts: u32,
+    /// Unix timestamp when the code was sent (for send cooldown).
+    sent_at: u64,
 }
 
 /// Email verification service.
@@ -100,8 +105,28 @@ impl EmailVerifyService {
             bail!("Email verification is not configured");
         }
 
+        let now = epoch_secs();
+
+        // Check send cooldown to prevent email flooding
+        {
+            let pending = self.pending.lock();
+            if let Some(existing) = pending.get(user_id) {
+                let elapsed = now.saturating_sub(existing.sent_at);
+                if elapsed < OTP_SEND_COOLDOWN_SECS {
+                    let wait = OTP_SEND_COOLDOWN_SECS - elapsed;
+                    bail!(
+                        "인증코드가 이미 발송되었습니다. {}초 후에 다시 시도해주세요. / \
+                         Verification code already sent. Please wait {} seconds.",
+                        wait,
+                        wait
+                    );
+                }
+            }
+        }
+
         let code = generate_verification_code();
-        let code_hash = hash_code(&code);
+        // Salt the hash with user_id to prevent rainbow table attacks on 6-digit codes
+        let code_hash = hash_code_salted(&code, user_id);
         let ttl = if self.config.code_ttl_secs > 0 {
             self.config.code_ttl_secs
         } else {
@@ -112,13 +137,12 @@ impl EmailVerifyService {
         } else {
             DEFAULT_MAX_ATTEMPTS
         };
-        let expires_at = epoch_secs() + ttl;
+        let expires_at = now + ttl;
 
         // Store the pending verification (replaces any existing for this user)
         {
             let mut pending = self.pending.lock();
             // Cleanup expired entries opportunistically
-            let now = epoch_secs();
             pending.retain(|_, v| v.expires_at > now);
 
             pending.insert(
@@ -130,6 +154,7 @@ impl EmailVerifyService {
                     expires_at,
                     failed_attempts: 0,
                     max_attempts,
+                    sent_at: now,
                 },
             );
         }
@@ -174,8 +199,8 @@ impl EmailVerifyService {
             );
         }
 
-        // Verify code hash
-        let attempt_hash = hash_code(code.trim());
+        // Verify code hash (salted with user_id)
+        let attempt_hash = hash_code_salted(code.trim(), user_id);
         if !constant_time_eq(entry.code_hash.as_bytes(), attempt_hash.as_bytes()) {
             entry.failed_attempts += 1;
             let remaining = entry.max_attempts - entry.failed_attempts;
@@ -257,10 +282,7 @@ impl EmailVerifyService {
         let email = Message::builder()
             .from(from.parse()?)
             .to(to_email.parse()?)
-            .subject(format!(
-                "[MoA] 원격접속 인증코드 / Remote Access Verification Code: {}",
-                code
-            ))
+            .subject("[MoA] 원격접속 인증코드 / Remote Access Verification Code")
             .header(ContentType::TEXT_PLAIN)
             .body(body)?;
 
@@ -301,9 +323,14 @@ fn generate_verification_code() -> String {
     }
 }
 
-/// Hash a verification code with SHA-256.
-fn hash_code(code: &str) -> String {
+/// Hash a verification code with SHA-256, salted with user_id.
+///
+/// Salt prevents rainbow table attacks — a 6-digit code has only 1M possibilities,
+/// so unsalted SHA-256 hashes can be trivially pre-computed.
+fn hash_code_salted(code: &str, salt: &str) -> String {
     let mut h = Sha256::new();
+    h.update(salt.as_bytes());
+    h.update(b":");
     h.update(code.trim().as_bytes());
     hex::encode(h.finalize())
 }
@@ -344,7 +371,7 @@ mod tests {
             from_email: Some("noreply@example.com".into()),
             from_name: "MoA Test".into(),
             code_ttl_secs: 300,
-            max_attempts: 5,
+            max_attempts: 3,
         }
     }
 
@@ -378,9 +405,20 @@ mod tests {
     }
 
     #[test]
-    fn hash_code_is_deterministic() {
-        assert_eq!(hash_code("123456"), hash_code("123456"));
-        assert_ne!(hash_code("123456"), hash_code("654321"));
+    fn hash_code_salted_is_deterministic() {
+        assert_eq!(
+            hash_code_salted("123456", "user_a"),
+            hash_code_salted("123456", "user_a")
+        );
+        assert_ne!(
+            hash_code_salted("123456", "user_a"),
+            hash_code_salted("654321", "user_a")
+        );
+        // Same code with different salt produces different hash
+        assert_ne!(
+            hash_code_salted("123456", "user_a"),
+            hash_code_salted("123456", "user_b")
+        );
     }
 
     #[test]
@@ -395,7 +433,7 @@ mod tests {
     fn verify_code_direct_insertion_and_verification() {
         let svc = EmailVerifyService::new(test_config());
         let code = "654321";
-        let code_hash = hash_code(code);
+        let code_hash = hash_code_salted(code, "user_a");
 
         // Manually insert a pending verification (bypass SMTP send)
         {
@@ -408,7 +446,8 @@ mod tests {
                     device_id: "dev_1".to_string(),
                     expires_at: epoch_secs() + 300,
                     failed_attempts: 0,
-                    max_attempts: 5,
+                    max_attempts: 3,
+                    sent_at: epoch_secs(),
                 },
             );
         }
@@ -424,7 +463,7 @@ mod tests {
     #[test]
     fn verify_code_wrong_code_decrements_attempts() {
         let svc = EmailVerifyService::new(test_config());
-        let code_hash = hash_code("111111");
+        let code_hash = hash_code_salted("111111", "user_b");
 
         {
             let mut pending = svc.pending.lock();
@@ -437,6 +476,7 @@ mod tests {
                     expires_at: epoch_secs() + 300,
                     failed_attempts: 0,
                     max_attempts: 3,
+                    sent_at: epoch_secs(),
                 },
             );
         }
@@ -463,7 +503,7 @@ mod tests {
     #[test]
     fn verify_code_expired_fails() {
         let svc = EmailVerifyService::new(test_config());
-        let code_hash = hash_code("222222");
+        let code_hash = hash_code_salted("222222", "user_c");
 
         {
             let mut pending = svc.pending.lock();
@@ -475,7 +515,8 @@ mod tests {
                     device_id: "dev_3".to_string(),
                     expires_at: epoch_secs().saturating_sub(1), // Already expired
                     failed_attempts: 0,
-                    max_attempts: 5,
+                    max_attempts: 3,
+                    sent_at: epoch_secs().saturating_sub(301),
                 },
             );
         }
@@ -495,12 +536,13 @@ mod tests {
             pending.insert(
                 "user_d".to_string(),
                 PendingVerification {
-                    code_hash: hash_code("333333"),
+                    code_hash: hash_code_salted("333333", "user_d"),
                     user_id: "user_d".to_string(),
                     device_id: "dev_4".to_string(),
                     expires_at: epoch_secs() + 300,
                     failed_attempts: 0,
-                    max_attempts: 5,
+                    max_attempts: 3,
+                    sent_at: epoch_secs(),
                 },
             );
         }
@@ -517,12 +559,13 @@ mod tests {
             pending.insert(
                 "user_e".to_string(),
                 PendingVerification {
-                    code_hash: hash_code("444444"),
+                    code_hash: hash_code_salted("444444", "user_e"),
                     user_id: "user_e".to_string(),
                     device_id: "dev_5".to_string(),
                     expires_at: epoch_secs() + 300,
                     failed_attempts: 0,
-                    max_attempts: 5,
+                    max_attempts: 3,
+                    sent_at: epoch_secs(),
                 },
             );
         }
