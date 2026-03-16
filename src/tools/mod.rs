@@ -50,6 +50,7 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
 pub mod node_tool;
+pub mod notion_tool;
 pub mod pdf_read;
 pub mod proxy_config;
 pub mod pushover;
@@ -97,6 +98,7 @@ pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
 #[allow(unused_imports)]
 pub use node_tool::NodeTool;
+pub use notion_tool::NotionTool;
 pub use pdf_read::PdfReadTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
@@ -342,6 +344,22 @@ pub fn all_tools_with_runtime(
             root_config.config_path.clone(),
             root_config.secrets.encrypt,
         )));
+    }
+
+    // Notion API tool (conditionally registered)
+    if root_config.notion.enabled {
+        let notion_api_key = if root_config.notion.api_key.trim().is_empty() {
+            std::env::var("NOTION_API_KEY").unwrap_or_default()
+        } else {
+            root_config.notion.api_key.trim().to_string()
+        };
+        if notion_api_key.trim().is_empty() {
+            tracing::warn!(
+                "Notion tool enabled but no API key found (set notion.api_key or NOTION_API_KEY env var)"
+            );
+        } else {
+            tool_arcs.push(Arc::new(NotionTool::new(notion_api_key, security.clone())));
+        }
     }
 
     // PDF extraction (feature-gated at compile time via rag-pdf)
