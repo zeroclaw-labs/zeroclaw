@@ -3344,10 +3344,46 @@ pub struct HeartbeatConfig {
     /// explicitly set).
     #[serde(default, alias = "recipient")]
     pub to: Option<String>,
+    /// Enable adaptive intervals that back off on failures and speed up for
+    /// high-priority tasks. Default: `false`.
+    #[serde(default)]
+    pub adaptive: bool,
+    /// Minimum interval in minutes when adaptive mode is enabled. Default: `5`.
+    #[serde(default = "default_heartbeat_min_interval")]
+    pub min_interval_minutes: u32,
+    /// Maximum interval in minutes when adaptive mode backs off. Default: `120`.
+    #[serde(default = "default_heartbeat_max_interval")]
+    pub max_interval_minutes: u32,
+    /// Dead-man's switch timeout in minutes. If the heartbeat has not ticked
+    /// within this window, an alert is sent. `0` disables. Default: `0`.
+    #[serde(default)]
+    pub deadman_timeout_minutes: u32,
+    /// Channel for dead-man's switch alerts (e.g. `telegram`). Falls back to
+    /// the heartbeat delivery channel.
+    #[serde(default)]
+    pub deadman_channel: Option<String>,
+    /// Recipient for dead-man's switch alerts. Falls back to `to`.
+    #[serde(default)]
+    pub deadman_to: Option<String>,
+    /// Maximum number of heartbeat run history records to retain. Default: `100`.
+    #[serde(default = "default_heartbeat_max_run_history")]
+    pub max_run_history: u32,
 }
 
 fn default_two_phase() -> bool {
     true
+}
+
+fn default_heartbeat_min_interval() -> u32 {
+    5
+}
+
+fn default_heartbeat_max_interval() -> u32 {
+    120
+}
+
+fn default_heartbeat_max_run_history() -> u32 {
+    100
 }
 
 impl Default for HeartbeatConfig {
@@ -3359,6 +3395,13 @@ impl Default for HeartbeatConfig {
             message: None,
             target: None,
             to: None,
+            adaptive: false,
+            min_interval_minutes: default_heartbeat_min_interval(),
+            max_interval_minutes: default_heartbeat_max_interval(),
+            deadman_timeout_minutes: 0,
+            deadman_channel: None,
+            deadman_to: None,
+            max_run_history: default_heartbeat_max_run_history(),
         }
     }
 }
@@ -7358,6 +7401,7 @@ default_temperature = 0.7
                 message: Some("Check London time".into()),
                 target: Some("telegram".into()),
                 to: Some("123456".into()),
+                ..HeartbeatConfig::default()
             },
             cron: CronConfig::default(),
             channels_config: ChannelsConfig {
