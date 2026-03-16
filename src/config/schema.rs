@@ -10588,59 +10588,6 @@ default_model = "legacy-model"
     }
 
     #[test]
-    async fn load_or_init_logs_existing_config_as_initialized() {
-        let _env_guard = env_override_lock().await;
-        let temp_home =
-            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
-        let workspace_dir = temp_home.join("profile-a");
-        let config_path = workspace_dir.join("config.toml");
-
-        fs::create_dir_all(&workspace_dir).await.unwrap();
-        fs::write(
-            &config_path,
-            r#"default_temperature = 0.7
-default_model = "persisted-profile"
-"#,
-        )
-        .await
-        .unwrap();
-
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
-
-        let capture = SharedLogBuffer::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .without_time()
-            .with_target(false)
-            .with_writer(capture.clone())
-            .finish();
-        let dispatch = tracing::Dispatch::new(subscriber);
-        let guard = tracing::dispatcher::set_default(&dispatch);
-
-        let config = Config::load_or_init().await.unwrap();
-
-        drop(guard);
-        let logs = capture.captured();
-
-        assert_eq!(config.workspace_dir, workspace_dir.join("workspace"));
-        assert_eq!(config.config_path, config_path);
-        assert_eq!(config.default_model.as_deref(), Some("persisted-profile"));
-        assert!(logs.contains("Config loaded"), "{logs}");
-        assert!(logs.contains("initialized=true"), "{logs}");
-        assert!(!logs.contains("initialized=false"), "{logs}");
-
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = fs::remove_dir_all(temp_home).await;
-    }
-
-    #[test]
     async fn load_or_init_uses_persisted_active_workspace_marker() {
         let _env_guard = env_override_lock().await;
         let temp_home =
@@ -10736,6 +10683,59 @@ default_model = "persisted-profile"
             .unwrap();
         assert!(!marker_path.exists());
 
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    async fn load_or_init_logs_existing_config_as_initialized() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("profile-a");
+        let config_path = workspace_dir.join("config.toml");
+
+        fs::create_dir_all(&workspace_dir).await.unwrap();
+        fs::write(
+            &config_path,
+            r#"default_temperature = 0.7
+default_model = "persisted-profile"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
+        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+
+        let capture = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(capture.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+
+        let config = Config::load_or_init().await.unwrap();
+
+        drop(guard);
+        let logs = capture.captured();
+
+        assert_eq!(config.workspace_dir, workspace_dir.join("workspace"));
+        assert_eq!(config.config_path, config_path);
+        assert_eq!(config.default_model.as_deref(), Some("persisted-profile"));
+        assert!(logs.contains("Config loaded"), "{logs}");
+        assert!(logs.contains("initialized=true"), "{logs}");
+        assert!(!logs.contains("initialized=false"), "{logs}");
+
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
         } else {
