@@ -288,15 +288,6 @@ $ zeroclaw onboard
 # ↑ Chỉ thêm một từ, tự phát hiện âm thầm!
 ```
 
-### Người dùng nâng cao (kiểm soát tường minh)
-
-```bash
-$ zeroclaw onboard --security-level paranoid
-[1/9] Workspace Setup...
-...
-✓ Security: Paranoid | Landlock + Firejail | Audit signed
-```
-
 ---
 
 ## Tương thích ngược

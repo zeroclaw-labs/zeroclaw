@@ -285,14 +285,6 @@ $ zeroclaw onboard
 # ↑ Just one extra word, silent auto-detection!
 ```
 
-### Advanced User (Explicit Control)
-```bash
-$ zeroclaw onboard --security-level paranoid
-[1/9] Workspace Setup...
-...
-✓ Security: Paranoid | Landlock + Firejail | Audit signed
-```
-
 ---
 
 ## Backward Compatibility

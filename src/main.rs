@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(
     clippy::assigning_clones,
@@ -36,7 +37,7 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -44,6 +45,30 @@ use tracing_subscriber::{fmt, EnvFilter};
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
     config::schema::validate_temperature(t)
+}
+
+fn print_no_command_help() -> Result<()> {
+    println!("No command provided.");
+    println!("Try `zeroclaw onboard` to initialize your workspace.");
+    println!();
+
+    let mut cmd = Cli::command();
+    cmd.print_help()?;
+    println!();
+
+    #[cfg(windows)]
+    pause_after_no_command_help();
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn pause_after_no_command_help() {
+    println!();
+    print!("Press Enter to exit...");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
 }
 
 mod agent;
@@ -133,10 +158,6 @@ struct Cli {
 enum Commands {
     /// Initialize your workspace and configuration
     Onboard {
-        /// Run the full interactive wizard (default is quick setup)
-        #[arg(long)]
-        interactive: bool,
-
         /// Overwrite existing config without confirmation
         #[arg(long)]
         force: bool,
@@ -149,7 +170,7 @@ enum Commands {
         #[arg(long)]
         channels_only: bool,
 
-        /// API key (used in quick mode, ignored with --interactive)
+        /// API key for provider configuration
         #[arg(long)]
         api_key: Option<String>,
 
@@ -304,11 +325,12 @@ override with --tz and an IANA timezone name.
 
 Examples:
   zeroclaw cron list
-  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
-  zeroclaw cron add '*/30 * * * *' 'Check system health'
-  zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder'
+  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
+  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
+  zeroclaw cron add '*/5 * * * *' 'echo ok'
+  zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
   zeroclaw cron add-every 60000 'Ping heartbeat'
-  zeroclaw cron once 30m 'Run backup in 30 minutes'
+  zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
   zeroclaw cron pause <task-id>
   zeroclaw cron update <task-id> --expression '0 8 * * *' --tz Europe/London")]
     Cron {
@@ -667,6 +689,10 @@ async fn main() -> Result<()> {
         eprintln!("Warning: Failed to install default crypto provider: {e:?}");
     }
 
+    if std::env::args_os().len() <= 1 {
+        return print_no_command_help();
+    }
+
     let cli = Cli::parse();
 
     if let Some(config_dir) = &cli.config_dir {
@@ -693,12 +719,12 @@ async fn main() -> Result<()> {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    // Onboard runs quick setup by default, or the interactive wizard with --interactive.
-    // The onboard wizard uses reqwest::blocking internally, which creates its own
-    // Tokio runtime. To avoid "Cannot drop a runtime in a context where blocking is
-    // not allowed", we run the wizard on a blocking thread via spawn_blocking.
+    // Onboard auto-detects the environment: if stdin/stdout are a TTY and no
+    // provider flags were given, it runs the full interactive wizard; otherwise
+    // it runs the quick (scriptable) setup.  This means `curl … | bash` and
+    // `zeroclaw onboard --api-key …` both take the fast path, while a bare
+    // `zeroclaw onboard` in a terminal launches the wizard.
     if let Commands::Onboard {
-        interactive,
         force,
         reinit,
         channels_only,
@@ -708,7 +734,6 @@ async fn main() -> Result<()> {
         memory,
     } = &cli.command
     {
-        let interactive = *interactive;
         let force = *force;
         let reinit = *reinit;
         let channels_only = *channels_only;
@@ -717,14 +742,8 @@ async fn main() -> Result<()> {
         let model = model.clone();
         let memory = memory.clone();
 
-        if interactive && channels_only {
-            bail!("Use either --interactive or --channels-only, not both");
-        }
         if reinit && channels_only {
-            bail!("Use either --reinit or --channels-only, not both");
-        }
-        if reinit && !interactive {
-            bail!("--reinit requires --interactive mode");
+            bail!("--reinit and --channels-only cannot be used together");
         }
         if channels_only
             && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
@@ -776,9 +795,15 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Auto-detect: run the interactive wizard when in a TTY with no
+        // provider flags, quick setup otherwise (scriptable path).
+        let has_provider_flags =
+            api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some();
+        let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
-        } else if interactive {
+        } else if is_tty && !has_provider_flags {
             Box::pin(onboard::run_wizard(force)).await
         } else {
             onboard::run_quick_setup(
@@ -790,6 +815,33 @@ async fn main() -> Result<()> {
             )
             .await
         }?;
+
+        // Display pairing code — user enters it in the dashboard to pair securely.
+        // The code is one-time use and brute-force protected (5 attempts → lockout).
+        // No auth material is placed in URLs to prevent leakage via browser history,
+        // Referer headers, clipboard, or proxy logs.
+        if config.gateway.require_pairing {
+            let pairing = security::PairingGuard::new(true, &config.gateway.paired_tokens);
+            if let Some(code) = pairing.pairing_code() {
+                println!();
+                println!("  \x1b[1;34m🦀 Gateway Pairing Code\x1b[0m");
+                println!();
+                println!("  \x1b[1;34m┌──────────────┐\x1b[0m");
+                println!("  \x1b[1;34m│\x1b[0m  \x1b[1m{code}\x1b[0m  \x1b[1;34m│\x1b[0m");
+                println!("  \x1b[1;34m└──────────────┘\x1b[0m");
+                println!();
+                println!("  Enter this code in the dashboard to pair your device.");
+                println!("  The code is single-use and expires after pairing.");
+                println!();
+                println!(
+                    "  \x1b[2mDashboard: http://127.0.0.1:{}\x1b[0m",
+                    config.gateway.port
+                );
+                println!("  \x1b[2mDocs: https://www.zeroclawlabs.ai/docs\x1b[0m");
+                println!();
+            }
+        }
+
         // Auto-start channels if user said yes during wizard
         if std::env::var("ZEROCLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
             channels::start_channels(config).await?;
@@ -837,6 +889,7 @@ async fn main() -> Result<()> {
                 peripheral,
                 true,
                 session_state_file,
+                None,
             )
             .await
             .map(|_| ())
@@ -2112,7 +2165,6 @@ mod tests {
 
         match cli.command {
             Commands::Onboard {
-                interactive,
                 force,
                 channels_only,
                 api_key,
@@ -2120,7 +2172,6 @@ mod tests {
                 model,
                 ..
             } => {
-                assert!(!interactive);
                 assert!(!force);
                 assert!(!channels_only);
                 assert_eq!(provider.as_deref(), Some("openrouter"));
@@ -2162,6 +2213,22 @@ mod tests {
 
         match cli.command {
             Commands::Onboard { force, .. } => assert!(force),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn onboard_cli_rejects_removed_interactive_flag() {
+        // --interactive was removed; onboard auto-detects TTY instead.
+        assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"]).is_err());
+    }
+
+    #[test]
+    fn onboard_cli_bare_parses() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard"]).expect("bare onboard should parse");
+
+        match cli.command {
+            Commands::Onboard { .. } => {}
             other => panic!("expected onboard command, got {other:?}"),
         }
     }
