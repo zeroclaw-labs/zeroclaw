@@ -361,10 +361,12 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ── Post-publish: only run after ALL artifacts are live ──────────────
+  # ── Post-publish: tweet after release + website are live ──────────────
+  # Docker push can be slow; don't let it block the tweet.
   tweet:
     name: Tweet Release
-    needs: [validate, publish, docker, redeploy-website]
+    needs: [validate, publish, redeploy-website]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
     uses: ./.github/workflows/tweet-release.yml
     with:
       release_tag: ${{ needs.validate.outputs.tag }}
