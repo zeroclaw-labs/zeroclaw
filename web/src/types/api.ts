@@ -175,6 +175,8 @@ export interface WsMessage {
   args?: any;
   output?: string;
   message?: string;
+  code?: string;
+  fallback_to_relay?: boolean;
   session_id?: string;
   messages?: Array<{
     role: 'user' | 'assistant';

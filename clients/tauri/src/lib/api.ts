@@ -461,20 +461,25 @@ export class MoAClient {
 
     if (res !== null) {
       // Primary connected. Check if API key error from local gateway
-      // → fallback to relay which can use operator keys
-      if (primaryUrl === this.serverUrl && res.status === 400) {
+      // → fallback to relay which can use operator keys.
+      // Gateway returns 400 with { fallback_to_relay: true } for:
+      // - missing API key (code: "missing_api_key")
+      // - provider auth error / 401 (code: "provider_auth_error")
+      if (primaryUrl === this.serverUrl && (res.status === 400 || res.status === 500)) {
         // Read the error body to check for fallback hint
         const errorText = await res.text().catch(() => "");
         let shouldFallback = false;
         let errorJson: Record<string, unknown> = {};
         try {
           errorJson = JSON.parse(errorText);
-          // Gateway returns { fallback_to_relay: true } for missing API key
           shouldFallback = errorJson.fallback_to_relay === true
-            || errorJson.code === "missing_api_key";
+            || errorJson.code === "missing_api_key"
+            || errorJson.code === "provider_auth_error";
         } catch {
           // Not JSON — might still be an API key issue, try fallback anyway
-          shouldFallback = errorText.includes("API key");
+          shouldFallback = errorText.includes("API key")
+            || errorText.includes("Unauthorized")
+            || errorText.includes("authentication");
         }
 
         if (shouldFallback) {
@@ -485,9 +490,18 @@ export class MoAClient {
             return this.parseChatResponse(fallbackRes);
           }
         }
-        // Relay also failed or not a fallback-eligible error — throw original
-        const errorMessage = (errorJson.error as string) || errorText || `Chat request failed (${res.status})`;
-        throw new Error(errorMessage);
+
+        // Not a fallback-eligible error, or relay also failed — show error
+        if (res.status === 400) {
+          const errorMessage = (errorJson.error as string) || errorText || `Chat request failed (${res.status})`;
+          throw new Error(errorMessage);
+        }
+        // For 500 errors without fallback, fall through to parseChatResponse
+        // which will throw with the error detail from the response body
+        if (errorText) {
+          const errorMessage = (errorJson.error as string) || errorText || `Chat request failed (${res.status})`;
+          throw new Error(errorMessage);
+        }
       }
 
       return this.parseChatResponse(res);

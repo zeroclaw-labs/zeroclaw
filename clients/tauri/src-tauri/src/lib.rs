@@ -110,15 +110,18 @@ async fn chat(
                 .await
                 .map_err(|e| format!("Invalid response: {e}"));
         }
-        Ok(res) if res.status().as_u16() == 400 => {
-            // API key missing/invalid — check if fallback is suggested
+        Ok(res) if res.status().as_u16() == 400 || res.status().as_u16() == 500 => {
+            // API key missing/invalid or provider auth error — check if fallback is suggested
+            let status = res.status();
             let text = res.text().await.unwrap_or_default();
             let should_fallback = text.contains("fallback_to_relay")
                 || text.contains("missing_api_key")
+                || text.contains("provider_auth_error")
+                || text.contains("Unauthorized")
                 || text.contains("API key");
 
             if should_fallback {
-                eprintln!("[MoA] Local gateway missing API key, falling back to relay...");
+                eprintln!("[MoA] Local gateway API key issue ({status}), falling back to relay...");
             } else {
                 return Err(format!("Chat failed: {text}"));
             }

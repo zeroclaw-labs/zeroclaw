@@ -87,12 +87,19 @@ export class WebSocketClient {
     };
   }
 
-  /** Send a chat message to the agent. */
-  sendMessage(content: string): void {
+  /** Send a chat message to the agent, with optional provider overrides. */
+  sendMessage(
+    content: string,
+    options?: { provider?: string; model?: string; api_key?: string },
+  ): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error('WebSocket is not connected');
     }
-    this.ws.send(JSON.stringify({ type: 'message', content }));
+    const payload: Record<string, string> = { type: 'message', content };
+    if (options?.provider) payload.provider = options.provider;
+    if (options?.model) payload.model = options.model;
+    if (options?.api_key) payload.api_key = options.api_key;
+    this.ws.send(JSON.stringify(payload));
   }
 
   /** Close the connection without auto-reconnecting. */

@@ -119,19 +119,27 @@ export default function AgentChat() {
           ]);
           break;
 
-        case 'error':
+        case 'error': {
+          const errorText = msg.message ?? 'Unknown error';
+          const isApiKeyError =
+            msg.code === 'missing_api_key' || msg.code === 'provider_auth_error';
+          const displayContent = isApiKeyError
+            ? `[API Key Error] ${errorText}\n\nPlease configure your API key in Settings → Integrations.`
+            : `[Error] ${errorText}`;
+
           setMessages((prev) => [
             ...prev,
             {
               id: makeMessageId(),
               role: 'agent',
-              content: `[Error] ${msg.message ?? 'Unknown error'}`,
+              content: displayContent,
               timestamp: new Date(),
             },
           ]);
           setTyping(false);
           pendingContentRef.current = '';
           break;
+        }
       }
     };
 

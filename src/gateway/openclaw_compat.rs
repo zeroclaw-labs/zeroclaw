@@ -367,6 +367,21 @@ pub async fn handle_api_chat(
                 });
 
             tracing::error!("/api/chat provider error: {sanitized}");
+
+            // Detect provider authentication errors (401 Unauthorized) so the
+            // client can fall back to the relay server with operator keys.
+            let is_auth_error = sanitized.contains("401")
+                || sanitized.contains("Unauthorized")
+                || sanitized.contains("authentication");
+            if is_auth_error {
+                let err = serde_json::json!({
+                    "error": format!("LLM request failed: {sanitized}"),
+                    "code": "provider_auth_error",
+                    "fallback_to_relay": true,
+                });
+                return (StatusCode::BAD_REQUEST, Json(err));
+            }
+
             let err = serde_json::json!({
                 "error": format!("LLM request failed: {sanitized}"),
             });
@@ -747,7 +762,7 @@ pub async fn handle_v1_chat_completions_with_tools(
             tracing::error!("/v1/chat/completions (compat) provider error: {sanitized}");
             let err = serde_json::json!({
                 "error": {
-                    "message": "LLM request failed",
+                    "message": format!("LLM request failed: {sanitized}"),
                     "type": "server_error",
                     "code": "provider_error"
                 }

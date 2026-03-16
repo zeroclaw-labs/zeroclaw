@@ -395,7 +395,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     }
 
     // ── Hydrate provider-specific env vars from saved provider_api_keys ──
-    // This ensures API keys saved via Settings persist across restarts.
+    // This ensures API keys saved via Settings persist across restarts and
+    // that runtime key changes (via Settings UI) take effect immediately.
     for (provider, key) in &config.provider_api_keys {
         if key.trim().is_empty() {
             continue;
@@ -410,11 +411,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "mistral" => "MISTRAL_API_KEY",
             _ => continue,
         };
-        // Only set if not already overridden by a real env var
-        if std::env::var(env_var).map_or(true, |v| v.trim().is_empty()) {
-            std::env::set_var(env_var, key);
-            tracing::info!(provider = provider, "Loaded API key from config");
-        }
+        // Always overwrite so config-saved keys take precedence.
+        std::env::set_var(env_var, key);
+        tracing::info!(provider = provider, "Loaded API key from config");
     }
 
     // ── Security: refuse public bind without tunnel or explicit opt-in ──
