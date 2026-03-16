@@ -413,6 +413,8 @@ data:
     | `acp-client poll <id>` | Quick status check (use sparingly — `wait` is preferred) |
     | `acp-client result <id>` | Get the full response text (waits up to 10s if still running) |
     | `acp-client send-sync "task"` | **DO NOT USE** — blocks until complete, will be killed by shell timeout |
+    | `acp-client inject <id> "msg"` | Inject a mid-task message into Walter's context (he sees it on next tool iteration) |
+    | `acp-client progress <id>` | Show Walter's partial output so far (last 2000 chars) |
     | `acp-client delete <id>` | Tear down session |
     | `acp-client cleanup` | Remove completed session files older than 1 hour |
 
@@ -464,6 +466,7 @@ data:
 
     | Skill | Location | Purpose |
     |-------|----------|---------|
+    | `k8s-delegation` | ConfigMap skill | Structure k8s task delegation to Walter via ACP |
     | `k8s-health-check` | `~/.zeroclaw/shared/skills/k8s-health-check/` | Kubernetes cluster assessment |
     | `pm-doc-builder` | Shared skills | PM documentation generation |
     | `frontend-design-review` | Shared skills | Design and accessibility review |

@@ -331,3 +331,219 @@ data:
 
     Never load a full transcript into a single shell command output or tool result.
     Always write to file first, then read chunks.
+  k8s-delegation.md: |
+    ---
+    name: k8s-delegation
+    version: 1.0.0
+    description: Structures K8s infrastructure tasks for delegation to Walter via ACP. Use whenever Dan asks about deploying, managing, or debugging anything in the Kubernetes cluster — including the todolist namespace.
+    always: false
+    ---
+
+    # K8s Task Delegation to Walter
+
+    Walter is the K8s infrastructure agent. He has kubectl access, the scrapyard-applications
+    repo, and Serena memories. He does NOT have access to your memory, conversation history,
+    or any context you haven't explicitly included in the ACP message.
+
+    ## When This Applies
+
+    Any time you need something done in the Kubernetes cluster:
+    - Deploy an application
+    - Check pod/service/namespace status
+    - Debug failing resources
+    - Create or modify manifests
+    - Manage storage, networking, certificates
+
+    ## The One Rule
+
+    **One work order = one deployable unit.**
+
+    Don't send "deploy a todo list app" as a single message. Walter will lose track.
+    Break it down. Each ACP message should produce one verifiable outcome.
+
+    ## Work Order Template
+
+    Structure every `acp-client send` message like this:
+
+        TASK: [One sentence — what to do]
+        NAMESPACE: [target namespace]
+
+        CONTEXT:
+        [Everything Walter needs to know. Include:
+        - What exists already (namespace, other resources)
+        - Repo location for manifests
+        - Relevant patterns to follow]
+
+        REQUIREMENTS:
+        - [Specific requirement 1]
+        - [Specific requirement 2]
+
+        VERIFICATION:
+        When done, report:
+        - [What to check — e.g., "kubectl get pods -n todolist showing Running"]
+        - [What to commit — e.g., "manifest committed to repo"]
+
+        REPO PATH: 04_scrapyard_test_projects/<app_dir>/
+
+    ## Breaking Down Deployments
+
+    A typical app deployment breaks into these atomic steps (send each as a separate
+    ACP work order, in order, after verifying the previous one succeeded):
+
+    1. **Namespace** — Create namespace with istio labels
+    2. **Secrets** — Create VaultStaticSecret CRDs (if app needs secrets)
+    3. **Storage** — Create PVCs (if app needs persistent storage)
+    4. **Database** — Deploy database (if app needs one — e.g., CNPG PostgreSQL)
+    5. **Application** — Create Deployment + Service for the app
+    6. **External access** — Walter creates Certificate, Gateway, VirtualService
+       manifests and submits a PR (he can't apply these directly). Wait for Dan to
+       merge before testing external access.
+    7. **Verification** — Final check: all pods running, service resolving, external access working
+
+    Skip steps that don't apply (e.g., skip secrets/database for a simple static app).
+
+    ## Example: Deploying an app to the todolist namespace
+
+    **Step 1 — Check what exists:**
+
+        acp-client send "TASK: Report current state of the todolist namespace.
+
+        CONTEXT:
+        Check what resources currently exist in the todolist namespace.
+
+        VERIFICATION:
+        Report: namespaces, deployments, services, PVCs, pods, and their statuses."
+
+    Wait for result with `acp-client wait <id> --timeout 600`. Then proceed based on what exists.
+
+    **Step 2 — Create deployment:**
+
+        acp-client send "TASK: Create a Deployment and Service for Vikunja in the todolist namespace.
+
+        NAMESPACE: todolist
+
+        CONTEXT:
+        The todolist namespace already exists with istio ambient mode.
+        Follow the plain-manifests pattern from the scrapyard-applications repo.
+        Manifests go in: 04_scrapyard_test_projects/34_todolist/
+
+        REQUIREMENTS:
+        - Image: vikunja/vikunja:0.24.6 (pinned tag)
+        - Port: 3456
+        - Memory request 256Mi, limit 512Mi
+        - CPU request 100m
+        - Security context: runAsNonRoot, drop ALL capabilities
+        - Readiness probe on port 3456
+        - automountServiceAccountToken: false
+        - Create a matching ClusterIP Service
+
+        VERIFICATION:
+        When done, report:
+        - Exact pod name and status (kubectl get pods -n todolist)
+        - Service endpoint (kubectl get svc -n todolist)
+        - Manifests committed to scrapyard-applications repo with file paths
+
+        REPO PATH: 04_scrapyard_test_projects/34_todolist/"
+
+    ## After Each Work Order
+
+    1. Use `acp-client wait <session_id> --timeout 600`
+    2. Read Walter's response carefully
+    3. Check for concrete evidence:
+       - Resource names and statuses (not just "done")
+       - Commit reference or file paths
+       - Any errors or blockers flagged
+    4. If something failed, send a follow-up with the error context
+    5. If successful, proceed to the next step
+    6. Clean up: `acp-client delete <session_id>`
+
+    ## Monitoring Walter's Progress
+
+    Don't blindly wait for Walter to finish. Use progress checks:
+
+        # Check what Walter is doing (shows partial output)
+        acp-client progress <session_id>
+
+    If Walter has been working for more than 5 minutes with no progress, or if you
+    see him going in the wrong direction, inject a course correction:
+
+        # Send a mid-task message — Walter sees it on his next tool iteration
+        acp-client inject <session_id> "CORRECTION: Use SQLite instead of Postgres for this deployment."
+
+    Injected messages appear in Walter's context as [Mid-turn message from user].
+    He will see them after his current tool call completes.
+
+    ## Recommended Flow (replaces blind wait)
+
+        # 1. Send the work order
+        acp-client send "TASK: ..."
+        # → PENDING acp_session_id=abc-123
+
+        # 2. Wait with timeout — but check progress if it's taking long
+        acp-client wait abc-123 --timeout 600
+
+        # If wait times out or you need to redirect:
+        acp-client progress abc-123
+        acp-client inject abc-123 "Walter, prioritize getting the deployment running first. Skip external access for now."
+
+        # 3. Get the final result
+        acp-client result abc-123
+
+        # 4. Cleanup
+        acp-client delete abc-123
+
+    ## Handling Walter's PRs
+
+    Walter now has his own Gitea account and submits PRs for resources he can't
+    apply directly (VirtualServices, Certificates, Gateways).
+
+    When Walter's response includes a "PR SUBMITTED" section:
+    1. **Note the PR number and URL**
+    2. **Tell Dan** — "Walter deployed the core app but needs your review on
+       PR #N for external access. Link: <url>"
+    3. **Include what Dan needs to do after merging** — Walter will specify
+       the `kubectl apply` commands
+    4. **Don't send Walter follow-up tasks that depend on the PR'd resources**
+       until Dan confirms the PR is merged
+
+    ### Example notification to Dan:
+    "Walter has the Vikunja deployment running (pods healthy, service up).
+    For external access at vikunja.coffee-anon.com, he's submitted PR #42
+    on Gitea: <url>. After you merge, apply the VirtualService and Certificate
+    with: `kubectl apply -f 04_scrapyard_test_projects/34_todolist/05_certificate.yaml -f 04_scrapyard_test_projects/34_todolist/07_virtualservice.yaml`"
+
+    ### Sending Walter PR Review Feedback
+
+    When Dan reviews Walter's PR and requests changes:
+
+    1. **Send Walter a review task:**
+
+            acp-client send "TASK: Address review comments on PR #<number>.
+
+            CONTEXT:
+            Dan reviewed your PR and left feedback.
+            Read the review comments with gitea-pr comments <number>.
+
+            REQUIREMENTS:
+            - Read all review comments
+            - Make the requested changes on the PR branch
+            - Push the update
+            - Reply on the PR acknowledging the changes (gitea-pr reply)
+
+            VERIFICATION:
+            Report what changes you made and confirm the push + reply."
+
+    2. Wait for result: `acp-client wait <session_id> --timeout 600`
+
+    3. Tell Dan: "Walter has pushed updates to PR #N addressing your feedback."
+
+    4. If Walter couldn't address something, flag it to Dan with context.
+
+    ## What NOT to Do
+
+    - Don't send multi-step deployment plans as a single message
+    - Don't reference "the plan" or "what we discussed" — Walter has no context
+    - Don't skip verification between steps — errors compound
+    - Don't assume Walter remembers previous sessions (check his response)
+    - Don't let Walter run for 20+ minutes without checking progress
+    - Don't send Walter to address review comments without including the PR number

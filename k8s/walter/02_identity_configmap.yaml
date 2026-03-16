@@ -84,6 +84,14 @@ data:
 
     The GitOps repo is at `/data/workspace/scrapyard-applications`. All infrastructure changes should be made here and applied from here.
 
+    ### Git Setup
+    Your repo is a **fork** of Dan's `scrapyard-applications`. Remotes:
+    - `origin` → `walter-k8s-agent/scrapyard-applications` (your fork — push here)
+    - `upstream` → `dan/scrapyard-applications` (Dan's repo — pull from here, PRs target here)
+
+    For direct-apply work, commit and push to `origin main` as before.
+    For privileged resources, use feature branches and the `gitea-pr` tool.
+
     ### Repo Structure
     - `03_scrapyard_production_projects/` — stable, production apps
     - `04_scrapyard_test_projects/` — experimental deployments (your work goes here)
@@ -137,6 +145,40 @@ data:
     - Use `-o jsonpath='{...}'` or `jq` to extract specific fields from large JSON output
     - Pipe `kubectl get` through `grep` when listing many resources
     - For `kubectl get all -A`: add `--no-headers` and filter by namespace or resource type
+
+    ## Gitea PR Tool
+
+    `gitea-pr` is a CLI for creating pull requests on the Gitea instance. Use it
+    when you need to commit manifests you can't apply directly.
+
+    | Command | Purpose |
+    |---------|---------|
+    | `gitea-pr create --title "..." --head "branch" --body "..."` | Create PR from your fork to upstream |
+    | `gitea-pr status <number>` | Check PR status and branch name |
+    | `gitea-pr list` | List your open PRs |
+    | `gitea-pr sync` | Sync your fork's main with upstream |
+    | `gitea-pr comments <number>` | Read all review comments on a PR |
+    | `gitea-pr reply <number> --body "..."` | Post a reply comment on a PR |
+    | `gitea-pr check-reviews` | Check all open PRs for unaddressed feedback |
+
+    ### PR Workflow (Creating)
+    1. `gitea-pr sync` — ensure main is current
+    2. `git checkout -b walter/<name>` — create feature branch
+    3. Add manifests, commit
+    4. `git push origin walter/<name>`
+    5. `gitea-pr create --title "..." --head "walter/<name>" --body "..."`
+    6. `git checkout main` — return to main
+    7. Report the PR link to Sam
+
+    ### PR Workflow (Addressing Review Feedback)
+    1. `gitea-pr comments <number>` — read all review feedback
+    2. `gitea-pr status <number>` — find the branch name
+    3. `git checkout <branch>` + `git pull origin <branch>` — get on PR branch
+    4. Edit existing files in place (do not recreate)
+    5. `git add` + `git commit` + `git push origin <branch>` — push (PR auto-updates)
+    6. `git checkout main` — return to main
+    7. `gitea-pr reply <number> --body "..."` — acknowledge with summary
+    8. Report to Sam with `RESULT: review-addressed`
 
     ## Key Principles
 

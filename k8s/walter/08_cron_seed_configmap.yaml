@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zeroclaw-k8s-agent-cron-seed
+  namespace: ai-agents
+data:
+  seed-cron.py: |
+    #!/usr/bin/env python3
+    """Seed the pr-review-monitor cron job into Walter's SQLite cron store.
+
+    Run once on container startup. Idempotent — skips if job already exists.
+    """
+    import sqlite3
+    import uuid
+    import os
+    from datetime import datetime, timezone
+
+    DB_PATH = "/data/.zeroclaw/workspace/cron/jobs.db"
+
+    CRON_NAME = "pr-review-monitor"
+    CRON_EXPR = "*/30 * * * *"
+    SCHEDULE_JSON = '{"kind":"cron","expr":"0 */30 * * * *","tz":"America/Edmonton"}'
+    PROMPT = (
+        "Run gitea-pr check-reviews to see if any of your open PRs have "
+        "unaddressed review comments. If ACTION NEEDED is reported, address "
+        "each PR feedback using the Addressing PR Review Comments workflow "
+        "(Phase READ through Phase REPORT). If all clear, no action needed."
+    )
+
+    def main():
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""CREATE TABLE IF NOT EXISTS cron_jobs (
+            id TEXT PRIMARY KEY, expression TEXT NOT NULL, command TEXT NOT NULL,
+            schedule TEXT, job_type TEXT NOT NULL DEFAULT 'shell', prompt TEXT,
+            name TEXT, session_target TEXT NOT NULL DEFAULT 'isolated', model TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1, delivery TEXT,
+            delete_after_run INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+            next_run TEXT NOT NULL, last_run TEXT, last_status TEXT, last_output TEXT)""")
+
+        exists = conn.execute(
+            "SELECT 1 FROM cron_jobs WHERE name=?", (CRON_NAME,)
+        ).fetchone()
+
+        if not exists:
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "INSERT INTO cron_jobs "
+                "(id,expression,command,schedule,job_type,prompt,name,"
+                "session_target,enabled,delivery,delete_after_run,created_at,next_run) "
+                "VALUES (?,?,?,?,?,?,?,?,1,?,0,?,?)",
+                (str(uuid.uuid4()), CRON_EXPR, "", SCHEDULE_JSON, "agent",
+                 PROMPT, CRON_NAME, "isolated", '{"mode":"none"}', now, now))
+            conn.commit()
+            print(f"Seeded {CRON_NAME} cron job")
+        else:
+            print(f"{CRON_NAME} cron job already exists")
+
+        conn.close()
+
+    if __name__ == "__main__":
+        main()

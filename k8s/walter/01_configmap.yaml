@@ -48,7 +48,7 @@ data:
       block_high_risk_commands = false
       non_cli_excluded_tools = []
       non_cli_natural_language_approval_mode = "direct"
-      shell_env_passthrough = ["KUBECONFIG", "GIT_CONFIG_GLOBAL"]
+      shell_env_passthrough = ["KUBECONFIG", "GIT_CONFIG_GLOBAL", "GITEA_API_TOKEN"]
 
       [research]
       trigger = "never"

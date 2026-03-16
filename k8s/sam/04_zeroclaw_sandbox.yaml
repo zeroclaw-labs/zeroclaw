@@ -86,7 +86,7 @@ spec:
               readOnly: true
       containers:
         - name: zeroclaw
-          image: citizendaniel/zeroclaw-sam:v1.4.11
+          image: citizendaniel/zeroclaw-sam:v1.4.12
           imagePullPolicy: IfNotPresent
           command:
             - bash
@@ -171,7 +171,7 @@ spec:
               subPath: acp-client.py
               readOnly: true
         - name: serena
-          image: citizendaniel/zeroclaw-sam:v1.4.11
+          image: citizendaniel/zeroclaw-sam:v1.4.12
           imagePullPolicy: IfNotPresent
           command:
             - sh

@@ -1,0 +1,344 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zeroclaw-k8s-agent-gitea-pr
+  namespace: ai-agents
+data:
+  gitea-pr.py: |
+    #!/usr/bin/env python3
+    """Gitea PR CLI for Walter (K8s Infrastructure Agent).
+
+    Creates and manages pull requests on the self-hosted Gitea instance
+    for manifests that Walter cannot apply directly (VirtualServices,
+    Certificates, Gateways).
+
+    Commands:
+      gitea-pr create --title "..." --head "branch" [--body "..."] [--base main]
+      gitea-pr status <pr-number>
+      gitea-pr list [--state open]
+      gitea-pr sync
+      gitea-pr comments <pr-number>
+      gitea-pr reply <pr-number> --body "..."
+      gitea-pr check-reviews
+      gitea-pr help
+
+    Environment:
+      GITEA_API_TOKEN  — API token for walter-k8s-agent (required)
+      GITEA_BASE_URL   — Gitea URL (default: https://gitea.coffee-anon.com)
+      GITEA_UPSTREAM   — Upstream repo (default: dan/scrapyard-applications)
+      GITEA_FORK_OWNER — Fork owner (default: walter-k8s-agent)
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+    import urllib.request
+    import urllib.error
+
+    BASE_URL = os.environ.get("GITEA_BASE_URL", "https://gitea.coffee-anon.com")
+    API_URL = f"{BASE_URL}/api/v1"
+    TOKEN = os.environ.get("GITEA_API_TOKEN", "")
+    UPSTREAM = os.environ.get("GITEA_UPSTREAM", "dan/scrapyard-applications")
+    FORK_OWNER = os.environ.get("GITEA_FORK_OWNER", "walter-k8s-agent")
+    REPO_DIR = "/data/workspace/scrapyard-applications"
+
+
+    def _api(method, path, data=None, timeout=30):
+        """Make an authenticated Gitea API request."""
+        if not TOKEN:
+            print("ERROR: GITEA_API_TOKEN not set", file=sys.stderr)
+            sys.exit(1)
+        url = f"{API_URL}{path}"
+        headers = {
+            "Authorization": f"token {TOKEN}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        body = json.dumps(data).encode() if data else None
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+            return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode() if e.fp else ""
+            print(f"ERROR: HTTP {e.code} — {e.reason}", file=sys.stderr)
+            if error_body:
+                try:
+                    detail = json.loads(error_body)
+                    print(f"Detail: {detail.get('message', error_body)}", file=sys.stderr)
+                except json.JSONDecodeError:
+                    print(f"Detail: {error_body[:500]}", file=sys.stderr)
+            sys.exit(1)
+        except urllib.error.URLError as e:
+            print(f"ERROR: {e.reason}", file=sys.stderr)
+            sys.exit(1)
+
+
+    def cmd_create(args):
+        """Create a PR from Walter's fork to upstream."""
+        title = body = head = None
+        base = "main"
+        i = 0
+        while i < len(args):
+            if args[i] == "--title" and i + 1 < len(args):
+                title = args[i + 1]; i += 2
+            elif args[i] == "--body" and i + 1 < len(args):
+                body = args[i + 1]; i += 2
+            elif args[i] == "--head" and i + 1 < len(args):
+                head = args[i + 1]; i += 2
+            elif args[i] == "--base" and i + 1 < len(args):
+                base = args[i + 1]; i += 2
+            else:
+                print(f"Unknown arg: {args[i]}", file=sys.stderr)
+                sys.exit(1)
+        if not title or not head:
+            print('Usage: gitea-pr create --title "..." --head "branch" [--body "..."] [--base main]',
+                  file=sys.stderr)
+            sys.exit(1)
+        result = _api("POST", f"/repos/{UPSTREAM}/pulls", {
+            "title": title,
+            "body": body or "",
+            "head": f"{FORK_OWNER}:{head}",
+            "base": base,
+        })
+        pr_number = result.get("number", "?")
+        pr_url = result.get("html_url", f"{BASE_URL}/{UPSTREAM}/pulls/{pr_number}")
+        print(f"PR #{pr_number} created: {pr_url}")
+
+
+    def cmd_status(args):
+        """Check PR status."""
+        if not args:
+            print("Usage: gitea-pr status <pr-number>", file=sys.stderr)
+            sys.exit(1)
+        result = _api("GET", f"/repos/{UPSTREAM}/pulls/{args[0]}")
+        state = result.get("state", "unknown")
+        merged = result.get("merged", False)
+        title = result.get("title", "")
+        status = "MERGED" if merged else state.upper()
+        head_ref = result.get("head", {}).get("ref", "unknown")
+        print(f"PR #{args[0]}: {status} — {title}")
+        print(f"  Branch: {head_ref}")
+
+
+    def cmd_list(args):
+        """List PRs by walter-k8s-agent."""
+        state = "open"
+        if "--state" in args:
+            idx = args.index("--state")
+            if idx + 1 < len(args):
+                state = args[idx + 1]
+        results = _api("GET", f"/repos/{UPSTREAM}/pulls?state={state}&limit=20")
+        walter_prs = [pr for pr in results if pr.get("user", {}).get("login") == FORK_OWNER]
+        if not walter_prs:
+            print(f"No {state} PRs from {FORK_OWNER}")
+            return
+        for pr in walter_prs:
+            num = pr.get("number", "?")
+            title = pr.get("title", "Untitled")
+            merged = pr.get("merged", False)
+            status = "MERGED" if merged else pr.get("state", "?").upper()
+            print(f"  #{num} [{status}] {title}")
+
+
+    def cmd_sync(args):
+        """Sync fork main with upstream (fetch + ff-merge + push)."""
+        cmds = [
+            ["git", "-C", REPO_DIR, "fetch", "upstream"],
+            ["git", "-C", REPO_DIR, "checkout", "main"],
+            ["git", "-C", REPO_DIR, "merge", "--ff-only", "upstream/main"],
+            ["git", "-C", REPO_DIR, "push", "origin", "main"],
+        ]
+        for cmd in cmds:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                print(f"WARN: {' '.join(cmd)} failed: {r.stderr.strip()}", file=sys.stderr)
+                if "merge" in cmd:
+                    print("Fork may have diverged. Manual intervention needed.", file=sys.stderr)
+                    sys.exit(1)
+        print("Fork main synced with upstream.")
+
+
+    def cmd_comments(args):
+        """Fetch all comments on a PR (general + review line comments)."""
+        if not args:
+            print("Usage: gitea-pr comments <pr-number>", file=sys.stderr)
+            sys.exit(1)
+        pr_num = args[0]
+
+        # 1. Fetch general issue comments (PRs are issues in Gitea)
+        general = _api("GET", f"/repos/{UPSTREAM}/issues/{pr_num}/comments")
+
+        # 2. Fetch reviews (each review can have line-level comments)
+        reviews = _api("GET", f"/repos/{UPSTREAM}/pulls/{pr_num}/reviews")
+
+        all_comments = []
+
+        for c in general:
+            body = (c.get("body") or "").strip()
+            if not body:
+                continue
+            all_comments.append({
+                "type": "general",
+                "author": c.get("user", {}).get("login", "unknown"),
+                "created": c.get("created_at", ""),
+                "body": body,
+                "file": None,
+                "line": None,
+            })
+
+        for review in reviews:
+            review_id = review.get("id")
+            reviewer = review.get("user", {}).get("login", "unknown")
+            review_state = review.get("state", "").upper()
+            review_body = (review.get("body") or "").strip()
+
+            if review_body:
+                all_comments.append({
+                    "type": f"review ({review_state})",
+                    "author": reviewer,
+                    "created": review.get("submitted_at", review.get("created_at", "")),
+                    "body": review_body,
+                    "file": None,
+                    "line": None,
+                })
+
+            if review_id:
+                try:
+                    line_comments = _api("GET",
+                        f"/repos/{UPSTREAM}/pulls/{pr_num}/reviews/{review_id}/comments")
+                except SystemExit:
+                    line_comments = []
+                for lc in line_comments:
+                    lc_body = (lc.get("body") or "").strip()
+                    if not lc_body:
+                        continue
+                    all_comments.append({
+                        "type": "line comment",
+                        "author": lc.get("user", {}).get("login", reviewer),
+                        "created": lc.get("created_at", ""),
+                        "body": lc_body,
+                        "file": lc.get("path", None),
+                        "line": lc.get("line", lc.get("old_line", None)),
+                    })
+
+        if not all_comments:
+            print(f"PR #{pr_num}: No review comments found.")
+            return
+
+        all_comments.sort(key=lambda x: x["created"])
+
+        print(f"PR #{pr_num} — {len(all_comments)} comment(s):\n")
+        for i, c in enumerate(all_comments, 1):
+            print(f"--- Comment {i} [{c['type']}] by {c['author']} ({c['created']}) ---")
+            if c["file"]:
+                loc = f"  File: {c['file']}"
+                if c["line"]:
+                    loc += f" line {c['line']}"
+                print(loc)
+            print(c["body"])
+            print()
+
+
+    def cmd_reply(args):
+        """Post a general comment on a PR."""
+        body = None
+        i = 0
+        pr_num = None
+        if args and not args[0].startswith("--"):
+            pr_num = args[0]
+            i = 1
+        while i < len(args):
+            if args[i] == "--body" and i + 1 < len(args):
+                body = args[i + 1]; i += 2
+            else:
+                print(f"Unknown arg: {args[i]}", file=sys.stderr)
+                sys.exit(1)
+        if not pr_num or not body:
+            print('Usage: gitea-pr reply <pr-number> --body "..."', file=sys.stderr)
+            sys.exit(1)
+        result = _api("POST", f"/repos/{UPSTREAM}/issues/{pr_num}/comments", {
+            "body": body,
+        })
+        comment_id = result.get("id", "?")
+        print(f"Comment posted on PR #{pr_num} (comment id: {comment_id})")
+
+
+    def cmd_check_reviews(args):
+        """Check all open PRs for unaddressed review comments."""
+        results = _api("GET", f"/repos/{UPSTREAM}/pulls?state=open&limit=50")
+        walter_prs = [pr for pr in results if pr.get("user", {}).get("login") == FORK_OWNER]
+
+        if not walter_prs:
+            print("No open PRs. Nothing to check.")
+            return
+
+        needs_attention = []
+        all_clear = []
+
+        for pr in walter_prs:
+            pr_num = pr.get("number")
+            pr_title = pr.get("title", "Untitled")
+            head_ref = pr.get("head", {}).get("ref", "unknown")
+
+            # Fetch general comments
+            try:
+                comments = _api("GET", f"/repos/{UPSTREAM}/issues/{pr_num}/comments")
+            except SystemExit:
+                comments = []
+
+            # Filter to non-empty comments
+            real_comments = [c for c in comments if (c.get("body") or "").strip()]
+
+            if not real_comments:
+                all_clear.append(f"  #{pr_num}: {pr_title} — no comments")
+                continue
+
+            # Check last commenter
+            last = real_comments[-1]
+            last_author = last.get("user", {}).get("login", "unknown")
+
+            if last_author != FORK_OWNER:
+                needs_attention.append({
+                    "number": pr_num,
+                    "title": pr_title,
+                    "branch": head_ref,
+                    "last_author": last_author,
+                    "last_body": (last.get("body") or "")[:200],
+                    "comment_count": len(real_comments),
+                })
+            else:
+                all_clear.append(f"  #{pr_num}: {pr_title} — last comment is mine")
+
+        if needs_attention:
+            print(f"ACTION NEEDED — {len(needs_attention)} PR(s) with unaddressed feedback:\n")
+            for pr in needs_attention:
+                print(f"  PR #{pr['number']}: {pr['title']}")
+                print(f"    Branch: {pr['branch']}")
+                print(f"    Last comment by: {pr['last_author']} ({pr['comment_count']} total)")
+                print(f"    Preview: {pr['last_body']}")
+                print()
+        else:
+            print("All clear — no unaddressed review comments.")
+
+        if all_clear:
+            print(f"OK ({len(all_clear)} PR(s) with no pending feedback):")
+            for line in all_clear:
+                print(line)
+
+
+    def main():
+        if len(sys.argv) < 2 or sys.argv[1] in ("help", "--help", "-h"):
+            print(__doc__)
+            sys.exit(0)
+        commands = {"create": cmd_create, "status": cmd_status, "list": cmd_list, "sync": cmd_sync, "comments": cmd_comments, "reply": cmd_reply, "check-reviews": cmd_check_reviews}
+        cmd = sys.argv[1]
+        if cmd not in commands:
+            print(f"Unknown command: {cmd}", file=sys.stderr)
+            print(__doc__)
+            sys.exit(1)
+        commands[cmd](sys.argv[2:])
+
+
+    if __name__ == "__main__":
+        main()
