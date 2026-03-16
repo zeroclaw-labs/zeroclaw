@@ -7875,6 +7875,9 @@ This is an example JSON object for profile settings."#;
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -7974,6 +7977,9 @@ This is an example JSON object for profile settings."#;
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -8065,6 +8071,9 @@ This is an example JSON object for profile settings."#;
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -8176,6 +8185,9 @@ This is an example JSON object for profile settings."#;
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
         });
 
         process_channel_message(
