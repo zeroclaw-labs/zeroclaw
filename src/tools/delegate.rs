@@ -366,13 +366,15 @@ impl DelegateTool {
             .filter(|name| !name.is_empty())
             .collect::<std::collections::HashSet<_>>();
 
-        let parent_tools = self.parent_tools.read();
-        let sub_tools: Vec<Box<dyn Tool>> = parent_tools
-            .iter()
-            .filter(|tool| allowed.contains(tool.name()))
-            .filter(|tool| tool.name() != "delegate")
-            .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
-            .collect();
+        let sub_tools: Vec<Box<dyn Tool>> = {
+            let parent_tools = self.parent_tools.read();
+            parent_tools
+                .iter()
+                .filter(|tool| allowed.contains(tool.name()))
+                .filter(|tool| tool.name() != "delegate")
+                .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
+                .collect()
+        };
 
         if sub_tools.is_empty() {
             return Ok(ToolResult {
