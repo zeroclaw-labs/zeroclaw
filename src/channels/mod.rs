@@ -32,6 +32,8 @@ pub mod nextcloud_talk;
 pub mod nostr;
 pub mod notion;
 pub mod qq;
+pub mod session_backend;
+pub mod session_sqlite;
 pub mod session_store;
 pub mod signal;
 pub mod slack;
