@@ -1280,10 +1280,15 @@ fn xml_dispatcher_generates_tool_instructions() {
     let dispatcher = XmlToolDispatcher;
     let instructions = dispatcher.prompt_instructions(&tools);
 
+    // Must contain the call-syntax protocol block
     assert!(instructions.contains("## Tool Use Protocol"));
     assert!(instructions.contains("<tool_call>"));
-    assert!(instructions.contains("echo"));
-    assert!(instructions.contains("Echoes the input"));
+
+    // Must NOT list tool names or descriptions — ToolsSection in prompt.rs
+    // is the sole owner of the tool catalogue. Listing tools here too would
+    // inject the full schema twice into the system prompt (issue #3643).
+    assert!(!instructions.contains("echo"));
+    assert!(!instructions.contains("Echoes the input"));
 }
 
 #[test]
