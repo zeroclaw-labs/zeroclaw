@@ -515,6 +515,91 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
         if content.is_empty() {
             continue;
         }
+
+        // ── Apply client-provided overrides (provider, model, api_key) ──
+        // This mirrors the logic in openclaw_compat.rs for the HTTP /api/chat handler.
+        {
+            let mut config_guard = state.config.lock();
+
+            if let Some(client_provider) = parsed["provider"].as_str().filter(|p| !p.trim().is_empty()) {
+                let backend_provider = match client_provider {
+                    "claude" => "anthropic",
+                    p => p,
+                };
+                config_guard.default_provider = Some(backend_provider.to_string());
+            }
+
+            if let Some(client_model) = parsed["model"].as_str().filter(|m| !m.trim().is_empty()) {
+                config_guard.default_model = Some(client_model.to_string());
+            }
+
+            if let Some(client_key) = parsed["api_key"].as_str().filter(|k| !k.trim().is_empty()) {
+                config_guard.api_key = Some(client_key.to_string());
+            }
+        }
+
+        // ── Resolve provider-specific key from provider_api_keys map ──
+        // When the client doesn't send an api_key, look up the per-provider
+        // key stored via Settings → /api/config/api-key.
+        {
+            let mut config_guard = state.config.lock();
+            let provider_name = config_guard
+                .default_provider
+                .clone()
+                .unwrap_or_else(|| "gemini".to_string());
+
+            if config_guard.api_key.as_ref().map_or(true, |k| k.trim().is_empty()) {
+                if let Some(stored_key) = config_guard.provider_api_keys.get(&provider_name).cloned() {
+                    if !stored_key.trim().is_empty() {
+                        config_guard.api_key = Some(stored_key);
+                    }
+                }
+            }
+        }
+
+        // ── Validate API key for cloud providers ──
+        let credential_missing = {
+            let config_guard = state.config.lock();
+            let provider_name = config_guard
+                .default_provider
+                .as_deref()
+                .unwrap_or("gemini")
+                .to_string();
+
+            if crate::providers::provider_requires_credential(&provider_name) {
+                let has_key = crate::providers::has_provider_credential(
+                    &provider_name,
+                    config_guard.api_key.as_deref(),
+                );
+                if !has_key {
+                    Some(provider_name)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(provider_name) = credential_missing {
+            let env_hint = match provider_name.as_str() {
+                "anthropic" => "ANTHROPIC_API_KEY",
+                "openai" => "OPENAI_API_KEY",
+                "gemini" | "google" | "google-gemini" => "GEMINI_API_KEY",
+                _ => "<PROVIDER>_API_KEY",
+            };
+            let err = serde_json::json!({
+                "type": "error",
+                "code": "missing_api_key",
+                "message": format!(
+                    "No API key configured for provider '{}'. Please add your API key in Settings or set {} env var.",
+                    provider_name, env_hint
+                ),
+                "fallback_to_relay": true,
+            });
+            let _ = socket.send(Message::Text(err.to_string().into())).await;
+            continue;
+        }
+
         let perplexity_cfg = { state.config.lock().security.perplexity_filter.clone() };
         if let Some(assessment) =
             crate::security::detect_adversarial_suffix(&content, &perplexity_cfg)
@@ -589,10 +674,26 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
             }
             Err(e) => {
                 let sanitized = crate::providers::sanitize_api_error(&e.to_string());
-                let err = serde_json::json!({
-                    "type": "error",
-                    "message": sanitized,
-                });
+
+                // Detect provider authentication errors (401 Unauthorized) so
+                // the client can fall back to relay or prompt the user.
+                let is_auth_error = sanitized.contains("401")
+                    || sanitized.contains("Unauthorized")
+                    || sanitized.contains("authentication");
+
+                let err = if is_auth_error {
+                    serde_json::json!({
+                        "type": "error",
+                        "code": "provider_auth_error",
+                        "message": format!("LLM request failed: {sanitized}"),
+                        "fallback_to_relay": true,
+                    })
+                } else {
+                    serde_json::json!({
+                        "type": "error",
+                        "message": sanitized,
+                    })
+                };
                 let _ = socket.send(Message::Text(err.to_string().into())).await;
 
                 // Broadcast error event

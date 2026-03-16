@@ -770,9 +770,10 @@ fn hydrate_provider_env_vars(config: &Config) {
             "mistral" => "MISTRAL_API_KEY",
             _ => continue,
         };
-        if std::env::var(env_var).map_or(true, |v| v.trim().is_empty()) {
-            std::env::set_var(env_var, key);
-        }
+        // Always overwrite from config so that runtime key changes (e.g.
+        // via Settings UI) take effect on subsequent requests without
+        // requiring a gateway restart.
+        std::env::set_var(env_var, key);
     }
 }
 
