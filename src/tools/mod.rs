@@ -53,8 +53,10 @@ pub mod model_routing_config;
 pub mod node_tool;
 pub mod notion_tool;
 pub mod pdf_read;
+pub mod project_intel;
 pub mod proxy_config;
 pub mod pushover;
+pub mod report_templates;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
@@ -102,6 +104,7 @@ pub use model_routing_config::ModelRoutingConfigTool;
 pub use node_tool::NodeTool;
 pub use notion_tool::NotionTool;
 pub use pdf_read::PdfReadTool;
+pub use project_intel::ProjectIntelTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
@@ -362,6 +365,14 @@ pub fn all_tools_with_runtime(
         } else {
             tool_arcs.push(Arc::new(NotionTool::new(notion_api_key, security.clone())));
         }
+    }
+
+    // Project delivery intelligence
+    if root_config.project_intel.enabled {
+        tool_arcs.push(Arc::new(ProjectIntelTool::new(
+            root_config.project_intel.default_language.clone(),
+            root_config.project_intel.risk_sensitivity.clone(),
+        )));
     }
 
     // PDF extraction (feature-gated at compile time via rag-pdf)
