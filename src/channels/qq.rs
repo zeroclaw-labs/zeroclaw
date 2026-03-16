@@ -257,8 +257,10 @@ impl Channel for QQChannel {
             (
                 format!("{QQ_API_BASE}/v2/groups/{group_id}/messages"),
                 json!({
-                    "content": &message.content,
-                    "msg_type": 0,
+                    "markdown": {
+                        "content": &message.content,
+                    },
+                    "msg_type": 2,
                 }),
             )
         } else {
@@ -273,8 +275,10 @@ impl Channel for QQChannel {
             (
                 format!("{QQ_API_BASE}/v2/users/{user_id}/messages"),
                 json!({
-                    "content": &message.content,
-                    "msg_type": 0,
+                    "markdown": {
+                        "content": &message.content,
+                    },
+                    "msg_type": 2,
                 }),
             )
         };
