@@ -38,6 +38,7 @@ pub mod policy;
 pub mod prompt_guard;
 pub mod secrets;
 pub mod traits;
+pub mod workspace_boundary;
 
 #[allow(unused_imports)]
 pub use audit::{AuditEvent, AuditEventType, AuditLogger};
@@ -60,6 +61,8 @@ pub use traits::{NoopSandbox, Sandbox};
 pub use leak_detector::{LeakDetector, LeakResult};
 #[allow(unused_imports)]
 pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
+#[allow(unused_imports)]
+pub use workspace_boundary::{BoundaryVerdict, WorkspaceBoundary};
 
 /// Redact sensitive values for safe logging. Shows first 4 chars + "***" suffix.
 /// This function intentionally breaks the data-flow taint chain for static analysis.
