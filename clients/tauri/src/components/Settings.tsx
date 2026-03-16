@@ -124,10 +124,12 @@ export function Settings({ locale, isConnected, onLocaleChange, onBack, onLogout
         text: key ? t("api_key_saved", locale) : t("api_key_cleared", locale),
       });
     } catch {
-      // Local agent might not be running — still saved locally
+      // Local agent might not be running — saved to localStorage only
       setMessage({
-        type: "success",
-        text: key ? t("api_key_saved", locale) : t("api_key_cleared", locale),
+        type: "error",
+        text: locale === "ko"
+          ? "로컬 에이전트에 저장 실패 — 로컬 저장소에만 저장됨"
+          : "Failed to save to local agent — saved to local storage only",
       });
     }
     clearMessage();
@@ -148,12 +150,16 @@ export function Settings({ locale, isConnected, onLocaleChange, onBack, onLogout
     const defaultModel = MODEL_OPTIONS[provider]?.[0]?.id || "";
     setSelectedModel(defaultModel);
     localStorage.setItem(STORAGE_KEY_LLM_MODEL, defaultModel);
+    // Sync provider/model selection to local agent so server-side config stays current
+    apiClient.saveProviderModelToAgent(provider, defaultModel).catch(() => {});
   }, []);
 
   const handleModelChange = useCallback((model: string) => {
     setSelectedModel(model);
     localStorage.setItem(STORAGE_KEY_LLM_MODEL, model);
-  }, []);
+    // Sync model selection to local agent
+    apiClient.saveProviderModelToAgent(selectedProvider, model).catch(() => {});
+  }, [selectedProvider]);
 
   const handleTriggerSync = useCallback(async () => {
     setIsSyncing(true);

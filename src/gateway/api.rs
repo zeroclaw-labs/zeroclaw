@@ -222,7 +222,14 @@ pub async fn handle_api_config_api_key_put(
     }
 
     let provider = body.get("provider").and_then(|v| v.as_str()).unwrap_or("");
-    let api_key = body.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
+    let api_key_field = body.get("api_key"); // None = field absent, Some("") = explicit clear
+    let api_key = api_key_field.and_then(|v| v.as_str()).unwrap_or("");
+    let has_api_key_field = api_key_field.is_some();
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
 
     if provider.is_empty() {
         return (
@@ -241,12 +248,16 @@ pub async fn handle_api_config_api_key_put(
     };
 
     // Store or remove the key in the per-provider map.
-    if api_key.is_empty() {
-        config.provider_api_keys.remove(backend_provider);
-    } else {
-        config
-            .provider_api_keys
-            .insert(backend_provider.to_string(), api_key.to_string());
+    // Only touch provider_api_keys when api_key field is explicitly present in the request.
+    // This allows provider/model-only updates without accidentally wiping stored keys.
+    if has_api_key_field {
+        if api_key.is_empty() {
+            config.provider_api_keys.remove(backend_provider);
+        } else {
+            config
+                .provider_api_keys
+                .insert(backend_provider.to_string(), api_key.to_string());
+        }
     }
 
     // Also set the provider-specific env var so resolve_provider_credential()
@@ -279,15 +290,23 @@ pub async fn handle_api_config_api_key_put(
         "cloudflare" | "cloudflare-ai" => "CLOUDFLARE_API_KEY",
         _ => "",
     };
-    if !env_var.is_empty() {
+    if has_api_key_field && !env_var.is_empty() {
         std::env::set_var(env_var, api_key);
     }
 
     // Set config-level api_key to this provider's key and update default_provider.
     // Only update when setting a key, not when removing one.
-    if !api_key.is_empty() {
+    if has_api_key_field && !api_key.is_empty() {
         config.api_key = Some(api_key.to_string());
-        config.default_provider = Some(backend_provider.to_string());
+    }
+
+    // Always update default_provider when explicitly provided (even without a key change).
+    // This lets the frontend sync provider selection independently of key management.
+    config.default_provider = Some(backend_provider.to_string());
+
+    // Update default_model if provided.
+    if let Some(model_name) = model {
+        config.default_model = Some(model_name.to_string());
     }
 
     if let Err(e) = config.save().await {
@@ -1743,6 +1762,11 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     let mut masked = config.clone();
 
     mask_optional_secret(&mut masked.api_key);
+    for value in masked.provider_api_keys.values_mut() {
+        if !value.is_empty() {
+            *value = MASKED_SECRET.to_string();
+        }
+    }
     mask_vec_secrets(&mut masked.reliability.api_keys);
     mask_optional_secret(&mut masked.composio.api_key);
     mask_optional_secret(&mut masked.proxy.http_proxy);
@@ -1849,6 +1873,23 @@ fn restore_masked_sensitive_fields(
     current: &crate::config::Config,
 ) {
     restore_optional_secret(&mut incoming.api_key, &current.api_key);
+    for (key, value) in &mut incoming.provider_api_keys {
+        if value == MASKED_SECRET {
+            if let Some(original) = current.provider_api_keys.get(key) {
+                *value = original.clone();
+            }
+        }
+    }
+    // Preserve provider_api_keys entries that exist in current but were removed from incoming
+    // (the frontend may not include empty/masked entries)
+    for (key, value) in &current.provider_api_keys {
+        if !value.is_empty() {
+            incoming
+                .provider_api_keys
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
     restore_vec_secrets(
         &mut incoming.reliability.api_keys,
         &current.reliability.api_keys,

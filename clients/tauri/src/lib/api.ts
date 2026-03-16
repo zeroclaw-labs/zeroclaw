@@ -636,17 +636,39 @@ export class MoAClient {
   // When no key is set, MoA falls back to operator keys via relay.
 
   async saveApiKeyToAgent(provider: string, key: string): Promise<void> {
+    const res = await fetch(`${this.serverUrl}/api/config/api-key`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({ provider, api_key: key }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: "Save failed" }));
+      throw new Error(data.error || `Save failed (${res.status})`);
+    }
+  }
+
+  /**
+   * Sync provider and model selection to the local MoA agent config.
+   * This ensures the server uses the correct provider/model for chat requests
+   * that don't include explicit overrides (e.g. WebSocket chat).
+   */
+  async saveProviderModelToAgent(provider: string, model?: string): Promise<void> {
     try {
+      const body: Record<string, string> = { provider };
+      if (model) body.model = model;
       await fetch(`${this.serverUrl}/api/config/api-key`, {
         method: "PUT",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${this.token}`,
         },
-        body: JSON.stringify({ provider, api_key: key }),
+        body: JSON.stringify(body),
       });
     } catch {
-      // Local agent might not be running — key is still saved in localStorage
+      // Local agent might not be running — preference is still saved in localStorage
     }
   }
 
