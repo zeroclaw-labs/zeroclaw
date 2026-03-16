@@ -325,8 +325,13 @@ impl Memory for LucidMemory {
         query: &str,
         limit: usize,
         session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let local_results = self.local.recall(query, limit, session_id).await?;
+        let local_results = self
+            .local
+            .recall(query, limit, session_id, since, until)
+            .await?;
         if limit == 0
             || local_results.len() >= limit
             || local_results.len() >= self.local_hit_threshold
@@ -341,7 +346,24 @@ impl Memory for LucidMemory {
         match self.recall_from_lucid(query).await {
             Ok(lucid_results) if !lucid_results.is_empty() => {
                 self.clear_failure();
-                Ok(Self::merge_results(local_results, lucid_results, limit))
+                let merged = Self::merge_results(local_results, lucid_results, limit);
+                let filtered: Vec<MemoryEntry> = merged
+                    .into_iter()
+                    .filter(|e| {
+                        if let Some(s) = since {
+                            if e.timestamp.as_str() < s {
+                                return false;
+                            }
+                        }
+                        if let Some(u) = until {
+                            if e.timestamp.as_str() > u {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .collect();
+                Ok(filtered)
             }
             Ok(_) => {
                 self.clear_failure();
@@ -541,7 +563,7 @@ exit 1
             .await
             .unwrap();
 
-        let entries = memory.recall("auth", 5, None).await.unwrap();
+        let entries = memory.recall("auth", 5, None, None, None).await.unwrap();
 
         assert!(entries
             .iter()
@@ -565,7 +587,7 @@ exit 1
             .await
             .unwrap();
 
-        let entries = memory.recall("auth", 5, None).await.unwrap();
+        let entries = memory.recall("auth", 5, None, None, None).await.unwrap();
 
         assert!(entries
             .iter()
@@ -603,7 +625,7 @@ exit 1
             .await
             .unwrap();
 
-        let entries = memory.recall("rust", 5, None).await.unwrap();
+        let entries = memory.recall("rust", 5, None, None, None).await.unwrap();
         assert!(entries
             .iter()
             .any(|e| e.content.contains("Rust should stay local-first")));
@@ -663,8 +685,8 @@ exit 1
             Duration::from_secs(5),
         );
 
-        let first = memory.recall("auth", 5, None).await.unwrap();
-        let second = memory.recall("auth", 5, None).await.unwrap();
+        let first = memory.recall("auth", 5, None, None, None).await.unwrap();
+        let second = memory.recall("auth", 5, None, None, None).await.unwrap();
 
         assert!(first.is_empty());
         assert!(second.is_empty());

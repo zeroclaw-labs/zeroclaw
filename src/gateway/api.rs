@@ -50,6 +50,10 @@ fn require_auth(
 pub struct MemoryQuery {
     pub query: Option<String>,
     pub category: Option<String>,
+    /// Filter memories created at or after (ISO 8601)
+    pub since: Option<String>,
+    /// Filter memories created at or before (ISO 8601)
+    pub until: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -460,9 +464,12 @@ pub async fn handle_api_memory_list(
         return e.into_response();
     }
 
-    if let Some(ref query) = params.query {
-        // Search mode
-        match state.mem.recall(query, 50, None).await {
+    // Use recall when query or time range is provided
+    if params.query.is_some() || params.since.is_some() || params.until.is_some() {
+        let query = params.query.as_deref().unwrap_or("");
+        let since = params.since.as_deref();
+        let until = params.until.as_deref();
+        match state.mem.recall(query, 50, None, since, until).await {
             Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,

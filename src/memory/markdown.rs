@@ -158,6 +158,8 @@ impl Memory for MarkdownMemory {
         query: &str,
         limit: usize,
         _session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         let all = self.read_all_entries().await?;
         let query_lower = query.to_lowercase();
@@ -166,6 +168,21 @@ impl Memory for MarkdownMemory {
         let mut scored: Vec<MemoryEntry> = all
             .into_iter()
             .filter_map(|mut entry| {
+                if let Some(s) = since {
+                    if entry.timestamp.as_str() < s {
+                        return None;
+                    }
+                }
+                if let Some(u) = until {
+                    if entry.timestamp.as_str() > u {
+                        return None;
+                    }
+                }
+                if keywords.is_empty() {
+                    // Time-only query: include all time-filtered entries
+                    entry.score = Some(1.0);
+                    return Some(entry);
+                }
                 let content_lower = entry.content.to_lowercase();
                 let matched = keywords
                     .iter()
@@ -183,9 +200,14 @@ impl Memory for MarkdownMemory {
             .collect();
 
         scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            // Time-only: sort by timestamp desc; else by score desc
+            if keywords.is_empty() {
+                b.timestamp.as_str().cmp(a.timestamp.as_str())
+            } else {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }
         });
         scored.truncate(limit);
         Ok(scored)
@@ -283,7 +305,7 @@ mod tests {
             .await
             .unwrap();
 
-        let results = mem.recall("Rust", 10, None).await.unwrap();
+        let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
         assert!(results.len() >= 2);
         assert!(results
             .iter()
@@ -296,7 +318,10 @@ mod tests {
         mem.store("a", "Rust is great", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("javascript", 10, None).await.unwrap();
+        let results = mem
+            .recall("javascript", 10, None, None, None)
+            .await
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -343,7 +368,7 @@ mod tests {
     #[tokio::test]
     async fn markdown_empty_recall() {
         let (_tmp, mem) = temp_workspace();
-        let results = mem.recall("anything", 10, None).await.unwrap();
+        let results = mem.recall("anything", 10, None, None, None).await.unwrap();
         assert!(results.is_empty());
     }
 

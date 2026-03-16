@@ -291,9 +291,19 @@ impl Memory for QdrantMemory {
         query: &str,
         limit: usize,
         session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
         if query.trim().is_empty() {
-            return self.list(None, session_id).await;
+            let mut entries = self.list(None, session_id).await?;
+            if let Some(s) = since {
+                entries.retain(|e| e.timestamp.as_str() >= s);
+            }
+            if let Some(u) = until {
+                entries.retain(|e| e.timestamp.as_str() <= u);
+            }
+            entries.truncate(limit);
+            return Ok(entries);
         }
 
         self.ensure_initialized().await?;
@@ -344,7 +354,7 @@ impl Memory for QdrantMemory {
 
         let result: QdrantSearchResult = resp.json().await?;
 
-        let entries = result
+        let mut entries: Vec<MemoryEntry> = result
             .result
             .into_iter()
             .filter_map(|point| {
@@ -366,6 +376,14 @@ impl Memory for QdrantMemory {
                 })
             })
             .collect();
+
+        // Filter by time range if specified (ISO 8601 lexicographic comparison)
+        if let Some(s) = since {
+            entries.retain(|e| e.timestamp.as_str() >= s);
+        }
+        if let Some(u) = until {
+            entries.retain(|e| e.timestamp.as_str() <= u);
+        }
 
         Ok(entries)
     }
