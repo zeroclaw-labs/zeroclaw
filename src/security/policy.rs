@@ -793,6 +793,8 @@ impl SecurityPolicy {
     //   1. Allowlist check (is the base command permitted at all?)
     //   2. Risk classification (high / medium / low)
     //   3. Policy flags (block_high_risk_commands, require_approval_for_medium_risk)
+    //      — explicit allowlist entries exempt a command from the high-risk block,
+    //        but the wildcard "*" does NOT grant an exemption.
     //   4. Autonomy level × approval status (supervised requires explicit approval)
     // This ordering ensures deny-by-default: unknown commands are rejected
     // before any risk or autonomy logic runs.
@@ -810,7 +812,7 @@ impl SecurityPolicy {
         let risk = self.command_risk_level(command);
 
         if risk == CommandRiskLevel::High {
-            if self.block_high_risk_commands {
+            if self.block_high_risk_commands && !self.is_command_explicitly_allowed(command) {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
             }
             if self.autonomy == AutonomyLevel::Supervised && !approved {
@@ -832,6 +834,48 @@ impl SecurityPolicy {
         }
 
         Ok(risk)
+    }
+
+    /// Check whether **every** segment of a command is explicitly listed in
+    /// `allowed_commands` — i.e., matched by a concrete entry rather than by
+    /// the wildcard `"*"`.
+    ///
+    /// This is used to exempt explicitly-allowlisted high-risk commands from
+    /// the `block_high_risk_commands` gate. The wildcard entry intentionally
+    /// does **not** qualify as an explicit allowlist match, so that operators
+    /// who set `allowed_commands = ["*"]` still get the high-risk safety net.
+    fn is_command_explicitly_allowed(&self, command: &str) -> bool {
+        let segments = split_unquoted_segments(command);
+        for segment in &segments {
+            let cmd_part = skip_env_assignments(segment);
+            let mut words = cmd_part.split_whitespace();
+            let executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
+            let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
+
+            if base_cmd.is_empty() {
+                continue;
+            }
+
+            let explicitly_listed = self.allowed_commands.iter().any(|allowed| {
+                let allowed = strip_wrapping_quotes(allowed).trim();
+                // Skip wildcard — it does not count as an explicit entry.
+                if allowed.is_empty() || allowed == "*" {
+                    return false;
+                }
+                is_allowlist_entry_match(allowed, executable, base_cmd)
+            });
+
+            if !explicitly_listed {
+                return false;
+            }
+        }
+
+        // At least one real command must be present.
+        segments.iter().any(|s| {
+            let s = skip_env_assignments(s.trim());
+            s.split_whitespace().next().is_some_and(|w| !w.is_empty())
+        })
     }
 
     // ── Layered Command Allowlist ──────────────────────────────────────────
@@ -1503,16 +1547,113 @@ mod tests {
     }
 
     #[test]
-    fn validate_command_blocks_high_risk_by_default() {
+    fn validate_command_blocks_high_risk_via_wildcard() {
+        // Wildcard allows the command through is_command_allowed, but
+        // block_high_risk_commands still rejects it because "*" does not
+        // count as an explicit allowlist entry.
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            allowed_commands: vec!["rm".into()],
+            allowed_commands: vec!["*".into()],
             ..SecurityPolicy::default()
         };
 
         let result = p.validate_command_execution("rm -rf /tmp/test", true);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("high-risk"));
+    }
+
+    #[test]
+    fn validate_command_allows_explicitly_listed_high_risk() {
+        // When a high-risk command is explicitly in allowed_commands, the
+        // block_high_risk_commands gate is bypassed — the operator has made
+        // a deliberate decision to permit it.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["curl".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        let result = p.validate_command_execution("curl https://api.example.com/data", true);
+        assert_eq!(result.unwrap(), CommandRiskLevel::High);
+    }
+
+    #[test]
+    fn validate_command_allows_wget_when_explicitly_listed() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["wget".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        let result =
+            p.validate_command_execution("wget https://releases.example.com/v1.tar.gz", true);
+        assert_eq!(result.unwrap(), CommandRiskLevel::High);
+    }
+
+    #[test]
+    fn validate_command_blocks_non_listed_high_risk_when_another_is_allowed() {
+        // Allowing curl explicitly should not exempt wget.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["curl".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        let result = p.validate_command_execution("wget https://evil.com", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not allowed"));
+    }
+
+    #[test]
+    fn validate_command_explicit_rm_bypasses_high_risk_block() {
+        // Operator explicitly listed "rm" — they accept the risk.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["rm".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        let result = p.validate_command_execution("rm -rf /tmp/test", true);
+        assert_eq!(result.unwrap(), CommandRiskLevel::High);
+    }
+
+    #[test]
+    fn validate_command_high_risk_still_needs_approval_in_supervised() {
+        // Even when explicitly allowed, supervised mode still requires
+        // approval for high-risk commands (the approval gate is separate
+        // from the block gate).
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["curl".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        let denied = p.validate_command_execution("curl https://api.example.com", false);
+        assert!(denied.is_err());
+        assert!(denied.unwrap_err().contains("requires explicit approval"));
+
+        let allowed = p.validate_command_execution("curl https://api.example.com", true);
+        assert_eq!(allowed.unwrap(), CommandRiskLevel::High);
+    }
+
+    #[test]
+    fn validate_command_pipe_needs_all_segments_explicitly_allowed() {
+        // When a pipeline contains a high-risk command, every segment
+        // must be explicitly allowed for the exemption to apply.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["curl".into(), "grep".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        let result = p.validate_command_execution("curl https://api.example.com | grep data", true);
+        assert_eq!(result.unwrap(), CommandRiskLevel::High);
     }
 
     #[test]

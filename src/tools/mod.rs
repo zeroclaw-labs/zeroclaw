@@ -50,6 +50,7 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
 pub mod node_tool;
+pub mod notion_tool;
 pub mod pdf_read;
 pub mod proxy_config;
 pub mod pushover;
@@ -57,10 +58,12 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
+pub mod swarm;
 pub mod tool_search;
 pub mod traits;
 pub mod web_fetch;
 pub mod web_search_tool;
+pub mod workspace_tool;
 
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
@@ -95,6 +98,7 @@ pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
 #[allow(unused_imports)]
 pub use node_tool::NodeTool;
+pub use notion_tool::NotionTool;
 pub use pdf_read::PdfReadTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
@@ -103,12 +107,14 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
+pub use swarm::SwarmTool;
 pub use tool_search::ToolSearchTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
+pub use workspace_tool::WorkspaceTool;
 
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
@@ -314,6 +320,7 @@ pub fn all_tools_with_runtime(
             http_config.allowed_domains.clone(),
             http_config.max_response_size,
             http_config.timeout_secs,
+            http_config.allow_private_hosts,
         )));
     }
 
@@ -339,6 +346,22 @@ pub fn all_tools_with_runtime(
         )));
     }
 
+    // Notion API tool (conditionally registered)
+    if root_config.notion.enabled {
+        let notion_api_key = if root_config.notion.api_key.trim().is_empty() {
+            std::env::var("NOTION_API_KEY").unwrap_or_default()
+        } else {
+            root_config.notion.api_key.trim().to_string()
+        };
+        if notion_api_key.trim().is_empty() {
+            tracing::warn!(
+                "Notion tool enabled but no API key found (set notion.api_key or NOTION_API_KEY env var)"
+            );
+        } else {
+            tool_arcs.push(Arc::new(NotionTool::new(notion_api_key, security.clone())));
+        }
+    }
+
     // PDF extraction (feature-gated at compile time via rag-pdf)
     tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
 
@@ -357,6 +380,24 @@ pub fn all_tools_with_runtime(
     }
 
     // Add delegation tool when agents are configured
+    let delegate_fallback_credential = fallback_api_key.and_then(|value| {
+        let trimmed_value = value.trim();
+        (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
+    });
+    let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
+        auth_profile_override: None,
+        provider_api_url: root_config.api_url.clone(),
+        zeroclaw_dir: root_config
+            .config_path
+            .parent()
+            .map(std::path::PathBuf::from),
+        secrets_encrypt: root_config.secrets.encrypt,
+        reasoning_enabled: root_config.runtime.reasoning_enabled,
+        provider_timeout_secs: Some(root_config.provider_timeout_secs),
+        extra_headers: root_config.extra_headers.clone(),
+        api_path: root_config.api_path.clone(),
+    };
+
     let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {
         None
     } else {
@@ -364,34 +405,50 @@ pub fn all_tools_with_runtime(
             .iter()
             .map(|(name, cfg)| (name.clone(), cfg.clone()))
             .collect();
-        let delegate_fallback_credential = fallback_api_key.and_then(|value| {
-            let trimmed_value = value.trim();
-            (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
-        });
         let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
         let delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
-            delegate_fallback_credential,
+            delegate_fallback_credential.clone(),
             security.clone(),
-            crate::providers::ProviderRuntimeOptions {
-                auth_profile_override: None,
-                provider_api_url: root_config.api_url.clone(),
-                zeroclaw_dir: root_config
-                    .config_path
-                    .parent()
-                    .map(std::path::PathBuf::from),
-                secrets_encrypt: root_config.secrets.encrypt,
-                reasoning_enabled: root_config.runtime.reasoning_enabled,
-                provider_timeout_secs: Some(root_config.provider_timeout_secs),
-                extra_headers: root_config.extra_headers.clone(),
-                api_path: root_config.api_path.clone(),
-            },
+            provider_runtime_options.clone(),
         )
         .with_parent_tools(Arc::clone(&parent_tools))
         .with_multimodal_config(root_config.multimodal.clone());
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };
+
+    // Add swarm tool when swarms are configured
+    if !root_config.swarms.is_empty() {
+        let swarm_agents: HashMap<String, DelegateAgentConfig> = agents
+            .iter()
+            .map(|(name, cfg)| (name.clone(), cfg.clone()))
+            .collect();
+        tool_arcs.push(Arc::new(SwarmTool::new(
+            root_config.swarms.clone(),
+            swarm_agents,
+            delegate_fallback_credential,
+            security.clone(),
+            provider_runtime_options,
+        )));
+    }
+
+    // Workspace management tool (conditionally registered when workspace isolation is enabled)
+    if root_config.workspace.enabled {
+        let workspaces_dir = if root_config.workspace.workspaces_dir.starts_with("~/") {
+            let home = directories::UserDirs::new()
+                .map(|u| u.home_dir().to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            home.join(&root_config.workspace.workspaces_dir[2..])
+        } else {
+            std::path::PathBuf::from(&root_config.workspace.workspaces_dir)
+        };
+        let ws_manager = crate::config::workspace::WorkspaceManager::new(workspaces_dir);
+        tool_arcs.push(Arc::new(WorkspaceTool::new(
+            Arc::new(tokio::sync::RwLock::new(ws_manager)),
+            security.clone(),
+        )));
+    }
 
     (boxed_registry_from_arcs(tool_arcs), delegate_handle)
 }

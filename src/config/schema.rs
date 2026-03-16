@@ -232,6 +232,10 @@ pub struct Config {
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
 
+    /// Swarm configurations for multi-agent orchestration.
+    #[serde(default)]
+    pub swarms: HashMap<String, SwarmConfig>,
+
     /// Hooks configuration (lifecycle hooks and built-in hook toggles).
     #[serde(default)]
     pub hooks: HooksConfig,
@@ -255,6 +259,62 @@ pub struct Config {
     /// Dynamic node discovery configuration (`[nodes]`).
     #[serde(default)]
     pub nodes: NodesConfig,
+
+    /// Multi-client workspace isolation configuration (`[workspace]`).
+    #[serde(default)]
+    pub workspace: WorkspaceConfig,
+
+    /// Notion integration configuration (`[notion]`).
+    #[serde(default)]
+    pub notion: NotionConfig,
+}
+
+/// Multi-client workspace isolation configuration.
+///
+/// When enabled, each client engagement gets an isolated workspace with
+/// separate memory, audit, secrets, and tool restrictions.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceConfig {
+    /// Enable workspace isolation. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Currently active workspace name.
+    #[serde(default)]
+    pub active_workspace: Option<String>,
+    /// Base directory for workspace profiles.
+    #[serde(default = "default_workspaces_dir")]
+    pub workspaces_dir: String,
+    /// Isolate memory databases per workspace. Default: true.
+    #[serde(default = "default_true")]
+    pub isolate_memory: bool,
+    /// Isolate secrets namespaces per workspace. Default: true.
+    #[serde(default = "default_true")]
+    pub isolate_secrets: bool,
+    /// Isolate audit logs per workspace. Default: true.
+    #[serde(default = "default_true")]
+    pub isolate_audit: bool,
+    /// Allow searching across workspaces. Default: false (security).
+    #[serde(default)]
+    pub cross_workspace_search: bool,
+}
+
+fn default_workspaces_dir() -> String {
+    "~/.zeroclaw/workspaces".to_string()
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            active_workspace: None,
+            workspaces_dir: default_workspaces_dir(),
+            isolate_memory: true,
+            isolate_secrets: true,
+            isolate_audit: true,
+            cross_workspace_search: false,
+        }
+    }
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -317,6 +377,44 @@ pub struct DelegateAgentConfig {
     /// Maximum tool-call iterations in agentic mode.
     #[serde(default = "default_max_tool_iterations")]
     pub max_iterations: usize,
+}
+
+// ── Swarms ──────────────────────────────────────────────────────
+
+/// Orchestration strategy for a swarm of agents.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmStrategy {
+    /// Run agents sequentially; each agent's output feeds into the next.
+    Sequential,
+    /// Run agents in parallel; collect all outputs.
+    Parallel,
+    /// Use the LLM to pick the best agent for the task.
+    Router,
+}
+
+/// Configuration for a swarm of coordinated agents.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SwarmConfig {
+    /// Ordered list of agent names (must reference keys in `agents`).
+    pub agents: Vec<String>,
+    /// Orchestration strategy.
+    pub strategy: SwarmStrategy,
+    /// System prompt for router strategy (used to pick the best agent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_prompt: Option<String>,
+    /// Optional description shown to the LLM when choosing swarms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Maximum total timeout for the swarm execution in seconds.
+    #[serde(default = "default_swarm_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+const DEFAULT_SWARM_TIMEOUT_SECS: u64 = 300;
+
+fn default_swarm_timeout_secs() -> u64 {
+    DEFAULT_SWARM_TIMEOUT_SECS
 }
 
 /// Valid temperature range for all paths (config, CLI, env override).
@@ -791,6 +889,11 @@ pub struct AgentConfig {
     /// Maximum conversation history messages retained per session. Default: `50`.
     #[serde(default = "default_agent_max_history_messages")]
     pub max_history_messages: usize,
+    /// Maximum estimated tokens for conversation history before compaction triggers.
+    /// Uses ~4 chars/token heuristic. When this threshold is exceeded, older messages
+    /// are summarized to preserve context while staying within budget. Default: `32000`.
+    #[serde(default = "default_agent_max_context_tokens")]
+    pub max_context_tokens: usize,
     /// Enable parallel tool execution within a single iteration. Default: `false`.
     #[serde(default)]
     pub parallel_tools: bool,
@@ -817,6 +920,10 @@ fn default_agent_max_history_messages() -> usize {
     50
 }
 
+fn default_agent_max_context_tokens() -> usize {
+    32_000
+}
+
 fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
@@ -827,6 +934,7 @@ impl Default for AgentConfig {
             compact_context: false,
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
+            max_context_tokens: default_agent_max_context_tokens(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             tool_call_dedup_exempt: Vec::new(),
@@ -1413,6 +1521,10 @@ pub struct HttpRequestConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_http_timeout_secs")]
     pub timeout_secs: u64,
+    /// Allow requests to private/LAN hosts (RFC 1918, loopback, link-local, .local).
+    /// Default: false (deny private hosts for SSRF protection).
+    #[serde(default)]
+    pub allow_private_hosts: bool,
 }
 
 impl Default for HttpRequestConfig {
@@ -1422,6 +1534,7 @@ impl Default for HttpRequestConfig {
             allowed_domains: vec![],
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
+            allow_private_hosts: false,
         }
     }
 }
@@ -2960,10 +3073,10 @@ impl Default for CronConfig {
 
 /// Tunnel configuration for exposing the gateway publicly (`[tunnel]` section).
 ///
-/// Supported providers: `"none"` (default), `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"custom"`.
+/// Supported providers: `"none"` (default), `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"openvpn"`, `"custom"`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TunnelConfig {
-    /// Tunnel provider: `"none"`, `"cloudflare"`, `"tailscale"`, `"ngrok"`, or `"custom"`. Default: `"none"`.
+    /// Tunnel provider: `"none"`, `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"openvpn"`, or `"custom"`. Default: `"none"`.
     pub provider: String,
 
     /// Cloudflare Tunnel configuration (used when `provider = "cloudflare"`).
@@ -2978,6 +3091,10 @@ pub struct TunnelConfig {
     #[serde(default)]
     pub ngrok: Option<NgrokTunnelConfig>,
 
+    /// OpenVPN tunnel configuration (used when `provider = "openvpn"`).
+    #[serde(default)]
+    pub openvpn: Option<OpenVpnTunnelConfig>,
+
     /// Custom tunnel command configuration (used when `provider = "custom"`).
     #[serde(default)]
     pub custom: Option<CustomTunnelConfig>,
@@ -2990,6 +3107,7 @@ impl Default for TunnelConfig {
             cloudflare: None,
             tailscale: None,
             ngrok: None,
+            openvpn: None,
             custom: None,
         }
     }
@@ -3016,6 +3134,36 @@ pub struct NgrokTunnelConfig {
     pub auth_token: String,
     /// Optional custom domain
     pub domain: Option<String>,
+}
+
+/// OpenVPN tunnel configuration (`[tunnel.openvpn]`).
+///
+/// Required when `tunnel.provider = "openvpn"`. Omitting this section entirely
+/// preserves previous behavior. Setting `tunnel.provider = "none"` (or removing
+/// the `[tunnel.openvpn]` block) cleanly reverts to no-tunnel mode.
+///
+/// Defaults: `connect_timeout_secs = 30`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OpenVpnTunnelConfig {
+    /// Path to `.ovpn` configuration file (must not be empty).
+    pub config_file: String,
+    /// Optional path to auth credentials file (`--auth-user-pass`).
+    #[serde(default)]
+    pub auth_file: Option<String>,
+    /// Advertised address once VPN is connected (e.g., `"10.8.0.2:42617"`).
+    /// When omitted the tunnel falls back to `http://{local_host}:{local_port}`.
+    #[serde(default)]
+    pub advertise_address: Option<String>,
+    /// Connection timeout in seconds (default: 30, must be > 0).
+    #[serde(default = "default_openvpn_timeout")]
+    pub connect_timeout_secs: u64,
+    /// Extra openvpn CLI arguments forwarded verbatim.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+}
+
+fn default_openvpn_timeout() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3052,6 +3200,7 @@ impl<T: ChannelConfig> crate::config::traits::ConfigHandle for ConfigWrapper<T> 
 ///
 /// Each channel sub-section (e.g. `telegram`, `discord`) is optional;
 /// setting it to `Some(...)` enables that channel.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ChannelsConfig {
     /// Enable the CLI interactive channel. Default: `true`.
@@ -3114,6 +3263,10 @@ pub struct ChannelsConfig {
     /// not forwarded as individual channel messages. Default: `true`.
     #[serde(default = "default_true")]
     pub show_tool_calls: bool,
+    /// Persist channel conversation history to JSONL files so sessions survive
+    /// daemon restarts. Files are stored in `{workspace}/sessions/`. Default: `true`.
+    #[serde(default = "default_true")]
+    pub session_persistence: bool,
 }
 
 impl ChannelsConfig {
@@ -3248,6 +3401,7 @@ impl Default for ChannelsConfig {
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
             show_tool_calls: true,
+            session_persistence: true,
         }
     }
 }
@@ -3791,6 +3945,10 @@ pub struct SecurityConfig {
     /// Emergency-stop state machine configuration.
     #[serde(default)]
     pub estop: EstopConfig,
+
+    /// Nevis IAM integration for SSO/MFA authentication and role-based access.
+    #[serde(default)]
+    pub nevis: NevisConfig,
 }
 
 /// OTP validation strategy.
@@ -3900,6 +4058,163 @@ impl Default for EstopConfig {
             require_otp_to_resume: true,
         }
     }
+}
+
+/// Nevis IAM integration configuration.
+///
+/// When `enabled` is true, ZeroClaw validates incoming requests against a Nevis
+/// Security Suite instance and maps Nevis roles to tool/workspace permissions.
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NevisConfig {
+    /// Enable Nevis IAM integration. Defaults to false for backward compatibility.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Base URL of the Nevis instance (e.g. `https://nevis.example.com`).
+    #[serde(default)]
+    pub instance_url: String,
+
+    /// Nevis realm to authenticate against.
+    #[serde(default = "default_nevis_realm")]
+    pub realm: String,
+
+    /// OAuth2 client ID registered in Nevis.
+    #[serde(default)]
+    pub client_id: String,
+
+    /// OAuth2 client secret. Encrypted via SecretStore when stored on disk.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+
+    /// Token validation strategy: `"local"` (JWKS) or `"remote"` (introspection).
+    #[serde(default = "default_nevis_token_validation")]
+    pub token_validation: String,
+
+    /// JWKS endpoint URL for local token validation.
+    #[serde(default)]
+    pub jwks_url: Option<String>,
+
+    /// Nevis role to ZeroClaw permission mappings.
+    #[serde(default)]
+    pub role_mapping: Vec<NevisRoleMappingConfig>,
+
+    /// Require MFA verification for all Nevis-authenticated requests.
+    #[serde(default)]
+    pub require_mfa: bool,
+
+    /// Session timeout in seconds.
+    #[serde(default = "default_nevis_session_timeout_secs")]
+    pub session_timeout_secs: u64,
+}
+
+impl std::fmt::Debug for NevisConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NevisConfig")
+            .field("enabled", &self.enabled)
+            .field("instance_url", &self.instance_url)
+            .field("realm", &self.realm)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("token_validation", &self.token_validation)
+            .field("jwks_url", &self.jwks_url)
+            .field("role_mapping", &self.role_mapping)
+            .field("require_mfa", &self.require_mfa)
+            .field("session_timeout_secs", &self.session_timeout_secs)
+            .finish()
+    }
+}
+
+impl NevisConfig {
+    /// Validate that required fields are present when Nevis is enabled.
+    ///
+    /// Call at config load time to fail fast on invalid configuration rather
+    /// than deferring errors to the first authentication request.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        if self.instance_url.trim().is_empty() {
+            return Err("nevis.instance_url is required when Nevis IAM is enabled".into());
+        }
+
+        if self.client_id.trim().is_empty() {
+            return Err("nevis.client_id is required when Nevis IAM is enabled".into());
+        }
+
+        if self.realm.trim().is_empty() {
+            return Err("nevis.realm is required when Nevis IAM is enabled".into());
+        }
+
+        match self.token_validation.as_str() {
+            "local" | "remote" => {}
+            other => {
+                return Err(format!(
+                    "nevis.token_validation has invalid value '{other}': \
+                     expected 'local' or 'remote'"
+                ));
+            }
+        }
+
+        if self.token_validation == "local" && self.jwks_url.is_none() {
+            return Err("nevis.jwks_url is required when token_validation is 'local'".into());
+        }
+
+        if self.session_timeout_secs == 0 {
+            return Err("nevis.session_timeout_secs must be greater than 0".into());
+        }
+
+        Ok(())
+    }
+}
+
+fn default_nevis_realm() -> String {
+    "master".into()
+}
+
+fn default_nevis_token_validation() -> String {
+    "local".into()
+}
+
+fn default_nevis_session_timeout_secs() -> u64 {
+    3600
+}
+
+impl Default for NevisConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            instance_url: String::new(),
+            realm: default_nevis_realm(),
+            client_id: String::new(),
+            client_secret: None,
+            token_validation: default_nevis_token_validation(),
+            jwks_url: None,
+            role_mapping: Vec::new(),
+            require_mfa: false,
+            session_timeout_secs: default_nevis_session_timeout_secs(),
+        }
+    }
+}
+
+/// Maps a Nevis role to ZeroClaw tool permissions and workspace access.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NevisRoleMappingConfig {
+    /// Nevis role name (case-insensitive).
+    pub nevis_role: String,
+
+    /// Tool names this role can access. Use `"all"` for unrestricted tool access.
+    #[serde(default)]
+    pub zeroclaw_permissions: Vec<String>,
+
+    /// Workspace names this role can access. Use `"all"` for unrestricted.
+    #[serde(default)]
+    pub workspace_access: Vec<String>,
 }
 
 /// Sandbox configuration for OS-level isolation
@@ -4132,6 +4447,70 @@ pub fn default_nostr_relays() -> Vec<String> {
     ]
 }
 
+// -- Notion --
+
+/// Notion integration configuration (`[notion]`).
+///
+/// When `enabled = true`, the agent polls a Notion database for pending tasks
+/// and exposes a `notion` tool for querying, reading, creating, and updating pages.
+/// Requires `api_key` (or the `NOTION_API_KEY` env var) and `database_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NotionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub database_id: String,
+    #[serde(default = "default_notion_poll_interval")]
+    pub poll_interval_secs: u64,
+    #[serde(default = "default_notion_status_prop")]
+    pub status_property: String,
+    #[serde(default = "default_notion_input_prop")]
+    pub input_property: String,
+    #[serde(default = "default_notion_result_prop")]
+    pub result_property: String,
+    #[serde(default = "default_notion_max_concurrent")]
+    pub max_concurrent: usize,
+    #[serde(default = "default_notion_recover_stale")]
+    pub recover_stale: bool,
+}
+
+fn default_notion_poll_interval() -> u64 {
+    5
+}
+fn default_notion_status_prop() -> String {
+    "Status".into()
+}
+fn default_notion_input_prop() -> String {
+    "Input".into()
+}
+fn default_notion_result_prop() -> String {
+    "Result".into()
+}
+fn default_notion_max_concurrent() -> usize {
+    4
+}
+fn default_notion_recover_stale() -> bool {
+    true
+}
+
+impl Default for NotionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: String::new(),
+            database_id: String::new(),
+            poll_interval_secs: default_notion_poll_interval(),
+            status_property: default_notion_status_prop(),
+            input_property: default_notion_input_prop(),
+            result_property: default_notion_result_prop(),
+            max_concurrent: default_notion_max_concurrent(),
+            recover_stale: default_notion_recover_stale(),
+        }
+    }
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -4181,6 +4560,7 @@ impl Default for Config {
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            swarms: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
@@ -4188,6 +4568,8 @@ impl Default for Config {
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            workspace: WorkspaceConfig::default(),
+            notion: NotionConfig::default(),
         }
     }
 }
@@ -4920,6 +5302,18 @@ impl Config {
                 decrypt_secret(&store, token, "config.gateway.paired_tokens[]")?;
             }
 
+            // Decrypt Nevis IAM secret
+            decrypt_optional_secret(
+                &store,
+                &mut config.security.nevis.client_secret,
+                "config.security.nevis.client_secret",
+            )?;
+
+            // Notion API key (top-level, not in ChannelsConfig)
+            if !config.notion.api_key.is_empty() {
+                decrypt_secret(&store, &mut config.notion.api_key, "config.notion.api_key")?;
+            }
+
             config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
@@ -5055,6 +5449,20 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
+        // Tunnel — OpenVPN
+        if self.tunnel.provider.trim() == "openvpn" {
+            let openvpn = self.tunnel.openvpn.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("tunnel.provider='openvpn' requires [tunnel.openvpn]")
+            })?;
+
+            if openvpn.config_file.trim().is_empty() {
+                anyhow::bail!("tunnel.openvpn.config_file must not be empty");
+            }
+            if openvpn.connect_timeout_secs == 0 {
+                anyhow::bail!("tunnel.openvpn.connect_timeout_secs must be greater than 0");
+            }
+        }
+
         // Gateway
         if self.gateway.host.trim().is_empty() {
             anyhow::bail!("gateway.host must not be empty");
@@ -5219,9 +5627,31 @@ impl Config {
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
 
-        // MCP servers
-        if self.mcp.enabled {
-            validate_mcp_config(&self.mcp)?;
+        // Notion
+        if self.notion.enabled {
+            if self.notion.database_id.trim().is_empty() {
+                anyhow::bail!("notion.database_id must not be empty when notion.enabled = true");
+            }
+            if self.notion.poll_interval_secs == 0 {
+                anyhow::bail!("notion.poll_interval_secs must be greater than 0");
+            }
+            if self.notion.max_concurrent == 0 {
+                anyhow::bail!("notion.max_concurrent must be greater than 0");
+            }
+            if self.notion.status_property.trim().is_empty() {
+                anyhow::bail!("notion.status_property must not be empty");
+            }
+            if self.notion.input_property.trim().is_empty() {
+                anyhow::bail!("notion.input_property must not be empty");
+            }
+            if self.notion.result_property.trim().is_empty() {
+                anyhow::bail!("notion.result_property must not be empty");
+            }
+        }
+
+        // Nevis IAM — delegate to NevisConfig::validate() for field-level checks
+        if let Err(msg) = self.security.nevis.validate() {
+            anyhow::bail!("security.nevis: {msg}");
         }
 
         Ok(())
@@ -5847,6 +6277,22 @@ impl Config {
             encrypt_secret(&store, token, "config.gateway.paired_tokens[]")?;
         }
 
+        // Encrypt Nevis IAM secret
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.security.nevis.client_secret,
+            "config.security.nevis.client_secret",
+        )?;
+
+        // Notion API key (top-level, not in ChannelsConfig)
+        if !config_to_save.notion.api_key.is_empty() {
+            encrypt_secret(
+                &store,
+                &mut config_to_save.notion.api_key,
+                "config.notion.api_key",
+            )?;
+        }
+
         let toml_str =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
 
@@ -5934,6 +6380,7 @@ impl Config {
     }
 }
 
+#[allow(clippy::unused_async)] // async needed on unix for tokio File I/O; no-op on other platforms
 async fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -5959,6 +6406,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    #[cfg(unix)]
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
@@ -6269,6 +6717,7 @@ default_temperature = 0.7
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
+                session_persistence: true,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -6287,12 +6736,15 @@ default_temperature = 0.7
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            swarms: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            workspace: WorkspaceConfig::default(),
+            notion: NotionConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -6578,12 +7030,15 @@ tool_dispatcher = "xml"
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            swarms: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
+            workspace: WorkspaceConfig::default(),
+            notion: NotionConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -6983,6 +7438,7 @@ allowed_users = ["@ops:matrix.org"]
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
+            session_persistence: true,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -7210,6 +7666,7 @@ channel_id = "C123"
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
+            session_persistence: true,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -9327,5 +9784,256 @@ require_otp_to_resume = true
                 serde_json::from_str(expected_json).expect("deserialize");
             assert_eq!(&deserialized, variant);
         }
+    }
+
+    #[test]
+    async fn swarm_strategy_roundtrip() {
+        let cases = vec![
+            (SwarmStrategy::Sequential, "\"sequential\""),
+            (SwarmStrategy::Parallel, "\"parallel\""),
+            (SwarmStrategy::Router, "\"router\""),
+        ];
+        for (variant, expected_json) in &cases {
+            let serialized = serde_json::to_string(variant).expect("serialize");
+            assert_eq!(&serialized, expected_json, "variant: {variant:?}");
+            let deserialized: SwarmStrategy =
+                serde_json::from_str(expected_json).expect("deserialize");
+            assert_eq!(&deserialized, variant);
+        }
+    }
+
+    #[test]
+    async fn swarm_config_deserializes_with_defaults() {
+        let toml_str = r#"
+            agents = ["researcher", "writer"]
+            strategy = "sequential"
+        "#;
+        let config: SwarmConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(config.agents, vec!["researcher", "writer"]);
+        assert_eq!(config.strategy, SwarmStrategy::Sequential);
+        assert!(config.router_prompt.is_none());
+        assert!(config.description.is_none());
+        assert_eq!(config.timeout_secs, 300);
+    }
+
+    #[test]
+    async fn swarm_config_deserializes_full() {
+        let toml_str = r#"
+            agents = ["a", "b", "c"]
+            strategy = "router"
+            router_prompt = "Pick the best."
+            description = "Multi-agent router"
+            timeout_secs = 120
+        "#;
+        let config: SwarmConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(config.agents.len(), 3);
+        assert_eq!(config.strategy, SwarmStrategy::Router);
+        assert_eq!(config.router_prompt.as_deref(), Some("Pick the best."));
+        assert_eq!(config.description.as_deref(), Some("Multi-agent router"));
+        assert_eq!(config.timeout_secs, 120);
+    }
+
+    #[test]
+    async fn config_with_swarms_section_deserializes() {
+        let toml_str = r#"
+            [agents.researcher]
+            provider = "ollama"
+            model = "llama3"
+
+            [agents.writer]
+            provider = "openrouter"
+            model = "claude-sonnet"
+
+            [swarms.pipeline]
+            agents = ["researcher", "writer"]
+            strategy = "sequential"
+        "#;
+        let config: Config = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(config.agents.len(), 2);
+        assert_eq!(config.swarms.len(), 1);
+        assert!(config.swarms.contains_key("pipeline"));
+    }
+
+    #[tokio::test]
+    async fn nevis_client_secret_encrypt_decrypt_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_nevis_secret_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let plaintext_secret = "nevis-test-client-secret-value";
+
+        let mut config = Config::default();
+        config.workspace_dir = dir.join("workspace");
+        config.config_path = dir.join("config.toml");
+        config.security.nevis.client_secret = Some(plaintext_secret.into());
+
+        // Save (triggers encryption)
+        config.save().await.unwrap();
+
+        // Read raw TOML and verify plaintext secret is NOT present
+        let raw_toml = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        assert!(
+            !raw_toml.contains(plaintext_secret),
+            "Saved TOML must not contain the plaintext client_secret"
+        );
+
+        // Parse stored TOML and verify the value is encrypted
+        let stored: Config = toml::from_str(&raw_toml).unwrap();
+        let stored_secret = stored.security.nevis.client_secret.as_ref().unwrap();
+        assert!(
+            crate::security::SecretStore::is_encrypted(stored_secret),
+            "Stored client_secret must be marked as encrypted"
+        );
+
+        // Decrypt and verify it matches the original plaintext
+        let store = crate::security::SecretStore::new(&dir, true);
+        assert_eq!(store.decrypt(stored_secret).unwrap(), plaintext_secret);
+
+        // Simulate a full load: deserialize then decrypt (mirrors load_or_init logic)
+        let mut loaded: Config = toml::from_str(&raw_toml).unwrap();
+        loaded.config_path = dir.join("config.toml");
+        let load_store = crate::security::SecretStore::new(&dir, loaded.secrets.encrypt);
+        decrypt_optional_secret(
+            &load_store,
+            &mut loaded.security.nevis.client_secret,
+            "config.security.nevis.client_secret",
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.security.nevis.client_secret.as_deref().unwrap(),
+            plaintext_secret,
+            "Loaded client_secret must match the original plaintext after decryption"
+        );
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Nevis config validation tests
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    async fn nevis_config_validate_disabled_accepts_empty_fields() {
+        let cfg = NevisConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    async fn nevis_config_validate_rejects_empty_instance_url() {
+        let cfg = NevisConfig {
+            enabled: true,
+            instance_url: String::new(),
+            client_id: "test-client".into(),
+            ..NevisConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("instance_url"));
+    }
+
+    #[test]
+    async fn nevis_config_validate_rejects_empty_client_id() {
+        let cfg = NevisConfig {
+            enabled: true,
+            instance_url: "https://nevis.example.com".into(),
+            client_id: String::new(),
+            ..NevisConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("client_id"));
+    }
+
+    #[test]
+    async fn nevis_config_validate_rejects_empty_realm() {
+        let cfg = NevisConfig {
+            enabled: true,
+            instance_url: "https://nevis.example.com".into(),
+            client_id: "test-client".into(),
+            realm: String::new(),
+            ..NevisConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("realm"));
+    }
+
+    #[test]
+    async fn nevis_config_validate_rejects_local_without_jwks() {
+        let cfg = NevisConfig {
+            enabled: true,
+            instance_url: "https://nevis.example.com".into(),
+            client_id: "test-client".into(),
+            token_validation: "local".into(),
+            jwks_url: None,
+            ..NevisConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("jwks_url"));
+    }
+
+    #[test]
+    async fn nevis_config_validate_rejects_zero_session_timeout() {
+        let cfg = NevisConfig {
+            enabled: true,
+            instance_url: "https://nevis.example.com".into(),
+            client_id: "test-client".into(),
+            token_validation: "remote".into(),
+            session_timeout_secs: 0,
+            ..NevisConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("session_timeout_secs"));
+    }
+
+    #[test]
+    async fn nevis_config_validate_accepts_valid_enabled_config() {
+        let cfg = NevisConfig {
+            enabled: true,
+            instance_url: "https://nevis.example.com".into(),
+            realm: "master".into(),
+            client_id: "test-client".into(),
+            token_validation: "remote".into(),
+            session_timeout_secs: 3600,
+            ..NevisConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    async fn nevis_config_validate_rejects_invalid_token_validation() {
+        let cfg = NevisConfig {
+            enabled: true,
+            instance_url: "https://nevis.example.com".into(),
+            realm: "master".into(),
+            client_id: "test-client".into(),
+            token_validation: "invalid_mode".into(),
+            session_timeout_secs: 3600,
+            ..NevisConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("invalid value 'invalid_mode'"),
+            "Expected invalid token_validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn nevis_config_debug_redacts_client_secret() {
+        let cfg = NevisConfig {
+            client_secret: Some("super-secret".into()),
+            ..NevisConfig::default()
+        };
+        let debug_output = format!("{:?}", cfg);
+        assert!(
+            !debug_output.contains("super-secret"),
+            "Debug output must not contain the raw client_secret"
+        );
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug output must show [REDACTED] for client_secret"
+        );
     }
 }
