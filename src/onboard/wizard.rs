@@ -159,6 +159,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         tunnel: tunnel_config,
         gateway: crate::config::GatewayConfig::default(),
         composio: composio_config,
+        microsoft365: crate::config::Microsoft365Config::default(),
         secrets: secrets_config,
         browser: BrowserConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
@@ -180,6 +181,8 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         mcp: crate::config::McpConfig::default(),
         nodes: crate::config::NodesConfig::default(),
         workspace: crate::config::WorkspaceConfig::default(),
+        notion: crate::config::NotionConfig::default(),
+        node_transport: crate::config::NodeTransportConfig::default(),
     };
 
     println!(
@@ -519,6 +522,7 @@ async fn run_quick_setup_with_home(
         tunnel: crate::config::TunnelConfig::default(),
         gateway: crate::config::GatewayConfig::default(),
         composio: ComposioConfig::default(),
+        microsoft365: crate::config::Microsoft365Config::default(),
         secrets: SecretsConfig::default(),
         browser: BrowserConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
@@ -540,6 +544,8 @@ async fn run_quick_setup_with_home(
         mcp: crate::config::McpConfig::default(),
         nodes: crate::config::NodesConfig::default(),
         workspace: crate::config::WorkspaceConfig::default(),
+        notion: crate::config::NotionConfig::default(),
+        node_transport: crate::config::NodeTransportConfig::default(),
     };
 
     config.save().await?;

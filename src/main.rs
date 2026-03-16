@@ -844,7 +844,7 @@ async fn main() -> Result<()> {
 
         // Auto-start channels if user said yes during wizard
         if std::env::var("ZEROCLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
-            channels::start_channels(config).await?;
+            Box::pin(channels::start_channels(config)).await?;
         }
         return Ok(());
     }
@@ -880,7 +880,7 @@ async fn main() -> Result<()> {
         } => {
             let final_temperature = temperature.unwrap_or(config.default_temperature);
 
-            agent::run(
+            Box::pin(agent::run(
                 config,
                 message,
                 provider,
@@ -890,7 +890,7 @@ async fn main() -> Result<()> {
                 true,
                 session_state_file,
                 None,
-            )
+            ))
             .await
             .map(|_| ())
         }
@@ -1189,8 +1189,8 @@ async fn main() -> Result<()> {
         },
 
         Commands::Channel { channel_command } => match channel_command {
-            ChannelCommands::Start => channels::start_channels(config).await,
-            ChannelCommands::Doctor => channels::doctor_channels(config).await,
+            ChannelCommands::Start => Box::pin(channels::start_channels(config)).await,
+            ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => channels::handle_command(other, &config).await,
         },
 

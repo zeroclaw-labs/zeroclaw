@@ -188,6 +188,10 @@ pub struct Config {
     #[serde(default)]
     pub composio: ComposioConfig,
 
+    /// Microsoft 365 Graph API integration (`[microsoft365]`).
+    #[serde(default)]
+    pub microsoft365: Microsoft365Config,
+
     /// Secrets encryption configuration (`[secrets]`).
     #[serde(default)]
     pub secrets: SecretsConfig,
@@ -267,6 +271,14 @@ pub struct Config {
     /// Multi-client workspace isolation configuration (`[workspace]`).
     #[serde(default)]
     pub workspace: WorkspaceConfig,
+
+    /// Notion integration configuration (`[notion]`).
+    #[serde(default)]
+    pub notion: NotionConfig,
+
+    /// Secure inter-node transport configuration (`[node_transport]`).
+    #[serde(default)]
+    pub node_transport: NodeTransportConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -1348,6 +1360,67 @@ impl Default for GatewayConfig {
     }
 }
 
+/// Secure transport configuration for inter-node communication (`[node_transport]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NodeTransportConfig {
+    /// Enable the secure transport layer.
+    #[serde(default = "default_node_transport_enabled")]
+    pub enabled: bool,
+    /// Shared secret for HMAC authentication between nodes.
+    #[serde(default)]
+    pub shared_secret: String,
+    /// Maximum age of signed requests in seconds (replay protection).
+    #[serde(default = "default_max_request_age")]
+    pub max_request_age_secs: i64,
+    /// Require HTTPS for all node communication.
+    #[serde(default = "default_require_https")]
+    pub require_https: bool,
+    /// Allow specific node IPs/CIDRs.
+    #[serde(default)]
+    pub allowed_peers: Vec<String>,
+    /// Path to TLS certificate file.
+    #[serde(default)]
+    pub tls_cert_path: Option<String>,
+    /// Path to TLS private key file.
+    #[serde(default)]
+    pub tls_key_path: Option<String>,
+    /// Require client certificates (mutual TLS).
+    #[serde(default)]
+    pub mutual_tls: bool,
+    /// Maximum number of connections per peer.
+    #[serde(default = "default_connection_pool_size")]
+    pub connection_pool_size: usize,
+}
+
+fn default_node_transport_enabled() -> bool {
+    true
+}
+fn default_max_request_age() -> i64 {
+    300
+}
+fn default_require_https() -> bool {
+    true
+}
+fn default_connection_pool_size() -> usize {
+    4
+}
+
+impl Default for NodeTransportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_node_transport_enabled(),
+            shared_secret: String::new(),
+            max_request_age_secs: default_max_request_age(),
+            require_https: default_require_https(),
+            allowed_peers: Vec::new(),
+            tls_cert_path: None,
+            tls_key_path: None,
+            mutual_tls: false,
+            connection_pool_size: default_connection_pool_size(),
+        }
+    }
+}
+
 // ── Composio (managed tool surface) ─────────────────────────────
 
 /// Composio managed OAuth tools integration (`[composio]` section).
@@ -1376,6 +1449,78 @@ impl Default for ComposioConfig {
             enabled: false,
             api_key: None,
             entity_id: default_entity_id(),
+        }
+    }
+}
+
+// ── Microsoft 365 (Graph API integration) ───────────────────────
+
+/// Microsoft 365 integration via Microsoft Graph API (`[microsoft365]` section).
+///
+/// Provides access to Outlook mail, Teams messages, Calendar events,
+/// OneDrive files, and SharePoint search.
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Microsoft365Config {
+    /// Enable Microsoft 365 integration
+    #[serde(default, alias = "enable")]
+    pub enabled: bool,
+    /// Azure AD tenant ID
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    /// Azure AD application (client) ID
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Azure AD client secret (stored encrypted when secrets.encrypt = true)
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// Authentication flow: "client_credentials" or "device_code"
+    #[serde(default = "default_ms365_auth_flow")]
+    pub auth_flow: String,
+    /// OAuth scopes to request
+    #[serde(default = "default_ms365_scopes")]
+    pub scopes: Vec<String>,
+    /// Encrypt the token cache file on disk
+    #[serde(default = "default_true")]
+    pub token_cache_encrypted: bool,
+    /// User principal name or "me" (for delegated flows)
+    #[serde(default)]
+    pub user_id: Option<String>,
+}
+
+fn default_ms365_auth_flow() -> String {
+    "client_credentials".to_string()
+}
+
+fn default_ms365_scopes() -> Vec<String> {
+    vec!["https://graph.microsoft.com/.default".to_string()]
+}
+
+impl std::fmt::Debug for Microsoft365Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Microsoft365Config")
+            .field("enabled", &self.enabled)
+            .field("tenant_id", &self.tenant_id)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &self.client_secret.as_ref().map(|_| "***"))
+            .field("auth_flow", &self.auth_flow)
+            .field("scopes", &self.scopes)
+            .field("token_cache_encrypted", &self.token_cache_encrypted)
+            .field("user_id", &self.user_id)
+            .finish()
+    }
+}
+
+impl Default for Microsoft365Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tenant_id: None,
+            client_id: None,
+            client_secret: None,
+            auth_flow: default_ms365_auth_flow(),
+            scopes: default_ms365_scopes(),
+            token_cache_encrypted: true,
+            user_id: None,
         }
     }
 }
@@ -3131,10 +3276,10 @@ impl Default for CronConfig {
 
 /// Tunnel configuration for exposing the gateway publicly (`[tunnel]` section).
 ///
-/// Supported providers: `"none"` (default), `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"custom"`.
+/// Supported providers: `"none"` (default), `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"openvpn"`, `"custom"`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TunnelConfig {
-    /// Tunnel provider: `"none"`, `"cloudflare"`, `"tailscale"`, `"ngrok"`, or `"custom"`. Default: `"none"`.
+    /// Tunnel provider: `"none"`, `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"openvpn"`, or `"custom"`. Default: `"none"`.
     pub provider: String,
 
     /// Cloudflare Tunnel configuration (used when `provider = "cloudflare"`).
@@ -3149,6 +3294,10 @@ pub struct TunnelConfig {
     #[serde(default)]
     pub ngrok: Option<NgrokTunnelConfig>,
 
+    /// OpenVPN tunnel configuration (used when `provider = "openvpn"`).
+    #[serde(default)]
+    pub openvpn: Option<OpenVpnTunnelConfig>,
+
     /// Custom tunnel command configuration (used when `provider = "custom"`).
     #[serde(default)]
     pub custom: Option<CustomTunnelConfig>,
@@ -3161,6 +3310,7 @@ impl Default for TunnelConfig {
             cloudflare: None,
             tailscale: None,
             ngrok: None,
+            openvpn: None,
             custom: None,
         }
     }
@@ -3187,6 +3337,36 @@ pub struct NgrokTunnelConfig {
     pub auth_token: String,
     /// Optional custom domain
     pub domain: Option<String>,
+}
+
+/// OpenVPN tunnel configuration (`[tunnel.openvpn]`).
+///
+/// Required when `tunnel.provider = "openvpn"`. Omitting this section entirely
+/// preserves previous behavior. Setting `tunnel.provider = "none"` (or removing
+/// the `[tunnel.openvpn]` block) cleanly reverts to no-tunnel mode.
+///
+/// Defaults: `connect_timeout_secs = 30`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OpenVpnTunnelConfig {
+    /// Path to `.ovpn` configuration file (must not be empty).
+    pub config_file: String,
+    /// Optional path to auth credentials file (`--auth-user-pass`).
+    #[serde(default)]
+    pub auth_file: Option<String>,
+    /// Advertised address once VPN is connected (e.g., `"10.8.0.2:42617"`).
+    /// When omitted the tunnel falls back to `http://{local_host}:{local_port}`.
+    #[serde(default)]
+    pub advertise_address: Option<String>,
+    /// Connection timeout in seconds (default: 30, must be > 0).
+    #[serde(default = "default_openvpn_timeout")]
+    pub connect_timeout_secs: u64,
+    /// Extra openvpn CLI arguments forwarded verbatim.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+}
+
+fn default_openvpn_timeout() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3968,6 +4148,10 @@ pub struct SecurityConfig {
     /// Emergency-stop state machine configuration.
     #[serde(default)]
     pub estop: EstopConfig,
+
+    /// Nevis IAM integration for SSO/MFA authentication and role-based access.
+    #[serde(default)]
+    pub nevis: NevisConfig,
 }
 
 /// OTP validation strategy.
@@ -4077,6 +4261,163 @@ impl Default for EstopConfig {
             require_otp_to_resume: true,
         }
     }
+}
+
+/// Nevis IAM integration configuration.
+///
+/// When `enabled` is true, ZeroClaw validates incoming requests against a Nevis
+/// Security Suite instance and maps Nevis roles to tool/workspace permissions.
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NevisConfig {
+    /// Enable Nevis IAM integration. Defaults to false for backward compatibility.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Base URL of the Nevis instance (e.g. `https://nevis.example.com`).
+    #[serde(default)]
+    pub instance_url: String,
+
+    /// Nevis realm to authenticate against.
+    #[serde(default = "default_nevis_realm")]
+    pub realm: String,
+
+    /// OAuth2 client ID registered in Nevis.
+    #[serde(default)]
+    pub client_id: String,
+
+    /// OAuth2 client secret. Encrypted via SecretStore when stored on disk.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+
+    /// Token validation strategy: `"local"` (JWKS) or `"remote"` (introspection).
+    #[serde(default = "default_nevis_token_validation")]
+    pub token_validation: String,
+
+    /// JWKS endpoint URL for local token validation.
+    #[serde(default)]
+    pub jwks_url: Option<String>,
+
+    /// Nevis role to ZeroClaw permission mappings.
+    #[serde(default)]
+    pub role_mapping: Vec<NevisRoleMappingConfig>,
+
+    /// Require MFA verification for all Nevis-authenticated requests.
+    #[serde(default)]
+    pub require_mfa: bool,
+
+    /// Session timeout in seconds.
+    #[serde(default = "default_nevis_session_timeout_secs")]
+    pub session_timeout_secs: u64,
+}
+
+impl std::fmt::Debug for NevisConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NevisConfig")
+            .field("enabled", &self.enabled)
+            .field("instance_url", &self.instance_url)
+            .field("realm", &self.realm)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("token_validation", &self.token_validation)
+            .field("jwks_url", &self.jwks_url)
+            .field("role_mapping", &self.role_mapping)
+            .field("require_mfa", &self.require_mfa)
+            .field("session_timeout_secs", &self.session_timeout_secs)
+            .finish()
+    }
+}
+
+impl NevisConfig {
+    /// Validate that required fields are present when Nevis is enabled.
+    ///
+    /// Call at config load time to fail fast on invalid configuration rather
+    /// than deferring errors to the first authentication request.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        if self.instance_url.trim().is_empty() {
+            return Err("nevis.instance_url is required when Nevis IAM is enabled".into());
+        }
+
+        if self.client_id.trim().is_empty() {
+            return Err("nevis.client_id is required when Nevis IAM is enabled".into());
+        }
+
+        if self.realm.trim().is_empty() {
+            return Err("nevis.realm is required when Nevis IAM is enabled".into());
+        }
+
+        match self.token_validation.as_str() {
+            "local" | "remote" => {}
+            other => {
+                return Err(format!(
+                    "nevis.token_validation has invalid value '{other}': \
+                     expected 'local' or 'remote'"
+                ));
+            }
+        }
+
+        if self.token_validation == "local" && self.jwks_url.is_none() {
+            return Err("nevis.jwks_url is required when token_validation is 'local'".into());
+        }
+
+        if self.session_timeout_secs == 0 {
+            return Err("nevis.session_timeout_secs must be greater than 0".into());
+        }
+
+        Ok(())
+    }
+}
+
+fn default_nevis_realm() -> String {
+    "master".into()
+}
+
+fn default_nevis_token_validation() -> String {
+    "local".into()
+}
+
+fn default_nevis_session_timeout_secs() -> u64 {
+    3600
+}
+
+impl Default for NevisConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            instance_url: String::new(),
+            realm: default_nevis_realm(),
+            client_id: String::new(),
+            client_secret: None,
+            token_validation: default_nevis_token_validation(),
+            jwks_url: None,
+            role_mapping: Vec::new(),
+            require_mfa: false,
+            session_timeout_secs: default_nevis_session_timeout_secs(),
+        }
+    }
+}
+
+/// Maps a Nevis role to ZeroClaw tool permissions and workspace access.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NevisRoleMappingConfig {
+    /// Nevis role name (case-insensitive).
+    pub nevis_role: String,
+
+    /// Tool names this role can access. Use `"all"` for unrestricted tool access.
+    #[serde(default)]
+    pub zeroclaw_permissions: Vec<String>,
+
+    /// Workspace names this role can access. Use `"all"` for unrestricted.
+    #[serde(default)]
+    pub workspace_access: Vec<String>,
 }
 
 /// Sandbox configuration for OS-level isolation
@@ -4309,6 +4650,70 @@ pub fn default_nostr_relays() -> Vec<String> {
     ]
 }
 
+// -- Notion --
+
+/// Notion integration configuration (`[notion]`).
+///
+/// When `enabled = true`, the agent polls a Notion database for pending tasks
+/// and exposes a `notion` tool for querying, reading, creating, and updating pages.
+/// Requires `api_key` (or the `NOTION_API_KEY` env var) and `database_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NotionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub database_id: String,
+    #[serde(default = "default_notion_poll_interval")]
+    pub poll_interval_secs: u64,
+    #[serde(default = "default_notion_status_prop")]
+    pub status_property: String,
+    #[serde(default = "default_notion_input_prop")]
+    pub input_property: String,
+    #[serde(default = "default_notion_result_prop")]
+    pub result_property: String,
+    #[serde(default = "default_notion_max_concurrent")]
+    pub max_concurrent: usize,
+    #[serde(default = "default_notion_recover_stale")]
+    pub recover_stale: bool,
+}
+
+fn default_notion_poll_interval() -> u64 {
+    5
+}
+fn default_notion_status_prop() -> String {
+    "Status".into()
+}
+fn default_notion_input_prop() -> String {
+    "Input".into()
+}
+fn default_notion_result_prop() -> String {
+    "Result".into()
+}
+fn default_notion_max_concurrent() -> usize {
+    4
+}
+fn default_notion_recover_stale() -> bool {
+    true
+}
+
+impl Default for NotionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: String::new(),
+            database_id: String::new(),
+            poll_interval_secs: default_notion_poll_interval(),
+            status_property: default_notion_status_prop(),
+            input_property: default_notion_input_prop(),
+            result_property: default_notion_result_prop(),
+            max_concurrent: default_notion_max_concurrent(),
+            recover_stale: default_notion_recover_stale(),
+        }
+    }
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -4347,6 +4752,7 @@ impl Default for Config {
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
+            microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
@@ -4368,6 +4774,8 @@ impl Default for Config {
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
             workspace: WorkspaceConfig::default(),
+            notion: NotionConfig::default(),
+            node_transport: NodeTransportConfig::default(),
         }
     }
 }
@@ -4843,6 +5251,11 @@ impl Config {
                 &mut config.composio.api_key,
                 "config.composio.api_key",
             )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.microsoft365.client_secret,
+                "config.microsoft365.client_secret",
+            )?;
 
             decrypt_optional_secret(
                 &store,
@@ -5100,6 +5513,18 @@ impl Config {
                 decrypt_secret(&store, token, "config.gateway.paired_tokens[]")?;
             }
 
+            // Decrypt Nevis IAM secret
+            decrypt_optional_secret(
+                &store,
+                &mut config.security.nevis.client_secret,
+                "config.security.nevis.client_secret",
+            )?;
+
+            // Notion API key (top-level, not in ChannelsConfig)
+            if !config.notion.api_key.is_empty() {
+                decrypt_secret(&store, &mut config.notion.api_key, "config.notion.api_key")?;
+            }
+
             config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
@@ -5235,6 +5660,20 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
+        // Tunnel — OpenVPN
+        if self.tunnel.provider.trim() == "openvpn" {
+            let openvpn = self.tunnel.openvpn.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("tunnel.provider='openvpn' requires [tunnel.openvpn]")
+            })?;
+
+            if openvpn.config_file.trim().is_empty() {
+                anyhow::bail!("tunnel.openvpn.config_file must not be empty");
+            }
+            if openvpn.connect_timeout_secs == 0 {
+                anyhow::bail!("tunnel.openvpn.connect_timeout_secs must be greater than 0");
+            }
+        }
+
         // Gateway
         if self.gateway.host.trim().is_empty() {
             anyhow::bail!("gateway.host must not be empty");
@@ -5391,6 +5830,88 @@ impl Config {
             }
         }
 
+        // Microsoft 365
+        if self.microsoft365.enabled {
+            let tenant = self
+                .microsoft365
+                .tenant_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if tenant.is_none() {
+                anyhow::bail!(
+                    "microsoft365.tenant_id must not be empty when microsoft365 is enabled"
+                );
+            }
+            let client = self
+                .microsoft365
+                .client_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if client.is_none() {
+                anyhow::bail!(
+                    "microsoft365.client_id must not be empty when microsoft365 is enabled"
+                );
+            }
+            let flow = self.microsoft365.auth_flow.trim();
+            if flow != "client_credentials" && flow != "device_code" {
+                anyhow::bail!(
+                    "microsoft365.auth_flow must be 'client_credentials' or 'device_code'"
+                );
+            }
+            if flow == "client_credentials"
+                && self
+                    .microsoft365
+                    .client_secret
+                    .as_deref()
+                    .map_or(true, |s| s.trim().is_empty())
+            {
+                anyhow::bail!(
+                    "microsoft365.client_secret must not be empty when auth_flow is 'client_credentials'"
+                );
+            }
+        }
+
+        // Microsoft 365
+        if self.microsoft365.enabled {
+            let tenant = self
+                .microsoft365
+                .tenant_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if tenant.is_none() {
+                anyhow::bail!(
+                    "microsoft365.tenant_id must not be empty when microsoft365 is enabled"
+                );
+            }
+            let client = self
+                .microsoft365
+                .client_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if client.is_none() {
+                anyhow::bail!(
+                    "microsoft365.client_id must not be empty when microsoft365 is enabled"
+                );
+            }
+            let flow = self.microsoft365.auth_flow.trim();
+            if flow != "client_credentials" && flow != "device_code" {
+                anyhow::bail!("microsoft365.auth_flow must be client_credentials or device_code");
+            }
+            if flow == "client_credentials"
+                && self
+                    .microsoft365
+                    .client_secret
+                    .as_deref()
+                    .map_or(true, |s| s.trim().is_empty())
+            {
+                anyhow::bail!("microsoft365.client_secret must not be empty when auth_flow is client_credentials");
+            }
+        }
+
         // MCP
         if self.mcp.enabled {
             validate_mcp_config(&self.mcp)?;
@@ -5420,6 +5941,33 @@ impl Config {
 
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
+
+        // Notion
+        if self.notion.enabled {
+            if self.notion.database_id.trim().is_empty() {
+                anyhow::bail!("notion.database_id must not be empty when notion.enabled = true");
+            }
+            if self.notion.poll_interval_secs == 0 {
+                anyhow::bail!("notion.poll_interval_secs must be greater than 0");
+            }
+            if self.notion.max_concurrent == 0 {
+                anyhow::bail!("notion.max_concurrent must be greater than 0");
+            }
+            if self.notion.status_property.trim().is_empty() {
+                anyhow::bail!("notion.status_property must not be empty");
+            }
+            if self.notion.input_property.trim().is_empty() {
+                anyhow::bail!("notion.input_property must not be empty");
+            }
+            if self.notion.result_property.trim().is_empty() {
+                anyhow::bail!("notion.result_property must not be empty");
+            }
+        }
+
+        // Nevis IAM — delegate to NevisConfig::validate() for field-level checks
+        if let Err(msg) = self.security.nevis.validate() {
+            anyhow::bail!("security.nevis: {msg}");
+        }
 
         Ok(())
     }
@@ -5787,6 +6335,11 @@ impl Config {
             &mut config_to_save.composio.api_key,
             "config.composio.api_key",
         )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.microsoft365.client_secret,
+            "config.microsoft365.client_secret",
+        )?;
 
         encrypt_optional_secret(
             &store,
@@ -6044,6 +6597,22 @@ impl Config {
             encrypt_secret(&store, token, "config.gateway.paired_tokens[]")?;
         }
 
+        // Encrypt Nevis IAM secret
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.security.nevis.client_secret,
+            "config.security.nevis.client_secret",
+        )?;
+
+        // Notion API key (top-level, not in ChannelsConfig)
+        if !config_to_save.notion.api_key.is_empty() {
+            encrypt_secret(
+                &store,
+                &mut config_to_save.notion.api_key,
+                "config.notion.api_key",
+            )?;
+        }
+
         let toml_str =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
 
@@ -6131,7 +6700,7 @@ impl Config {
     }
 }
 
-#[allow(clippy::unused_async)]
+#[allow(clippy::unused_async)] // async needed on unix for tokio File I/O; no-op on other platforms
 async fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -6157,7 +6726,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    #[allow(unused_imports)]
+    #[cfg(unix)]
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
@@ -6475,6 +7044,7 @@ default_temperature = 0.7
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
+            microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
@@ -6496,6 +7066,8 @@ default_temperature = 0.7
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
             workspace: WorkspaceConfig::default(),
+            notion: NotionConfig::default(),
+            node_transport: NodeTransportConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -6769,6 +7341,7 @@ tool_dispatcher = "xml"
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
+            microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
@@ -6790,6 +7363,8 @@ tool_dispatcher = "xml"
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
             workspace: WorkspaceConfig::default(),
+            notion: NotionConfig::default(),
+            node_transport: NodeTransportConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -9603,5 +10178,188 @@ require_otp_to_resume = true
         assert_eq!(config.agents.len(), 2);
         assert_eq!(config.swarms.len(), 1);
         assert!(config.swarms.contains_key("pipeline"));
+    }
+
+    #[tokio::test]
+    async fn nevis_client_secret_encrypt_decrypt_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_nevis_secret_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let plaintext_secret = "nevis-test-client-secret-value";
+
+        let mut config = Config::default();
+        config.workspace_dir = dir.join("workspace");
+        config.config_path = dir.join("config.toml");
+        config.security.nevis.client_secret = Some(plaintext_secret.into());
+
+        // Save (triggers encryption)
+        config.save().await.unwrap();
+
+        // Read raw TOML and verify plaintext secret is NOT present
+        let raw_toml = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        assert!(
+            !raw_toml.contains(plaintext_secret),
+            "Saved TOML must not contain the plaintext client_secret"
+        );
+
+        // Parse stored TOML and verify the value is encrypted
+        let stored: Config = toml::from_str(&raw_toml).unwrap();
+        let stored_secret = stored.security.nevis.client_secret.as_ref().unwrap();
+        assert!(
+            crate::security::SecretStore::is_encrypted(stored_secret),
+            "Stored client_secret must be marked as encrypted"
+        );
+
+        // Decrypt and verify it matches the original plaintext
+        let store = crate::security::SecretStore::new(&dir, true);
+        assert_eq!(store.decrypt(stored_secret).unwrap(), plaintext_secret);
+
+        // Simulate a full load: deserialize then decrypt (mirrors load_or_init logic)
+        let mut loaded: Config = toml::from_str(&raw_toml).unwrap();
+        loaded.config_path = dir.join("config.toml");
+        let load_store = crate::security::SecretStore::new(&dir, loaded.secrets.encrypt);
+        decrypt_optional_secret(
+            &load_store,
+            &mut loaded.security.nevis.client_secret,
+            "config.security.nevis.client_secret",
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.security.nevis.client_secret.as_deref().unwrap(),
+            plaintext_secret,
+            "Loaded client_secret must match the original plaintext after decryption"
+        );
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Nevis config validation tests
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    async fn nevis_config_validate_disabled_accepts_empty_fields() {
+        let cfg = NevisConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    async fn nevis_config_validate_rejects_empty_instance_url() {
+        let cfg = NevisConfig {
+            enabled: true,
+            instance_url: String::new(),
+            client_id: "test-client".into(),
+            ..NevisConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("instance_url"));
+    }
+
+    #[test]
+    async fn nevis_config_validate_rejects_empty_client_id() {
+        let cfg = NevisConfig {
+            enabled: true,
+            instance_url: "https://nevis.example.com".into(),
+            client_id: String::new(),
+            ..NevisConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("client_id"));
+    }
+
+    #[test]
+    async fn nevis_config_validate_rejects_empty_realm() {
+        let cfg = NevisConfig {
+            enabled: true,
+            instance_url: "https://nevis.example.com".into(),
+            client_id: "test-client".into(),
+            realm: String::new(),
+            ..NevisConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("realm"));
+    }
+
+    #[test]
+    async fn nevis_config_validate_rejects_local_without_jwks() {
+        let cfg = NevisConfig {
+            enabled: true,
+            instance_url: "https://nevis.example.com".into(),
+            client_id: "test-client".into(),
+            token_validation: "local".into(),
+            jwks_url: None,
+            ..NevisConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("jwks_url"));
+    }
+
+    #[test]
+    async fn nevis_config_validate_rejects_zero_session_timeout() {
+        let cfg = NevisConfig {
+            enabled: true,
+            instance_url: "https://nevis.example.com".into(),
+            client_id: "test-client".into(),
+            token_validation: "remote".into(),
+            session_timeout_secs: 0,
+            ..NevisConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("session_timeout_secs"));
+    }
+
+    #[test]
+    async fn nevis_config_validate_accepts_valid_enabled_config() {
+        let cfg = NevisConfig {
+            enabled: true,
+            instance_url: "https://nevis.example.com".into(),
+            realm: "master".into(),
+            client_id: "test-client".into(),
+            token_validation: "remote".into(),
+            session_timeout_secs: 3600,
+            ..NevisConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    async fn nevis_config_validate_rejects_invalid_token_validation() {
+        let cfg = NevisConfig {
+            enabled: true,
+            instance_url: "https://nevis.example.com".into(),
+            realm: "master".into(),
+            client_id: "test-client".into(),
+            token_validation: "invalid_mode".into(),
+            session_timeout_secs: 3600,
+            ..NevisConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("invalid value 'invalid_mode'"),
+            "Expected invalid token_validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn nevis_config_debug_redacts_client_secret() {
+        let cfg = NevisConfig {
+            client_secret: Some("super-secret".into()),
+            ..NevisConfig::default()
+        };
+        let debug_output = format!("{:?}", cfg);
+        assert!(
+            !debug_output.contains("super-secret"),
+            "Debug output must not contain the raw client_secret"
+        );
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug output must show [REDACTED] for client_secret"
+        );
     }
 }
