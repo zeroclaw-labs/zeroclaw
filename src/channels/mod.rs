@@ -1016,6 +1016,15 @@ fn rollback_orphan_user_turn(
     if turns.is_empty() {
         histories.remove(sender_key);
     }
+
+    // Mirror the in-memory rollback in the JSONL session store so the orphan
+    // turn does not survive a daemon restart via session hydration.
+    if let Some(ref store) = ctx.session_store {
+        if let Err(e) = store.rollback_last(sender_key) {
+            tracing::warn!("Failed to rollback session store entry for {sender_key}: {e}");
+        }
+    }
+
     true
 }
 
@@ -4364,6 +4373,87 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].content, "first");
         assert_eq!(turns[1].content, "ok");
+    }
+
+    #[test]
+    fn rollback_orphan_user_turn_removes_from_session_store() {
+        use crate::channels::session_store::SessionStore;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(SessionStore::new(tmp.path()).unwrap());
+
+        let sender = "telegram_zeroclaw_user".to_string();
+
+        // Pre-populate the JSONL store with two turns.
+        store.append(&sender, &ChatMessage::user("hello")).unwrap();
+        store
+            .append(&sender, &ChatMessage::user("pending"))
+            .unwrap();
+
+        let mut histories = HashMap::new();
+        histories.insert(
+            sender.clone(),
+            vec![ChatMessage::user("hello"), ChatMessage::user("pending")],
+        );
+
+        let ctx = ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::new()),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("system".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(histories)),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(tmp.path().to_path_buf()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: Some(store.clone()),
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+        };
+
+        let rolled_back = rollback_orphan_user_turn(&ctx, &sender, "pending");
+        assert!(rolled_back);
+
+        // In-memory history should only have "hello" remaining.
+        let locked = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = locked.get(&sender).expect("history should remain");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].content, "hello");
+        drop(locked);
+
+        // JSONL store should also only have "hello" remaining.
+        let persisted = store.load(&sender);
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].content, "hello");
     }
 
     struct DummyProvider;

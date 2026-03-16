@@ -78,6 +78,33 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Remove the last entry from the session JSONL file.
+    ///
+    /// Returns `Ok(true)` if an entry was removed, `Ok(false)` if the session
+    /// file does not exist or is already empty.  Used to roll back an orphan
+    /// user turn that was persisted before an LLM call that subsequently failed
+    /// (e.g. a `ProviderCapabilityError` for vision on a non-vision provider).
+    pub fn rollback_last(&self, session_key: &str) -> std::io::Result<bool> {
+        let path = self.session_path(session_key);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let mut lines: Vec<&str> = content.lines().collect();
+        if lines.is_empty() {
+            return Ok(false);
+        }
+        lines.pop();
+        let new_content = if lines.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", lines.join("\n"))
+        };
+        std::fs::write(&path, new_content)?;
+        Ok(true)
+    }
+
     /// List all session keys that have files on disk.
     pub fn list_sessions(&self) -> Vec<String> {
         let entries = match std::fs::read_dir(&self.sessions_dir) {
@@ -196,5 +223,80 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "hello");
         assert_eq!(messages[1].content, "world");
+    }
+
+    #[test]
+    fn rollback_last_removes_final_entry() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "rollback_test";
+
+        store.append(key, &ChatMessage::user("msg1")).unwrap();
+        store.append(key, &ChatMessage::assistant("reply")).unwrap();
+        store.append(key, &ChatMessage::user("msg2")).unwrap();
+
+        let removed = store.rollback_last(key).unwrap();
+        assert!(removed);
+
+        let messages = store.load(key);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "msg1");
+        assert_eq!(messages[1].content, "reply");
+    }
+
+    #[test]
+    fn rollback_last_on_single_entry_leaves_empty_file() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "rollback_single";
+
+        store.append(key, &ChatMessage::user("only")).unwrap();
+
+        let removed = store.rollback_last(key).unwrap();
+        assert!(removed);
+
+        let messages = store.load(key);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn rollback_last_on_nonexistent_session_returns_false() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+
+        let result = store.rollback_last("does_not_exist").unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn rollback_last_on_empty_file_returns_false() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "empty_session";
+
+        // Create an empty file manually
+        let path = store.session_path(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+
+        let result = store.rollback_last(key).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn rollback_last_is_idempotent_on_subsequent_calls() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "rollback_idempotent";
+
+        store.append(key, &ChatMessage::user("msg1")).unwrap();
+        store.append(key, &ChatMessage::user("msg2")).unwrap();
+
+        assert!(store.rollback_last(key).unwrap());
+        assert!(store.rollback_last(key).unwrap());
+        assert!(!store.rollback_last(key).unwrap());
+
+        let messages = store.load(key);
+        assert!(messages.is_empty());
     }
 }

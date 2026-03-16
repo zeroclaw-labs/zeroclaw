@@ -97,6 +97,24 @@ pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
     count_image_markers(messages) > 0
 }
 
+/// Strip `[IMAGE:...]` markers from all user messages **except** the latest one.
+///
+/// When a non-vision provider encounters stale image markers left in historical
+/// turns (e.g. reloaded from a persisted JSONL session), this function removes
+/// them so the vision capability check only fires for the current request.
+pub fn strip_image_markers_from_history(messages: &mut [ChatMessage]) {
+    let last_user_idx = messages.iter().rposition(|m| m.role == "user");
+    for (i, msg) in messages.iter_mut().enumerate() {
+        if msg.role != "user" || Some(i) == last_user_idx {
+            continue;
+        }
+        let (cleaned, refs) = parse_image_markers(&msg.content);
+        if !refs.is_empty() {
+            msg.content = cleaned;
+        }
+    }
+}
+
 pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     if image_ref.starts_with("data:") {
         let comma_idx = image_ref.find(',')?;
@@ -565,5 +583,66 @@ mod tests {
         let payload = extract_ollama_image_payload("data:image/png;base64,abcd==")
             .expect("payload should be extracted");
         assert_eq!(payload, "abcd==");
+    }
+
+    #[test]
+    fn strip_image_markers_from_history_cleans_old_preserves_latest() {
+        let mut history = vec![
+            ChatMessage::user("first message [IMAGE:/tmp/old.png]"),
+            ChatMessage::assistant("I saw your image"),
+            ChatMessage::user("second message [IMAGE:/tmp/current.png]"),
+        ];
+
+        strip_image_markers_from_history(&mut history);
+
+        assert_eq!(history[0].content, "first message");
+        assert_eq!(history[1].content, "I saw your image");
+        assert_eq!(
+            history[2].content,
+            "second message [IMAGE:/tmp/current.png]"
+        );
+    }
+
+    #[test]
+    fn strip_image_markers_from_history_no_user_messages_is_noop() {
+        let mut history = vec![
+            ChatMessage::assistant("hello"),
+            ChatMessage::assistant("world"),
+        ];
+        let original = history.clone();
+
+        strip_image_markers_from_history(&mut history);
+
+        assert_eq!(history[0].content, original[0].content);
+        assert_eq!(history[1].content, original[1].content);
+    }
+
+    #[test]
+    fn strip_image_markers_from_history_single_user_message_preserved() {
+        let mut history = vec![ChatMessage::user("only message [IMAGE:/tmp/a.png]")];
+
+        strip_image_markers_from_history(&mut history);
+
+        assert_eq!(
+            history[0].content, "only message [IMAGE:/tmp/a.png]",
+            "sole user message must not be stripped"
+        );
+    }
+
+    #[test]
+    fn strip_image_markers_from_history_multiple_old_markers_all_cleaned() {
+        let mut history = vec![
+            ChatMessage::user("msg1 [IMAGE:/tmp/a.png]"),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user("msg2 [IMAGE:/tmp/b.png]"),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user("latest text only"),
+        ];
+
+        strip_image_markers_from_history(&mut history);
+
+        assert_eq!(history[0].content, "msg1");
+        assert_eq!(history[2].content, "msg2");
+        assert_eq!(history[4].content, "latest text only");
     }
 }

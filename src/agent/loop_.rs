@@ -2361,16 +2361,23 @@ pub(crate) async fn run_tool_call_loop(
             return Err(ToolLoopCancelled.into());
         }
 
-        let image_marker_count = multimodal::count_image_markers(history);
-        if image_marker_count > 0 && !provider.supports_vision() {
-            return Err(ProviderCapabilityError {
-                provider: provider_name.to_string(),
-                capability: "vision".to_string(),
-                message: format!(
-                    "received {image_marker_count} image marker(s), but this provider does not support vision input"
-                ),
+        if !provider.supports_vision() {
+            // Strip stale image markers from all historical turns except the
+            // latest user message. This prevents persisted [IMAGE:] markers
+            // (e.g. reloaded from a JSONL session store after a daemon restart)
+            // from permanently poisoning the conversation for non-vision providers.
+            multimodal::strip_image_markers_from_history(history);
+            let image_marker_count = multimodal::count_image_markers(history);
+            if image_marker_count > 0 {
+                return Err(ProviderCapabilityError {
+                    provider: provider_name.to_string(),
+                    capability: "vision".to_string(),
+                    message: format!(
+                        "received {image_marker_count} image marker(s), but this provider does not support vision input"
+                    ),
+                }
+                .into());
             }
-            .into());
         }
 
         let prepared_messages =
