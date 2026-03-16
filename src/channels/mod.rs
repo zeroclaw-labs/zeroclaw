@@ -27,6 +27,7 @@ pub mod linq;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 pub mod mattermost;
+pub mod mochat;
 pub mod nextcloud_talk;
 #[cfg(feature = "channel-nostr")]
 pub mod nostr;
@@ -41,6 +42,7 @@ pub mod telegram;
 pub mod traits;
 pub mod transcription;
 pub mod tts;
+pub mod twitter;
 pub mod wati;
 pub mod wecom;
 pub mod whatsapp;
@@ -62,6 +64,7 @@ pub use linq::LinqChannel;
 #[cfg(feature = "channel-matrix")]
 pub use matrix::MatrixChannel;
 pub use mattermost::MattermostChannel;
+pub use mochat::MochatChannel;
 pub use nextcloud_talk::NextcloudTalkChannel;
 #[cfg(feature = "channel-nostr")]
 pub use nostr::NostrChannel;
@@ -73,6 +76,7 @@ pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
 #[allow(unused_imports)]
 pub use tts::{TtsManager, TtsProvider};
+pub use twitter::TwitterChannel;
 pub use wati::WatiChannel;
 pub use wecom::WeComChannel;
 pub use whatsapp::WhatsAppChannel;
@@ -3434,6 +3438,28 @@ fn collect_configured_channels(
                 qq.app_id.clone(),
                 qq.app_secret.clone(),
                 qq.allowed_users.clone(),
+            )),
+        });
+    }
+
+    if let Some(ref tw) = config.channels_config.twitter {
+        channels.push(ConfiguredChannel {
+            display_name: "X/Twitter",
+            channel: Arc::new(TwitterChannel::new(
+                tw.bearer_token.clone(),
+                tw.allowed_users.clone(),
+            )),
+        });
+    }
+
+    if let Some(ref mc) = config.channels_config.mochat {
+        channels.push(ConfiguredChannel {
+            display_name: "Mochat",
+            channel: Arc::new(MochatChannel::new(
+                mc.api_url.clone(),
+                mc.api_token.clone(),
+                mc.allowed_users.clone(),
+                mc.poll_interval_secs,
             )),
         });
     }
