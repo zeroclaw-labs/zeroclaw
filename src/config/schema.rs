@@ -7105,7 +7105,9 @@ mod tests {
             if !merged.is_empty() {
                 merged.push_str("\n\n");
             }
-            merged.push_str(&format!("[{table}]"));
+            merged.push('[');
+            merged.push_str(table);
+            merged.push(']');
         }
         merged.push('\n');
         toml::from_str(&merged).unwrap()
@@ -10558,7 +10560,7 @@ require_otp_to_resume = true
             agents = ["researcher", "writer"]
             strategy = "sequential"
         "#;
-        let config: Config = toml::from_str(toml_str).expect("deserialize");
+        let config = parse_test_config(toml_str);
         assert_eq!(config.agents.len(), 2);
         assert_eq!(config.swarms.len(), 1);
         assert!(config.swarms.contains_key("pipeline"));
