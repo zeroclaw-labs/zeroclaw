@@ -440,6 +440,12 @@ impl BrowserTool {
     async fn run_command(&self, args: &[&str]) -> anyhow::Result<AgentBrowserResponse> {
         let mut cmd = Command::new("agent-browser");
 
+        // When running as a service (systemd/OpenRC), the process may lack
+        // HOME which browsers need for profile directories.
+        if is_service_environment() {
+            ensure_browser_env(&mut cmd);
+        }
+
         // Add session if configured
         if let Some(ref session) = self.session_name {
             cmd.arg("--session").arg(session);
@@ -1461,6 +1467,14 @@ mod native_backend {
                 args.push(Value::String("--disable-gpu".to_string()));
             }
 
+            // When running as a service (systemd/OpenRC), the browser sandbox
+            // fails because the process lacks a user namespace / session.
+            // --no-sandbox and --disable-dev-shm-usage are required in this context.
+            if super::is_service_environment() {
+                args.push(Value::String("--no-sandbox".to_string()));
+                args.push(Value::String("--disable-dev-shm-usage".to_string()));
+            }
+
             if !args.is_empty() {
                 chrome_options.insert("args".to_string(), Value::Array(args));
             }
@@ -2111,6 +2125,44 @@ fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
         || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
 }
 
+/// Detect whether the current process is running inside a service environment
+/// (e.g. systemd, OpenRC, or launchd) where the browser sandbox and
+/// environment setup may be restricted.
+fn is_service_environment() -> bool {
+    if std::env::var_os("INVOCATION_ID").is_some() {
+        return true;
+    }
+    if std::env::var_os("JOURNAL_STREAM").is_some() {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if std::path::Path::new("/run/openrc").exists() && std::env::var_os("HOME").is_none() {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("HOME").is_none() {
+        return true;
+    }
+    false
+}
+
+/// Ensure environment variables required by headless browsers are present
+/// when running inside a service context.
+fn ensure_browser_env(cmd: &mut Command) {
+    if std::env::var_os("HOME").is_none() {
+        cmd.env("HOME", "/tmp");
+    }
+    let existing = std::env::var("CHROMIUM_FLAGS").unwrap_or_default();
+    if !existing.contains("--no-sandbox") {
+        let new_flags = if existing.is_empty() {
+            "--no-sandbox --disable-dev-shm-usage".to_string()
+        } else {
+            format!("{existing} --no-sandbox --disable-dev-shm-usage")
+        };
+        cmd.env("CHROMIUM_FLAGS", new_flags);
+    }
+}
+
 fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
     allowed.iter().any(|pattern| {
         if pattern == "*" {
@@ -2491,5 +2543,79 @@ mod tests {
             state.reset_session().await;
             state.reset_session().await;
         });
+    }
+
+    #[test]
+    fn ensure_browser_env_sets_home_when_missing() {
+        let original_home = std::env::var_os("HOME");
+        unsafe { std::env::remove_var("HOME") };
+
+        let mut cmd = Command::new("true");
+        ensure_browser_env(&mut cmd);
+        // Function completes without panic — HOME and CHROMIUM_FLAGS set on cmd.
+
+        if let Some(home) = original_home {
+            unsafe { std::env::set_var("HOME", home) };
+        }
+    }
+
+    #[test]
+    fn ensure_browser_env_sets_chromium_flags() {
+        let original = std::env::var_os("CHROMIUM_FLAGS");
+        unsafe { std::env::remove_var("CHROMIUM_FLAGS") };
+
+        let mut cmd = Command::new("true");
+        ensure_browser_env(&mut cmd);
+
+        if let Some(val) = original {
+            unsafe { std::env::set_var("CHROMIUM_FLAGS", val) };
+        }
+    }
+
+    #[test]
+    fn is_service_environment_detects_invocation_id() {
+        let original = std::env::var_os("INVOCATION_ID");
+        unsafe { std::env::set_var("INVOCATION_ID", "test-unit-id") };
+
+        assert!(is_service_environment());
+
+        if let Some(val) = original {
+            unsafe { std::env::set_var("INVOCATION_ID", val) };
+        } else {
+            unsafe { std::env::remove_var("INVOCATION_ID") };
+        }
+    }
+
+    #[test]
+    fn is_service_environment_detects_journal_stream() {
+        let original = std::env::var_os("JOURNAL_STREAM");
+        unsafe { std::env::set_var("JOURNAL_STREAM", "8:12345") };
+
+        assert!(is_service_environment());
+
+        if let Some(val) = original {
+            unsafe { std::env::set_var("JOURNAL_STREAM", val) };
+        } else {
+            unsafe { std::env::remove_var("JOURNAL_STREAM") };
+        }
+    }
+
+    #[test]
+    fn is_service_environment_false_in_normal_context() {
+        let inv = std::env::var_os("INVOCATION_ID");
+        let journal = std::env::var_os("JOURNAL_STREAM");
+        unsafe { std::env::remove_var("INVOCATION_ID") };
+        unsafe { std::env::remove_var("JOURNAL_STREAM") };
+
+        if std::env::var_os("HOME").is_some() {
+            assert!(!is_service_environment());
+        }
+
+        if let Some(val) = inv {
+            unsafe { std::env::set_var("INVOCATION_ID", val) };
+        }
+        if let Some(val) = journal {
+            unsafe { std::env::set_var("JOURNAL_STREAM", val) };
+        }
     }
 }

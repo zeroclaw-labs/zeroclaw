@@ -37,7 +37,7 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -325,11 +325,12 @@ override with --tz and an IANA timezone name.
 
 Examples:
   zeroclaw cron list
-  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
-  zeroclaw cron add '*/30 * * * *' 'Check system health'
-  zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder'
+  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
+  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
+  zeroclaw cron add '*/5 * * * *' 'echo ok'
+  zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
   zeroclaw cron add-every 60000 'Ping heartbeat'
-  zeroclaw cron once 30m 'Run backup in 30 minutes'
+  zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
   zeroclaw cron pause <task-id>
   zeroclaw cron update <task-id> --expression '0 8 * * *' --tz Europe/London")]
     Cron {
@@ -718,10 +719,11 @@ async fn main() -> Result<()> {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    // Onboard runs quick setup by default, or the interactive wizard with --interactive.
-    // The onboard wizard uses reqwest::blocking internally, which creates its own
-    // Tokio runtime. To avoid "Cannot drop a runtime in a context where blocking is
-    // not allowed", we run the wizard on a blocking thread via spawn_blocking.
+    // Onboard auto-detects the environment: if stdin/stdout are a TTY and no
+    // provider flags were given, it runs the full interactive wizard; otherwise
+    // it runs the quick (scriptable) setup.  This means `curl … | bash` and
+    // `zeroclaw onboard --api-key …` both take the fast path, while a bare
+    // `zeroclaw onboard` in a terminal launches the wizard.
     if let Commands::Onboard {
         force,
         reinit,
@@ -793,8 +795,16 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Auto-detect: run the interactive wizard when in a TTY with no
+        // provider flags, quick setup otherwise (scriptable path).
+        let has_provider_flags =
+            api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some();
+        let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
+        } else if is_tty && !has_provider_flags {
+            Box::pin(onboard::run_wizard(force)).await
         } else {
             onboard::run_quick_setup(
                 api_key.as_deref(),
@@ -834,7 +844,7 @@ async fn main() -> Result<()> {
 
         // Auto-start channels if user said yes during wizard
         if std::env::var("ZEROCLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
-            channels::start_channels(config).await?;
+            Box::pin(channels::start_channels(config)).await?;
         }
         return Ok(());
     }
@@ -870,7 +880,7 @@ async fn main() -> Result<()> {
         } => {
             let final_temperature = temperature.unwrap_or(config.default_temperature);
 
-            agent::run(
+            Box::pin(agent::run(
                 config,
                 message,
                 provider,
@@ -879,7 +889,8 @@ async fn main() -> Result<()> {
                 peripheral,
                 true,
                 session_state_file,
-            )
+                None,
+            ))
             .await
             .map(|_| ())
         }
@@ -1178,8 +1189,8 @@ async fn main() -> Result<()> {
         },
 
         Commands::Channel { channel_command } => match channel_command {
-            ChannelCommands::Start => channels::start_channels(config).await,
-            ChannelCommands::Doctor => channels::doctor_channels(config).await,
+            ChannelCommands::Start => Box::pin(channels::start_channels(config)).await,
+            ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => channels::handle_command(other, &config).await,
         },
 
@@ -2202,6 +2213,22 @@ mod tests {
 
         match cli.command {
             Commands::Onboard { force, .. } => assert!(force),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn onboard_cli_rejects_removed_interactive_flag() {
+        // --interactive was removed; onboard auto-detects TTY instead.
+        assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"]).is_err());
+    }
+
+    #[test]
+    fn onboard_cli_bare_parses() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard"]).expect("bare onboard should parse");
+
+        match cli.command {
+            Commands::Onboard { .. } => {}
             other => panic!("expected onboard command, got {other:?}"),
         }
     }

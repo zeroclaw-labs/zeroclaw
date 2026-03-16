@@ -93,6 +93,24 @@ pub(crate) fn filter_tool_specs_for_turn(
         .collect()
 }
 
+/// Filters a tool spec list by an optional capability allowlist.
+///
+/// When `allowed` is `None`, all specs pass through unchanged.
+/// When `allowed` is `Some(list)`, only specs whose name appears in the list
+/// are retained. Unknown names in the allowlist are silently ignored.
+pub(crate) fn filter_by_allowed_tools(
+    specs: Vec<crate::tools::ToolSpec>,
+    allowed: Option<&[String]>,
+) -> Vec<crate::tools::ToolSpec> {
+    match allowed {
+        None => specs,
+        Some(list) => specs
+            .into_iter()
+            .filter(|spec| list.iter().any(|name| name == &spec.name))
+            .collect(),
+    }
+}
+
 /// Computes the list of MCP tool names that should be excluded for a given turn
 /// based on `tool_filter_groups` and the user message.
 ///
@@ -2660,6 +2678,15 @@ pub(crate) async fn run_tool_call_loop(
                                 "arguments": scrub_credentials(&tool_args.to_string()),
                             }),
                         );
+                        if let Some(ref tx) = on_delta {
+                            let _ = tx
+                                .send(format!(
+                                    "\u{274c} {}: {}\n",
+                                    call.name,
+                                    truncate_with_ellipsis(&scrub_credentials(&cancelled), 200)
+                                ))
+                                .await;
+                        }
                         ordered_results[idx] = Some((
                             call.name.clone(),
                             call.tool_call_id.clone(),
@@ -2687,11 +2714,13 @@ pub(crate) async fn run_tool_call_loop(
                         arguments: tool_args.clone(),
                     };
 
-                    // Only prompt interactively on CLI; auto-approve on other channels.
-                    let decision = if channel_name == "cli" {
-                        mgr.prompt_cli(&request)
+                    // Interactive CLI: prompt the operator.
+                    // Non-interactive (channels): auto-deny since no operator
+                    // is present to approve.
+                    let decision = if mgr.is_non_interactive() {
+                        ApprovalResponse::No
                     } else {
-                        ApprovalResponse::Yes
+                        mgr.prompt_cli(&request)
                     };
 
                     mgr.record_decision(&tool_name, &tool_args, decision, channel_name);
@@ -2712,6 +2741,11 @@ pub(crate) async fn run_tool_call_loop(
                                 "arguments": scrub_credentials(&tool_args.to_string()),
                             }),
                         );
+                        if let Some(ref tx) = on_delta {
+                            let _ = tx
+                                .send(format!("\u{274c} {}: {}\n", tool_name, denied))
+                                .await;
+                        }
                         ordered_results[idx] = Some((
                             tool_name.clone(),
                             call.tool_call_id.clone(),
@@ -2748,6 +2782,11 @@ pub(crate) async fn run_tool_call_loop(
                         "deduplicated": true,
                     }),
                 );
+                if let Some(ref tx) = on_delta {
+                    let _ = tx
+                        .send(format!("\u{274c} {}: {}\n", tool_name, duplicate))
+                        .await;
+                }
                 ordered_results[idx] = Some((
                     tool_name.clone(),
                     call.tool_call_id.clone(),
@@ -2850,13 +2889,19 @@ pub(crate) async fn run_tool_call_loop(
             // ── Progress: tool completion ───────────────────────
             if let Some(ref tx) = on_delta {
                 let secs = outcome.duration.as_secs();
-                let icon = if outcome.success {
-                    "\u{2705}"
+                let progress_msg = if outcome.success {
+                    format!("\u{2705} {} ({secs}s)\n", call.name)
+                } else if let Some(ref reason) = outcome.error_reason {
+                    format!(
+                        "\u{274c} {} ({secs}s): {}\n",
+                        call.name,
+                        truncate_with_ellipsis(reason, 200)
+                    )
                 } else {
-                    "\u{274c}"
+                    format!("\u{274c} {} ({secs}s)\n", call.name)
                 };
                 tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
-                let _ = tx.send(format!("{icon} {} ({secs}s)\n", call.name)).await;
+                let _ = tx.send(progress_msg).await;
             }
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
@@ -2967,6 +3012,7 @@ pub async fn run(
     peripheral_overrides: Vec<String>,
     interactive: bool,
     session_state_file: Option<PathBuf>,
+    allowed_tools: Option<Vec<String>>,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -3026,6 +3072,19 @@ pub async fn run(
     if !peripheral_tools.is_empty() {
         tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
         tools_registry.extend(peripheral_tools);
+    }
+
+    // ── Capability-based tool access control ─────────────────────
+    // When `allowed_tools` is `Some(list)`, restrict the tool registry to only
+    // those tools whose name appears in the list. Unknown names are silently
+    // ignored. When `None`, all tools remain available (backward compatible).
+    if let Some(ref allow_list) = allowed_tools {
+        tools_registry.retain(|t| allow_list.iter().any(|name| name == t.name()));
+        tracing::info!(
+            allowed = allow_list.len(),
+            retained = tools_registry.len(),
+            "Applied capability-based tool access filter"
+        );
     }
 
     // ── Wire MCP tools (non-fatal) — CLI path ────────────────────
@@ -3847,7 +3906,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn test_scrub_credentials() {
+    fn scrub_credentials_redacts_bearer_token() {
         let input = "API_KEY=sk-1234567890abcdef; token: 1234567890; password=\"secret123456\"";
         let scrubbed = scrub_credentials(input);
         assert!(scrubbed.contains("API_KEY=sk-1*[REDACTED]"));
@@ -3858,7 +3917,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scrub_credentials_json() {
+    fn scrub_credentials_redacts_json_api_key() {
         let input = r#"{"api_key": "sk-1234567890", "other": "public"}"#;
         let scrubbed = scrub_credentials(input);
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
@@ -4131,6 +4190,52 @@ mod tests {
                 success: true,
                 output: format!("ok:{value}"),
                 error: None,
+            })
+        }
+    }
+
+    /// A tool that always returns a failure with a given error reason.
+    struct FailingTool {
+        tool_name: String,
+        error_reason: String,
+    }
+
+    impl FailingTool {
+        fn new(name: &str, error_reason: &str) -> Self {
+            Self {
+                tool_name: name.to_string(),
+                error_reason: error_reason.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for FailingTool {
+        fn name(&self) -> &str {
+            &self.tool_name
+        }
+
+        fn description(&self) -> &str {
+            "A tool that always fails for testing failure surfacing"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(self.error_reason.clone()),
             })
         }
     }
@@ -6500,5 +6605,123 @@ Let me check the result."#;
         ];
         let tokens = super::estimate_history_tokens(&history);
         assert_eq!(tokens, 23);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_surfaces_tool_failure_reason_in_on_delta() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"failing_shell","arguments":{"command":"rm -rf /"}}
+</tool_call>"#,
+            "I could not execute that command.",
+        ]);
+
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(FailingTool::new(
+            "failing_shell",
+            "Command not allowed by security policy: rm -rf /",
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("delete everything"),
+        ];
+        let observer = NoopObserver;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+        )
+        .await
+        .expect("tool loop should complete");
+
+        // Collect all messages sent to the on_delta channel.
+        let mut deltas = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            deltas.push(msg);
+        }
+
+        let all_deltas = deltas.join("");
+
+        // The failure reason should appear in the progress messages.
+        assert!(
+            all_deltas.contains("Command not allowed by security policy"),
+            "on_delta messages should include the tool failure reason, got: {all_deltas}"
+        );
+
+        // Should also contain the cross mark (❌) icon to indicate failure.
+        assert!(
+            all_deltas.contains('\u{274c}'),
+            "on_delta messages should include ❌ for failed tool calls, got: {all_deltas}"
+        );
+
+        assert_eq!(result, "I could not execute that command.");
+    }
+
+    // ── filter_by_allowed_tools tests ─────────────────────────────────────
+
+    #[test]
+    fn filter_by_allowed_tools_none_passes_all() {
+        let specs = vec![
+            make_spec("shell"),
+            make_spec("memory_store"),
+            make_spec("file_read"),
+        ];
+        let result = filter_by_allowed_tools(specs, None);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn filter_by_allowed_tools_some_restricts_to_listed() {
+        let specs = vec![
+            make_spec("shell"),
+            make_spec("memory_store"),
+            make_spec("file_read"),
+        ];
+        let allowed = vec!["shell".to_string(), "memory_store".to_string()];
+        let result = filter_by_allowed_tools(specs, Some(&allowed));
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"shell"));
+        assert!(names.contains(&"memory_store"));
+        assert!(!names.contains(&"file_read"));
+    }
+
+    #[test]
+    fn filter_by_allowed_tools_unknown_names_silently_ignored() {
+        let specs = vec![make_spec("shell"), make_spec("file_read")];
+        let allowed = vec![
+            "shell".to_string(),
+            "nonexistent_tool".to_string(),
+            "another_missing".to_string(),
+        ];
+        let result = filter_by_allowed_tools(specs, Some(&allowed));
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names.len(), 1);
+        assert!(names.contains(&"shell"));
+    }
+
+    #[test]
+    fn filter_by_allowed_tools_empty_list_excludes_all() {
+        let specs = vec![make_spec("shell"), make_spec("file_read")];
+        let allowed: Vec<String> = vec![];
+        let result = filter_by_allowed_tools(specs, Some(&allowed));
+        assert!(result.is_empty());
     }
 }

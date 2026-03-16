@@ -43,8 +43,13 @@ pub async fn consolidate_turn(
     let turn_text = format!("User: {user_message}\nAssistant: {assistant_response}");
 
     // Truncate very long turns to avoid wasting tokens on consolidation.
+    // Use char-boundary-safe slicing to prevent panic on multi-byte UTF-8 (e.g. CJK text).
     let truncated = if turn_text.len() > 4000 {
-        format!("{}…", &turn_text[..4000])
+        let mut end = 4000;
+        while end > 0 && !turn_text.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &turn_text[..end])
     } else {
         turn_text.clone()
     };
@@ -92,8 +97,13 @@ fn parse_consolidation_response(raw: &str, fallback_text: &str) -> Consolidation
 
     serde_json::from_str(cleaned).unwrap_or_else(|_| {
         // Fallback: use truncated turn text as history entry.
+        // Use char-boundary-safe slicing to prevent panic on multi-byte UTF-8.
         let summary = if fallback_text.len() > 200 {
-            format!("{}…", &fallback_text[..200])
+            let mut end = 200;
+            while end > 0 && !fallback_text.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…", &fallback_text[..end])
         } else {
             fallback_text.to_string()
         };
@@ -149,5 +159,17 @@ mod tests {
         let result = parse_consolidation_response("invalid", &long_text);
         // 200 bytes + "…" (3 bytes in UTF-8) = 203
         assert!(result.history_entry.len() <= 203);
+    }
+
+    #[test]
+    fn fallback_truncates_cjk_text_without_panic() {
+        // Each CJK character is 3 bytes in UTF-8; byte index 200 may land
+        // inside a character. This must not panic.
+        let cjk_text = "二手书项目".repeat(50); // 250 chars = 750 bytes
+        let result = parse_consolidation_response("invalid", &cjk_text);
+        assert!(result
+            .history_entry
+            .is_char_boundary(result.history_entry.len()));
+        assert!(result.history_entry.ends_with('…'));
     }
 }

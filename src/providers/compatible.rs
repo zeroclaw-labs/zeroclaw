@@ -500,19 +500,23 @@ struct ToolCall {
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     #[serde(rename = "type")]
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     function: Option<Function>,
 
     // Compatibility: Some providers (e.g., older GLM) may use 'name' directly
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     arguments: Option<String>,
 
     // Compatibility: DeepSeek sometimes wraps arguments differently
-    #[serde(rename = "parameters", default)]
+    #[serde(
+        rename = "parameters",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     parameters: Option<serde_json::Value>,
 }
 
@@ -3093,5 +3097,51 @@ mod tests {
         assert_eq!(p.extra_headers.len(), 1);
         // Should not panic
         let _client = p.http_client();
+    }
+
+    #[test]
+    fn tool_call_none_fields_omitted_from_json() {
+        // Ensures providers like Mistral that reject extra fields (e.g. "name": null)
+        // don't receive them when the ToolCall compat fields are None.
+        let tc = ToolCall {
+            id: Some("call_1".to_string()),
+            kind: Some("function".to_string()),
+            function: Some(Function {
+                name: Some("shell".to_string()),
+                arguments: Some("{\"command\":\"ls\"}".to_string()),
+            }),
+            name: None,
+            arguments: None,
+            parameters: None,
+        };
+        let json = serde_json::to_value(&tc).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("name"));
+        assert!(!json.as_object().unwrap().contains_key("arguments"));
+        assert!(!json.as_object().unwrap().contains_key("parameters"));
+        // Standard fields must be present
+        assert!(json.as_object().unwrap().contains_key("id"));
+        assert!(json.as_object().unwrap().contains_key("type"));
+        assert!(json.as_object().unwrap().contains_key("function"));
+    }
+
+    #[test]
+    fn tool_call_with_compat_fields_serializes_them() {
+        // When compat fields are Some, they should appear in the output.
+        let tc = ToolCall {
+            id: None,
+            kind: None,
+            function: None,
+            name: Some("shell".to_string()),
+            arguments: Some("{\"command\":\"ls\"}".to_string()),
+            parameters: None,
+        };
+        let json = serde_json::to_value(&tc).unwrap();
+        assert_eq!(json["name"], "shell");
+        assert_eq!(json["arguments"], "{\"command\":\"ls\"}");
+        // None fields should be omitted
+        assert!(!json.as_object().unwrap().contains_key("id"));
+        assert!(!json.as_object().unwrap().contains_key("type"));
+        assert!(!json.as_object().unwrap().contains_key("function"));
+        assert!(!json.as_object().unwrap().contains_key("parameters"));
     }
 }
