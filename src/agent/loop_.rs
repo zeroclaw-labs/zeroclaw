@@ -1281,7 +1281,6 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
                 }
             }
         }
-
     }
 
     calls
@@ -5912,7 +5911,10 @@ Final answer."#;
         // causing false positives when LLMs included URLs in normal text.
         let response = "https://example.com/api";
         let calls = parse_glm_style_tool_calls(response);
-        assert!(calls.is_empty(), "plain URL must not be parsed as tool call");
+        assert!(
+            calls.is_empty(),
+            "plain URL must not be parsed as tool call"
+        );
     }
 
     #[test]
