@@ -47,61 +47,89 @@ fi
 # --- From here on, we are running under bash ---
 set -euo pipefail
 
+# --- Color and styling ---
+if [[ -t 1 ]]; then
+  BLUE='\033[0;34m'
+  BOLD_BLUE='\033[1;34m'
+  GREEN='\033[0;32m'
+  YELLOW='\033[0;33m'
+  RED='\033[0;31m'
+  BOLD='\033[1m'
+  DIM='\033[2m'
+  RESET='\033[0m'
+else
+  BLUE='' BOLD_BLUE='' GREEN='' YELLOW='' RED='' BOLD='' DIM='' RESET=''
+fi
+
+CRAB="🦀"
+
 info() {
-  echo "==> $*"
+  echo -e "${BLUE}${CRAB}${RESET} ${BOLD}$*${RESET}"
+}
+
+step_ok() {
+  echo -e "  ${GREEN}✓${RESET} $*"
+}
+
+step_dot() {
+  echo -e "  ${DIM}·${RESET} $*"
+}
+
+step_fail() {
+  echo -e "  ${RED}✗${RESET} $*"
 }
 
 warn() {
-  echo "warning: $*" >&2
+  echo -e "${YELLOW}!${RESET} $*" >&2
 }
 
 error() {
-  echo "error: $*" >&2
+  echo -e "${RED}✗${RESET} ${RED}$*${RESET}" >&2
 }
 
 usage() {
   cat <<'USAGE'
-ZeroClaw installer
+ZeroClaw installer — one-click bootstrap
 
 Usage:
   ./install.sh [options]
 
-Modes:
-  Default mode installs/builds ZeroClaw only (requires existing Rust toolchain).
-  Guided mode asks setup questions and configures options interactively.
-  Optional bootstrap mode can also install system dependencies and Rust.
+The installer builds ZeroClaw, configures your provider and API key,
+starts the gateway service, and opens the dashboard — all in one step.
 
 Options:
-  --guided                   Run interactive guided installer
+  --guided                   Run interactive guided installer (default on Linux TTY)
   --no-guided                Disable guided installer
-  --docker                   Run install in Docker-compatible mode and launch onboarding inside the container
+  --docker                   Run install in Docker-compatible mode
   --install-system-deps      Install build dependencies (Linux/macOS)
   --install-rust             Install Rust via rustup if missing
   --prefer-prebuilt          Try latest release binary first; fallback to source build on miss
   --prebuilt-only            Install only from latest release binary (no source build fallback)
   --force-source-build       Disable prebuilt flow and always build from source
-  --onboard                  Run onboarding after install
-  --interactive-onboard      Run interactive onboarding (implies --onboard)
-  --api-key <key>            API key for non-interactive onboarding
-  --provider <id>            Provider for non-interactive onboarding (default: openrouter)
-  --model <id>               Model for non-interactive onboarding (optional)
+  --api-key <key>            API key (skips interactive prompt)
+  --provider <id>            Provider (default: openrouter)
+  --model <id>               Model (optional)
+  --skip-onboard             Skip provider/API key configuration
+  --skip-build               Skip build step
+  --skip-install             Skip cargo install step
   --build-first              Alias for explicitly enabling separate `cargo build --release --locked`
-  --skip-build               Skip build step (`cargo build --release --locked` or Docker image build)
-  --skip-install             Skip `cargo install --path . --force --locked`
   -h, --help                 Show help
 
 Examples:
-  ./install.sh
-  ./install.sh --guided
-  ./install.sh --install-system-deps --install-rust
-  ./install.sh --prefer-prebuilt
-  ./install.sh --prebuilt-only
-  ./install.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
-  ./install.sh --interactive-onboard
+  # One-click install (interactive)
+  curl -fsSL https://zeroclawlabs.ai/install.sh | bash
+
+  # Non-interactive with API key
+  ./install.sh --api-key "sk-..." --provider openrouter
+
+  # Prebuilt binary (fastest)
+  ./install.sh --prefer-prebuilt --api-key "sk-..."
+
+  # Docker deploy
   ./install.sh --docker
 
-  # Remote one-liner
-  curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+  # Build only, configure later
+  ./install.sh --skip-onboard
 
 Environment:
   ZEROCLAW_CONTAINER_CLI     Container CLI command (default: docker; auto-fallback: podman)
@@ -159,7 +187,12 @@ detect_release_target() {
       echo "x86_64-unknown-linux-gnu"
       ;;
     Linux:aarch64|Linux:arm64)
-      echo "aarch64-unknown-linux-gnu"
+      # Termux on Android needs the android target, not linux-gnu
+      if [[ -n "${TERMUX_VERSION:-}" || -d "/data/data/com.termux" ]]; then
+        echo "aarch64-linux-android"
+      else
+        echo "aarch64-unknown-linux-gnu"
+      fi
       ;;
     Linux:armv7l|Linux:armv6l)
       echo "armv7-unknown-linux-gnueabihf"
@@ -211,8 +244,35 @@ should_attempt_prebuilt_for_resources() {
   return 1
 }
 
+resolve_asset_url() {
+  local asset_name="$1"
+  local api_url="https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases"
+  local releases_json download_url
+
+  # Fetch up to 10 recent releases (includes prereleases) and find the first
+  # one that contains the requested asset.
+  releases_json="$(curl -fsSL "${api_url}?per_page=10" 2>/dev/null || true)"
+  if [[ -z "$releases_json" ]]; then
+    return 1
+  fi
+
+  # Parse with simple grep/sed — avoids jq dependency.
+  download_url="$(printf '%s\n' "$releases_json" \
+    | tr ',' '\n' \
+    | grep '"browser_download_url"' \
+    | sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' \
+    | grep "/${asset_name}\$" \
+    | head -n 1)"
+
+  if [[ -z "$download_url" ]]; then
+    return 1
+  fi
+
+  echo "$download_url"
+}
+
 install_prebuilt_binary() {
-  local target archive_url temp_dir archive_path extracted_bin install_dir
+  local target archive_url temp_dir archive_path extracted_bin install_dir asset_name
 
   if ! have_cmd curl; then
     warn "curl is required for pre-built binary installation."
@@ -229,11 +289,19 @@ install_prebuilt_binary() {
     return 1
   fi
 
-  archive_url="https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-${target}.tar.gz"
-  temp_dir="$(mktemp -d -t zeroclaw-prebuilt-XXXXXX)"
-  archive_path="$temp_dir/zeroclaw-${target}.tar.gz"
+  asset_name="zeroclaw-${target}.tar.gz"
 
-  info "Attempting pre-built binary install for target: $target"
+  # Try the GitHub API first to find the newest release (including prereleases)
+  # that actually contains the asset, then fall back to /releases/latest/.
+  archive_url="$(resolve_asset_url "$asset_name" || true)"
+  if [[ -z "$archive_url" ]]; then
+    archive_url="https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/${asset_name}"
+  fi
+
+  temp_dir="$(mktemp -d -t zeroclaw-prebuilt-XXXXXX)"
+  archive_path="$temp_dir/${asset_name}"
+
+  step_dot "Attempting pre-built binary install for target: $target"
   if ! curl -fsSL "$archive_url" -o "$archive_path"; then
     warn "Could not download release asset: $archive_url"
     rm -rf "$temp_dir"
@@ -261,7 +329,7 @@ install_prebuilt_binary() {
   install -m 0755 "$extracted_bin" "$install_dir/zeroclaw"
   rm -rf "$temp_dir"
 
-  info "Installed pre-built binary to $install_dir/zeroclaw"
+  step_ok "Installed pre-built binary to $install_dir/zeroclaw"
   if [[ ":$PATH:" != *":$install_dir:"* ]]; then
     warn "$install_dir is not in PATH for this shell."
     warn "Run: export PATH=\"$install_dir:\$PATH\""
@@ -357,8 +425,15 @@ bool_to_word() {
 }
 
 guided_input_stream() {
-  if [[ -t 0 ]]; then
+  # Some constrained containers report interactive stdin (-t 0) but deny
+  # opening /dev/stdin directly. Probe readability before selecting it.
+  if [[ -t 0 ]] && (: </dev/stdin) 2>/dev/null; then
     echo "/dev/stdin"
+    return 0
+  fi
+
+  if [[ -t 0 ]] && (: </proc/self/fd/0) 2>/dev/null; then
+    echo "/proc/self/fd/0"
     return 0
   fi
 
@@ -428,16 +503,16 @@ prompt_yes_no() {
 }
 
 install_system_deps() {
-  info "Installing system dependencies"
+  step_dot "Installing system dependencies"
 
   case "$(uname -s)" in
     Linux)
       if have_cmd apk; then
         find_missing_alpine_prereqs
         if [[ ${#ALPINE_MISSING_PKGS[@]} -eq 0 ]]; then
-          info "Alpine prerequisites already installed"
+          step_ok "Alpine prerequisites already installed"
         else
-          info "Installing Alpine prerequisites: ${ALPINE_MISSING_PKGS[*]}"
+          step_dot "Installing Alpine prerequisites: ${ALPINE_MISSING_PKGS[*]}"
           run_privileged apk add --no-cache "${ALPINE_MISSING_PKGS[@]}"
         fi
       elif have_cmd apt-get; then
@@ -464,13 +539,15 @@ install_system_deps() {
           openssl \
           perl \
           ca-certificates
+      elif have_cmd pkg && [[ -n "${TERMUX_VERSION:-}" ]]; then
+        pkg install -y build-essential pkg-config git curl openssl perl
       else
         warn "Unsupported Linux distribution. Install compiler toolchain + pkg-config + git + curl + OpenSSL headers + perl manually."
       fi
       ;;
     Darwin)
       if ! xcode-select -p >/dev/null 2>&1; then
-        info "Installing Xcode Command Line Tools"
+        step_dot "Installing Xcode Command Line Tools"
         xcode-select --install || true
         cat <<'MSG'
 Please complete the Xcode Command Line Tools installation dialog,
@@ -490,7 +567,7 @@ MSG
 
 install_rust_toolchain() {
   if have_cmd cargo && have_cmd rustc; then
-    info "Rust already installed: $(rustc --version)"
+    step_ok "Rust already installed: $(rustc --version)"
     return
   fi
 
@@ -499,7 +576,7 @@ install_rust_toolchain() {
     exit 1
   fi
 
-  info "Installing Rust via rustup"
+  step_dot "Installing Rust via rustup"
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
   if [[ -f "$HOME/.cargo/env" ]]; then
@@ -514,11 +591,98 @@ install_rust_toolchain() {
   fi
 }
 
+prompt_provider() {
+  local provider_input=""
+  echo
+  echo -e "  ${BOLD}Select your AI provider${RESET}"
+  echo -e "  ${DIM}(press Enter for default: ${PROVIDER})${RESET}"
+  echo
+  echo -e "  ${BOLD_BLUE}1)${RESET} OpenRouter ${DIM}(recommended — multi-model gateway)${RESET}"
+  echo -e "  ${BOLD_BLUE}2)${RESET} Anthropic ${DIM}(Claude)${RESET}"
+  echo -e "  ${BOLD_BLUE}3)${RESET} OpenAI ${DIM}(GPT)${RESET}"
+  echo -e "  ${BOLD_BLUE}4)${RESET} Gemini ${DIM}(Google)${RESET}"
+  echo -e "  ${BOLD_BLUE}5)${RESET} Ollama ${DIM}(local, no API key needed)${RESET}"
+  echo -e "  ${BOLD_BLUE}6)${RESET} Groq ${DIM}(fast inference)${RESET}"
+  echo -e "  ${BOLD_BLUE}7)${RESET} Venice ${DIM}(privacy-focused)${RESET}"
+  echo -e "  ${BOLD_BLUE}8)${RESET} Other ${DIM}(enter provider ID manually)${RESET}"
+  echo
+
+  if ! guided_read provider_input "  Provider [1]: "; then
+    error "input was interrupted."
+    exit 1
+  fi
+
+  case "${provider_input:-1}" in
+    1|"") PROVIDER="openrouter" ;;
+    2) PROVIDER="anthropic" ;;
+    3) PROVIDER="openai" ;;
+    4) PROVIDER="gemini" ;;
+    5) PROVIDER="ollama" ;;
+    6) PROVIDER="groq" ;;
+    7) PROVIDER="venice" ;;
+    8)
+      if ! guided_read provider_input "  Provider ID: "; then
+        error "input was interrupted."
+        exit 1
+      fi
+      if [[ -n "$provider_input" ]]; then
+        PROVIDER="$provider_input"
+      fi
+      ;;
+    *) PROVIDER="openrouter" ;;
+  esac
+}
+
+prompt_api_key() {
+  local api_key_input=""
+
+  if [[ "$PROVIDER" == "ollama" ]]; then
+    step_ok "Ollama selected — no API key required"
+    return 0
+  fi
+
+  echo
+  if [[ -n "$API_KEY" ]]; then
+    step_ok "API key provided via environment/flag"
+    return 0
+  fi
+
+  echo -e "  ${BOLD}Enter your ${PROVIDER} API key${RESET}"
+  echo -e "  ${DIM}(input is hidden; leave empty to configure later)${RESET}"
+  echo
+
+  if ! guided_read api_key_input "  API key: " true; then
+    echo
+    error "input was interrupted."
+    exit 1
+  fi
+  echo
+
+  if [[ -n "$api_key_input" ]]; then
+    API_KEY="$api_key_input"
+    step_ok "API key set"
+  else
+    warn "No API key entered — you can configure it later with zeroclaw onboard"
+    SKIP_ONBOARD=true
+  fi
+}
+
+prompt_model() {
+  local model_input=""
+
+  echo -e "  ${DIM}Model (press Enter for provider default):${RESET}"
+  if ! guided_read model_input "  Model [default]: "; then
+    error "input was interrupted."
+    exit 1
+  fi
+
+  if [[ -n "$model_input" ]]; then
+    MODEL="$model_input"
+  fi
+}
+
 run_guided_installer() {
   local os_name="$1"
-  local provider_input=""
-  local model_input=""
-  local api_key_input=""
 
   if ! guided_input_stream >/dev/null; then
     error "guided installer requires an interactive terminal."
@@ -527,10 +691,11 @@ run_guided_installer() {
   fi
 
   echo
-  echo "ZeroClaw guided installer"
-  echo "Answer a few questions, then the installer will run automatically."
+  echo -e "  ${BOLD_BLUE}${CRAB} ZeroClaw Guided Installer${RESET}"
+  echo -e "  ${DIM}Answer a few questions, then the installer will handle everything.${RESET}"
   echo
 
+  # --- System dependencies ---
   if [[ "$os_name" == "Linux" ]]; then
     if prompt_yes_no "Install Linux build dependencies (toolchain/pkg-config/git/curl)?" "yes"; then
       INSTALL_SYSTEM_DEPS=true
@@ -541,89 +706,34 @@ run_guided_installer() {
     fi
   fi
 
+  # --- Rust toolchain ---
   if have_cmd cargo && have_cmd rustc; then
-    info "Detected Rust toolchain: $(rustc --version)"
+    step_ok "Detected Rust toolchain: $(rustc --version)"
   else
     if prompt_yes_no "Rust toolchain not found. Install Rust via rustup now?" "yes"; then
       INSTALL_RUST=true
     fi
   fi
 
-  if prompt_yes_no "Run a separate prebuild before install?" "yes"; then
-    SKIP_BUILD=false
-  else
-    SKIP_BUILD=true
-  fi
+  # --- Provider + API key (inline onboarding) ---
+  prompt_provider
+  prompt_api_key
+  prompt_model
 
-  if prompt_yes_no "Install zeroclaw into cargo bin now?" "yes"; then
-    SKIP_INSTALL=false
-  else
-    SKIP_INSTALL=true
-  fi
-
-  if prompt_yes_no "Run onboarding after install?" "no"; then
-    RUN_ONBOARD=true
-    if prompt_yes_no "Use interactive onboarding?" "yes"; then
-      INTERACTIVE_ONBOARD=true
-    else
-      INTERACTIVE_ONBOARD=false
-      if ! guided_read provider_input "Provider [$PROVIDER]: "; then
-        error "guided installer input was interrupted."
-        exit 1
-      fi
-      if [[ -n "$provider_input" ]]; then
-        PROVIDER="$provider_input"
-      fi
-
-      if ! guided_read model_input "Model [${MODEL:-leave empty}]: "; then
-        error "guided installer input was interrupted."
-        exit 1
-      fi
-      if [[ -n "$model_input" ]]; then
-        MODEL="$model_input"
-      fi
-
-      if [[ -z "$API_KEY" ]]; then
-        if ! guided_read api_key_input "API key (hidden, leave empty to switch to interactive onboarding): " true; then
-          echo
-          error "guided installer input was interrupted."
-          exit 1
-        fi
-        echo
-        if [[ -n "$api_key_input" ]]; then
-          API_KEY="$api_key_input"
-        else
-          warn "No API key entered. Using interactive onboarding instead."
-          INTERACTIVE_ONBOARD=true
-        fi
-      fi
-    fi
-  fi
-
+  # --- Install plan summary ---
   echo
-  info "Installer plan"
-  local install_binary=true
-  local build_first=false
-  if [[ "$SKIP_INSTALL" == true ]]; then
-    install_binary=false
+  echo -e "${BOLD}Install plan${RESET}"
+  step_dot "OS: $(echo "$os_name" | tr '[:upper:]' '[:lower:]')"
+  step_dot "Install system deps: $(bool_to_word "$INSTALL_SYSTEM_DEPS")"
+  step_dot "Install Rust: $(bool_to_word "$INSTALL_RUST")"
+  step_dot "Provider: ${PROVIDER}"
+  if [[ -n "$MODEL" ]]; then
+    step_dot "Model: ${MODEL}"
   fi
-  if [[ "$SKIP_BUILD" == false ]]; then
-    build_first=true
-  fi
-  echo "    docker-mode: $(bool_to_word "$DOCKER_MODE")"
-  echo "    install-system-deps: $(bool_to_word "$INSTALL_SYSTEM_DEPS")"
-  echo "    install-rust: $(bool_to_word "$INSTALL_RUST")"
-  echo "    build-first: $(bool_to_word "$build_first")"
-  echo "    install-binary: $(bool_to_word "$install_binary")"
-  echo "    onboard: $(bool_to_word "$RUN_ONBOARD")"
-  if [[ "$RUN_ONBOARD" == true ]]; then
-    echo "    interactive-onboard: $(bool_to_word "$INTERACTIVE_ONBOARD")"
-    if [[ "$INTERACTIVE_ONBOARD" == false ]]; then
-      echo "    provider: $PROVIDER"
-      if [[ -n "$MODEL" ]]; then
-        echo "    model: $MODEL"
-      fi
-    fi
+  if [[ -n "$API_KEY" ]]; then
+    step_ok "API key: configured"
+  else
+    step_dot "API key: not set (configure later)"
   fi
 
   echo
@@ -723,42 +833,37 @@ run_docker_bootstrap() {
   info "Container CLI: $CONTAINER_CLI"
 
   local onboard_cmd=()
-  if [[ "$INTERACTIVE_ONBOARD" == true ]]; then
-    info "Launching interactive onboarding in container"
-    onboard_cmd=(onboard --interactive)
-  else
-    if [[ -z "$API_KEY" ]]; then
-      cat <<'MSG'
-==> Onboarding requested, but API key not provided.
-Use either:
-  --api-key "sk-..."
-or:
-  ZEROCLAW_API_KEY="sk-..." ./install.sh --docker
-or run interactive:
-  ./install.sh --docker --interactive-onboard
-MSG
-      exit 1
-    fi
+  if [[ "$SKIP_ONBOARD" == true ]]; then
+    info "Skipping onboarding in container"
+    onboard_cmd=()
+  elif [[ -n "$API_KEY" ]]; then
     if [[ -n "$MODEL" ]]; then
-      info "Launching quick onboarding in container (provider: $PROVIDER, model: $MODEL)"
+      info "Configuring provider in container (provider: $PROVIDER, model: $MODEL)"
     else
-      info "Launching quick onboarding in container (provider: $PROVIDER)"
+      info "Configuring provider in container (provider: $PROVIDER)"
     fi
     onboard_cmd=(onboard --api-key "$API_KEY" --provider "$PROVIDER")
     if [[ -n "$MODEL" ]]; then
       onboard_cmd+=(--model "$MODEL")
     fi
+  else
+    info "Launching setup in container"
+    onboard_cmd=(onboard --provider "$PROVIDER")
   fi
 
-  "$CONTAINER_CLI" run --rm -it \
-    "${container_run_namespace_args[@]+"${container_run_namespace_args[@]}"}" \
-    "${container_run_user_args[@]}" \
-    -e HOME=/zeroclaw-data \
-    -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
-    -v "$config_mount" \
-    -v "$workspace_mount" \
-    "$docker_image" \
-    "${onboard_cmd[@]}"
+  if [[ ${#onboard_cmd[@]} -gt 0 ]]; then
+    "$CONTAINER_CLI" run --rm -it \
+      "${container_run_namespace_args[@]+"${container_run_namespace_args[@]}"}" \
+      "${container_run_user_args[@]}" \
+      -e HOME=/zeroclaw-data \
+      -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
+      -v "$config_mount" \
+      -v "$workspace_mount" \
+      "$docker_image" \
+      "${onboard_cmd[@]}"
+  else
+    info "Docker image ready. Run zeroclaw onboard inside the container to configure."
+  fi
 }
 
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
@@ -774,8 +879,7 @@ INSTALL_RUST=false
 PREFER_PREBUILT=false
 PREBUILT_ONLY=false
 FORCE_SOURCE_BUILD=false
-RUN_ONBOARD=false
-INTERACTIVE_ONBOARD=false
+SKIP_ONBOARD=false
 SKIP_BUILD=false
 SKIP_INSTALL=false
 PREBUILT_INSTALLED=false
@@ -818,13 +922,8 @@ while [[ $# -gt 0 ]]; do
       FORCE_SOURCE_BUILD=true
       shift
       ;;
-    --onboard)
-      RUN_ONBOARD=true
-      shift
-      ;;
-    --interactive-onboard)
-      RUN_ONBOARD=true
-      INTERACTIVE_ONBOARD=true
+    --skip-onboard)
+      SKIP_ONBOARD=true
       shift
       ;;
     --api-key)
@@ -955,8 +1054,51 @@ if [[ ! -f "$WORK_DIR/Cargo.toml" ]]; then
   fi
 fi
 
-info "ZeroClaw installer"
-echo "    workspace: $WORK_DIR"
+echo
+echo -e "  ${BOLD_BLUE}${CRAB} ZeroClaw Installer${RESET}"
+echo -e "  ${DIM}Build it, run it, trust it.${RESET}"
+echo
+step_ok "Detected: ${BOLD}$(echo "$OS_NAME" | tr '[:upper:]' '[:lower:]')${RESET}"
+
+# --- Detect existing installation and version ---
+EXISTING_VERSION=""
+INSTALL_MODE="fresh"
+if have_cmd zeroclaw; then
+  EXISTING_VERSION="$(zeroclaw --version 2>/dev/null | awk '{print $NF}' || true)"
+  INSTALL_MODE="upgrade"
+elif [[ -x "$HOME/.cargo/bin/zeroclaw" ]]; then
+  EXISTING_VERSION="$("$HOME/.cargo/bin/zeroclaw" --version 2>/dev/null | awk '{print $NF}' || true)"
+  INSTALL_MODE="upgrade"
+fi
+
+# Determine install method
+if [[ "$DOCKER_MODE" == true ]]; then
+  INSTALL_METHOD="docker"
+elif [[ "$PREBUILT_ONLY" == true || "$PREFER_PREBUILT" == true ]]; then
+  INSTALL_METHOD="prebuilt binary"
+else
+  INSTALL_METHOD="source (cargo)"
+fi
+
+# Determine target version from Cargo.toml
+TARGET_VERSION=""
+if [[ -f "$WORK_DIR/Cargo.toml" ]]; then
+  TARGET_VERSION="$(grep -m1 '^version' "$WORK_DIR/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/' || true)"
+fi
+
+echo
+echo -e "${BOLD}Install plan${RESET}"
+step_dot "OS: $(echo "$OS_NAME" | tr '[:upper:]' '[:lower:]')"
+step_dot "Install method: ${INSTALL_METHOD}"
+if [[ -n "$TARGET_VERSION" ]]; then
+  step_dot "Requested version: v${TARGET_VERSION}"
+fi
+step_dot "Workspace: $WORK_DIR"
+if [[ "$INSTALL_MODE" == "upgrade" && -n "$EXISTING_VERSION" ]]; then
+  step_dot "Existing ZeroClaw installation detected, upgrading from v${EXISTING_VERSION}"
+elif [[ "$INSTALL_MODE" == "upgrade" ]]; then
+  step_dot "Existing ZeroClaw installation detected, upgrading"
+fi
 
 cd "$WORK_DIR"
 
@@ -971,26 +1113,21 @@ fi
 
 if [[ "$DOCKER_MODE" == true ]]; then
   ensure_docker_ready
-  if [[ "$RUN_ONBOARD" == false ]]; then
-    RUN_ONBOARD=true
-    if [[ -z "$API_KEY" ]]; then
-      INTERACTIVE_ONBOARD=true
-    fi
-  fi
   run_docker_bootstrap
-  cat <<'DONE'
-
-✅ Docker bootstrap complete.
-
-Your containerized ZeroClaw data is persisted under:
-DONE
-  echo "  $DOCKER_DATA_DIR"
-  cat <<'DONE'
-
-Next steps:
-  ./install.sh --docker --interactive-onboard
-  ./install.sh --docker --api-key "sk-..." --provider openrouter
-DONE
+  echo
+  echo -e "${BOLD_BLUE}${CRAB} Docker bootstrap complete!${RESET}"
+  echo
+  echo -e "${BOLD}Your containerized ZeroClaw data is persisted under:${RESET}"
+  echo -e "  ${DIM}$DOCKER_DATA_DIR${RESET}"
+  echo
+  echo -e "${BOLD}Dashboard URL:${RESET} ${BLUE}http://127.0.0.1:42617${RESET}"
+  echo
+  echo -e "${BOLD}Next steps:${RESET}"
+  echo -e "  ${DIM}zeroclaw status${RESET}"
+  echo -e "  ${DIM}zeroclaw agent -m \"Hello, ZeroClaw!\"${RESET}"
+  echo -e "  ${DIM}zeroclaw gateway${RESET}"
+  echo
+  echo -e "${BOLD}Docs:${RESET} ${BLUE}https://www.zeroclawlabs.ai/docs${RESET}"
   exit 0
 fi
 
@@ -1027,18 +1164,56 @@ MSG
   exit 1
 fi
 
-if [[ "$SKIP_BUILD" == false ]]; then
-  info "Building release binary"
-  cargo build --release --locked
+echo
+echo -e "${BOLD_BLUE}[1/3]${RESET} ${BOLD}Preparing environment${RESET}"
+if [[ "$INSTALL_SYSTEM_DEPS" == true ]]; then
+  step_ok "System dependencies installed"
 else
-  info "Skipping build"
+  step_ok "System dependencies satisfied"
+fi
+if have_cmd cargo && have_cmd rustc; then
+  step_ok "Rust $(rustc --version | awk '{print $2}') found"
+  step_dot "Active Rust: $(rustc --version) ($(command -v rustc))"
+  step_dot "Active cargo: $(cargo --version | awk '{print $2}') ($(command -v cargo))"
+else
+  step_dot "Rust not detected"
+fi
+if have_cmd git; then
+  step_ok "Git already installed"
+else
+  step_dot "Git not found"
+fi
+
+echo
+echo -e "${BOLD_BLUE}[2/3]${RESET} ${BOLD}Installing ZeroClaw${RESET}"
+if [[ -n "$TARGET_VERSION" ]]; then
+  step_dot "Installing ZeroClaw v${TARGET_VERSION}"
+fi
+if [[ "$SKIP_BUILD" == false ]]; then
+  step_dot "Building release binary"
+  cargo build --release --locked
+  step_ok "Release binary built"
+else
+  step_dot "Skipping build"
 fi
 
 if [[ "$SKIP_INSTALL" == false ]]; then
-  info "Installing zeroclaw to cargo bin"
+  step_dot "Installing zeroclaw to cargo bin"
+
+  # Clean up stale cargo install tracking from the old "zeroclaw" package name
+  # (renamed to "zeroclawlabs"). Without this, `cargo install zeroclawlabs` from
+  # crates.io fails with "binary already exists as part of `zeroclaw`".
+  if have_cmd cargo; then
+    if [[ -f "$HOME/.cargo/.crates.toml" ]] && grep -q '^"zeroclaw ' "$HOME/.cargo/.crates.toml" 2>/dev/null; then
+      step_dot "Removing stale cargo tracking for old 'zeroclaw' package name"
+      cargo uninstall zeroclaw 2>/dev/null || true
+    fi
+  fi
+
   cargo install --path "$WORK_DIR" --force --locked
+  step_ok "ZeroClaw installed"
 else
-  info "Skipping install"
+  step_dot "Skipping install"
 fi
 
 ZEROCLAW_BIN=""
@@ -1050,48 +1225,149 @@ elif [[ -x "$WORK_DIR/target/release/zeroclaw" ]]; then
   ZEROCLAW_BIN="$WORK_DIR/target/release/zeroclaw"
 fi
 
-if [[ "$RUN_ONBOARD" == true ]]; then
-  if [[ -z "$ZEROCLAW_BIN" ]]; then
-    error "onboarding requested but zeroclaw binary is not available."
-    error "Run without --skip-install, or ensure zeroclaw is in PATH."
-    exit 1
-  fi
+echo
+echo -e "${BOLD_BLUE}[3/3]${RESET} ${BOLD}Finalizing setup${RESET}"
 
-  if [[ "$INTERACTIVE_ONBOARD" == true ]]; then
-    info "Running interactive onboarding"
-    "$ZEROCLAW_BIN" onboard --interactive
-  else
-    if [[ -z "$API_KEY" ]]; then
-      cat <<'MSG'
-==> Onboarding requested, but API key not provided.
-Use either:
-  --api-key "sk-..."
-or:
-  ZEROCLAW_API_KEY="sk-..." ./install.sh --onboard
-or run interactive:
-  ./install.sh --interactive-onboard
-MSG
-      exit 1
-    fi
-    if [[ -n "$MODEL" ]]; then
-      info "Running quick onboarding (provider: $PROVIDER, model: $MODEL)"
-    else
-      info "Running quick onboarding (provider: $PROVIDER)"
-    fi
+# --- Inline onboarding (provider + API key configuration) ---
+if [[ "$SKIP_ONBOARD" == false && -n "$ZEROCLAW_BIN" ]]; then
+  if [[ -n "$API_KEY" ]]; then
+    step_dot "Configuring provider: ${PROVIDER}"
     ONBOARD_CMD=("$ZEROCLAW_BIN" onboard --api-key "$API_KEY" --provider "$PROVIDER")
     if [[ -n "$MODEL" ]]; then
       ONBOARD_CMD+=(--model "$MODEL")
     fi
-    "${ONBOARD_CMD[@]}"
+    if "${ONBOARD_CMD[@]}" 2>/dev/null; then
+      step_ok "Provider configured"
+    else
+      step_fail "Provider configuration failed — run zeroclaw onboard to retry"
+    fi
+  elif [[ "$PROVIDER" == "ollama" ]]; then
+    step_dot "Configuring Ollama (no API key needed)"
+    if "$ZEROCLAW_BIN" onboard --provider ollama 2>/dev/null; then
+      step_ok "Ollama configured"
+    else
+      step_fail "Ollama configuration failed — run zeroclaw onboard to retry"
+    fi
+  else
+    # No API key and not ollama — prompt inline if interactive, skip otherwise
+    if [[ -t 0 && -t 1 ]]; then
+      prompt_provider
+      prompt_api_key
+      if [[ -n "$API_KEY" ]]; then
+        ONBOARD_CMD=("$ZEROCLAW_BIN" onboard --api-key "$API_KEY" --provider "$PROVIDER")
+        if [[ -n "$MODEL" ]]; then
+          ONBOARD_CMD+=(--model "$MODEL")
+        fi
+        if "${ONBOARD_CMD[@]}" 2>/dev/null; then
+          step_ok "Provider configured"
+        else
+          step_fail "Provider configuration failed — run zeroclaw onboard to retry"
+        fi
+      fi
+    else
+      step_dot "No API key provided — run zeroclaw onboard to configure"
+    fi
+  fi
+elif [[ "$SKIP_ONBOARD" == true ]]; then
+  step_dot "Skipping configuration (run zeroclaw onboard later)"
+elif [[ -z "$ZEROCLAW_BIN" ]]; then
+  warn "ZeroClaw binary not found — cannot configure provider"
+fi
+
+# --- Gateway service management ---
+if [[ -n "$ZEROCLAW_BIN" ]]; then
+  # Try to install and start the gateway service
+  step_dot "Checking gateway service"
+  if "$ZEROCLAW_BIN" service install 2>/dev/null; then
+    step_ok "Gateway service installed"
+    if "$ZEROCLAW_BIN" service restart 2>/dev/null; then
+      step_ok "Gateway service restarted"
+    else
+      step_fail "Gateway service restart failed — re-run with zeroclaw service start"
+    fi
+  else
+    step_dot "Gateway service not installed (run zeroclaw service install later)"
+  fi
+
+  # --- Post-install doctor check ---
+  step_dot "Running doctor to validate installation"
+  if "$ZEROCLAW_BIN" doctor 2>/dev/null; then
+    step_ok "Doctor complete"
+  else
+    warn "Doctor reported issues — run zeroclaw doctor --fix to resolve"
   fi
 fi
 
-cat <<'DONE'
+# --- Determine installed version ---
+INSTALLED_VERSION=""
+if [[ -n "$ZEROCLAW_BIN" ]]; then
+  INSTALLED_VERSION="$("$ZEROCLAW_BIN" --version 2>/dev/null | awk '{print $NF}' || true)"
+fi
 
-✅ Bootstrap complete.
+# --- Success banner ---
+echo
+if [[ -n "$INSTALLED_VERSION" ]]; then
+  echo -e "${BOLD_BLUE}${CRAB} ZeroClaw installed successfully (ZeroClaw ${INSTALLED_VERSION})!${RESET}"
+else
+  echo -e "${BOLD_BLUE}${CRAB} ZeroClaw installed successfully!${RESET}"
+fi
 
-Next steps:
-  zeroclaw status
-  zeroclaw agent -m "Hello, ZeroClaw!"
-  zeroclaw gateway
-DONE
+if [[ "$INSTALL_MODE" == "upgrade" ]]; then
+  step_dot "Upgrade complete"
+fi
+
+# --- Dashboard URL ---
+GATEWAY_PORT=42617
+DASHBOARD_URL="http://127.0.0.1:${GATEWAY_PORT}"
+echo
+echo -e "${BOLD}Dashboard URL:${RESET} ${BLUE}${DASHBOARD_URL}${RESET}"
+echo -e "${DIM}  Enter the pairing code shown above to connect.${RESET}"
+
+# --- Copy to clipboard ---
+COPIED_TO_CLIPBOARD=false
+if [[ -t 1 ]]; then
+  case "$OS_NAME" in
+    Darwin)
+      if have_cmd pbcopy; then
+        printf '%s' "$DASHBOARD_URL" | pbcopy 2>/dev/null && COPIED_TO_CLIPBOARD=true
+      fi
+      ;;
+    Linux)
+      if have_cmd xclip; then
+        printf '%s' "$DASHBOARD_URL" | xclip -selection clipboard 2>/dev/null && COPIED_TO_CLIPBOARD=true
+      elif have_cmd xsel; then
+        printf '%s' "$DASHBOARD_URL" | xsel --clipboard 2>/dev/null && COPIED_TO_CLIPBOARD=true
+      elif have_cmd wl-copy; then
+        printf '%s' "$DASHBOARD_URL" | wl-copy 2>/dev/null && COPIED_TO_CLIPBOARD=true
+      fi
+      ;;
+  esac
+fi
+if [[ "$COPIED_TO_CLIPBOARD" == true ]]; then
+  step_ok "Copied to clipboard"
+fi
+
+# --- Open in browser ---
+if [[ -t 1 ]]; then
+  case "$OS_NAME" in
+    Darwin)
+      if have_cmd open; then
+        open "$DASHBOARD_URL" 2>/dev/null && step_ok "Opened in your browser"
+      fi
+      ;;
+    Linux)
+      if have_cmd xdg-open; then
+        xdg-open "$DASHBOARD_URL" 2>/dev/null && step_ok "Opened in your browser"
+      fi
+      ;;
+  esac
+fi
+
+echo
+echo -e "${BOLD}Next steps:${RESET}"
+echo -e "  ${DIM}zeroclaw status${RESET}"
+echo -e "  ${DIM}zeroclaw agent -m \"Hello, ZeroClaw!\"${RESET}"
+echo -e "  ${DIM}zeroclaw gateway${RESET}"
+echo
+echo -e "${BOLD}Docs:${RESET} ${BLUE}https://www.zeroclawlabs.ai/docs${RESET}"
+echo

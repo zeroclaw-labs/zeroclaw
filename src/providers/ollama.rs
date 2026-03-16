@@ -27,7 +27,7 @@ struct ChatRequest {
     tools: Option<Vec<serde_json::Value>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct Message {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,14 +40,14 @@ struct Message {
     tool_name: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct OutgoingToolCall {
     #[serde(rename = "type")]
     kind: String,
     function: OutgoingFunction,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct OutgoingFunction {
     name: String,
     arguments: serde_json::Value,
@@ -89,10 +89,26 @@ struct OllamaToolCall {
 #[derive(Debug, Deserialize)]
 struct OllamaFunction {
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_args")]
     arguments: serde_json::Value,
 }
 
+// ─── serde Helpers ───────────────────────────────────────────────────────────
+fn deserialize_args<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+
+    if let Some(s) = value.as_str() {
+        match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(v) => Ok(v),
+            Err(_) => Ok(serde_json::json!({})),
+        }
+    } else {
+        Ok(value)
+    }
+}
 // ─── Implementation ───────────────────────────────────────────────────────────
 
 impl OllamaProvider {
@@ -259,12 +275,30 @@ impl OllamaProvider {
         temperature: f64,
         tools: Option<&[serde_json::Value]>,
     ) -> ChatRequest {
+        self.build_chat_request_with_think(
+            messages,
+            model,
+            temperature,
+            tools,
+            self.reasoning_enabled,
+        )
+    }
+
+    /// Build a chat request with an explicit `think` value.
+    fn build_chat_request_with_think(
+        &self,
+        messages: Vec<Message>,
+        model: &str,
+        temperature: f64,
+        tools: Option<&[serde_json::Value]>,
+        think: Option<bool>,
+    ) -> ChatRequest {
         ChatRequest {
             model: model.to_string(),
             messages,
             stream: false,
             options: Options { temperature },
-            think: self.reasoning_enabled,
+            think,
             tools: tools.map(|t| t.to_vec()),
         }
     }
@@ -396,17 +430,18 @@ impl OllamaProvider {
             .collect()
     }
 
-    /// Send a request to Ollama and get the parsed response.
-    /// Pass `tools` to enable native function-calling for models that support it.
-    async fn send_request(
+    /// Send a single HTTP request to Ollama and parse the response.
+    async fn send_request_inner(
         &self,
-        messages: Vec<Message>,
+        messages: &[Message],
         model: &str,
         temperature: f64,
         should_auth: bool,
         tools: Option<&[serde_json::Value]>,
+        think: Option<bool>,
     ) -> anyhow::Result<ApiChatResponse> {
-        let request = self.build_chat_request(messages, model, temperature, tools);
+        let request =
+            self.build_chat_request_with_think(messages.to_vec(), model, temperature, tools, think);
 
         let url = format!("{}/api/chat", self.base_url);
 
@@ -464,6 +499,59 @@ impl OllamaProvider {
         };
 
         Ok(chat_response)
+    }
+
+    /// Send a request to Ollama and get the parsed response.
+    /// Pass `tools` to enable native function-calling for models that support it.
+    ///
+    /// When `reasoning_enabled` (`think`) is set to `true`, the first request
+    /// includes `think: true`.  If that request fails (the model may not support
+    /// the `think` parameter), we automatically retry once with `think` omitted
+    /// so the call succeeds instead of entering an infinite retry loop.
+    async fn send_request(
+        &self,
+        messages: Vec<Message>,
+        model: &str,
+        temperature: f64,
+        should_auth: bool,
+        tools: Option<&[serde_json::Value]>,
+    ) -> anyhow::Result<ApiChatResponse> {
+        let result = self
+            .send_request_inner(
+                &messages,
+                model,
+                temperature,
+                should_auth,
+                tools,
+                self.reasoning_enabled,
+            )
+            .await;
+
+        match result {
+            Ok(resp) => Ok(resp),
+            Err(first_err) if self.reasoning_enabled == Some(true) => {
+                tracing::warn!(
+                    model = model,
+                    error = %first_err,
+                    "Ollama request failed with think=true; retrying without reasoning \
+                     (model may not support it)"
+                );
+                // Retry with think omitted from the request entirely.
+                self.send_request_inner(&messages, model, temperature, should_auth, tools, None)
+                    .await
+                    .map_err(|retry_err| {
+                        // Both attempts failed — return the original error for clarity.
+                        tracing::error!(
+                            model = model,
+                            original_error = %first_err,
+                            retry_error = %retry_err,
+                            "Ollama request also failed without think; returning original error"
+                        );
+                        first_err
+                    })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Convert Ollama tool calls to the JSON format expected by parse_tool_calls in loop_.rs
