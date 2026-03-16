@@ -60,6 +60,7 @@ pub mod report_templates;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
+pub mod security_ops;
 pub mod shell;
 pub mod swarm;
 pub mod tool_search;
@@ -111,6 +112,7 @@ pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
+pub use security_ops::SecurityOpsTool;
 pub use shell::ShellTool;
 pub use swarm::SwarmTool;
 pub use tool_search::ToolSearchTool;
@@ -372,6 +374,13 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(ProjectIntelTool::new(
             root_config.project_intel.default_language.clone(),
             root_config.project_intel.risk_sensitivity.clone(),
+        )));
+    }
+
+    // MCSS Security Operations
+    if root_config.security_ops.enabled {
+        tool_arcs.push(Arc::new(SecurityOpsTool::new(
+            root_config.security_ops.clone(),
         )));
     }
 

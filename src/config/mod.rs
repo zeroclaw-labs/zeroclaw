@@ -18,10 +18,10 @@ pub use schema::{
     PeripheralBoardConfig, PeripheralsConfig, ProjectIntelConfig, ProxyConfig, ProxyScope,
     QdrantConfig, QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig,
     RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,
-    SkillsConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
-    StorageProviderSection, StreamMode, SwarmConfig, SwarmStrategy, TelegramConfig,
-    ToolFilterGroup, ToolFilterGroupMode, TranscriptionConfig, TtsConfig, TunnelConfig,
-    WebFetchConfig, WebSearchConfig, WebhookConfig, WorkspaceConfig,
+    SecurityOpsConfig, SkillsConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig,
+    StorageProviderConfig, StorageProviderSection, StreamMode, SwarmConfig, SwarmStrategy,
+    TelegramConfig, ToolFilterGroup, ToolFilterGroupMode, TranscriptionConfig, TtsConfig,
+    TunnelConfig, WebFetchConfig, WebSearchConfig, WebhookConfig, WorkspaceConfig,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
