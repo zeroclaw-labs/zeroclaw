@@ -199,7 +199,10 @@ mod tests {
     #[tokio::test]
     async fn default_loader_formats_context() {
         let loader = DefaultMemoryLoader::default();
-        let context = loader.load_context(&MockMemory, "hello", None).await.unwrap();
+        let context = loader
+            .load_context(&MockMemory, "hello", None)
+            .await
+            .unwrap();
         assert!(context.contains("[Memory context]"));
         assert!(context.contains("- k: v"));
     }

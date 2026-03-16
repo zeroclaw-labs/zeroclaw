@@ -1270,7 +1270,12 @@ async fn handle_whatsapp_message(
                 .await;
         }
 
-        match Box::pin(run_gateway_chat_with_tools(&state, &msg.content, Some(&session_id))).await
+        match Box::pin(run_gateway_chat_with_tools(
+            &state,
+            &msg.content,
+            Some(&session_id),
+        ))
+        .await
         {
             Ok(response) => {
                 // Send reply via WhatsApp
@@ -1385,7 +1390,12 @@ async fn handle_linq_webhook(
         }
 
         // Call the LLM
-        match Box::pin(run_gateway_chat_with_tools(&state, &msg.content, Some(&session_id))).await
+        match Box::pin(run_gateway_chat_with_tools(
+            &state,
+            &msg.content,
+            Some(&session_id),
+        ))
+        .await
         {
             Ok(response) => {
                 // Send reply via Linq
@@ -1484,7 +1494,12 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
         }
 
         // Call the LLM
-        match Box::pin(run_gateway_chat_with_tools(&state, &msg.content, Some(&session_id))).await
+        match Box::pin(run_gateway_chat_with_tools(
+            &state,
+            &msg.content,
+            Some(&session_id),
+        ))
+        .await
         {
             Ok(response) => {
                 // Send reply via WATI
@@ -1595,7 +1610,12 @@ async fn handle_nextcloud_talk_webhook(
                 .await;
         }
 
-        match Box::pin(run_gateway_chat_with_tools(&state, &msg.content, Some(&session_id))).await
+        match Box::pin(run_gateway_chat_with_tools(
+            &state,
+            &msg.content,
+            Some(&session_id),
+        ))
+        .await
         {
             Ok(response) => {
                 if let Err(e) = nextcloud_talk
