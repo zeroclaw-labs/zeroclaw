@@ -122,31 +122,36 @@ pub struct Config {
 
     /// Security subsystem configuration (`[security]`).
     #[serde(default)]
+    pub security: SecurityConfig,
+
     /// Backup tool configuration (`[backup]`).
+    #[serde(default)]
     pub backup: BackupConfig,
 
     /// Security subsystem configuration (`[security]`).
     #[serde(default)]
     /// Data retention and purge configuration (`[data_retention]`).
+    #[serde(default)]
     pub data_retention: DataRetentionConfig,
 
     /// Security subsystem configuration (`[security]`).
     #[serde(default)]
     /// Cloud transformation accelerator configuration (`[cloud_ops]`).
+    #[serde(default)]
     pub cloud_ops: CloudOpsConfig,
 
     /// Security subsystem configuration (`[security]`).
     #[serde(default)]
     /// Conversational AI agent builder configuration (`[conversational_ai]`).
+    #[serde(default)]
     pub conversational_ai: ConversationalAiConfig,
 
     /// Security subsystem configuration (`[security]`).
     #[serde(default)]
     pub security: SecurityConfig,
 
-    /// Security subsystem configuration (`[security]`).
-    #[serde(default)]
     /// Managed cybersecurity service configuration (`[security_ops]`).
+    #[serde(default)]
     pub security_ops: SecurityOpsConfig,
 
     /// Runtime adapter configuration (`[runtime]`). Controls native vs Docker execution.
