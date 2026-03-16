@@ -179,6 +179,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         mcp: crate::config::McpConfig::default(),
         nodes: crate::config::NodesConfig::default(),
         workspace: crate::config::WorkspaceConfig::default(),
+        notion: crate::config::NotionConfig::default(),
     };
 
     println!(
@@ -538,6 +539,7 @@ async fn run_quick_setup_with_home(
         mcp: crate::config::McpConfig::default(),
         nodes: crate::config::NodesConfig::default(),
         workspace: crate::config::WorkspaceConfig::default(),
+        notion: crate::config::NotionConfig::default(),
     };
 
     config.save().await?;
