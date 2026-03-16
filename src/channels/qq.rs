@@ -242,6 +242,18 @@ impl QQChannel {
     }
 }
 
+fn is_markdown_content(content: &str) -> bool {
+    // Check for common markdown patterns
+    content.contains("**")
+        || content.contains("__")
+        || content.contains("* ")
+        || content.contains("# ")
+        || content.contains("```")
+        || content.contains("`")
+        || content.contains("[")
+        || content.contains("]")
+}
+
 #[async_trait]
 impl Channel for QQChannel {
     fn name(&self) -> &str {
@@ -251,15 +263,27 @@ impl Channel for QQChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let token = self.get_token().await?;
 
+        // Check if content contains markdown syntax
+        let is_markdown = is_markdown_content(&message.content);
+
         // Determine if this is a group or private message based on recipient format
         // Format: "user:{openid}" or "group:{group_openid}"
         let (url, body) = if let Some(group_id) = message.recipient.strip_prefix("group:") {
             (
                 format!("{QQ_API_BASE}/v2/groups/{group_id}/messages"),
-                json!({
-                    "content": &message.content,
-                    "msg_type": 0,
-                }),
+                if is_markdown {
+                    json!({
+                        "markdown": {
+                            "content": &message.content
+                        },
+                        "msg_type": 2,
+                    })
+                } else {
+                    json!({
+                        "content": &message.content,
+                        "msg_type": 0,
+                    })
+                },
             )
         } else {
             let raw_uid = message
@@ -272,10 +296,19 @@ impl Channel for QQChannel {
                 .collect();
             (
                 format!("{QQ_API_BASE}/v2/users/{user_id}/messages"),
-                json!({
-                    "content": &message.content,
-                    "msg_type": 0,
-                }),
+                if is_markdown {
+                    json!({
+                        "markdown": {
+                            "content": &message.content
+                        },
+                        "msg_type": 2,
+                    })
+                } else {
+                    json!({
+                        "content": &message.content,
+                        "msg_type": 0,
+                    })
+                },
             )
         };
 
