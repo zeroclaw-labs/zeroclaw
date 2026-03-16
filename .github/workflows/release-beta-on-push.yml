@@ -189,6 +189,8 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         if: runner.os != 'Windows'
+        with:
+          prefix-key: ${{ matrix.os }}-${{ matrix.target }}
 
       - uses: actions/download-artifact@v4
         with:
