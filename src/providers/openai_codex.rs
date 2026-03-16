@@ -473,6 +473,75 @@ fn extract_stream_error_message(event: &Value) -> Option<String> {
     None
 }
 
+fn append_utf8_stream_chunk(
+    body: &mut String,
+    pending: &mut Vec<u8>,
+    chunk: &[u8],
+) -> anyhow::Result<()> {
+    if pending.is_empty() {
+        if let Ok(text) = std::str::from_utf8(chunk) {
+            body.push_str(text);
+            return Ok(());
+        }
+    }
+
+    if !chunk.is_empty() {
+        pending.extend_from_slice(chunk);
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    match std::str::from_utf8(pending) {
+        Ok(text) => {
+            body.push_str(text);
+            pending.clear();
+            Ok(())
+        }
+        Err(err) => {
+            let valid_up_to = err.valid_up_to();
+            if valid_up_to > 0 {
+                // SAFETY: `valid_up_to` always points to the end of a valid UTF-8 prefix.
+                let prefix = std::str::from_utf8(&pending[..valid_up_to])
+                    .expect("valid UTF-8 prefix from Utf8Error::valid_up_to");
+                body.push_str(prefix);
+                pending.drain(..valid_up_to);
+            }
+
+            if err.error_len().is_some() {
+                return Err(anyhow::anyhow!(
+                    "OpenAI Codex response contained invalid UTF-8: {err}"
+                ));
+            }
+
+            // `error_len == None` means we have a valid prefix and an incomplete
+            // multi-byte sequence at the end; keep it buffered until next chunk.
+            Ok(())
+        }
+    }
+}
+
+fn decode_utf8_stream_chunks<'a, I>(chunks: I) -> anyhow::Result<String>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let mut body = String::new();
+    let mut pending = Vec::new();
+
+    for chunk in chunks {
+        append_utf8_stream_chunk(&mut body, &mut pending, chunk)?;
+    }
+
+    if !pending.is_empty() {
+        let err = std::str::from_utf8(&pending).expect_err("pending bytes should be invalid UTF-8");
+        return Err(anyhow::anyhow!(
+            "OpenAI Codex response ended with incomplete UTF-8: {err}"
+        ));
+    }
+
+    Ok(body)
+}
+
 /// Read the response body incrementally via `bytes_stream()` to avoid
 /// buffering the entire SSE payload in memory.  The previous implementation
 /// used `response.text().await?` which holds the HTTP connection open until
@@ -481,15 +550,21 @@ fn extract_stream_error_message(event: &Value) -> Option<String> {
 /// reported in #3544.
 async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<String> {
     let mut body = String::new();
+    let mut pending_utf8 = Vec::new();
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk
             .map_err(|err| anyhow::anyhow!("error reading OpenAI Codex response stream: {err}"))?;
-        let text = std::str::from_utf8(&bytes).map_err(|err| {
-            anyhow::anyhow!("OpenAI Codex response contained invalid UTF-8: {err}")
-        })?;
-        body.push_str(text);
+        append_utf8_stream_chunk(&mut body, &mut pending_utf8, &bytes)?;
+    }
+
+    if !pending_utf8.is_empty() {
+        let err = std::str::from_utf8(&pending_utf8)
+            .expect_err("pending bytes should be invalid UTF-8 at end of stream");
+        return Err(anyhow::anyhow!(
+            "OpenAI Codex response ended with incomplete UTF-8: {err}"
+        ));
     }
 
     if let Some(text) = parse_sse_text(&body)? {
@@ -899,6 +974,21 @@ data: [DONE]
 "#;
 
         assert_eq!(parse_sse_text(payload).unwrap().as_deref(), Some("Done"));
+    }
+
+    #[test]
+    fn decode_utf8_stream_chunks_handles_multibyte_split_across_chunks() {
+        let payload =
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello 世\"}\n\ndata: [DONE]\n";
+        let bytes = payload.as_bytes();
+        let split_at = payload.find('世').unwrap() + 1;
+
+        let decoded = decode_utf8_stream_chunks([&bytes[..split_at], &bytes[split_at..]]).unwrap();
+        assert_eq!(decoded, payload);
+        assert_eq!(
+            parse_sse_text(&decoded).unwrap().as_deref(),
+            Some("Hello 世")
+        );
     }
 
     #[test]
