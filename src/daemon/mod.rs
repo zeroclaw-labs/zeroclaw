@@ -642,6 +642,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            ack_reaction: true,
         });
 
         let target = resolve_heartbeat_delivery(&config).unwrap();
