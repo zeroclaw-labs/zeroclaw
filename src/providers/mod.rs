@@ -846,7 +846,9 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         // not a single API key. Credential resolution happens inside BedrockProvider.
         "bedrock" | "aws-bedrock" => return None,
         name if is_qianfan_alias(name) => vec!["QIANFAN_API_KEY"],
-        name if is_doubao_alias(name) => vec!["ARK_API_KEY", "DOUBAO_API_KEY"],
+        name if is_doubao_alias(name) => {
+            vec!["ARK_API_KEY", "VOLCENGINE_API_KEY", "DOUBAO_API_KEY"]
+        }
         name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
@@ -2605,6 +2607,14 @@ mod tests {
         let _guard = EnvGuard::set("OSAURUS_API_KEY", Some("osaurus-test-key"));
         let resolved = resolve_provider_credential("osaurus", None);
         assert_eq!(resolved, Some("osaurus-test-key".to_string()));
+    }
+
+    #[test]
+    fn resolve_provider_credential_volcengine_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("VOLCENGINE_API_KEY", Some("volc-test-key"));
+        let resolved = resolve_provider_credential("volcengine", None);
+        assert_eq!(resolved, Some("volc-test-key".to_string()));
     }
 
     // ── Extended ecosystem ───────────────────────────────────
