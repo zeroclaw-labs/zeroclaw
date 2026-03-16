@@ -1,4 +1,5 @@
 /target
+/target-*/
 firmware/*/target
 web/dist/
 *.db
