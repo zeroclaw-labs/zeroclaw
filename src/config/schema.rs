@@ -2650,6 +2650,9 @@ pub struct MemoryConfig {
     /// Max number of cached responses before LRU eviction (default: 5000)
     #[serde(default = "default_response_cache_max")]
     pub response_cache_max_entries: usize,
+    /// Max in-memory hot cache entries for the two-tier response cache (default: 256)
+    #[serde(default = "default_response_cache_hot_entries")]
+    pub response_cache_hot_entries: usize,
 
     // ── Memory Snapshot (soul backup to Markdown) ─────────────
     /// Enable periodic export of core memories to MEMORY_SNAPSHOT.md
@@ -2718,6 +2721,10 @@ fn default_response_cache_max() -> usize {
     5_000
 }
 
+fn default_response_cache_hot_entries() -> usize {
+    256
+}
+
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
@@ -2738,6 +2745,7 @@ impl Default for MemoryConfig {
             response_cache_enabled: false,
             response_cache_ttl_minutes: default_response_cache_ttl(),
             response_cache_max_entries: default_response_cache_max(),
+            response_cache_hot_entries: default_response_cache_hot_entries(),
             snapshot_enabled: false,
             snapshot_on_hygiene: false,
             auto_hydrate: true,

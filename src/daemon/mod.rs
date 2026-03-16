@@ -323,7 +323,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         tracing::info!("💓 Heartbeat Phase 1: skip (nothing to do)");
                         crate::health::mark_component_ok("heartbeat");
                         #[allow(clippy::cast_precision_loss)]
-                let elapsed = tick_start.elapsed().as_millis() as f64;
+                        let elapsed = tick_start.elapsed().as_millis() as f64;
                         metrics.lock().record_success(elapsed);
                         continue;
                     }

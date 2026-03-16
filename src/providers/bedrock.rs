@@ -832,6 +832,7 @@ impl BedrockProvider {
         let usage = response.usage.map(|u| TokenUsage {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
+            cached_input_tokens: None,
         });
 
         if let Some(output) = response.output {
@@ -967,6 +968,7 @@ impl Provider for BedrockProvider {
         ProviderCapabilities {
             native_tool_calling: true,
             vision: true,
+            prompt_caching: false,
         }
     }
 

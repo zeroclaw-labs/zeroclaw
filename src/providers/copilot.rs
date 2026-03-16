@@ -353,6 +353,7 @@ impl CopilotProvider {
         let usage = api_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
+            cached_input_tokens: None,
         });
         let choice = api_response
             .choices

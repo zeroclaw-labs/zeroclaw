@@ -47,6 +47,15 @@ impl Observer for LogObserver {
             ObserverEvent::HeartbeatTick => {
                 info!("heartbeat.tick");
             }
+            ObserverEvent::CacheHit {
+                cache_type,
+                tokens_saved,
+            } => {
+                info!(cache_type = %cache_type, tokens_saved = tokens_saved, "cache.hit");
+            }
+            ObserverEvent::CacheMiss { cache_type } => {
+                info!(cache_type = %cache_type, "cache.miss");
+            }
             ObserverEvent::Error { component, message } => {
                 info!(component = %component, error = %message, "error");
             }

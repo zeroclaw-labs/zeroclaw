@@ -38,6 +38,7 @@ pub struct Agent {
     available_hints: Vec<String>,
     route_model_by_hint: HashMap<String, String>,
     allowed_tools: Option<Vec<String>>,
+    response_cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
 }
 
 pub struct AgentBuilder {
@@ -60,6 +61,7 @@ pub struct AgentBuilder {
     available_hints: Option<Vec<String>>,
     route_model_by_hint: Option<HashMap<String, String>>,
     allowed_tools: Option<Vec<String>>,
+    response_cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
 }
 
 impl AgentBuilder {
@@ -84,6 +86,7 @@ impl AgentBuilder {
             available_hints: None,
             route_model_by_hint: None,
             allowed_tools: None,
+            response_cache: None,
         }
     }
 
@@ -188,6 +191,14 @@ impl AgentBuilder {
         self
     }
 
+    pub fn response_cache(
+        mut self,
+        cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
+    ) -> Self {
+        self.response_cache = cache;
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self
             .tools
@@ -236,6 +247,7 @@ impl AgentBuilder {
             available_hints: self.available_hints.unwrap_or_default(),
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
             allowed_tools: allowed,
+            response_cache: self.response_cache,
         })
     }
 }
@@ -330,11 +342,25 @@ impl Agent {
             .collect();
         let available_hints: Vec<String> = route_model_by_hint.keys().cloned().collect();
 
+        let response_cache = if config.memory.response_cache_enabled {
+            crate::memory::response_cache::ResponseCache::with_hot_cache(
+                &config.workspace_dir,
+                config.memory.response_cache_ttl_minutes,
+                config.memory.response_cache_max_entries,
+                config.memory.response_cache_hot_entries,
+            )
+            .ok()
+            .map(Arc::new)
+        } else {
+            None
+        };
+
         Agent::builder()
             .provider(provider)
             .tools(tools)
             .memory(memory)
             .observer(observer)
+            .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
             .memory_loader(Box::new(DefaultMemoryLoader::new(
                 5,
@@ -513,6 +539,47 @@ impl Agent {
 
         for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+
+            // Response cache: check before LLM call (only for deterministic, text-only prompts)
+            let cache_key = if self.temperature == 0.0 {
+                self.response_cache.as_ref().map(|_| {
+                    let last_user = messages
+                        .iter()
+                        .rfind(|m| m.role == "user")
+                        .map(|m| m.content.as_str())
+                        .unwrap_or("");
+                    let system = messages
+                        .iter()
+                        .find(|m| m.role == "system")
+                        .map(|m| m.content.as_str());
+                    crate::memory::response_cache::ResponseCache::cache_key(
+                        &effective_model,
+                        system,
+                        last_user,
+                    )
+                })
+            } else {
+                None
+            };
+
+            if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                if let Ok(Some(cached)) = cache.get(key) {
+                    self.observer.record_event(&ObserverEvent::CacheHit {
+                        cache_type: "response".into(),
+                        tokens_saved: 0,
+                    });
+                    self.history
+                        .push(ConversationMessage::Chat(ChatMessage::assistant(
+                            cached.clone(),
+                        )));
+                    self.trim_history();
+                    return Ok(cached);
+                }
+                self.observer.record_event(&ObserverEvent::CacheMiss {
+                    cache_type: "response".into(),
+                });
+            }
+
             let response = match self
                 .provider
                 .chat(
@@ -540,6 +607,17 @@ impl Agent {
                 } else {
                     text
                 };
+
+                // Store in response cache (text-only, no tool calls)
+                if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                    let token_count = response
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.output_tokens)
+                        .unwrap_or(0);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let _ = cache.put(key, &effective_model, &final_text, token_count as u32);
+                }
 
                 self.history
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
