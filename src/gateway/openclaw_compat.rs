@@ -72,6 +72,12 @@ pub struct ApiChatBody {
     /// When provided, overrides the server's default_model for this request.
     #[serde(default)]
     pub model: Option<String>,
+
+    /// Optional API key override for the selected provider.
+    /// When provided, takes highest priority over server-side stored keys.
+    /// This allows the client to pass a key from its local storage directly.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 fn api_chat_memory_key() -> String {
@@ -215,20 +221,36 @@ pub async fn handle_api_chat(
         }
     }
 
-    // ── Resolve provider-specific key from provider_api_keys map ──
-    // Users configure API keys once via Settings (stored in provider_api_keys).
-    // At chat time, we always look up the correct key for the effective provider.
-    // This prevents the 401 bug where config.api_key holds a DIFFERENT
-    // provider's key (e.g. Gemini key when using Anthropic).
+    // ── Resolve API key: client-provided > provider_api_keys > env ──
+    // Priority order:
+    // 1. Client-provided api_key (from request body — user's own key)
+    // 2. Server-side provider_api_keys map (from Settings / config)
+    // 3. Environment variables (checked later by provider factory)
     let provider_name = config
         .default_provider
         .as_deref()
         .unwrap_or("gemini");
 
-    if let Some(stored_key) = config.provider_api_keys.get(provider_name) {
+    let client_key = chat_body
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty());
+
+    if let Some(key) = client_key {
+        config.api_key = Some(key.to_string());
+    } else if let Some(stored_key) = config.provider_api_keys.get(provider_name) {
         if !stored_key.trim().is_empty() {
             config.api_key = Some(stored_key.clone());
+        } else {
+            // Clear stale key from a different provider
+            config.api_key = None;
         }
+    } else {
+        // No key found for this provider — clear any previous
+        // provider's key so we don't send a mismatched key.
+        // The provider factory will check env vars as fallback.
+        config.api_key = None;
     }
 
     // ── Validate API key for cloud providers ──
@@ -348,7 +370,7 @@ pub async fn handle_api_chat(
             state
                 .observer
                 .record_event(&crate::observability::ObserverEvent::AgentEnd {
-                    provider: provider_label,
+                    provider: provider_label.clone(),
                     model: model_label,
                     duration,
                     tokens_used: None,
@@ -363,16 +385,31 @@ pub async fn handle_api_chat(
                 || sanitized.contains("Unauthorized")
                 || sanitized.contains("authentication");
             if is_auth_error {
+                let user_message = format!(
+                    "API key for '{}' is invalid or expired. Please update your API key in Settings.",
+                    provider_label
+                );
                 let err = serde_json::json!({
-                    "error": format!("LLM request failed: {sanitized}"),
+                    "error": user_message,
+                    "detail": sanitized,
                     "code": "provider_auth_error",
                     "fallback_to_relay": true,
                 });
                 return (StatusCode::BAD_REQUEST, Json(err));
             }
 
+            // Detect context window / token limit errors for user-friendly message
+            let is_context_error = sanitized.contains("context")
+                || sanitized.contains("token limit")
+                || sanitized.contains("too long");
+            let user_message = if is_context_error {
+                "The message is too long for the selected model. Try a shorter message or switch to a model with a larger context window.".to_string()
+            } else {
+                format!("LLM request failed: {sanitized}")
+            };
+
             let err = serde_json::json!({
-                "error": format!("LLM request failed: {sanitized}"),
+                "error": user_message,
             });
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
@@ -668,7 +705,12 @@ pub async fn handle_v1_chat_completions_with_tools(
         if let Some(stored_key) = config_guard.provider_api_keys.get(&provider_name).cloned() {
             if !stored_key.trim().is_empty() {
                 config_guard.api_key = Some(stored_key);
+            } else {
+                config_guard.api_key = None;
             }
+        } else {
+            // No key for this provider — clear stale key from another provider
+            config_guard.api_key = None;
         }
     }
 
@@ -922,6 +964,19 @@ mod tests {
         assert_eq!(body.context.len(), 2);
         assert_eq!(body.provider.as_deref(), Some("anthropic"));
         assert_eq!(body.model.as_deref(), Some("claude-opus-4-6"));
+        assert!(body.api_key.is_none());
+    }
+
+    #[test]
+    fn api_chat_body_deserializes_with_api_key() {
+        let json = r#"{
+            "message": "Hello",
+            "provider": "anthropic",
+            "api_key": "sk-ant-test-key"
+        }"#;
+        let body: ApiChatBody = serde_json::from_str(json).unwrap();
+        assert_eq!(body.message, "Hello");
+        assert_eq!(body.api_key.as_deref(), Some("sk-ant-test-key"));
     }
 
     #[test]
