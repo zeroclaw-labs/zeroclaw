@@ -11,6 +11,9 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use rustyline::config::Config as RustylineConfig;
+use rustyline::history::FileHistory;
+use rustyline::{EditMode, Editor};
 use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -3435,28 +3438,55 @@ pub async fn run(
             vec![ChatMessage::system(&system_prompt)]
         };
 
-        loop {
-            print!("> ");
-            let _ = std::io::stdout().flush();
+        let mut rl = Editor::<(), FileHistory>::with_config(
+            RustylineConfig::builder().edit_mode(EditMode::Vi).build(),
+        )?;
 
-            // Read raw bytes to avoid UTF-8 validation errors when PTY
-            // transport splits multi-byte characters at frame boundaries
-            // (e.g. CJK input with spaces over kubectl exec / SSH).
-            let mut raw = Vec::new();
-            match std::io::BufRead::read_until(&mut std::io::stdin().lock(), b'\n', &mut raw) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("\nError reading input: {e}\n");
+        // Try to load command history from a file in the config directory
+        let history_path = config.config_path.parent().map(|p| p.join(".zeroclaw_history"));
+
+        if let Some(ref path) = history_path {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = rl.load_history(path);
+        }
+
+        loop {
+            let mut current_rl = rl;
+            let (input_result, next_rl) = tokio::task::spawn_blocking(move || {
+                let res = current_rl.readline("> ");
+                (res, current_rl)
+            })
+            .await?;
+            rl = next_rl;
+
+            let input = match input_result {
+                Ok(line) => line,
+                Err(rustyline::error::ReadlineError::Interrupted) => {
+                    println!("Interrupted (CTRL-C)");
                     break;
                 }
-            }
-            let input = String::from_utf8_lossy(&raw).into_owned();
+                Err(rustyline::error::ReadlineError::Eof) => {
+                    println!("Exit (CTRL-D)");
+                    break;
+                }
+                Err(err) => {
+                    eprintln!("Error reading input: {err}");
+                    break;
+                }
+            };
 
             let user_input = input.trim().to_string();
             if user_input.is_empty() {
                 continue;
             }
+
+            let _ = rl.add_history_entry(&user_input);
+            if let Some(ref path) = history_path {
+                let _ = rl.save_history(path);
+            }
+
             match user_input.as_str() {
                 "/quit" | "/exit" => break,
                 "/help" => {
