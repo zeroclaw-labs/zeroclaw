@@ -102,6 +102,7 @@ use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -327,10 +328,10 @@ pub fn all_tools_with_runtime(
             .map(std::path::PathBuf::from),
         secrets_encrypt: root_config.secrets.encrypt,
         reasoning_enabled: root_config.runtime.reasoning_enabled,
-        reasoning_effort: root_config.runtime.reasoning_effort.clone(),
         provider_timeout_secs: Some(root_config.provider_timeout_secs),
         extra_headers: root_config.extra_headers.clone(),
         api_path: root_config.api_path.clone(),
+        reasoning_effort: root_config.runtime.reasoning_effort.clone(),
     };
 
     // Add delegation tool when agents are configured
@@ -339,7 +340,7 @@ pub fn all_tools_with_runtime(
             .iter()
             .map(|(name, cfg)| (name.clone(), cfg.clone()))
             .collect();
-        let parent_tools = Arc::new(tool_arcs.clone());
+        let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
         let delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
             delegate_fallback_credential,

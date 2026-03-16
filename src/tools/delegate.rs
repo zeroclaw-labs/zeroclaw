@@ -6,6 +6,7 @@ use crate::providers::{self, ChatMessage, Provider};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,7 +31,7 @@ pub struct DelegateTool {
     /// Depth at which this tool instance lives in the delegation chain.
     depth: u32,
     /// Parent tool registry for agentic sub-agents.
-    parent_tools: Arc<Vec<Arc<dyn Tool>>>,
+    parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
 }
@@ -61,7 +62,7 @@ impl DelegateTool {
             fallback_credential,
             provider_runtime_options,
             depth: 0,
-            parent_tools: Arc::new(Vec::new()),
+            parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
         }
     }
@@ -97,13 +98,13 @@ impl DelegateTool {
             fallback_credential,
             provider_runtime_options,
             depth,
-            parent_tools: Arc::new(Vec::new()),
+            parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
         }
     }
 
     /// Attach parent tools used to build sub-agent allowlist registries.
-    pub fn with_parent_tools(mut self, parent_tools: Arc<Vec<Arc<dyn Tool>>>) -> Self {
+    pub fn with_parent_tools(mut self, parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>) -> Self {
         self.parent_tools = parent_tools;
         self
     }
@@ -365,8 +366,8 @@ impl DelegateTool {
             .filter(|name| !name.is_empty())
             .collect::<std::collections::HashSet<_>>();
 
-        let sub_tools: Vec<Box<dyn Tool>> = self
-            .parent_tools
+        let parent_tools = self.parent_tools.read();
+        let sub_tools: Vec<Box<dyn Tool>> = parent_tools
             .iter()
             .filter(|tool| allowed.contains(tool.name()))
             .filter(|tool| tool.name() != "delegate")
@@ -1000,7 +1001,7 @@ mod tests {
         );
 
         let tool = DelegateTool::new(agents, None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
         let result = tool
             .execute(json!({"agent": "agentic", "prompt": "test"}))
             .await
@@ -1018,10 +1019,10 @@ mod tests {
     async fn execute_agentic_runs_tool_call_loop_with_filtered_tools() {
         let config = agentic_config(vec!["echo_tool".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
-            Arc::new(vec![
+            Arc::new(RwLock::new(vec![
                 Arc::new(EchoTool),
                 Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
-            ]),
+            ])),
         );
 
         let provider = OneToolThenFinalProvider;
@@ -1039,11 +1040,11 @@ mod tests {
     async fn execute_agentic_excludes_delegate_even_if_allowlisted() {
         let config = agentic_config(vec!["delegate".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
-            Arc::new(vec![Arc::new(DelegateTool::new(
+            Arc::new(RwLock::new(vec![Arc::new(DelegateTool::new(
                 HashMap::new(),
                 None,
                 test_security(),
-            ))]),
+            ))])),
         );
 
         let provider = OneToolThenFinalProvider;
@@ -1064,7 +1065,7 @@ mod tests {
     async fn execute_agentic_respects_max_iterations() {
         let config = agentic_config(vec!["echo_tool".to_string()], 2);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
 
         let provider = InfiniteToolCallProvider;
         let result = tool
@@ -1084,7 +1085,7 @@ mod tests {
     async fn execute_agentic_propagates_provider_errors() {
         let config = agentic_config(vec!["echo_tool".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
 
         let provider = FailingProvider;
         let result = tool

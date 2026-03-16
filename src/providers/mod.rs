@@ -677,10 +677,16 @@ pub struct ProviderRuntimeOptions {
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
-    pub reasoning_effort: Option<String>,
+    /// HTTP request timeout in seconds for LLM provider API calls.
+    /// `None` uses the provider's built-in default (120s for compatible providers).
     pub provider_timeout_secs: Option<u64>,
+    /// Extra HTTP headers to include in provider API requests.
+    /// These are merged from the config file and `ZEROCLAW_EXTRA_HEADERS` env var.
     pub extra_headers: std::collections::HashMap<String, String>,
+    /// Custom API path suffix for OpenAI-compatible providers
+    /// (e.g. "/v2/generate" instead of the default "/chat/completions").
     pub api_path: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -691,10 +697,10 @@ impl Default for ProviderRuntimeOptions {
             zeroclaw_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: None,
-            reasoning_effort: None,
             provider_timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
+            reasoning_effort: None,
         }
     }
 }
