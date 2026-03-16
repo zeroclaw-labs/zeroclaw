@@ -517,7 +517,7 @@ install_system_deps() {
         fi
       elif have_cmd apt-get; then
         run_privileged apt-get update -qq
-        run_privileged apt-get install -y build-essential pkg-config git curl
+        run_privileged apt-get install -y build-essential pkg-config git curl libssl-dev
       elif have_cmd dnf; then
         run_privileged dnf install -y \
           gcc \

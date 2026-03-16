@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ── Stage 1: Build ────────────────────────────────────────────
-FROM rust:1.93-slim@sha256:9663b80a1621253d30b146454f903de48f0af925c967be48c84745537cd35d8b AS builder
+FROM rust:1.94-slim@sha256:7d3701660d2aa7101811ba0c54920021452aa60e5bae073b79c2b137a432b2f4 AS builder
 
 WORKDIR /app
 
@@ -33,6 +33,7 @@ COPY benches/ benches/
 COPY crates/ crates/
 COPY firmware/ firmware/
 COPY web/ web/
+COPY *.rs .
 # Keep release builds resilient when frontend dist assets are not prebuilt in Git.
 RUN mkdir -p web/dist && \
     if [ ! -f web/dist/index.html ]; then \
