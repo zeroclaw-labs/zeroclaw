@@ -1470,7 +1470,7 @@ mod native_backend {
             // When running as a service (systemd/OpenRC), the browser sandbox
             // fails because the process lacks a user namespace / session.
             // --no-sandbox and --disable-dev-shm-usage are required in this context.
-            if is_service_environment() {
+            if super::is_service_environment() {
                 args.push(Value::String("--no-sandbox".to_string()));
                 args.push(Value::String("--disable-dev-shm-usage".to_string()));
             }
