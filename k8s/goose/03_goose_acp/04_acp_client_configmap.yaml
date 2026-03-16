@@ -455,6 +455,66 @@ data:
                     count += 1
         print(f"Cleaned up {count} session(s).")
 
+    def cmd_inject(acp_session_id, message):
+        """Inject a mid-task message into a running ACP session.
+
+        The message is queued and the agent sees it between tool iterations
+        as a [Mid-turn message from user] entry in its context.
+        """
+        session_dir = os.path.join(SESSION_DIR, acp_session_id)
+        status_file = os.path.join(session_dir, "status.json")
+        if not os.path.exists(status_file):
+            print(f"ERROR: No session found: {acp_session_id}", file=sys.stderr)
+            sys.exit(1)
+        with open(status_file) as f:
+            status = json.load(f)
+        session_id = status.get("session_id", "")
+
+        payload = json.dumps({
+            "jsonrpc": "2.0",
+            "method": "session/inject",
+            "id": 3,
+            "params": {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": message}]
+            }
+        }).encode()
+
+        try:
+            resp = _post(payload, acp_session_id=acp_session_id, timeout=30)
+            body = resp.read().decode()
+            if "injected" in body:
+                print(f"INJECTED into {acp_session_id}")
+            else:
+                print(f"INJECT FAILED: {body}", file=sys.stderr)
+                sys.exit(1)
+        except Exception as e:
+            print(f"INJECT ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    def cmd_progress(acp_session_id):
+        """Show the current progress of a running ACP session (partial response)."""
+        session_dir = os.path.join(SESSION_DIR, acp_session_id)
+        response_file = os.path.join(session_dir, "response.txt")
+        status_file = os.path.join(session_dir, "status.json")
+        if not os.path.exists(status_file):
+            print(f"No session: {acp_session_id}", file=sys.stderr)
+            sys.exit(1)
+        with open(status_file) as f:
+            status = json.load(f)
+        state = status.get("status", "UNKNOWN")
+        started = status.get("started_at", time.time())
+        elapsed = time.time() - started
+        if os.path.exists(response_file):
+            with open(response_file) as f:
+                content = f.read()
+            if len(content) > 2000:
+                content = "...\n" + content[-2000:]
+            print(f"[{state}] {elapsed:.0f}s elapsed")
+            print(content)
+        else:
+            print(f"[{state}] {elapsed:.0f}s elapsed, no output yet")
+
     def main():
         if len(sys.argv) < 2:
             print(__doc__)
@@ -506,6 +566,16 @@ data:
                 print("Usage: acp-client delete <acp-session-id>", file=sys.stderr)
                 sys.exit(1)
             cmd_delete(sys.argv[2])
+        elif cmd == "inject":
+            if len(sys.argv) < 4:
+                print("Usage: acp-client inject <acp-session-id> \"message\"", file=sys.stderr)
+                sys.exit(1)
+            cmd_inject(sys.argv[2], " ".join(sys.argv[3:]))
+        elif cmd == "progress":
+            if len(sys.argv) < 3:
+                print("Usage: acp-client progress <acp-session-id>", file=sys.stderr)
+                sys.exit(1)
+            cmd_progress(sys.argv[2])
         elif cmd == "cleanup":
             cmd_cleanup()
         else:
