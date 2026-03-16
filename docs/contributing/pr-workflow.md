@@ -105,6 +105,15 @@ Maintain these branch protection rules on `master`:
 - Restrict force-push on protected branches.
 - All contributor PRs target `master` directly.
 
+### 3.1 Branch Policy FAQ
+
+- Source of truth for builds and debugging today: `master`
+- Active contribution branch: `master`
+- Active release source: `master`
+- What `main`, `dev`, and `main-fix` mean today: historical branches only; they are not part of the supported PR or release path and may be stale or divergent.
+- Code flow: contributor PR -> review + `CI Required Gate` on `master` -> merge to `master` -> beta release on `master` push -> optional stable release cut from `master`
+- Canonical workflow reference: [`.github/workflows/master-branch-flow.md`](../../.github/workflows/master-branch-flow.md)
+
 ---
 
 ## 4. PR Lifecycle Runbook
