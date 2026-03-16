@@ -889,6 +889,7 @@ async fn main() -> Result<()> {
                 peripheral,
                 true,
                 session_state_file,
+                None,
             )
             .await
             .map(|_| ())
