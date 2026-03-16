@@ -15,9 +15,12 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod backup_tool;
 pub mod browser;
 pub mod browser_open;
 pub mod cli_discovery;
+pub mod cloud_ops;
+pub mod cloud_patterns;
 pub mod composio;
 pub mod content_search;
 pub mod cron_add;
@@ -26,6 +29,7 @@ pub mod cron_remove;
 pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
+pub mod data_management;
 pub mod delegate;
 pub mod file_edit;
 pub mod file_read;
@@ -48,15 +52,19 @@ pub mod mcp_transport;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod microsoft365;
 pub mod model_routing_config;
 pub mod node_tool;
 pub mod notion_tool;
 pub mod pdf_read;
+pub mod project_intel;
 pub mod proxy_config;
 pub mod pushover;
+pub mod report_templates;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
+pub mod security_ops;
 pub mod shell;
 pub mod swarm;
 pub mod tool_search;
@@ -65,8 +73,11 @@ pub mod web_fetch;
 pub mod web_search_tool;
 pub mod workspace_tool;
 
+pub use backup_tool::BackupTool;
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
+pub use cloud_ops::CloudOpsTool;
+pub use cloud_patterns::CloudPatternsTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -75,6 +86,7 @@ pub use cron_remove::CronRemoveTool;
 pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
+pub use data_management::DataManagementTool;
 pub use delegate::DelegateTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
@@ -95,17 +107,20 @@ pub use mcp_tool::McpToolWrapper;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use microsoft365::Microsoft365Tool;
 pub use model_routing_config::ModelRoutingConfigTool;
 #[allow(unused_imports)]
 pub use node_tool::NodeTool;
 pub use notion_tool::NotionTool;
 pub use pdf_read::PdfReadTool;
+pub use project_intel::ProjectIntelTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
+pub use security_ops::SecurityOpsTool;
 pub use shell::ShellTool;
 pub use swarm::SwarmTool;
 pub use tool_search::ToolSearchTool;
@@ -362,6 +377,44 @@ pub fn all_tools_with_runtime(
         }
     }
 
+    // Project delivery intelligence
+    if root_config.project_intel.enabled {
+        tool_arcs.push(Arc::new(ProjectIntelTool::new(
+            root_config.project_intel.default_language.clone(),
+            root_config.project_intel.risk_sensitivity.clone(),
+        )));
+    }
+
+    // MCSS Security Operations
+    if root_config.security_ops.enabled {
+        tool_arcs.push(Arc::new(SecurityOpsTool::new(
+            root_config.security_ops.clone(),
+        )));
+    }
+
+    // Backup tool (enabled by default)
+    if root_config.backup.enabled {
+        tool_arcs.push(Arc::new(BackupTool::new(
+            workspace_dir.to_path_buf(),
+            root_config.backup.include_dirs.clone(),
+            root_config.backup.max_keep,
+        )));
+    }
+
+    // Data management tool (disabled by default)
+    if root_config.data_retention.enabled {
+        tool_arcs.push(Arc::new(DataManagementTool::new(
+            workspace_dir.to_path_buf(),
+            root_config.data_retention.retention_days,
+        )));
+    }
+
+    // Cloud operations advisory tools (read-only analysis)
+    if root_config.cloud_ops.enabled {
+        tool_arcs.push(Arc::new(CloudOpsTool::new(root_config.cloud_ops.clone())));
+        tool_arcs.push(Arc::new(CloudPatternsTool::new()));
+    }
+
     // PDF extraction (feature-gated at compile time via rag-pdf)
     tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
 
@@ -376,6 +429,61 @@ pub fn all_tools_with_runtime(
                 composio_entity_id,
                 security.clone(),
             )));
+        }
+    }
+
+    // Microsoft 365 Graph API integration
+    if root_config.microsoft365.enabled {
+        let ms_cfg = &root_config.microsoft365;
+        let tenant_id = ms_cfg
+            .tenant_id
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let client_id = ms_cfg
+            .client_id
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !tenant_id.is_empty() && !client_id.is_empty() {
+            // Fail fast: client_credentials flow requires a client_secret at registration time.
+            if ms_cfg.auth_flow.trim() == "client_credentials"
+                && ms_cfg
+                    .client_secret
+                    .as_deref()
+                    .map_or(true, |s| s.trim().is_empty())
+            {
+                tracing::error!(
+                    "microsoft365: client_credentials auth_flow requires a non-empty client_secret"
+                );
+                return (boxed_registry_from_arcs(tool_arcs), None);
+            }
+
+            let resolved = microsoft365::types::Microsoft365ResolvedConfig {
+                tenant_id,
+                client_id,
+                client_secret: ms_cfg.client_secret.clone(),
+                auth_flow: ms_cfg.auth_flow.clone(),
+                scopes: ms_cfg.scopes.clone(),
+                token_cache_encrypted: ms_cfg.token_cache_encrypted,
+                user_id: ms_cfg.user_id.as_deref().unwrap_or("me").to_string(),
+            };
+            // Store token cache in the config directory (next to config.toml),
+            // not the workspace directory, to keep bearer tokens out of the
+            // project tree.
+            let cache_dir = root_config.config_path.parent().unwrap_or(workspace_dir);
+            match Microsoft365Tool::new(resolved, security.clone(), cache_dir) {
+                Ok(tool) => tool_arcs.push(Arc::new(tool)),
+                Err(e) => {
+                    tracing::error!("microsoft365: failed to initialize tool: {e}");
+                }
+            }
+        } else {
+            tracing::warn!(
+                "microsoft365: skipped registration because tenant_id or client_id is empty"
+            );
         }
     }
 

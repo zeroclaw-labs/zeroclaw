@@ -36,10 +36,12 @@ pub mod leak_detector;
 pub mod nevis;
 pub mod otp;
 pub mod pairing;
+pub mod playbook;
 pub mod policy;
 pub mod prompt_guard;
 pub mod secrets;
 pub mod traits;
+pub mod vulnerability;
 pub mod workspace_boundary;
 
 #[allow(unused_imports)]
