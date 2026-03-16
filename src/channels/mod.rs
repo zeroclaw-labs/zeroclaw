@@ -1896,19 +1896,27 @@ async fn process_channel_message(
         }
     }
 
-    // Strip [IMAGE:] markers from older history messages when the active
+    // Strip [IMAGE:] markers from *older* history messages when the active
     // provider does not support vision. This prevents "history poisoning"
     // where a previously-sent image marker gets reloaded from the JSONL
     // session file and permanently breaks the conversation (fixes #3674).
-    if !active_provider.supports_vision() {
-        for turn in &mut prior_turns {
+    // We skip the last turn (the current message) so the vision check can
+    // still reject fresh image sends with a proper error.
+    if !active_provider.supports_vision() && prior_turns.len() > 1 {
+        let last_idx = prior_turns.len() - 1;
+        for turn in &mut prior_turns[..last_idx] {
             if turn.content.contains("[IMAGE:") {
                 let (cleaned, _refs) = crate::multimodal::parse_image_markers(&turn.content);
                 turn.content = cleaned;
             }
         }
-        // Drop turns that became empty after marker removal (e.g. image-only messages).
+        // Drop older turns that became empty after marker removal (e.g. image-only messages).
+        // Keep the last turn (current message) intact.
+        let current = prior_turns.pop();
         prior_turns.retain(|turn| !turn.content.trim().is_empty());
+        if let Some(current) = current {
+            prior_turns.push(current);
+        }
     }
 
     // Proactively trim conversation history before sending to the provider
