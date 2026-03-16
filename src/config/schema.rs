@@ -3621,6 +3621,10 @@ pub struct ChannelsConfig {
     pub wecom: Option<WeComConfig>,
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
+    /// X/Twitter channel configuration.
+    pub twitter: Option<TwitterConfig>,
+    /// Mochat customer service channel configuration.
+    pub mochat: Option<MochatConfig>,
     #[cfg(feature = "channel-nostr")]
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
@@ -3784,6 +3788,8 @@ impl Default for ChannelsConfig {
             dingtalk: None,
             wecom: None,
             qq: None,
+            twitter: None,
+            mochat: None,
             #[cfg(feature = "channel-nostr")]
             nostr: None,
             clawdtalk: None,
@@ -4801,6 +4807,53 @@ impl ChannelConfig for QQConfig {
     }
     fn desc() -> &'static str {
         "Tencent QQ Bot"
+    }
+}
+
+/// X/Twitter channel configuration (Twitter API v2)
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TwitterConfig {
+    /// Twitter API v2 Bearer Token (OAuth 2.0)
+    pub bearer_token: String,
+    /// Allowed usernames or user IDs. Empty = deny all, "*" = allow all
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+}
+
+impl ChannelConfig for TwitterConfig {
+    fn name() -> &'static str {
+        "X/Twitter"
+    }
+    fn desc() -> &'static str {
+        "X/Twitter Bot via API v2"
+    }
+}
+
+/// Mochat channel configuration (Mochat customer service API)
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MochatConfig {
+    /// Mochat API base URL
+    pub api_url: String,
+    /// Mochat API token
+    pub api_token: String,
+    /// Allowed user IDs. Empty = deny all, "*" = allow all
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Poll interval in seconds for new messages. Default: 5
+    #[serde(default = "default_mochat_poll_interval")]
+    pub poll_interval_secs: u64,
+}
+
+fn default_mochat_poll_interval() -> u64 {
+    5
+}
+
+impl ChannelConfig for MochatConfig {
+    fn name() -> &'static str {
+        "Mochat"
+    }
+    fn desc() -> &'static str {
+        "Mochat Customer Service"
     }
 }
 
@@ -7460,6 +7513,8 @@ default_temperature = 0.7
                 dingtalk: None,
                 wecom: None,
                 qq: None,
+                twitter: None,
+                mochat: None,
                 #[cfg(feature = "channel-nostr")]
                 nostr: None,
                 clawdtalk: None,
@@ -8195,6 +8250,8 @@ allowed_users = ["@ops:matrix.org"]
             dingtalk: None,
             wecom: None,
             qq: None,
+            twitter: None,
+            mochat: None,
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: 300,
@@ -8425,6 +8482,8 @@ channel_id = "C123"
             dingtalk: None,
             wecom: None,
             qq: None,
+            twitter: None,
+            mochat: None,
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: 300,
