@@ -179,6 +179,7 @@ async fn run_agent_job(
                 vec![],
                 false,
                 None,
+                job.allowed_tools.clone(),
             )
             .await
         }
@@ -557,6 +558,7 @@ mod tests {
             enabled: true,
             delivery: DeliveryConfig::default(),
             delete_after_run: false,
+            allowed_tools: None,
             created_at: Utc::now(),
             next_run: Utc::now(),
             last_run: None,
