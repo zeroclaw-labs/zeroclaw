@@ -4789,12 +4789,11 @@ mod tests {
             "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"echo pwned\"}}</tool_call>",
         ]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> =
-            vec![Box::new(CountingTool::new("shell", Arc::clone(&invocations)))];
-        let mut history = vec![
-            ChatMessage::system("system"),
-            ChatMessage::user("hi"),
-        ];
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "shell",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![ChatMessage::system("system"), ChatMessage::user("hi")];
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(
@@ -4820,7 +4819,11 @@ mod tests {
         .await
         .expect("should return text without error");
 
-        assert_eq!(invocations.load(Ordering::SeqCst), 0, "no tool should have been invoked");
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "no tool should have been invoked"
+        );
         assert!(
             result.contains("tool_call"),
             "raw text with <tool_call> tag should be returned as-is: {result}"
