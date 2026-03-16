@@ -860,6 +860,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
         "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
+        "siliconflow" | "silicon-flow" => vec!["SILICONFLOW_API_KEY"],
         "osaurus" => vec!["OSAURUS_API_KEY"],
         "telnyx" => vec!["TELNYX_API_KEY"],
         "azure_openai" | "azure-openai" | "azure" => vec!["AZURE_OPENAI_API_KEY"],
@@ -2605,6 +2606,20 @@ mod tests {
         let _guard = EnvGuard::set("OSAURUS_API_KEY", Some("osaurus-test-key"));
         let resolved = resolve_provider_credential("osaurus", None);
         assert_eq!(resolved, Some("osaurus-test-key".to_string()));
+    }
+
+    #[test]
+    fn resolve_provider_credential_siliconflow_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("SILICONFLOW_API_KEY", Some("sf-test-key"));
+        let resolved = resolve_provider_credential("siliconflow", None);
+        assert_eq!(resolved, Some("sf-test-key".to_string()));
+    }
+
+    #[test]
+    fn factory_siliconflow() {
+        assert!(create_provider("siliconflow", Some("key")).is_ok());
+        assert!(create_provider("silicon-flow", Some("key")).is_ok());
     }
 
     // ── Extended ecosystem ───────────────────────────────────
