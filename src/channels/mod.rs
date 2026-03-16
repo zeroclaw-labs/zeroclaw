@@ -41,6 +41,7 @@ pub mod transcription;
 pub mod tts;
 pub mod wati;
 pub mod wecom;
+pub mod wecom_ws;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
@@ -73,6 +74,7 @@ pub use traits::{Channel, SendMessage};
 pub use tts::{TtsManager, TtsProvider};
 pub use wati::WatiChannel;
 pub use wecom::WeComChannel;
+pub use wecom_ws::WeComWsChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
@@ -197,6 +199,31 @@ const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
+
+fn live_channels_registry() -> &'static Mutex<HashMap<String, Arc<dyn Channel>>> {
+    static STORE: OnceLock<Mutex<HashMap<String, Arc<dyn Channel>>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_live_channels(channels_by_name: &HashMap<String, Arc<dyn Channel>>) {
+    let mut guard = live_channels_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.clear();
+    guard.extend(
+        channels_by_name
+            .iter()
+            .map(|(name, channel)| (name.clone(), Arc::clone(channel))),
+    );
+}
+
+pub(crate) fn get_live_channel(name: &str) -> Option<Arc<dyn Channel>> {
+    live_channels_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(name)
+        .cloned()
+}
 
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
@@ -367,6 +394,10 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
 }
 
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
+    if msg.channel == "wecom_ws" {
+        return format!("wecom_ws_{}", msg.reply_target);
+    }
+
     // Include thread_ts for per-topic session isolation in forum groups
     match &msg.thread_ts {
         Some(tid) => format!("{}_{}_{}", msg.channel, tid, msg.sender),
@@ -380,6 +411,36 @@ fn followup_thread_id(msg: &traits::ChannelMessage) -> Option<String> {
 
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
+}
+
+fn wecom_ws_group_requires_sender_identity(msg: &traits::ChannelMessage) -> bool {
+    msg.channel == "wecom_ws" && msg.reply_target.starts_with("group--")
+}
+
+fn llm_user_content_with_sender_identity(msg: &traits::ChannelMessage, content: &str) -> String {
+    if !wecom_ws_group_requires_sender_identity(msg) {
+        return content.to_string();
+    }
+
+    let sender = msg.sender.trim();
+    if sender.is_empty() {
+        return content.to_string();
+    }
+
+    let prefix = format!("[sender_userid={sender}]");
+    if content.trim_start().starts_with(prefix.as_str()) {
+        return content.to_string();
+    }
+
+    format!("{prefix} {content}")
+}
+
+fn persisted_channel_user_content(msg: &traits::ChannelMessage, content: &str) -> String {
+    if wecom_ws_group_requires_sender_identity(msg) {
+        return llm_user_content_with_sender_identity(msg, content);
+    }
+
+    content.to_string()
 }
 
 /// Strip tool-call XML tags from outgoing messages.
@@ -521,6 +582,15 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
+        "wecom_ws" => Some(
+            "When responding on WeCom WS (企业微信长连接):\n\
+             - Use standard markdown for formatting: **bold**, *italic*, `code`, code blocks, lists, links.\n\
+             - Keep responses concise and well-structured for enterprise chat contexts.\n\
+             - Image/file attachments are automatically downloaded and provided as local paths like [IMAGE:/path/to/file.png] or [Document: /path/to/file.bin].\n\
+             - Quoted messages are injected as [WECOM_QUOTE]...[/WECOM_QUOTE] blocks containing msgtype and content.\n\
+             - In shared group chats, each turn includes a [sender_userid=xxx] prefix to identify who is speaking.\n\
+             - Use tool results silently: answer the user's question directly without narrating internal execution steps.",
+        ),
         _ => None,
     }
 }
@@ -568,6 +638,23 @@ fn build_channel_system_prompt(
              reaches the user."
         );
         prompt.push_str(&context);
+    }
+
+    if channel_name == "wecom_ws" && !reply_target.is_empty() {
+        let chat_type = if reply_target.starts_with("group--") {
+            "group"
+        } else {
+            "single"
+        };
+        let mut lines = vec![
+            "\n\n[WECOM_WS_STATIC_CONTEXT_V1]".to_string(),
+            format!("chat_type={chat_type}"),
+            format!("conversation_scope={reply_target}"),
+        ];
+        if let Some(userid) = reply_target.strip_prefix("user--") {
+            lines.push(format!("sender_userid={userid}"));
+        }
+        prompt.push_str(&lines.join("\n"));
     }
 
     prompt
@@ -626,7 +713,7 @@ fn strip_tool_result_content(text: &str) -> String {
 }
 
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
-    matches!(channel_name, "telegram" | "discord" | "matrix")
+    matches!(channel_name, "telegram" | "discord" | "matrix" | "wecom_ws")
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
@@ -1863,8 +1950,19 @@ async fn process_channel_message(
         .get(&history_key)
         .is_some_and(|turns| !turns.is_empty());
 
+    let wecom_ws_group_sender_identity = wecom_ws_group_requires_sender_identity(&msg);
+
     // Preserve user turn before the LLM call so interrupted requests keep context.
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+    if wecom_ws_group_sender_identity {
+        let persisted_user_content = persisted_channel_user_content(&msg, &msg.content);
+        append_sender_turn(
+            ctx.as_ref(),
+            &history_key,
+            ChatMessage::user(&persisted_user_content),
+        );
+    } else {
+        append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+    }
 
     // Build history from per-sender conversation cache.
     let prior_turns_raw = ctx
@@ -1905,7 +2003,19 @@ async fn process_channel_message(
             build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
         if let Some(last_turn) = prior_turns.last_mut() {
             if last_turn.role == "user" && !memory_context.is_empty() {
-                last_turn.content = format!("{memory_context}{}", msg.content);
+                if wecom_ws_group_sender_identity {
+                    last_turn.content = format!("{memory_context}{}", last_turn.content);
+                } else {
+                    last_turn.content = format!("{memory_context}{}", msg.content);
+                }
+            }
+        }
+    }
+
+    if wecom_ws_group_sender_identity {
+        if let Some(last_turn) = prior_turns.last_mut() {
+            if last_turn.role == "user" {
+                last_turn.content = llm_user_content_with_sender_identity(&msg, &last_turn.content);
             }
         }
     }
@@ -2490,7 +2600,8 @@ async fn run_message_dispatch_loop(
             let _permit = permit;
             let interrupt_enabled = worker_ctx
                 .interrupt_on_new_message
-                .enabled_for_channel(msg.channel.as_str());
+                .enabled_for_channel(msg.channel.as_str())
+                || (msg.channel == "wecom_ws" && worker_ctx.interrupt_on_new_message.telegram);
             let sender_scope_key = interruption_scope_key(&msg);
             let cancellation_token = CancellationToken::new();
             let completion = Arc::new(InFlightTaskCompletion::new());
@@ -3414,6 +3525,16 @@ fn collect_configured_channels(
         });
     }
 
+    if let Some(ref wc_ws) = config.channels_config.wecom_ws {
+        match WeComWsChannel::new(wc_ws, &config.workspace_dir) {
+            Ok(channel) => channels.push(ConfiguredChannel {
+                display_name: "WeCom WS",
+                channel: Arc::new(channel),
+            }),
+            Err(err) => tracing::warn!("WeCom WS channel config invalid; skipping startup: {err}"),
+        }
+    }
+
     if let Some(ref ct) = config.channels_config.clawdtalk {
         channels.push(ConfiguredChannel {
             display_name: "ClawdTalk",
@@ -3841,6 +3962,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
+    register_live_channels(channels_by_name.as_ref());
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
@@ -6751,6 +6873,33 @@ BTC is currently around $65,000 based on latest tool output."#
         };
 
         assert_eq!(followup_thread_id(&msg).as_deref(), Some("msg_abc123"));
+    }
+
+    #[test]
+    fn conversation_history_key_uses_reply_target_for_wecom_ws() {
+        let msg = traits::ChannelMessage {
+            id: "msg_wecom_ws".into(),
+            sender: "hanxiao".into(),
+            reply_target: "group--room-1".into(),
+            content: "hello".into(),
+            channel: "wecom_ws".into(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+
+        assert_eq!(conversation_history_key(&msg), "wecom_ws_group--room-1");
+    }
+
+    #[test]
+    fn parse_runtime_command_allows_new_session_for_wecom_ws() {
+        assert!(matches!(
+            parse_runtime_command("wecom_ws", "/new"),
+            Some(ChannelRuntimeCommand::NewSession)
+        ));
+        assert!(matches!(
+            parse_runtime_command("wecom_ws", "/models openrouter"),
+            Some(ChannelRuntimeCommand::SetProvider(provider)) if provider == "openrouter"
+        ));
     }
 
     #[test]

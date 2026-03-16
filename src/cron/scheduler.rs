@@ -1,8 +1,8 @@
 #[cfg(feature = "channel-matrix")]
 use crate::channels::MatrixChannel;
 use crate::channels::{
-    Channel, DiscordChannel, MattermostChannel, SendMessage, SignalChannel, SlackChannel,
-    TelegramChannel,
+    get_live_channel, Channel, DiscordChannel, MattermostChannel, SendMessage, SignalChannel,
+    SlackChannel, TelegramChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -430,6 +430,18 @@ pub(crate) async fn deliver_announcement(
             #[cfg(not(feature = "channel-matrix"))]
             {
                 anyhow::bail!("matrix delivery channel requires `channel-matrix` feature");
+            }
+        }
+        "wecom_ws" => {
+            config
+                .channels_config
+                .wecom_ws
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("wecom_ws channel not configured"))?;
+            if let Some(live_channel) = get_live_channel("wecom_ws") {
+                live_channel.send(&SendMessage::new(output, target)).await?;
+            } else {
+                anyhow::bail!("wecom_ws channel is not connected");
             }
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
