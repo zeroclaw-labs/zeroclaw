@@ -224,10 +224,10 @@ pub async fn handle_api_config_api_key_put(
     let provider = body.get("provider").and_then(|v| v.as_str()).unwrap_or("");
     let api_key = body.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
 
-    if provider.is_empty() || api_key.is_empty() {
+    if provider.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "provider and api_key are required"})),
+            Json(serde_json::json!({"error": "provider is required"})),
         )
             .into_response();
     }
@@ -240,11 +240,14 @@ pub async fn handle_api_config_api_key_put(
         p => p,
     };
 
-    // Store the key in the per-provider map so multiple providers can each
-    // keep their own key instead of overwriting the single api_key field.
-    config
-        .provider_api_keys
-        .insert(backend_provider.to_string(), api_key.to_string());
+    // Store or remove the key in the per-provider map.
+    if api_key.is_empty() {
+        config.provider_api_keys.remove(backend_provider);
+    } else {
+        config
+            .provider_api_keys
+            .insert(backend_provider.to_string(), api_key.to_string());
+    }
 
     // Also set the provider-specific env var so resolve_provider_credential()
     // picks it up for the current process lifetime.
@@ -256,6 +259,24 @@ pub async fn handle_api_config_api_key_put(
         "openrouter" => "OPENROUTER_API_KEY",
         "groq" => "GROQ_API_KEY",
         "mistral" => "MISTRAL_API_KEY",
+        "xai" | "grok" => "XAI_API_KEY",
+        "venice" => "VENICE_API_KEY",
+        "ollama" => "OLLAMA_API_KEY",
+        "cohere" => "COHERE_API_KEY",
+        "perplexity" => "PERPLEXITY_API_KEY",
+        "together" | "together-ai" => "TOGETHER_API_KEY",
+        "fireworks" | "fireworks-ai" => "FIREWORKS_API_KEY",
+        "hunyuan" | "tencent" => "HUNYUAN_API_KEY",
+        "synthetic" => "SYNTHETIC_API_KEY",
+        "ovhcloud" | "ovh" => "OVH_AI_ENDPOINTS_ACCESS_TOKEN",
+        "astrai" => "ASTRAI_API_KEY",
+        "sglang" => "SGLANG_API_KEY",
+        "vllm" => "VLLM_API_KEY",
+        "osaurus" => "OSAURUS_API_KEY",
+        "telnyx" => "TELNYX_API_KEY",
+        "nvidia" | "nvidia-nim" => "NVIDIA_API_KEY",
+        "vercel" | "vercel-ai" => "VERCEL_API_KEY",
+        "cloudflare" | "cloudflare-ai" => "CLOUDFLARE_API_KEY",
         _ => "",
     };
     if !env_var.is_empty() {
@@ -263,8 +284,11 @@ pub async fn handle_api_config_api_key_put(
     }
 
     // Set config-level api_key to this provider's key and update default_provider.
-    config.api_key = Some(api_key.to_string());
-    config.default_provider = Some(backend_provider.to_string());
+    // Only update when setting a key, not when removing one.
+    if !api_key.is_empty() {
+        config.api_key = Some(api_key.to_string());
+        config.default_provider = Some(backend_provider.to_string());
+    }
 
     if let Err(e) = config.save().await {
         return (

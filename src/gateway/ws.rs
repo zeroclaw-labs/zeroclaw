@@ -516,12 +516,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
             continue;
         }
 
-        // ── Apply client-provided overrides (provider, model, api_key) ──
+        // ── Apply client-provided overrides (provider, model) ──
         // This mirrors the logic in openclaw_compat.rs for the HTTP /api/chat handler.
-        let client_sent_api_key = parsed["api_key"]
-            .as_str()
-            .filter(|k| !k.trim().is_empty())
-            .is_some();
         {
             let mut config_guard = state.config.lock();
 
@@ -536,19 +532,14 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
             if let Some(client_model) = parsed["model"].as_str().filter(|m| !m.trim().is_empty()) {
                 config_guard.default_model = Some(client_model.to_string());
             }
-
-            if let Some(client_key) = parsed["api_key"].as_str().filter(|k| !k.trim().is_empty()) {
-                config_guard.api_key = Some(client_key.to_string());
-            }
         }
 
         // ── Resolve provider-specific key from provider_api_keys map ──
-        // When the client doesn't send an explicit api_key, always look up
-        // the per-provider key stored via Settings → /api/config/api-key.
-        // This is critical because config.api_key may hold a DIFFERENT
-        // provider's key (e.g. Gemini key when the user switches to Anthropic),
-        // which would cause a 401 Unauthorized error.
-        if !client_sent_api_key {
+        // Users configure API keys once via Settings (stored in provider_api_keys).
+        // At chat time, we always look up the correct key for the effective provider.
+        // This prevents the 401 bug where config.api_key holds a DIFFERENT
+        // provider's key (e.g. Gemini key when using Anthropic).
+        {
             let mut config_guard = state.config.lock();
             let provider_name = config_guard
                 .default_provider

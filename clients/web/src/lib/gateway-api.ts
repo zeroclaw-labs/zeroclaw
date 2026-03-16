@@ -128,6 +128,15 @@ export function putConfig(toml: string): Promise<void> {
   });
 }
 
+// Provider API Key
+export function putProviderApiKey(provider: string, apiKey: string): Promise<{ status: string; provider: string }> {
+  return apiFetch<{ status: string; provider: string }>('/api/config/api-key', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider, api_key: apiKey }),
+  });
+}
+
 // Tools
 export function getTools(): Promise<ToolSpec[]> {
   return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>('/api/tools').then((data) =>

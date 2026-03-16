@@ -1,9 +1,10 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useCallback } from 'react';
 import { Search } from 'lucide-react';
 import { CONFIG_SECTIONS } from './configSections';
 import ConfigSection from './ConfigSection';
+import ProviderApiKeysEditor from './ProviderApiKeysEditor';
 import type { FieldDef } from './types';
 
 const CATEGORY_ORDER = [
@@ -27,6 +28,16 @@ interface Props {
 export default function ConfigFormEditor({ getFieldValue, setFieldValue, isFieldMasked }: Props) {
   const [search, setSearch] = useState('');
   const [activeCategory, setActiveCategory] = useState('all');
+  const [providerKeysRefresh, setProviderKeysRefresh] = useState(0);
+
+  const handleProviderKeySaved = useCallback((_provider: string) => {
+    // Trigger re-render to reflect the newly saved provider key
+    setProviderKeysRefresh((n) => n + 1);
+  }, []);
+
+  const handleProviderKeyRemoved = useCallback((_provider: string) => {
+    setProviderKeysRefresh((n) => n + 1);
+  }, []);
 
   const isSearching = search.trim().length > 0;
 
@@ -78,7 +89,18 @@ export default function ConfigFormEditor({ getFieldValue, setFieldValue, isField
         </div>
       )}
 
-      {filteredSections.length === 0 ? (
+      {/* Provider API Keys editor — show in general category or all, and when searching for key-related terms */}
+      {((!isSearching && (activeCategory === 'all' || activeCategory === 'general')) ||
+        (isSearching && ['api', 'key', 'provider', 'llm'].some((q) => search.toLowerCase().includes(q)))) && (
+        <ProviderApiKeysEditor
+          key={providerKeysRefresh}
+          configuredProviders={(getFieldValue('', 'provider_api_keys') as Record<string, string>) || {}}
+          onKeySaved={handleProviderKeySaved}
+          onKeyRemoved={handleProviderKeyRemoved}
+        />
+      )}
+
+      {filteredSections.length === 0 && !(!isSearching && (activeCategory === 'all' || activeCategory === 'general')) ? (
         <div className="text-center py-12 text-gray-500 text-sm">No matching config fields found.</div>
       ) : (
         filteredSections.map(({ section, fields }) => (
