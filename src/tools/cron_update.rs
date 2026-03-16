@@ -119,21 +119,11 @@ impl Tool for CronUpdateTool {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        if let Some(command) = &patch.command {
-            if let Err(reason) = self.security.validate_command_execution(command, approved) {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(reason),
-                });
-            }
-        }
-
         if let Some(blocked) = self.enforce_mutation_allowed("cron_update") {
             return Ok(blocked);
         }
 
-        match cron::update_job(&self.config, job_id, patch) {
+        match cron::update_shell_job_with_approval(&self.config, job_id, patch, approved) {
             Ok(job) => Ok(ToolResult {
                 success: true,
                 output: serde_json::to_string_pretty(&job)?,
@@ -228,10 +218,10 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.level = AutonomyLevel::ReadOnly;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        config.autonomy.level = AutonomyLevel::ReadOnly;
         let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
 
         let result = tool

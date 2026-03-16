@@ -622,7 +622,18 @@ impl Channel for DiscordChannel {
                 msg = read.next() => {
                     let msg = match msg {
                         Some(Ok(Message::Text(t))) => t,
+                        Some(Ok(Message::Ping(payload))) => {
+                            if write.send(Message::Pong(payload)).await.is_err() {
+                                tracing::warn!("Discord: pong send failed, reconnecting");
+                                break;
+                            }
+                            continue;
+                        }
                         Some(Ok(Message::Close(_))) | None => break,
+                        Some(Err(e)) => {
+                            tracing::warn!("Discord: websocket read error: {e}, reconnecting");
+                            break;
+                        }
                         _ => continue,
                     };
 
