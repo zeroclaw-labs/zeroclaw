@@ -656,7 +656,7 @@ async fn run_acp_agent_loop(
         "run_acp_agent_loop: calling process_message_with_history"
     );
     let result =
-        crate::agent::process_message_with_history(config, message, existing_history).await;
+        crate::agent::process_message_with_history(config, message, existing_history, None).await;
     match &result {
         Ok((text, hist)) => tracing::info!(
             response_len = text.len(),

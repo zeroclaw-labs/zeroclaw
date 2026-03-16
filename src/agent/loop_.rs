@@ -938,6 +938,7 @@ pub(crate) async fn agent_turn(
     silent: bool,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    injection_rx: Option<crate::channels::injection::InjectionReceiver>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -956,7 +957,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         &[],
-        None,
+        injection_rx,
     )
     .await
 }
@@ -3610,6 +3611,7 @@ pub async fn process_message_with_session(
                 true,
                 &config.multimodal,
                 config.agent.max_tool_iterations,
+                None,
             ),
         ),
     )
@@ -3628,6 +3630,7 @@ pub async fn process_message_with_history(
     config: Config,
     message: &str,
     existing_history: Vec<ChatMessage>,
+    injection_rx: Option<crate::channels::injection::InjectionReceiver>,
 ) -> Result<(String, Vec<ChatMessage>)> {
     if let Err(error) = crate::plugins::runtime::initialize_from_config(&config.plugins) {
         tracing::warn!("plugin registry initialization skipped: {error}");
@@ -3855,6 +3858,7 @@ pub async fn process_message_with_history(
                     true,
                     &config.multimodal,
                     config.agent.max_tool_iterations,
+                    injection_rx,
                 ),
             ),
         ),
