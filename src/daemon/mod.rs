@@ -16,6 +16,10 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sigterm = signal(SignalKind::terminate())?;
+        // Ignore SIGHUP to allow daemon to survive terminal/SSH session closes.
+        // When a terminal closes, SIGHUP is sent to the process group.
+        // By ignoring it, the daemon continues running in the background.
+        let mut sighup = signal(SignalKind::hangup())?;
 
         tokio::select! {
             _ = sigint.recv() => {
@@ -23,6 +27,10 @@ async fn wait_for_shutdown_signal() -> Result<()> {
             }
             _ = sigterm.recv() => {
                 tracing::info!("Received SIGTERM, shutting down...");
+            }
+            _ = sighup.recv() => {
+                // Ignore SIGHUP - daemon should continue running
+                tracing::debug!("Received SIGHUP, ignoring...");
             }
         }
     }
