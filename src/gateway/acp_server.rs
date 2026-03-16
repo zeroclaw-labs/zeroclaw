@@ -88,6 +88,9 @@ pub struct AcpTransportSession {
     /// Accumulated conversation history across `session/prompt` calls.
     pub history: Vec<crate::providers::ChatMessage>,
     pub created_at: Instant,
+    /// Sender for mid-task message injection (mirrors channel injection).
+    /// Set when a `session/prompt` spawns a task; cleared when the task completes.
+    pub injection_tx: Option<crate::channels::injection::InjectionSender>,
 }
 
 /// Thread-safe store of active ACP transport sessions.
@@ -128,6 +131,7 @@ impl AcpSessionStore {
             agent_session_id: None,
             history: Vec::new(),
             created_at: Instant::now(),
+            injection_tx: None,
         };
         let mut sessions = self.sessions.lock();
         self.evict_expired(&mut sessions);
@@ -330,6 +334,9 @@ pub async fn handle_acp(
         "session/prompt" => {
             handle_session_prompt(&req, &headers, acp_store, &state).await
         }
+        "session/inject" => {
+            handle_session_inject(&req, &headers, acp_store).await
+        }
         _ => (
             StatusCode::BAD_REQUEST,
             Json(jsonrpc_error(&req.id, -32601, &format!("Unknown method: {}", req.method))),
@@ -529,6 +536,16 @@ async fn handle_session_prompt(
     let existing_history = session.history.clone();
     let store_clone = store.clone();
 
+    // Create injection channel for mid-task messages from the caller (e.g., Sam → Walter).
+    let (injection_tx, injection_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::channels::injection::InjectedMessage>();
+
+    // Store sender in session so session/inject can find it.
+    if let Some(mut session) = store.get(&transport_id) {
+        session.injection_tx = Some(injection_tx);
+        store.update(session);
+    }
+
     // Create a channel for streaming SSE events
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
 
@@ -548,7 +565,7 @@ async fn handle_session_prompt(
         tracing::info!("ACP agent task spawned, calling run_acp_agent_loop");
         let inner_tx = tx.clone();
         let join_result = tokio::spawn(async move {
-            run_acp_agent_loop(config, &prompt_text, existing_history, inner_tx).await
+            run_acp_agent_loop(config, &prompt_text, existing_history, Some(injection_rx), inner_tx).await
         })
         .await;
 
@@ -559,9 +576,10 @@ async fn handle_session_prompt(
                     history_len = updated_history.len(),
                     "ACP agent loop completed successfully"
                 );
-                // Persist updated history back to the session store
+                // Persist updated history and clear injection channel (task done).
                 if let Some(mut session) = store_clone.get(&transport_id) {
                     session.history = updated_history;
+                    session.injection_tx = None;
                     store_clone.update(session);
                 }
 
@@ -625,6 +643,91 @@ async fn handle_session_prompt(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// `session/inject` — inject a mid-task message into a running agent loop.
+///
+/// The injected message is queued and drained by the agent loop between tool
+/// iterations, mirroring the channel injection pattern used for Signal messages.
+async fn handle_session_inject(
+    req: &JsonRpcRequest,
+    headers: &HeaderMap,
+    store: &AcpSessionStore,
+) -> Response {
+    let transport_id = headers
+        .get("Acp-Session-Id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let session = match store.get(&transport_id) {
+        Some(s) => s,
+        None => {
+            let err = jsonrpc_error(&req.id, -32000, "Invalid or expired Acp-Session-Id");
+            return sse_response(sse_line(&err));
+        }
+    };
+
+    // Parse inject params (reuse SessionPromptParams structure).
+    let params: SessionPromptParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            let err = jsonrpc_error(&req.id, -32602, &format!("Invalid params: {e}"));
+            return sse_response(sse_line(&err));
+        }
+    };
+
+    let inject_text = params
+        .prompt
+        .iter()
+        .filter_map(|p| p.text.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if inject_text.is_empty() {
+        let err = jsonrpc_error(&req.id, -32602, "Empty inject message");
+        return sse_response(sse_line(&err));
+    }
+
+    match &session.injection_tx {
+        Some(tx) => {
+            let msg = crate::channels::injection::InjectedMessage {
+                content: inject_text.clone(),
+                channel: "acp".to_string(),
+                sender: transport_id.clone(),
+            };
+            match tx.send(msg) {
+                Ok(()) => {
+                    tracing::info!(
+                        acp_session_id = %transport_id,
+                        inject_len = inject_text.len(),
+                        "ACP session/inject: message queued"
+                    );
+                    let result = jsonrpc_result(
+                        &req.id,
+                        serde_json::json!({"injected": true}),
+                    );
+                    sse_response(sse_line(&result))
+                }
+                Err(_) => {
+                    let err = jsonrpc_error(
+                        &req.id,
+                        -32000,
+                        "Injection channel closed — task may have completed",
+                    );
+                    sse_response(sse_line(&err))
+                }
+            }
+        }
+        None => {
+            let err = jsonrpc_error(
+                &req.id,
+                -32000,
+                "No running task to inject into — send a session/prompt first",
+            );
+            sse_response(sse_line(&err))
+        }
+    }
+}
+
 fn sse_response(body: String) -> Response {
     Response::builder()
         .status(StatusCode::OK)
@@ -639,6 +742,7 @@ async fn run_acp_agent_loop(
     config: Config,
     message: &str,
     existing_history: Vec<crate::providers::ChatMessage>,
+    injection_rx: Option<crate::channels::injection::InjectionReceiver>,
     tx: tokio::sync::mpsc::Sender<String>,
 ) -> anyhow::Result<(String, Vec<crate::providers::ChatMessage>)> {
     // Send a "started" notification
@@ -656,7 +760,7 @@ async fn run_acp_agent_loop(
         "run_acp_agent_loop: calling process_message_with_history"
     );
     let result =
-        crate::agent::process_message_with_history(config, message, existing_history, None).await;
+        crate::agent::process_message_with_history(config, message, existing_history, injection_rx).await;
     match &result {
         Ok((text, hist)) => tracing::info!(
             response_len = text.len(),
