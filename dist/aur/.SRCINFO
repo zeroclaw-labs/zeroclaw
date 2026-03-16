@@ -1,6 +1,6 @@
 pkgbase = zeroclaw
 	pkgdesc = Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant.
-	pkgver = 0.4.0
+	pkgver = 0.4.1
 	pkgrel = 1
 	url = https://github.com/zeroclaw-labs/zeroclaw
 	arch = x86_64
@@ -10,7 +10,7 @@ pkgbase = zeroclaw
 	makedepends = git
 	depends = gcc-libs
 	depends = openssl
-	source = zeroclaw-0.4.0.tar.gz::https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/v0.4.0.tar.gz
+	source = zeroclaw-0.4.1.tar.gz::https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/v0.4.1.tar.gz
 	sha256sums = SKIP
 
 pkgname = zeroclaw
