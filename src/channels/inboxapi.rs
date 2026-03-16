@@ -43,7 +43,7 @@ pub struct InboxApiConfig {
     /// Path to credentials JSON file (default: ~/.local/inboxapi/credentials.json).
     #[serde(default = "default_credentials_path")]
     pub credentials_path: String,
-    /// Allowed sender addresses/domains (empty or ["*"] = allow all).
+    /// Allowed sender addresses/domains (empty = deny all, ["*"] = allow all).
     #[serde(default)]
     pub allowed_senders: Vec<String>,
     /// Inbox polling interval in seconds (default: 30).
@@ -141,7 +141,7 @@ impl InboxApiChannel {
     /// Check if a sender email is in the allowlist.
     pub fn is_sender_allowed(&self, email: &str) -> bool {
         if self.config.allowed_senders.is_empty() {
-            return true; // Empty = allow all (use explicit list to restrict)
+            return false; // Empty = deny all (use ["*"] to allow all)
         }
         if self.config.allowed_senders.iter().any(|a| a == "*") {
             return true; // Wildcard = allow all
@@ -288,7 +288,7 @@ impl InboxApiChannel {
 
     // ── Credential management ───────────────────────────────────────────
 
-    /// Resolve the credentials file path (expand ~ and env vars).
+    /// Resolve the credentials file path (expand ~).
     fn credentials_path(&self) -> std::path::PathBuf {
         let expanded = shellexpand::tilde(&self.config.credentials_path).into_owned();
         std::path::PathBuf::from(expanded)
@@ -408,7 +408,7 @@ impl InboxApiChannel {
         };
 
         // Update runtime state
-        let email_address = {
+        let (email_address, persisted_account_name) = {
             let mut state = self.tokens.write().await;
             let email = state
                 .as_ref()
@@ -420,12 +420,17 @@ impl InboxApiChannel {
                 expires_at,
                 email_address: email.clone(),
             });
-            email
+            // Use account name from existing credentials file (may be suffixed)
+            let acct = self
+                .load_credentials()
+                .map(|c| c.account_name)
+                .unwrap_or_else(|| self.config.account_name.clone());
+            (email, acct)
         };
 
         // Persist updated credentials
         if let Err(e) = self.save_credentials(&Credentials {
-            account_name: self.config.account_name.clone(),
+            account_name: persisted_account_name,
             access_token: access_token.clone(),
             refresh_token: new_refresh,
             expires_at,
@@ -659,7 +664,7 @@ impl InboxApiChannel {
             arr
         } else {
             warn!(
-                "InboxAPI get_emails returned unrecognized format: {}",
+                "InboxAPI search_emails returned unrecognized format: {}",
                 emails
                     .as_object()
                     .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
@@ -779,6 +784,17 @@ impl Channel for InboxApiChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
+        // Ensure in-memory tokens are populated from disk if not already set
+        {
+            let has_tokens = self.tokens.read().await.is_some();
+            if !has_tokens {
+                if let Some(creds) = self.load_credentials() {
+                    let ts = self.apply_credentials(&creds);
+                    *self.tokens.write().await = Some(ts);
+                }
+            }
+        }
+
         let token = self.get_access_token().await?;
 
         if let Some(ref reply_to) = message.thread_ts {
@@ -949,10 +965,10 @@ mod tests {
     // ── Sender allowlist ────────────────────────────────────────────────
 
     #[test]
-    fn is_sender_allowed_empty_list_allows_all() {
+    fn is_sender_allowed_empty_list_denies_all() {
         let channel = InboxApiChannel::new(InboxApiConfig::default());
-        assert!(channel.is_sender_allowed("anyone@example.com"));
-        assert!(channel.is_sender_allowed("other@test.org"));
+        assert!(!channel.is_sender_allowed("anyone@example.com"));
+        assert!(!channel.is_sender_allowed("other@test.org"));
     }
 
     #[test]
