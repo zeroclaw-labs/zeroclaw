@@ -191,7 +191,8 @@ impl Channel for TwitterChannel {
             );
 
             if let Some(ref id) = since_id {
-                url.push_str(&format!("&since_id={id}"));
+                use std::fmt::Write;
+                let _ = write!(url, "&since_id={id}");
             }
 
             match self

@@ -122,7 +122,8 @@ impl Channel for MochatChannel {
         loop {
             let mut url = format!("{}/api/message/receive", self.api_url);
             if let Some(ref id) = last_message_id {
-                url.push_str(&format!("?since_id={id}"));
+                use std::fmt::Write;
+                let _ = write!(url, "?since_id={id}");
             }
 
             match self
