@@ -54,6 +54,9 @@ RUN touch src/main.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
+    rm -rf target/release/.fingerprint/zeroclawlabs-* \
+           target/release/deps/zeroclawlabs-* \
+           target/release/incremental/zeroclawlabs-* && \
     cargo build --release --locked && \
     cp target/release/zeroclaw /app/zeroclaw && \
     strip /app/zeroclaw
