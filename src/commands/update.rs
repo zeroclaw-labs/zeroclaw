@@ -4,8 +4,10 @@ use anyhow::{bail, Context, Result};
 use std::path::Path;
 use tracing::{info, warn};
 
-const GITHUB_RELEASES_URL: &str =
+const GITHUB_RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest";
+const GITHUB_RELEASES_TAG_URL: &str =
+    "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/tags";
 
 #[derive(Debug)]
 pub struct UpdateInfo {
@@ -16,7 +18,9 @@ pub struct UpdateInfo {
 }
 
 /// Check for available updates without downloading.
-pub async fn check() -> Result<UpdateInfo> {
+///
+/// If `target_version` is `Some`, fetch that specific release tag instead of latest.
+pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
     let current = env!("CARGO_PKG_VERSION").to_string();
 
     let client = reqwest::Client::builder()
@@ -24,8 +28,20 @@ pub async fn check() -> Result<UpdateInfo> {
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
 
+    let url = match target_version {
+        Some(v) => {
+            let tag = if v.starts_with('v') {
+                v.to_string()
+            } else {
+                format!("v{v}")
+            };
+            format!("{GITHUB_RELEASES_TAG_URL}/{tag}")
+        }
+        None => GITHUB_RELEASES_LATEST_URL.to_string(),
+    };
+
     let resp = client
-        .get(GITHUB_RELEASES_URL)
+        .get(&url)
         .send()
         .await
         .context("failed to reach GitHub releases API")?;
@@ -53,10 +69,12 @@ pub async fn check() -> Result<UpdateInfo> {
 }
 
 /// Run the full 6-phase update pipeline.
-pub async fn run() -> Result<()> {
+///
+/// If `target_version` is `Some`, fetch that specific version instead of latest.
+pub async fn run(target_version: Option<&str>) -> Result<()> {
     // Phase 1: Preflight
     info!("Phase 1/6: Preflight checks...");
-    let update_info = check().await?;
+    let update_info = check(target_version).await?;
 
     if !update_info.is_newer {
         println!("Already up to date (v{}).", update_info.current_version);

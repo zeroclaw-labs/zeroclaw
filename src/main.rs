@@ -476,14 +476,24 @@ By default, downloads and installs the latest release with a \
 and smoke test. Automatic rollback on failure.
 
 Use --check to only check for updates without installing.
+Use --force to skip the confirmation prompt.
+Use --version to target a specific release instead of latest.
 
 Examples:
-  zeroclaw update             # download and install latest
-  zeroclaw update --check     # check only, don't install")]
+  zeroclaw update                      # download and install latest
+  zeroclaw update --check              # check only, don't install
+  zeroclaw update --force              # install without confirmation
+  zeroclaw update --version 0.6.0      # install specific version")]
     Update {
         /// Only check for updates, don't install
         #[arg(long)]
         check: bool,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+        /// Target version (default: latest)
+        #[arg(long)]
+        version: Option<String>,
     },
 
     /// Run diagnostic self-tests
@@ -1270,9 +1280,13 @@ async fn main() -> Result<()> {
             .await
         }
 
-        Commands::Update { check } => {
+        Commands::Update {
+            check,
+            force: _force,
+            version,
+        } => {
             if check {
-                let info = commands::update::check().await?;
+                let info = commands::update::check(version.as_deref()).await?;
                 if info.is_newer {
                     println!(
                         "Update available: v{} -> v{}",
@@ -1283,7 +1297,7 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             } else {
-                commands::update::run().await
+                commands::update::run(version.as_deref()).await
             }
         }
 
