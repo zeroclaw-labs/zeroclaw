@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import type { CostSummary } from '@/types/api';
 import { getCost } from '@/lib/api';
+import { t } from '@/lib/i18n';
 
 function formatUSD(value: number): string {
   return `$${value.toFixed(4)}`;
@@ -28,7 +29,7 @@ export default function Cost() {
     return (
       <div className="p-6 animate-fade-in">
         <div className="rounded-xl bg-[#ff446615] border border-[#ff446630] p-4 text-[#ff6680]">
-          Failed to load cost data: {error}
+          {t('cost.load_error')}: {error}
         </div>
       </div>
     );
@@ -49,10 +50,10 @@ export default function Cost() {
       {/* Summary Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 stagger-children">
         {[
-          { icon: DollarSign, color: '#0080ff', bg: '#0080ff15', label: 'Session Cost', value: formatUSD(cost.session_cost_usd) },
-          { icon: TrendingUp, color: '#00e68a', bg: '#00e68a15', label: 'Daily Cost', value: formatUSD(cost.daily_cost_usd) },
-          { icon: Layers, color: '#a855f7', bg: '#a855f715', label: 'Monthly Cost', value: formatUSD(cost.monthly_cost_usd) },
-          { icon: Hash, color: '#ff8800', bg: '#ff880015', label: 'Total Requests', value: cost.request_count.toLocaleString() },
+          { icon: DollarSign, color: '#0080ff', bg: '#0080ff15', label: t('cost.session_cost'), value: formatUSD(cost.session_cost_usd) },
+          { icon: TrendingUp, color: '#00e68a', bg: '#00e68a15', label: t('cost.daily_cost'), value: formatUSD(cost.daily_cost_usd) },
+          { icon: Layers, color: '#a855f7', bg: '#a855f715', label: t('cost.monthly_cost'), value: formatUSD(cost.monthly_cost_usd) },
+          { icon: Hash, color: '#ff8800', bg: '#ff880015', label: t('cost.total_requests'), value: cost.request_count.toLocaleString() },
         ].map(({ icon: Icon, color, bg, label, value }) => (
           <div key={label} className="glass-card p-5 animate-slide-in-up">
             <div className="flex items-center gap-3 mb-3">
@@ -69,13 +70,13 @@ export default function Cost() {
       {/* Token Statistics */}
       <div className="glass-card p-5 animate-slide-in-up" style={{ animationDelay: '200ms' }}>
         <h3 className="text-sm font-semibold text-white mb-4 uppercase tracking-wider">
-          Token Statistics
+          {t('cost.token_statistics')}
         </h3>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           {[
-            { label: 'Total Tokens', value: cost.total_tokens.toLocaleString() },
-            { label: 'Avg Tokens / Request', value: cost.request_count > 0 ? Math.round(cost.total_tokens / cost.request_count).toLocaleString() : '0' },
-            { label: 'Cost per 1K Tokens', value: cost.total_tokens > 0 ? formatUSD((cost.monthly_cost_usd / cost.total_tokens) * 1000) : '$0.0000' },
+            { label: t('cost.total_tokens'), value: cost.total_tokens.toLocaleString() },
+            { label: t('cost.avg_tokens_per_request'), value: cost.request_count > 0 ? Math.round(cost.total_tokens / cost.request_count).toLocaleString() : '0' },
+            { label: t('cost.cost_per_1k_tokens'), value: cost.total_tokens > 0 ? formatUSD((cost.monthly_cost_usd / cost.total_tokens) * 1000) : '$0.0000' },
           ].map(({ label, value }) => (
             <div key={label} className="rounded-xl p-4" style={{ background: 'rgba(0,128,255,0.04)', border: '1px solid rgba(0,128,255,0.08)' }}>
               <p className="text-xs text-[#556080] uppercase tracking-wider">{label}</p>
@@ -89,23 +90,23 @@ export default function Cost() {
       <div className="glass-card overflow-hidden animate-slide-in-up" style={{ animationDelay: '300ms' }}>
         <div className="px-5 py-4 border-b border-[#1a1a3e]">
           <h3 className="text-sm font-semibold text-white uppercase tracking-wider">
-            Model Breakdown
+            {t('cost.model_breakdown')}
           </h3>
         </div>
         {models.length === 0 ? (
           <div className="p-8 text-center text-[#334060]">
-            No model data available.
+            {t('cost.no_model_data')}
           </div>
         ) : (
           <div className="overflow-x-auto">
             <table className="table-electric">
               <thead>
                 <tr>
-                  <th className="text-left">Model</th>
-                  <th className="text-right">Cost</th>
-                  <th className="text-right">Tokens</th>
-                  <th className="text-right">Requests</th>
-                  <th className="text-left">Share</th>
+                  <th className="text-left">{t('cost.model')}</th>
+                  <th className="text-right">{t('cost.cost')}</th>
+                  <th className="text-right">{t('cost.tokens')}</th>
+                  <th className="text-right">{t('cost.requests')}</th>
+                  <th className="text-left">{t('cost.share')}</th>
                 </tr>
               </thead>
               <tbody>

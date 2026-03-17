@@ -9,6 +9,7 @@ import {
 } from 'lucide-react';
 import type { MemoryEntry } from '@/types/api';
 import { getMemory, storeMemory, deleteMemory } from '@/lib/api';
+import { t } from '@/lib/i18n';
 
 function truncate(text: string, max: number): string {
   if (text.length <= max) return text;
@@ -60,7 +61,7 @@ export default function Memory() {
 
   const handleAdd = async () => {
     if (!formKey.trim() || !formContent.trim()) {
-      setFormError('Key and content are required.');
+      setFormError(t('memory.validation_error'));
       return;
     }
     setSubmitting(true);
@@ -77,7 +78,7 @@ export default function Memory() {
       setFormContent('');
       setFormCategory('');
     } catch (err: unknown) {
-      setFormError(err instanceof Error ? err.message : 'Failed to store memory');
+      setFormError(err instanceof Error ? err.message : t('memory.store_error'));
     } finally {
       setSubmitting(false);
     }
@@ -88,7 +89,7 @@ export default function Memory() {
       await deleteMemory(key);
       setEntries((prev) => prev.filter((e) => e.key !== key));
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to delete memory');
+      setError(err instanceof Error ? err.message : t('memory.delete_error'));
     } finally {
       setConfirmDelete(null);
     }
@@ -98,7 +99,7 @@ export default function Memory() {
     return (
       <div className="p-6 animate-fade-in">
         <div className="rounded-xl bg-[#ff446615] border border-[#ff446630] p-4 text-[#ff6680]">
-          Failed to load memory: {error}
+          {t('memory.load_error')}: {error}
         </div>
       </div>
     );
@@ -111,7 +112,7 @@ export default function Memory() {
         <div className="flex items-center gap-2">
           <Brain className="h-5 w-5 text-[#0080ff]" />
           <h2 className="text-sm font-semibold text-white uppercase tracking-wider">
-            Memory ({entries.length})
+            {t('memory.memory_title')} ({entries.length})
           </h2>
         </div>
         <button
@@ -119,7 +120,7 @@ export default function Memory() {
           className="btn-electric flex items-center gap-2 text-sm px-4 py-2"
         >
           <Plus className="h-4 w-4" />
-          Add Memory
+          {t('memory.add_memory')}
         </button>
       </div>
 
@@ -132,7 +133,7 @@ export default function Memory() {
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Search memory entries..."
+            placeholder={t('memory.search_placeholder')}
             className="input-electric w-full pl-10 pr-4 py-2.5 text-sm"
           />
         </div>
@@ -143,7 +144,7 @@ export default function Memory() {
             onChange={(e) => setCategoryFilter(e.target.value)}
             className="input-electric pl-10 pr-8 py-2.5 text-sm appearance-none cursor-pointer"
           >
-            <option value="">All Categories</option>
+            <option value="">{t('memory.all_categories')}</option>
             {categories.map((cat) => (
               <option key={cat} value={cat}>
                 {cat}
@@ -155,7 +156,7 @@ export default function Memory() {
           onClick={handleSearch}
           className="btn-electric px-4 py-2.5 text-sm"
         >
-          Search
+          {t('memory.search_button')}
         </button>
       </div>
 
@@ -171,7 +172,7 @@ export default function Memory() {
         <div className="fixed inset-0 modal-backdrop flex items-center justify-center z-50">
           <div className="glass-card p-6 w-full max-w-md mx-4 animate-fade-in-scale">
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-semibold text-white">Add Memory</h3>
+              <h3 className="text-lg font-semibold text-white">{t('memory.add_modal_title')}</h3>
               <button
                 onClick={() => {
                   setShowForm(false);
@@ -192,7 +193,7 @@ export default function Memory() {
             <div className="space-y-4">
               <div>
                 <label className="block text-xs font-semibold text-[#8892a8] mb-1.5 uppercase tracking-wider">
-                  Key <span className="text-[#ff4466]">*</span>
+                  {t('memory.key_required')} <span className="text-[#ff4466]">*</span>
                 </label>
                 <input
                   type="text"
@@ -204,7 +205,7 @@ export default function Memory() {
               </div>
               <div>
                 <label className="block text-xs font-semibold text-[#8892a8] mb-1.5 uppercase tracking-wider">
-                  Content <span className="text-[#ff4466]">*</span>
+                  {t('memory.content_required')} <span className="text-[#ff4466]">*</span>
                 </label>
                 <textarea
                   value={formContent}
@@ -216,7 +217,7 @@ export default function Memory() {
               </div>
               <div>
                 <label className="block text-xs font-semibold text-[#8892a8] mb-1.5 uppercase tracking-wider">
-                  Category (optional)
+                  {t('memory.category_optional')}
                 </label>
                 <input
                   type="text"
@@ -236,14 +237,14 @@ export default function Memory() {
                 }}
                 className="px-4 py-2 text-sm font-medium text-[#8892a8] hover:text-white border border-[#1a1a3e] rounded-xl hover:bg-[#0080ff08] transition-all duration-300"
               >
-                Cancel
+                {t('memory.cancel')}
               </button>
               <button
                 onClick={handleAdd}
                 disabled={submitting}
                 className="btn-electric px-4 py-2 text-sm font-medium"
               >
-                {submitting ? 'Saving...' : 'Save'}
+                {submitting ? t('memory.saving') : t('common.save')}
               </button>
             </div>
           </div>
@@ -258,18 +259,18 @@ export default function Memory() {
       ) : entries.length === 0 ? (
         <div className="glass-card p-8 text-center">
           <Brain className="h-10 w-10 text-[#1a1a3e] mx-auto mb-3" />
-          <p className="text-[#556080]">No memory entries found.</p>
+          <p className="text-[#556080]">{t('memory.empty')}</p>
         </div>
       ) : (
         <div className="glass-card overflow-x-auto">
           <table className="table-electric">
             <thead>
               <tr>
-                <th className="text-left">Key</th>
-                <th className="text-left">Content</th>
-                <th className="text-left">Category</th>
-                <th className="text-left">Timestamp</th>
-                <th className="text-right">Actions</th>
+                <th className="text-left">{t('memory.key')}</th>
+                <th className="text-left">{t('memory.content')}</th>
+                <th className="text-left">{t('memory.category')}</th>
+                <th className="text-left">{t('memory.timestamp')}</th>
+                <th className="text-right">{t('common.actions')}</th>
               </tr>
             </thead>
             <tbody>
@@ -294,18 +295,18 @@ export default function Memory() {
                   <td className="px-4 py-3 text-right">
                     {confirmDelete === entry.key ? (
                       <div className="flex items-center justify-end gap-2 animate-fade-in">
-                        <span className="text-xs text-[#ff4466]">Delete?</span>
+                        <span className="text-xs text-[#ff4466]">{t('memory.delete_confirm')}</span>
                         <button
                           onClick={() => handleDelete(entry.key)}
                           className="text-[#ff4466] hover:text-[#ff6680] text-xs font-medium"
                         >
-                          Yes
+                          {t('memory.yes')}
                         </button>
                         <button
                           onClick={() => setConfirmDelete(null)}
                           className="text-[#556080] hover:text-white text-xs font-medium"
                         >
-                          No
+                          {t('memory.no')}
                         </button>
                       </div>
                     ) : (
