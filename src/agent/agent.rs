@@ -29,16 +29,17 @@ pub struct Agent {
     model_name: String,
     temperature: f64,
     workspace_dir: std::path::PathBuf,
-    autonomy_config: crate::config::AutonomyConfig,
     identity_config: crate::config::IdentityConfig,
     skills: Vec<crate::skills::Skill>,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     auto_save: bool,
+    memory_session_id: Option<String>,
     history: Vec<ConversationMessage>,
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
     route_model_by_hint: HashMap<String, String>,
     allowed_tools: Option<Vec<String>>,
+    response_cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
 }
 
 pub struct AgentBuilder {
@@ -53,15 +54,16 @@ pub struct AgentBuilder {
     model_name: Option<String>,
     temperature: Option<f64>,
     workspace_dir: Option<std::path::PathBuf>,
-    autonomy_config: Option<crate::config::AutonomyConfig>,
     identity_config: Option<crate::config::IdentityConfig>,
     skills: Option<Vec<crate::skills::Skill>>,
     skills_prompt_mode: Option<crate::config::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
+    memory_session_id: Option<String>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
     route_model_by_hint: Option<HashMap<String, String>>,
     allowed_tools: Option<Vec<String>>,
+    response_cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
 }
 
 impl AgentBuilder {
@@ -78,15 +80,16 @@ impl AgentBuilder {
             model_name: None,
             temperature: None,
             workspace_dir: None,
-            autonomy_config: None,
             identity_config: None,
             skills: None,
             skills_prompt_mode: None,
             auto_save: None,
+            memory_session_id: None,
             classification_config: None,
             available_hints: None,
             route_model_by_hint: None,
             allowed_tools: None,
+            response_cache: None,
         }
     }
 
@@ -145,11 +148,6 @@ impl AgentBuilder {
         self
     }
 
-    pub fn autonomy_config(mut self, autonomy_config: crate::config::AutonomyConfig) -> Self {
-        self.autonomy_config = Some(autonomy_config);
-        self
-    }
-
     pub fn identity_config(mut self, identity_config: crate::config::IdentityConfig) -> Self {
         self.identity_config = Some(identity_config);
         self
@@ -173,6 +171,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn memory_session_id(mut self, memory_session_id: Option<String>) -> Self {
+        self.memory_session_id = memory_session_id;
+        self
+    }
+
     pub fn classification_config(
         mut self,
         classification_config: crate::config::QueryClassificationConfig,
@@ -193,6 +196,14 @@ impl AgentBuilder {
 
     pub fn allowed_tools(mut self, allowed_tools: Option<Vec<String>>) -> Self {
         self.allowed_tools = allowed_tools;
+        self
+    }
+
+    pub fn response_cache(
+        mut self,
+        cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
+    ) -> Self {
+        self.response_cache = cache;
         self
     }
 
@@ -235,16 +246,17 @@ impl AgentBuilder {
             workspace_dir: self
                 .workspace_dir
                 .unwrap_or_else(|| std::path::PathBuf::from(".")),
-            autonomy_config: self.autonomy_config.unwrap_or_default(),
             identity_config: self.identity_config.unwrap_or_default(),
             skills: self.skills.unwrap_or_default(),
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
+            memory_session_id: self.memory_session_id,
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
             allowed_tools: allowed,
+            response_cache: self.response_cache,
         })
     }
 }
@@ -260,6 +272,10 @@ impl Agent {
 
     pub fn clear_history(&mut self) {
         self.history.clear();
+    }
+
+    pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
+        self.memory_session_id = session_id;
     }
 
     pub fn from_config(config: &Config) -> Result<Self> {
@@ -339,11 +355,25 @@ impl Agent {
             .collect();
         let available_hints: Vec<String> = route_model_by_hint.keys().cloned().collect();
 
+        let response_cache = if config.memory.response_cache_enabled {
+            crate::memory::response_cache::ResponseCache::with_hot_cache(
+                &config.workspace_dir,
+                config.memory.response_cache_ttl_minutes,
+                config.memory.response_cache_max_entries,
+                config.memory.response_cache_hot_entries,
+            )
+            .ok()
+            .map(Arc::new)
+        } else {
+            None
+        };
+
         Agent::builder()
             .provider(provider)
             .tools(tools)
             .memory(memory)
             .observer(observer)
+            .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
             .memory_loader(Box::new(DefaultMemoryLoader::new(
                 5,
@@ -354,7 +384,6 @@ impl Agent {
             .model_name(model_name)
             .temperature(config.default_temperature)
             .workspace_dir(config.workspace_dir.clone())
-            .autonomy_config(config.autonomy.clone())
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
             .route_model_by_hint(route_model_by_hint)
@@ -406,12 +435,7 @@ impl Agent {
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
         };
-        let mut prompt = self.prompt_builder.build(&ctx)?;
-        prompt.push_str(&crate::channels::autonomy_constraints_prompt(
-            &self.autonomy_config,
-            &self.workspace_dir,
-        ));
-        Ok(prompt)
+        self.prompt_builder.build(&ctx)
     }
 
     async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
@@ -504,13 +528,22 @@ impl Agent {
         if self.auto_save {
             let _ = self
                 .memory
-                .store("user_msg", user_message, MemoryCategory::Conversation, None)
+                .store(
+                    "user_msg",
+                    user_message,
+                    MemoryCategory::Conversation,
+                    self.memory_session_id.as_deref(),
+                )
                 .await;
         }
 
         let context = self
             .memory_loader
-            .load_context(self.memory.as_ref(), user_message)
+            .load_context(
+                self.memory.as_ref(),
+                user_message,
+                self.memory_session_id.as_deref(),
+            )
             .await
             .unwrap_or_default();
 
@@ -528,6 +561,47 @@ impl Agent {
 
         for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+
+            // Response cache: check before LLM call (only for deterministic, text-only prompts)
+            let cache_key = if self.temperature == 0.0 {
+                self.response_cache.as_ref().map(|_| {
+                    let last_user = messages
+                        .iter()
+                        .rfind(|m| m.role == "user")
+                        .map(|m| m.content.as_str())
+                        .unwrap_or("");
+                    let system = messages
+                        .iter()
+                        .find(|m| m.role == "system")
+                        .map(|m| m.content.as_str());
+                    crate::memory::response_cache::ResponseCache::cache_key(
+                        &effective_model,
+                        system,
+                        last_user,
+                    )
+                })
+            } else {
+                None
+            };
+
+            if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                if let Ok(Some(cached)) = cache.get(key) {
+                    self.observer.record_event(&ObserverEvent::CacheHit {
+                        cache_type: "response".into(),
+                        tokens_saved: 0,
+                    });
+                    self.history
+                        .push(ConversationMessage::Chat(ChatMessage::assistant(
+                            cached.clone(),
+                        )));
+                    self.trim_history();
+                    return Ok(cached);
+                }
+                self.observer.record_event(&ObserverEvent::CacheMiss {
+                    cache_type: "response".into(),
+                });
+            }
+
             let response = match self
                 .provider
                 .chat(
@@ -555,6 +629,17 @@ impl Agent {
                 } else {
                     text
                 };
+
+                // Store in response cache (text-only, no tool calls)
+                if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                    let token_count = response
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.output_tokens)
+                        .unwrap_or(0);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let _ = cache.put(key, &effective_model, &final_text, token_count as u32);
+                }
 
                 self.history
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
