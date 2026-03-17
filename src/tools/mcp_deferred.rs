@@ -161,8 +161,7 @@ impl DeferredMcpToolSet {
 /// The agent loop consults this each iteration to decide which tool_specs
 /// to include in the LLM request.
 pub struct ActivatedToolSet {
-    /// name -> activated Tool
-    tools: HashMap<String, Box<dyn Tool>>,
+    tools: HashMap<String, Arc<dyn Tool>>,
 }
 
 impl ActivatedToolSet {
@@ -172,27 +171,23 @@ impl ActivatedToolSet {
         }
     }
 
-    /// Mark a tool as activated, storing its live wrapper.
-    pub fn activate(&mut self, name: String, tool: Box<dyn Tool>) {
+    pub fn activate(&mut self, name: String, tool: Arc<dyn Tool>) {
         self.tools.insert(name, tool);
     }
 
-    /// Whether a tool has been activated.
     pub fn is_activated(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }
 
-    /// Get an activated tool for execution.
-    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.get(name).map(|t| t.as_ref())
+    /// Clone the Arc so the caller can drop the mutex guard before awaiting.
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools.get(name).cloned()
     }
 
-    /// All currently activated tool specs (to include in LLM requests).
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         self.tools.values().map(|t| t.spec()).collect()
     }
 
-    /// All activated tools for execution dispatch.
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.keys().map(|s| s.as_str()).collect()
     }
@@ -280,7 +275,7 @@ mod tests {
 
         let mut set = ActivatedToolSet::new();
         assert!(!set.is_activated("fake"));
-        set.activate("fake".into(), Box::new(FakeTool));
+        set.activate("fake".into(), Arc::new(FakeTool));
         assert!(set.is_activated("fake"));
         assert!(set.get("fake").is_some());
         assert_eq!(set.tool_specs().len(), 1);
