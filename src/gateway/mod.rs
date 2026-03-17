@@ -1891,6 +1891,8 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             session_backend: None,
+            device_registry: None,
+            pending_pairings: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1944,6 +1946,8 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             session_backend: None,
+            device_registry: None,
+            pending_pairings: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2321,6 +2325,8 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             session_backend: None,
+            device_registry: None,
+            pending_pairings: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2388,6 +2394,8 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             session_backend: None,
+            device_registry: None,
+            pending_pairings: None,
         };
 
         let headers = HeaderMap::new();
@@ -2467,6 +2475,8 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             session_backend: None,
+            device_registry: None,
+            pending_pairings: None,
         };
 
         let response = handle_webhook(
@@ -2518,6 +2528,8 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             session_backend: None,
+            device_registry: None,
+            pending_pairings: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2574,6 +2586,8 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             session_backend: None,
+            device_registry: None,
+            pending_pairings: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2635,6 +2649,8 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             session_backend: None,
+            device_registry: None,
+            pending_pairings: None,
         };
 
         let response = Box::pin(handle_nextcloud_talk_webhook(
@@ -2692,6 +2708,8 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             session_backend: None,
+            device_registry: None,
+            pending_pairings: None,
         };
 
         let mut headers = HeaderMap::new();

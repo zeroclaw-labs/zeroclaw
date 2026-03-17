@@ -9455,6 +9455,7 @@ channel_id = "C123"
             idempotency_max_keys: 4096,
             session_persistence: true,
             session_ttl_hours: 0,
+            pairing_dashboard: PairingDashboardConfig::default(),
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
