@@ -80,4 +80,39 @@ mod tests {
     fn noop_flush_does_not_panic() {
         NoopObserver.flush();
     }
+
+    #[test]
+    fn noop_hand_events_do_not_panic() {
+        let obs = NoopObserver;
+        obs.record_event(&ObserverEvent::HandStarted {
+            hand_name: "review".into(),
+        });
+        obs.record_event(&ObserverEvent::HandCompleted {
+            hand_name: "review".into(),
+            duration_ms: 1500,
+            findings_count: 3,
+        });
+        obs.record_event(&ObserverEvent::HandFailed {
+            hand_name: "review".into(),
+            error: "timeout".into(),
+            duration_ms: 5000,
+        });
+    }
+
+    #[test]
+    fn noop_hand_metrics_do_not_panic() {
+        let obs = NoopObserver;
+        obs.record_metric(&ObserverMetric::HandRunDuration {
+            hand_name: "review".into(),
+            duration: Duration::from_millis(1500),
+        });
+        obs.record_metric(&ObserverMetric::HandFindingsCount {
+            hand_name: "review".into(),
+            count: 5,
+        });
+        obs.record_metric(&ObserverMetric::HandSuccessRate {
+            hand_name: "review".into(),
+            success: true,
+        });
+    }
 }

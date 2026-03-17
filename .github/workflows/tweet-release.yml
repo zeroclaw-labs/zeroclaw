@@ -53,7 +53,15 @@ jobs:
             exit 0
           fi
 
-          # Find the PREVIOUS release tag (including betas) to check for new features
+          # Stable releases (no -beta suffix) always tweet — they represent
+          # the full release cycle, so skipping them loses visibility.
+          if [[ ! "$RELEASE_TAG" =~ -beta\. ]]; then
+            echo "Stable release ${RELEASE_TAG} — always tweet"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # For betas: find the PREVIOUS release tag to check for new features
           PREV_TAG=$(git tag --sort=-creatordate \
             | grep -v "^${RELEASE_TAG}$" \
             | head -1 || echo "")
@@ -63,15 +71,15 @@ jobs:
             exit 0
           fi
 
-          # Count new feat() commits since the previous release
-          NEW_FEATS=$(git log "${PREV_TAG}..${RELEASE_TAG}" --pretty=format:"%s" --no-merges \
-            | grep -ciE '^feat(\(|:)' || echo "0")
+          # Count new feat() OR fix() commits since the previous release
+          NEW_CHANGES=$(git log "${PREV_TAG}..${RELEASE_TAG}" --pretty=format:"%s" --no-merges \
+            | grep -ciE '^(feat|fix)(\(|:)' || echo "0")
 
-          if [ "$NEW_FEATS" -eq 0 ]; then
-            echo "No new features since ${PREV_TAG} — skipping tweet"
+          if [ "$NEW_CHANGES" -eq 0 ]; then
+            echo "No new features or fixes since ${PREV_TAG} — skipping tweet"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            echo "${NEW_FEATS} new feature(s) since ${PREV_TAG} — tweeting"
+            echo "${NEW_CHANGES} new change(s) since ${PREV_TAG} — tweeting"
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 

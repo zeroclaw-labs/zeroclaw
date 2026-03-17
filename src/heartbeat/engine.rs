@@ -1,6 +1,8 @@
 use crate::config::HeartbeatConfig;
 use crate::observability::{Observer, ObserverEvent};
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
@@ -68,6 +70,99 @@ impl fmt::Display for HeartbeatTask {
     }
 }
 
+// ── Health Metrics ───────────────────────────────────────────────
+
+/// Live health metrics for the heartbeat subsystem.
+///
+/// Shared via `Arc<ParkingMutex<>>` between the heartbeat worker,
+/// deadman watcher, and API consumers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatMetrics {
+    /// Monotonic uptime since the heartbeat loop started.
+    pub uptime_secs: u64,
+    /// Consecutive successful ticks (resets on failure).
+    pub consecutive_successes: u64,
+    /// Consecutive failed ticks (resets on success).
+    pub consecutive_failures: u64,
+    /// Timestamp of the most recent tick (UTC RFC 3339).
+    pub last_tick_at: Option<DateTime<Utc>>,
+    /// Exponential moving average of tick durations in milliseconds.
+    pub avg_tick_duration_ms: f64,
+    /// Total number of ticks executed since startup.
+    pub total_ticks: u64,
+}
+
+impl Default for HeartbeatMetrics {
+    fn default() -> Self {
+        Self {
+            uptime_secs: 0,
+            consecutive_successes: 0,
+            consecutive_failures: 0,
+            last_tick_at: None,
+            avg_tick_duration_ms: 0.0,
+            total_ticks: 0,
+        }
+    }
+}
+
+impl HeartbeatMetrics {
+    /// Record a successful tick with the given duration.
+    pub fn record_success(&mut self, duration_ms: f64) {
+        self.consecutive_successes += 1;
+        self.consecutive_failures = 0;
+        self.last_tick_at = Some(Utc::now());
+        self.total_ticks += 1;
+        self.update_avg_duration(duration_ms);
+    }
+
+    /// Record a failed tick with the given duration.
+    pub fn record_failure(&mut self, duration_ms: f64) {
+        self.consecutive_failures += 1;
+        self.consecutive_successes = 0;
+        self.last_tick_at = Some(Utc::now());
+        self.total_ticks += 1;
+        self.update_avg_duration(duration_ms);
+    }
+
+    fn update_avg_duration(&mut self, duration_ms: f64) {
+        const ALPHA: f64 = 0.3; // EMA smoothing factor
+        if self.total_ticks == 1 {
+            self.avg_tick_duration_ms = duration_ms;
+        } else {
+            self.avg_tick_duration_ms =
+                ALPHA * duration_ms + (1.0 - ALPHA) * self.avg_tick_duration_ms;
+        }
+    }
+}
+
+/// Compute the adaptive interval for the next heartbeat tick.
+///
+/// Strategy:
+/// - On failures: exponential back-off `base * 2^failures` capped at `max_interval`.
+/// - When high-priority tasks are present: use `min_interval` for faster reaction.
+/// - Otherwise: use `base_interval`.
+pub fn compute_adaptive_interval(
+    base_minutes: u32,
+    min_minutes: u32,
+    max_minutes: u32,
+    consecutive_failures: u64,
+    has_high_priority_tasks: bool,
+) -> u32 {
+    if consecutive_failures > 0 {
+        let backoff = base_minutes.saturating_mul(
+            1u32.checked_shl(consecutive_failures.min(10) as u32)
+                .unwrap_or(u32::MAX),
+        );
+        return backoff.min(max_minutes).max(min_minutes);
+    }
+
+    if has_high_priority_tasks {
+        return min_minutes.max(5); // never go below 5 minutes
+    }
+
+    base_minutes.clamp(min_minutes, max_minutes)
+}
+
 // ── Engine ───────────────────────────────────────────────────────
 
 /// Heartbeat engine — reads HEARTBEAT.md and executes tasks periodically
@@ -75,6 +170,7 @@ pub struct HeartbeatEngine {
     config: HeartbeatConfig,
     workspace_dir: std::path::PathBuf,
     observer: Arc<dyn Observer>,
+    metrics: Arc<ParkingMutex<HeartbeatMetrics>>,
 }
 
 impl HeartbeatEngine {
@@ -87,7 +183,13 @@ impl HeartbeatEngine {
             config,
             workspace_dir,
             observer,
+            metrics: Arc::new(ParkingMutex::new(HeartbeatMetrics::default())),
         }
+    }
+
+    /// Get a shared handle to the live heartbeat metrics.
+    pub fn metrics(&self) -> Arc<ParkingMutex<HeartbeatMetrics>> {
+        Arc::clone(&self.metrics)
     }
 
     /// Start the heartbeat loop (runs until cancelled)
@@ -672,5 +774,80 @@ mod tests {
         assert_eq!(tasks[2].priority, TaskPriority::Low);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    // ── HeartbeatMetrics tests ───────────────────────────────────
+
+    #[test]
+    fn metrics_record_success_updates_fields() {
+        let mut m = HeartbeatMetrics::default();
+        m.record_success(100.0);
+        assert_eq!(m.consecutive_successes, 1);
+        assert_eq!(m.consecutive_failures, 0);
+        assert_eq!(m.total_ticks, 1);
+        assert!(m.last_tick_at.is_some());
+        assert!((m.avg_tick_duration_ms - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn metrics_record_failure_resets_successes() {
+        let mut m = HeartbeatMetrics::default();
+        m.record_success(50.0);
+        m.record_success(50.0);
+        m.record_failure(200.0);
+        assert_eq!(m.consecutive_successes, 0);
+        assert_eq!(m.consecutive_failures, 1);
+        assert_eq!(m.total_ticks, 3);
+    }
+
+    #[test]
+    fn metrics_ema_smoothing() {
+        let mut m = HeartbeatMetrics::default();
+        m.record_success(100.0);
+        assert!((m.avg_tick_duration_ms - 100.0).abs() < f64::EPSILON);
+        m.record_success(200.0);
+        // EMA: 0.3 * 200 + 0.7 * 100 = 130
+        assert!((m.avg_tick_duration_ms - 130.0).abs() < f64::EPSILON);
+    }
+
+    // ── Adaptive interval tests ─────────────────────────────────
+
+    #[test]
+    fn adaptive_uses_base_when_no_failures() {
+        let result = compute_adaptive_interval(30, 5, 120, 0, false);
+        assert_eq!(result, 30);
+    }
+
+    #[test]
+    fn adaptive_uses_min_for_high_priority() {
+        let result = compute_adaptive_interval(30, 5, 120, 0, true);
+        assert_eq!(result, 5);
+    }
+
+    #[test]
+    fn adaptive_backs_off_on_failures() {
+        // 1 failure: 30 * 2 = 60
+        assert_eq!(compute_adaptive_interval(30, 5, 120, 1, false), 60);
+        // 2 failures: 30 * 4 = 120 (capped at max)
+        assert_eq!(compute_adaptive_interval(30, 5, 120, 2, false), 120);
+        // 3 failures: 30 * 8 = 240 → capped at 120
+        assert_eq!(compute_adaptive_interval(30, 5, 120, 3, false), 120);
+    }
+
+    #[test]
+    fn adaptive_backoff_respects_min() {
+        // Even with failures, must be >= min
+        assert!(compute_adaptive_interval(5, 10, 120, 0, false) >= 10);
+    }
+
+    // ── Engine metrics accessor ─────────────────────────────────
+
+    #[test]
+    fn engine_exposes_shared_metrics() {
+        let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
+        let engine =
+            HeartbeatEngine::new(HeartbeatConfig::default(), std::env::temp_dir(), observer);
+        let metrics = engine.metrics();
+        assert_eq!(metrics.lock().total_ticks, 0);
     }
 }

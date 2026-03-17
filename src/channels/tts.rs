@@ -85,6 +85,7 @@ impl TtsProvider for OpenAiTtsProvider {
             "input": text,
             "voice": voice,
             "speed": self.speed,
+            "response_format": "opus",
         });
 
         let resp = self

@@ -77,7 +77,7 @@ pub async fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> 
                 Some(path.clone())
             };
 
-            let mut cfg = crate::config::Config::load_or_init().await?;
+            let mut cfg = Box::pin(crate::config::Config::load_or_init()).await?;
             cfg.peripherals.enabled = true;
 
             if cfg

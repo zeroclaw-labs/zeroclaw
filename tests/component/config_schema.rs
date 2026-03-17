@@ -381,9 +381,6 @@ fn config_multiple_channels_coexist() {
     let toml_str = r#"
 default_temperature = 0.7
 
-[channels_config]
-cli = true
-
 [channels_config.telegram]
 bot_token = "test_token"
 allowed_users = ["zeroclaw_user"]
@@ -437,4 +434,24 @@ fn config_memory_defaults_when_section_absent() {
         (weight_sum - 1.0).abs() < 0.01,
         "vector + keyword weights should sum to ~1.0"
     );
+}
+
+#[test]
+fn config_channels_without_cli_field() {
+    let toml_str = r#"
+default_temperature = 0.7
+
+[channels_config.matrix]
+homeserver = "https://matrix.example.com"
+access_token = "syt_test_token"
+room_id = "!abc123:example.com"
+allowed_users = ["@user:example.com"]
+"#;
+    let parsed: Config = toml::from_str(toml_str)
+        .expect("channels_config with only a Matrix section (no explicit cli field) should parse");
+    assert!(
+        parsed.channels_config.cli,
+        "cli should default to true when omitted"
+    );
+    assert!(parsed.channels_config.matrix.is_some());
 }

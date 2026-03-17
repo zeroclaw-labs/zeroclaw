@@ -307,13 +307,16 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           VERSION: ${{ inputs.version }}
         run: |
-          # Skip if this version is already on crates.io (auto-sync may have published it)
+          # Publish to crates.io; treat "already exists" as success
+          # (auto-publish workflow may have already published this version)
           CRATE_NAME=$(sed -n 's/^name = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
-          if curl -sfL "https://crates.io/api/v1/crates/${CRATE_NAME}/${VERSION}" | grep -q '"version"'; then
-            echo "::notice::${CRATE_NAME}@${VERSION} already published on crates.io — skipping"
-          else
-            cargo publish --locked --allow-dirty --no-verify
+          OUTPUT=$(cargo publish --locked --allow-dirty --no-verify 2>&1) && exit 0
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -q 'already exists'; then
+            echo "::notice::${CRATE_NAME}@${VERSION} already on crates.io — skipping"
+            exit 0
           fi
+          exit 1
 
   redeploy-website:
     name: Trigger Website Redeploy
@@ -358,10 +361,33 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ── Post-publish: only run after ALL artifacts are live ──────────────
+  # ── Post-publish: package manager auto-sync ─────────────────────────
+  scoop:
+    name: Update Scoop Manifest
+    needs: [validate, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    uses: ./.github/workflows/pub-scoop.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+      dry_run: false
+    secrets: inherit
+
+  aur:
+    name: Update AUR Package
+    needs: [validate, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    uses: ./.github/workflows/pub-aur.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+      dry_run: false
+    secrets: inherit
+
+  # ── Post-publish: tweet after release + website are live ──────────────
+  # Docker push can be slow; don't let it block the tweet.
   tweet:
     name: Tweet Release
-    needs: [validate, publish, docker, crates-io, redeploy-website]
+    needs: [validate, publish, redeploy-website]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
     uses: ./.github/workflows/tweet-release.yml
     with:
       release_tag: ${{ needs.validate.outputs.tag }}

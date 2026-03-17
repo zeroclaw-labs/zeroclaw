@@ -566,4 +566,28 @@ mod tests {
             .expect("payload should be extracted");
         assert_eq!(payload, "abcd==");
     }
+
+    /// Stripping `[IMAGE:]` markers from history messages leaves only the text
+    /// portion, which is the behaviour needed for non-vision providers (#3674).
+    #[test]
+    fn parse_image_markers_strips_markers_leaving_caption() {
+        let input = "[IMAGE:/tmp/photo.jpg]\n\nDescribe this screenshot";
+        let (cleaned, refs) = parse_image_markers(input);
+        assert_eq!(cleaned, "Describe this screenshot");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0], "/tmp/photo.jpg");
+    }
+
+    /// An image-only message (no caption) should produce an empty string after
+    /// marker stripping, so callers can drop it from history.
+    #[test]
+    fn parse_image_markers_image_only_message_becomes_empty() {
+        let input = "[IMAGE:/tmp/photo.jpg]";
+        let (cleaned, refs) = parse_image_markers(input);
+        assert!(
+            cleaned.is_empty(),
+            "expected empty string, got: {cleaned:?}"
+        );
+        assert_eq!(refs.len(), 1);
+    }
 }

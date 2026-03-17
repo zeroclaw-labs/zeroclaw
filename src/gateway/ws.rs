@@ -116,7 +116,7 @@ pub async fn handle_ws_chat(
         .into_response()
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<String>) {
+async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<String>) {
     let (mut sender, mut receiver) = socket.split();
 
     // Build a persistent Agent for this connection so history is maintained across turns.
@@ -129,6 +129,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<S
             return;
         }
     };
+    agent.set_memory_session_id(session_id.clone());
 
     while let Some(msg) = receiver.next().await {
         let msg = match msg {

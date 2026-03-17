@@ -8,7 +8,8 @@ use tokio::time::Duration;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
-/// Wait for shutdown signal (SIGINT or SIGTERM)
+/// Wait for shutdown signal (SIGINT or SIGTERM).
+/// SIGHUP is explicitly ignored so the daemon survives terminal/SSH disconnects.
 async fn wait_for_shutdown_signal() -> Result<()> {
     #[cfg(unix)]
     {
@@ -16,13 +17,21 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sighup = signal(SignalKind::hangup())?;
 
-        tokio::select! {
-            _ = sigint.recv() => {
-                tracing::info!("Received SIGINT, shutting down...");
-            }
-            _ = sigterm.recv() => {
-                tracing::info!("Received SIGTERM, shutting down...");
+        loop {
+            tokio::select! {
+                _ = sigint.recv() => {
+                    tracing::info!("Received SIGINT, shutting down...");
+                    break;
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("Received SIGTERM, shutting down...");
+                    break;
+                }
+                _ = sighup.recv() => {
+                    tracing::info!("Received SIGHUP, ignoring (daemon stays running)");
+                }
             }
         }
     }
@@ -63,7 +72,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             move || {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
-                async move { crate::gateway::run_gateway(&host, port, cfg).await }
+                async move { Box::pin(crate::gateway::run_gateway(&host, port, cfg)).await }
             },
         ));
     }
@@ -107,7 +116,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             max_backoff,
             move || {
                 let cfg = scheduler_cfg.clone();
-                async move { crate::cron::scheduler::run(cfg).await }
+                async move { Box::pin(crate::cron::scheduler::run(cfg)).await }
             },
         ));
     } else {
@@ -203,7 +212,10 @@ where
 }
 
 async fn run_heartbeat_worker(config: Config) -> Result<()> {
-    use crate::heartbeat::engine::HeartbeatEngine;
+    use crate::heartbeat::engine::{
+        compute_adaptive_interval, HeartbeatEngine, HeartbeatTask, TaskPriority, TaskStatus,
+    };
+    use std::sync::Arc;
 
     let observer: std::sync::Arc<dyn crate::observability::Observer> =
         std::sync::Arc::from(crate::observability::create_observer(&config.observability));
@@ -212,19 +224,72 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         config.workspace_dir.clone(),
         observer,
     );
+    let metrics = engine.metrics();
     let delivery = resolve_heartbeat_delivery(&config)?;
     let two_phase = config.heartbeat.two_phase;
+    let adaptive = config.heartbeat.adaptive;
+    let start_time = std::time::Instant::now();
 
-    let interval_mins = config.heartbeat.interval_minutes.max(5);
-    let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
+    // ── Deadman watcher ──────────────────────────────────────────
+    let deadman_timeout = config.heartbeat.deadman_timeout_minutes;
+    if deadman_timeout > 0 {
+        let dm_metrics = Arc::clone(&metrics);
+        let dm_config = config.clone();
+        let dm_delivery = delivery.clone();
+        tokio::spawn(async move {
+            let check_interval = Duration::from_secs(60);
+            let timeout = chrono::Duration::minutes(i64::from(deadman_timeout));
+            loop {
+                tokio::time::sleep(check_interval).await;
+                let last_tick = dm_metrics.lock().last_tick_at;
+                if let Some(last) = last_tick {
+                    if chrono::Utc::now() - last > timeout {
+                        let alert = format!(
+                            "⚠️ Heartbeat dead-man's switch: no tick in {deadman_timeout} minutes"
+                        );
+                        let (channel, target) =
+                            if let Some(ch) = &dm_config.heartbeat.deadman_channel {
+                                let to = dm_config
+                                    .heartbeat
+                                    .deadman_to
+                                    .as_deref()
+                                    .or(dm_config.heartbeat.to.as_deref())
+                                    .unwrap_or_default();
+                                (ch.clone(), to.to_string())
+                            } else if let Some((ch, to)) = &dm_delivery {
+                                (ch.clone(), to.clone())
+                            } else {
+                                continue;
+                            };
+                        let _ = crate::cron::scheduler::deliver_announcement(
+                            &dm_config, &channel, &target, &alert,
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+    }
+
+    let base_interval = config.heartbeat.interval_minutes.max(5);
+    let mut sleep_mins = base_interval;
 
     loop {
-        interval.tick().await;
+        tokio::time::sleep(Duration::from_secs(u64::from(sleep_mins) * 60)).await;
+
+        // Update uptime
+        {
+            let mut m = metrics.lock();
+            m.uptime_secs = start_time.elapsed().as_secs();
+        }
+
+        let tick_start = std::time::Instant::now();
 
         // Collect runnable tasks (active only, sorted by priority)
         let mut tasks = engine.collect_runnable_tasks().await?;
+        let has_high_priority = tasks.iter().any(|t| t.priority == TaskPriority::High);
+
         if tasks.is_empty() {
-            // Try fallback message
             if let Some(fallback) = config
                 .heartbeat
                 .message
@@ -232,12 +297,15 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 .map(str::trim)
                 .filter(|m| !m.is_empty())
             {
-                tasks.push(crate::heartbeat::engine::HeartbeatTask {
+                tasks.push(HeartbeatTask {
                     text: fallback.to_string(),
-                    priority: crate::heartbeat::engine::TaskPriority::Medium,
-                    status: crate::heartbeat::engine::TaskStatus::Active,
+                    priority: TaskPriority::Medium,
+                    status: TaskStatus::Active,
                 });
             } else {
+                #[allow(clippy::cast_precision_loss)]
+                let elapsed = tick_start.elapsed().as_millis() as f64;
+                metrics.lock().record_success(elapsed);
                 continue;
             }
         }
@@ -250,7 +318,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 Some(decision_prompt),
                 None,
                 None,
-                0.0, // Low temperature for deterministic decision
+                0.0,
                 vec![],
                 false,
                 None,
@@ -263,6 +331,9 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     if indices.is_empty() {
                         tracing::info!("💓 Heartbeat Phase 1: skip (nothing to do)");
                         crate::health::mark_component_ok("heartbeat");
+                        #[allow(clippy::cast_precision_loss)]
+                        let elapsed = tick_start.elapsed().as_millis() as f64;
+                        metrics.lock().record_success(elapsed);
                         continue;
                     }
                     tracing::info!(
@@ -285,7 +356,9 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         };
 
         // ── Phase 2: Execute selected tasks ─────────────────────
+        let mut tick_had_error = false;
         for task in &tasks_to_run {
+            let task_start = std::time::Instant::now();
             let prompt = format!("[Heartbeat Task | {}] {}", task.priority, task.text);
             let temp = config.default_temperature;
             match Box::pin(crate::agent::run(
@@ -303,6 +376,20 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             {
                 Ok(output) => {
                     crate::health::mark_component_ok("heartbeat");
+                    #[allow(clippy::cast_possible_truncation)]
+                    let duration_ms = task_start.elapsed().as_millis() as i64;
+                    let now = chrono::Utc::now();
+                    let _ = crate::heartbeat::store::record_run(
+                        &config.workspace_dir,
+                        &task.text,
+                        &task.priority.to_string(),
+                        now - chrono::Duration::milliseconds(duration_ms),
+                        now,
+                        "ok",
+                        Some(output.as_str()),
+                        duration_ms,
+                        config.heartbeat.max_run_history,
+                    );
                     let announcement = if output.trim().is_empty() {
                         format!("💓 heartbeat task completed: {}", task.text)
                     } else {
@@ -326,10 +413,51 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     }
                 }
                 Err(e) => {
+                    tick_had_error = true;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let duration_ms = task_start.elapsed().as_millis() as i64;
+                    let now = chrono::Utc::now();
+                    let _ = crate::heartbeat::store::record_run(
+                        &config.workspace_dir,
+                        &task.text,
+                        &task.priority.to_string(),
+                        now - chrono::Duration::milliseconds(duration_ms),
+                        now,
+                        "error",
+                        Some(&e.to_string()),
+                        duration_ms,
+                        config.heartbeat.max_run_history,
+                    );
                     crate::health::mark_component_error("heartbeat", e.to_string());
                     tracing::warn!("Heartbeat task failed: {e}");
                 }
             }
+        }
+
+        // Update metrics
+        #[allow(clippy::cast_precision_loss)]
+        let tick_elapsed = tick_start.elapsed().as_millis() as f64;
+        {
+            let mut m = metrics.lock();
+            if tick_had_error {
+                m.record_failure(tick_elapsed);
+            } else {
+                m.record_success(tick_elapsed);
+            }
+        }
+
+        // Compute next sleep interval
+        if adaptive {
+            let failures = metrics.lock().consecutive_failures;
+            sleep_mins = compute_adaptive_interval(
+                base_interval,
+                config.heartbeat.min_interval_minutes,
+                config.heartbeat.max_interval_minutes,
+                failures,
+                has_high_priority,
+            );
+        } else {
+            sleep_mins = base_interval;
         }
     }
 }
@@ -654,5 +782,29 @@ mod tests {
         let config = Config::default();
         let target = auto_detect_heartbeat_channel(&config);
         assert!(target.is_none());
+    }
+
+    /// Verify that SIGHUP does not cause shutdown — the daemon should ignore it
+    /// and only terminate on SIGINT or SIGTERM.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sighup_does_not_shut_down_daemon() {
+        use libc;
+        use tokio::time::{timeout, Duration};
+
+        let handle = tokio::spawn(wait_for_shutdown_signal());
+
+        // Give the signal handler time to register
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Send SIGHUP to ourselves — should be ignored by the handler
+        unsafe { libc::raise(libc::SIGHUP) };
+
+        // The future should NOT complete within a short window
+        let result = timeout(Duration::from_millis(200), handle).await;
+        assert!(
+            result.is_err(),
+            "wait_for_shutdown_signal should not return after SIGHUP"
+        );
     }
 }
