@@ -15,7 +15,7 @@ use std::time::Duration;
 // immediately — avoiding wasted latency on errors that cannot self-heal.
 
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
-fn is_non_retryable(err: &anyhow::Error) -> bool {
+pub fn is_non_retryable(err: &anyhow::Error) -> bool {
     if is_context_window_exceeded(err) {
         return true;
     }

@@ -1,5 +1,6 @@
 import { Routes, Route, Navigate } from 'react-router-dom';
-import { useState, useEffect, createContext, useContext } from 'react';
+import { useState, useEffect, createContext, useContext, Component } from 'react';
+import type { ReactNode, ErrorInfo } from 'react';
 import Layout from './components/layout/Layout';
 import Dashboard from './pages/Dashboard';
 import AgentChat from './pages/AgentChat';
@@ -27,6 +28,60 @@ export const LocaleContext = createContext<LocaleContextType>({
 });
 
 export const useLocaleContext = () => useContext(LocaleContext);
+
+// ---------------------------------------------------------------------------
+// Error boundary — catches render crashes and shows a recoverable message
+// instead of a black screen
+// ---------------------------------------------------------------------------
+
+interface ErrorBoundaryState {
+  error: Error | null;
+}
+
+export class ErrorBoundary extends Component<
+  { children: ReactNode },
+  ErrorBoundaryState
+> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('[ZeroClaw] Render error:', error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="p-6">
+          <div className="bg-gray-900 border border-red-700 rounded-xl p-6 w-full max-w-lg">
+            <h2 className="text-lg font-semibold text-red-400 mb-2">
+              Something went wrong
+            </h2>
+            <p className="text-gray-400 text-sm mb-4">
+              A render error occurred. Check the browser console for details.
+            </p>
+            <pre className="text-xs text-red-300 bg-gray-800 rounded p-3 overflow-x-auto whitespace-pre-wrap break-all">
+              {this.state.error.message}
+            </pre>
+            <button
+              onClick={() => this.setState({ error: null })}
+              className="mt-6 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg transition-colors"
+            >
+              Try again
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // Pairing dialog component
 function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) {
@@ -77,7 +132,7 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
             autoFocus
           />
           {error && (
-            <p className="text-[#ff4466] text-sm mb-4 text-center animate-fade-in">{error}</p>
+            <p className="text-[#ff4466] text-sm mb-4 text-center animate-fade-in" aria-live="polite">{error}</p>
           )}
           <button
             type="submit"

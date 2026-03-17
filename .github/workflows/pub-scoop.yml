@@ -1,0 +1,151 @@
+name: Pub Scoop Manifest
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag (vX.Y.Z)"
+        required: true
+        type: string
+      dry_run:
+        description: "Generate manifest only (no push)"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: scoop-publish-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish-scoop:
+    name: Update Scoop Manifest
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      SCOOP_BUCKET_REPO: ${{ vars.SCOOP_BUCKET_REPO }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate and compute metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release_tag must be vX.Y.Z format."
+            exit 1
+          fi
+
+          version="${RELEASE_TAG#v}"
+          zip_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/zeroclaw-x86_64-pc-windows-msvc.zip"
+          sums_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/SHA256SUMS"
+
+          sha256="$(curl -fsSL "$sums_url" | grep 'zeroclaw-x86_64-pc-windows-msvc.zip' | awk '{print $1}')"
+
+          if [[ -z "$sha256" ]]; then
+            echo "::error::Could not find Windows binary hash in SHA256SUMS for ${RELEASE_TAG}."
+            exit 1
+          fi
+
+          {
+            echo "version=$version"
+            echo "zip_url=$zip_url"
+            echo "sha256=$sha256"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Scoop Manifest Metadata"
+            echo "- version: \`${version}\`"
+            echo "- zip_url: \`${zip_url}\`"
+            echo "- sha256: \`${sha256}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate manifest
+        id: manifest
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          ZIP_URL: ${{ steps.meta.outputs.zip_url }}
+          SHA256: ${{ steps.meta.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+
+          manifest_file="$(mktemp)"
+          cat > "$manifest_file" <<MANIFEST
+          {
+              "version": "${VERSION}",
+              "description": "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant.",
+              "homepage": "https://github.com/zeroclaw-labs/zeroclaw",
+              "license": "MIT|Apache-2.0",
+              "architecture": {
+                  "64bit": {
+                      "url": "${ZIP_URL}",
+                      "hash": "${SHA256}",
+                      "bin": "zeroclaw.exe"
+                  }
+              },
+              "checkver": {
+                  "github": "https://github.com/zeroclaw-labs/zeroclaw"
+              },
+              "autoupdate": {
+                  "architecture": {
+                      "64bit": {
+                          "url": "https://github.com/zeroclaw-labs/zeroclaw/releases/download/v\$version/zeroclaw-x86_64-pc-windows-msvc.zip"
+                      }
+                  },
+                  "hash": {
+                      "url": "https://github.com/zeroclaw-labs/zeroclaw/releases/download/v\$version/SHA256SUMS",
+                      "regex": "([a-f0-9]{64})\\\\s+zeroclaw-x86_64-pc-windows-msvc\\\\.zip"
+                  }
+              }
+          }
+          MANIFEST
+
+          jq '.' "$manifest_file" > "${manifest_file}.formatted"
+          mv "${manifest_file}.formatted" "$manifest_file"
+
+          echo "manifest_file=$manifest_file" >> "$GITHUB_OUTPUT"
+
+          echo "### Generated Manifest" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat "$manifest_file" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push to Scoop bucket
+        if: inputs.dry_run == false
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          MANIFEST_FILE: ${{ steps.manifest.outputs.manifest_file }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${SCOOP_BUCKET_REPO}" ]]; then
+            echo "::error::Repository variable SCOOP_BUCKET_REPO is required (e.g. zeroclaw-labs/scoop-zeroclaw)."
+            exit 1
+          fi
+
+          tmp_dir="$(mktemp -d)"
+          gh repo clone "${SCOOP_BUCKET_REPO}" "$tmp_dir/bucket" -- --depth=1
+
+          mkdir -p "$tmp_dir/bucket/bucket"
+          cp "$MANIFEST_FILE" "$tmp_dir/bucket/bucket/zeroclaw.json"
+
+          cd "$tmp_dir/bucket"
+          git config user.name "zeroclaw-bot"
+          git config user.email "bot@zeroclaw.dev"
+          git add bucket/zeroclaw.json
+          git commit -m "zeroclaw ${VERSION}"
+          gh auth setup-git
+          git push origin HEAD
+
+          echo "Scoop manifest updated to ${VERSION}"

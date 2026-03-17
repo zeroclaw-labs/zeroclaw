@@ -220,6 +220,30 @@ pub struct Config {
     #[serde(default)]
     pub browser: BrowserConfig,
 
+    /// Browser delegation configuration (`[browser_delegate]`).
+    ///
+    /// Delegates browser-based tasks to a browser-capable CLI subprocess (e.g.
+    /// Claude Code with `claude-in-chrome` MCP tools). Useful for interacting
+    /// with corporate web apps (Teams, Outlook, Jira, Confluence) that lack
+    /// direct API access. A persistent Chrome profile can be configured so SSO
+    /// sessions survive across invocations.
+    ///
+    /// Fields:
+    /// - `enabled` (`bool`, default `false`) — enable the browser delegation tool.
+    /// - `cli_binary` (`String`, default `"claude"`) — CLI binary to spawn for browser tasks.
+    /// - `chrome_profile_dir` (`String`, default `""`) — Chrome user-data directory for
+    ///   persistent SSO sessions. When empty, a fresh profile is used each invocation.
+    /// - `allowed_domains` (`Vec<String>`, default `[]`) — allowlist of domains the browser
+    ///   may navigate to. Empty means all non-blocked domains are permitted.
+    /// - `blocked_domains` (`Vec<String>`, default `[]`) — denylist of domains. Blocked
+    ///   domains take precedence over allowed domains.
+    /// - `task_timeout_secs` (`u64`, default `120`) — per-task timeout in seconds.
+    ///
+    /// Compatibility: additive and disabled by default; existing configs remain valid when omitted.
+    /// Rollback/migration: remove `[browser_delegate]` or keep `enabled = false` to disable.
+    #[serde(default)]
+    pub browser_delegate: crate::tools::browser_delegate::BrowserDelegateConfig,
+
     /// HTTP request tool configuration (`[http_request]`).
     #[serde(default)]
     pub http_request: HttpRequestConfig,
@@ -595,6 +619,11 @@ pub struct TranscriptionConfig {
     /// Optional language hint (ISO-639-1, e.g. "en", "ru").
     #[serde(default)]
     pub language: Option<String>,
+    /// Optional initial prompt to bias transcription toward expected vocabulary
+    /// (proper nouns, technical terms, etc.). Sent as the `prompt` field in the
+    /// Whisper API request.
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
     /// Maximum voice duration in seconds (messages longer than this are skipped).
     #[serde(default = "default_transcription_max_duration_secs")]
     pub max_duration_secs: u64,
@@ -607,6 +636,7 @@ impl Default for TranscriptionConfig {
             api_url: default_transcription_api_url(),
             model: default_transcription_model(),
             language: None,
+            initial_prompt: None,
             max_duration_secs: default_transcription_max_duration_secs(),
         }
     }
@@ -2318,10 +2348,10 @@ fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
         .with_context(|| format!("Invalid {field} URL: '{url}' is not a valid URL"))?;
 
     match parsed.scheme() {
-        "http" | "https" | "socks5" | "socks5h" => {}
+        "http" | "https" | "socks5" | "socks5h" | "socks" => {}
         scheme => {
             anyhow::bail!(
-                "Invalid {field} URL scheme '{scheme}'. Allowed: http, https, socks5, socks5h"
+                "Invalid {field} URL scheme '{scheme}'. Allowed: http, https, socks5, socks5h, socks"
             );
         }
     }
@@ -2650,6 +2680,9 @@ pub struct MemoryConfig {
     /// Max number of cached responses before LRU eviction (default: 5000)
     #[serde(default = "default_response_cache_max")]
     pub response_cache_max_entries: usize,
+    /// Max in-memory hot cache entries for the two-tier response cache (default: 256)
+    #[serde(default = "default_response_cache_hot_entries")]
+    pub response_cache_hot_entries: usize,
 
     // ── Memory Snapshot (soul backup to Markdown) ─────────────
     /// Enable periodic export of core memories to MEMORY_SNAPSHOT.md
@@ -2718,6 +2751,10 @@ fn default_response_cache_max() -> usize {
     5_000
 }
 
+fn default_response_cache_hot_entries() -> usize {
+    256
+}
+
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
@@ -2738,6 +2775,7 @@ impl Default for MemoryConfig {
             response_cache_enabled: false,
             response_cache_ttl_minutes: default_response_cache_ttl(),
             response_cache_max_entries: default_response_cache_max(),
+            response_cache_hot_entries: default_response_cache_hot_entries(),
             snapshot_enabled: false,
             snapshot_on_hygiene: false,
             auto_hydrate: true,
@@ -3344,10 +3382,46 @@ pub struct HeartbeatConfig {
     /// explicitly set).
     #[serde(default, alias = "recipient")]
     pub to: Option<String>,
+    /// Enable adaptive intervals that back off on failures and speed up for
+    /// high-priority tasks. Default: `false`.
+    #[serde(default)]
+    pub adaptive: bool,
+    /// Minimum interval in minutes when adaptive mode is enabled. Default: `5`.
+    #[serde(default = "default_heartbeat_min_interval")]
+    pub min_interval_minutes: u32,
+    /// Maximum interval in minutes when adaptive mode backs off. Default: `120`.
+    #[serde(default = "default_heartbeat_max_interval")]
+    pub max_interval_minutes: u32,
+    /// Dead-man's switch timeout in minutes. If the heartbeat has not ticked
+    /// within this window, an alert is sent. `0` disables. Default: `0`.
+    #[serde(default)]
+    pub deadman_timeout_minutes: u32,
+    /// Channel for dead-man's switch alerts (e.g. `telegram`). Falls back to
+    /// the heartbeat delivery channel.
+    #[serde(default)]
+    pub deadman_channel: Option<String>,
+    /// Recipient for dead-man's switch alerts. Falls back to `to`.
+    #[serde(default)]
+    pub deadman_to: Option<String>,
+    /// Maximum number of heartbeat run history records to retain. Default: `100`.
+    #[serde(default = "default_heartbeat_max_run_history")]
+    pub max_run_history: u32,
 }
 
 fn default_two_phase() -> bool {
     true
+}
+
+fn default_heartbeat_min_interval() -> u32 {
+    5
+}
+
+fn default_heartbeat_max_interval() -> u32 {
+    120
+}
+
+fn default_heartbeat_max_run_history() -> u32 {
+    100
 }
 
 impl Default for HeartbeatConfig {
@@ -3359,6 +3433,13 @@ impl Default for HeartbeatConfig {
             message: None,
             target: None,
             to: None,
+            adaptive: false,
+            min_interval_minutes: default_heartbeat_min_interval(),
+            max_interval_minutes: default_heartbeat_max_interval(),
+            deadman_timeout_minutes: 0,
+            deadman_channel: None,
+            deadman_to: None,
+            max_run_history: default_heartbeat_max_run_history(),
         }
     }
 }
@@ -3524,6 +3605,7 @@ impl<T: ChannelConfig> crate::config::traits::ConfigHandle for ConfigWrapper<T> 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ChannelsConfig {
     /// Enable the CLI interactive channel. Default: `true`.
+    #[serde(default = "default_true")]
     pub cli: bool,
     /// Telegram bot channel configuration.
     pub telegram: Option<TelegramConfig>,
@@ -3563,6 +3645,10 @@ pub struct ChannelsConfig {
     pub wecom: Option<WeComConfig>,
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
+    /// X/Twitter channel configuration.
+    pub twitter: Option<TwitterConfig>,
+    /// Mochat customer service channel configuration.
+    pub mochat: Option<MochatConfig>,
     #[cfg(feature = "channel-nostr")]
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
@@ -3587,6 +3673,13 @@ pub struct ChannelsConfig {
     /// daemon restarts. Files are stored in `{workspace}/sessions/`. Default: `true`.
     #[serde(default = "default_true")]
     pub session_persistence: bool,
+    /// Session persistence backend: `"jsonl"` (legacy) or `"sqlite"` (new default).
+    /// SQLite provides FTS5 search, metadata tracking, and TTL cleanup.
+    #[serde(default = "default_session_backend")]
+    pub session_backend: String,
+    /// Auto-archive stale sessions older than this many hours. `0` disables. Default: `0`.
+    #[serde(default)]
+    pub session_ttl_hours: u32,
 }
 
 impl ChannelsConfig {
@@ -3692,6 +3785,10 @@ fn default_channel_message_timeout_secs() -> u64 {
     300
 }
 
+fn default_session_backend() -> String {
+    "sqlite".into()
+}
+
 impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
@@ -3715,6 +3812,8 @@ impl Default for ChannelsConfig {
             dingtalk: None,
             wecom: None,
             qq: None,
+            twitter: None,
+            mochat: None,
             #[cfg(feature = "channel-nostr")]
             nostr: None,
             clawdtalk: None,
@@ -3722,6 +3821,8 @@ impl Default for ChannelsConfig {
             ack_reactions: true,
             show_tool_calls: true,
             session_persistence: true,
+            session_backend: default_session_backend(),
+            session_ttl_hours: 0,
         }
     }
 }
@@ -4733,6 +4834,53 @@ impl ChannelConfig for QQConfig {
     }
 }
 
+/// X/Twitter channel configuration (Twitter API v2)
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TwitterConfig {
+    /// Twitter API v2 Bearer Token (OAuth 2.0)
+    pub bearer_token: String,
+    /// Allowed usernames or user IDs. Empty = deny all, "*" = allow all
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+}
+
+impl ChannelConfig for TwitterConfig {
+    fn name() -> &'static str {
+        "X/Twitter"
+    }
+    fn desc() -> &'static str {
+        "X/Twitter Bot via API v2"
+    }
+}
+
+/// Mochat channel configuration (Mochat customer service API)
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MochatConfig {
+    /// Mochat API base URL
+    pub api_url: String,
+    /// Mochat API token
+    pub api_token: String,
+    /// Allowed user IDs. Empty = deny all, "*" = allow all
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Poll interval in seconds for new messages. Default: 5
+    #[serde(default = "default_mochat_poll_interval")]
+    pub poll_interval_secs: u64,
+}
+
+fn default_mochat_poll_interval() -> u64 {
+    5
+}
+
+impl ChannelConfig for MochatConfig {
+    fn name() -> &'static str {
+        "Mochat"
+    }
+    fn desc() -> &'static str {
+        "Mochat Customer Service"
+    }
+}
+
 /// Nostr channel configuration (NIP-04 + NIP-17 private messages)
 #[cfg(feature = "channel-nostr")]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -5106,6 +5254,7 @@ impl Default for Config {
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            browser_delegate: crate::tools::browser_delegate::BrowserDelegateConfig::default(),
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
@@ -7358,6 +7507,7 @@ default_temperature = 0.7
                 message: Some("Check London time".into()),
                 target: Some("telegram".into()),
                 to: Some("123456".into()),
+                ..HeartbeatConfig::default()
             },
             cron: CronConfig::default(),
             channels_config: ChannelsConfig {
@@ -7388,6 +7538,8 @@ default_temperature = 0.7
                 dingtalk: None,
                 wecom: None,
                 qq: None,
+                twitter: None,
+                mochat: None,
                 #[cfg(feature = "channel-nostr")]
                 nostr: None,
                 clawdtalk: None,
@@ -7395,6 +7547,8 @@ default_temperature = 0.7
                 ack_reactions: true,
                 show_tool_calls: true,
                 session_persistence: true,
+                session_backend: default_session_backend(),
+                session_ttl_hours: 0,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -7404,6 +7558,7 @@ default_temperature = 0.7
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            browser_delegate: crate::tools::browser_delegate::BrowserDelegateConfig::default(),
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
@@ -7706,6 +7861,7 @@ tool_dispatcher = "xml"
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            browser_delegate: crate::tools::browser_delegate::BrowserDelegateConfig::default(),
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
@@ -8121,12 +8277,16 @@ allowed_users = ["@ops:matrix.org"]
             dingtalk: None,
             wecom: None,
             qq: None,
+            twitter: None,
+            mochat: None,
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
             session_persistence: true,
+            session_backend: default_session_backend(),
+            session_ttl_hours: 0,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -8349,12 +8509,16 @@ channel_id = "C123"
             dingtalk: None,
             wecom: None,
             qq: None,
+            twitter: None,
+            mochat: None,
             nostr: None,
             clawdtalk: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
             session_persistence: true,
+            session_backend: default_session_backend(),
+            session_ttl_hours: 0,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

@@ -45,10 +45,12 @@ pub async fn consolidate_turn(
     // Truncate very long turns to avoid wasting tokens on consolidation.
     // Use char-boundary-safe slicing to prevent panic on multi-byte UTF-8 (e.g. CJK text).
     let truncated = if turn_text.len() > 4000 {
-        let mut end = 4000;
-        while end > 0 && !turn_text.is_char_boundary(end) {
-            end -= 1;
-        }
+        let end = turn_text
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= 4000)
+            .last()
+            .unwrap_or(0);
         format!("{}…", &turn_text[..end])
     } else {
         turn_text.clone()
@@ -99,10 +101,12 @@ fn parse_consolidation_response(raw: &str, fallback_text: &str) -> Consolidation
         // Fallback: use truncated turn text as history entry.
         // Use char-boundary-safe slicing to prevent panic on multi-byte UTF-8.
         let summary = if fallback_text.len() > 200 {
-            let mut end = 200;
-            while end > 0 && !fallback_text.is_char_boundary(end) {
-                end -= 1;
-            }
+            let end = fallback_text
+                .char_indices()
+                .map(|(i, _)| i)
+                .take_while(|&i| i <= 200)
+                .last()
+                .unwrap_or(0);
             format!("{}…", &fallback_text[..end])
         } else {
             fallback_text.to_string()

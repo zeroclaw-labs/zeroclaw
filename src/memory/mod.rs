@@ -90,6 +90,20 @@ pub fn is_assistant_autosave_key(key: &str) -> bool {
     normalized == "assistant_resp" || normalized.starts_with("assistant_resp_")
 }
 
+/// Filter known synthetic autosave noise patterns that should not be
+/// persisted as user conversation memories.
+pub fn should_skip_autosave_content(content: &str) -> bool {
+    let normalized = content.trim();
+    if normalized.is_empty() {
+        return true;
+    }
+
+    let lowered = normalized.to_ascii_lowercase();
+    lowered.starts_with("[cron:")
+        || lowered.starts_with("[distilled_")
+        || lowered.contains("distilled_index_sig:")
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct ResolvedEmbeddingConfig {
     provider: String,
@@ -448,6 +462,17 @@ mod tests {
         assert!(is_assistant_autosave_key("ASSISTANT_RESP_abcd"));
         assert!(!is_assistant_autosave_key("assistant_response"));
         assert!(!is_assistant_autosave_key("user_msg_1234"));
+    }
+
+    #[test]
+    fn autosave_content_filter_drops_cron_and_distilled_noise() {
+        assert!(should_skip_autosave_content("[cron:auto] patrol check"));
+        assert!(should_skip_autosave_content(
+            "[DISTILLED_MEMORY_CHUNK 1/2] DISTILLED_INDEX_SIG:abc123"
+        ));
+        assert!(!should_skip_autosave_content(
+            "User prefers concise answers."
+        ));
     }
 
     #[test]

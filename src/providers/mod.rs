@@ -846,7 +846,9 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         // not a single API key. Credential resolution happens inside BedrockProvider.
         "bedrock" | "aws-bedrock" => return None,
         name if is_qianfan_alias(name) => vec!["QIANFAN_API_KEY"],
-        name if is_doubao_alias(name) => vec!["ARK_API_KEY", "DOUBAO_API_KEY"],
+        name if is_doubao_alias(name) => {
+            vec!["ARK_API_KEY", "VOLCENGINE_API_KEY", "DOUBAO_API_KEY"]
+        }
         name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
@@ -860,6 +862,8 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
         "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
+        "aihubmix" => vec!["AIHUBMIX_API_KEY"],
+        "siliconflow" | "silicon-flow" => vec!["SILICONFLOW_API_KEY"],
         "osaurus" => vec!["OSAURUS_API_KEY"],
         "telnyx" => vec!["TELNYX_API_KEY"],
         "azure_openai" | "azure-openai" | "azure" => vec!["AZURE_OPENAI_API_KEY"],
@@ -2605,6 +2609,52 @@ mod tests {
         let _guard = EnvGuard::set("OSAURUS_API_KEY", Some("osaurus-test-key"));
         let resolved = resolve_provider_credential("osaurus", None);
         assert_eq!(resolved, Some("osaurus-test-key".to_string()));
+    }
+
+    #[test]
+    fn resolve_provider_credential_volcengine_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("VOLCENGINE_API_KEY", Some("volc-test-key"));
+        let resolved = resolve_provider_credential("volcengine", None);
+        assert_eq!(resolved, Some("volc-test-key".to_string()));
+    }
+
+    #[test]
+    fn resolve_provider_credential_aihubmix_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("AIHUBMIX_API_KEY", Some("aihubmix-test-key"));
+        let resolved = resolve_provider_credential("aihubmix", None);
+        assert_eq!(resolved, Some("aihubmix-test-key".to_string()));
+    }
+
+    #[test]
+    fn resolve_provider_credential_siliconflow_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("SILICONFLOW_API_KEY", Some("sf-test-key"));
+        let resolved = resolve_provider_credential("siliconflow", None);
+        assert_eq!(resolved, Some("sf-test-key".to_string()));
+    }
+
+    #[test]
+    fn factory_aihubmix() {
+        assert!(create_provider("aihubmix", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_siliconflow() {
+        assert!(create_provider("siliconflow", Some("key")).is_ok());
+        assert!(create_provider("silicon-flow", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_codex_oauth_aliases() {
+        let options = ProviderRuntimeOptions::default();
+        for alias in &["codex", "openai-codex", "openai_codex"] {
+            assert!(
+                create_provider_with_options(alias, None, &options).is_ok(),
+                "codex alias '{alias}' should produce a provider"
+            );
+        }
     }
 
     // ── Extended ecosystem ───────────────────────────────────

@@ -517,7 +517,7 @@ install_system_deps() {
         fi
       elif have_cmd apt-get; then
         run_privileged apt-get update -qq
-        run_privileged apt-get install -y build-essential pkg-config git curl
+        run_privileged apt-get install -y build-essential pkg-config git curl libssl-dev
       elif have_cmd dnf; then
         run_privileged dnf install -y \
           gcc \
@@ -1212,17 +1212,23 @@ if [[ "$SKIP_INSTALL" == false ]]; then
 
   cargo install --path "$WORK_DIR" --force --locked
   step_ok "ZeroClaw installed"
+
+  # Sync binary to ~/.local/bin so PATH lookups find the fresh version
+  if [[ -d "$HOME/.local/bin" ]]; then
+    cp -f "$HOME/.cargo/bin/zeroclaw" "$HOME/.local/bin/zeroclaw" 2>/dev/null && \
+      step_ok "Synced binary to ~/.local/bin" || true
+  fi
 else
   step_dot "Skipping install"
 fi
 
 ZEROCLAW_BIN=""
-if have_cmd zeroclaw; then
-  ZEROCLAW_BIN="zeroclaw"
-elif [[ -x "$HOME/.cargo/bin/zeroclaw" ]]; then
+if [[ -x "$HOME/.cargo/bin/zeroclaw" ]]; then
   ZEROCLAW_BIN="$HOME/.cargo/bin/zeroclaw"
 elif [[ -x "$WORK_DIR/target/release/zeroclaw" ]]; then
   ZEROCLAW_BIN="$WORK_DIR/target/release/zeroclaw"
+elif have_cmd zeroclaw; then
+  ZEROCLAW_BIN="zeroclaw"
 fi
 
 echo
@@ -1282,6 +1288,19 @@ if [[ -n "$ZEROCLAW_BIN" ]]; then
     step_ok "Gateway service installed"
     if "$ZEROCLAW_BIN" service restart 2>/dev/null; then
       step_ok "Gateway service restarted"
+
+      # Fetch and display pairing code from running gateway
+      sleep 1  # brief wait for service to start
+      if PAIR_CODE=$("$ZEROCLAW_BIN" gateway get-paircode 2>/dev/null | grep -oE '[0-9]{6}'); then
+        echo
+        echo -e "  ${BOLD_BLUE}🔐 Gateway Pairing Code${RESET}"
+        echo
+        echo -e "  ${BOLD_BLUE}┌──────────────┐${RESET}"
+        echo -e "  ${BOLD_BLUE}│${RESET}  ${BOLD}${PAIR_CODE}${RESET}  ${BOLD_BLUE}│${RESET}"
+        echo -e "  ${BOLD_BLUE}└──────────────┘${RESET}"
+        echo
+        echo -e "  ${DIM}Enter this code in the dashboard to pair your device.${RESET}"
+      fi
     else
       step_fail "Gateway service restart failed — re-run with zeroclaw service start"
     fi
@@ -1321,7 +1340,7 @@ GATEWAY_PORT=42617
 DASHBOARD_URL="http://127.0.0.1:${GATEWAY_PORT}"
 echo
 echo -e "${BOLD}Dashboard URL:${RESET} ${BLUE}${DASHBOARD_URL}${RESET}"
-echo -e "${DIM}  Enter the pairing code shown above to connect.${RESET}"
+echo -e "${DIM}  Run 'zeroclaw gateway get-paircode' to get your pairing code.${RESET}"
 
 # --- Copy to clipboard ---
 COPIED_TO_CLIPBOARD=false

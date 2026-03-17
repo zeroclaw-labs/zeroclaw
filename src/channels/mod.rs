@@ -27,11 +27,14 @@ pub mod linq;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 pub mod mattermost;
+pub mod mochat;
 pub mod nextcloud_talk;
 #[cfg(feature = "channel-nostr")]
 pub mod nostr;
 pub mod notion;
 pub mod qq;
+pub mod session_backend;
+pub mod session_sqlite;
 pub mod session_store;
 pub mod signal;
 pub mod slack;
@@ -39,6 +42,7 @@ pub mod telegram;
 pub mod traits;
 pub mod transcription;
 pub mod tts;
+pub mod twitter;
 pub mod wati;
 pub mod wecom;
 pub mod whatsapp;
@@ -60,6 +64,7 @@ pub use linq::LinqChannel;
 #[cfg(feature = "channel-matrix")]
 pub use matrix::MatrixChannel;
 pub use mattermost::MattermostChannel;
+pub use mochat::MochatChannel;
 pub use nextcloud_talk::NextcloudTalkChannel;
 #[cfg(feature = "channel-nostr")]
 pub use nostr::NostrChannel;
@@ -71,6 +76,7 @@ pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
 #[allow(unused_imports)]
 pub use tts::{TtsManager, TtsProvider};
+pub use twitter::TwitterChannel;
 pub use wati::WatiChannel;
 pub use wecom::WeComChannel;
 pub use whatsapp::WhatsAppChannel;
@@ -839,9 +845,17 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     let next_default_provider: Arc<dyn Provider> = Arc::from(next_default_provider);
 
     if let Err(err) = next_default_provider.warmup().await {
+        if crate::providers::reliable::is_non_retryable(&err) {
+            tracing::warn!(
+                provider = %next_defaults.default_provider,
+                model = %next_defaults.model,
+                "Rejecting config reload: model not available (non-retryable): {err}"
+            );
+            return Ok(());
+        }
         tracing::warn!(
             provider = %next_defaults.default_provider,
-            "Provider warmup failed after config reload: {err}"
+            "Provider warmup failed after config reload (retryable, applying anyway): {err}"
         );
     }
 
@@ -1018,11 +1032,24 @@ fn rollback_orphan_user_turn(
     if turns.is_empty() {
         histories.remove(sender_key);
     }
+
+    // Also remove the orphan turn from the persisted JSONL session store so
+    // it doesn't resurface after a daemon restart (fixes #3674).
+    if let Some(ref store) = ctx.session_store {
+        if let Err(e) = store.remove_last(sender_key) {
+            tracing::warn!("Failed to rollback session store entry: {e}");
+        }
+    }
+
     true
 }
 
 fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
     if memory::is_assistant_autosave_key(key) {
+        return true;
+    }
+
+    if memory::should_skip_autosave_content(content) {
         return true;
     }
 
@@ -1317,10 +1344,11 @@ async fn build_memory_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
+    session_id: Option<&str>,
 ) -> String {
     let mut context = String::new();
 
-    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+    if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
         let mut included = 0usize;
         let mut used_chars = 0usize;
 
@@ -1786,7 +1814,17 @@ async fn process_channel_message(
         msg
     };
 
-    let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
+    let target_channel = ctx
+        .channels_by_name
+        .get(&msg.channel)
+        .or_else(|| {
+            // Multi-room channels use "name:qualifier" format (e.g. "matrix:!roomId");
+            // fall back to base channel name for routing.
+            msg.channel
+                .split_once(':')
+                .and_then(|(base, _)| ctx.channels_by_name.get(base))
+        })
+        .cloned();
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
         tracing::warn!("Failed to apply runtime config update: {err}");
     }
@@ -1840,7 +1878,10 @@ async fn process_channel_message(
             return;
         }
     };
-    if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+    if ctx.auto_save_memory
+        && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !memory::should_skip_autosave_content(&msg.content)
+    {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
             .memory
@@ -1848,7 +1889,7 @@ async fn process_channel_message(
                 &autosave_key,
                 &msg.content,
                 crate::memory::MemoryCategory::Conversation,
-                None,
+                Some(&history_key),
             )
             .await;
     }
@@ -1885,6 +1926,29 @@ async fn process_channel_message(
         }
     }
 
+    // Strip [IMAGE:] markers from *older* history messages when the active
+    // provider does not support vision. This prevents "history poisoning"
+    // where a previously-sent image marker gets reloaded from the JSONL
+    // session file and permanently breaks the conversation (fixes #3674).
+    // We skip the last turn (the current message) so the vision check can
+    // still reject fresh image sends with a proper error.
+    if !active_provider.supports_vision() && prior_turns.len() > 1 {
+        let last_idx = prior_turns.len() - 1;
+        for turn in &mut prior_turns[..last_idx] {
+            if turn.content.contains("[IMAGE:") {
+                let (cleaned, _refs) = crate::multimodal::parse_image_markers(&turn.content);
+                turn.content = cleaned;
+            }
+        }
+        // Drop older turns that became empty after marker removal (e.g. image-only messages).
+        // Keep the last turn (current message) intact.
+        let current = prior_turns.pop();
+        prior_turns.retain(|turn| !turn.content.trim().is_empty());
+        if let Some(current) = current {
+            prior_turns.push(current);
+        }
+    }
+
     // Proactively trim conversation history before sending to the provider
     // to prevent context-window-exceeded errors (bug #3460).
     let dropped = proactive_trim_turns(&mut prior_turns, PROACTIVE_CONTEXT_BUDGET_CHARS);
@@ -1901,8 +1965,13 @@ async fn process_channel_message(
     // Only enrich with memory context when there is no prior conversation
     // history. Follow-up turns already include context from previous messages.
     if !had_prior_history {
-        let memory_context =
-            build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
+        let memory_context = build_memory_context(
+            ctx.memory.as_ref(),
+            &msg.content,
+            ctx.min_relevance_score,
+            Some(&history_key),
+        )
+        .await;
         if let Some(last_turn) = prior_turns.last_mut() {
             if last_turn.role == "user" && !memory_context.is_empty() {
                 last_turn.content = format!("{memory_context}{}", msg.content);
@@ -3261,12 +3330,15 @@ fn collect_configured_channels(
                 if wa.is_web_config() {
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
-                        channel: Arc::new(WhatsAppWebChannel::new(
-                            wa.session_path.clone().unwrap_or_default(),
-                            wa.pair_phone.clone(),
-                            wa.pair_code.clone(),
-                            wa.allowed_numbers.clone(),
-                        )),
+                        channel: Arc::new(
+                            WhatsAppWebChannel::new(
+                                wa.session_path.clone().unwrap_or_default(),
+                                wa.pair_phone.clone(),
+                                wa.pair_code.clone(),
+                                wa.allowed_numbers.clone(),
+                            )
+                            .with_transcription(config.transcription.clone()),
+                        ),
                     });
                 } else {
                     tracing::warn!("WhatsApp Web configured but session_path not set");
@@ -3400,6 +3472,28 @@ fn collect_configured_channels(
                 qq.app_id.clone(),
                 qq.app_secret.clone(),
                 qq.allowed_users.clone(),
+            )),
+        });
+    }
+
+    if let Some(ref tw) = config.channels_config.twitter {
+        channels.push(ConfiguredChannel {
+            display_name: "X/Twitter",
+            channel: Arc::new(TwitterChannel::new(
+                tw.bearer_token.clone(),
+                tw.allowed_users.clone(),
+            )),
+        });
+    }
+
+    if let Some(ref mc) = config.channels_config.mochat {
+        channels.push(ConfiguredChannel {
+            display_name: "Mochat",
+            channel: Arc::new(MochatChannel::new(
+                mc.api_url.clone(),
+                mc.api_token.clone(),
+                mc.allowed_users.clone(),
+                mc.poll_interval_secs,
             )),
         });
     }
@@ -4400,6 +4494,100 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].content, "first");
         assert_eq!(turns[1].content, "ok");
+    }
+
+    #[test]
+    fn rollback_orphan_user_turn_also_removes_from_session_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(session_store::SessionStore::new(tmp.path()).unwrap());
+
+        let sender = "telegram_u4".to_string();
+
+        // Pre-populate the session store with the same turns.
+        store.append(&sender, &ChatMessage::user("first")).unwrap();
+        store
+            .append(&sender, &ChatMessage::assistant("ok"))
+            .unwrap();
+        store
+            .append(
+                &sender,
+                &ChatMessage::user("[IMAGE:/tmp/photo.jpg]\n\nDescribe this"),
+            )
+            .unwrap();
+
+        let mut histories = HashMap::new();
+        histories.insert(
+            sender.clone(),
+            vec![
+                ChatMessage::user("first"),
+                ChatMessage::assistant("ok"),
+                ChatMessage::user("[IMAGE:/tmp/photo.jpg]\n\nDescribe this"),
+            ],
+        );
+
+        let ctx = ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::new()),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("system".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(histories)),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: Some(Arc::clone(&store)),
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+        };
+
+        assert!(rollback_orphan_user_turn(
+            &ctx,
+            &sender,
+            "[IMAGE:/tmp/photo.jpg]\n\nDescribe this"
+        ));
+
+        // In-memory history should have 2 turns remaining.
+        let locked = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = locked.get(&sender).expect("history should remain");
+        assert_eq!(turns.len(), 2);
+
+        // Session store should also have only 2 entries.
+        let persisted = store.load(&sender);
+        assert_eq!(
+            persisted.len(),
+            2,
+            "session store should also lose the rolled-back turn"
+        );
+        assert_eq!(persisted[0].content, "first");
+        assert_eq!(persisted[1].content, "ok");
     }
 
     struct DummyProvider;
@@ -6835,7 +7023,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .await
             .unwrap();
 
-        let context = build_memory_context(&mem, "age", 0.0).await;
+        let context = build_memory_context(&mem, "age", 0.0, None).await;
         assert!(context.contains("[Memory context]"));
         assert!(context.contains("Age is 45"));
     }
@@ -6867,7 +7055,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await
         .unwrap();
 
-        let context = build_memory_context(&mem, "screenshot", 0.0).await;
+        let context = build_memory_context(&mem, "screenshot", 0.0, None).await;
 
         // The image-marker entry must be excluded to prevent duplication.
         assert!(
