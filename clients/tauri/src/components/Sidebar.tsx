@@ -4,6 +4,7 @@ import type { ChatSession } from "../lib/storage";
 import { deriveChatTitle } from "../lib/storage";
 import type { DeviceInfo, ToolInfo, ChannelInfo } from "../lib/api";
 import { apiClient } from "../lib/api";
+import { ChannelGuide } from "./ChannelGuide";
 
 interface SidebarProps {
   chats: ChatSession[];
@@ -263,6 +264,9 @@ export function Sidebar({
     [configuredToolKeys],
   );
 
+  // Channel guide modal state
+  const [guideChannel, setGuideChannel] = useState<string | null>(null);
+
   const onlineDevices = devices.filter((d) => d.is_online);
 
   // Sort chats by updatedAt descending and compute date groups
@@ -369,6 +373,16 @@ export function Sidebar({
                       <span className="sidebar-info-label">
                         {CHANNEL_DISPLAY_NAMES[ch.name] || ch.name}
                       </span>
+                      <button
+                        className="sidebar-channel-guide-btn"
+                        title={locale === "ko" ? "채널추가 안내" : "Setup Guide"}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setGuideChannel(ch.name);
+                        }}
+                      >
+                        {locale === "ko" ? "채널추가 안내" : "Guide"}
+                      </button>
                       <span className={`sidebar-channel-status ${ch.enabled ? "enabled" : "disabled"}`}>
                         {ch.enabled
                           ? (locale === "ko" ? "활성" : "ON")
@@ -644,6 +658,15 @@ export function Sidebar({
 
       {/* Mobile overlay */}
       {isOpen && <div className="sidebar-overlay" onClick={onToggle} />}
+
+      {/* Channel setup guide modal */}
+      {guideChannel && (
+        <ChannelGuide
+          channelName={guideChannel}
+          locale={locale}
+          onClose={() => setGuideChannel(null)}
+        />
+      )}
     </>
   );
 }
