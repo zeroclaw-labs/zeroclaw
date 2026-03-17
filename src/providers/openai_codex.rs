@@ -22,6 +22,7 @@ pub struct OpenAiCodexProvider {
     responses_url: String,
     custom_endpoint: bool,
     gateway_api_key: Option<String>,
+    reasoning_effort: Option<String>,
     client: Client,
 }
 
@@ -105,6 +106,7 @@ impl OpenAiCodexProvider {
             custom_endpoint: !is_default_responses_url(&responses_url),
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
+            reasoning_effort: options.reasoning_effort.clone(),
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -304,9 +306,10 @@ fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
     effort.to_string()
 }
 
-fn resolve_reasoning_effort(model_id: &str) -> String {
-    let raw = std::env::var("ZEROCLAW_CODEX_REASONING_EFFORT")
-        .ok()
+fn resolve_reasoning_effort(model_id: &str, configured: Option<&str>) -> String {
+    let raw = configured
+        .map(ToString::to_string)
+        .or_else(|| std::env::var("ZEROCLAW_CODEX_REASONING_EFFORT").ok())
         .and_then(|value| first_nonempty(Some(&value)))
         .unwrap_or_else(|| "xhigh".to_string())
         .to_ascii_lowercase();
@@ -663,7 +666,10 @@ impl OpenAiCodexProvider {
                 verbosity: "medium".to_string(),
             },
             reasoning: ResponsesReasoningOptions {
-                effort: resolve_reasoning_effort(normalized_model),
+                effort: resolve_reasoning_effort(
+                    normalized_model,
+                    self.reasoning_effort.as_deref(),
+                ),
                 summary: "auto".to_string(),
             },
             include: vec!["reasoning.encrypted_content".to_string()],
@@ -952,6 +958,24 @@ mod tests {
     }
 
     #[test]
+    fn resolve_reasoning_effort_prefers_configured_override() {
+        let _guard = EnvGuard::set("ZEROCLAW_CODEX_REASONING_EFFORT", Some("low"));
+        assert_eq!(
+            resolve_reasoning_effort("gpt-5-codex", Some("high")),
+            "high".to_string()
+        );
+    }
+
+    #[test]
+    fn resolve_reasoning_effort_uses_legacy_env_when_unconfigured() {
+        let _guard = EnvGuard::set("ZEROCLAW_CODEX_REASONING_EFFORT", Some("minimal"));
+        assert_eq!(
+            resolve_reasoning_effort("gpt-5-codex", None),
+            "low".to_string()
+        );
+    }
+
+    #[test]
     fn parse_sse_text_reads_output_text_delta() {
         let payload = r#"data: {"type":"response.created","response":{"id":"resp_123"}}
 
@@ -1125,6 +1149,7 @@ data: [DONE]
             secrets_encrypt: false,
             auth_profile_override: None,
             reasoning_enabled: None,
+            reasoning_effort: None,
             provider_timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
