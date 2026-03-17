@@ -369,8 +369,8 @@ app_secret = "YOUR_APP_SECRET"`,
       "MoA를 재시작하고 DingTalk 봇에 메시지를 보내서 테스트하세요.",
     ],
     configExample: `[channels.dingtalk]
-app_key = "YOUR_APP_KEY"
-app_secret = "YOUR_APP_SECRET"`,
+client_id = "YOUR_APP_KEY"
+client_secret = "YOUR_APP_SECRET"`,
   },
 
   nostr: {
@@ -435,12 +435,13 @@ access_token = "github_pat_YOUR_TOKEN"
       "MoA를 재시작하고 설정된 이메일 주소로 메시지를 보내서 테스트하세요.",
     ],
     configExample: `[channels.email]
-imap_server = "imap.gmail.com"
+imap_host = "imap.gmail.com"
 imap_port = 993
-smtp_server = "smtp.gmail.com"
-smtp_port = 587
+smtp_host = "smtp.gmail.com"
+smtp_port = 465
 username = "your_email@gmail.com"
 password = "your_app_password"
+from_address = "your_email@gmail.com"
 allowed_senders = ["friend@example.com"]`,
   },
 
@@ -504,7 +505,7 @@ allowed_contacts = ["+1234567890", "friend@icloud.com"]`,
     ],
     configExample: `[channels.qq]
 app_id = "YOUR_APP_ID"
-token = "YOUR_TOKEN"`,
+app_secret = "YOUR_APP_SECRET"`,
   },
 
   napcat: {
@@ -525,8 +526,139 @@ token = "YOUR_TOKEN"`,
       "MoA를 재시작하고 QQ 메시지를 보내서 테스트하세요.",
     ],
     configExample: `[channels.napcat]
-http_url = "http://127.0.0.1:3000"
+websocket_url = "ws://127.0.0.1:3001"
 # access_token = "your_token"  # optional`,
+  },
+
+  bluebubbles: {
+    title: "BlueBubbles Setup",
+    titleKo: "BlueBubbles 설정 안내",
+    steps: [
+      "Install BlueBubbles Server on your Mac (https://bluebubbles.app).",
+      "Start the server and set a server password.",
+      "Note the server URL (e.g. http://192.168.1.100:1234 or your ngrok URL).",
+      "Add the config below to your config.toml file.",
+      "Restart MoA. Send an iMessage through BlueBubbles to test.",
+    ],
+    stepsKo: [
+      "Mac에 BlueBubbles Server를 설치하세요 (https://bluebubbles.app).",
+      "서버를 시작하고 서버 비밀번호를 설정하세요.",
+      "서버 URL을 확인하세요 (예: http://192.168.1.100:1234 또는 ngrok URL).",
+      "아래 설정을 config.toml 파일에 추가하세요.",
+      "MoA를 재시작하고 BlueBubbles를 통해 iMessage를 보내서 테스트하세요.",
+    ],
+    configExample: `[channels.bluebubbles]
+server_url = "http://192.168.1.100:1234"
+password = "YOUR_SERVER_PASSWORD"
+allowed_senders = ["+1234567890"]`,
+  },
+
+  linq: {
+    title: "Linq Setup",
+    titleKo: "Linq 설정 안내",
+    steps: [
+      "Sign up for a Linq Partner API account and get your API token.",
+      "Register a phone number for sending messages (E.164 format).",
+      "Add the config below to your config.toml file.",
+      "Restart MoA. Send a message to the Linq number to test.",
+    ],
+    stepsKo: [
+      "Linq Partner API 계정을 만들고 API 토큰을 받으세요.",
+      "메시지 전송용 전화번호를 등록하세요 (E.164 형식).",
+      "아래 설정을 config.toml 파일에 추가하세요.",
+      "MoA를 재시작하고 Linq 번호로 메시지를 보내서 테스트하세요.",
+    ],
+    configExample: `[channels.linq]
+api_token = "YOUR_API_TOKEN"
+from_phone = "+1234567890"
+allowed_senders = ["+9876543210"]`,
+  },
+
+  wati: {
+    title: "WATI Setup",
+    titleKo: "WATI 설정 안내",
+    steps: [
+      "Sign up at https://www.wati.io and get your API token.",
+      "Your WATI dashboard will show the API URL and token.",
+      "Add the config below to your config.toml file.",
+      "Restart MoA. Send a WhatsApp message through WATI to test.",
+    ],
+    stepsKo: [
+      "https://www.wati.io 에 가입하고 API 토큰을 받으세요.",
+      "WATI 대시보드에서 API URL과 토큰을 확인하세요.",
+      "아래 설정을 config.toml 파일에 추가하세요.",
+      "MoA를 재시작하고 WATI를 통해 WhatsApp 메시지를 보내서 테스트하세요.",
+    ],
+    configExample: `[channels.wati]
+api_token = "YOUR_API_TOKEN"
+# api_url = "https://live-mt-server.wati.io"  # default
+allowed_numbers = ["+1234567890"]`,
+  },
+
+  nextcloud_talk: {
+    title: "Nextcloud Talk Setup",
+    titleKo: "Nextcloud Talk 설정 안내",
+    steps: [
+      "Go to your Nextcloud admin panel and enable the Talk app.",
+      "Register a Bot app and get the app token (OCS API).",
+      "Set the webhook URL for message events.",
+      "Add the config below to your config.toml file.",
+      "Restart MoA. Send a message in Nextcloud Talk to test.",
+    ],
+    stepsKo: [
+      "Nextcloud 관리자 패널에서 Talk 앱을 활성화하세요.",
+      "Bot 앱을 등록하고 앱 토큰(OCS API)을 받으세요.",
+      "메시지 이벤트용 웹훅 URL을 설정하세요.",
+      "아래 설정을 config.toml 파일에 추가하세요.",
+      "MoA를 재시작하고 Nextcloud Talk에서 메시지를 보내서 테스트하세요.",
+    ],
+    configExample: `[channels.nextcloud_talk]
+base_url = "https://cloud.example.com"
+app_token = "YOUR_BOT_APP_TOKEN"
+allowed_users = ["your_user_id"]`,
+  },
+
+  acp: {
+    title: "ACP (Agent Client Protocol) Setup",
+    titleKo: "ACP 설정 안내",
+    steps: [
+      "ACP connects MoA to OpenCode or compatible agent clients.",
+      "Ensure OpenCode is installed (or set a custom path).",
+      "Add the config below to your config.toml file.",
+      "Restart MoA. The ACP channel will connect automatically.",
+    ],
+    stepsKo: [
+      "ACP는 MoA를 OpenCode 또는 호환 에이전트 클라이언트에 연결합니다.",
+      "OpenCode가 설치되어 있는지 확인하세요 (또는 경로를 지정하세요).",
+      "아래 설정을 config.toml 파일에 추가하세요.",
+      "MoA를 재시작하면 ACP 채널이 자동으로 연결됩니다.",
+    ],
+    configExample: `[channels.acp]
+# opencode_path = "opencode"  # default
+# workdir = "/path/to/workspace"  # optional`,
+  },
+
+  clawdtalk: {
+    title: "ClawdTalk (Voice) Setup",
+    titleKo: "ClawdTalk (음성) 설정 안내",
+    steps: [
+      "Sign up at https://telnyx.com and get an API key.",
+      "Create a SIP connection in Telnyx and copy the Connection ID.",
+      "Register a phone number for making/receiving calls.",
+      "Add the config below to your config.toml file.",
+      "Restart MoA. Call the number to test voice interaction.",
+    ],
+    stepsKo: [
+      "https://telnyx.com 에 가입하고 API 키를 받으세요.",
+      "Telnyx에서 SIP 연결을 만들고 Connection ID를 복사하세요.",
+      "전화 발신/수신용 전화번호를 등록하세요.",
+      "아래 설정을 config.toml 파일에 추가하세요.",
+      "MoA를 재시작하고 전화를 걸어 음성 상호작용을 테스트하세요.",
+    ],
+    configExample: `[channels.clawdtalk]
+api_key = "YOUR_TELNYX_API_KEY"
+connection_id = "YOUR_SIP_CONNECTION_ID"
+from_number = "+1234567890"`,
   },
 };
 
