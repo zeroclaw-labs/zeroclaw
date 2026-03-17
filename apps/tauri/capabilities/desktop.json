@@ -1,0 +1,10 @@
+{
+  "identifier": "desktop",
+  "description": "Desktop-specific permissions for ZeroClaw",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:allow-open",
+    "shell:allow-execute"
+  ]
+}

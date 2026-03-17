@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 
 pub struct GatewayClient {
-    base_url: String,
-    token: Option<String>,
+    pub(crate) base_url: String,
+    pub(crate) token: Option<String>,
     client: reqwest::Client,
 }
 
@@ -21,7 +21,7 @@ impl GatewayClient {
         }
     }
 
-    fn auth_header(&self) -> Option<String> {
+    pub(crate) fn auth_header(&self) -> Option<String> {
         self.token.as_ref().map(|t| format!("Bearer {t}"))
     }
 
@@ -68,5 +68,24 @@ impl GatewayClient {
         }
         let resp = req.send().await.context("webhook request failed")?;
         Ok(resp.json().await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_client_creation() {
+        let client = GatewayClient::new("http://127.0.0.1:42617", None);
+        assert_eq!(client.base_url, "http://127.0.0.1:42617");
+        assert!(client.token.is_none());
+    }
+
+    #[test]
+    fn test_client_with_token() {
+        let client = GatewayClient::new("http://localhost:8080", Some("test-token"));
+        assert!(client.token.is_some());
+        assert_eq!(client.auth_header().unwrap(), "Bearer test-token");
     }
 }
