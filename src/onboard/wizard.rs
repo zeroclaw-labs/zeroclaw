@@ -173,6 +173,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         web_fetch: crate::config::WebFetchConfig::default(),
         web_search: crate::config::WebSearchConfig::default(),
         project_intel: crate::config::ProjectIntelConfig::default(),
+        google_workspace: crate::config::GoogleWorkspaceConfig::default(),
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
@@ -424,14 +425,14 @@ pub async fn run_quick_setup(
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
 
-    run_quick_setup_with_home(
+    Box::pin(run_quick_setup_with_home(
         credential_override,
         provider,
         model_override,
         memory_backend,
         force,
         &home,
-    )
+    ))
     .await
 }
 
@@ -543,6 +544,7 @@ async fn run_quick_setup_with_home(
         web_fetch: crate::config::WebFetchConfig::default(),
         web_search: crate::config::WebSearchConfig::default(),
         project_intel: crate::config::ProjectIntelConfig::default(),
+        google_workspace: crate::config::GoogleWorkspaceConfig::default(),
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
@@ -5912,14 +5914,14 @@ mod tests {
         let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
         let tmp = TempDir::new().unwrap();
 
-        let config = run_quick_setup_with_home(
+        let config = Box::pin(run_quick_setup_with_home(
             Some("sk-issue946"),
             Some("openrouter"),
             Some("custom-model-946"),
             Some("sqlite"),
             false,
             tmp.path(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -5939,14 +5941,14 @@ mod tests {
         let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
         let tmp = TempDir::new().unwrap();
 
-        let config = run_quick_setup_with_home(
+        let config = Box::pin(run_quick_setup_with_home(
             Some("sk-issue946"),
             Some("anthropic"),
             None,
             Some("sqlite"),
             false,
             tmp.path(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -5969,14 +5971,14 @@ mod tests {
             .await
             .unwrap();
 
-        let err = run_quick_setup_with_home(
+        let err = Box::pin(run_quick_setup_with_home(
             Some("sk-existing"),
             Some("openrouter"),
             Some("custom-model"),
             Some("sqlite"),
             false,
             tmp.path(),
-        )
+        ))
         .await
         .expect_err("quick setup should refuse overwrite without --force");
 
@@ -6002,14 +6004,14 @@ mod tests {
         .await
         .unwrap();
 
-        let config = run_quick_setup_with_home(
+        let config = Box::pin(run_quick_setup_with_home(
             Some("sk-force"),
             Some("openrouter"),
             Some("custom-model-fresh"),
             Some("sqlite"),
             true,
             tmp.path(),
-        )
+        ))
         .await
         .expect("quick setup should overwrite existing config with --force");
 
@@ -6036,14 +6038,14 @@ mod tests {
         );
         let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
 
-        let config = run_quick_setup_with_home(
+        let config = Box::pin(run_quick_setup_with_home(
             Some("sk-env"),
             Some("openrouter"),
             Some("model-env"),
             Some("sqlite"),
             false,
             tmp.path(),
-        )
+        ))
         .await
         .expect("quick setup should honor ZEROCLAW_WORKSPACE");
 
