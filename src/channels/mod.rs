@@ -4573,6 +4573,7 @@ mod tests {
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         };
 
         assert!(rollback_orphan_user_turn(
