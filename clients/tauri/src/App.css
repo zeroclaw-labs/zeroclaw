@@ -392,21 +392,88 @@ html, body {
   margin-bottom: 8px;
 }
 
-.sidebar-tool-key-select {
+/* Custom tool selector (replaces native <select> for dark theme) */
+.tool-key-selector {
+  position: relative;
+}
+
+.tool-key-selector-trigger {
   width: 100%;
-  padding: 6px 8px;
-  font-size: 11px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 10px;
+  font-size: 12px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
   background: var(--color-bg-primary);
   color: var(--color-text-primary);
-  outline: none;
   cursor: pointer;
   font-family: var(--font-sans);
+  transition: border-color var(--transition-fast);
 }
 
-.sidebar-tool-key-select:focus {
-  border-color: var(--color-primary);
+.tool-key-selector-trigger:hover {
+  border-color: var(--color-border-light);
+}
+
+.tool-key-selector-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-key-selector-list {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  margin-top: 2px;
+  padding: 4px 0;
+  list-style: none;
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.tool-key-selector-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 10px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.tool-key-selector-item:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+
+.tool-key-selector-item.selected {
+  background: var(--color-primary-bg);
+  color: var(--color-primary);
+}
+
+.tool-key-selector-item-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-key-selector-item-check {
+  flex-shrink: 0;
+  margin-left: 6px;
+  color: var(--color-success);
+  font-weight: 700;
+  font-size: 13px;
 }
 
 .sidebar-tool-key-input-row {
@@ -460,6 +527,14 @@ html, body {
   font-size: 10px;
   color: var(--color-success);
   text-align: center;
+}
+
+.sidebar-tool-key-error-msg {
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--color-error);
+  text-align: center;
+  word-break: break-word;
 }
 
 .sidebar-tool-needs-key {

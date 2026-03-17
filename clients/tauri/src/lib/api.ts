@@ -750,14 +750,24 @@ export class MoAClient {
 
   /** Save an API key for a specific tool (e.g. composio, web_search_tool, web_fetch) */
   async saveToolApiKey(tool: string, apiKey: string): Promise<void> {
-    const res = await fetch(`${this.serverUrl}/api/config/tool-api-key`, {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.token}`,
-      },
-      body: JSON.stringify({ tool, api_key: apiKey }),
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${this.serverUrl}/api/config/tool-api-key`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.token}`,
+        },
+        body: JSON.stringify({ tool, api_key: apiKey }),
+      });
+    } catch (networkErr) {
+      // Network error — server might not be reachable
+      throw new Error(
+        networkErr instanceof Error
+          ? `Network error: ${networkErr.message}`
+          : "Network error: could not reach server",
+      );
+    }
     if (!res.ok) {
       const data = await res.json().catch(() => ({ error: "Save failed" }));
       throw new Error(data.error || `Save failed (${res.status})`);

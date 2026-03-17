@@ -225,6 +225,8 @@ export function Sidebar({
   const [toolKeyInput, setToolKeyInput] = useState("");
   const [toolKeySaving, setToolKeySaving] = useState(false);
   const [toolKeySaved, setToolKeySaved] = useState<string | null>(null);
+  const [toolKeyError, setToolKeyError] = useState<string | null>(null);
+  const [toolListOpen, setToolListOpen] = useState(false);
   const [configuredToolKeys, setConfiguredToolKeys] = useState<Set<string>>(() => {
     const set = new Set<string>();
     for (const info of TOOLS_REQUIRING_API_KEY) {
@@ -245,14 +247,17 @@ export function Sidebar({
   const handleSaveToolKey = useCallback(async () => {
     if (!selectedToolForKey || !toolKeyInput.trim()) return;
     setToolKeySaving(true);
+    setToolKeyError(null);
     try {
       await apiClient.saveToolApiKey(selectedToolForKey, toolKeyInput.trim());
       setConfiguredToolKeys((prev) => new Set([...prev, selectedToolForKey]));
       setToolKeySaved(selectedToolForKey);
       setToolKeyInput("");
       setTimeout(() => setToolKeySaved(null), 2000);
-    } catch {
-      // silently fail — user can retry
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Save failed";
+      setToolKeyError(msg);
+      setTimeout(() => setToolKeyError(null), 4000);
     } finally {
       setToolKeySaving(false);
     }
@@ -441,25 +446,46 @@ export function Sidebar({
                 <div className="sidebar-tool-key-dropdown-title">
                   {locale === "ko" ? "도구 API Key 설정" : "Tool API Key Settings"}
                 </div>
-                <select
-                  className="sidebar-tool-key-select"
-                  value={selectedToolForKey}
-                  onChange={(e) => {
-                    setSelectedToolForKey(e.target.value);
-                    setToolKeyInput("");
-                    setToolKeySaved(null);
-                  }}
-                >
-                  <option value="">
-                    {locale === "ko" ? "-- 도구 선택 --" : "-- Select Tool --"}
-                  </option>
-                  {TOOLS_REQUIRING_API_KEY.map((info) => (
-                    <option key={info.toolId} value={info.toolId}>
-                      {info.displayName}
-                      {configuredToolKeys.has(info.toolId) ? " \u2713" : ""}
-                    </option>
-                  ))}
-                </select>
+
+                {/* Custom tool selector */}
+                <div className="tool-key-selector">
+                  <button
+                    className="tool-key-selector-trigger"
+                    onClick={() => setToolListOpen((prev) => !prev)}
+                  >
+                    <span className="tool-key-selector-label">
+                      {selectedToolForKey
+                        ? TOOLS_REQUIRING_API_KEY.find((t) => t.toolId === selectedToolForKey)?.displayName
+                        : locale === "ko" ? "-- 도구 선택 --" : "-- Select Tool --"}
+                    </span>
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                      <polyline points="6 9 12 15 18 9" />
+                    </svg>
+                  </button>
+                  {toolListOpen && (
+                    <ul className="tool-key-selector-list">
+                      {TOOLS_REQUIRING_API_KEY.map((info) => (
+                        <li
+                          key={info.toolId}
+                          className={`tool-key-selector-item ${selectedToolForKey === info.toolId ? "selected" : ""}`}
+                          onClick={() => {
+                            setSelectedToolForKey(info.toolId);
+                            setToolKeyInput("");
+                            setToolKeySaved(null);
+                            setToolKeyError(null);
+                            setToolListOpen(false);
+                          }}
+                        >
+                          <span className="tool-key-selector-item-name">{info.displayName}</span>
+                          {configuredToolKeys.has(info.toolId) && (
+                            <span className="tool-key-selector-item-check">{"\u2713"}</span>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+
                 {selectedToolForKey && (
                   <div className="sidebar-tool-key-input-row">
                     <input
@@ -492,6 +518,11 @@ export function Sidebar({
                 {toolKeySaved && (
                   <div className="sidebar-tool-key-saved-msg">
                     {locale === "ko" ? "API Key가 저장되었습니다" : "API Key saved"}
+                  </div>
+                )}
+                {toolKeyError && (
+                  <div className="sidebar-tool-key-error-msg">
+                    {locale === "ko" ? `저장 실패: ${toolKeyError}` : `Error: ${toolKeyError}`}
                   </div>
                 )}
               </div>
