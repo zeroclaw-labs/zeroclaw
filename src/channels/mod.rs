@@ -292,6 +292,12 @@ impl InterruptOnNewMessageConfig {
 }
 
 #[derive(Clone)]
+struct ChannelCostTrackingState {
+    tracker: Arc<crate::cost::CostTracker>,
+    prices: Arc<HashMap<String, crate::config::schema::ModelPricing>>,
+}
+
+#[derive(Clone)]
 struct ChannelRuntimeContext {
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
     provider: Arc<dyn Provider>,
@@ -330,6 +336,7 @@ struct ChannelRuntimeContext {
     /// approval since no operator is present on channel runs.
     approval_manager: Arc<ApprovalManager>,
     activated_tools: Option<std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    cost_tracking: Option<ChannelCostTrackingState>,
 }
 
 #[derive(Clone)]
@@ -2115,33 +2122,40 @@ async fn process_channel_message(
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
+    let cost_tracking_context = ctx
+        .cost_tracking
+        .clone()
+        .map(|state| crate::agent::loop_::ToolLoopCostTrackingContext::new(state.tracker, state.prices));
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
             Duration::from_secs(timeout_budget_secs),
-            run_tool_call_loop(
-                active_provider.as_ref(),
-                &mut history,
-                ctx.tools_registry.as_ref(),
-                notify_observer.as_ref() as &dyn Observer,
-                route.provider.as_str(),
-                route.model.as_str(),
-                runtime_defaults.temperature,
-                true,
-                Some(&*ctx.approval_manager),
-                msg.channel.as_str(),
-                &ctx.multimodal,
-                ctx.max_tool_iterations,
-                Some(cancellation_token.clone()),
-                delta_tx,
-                ctx.hooks.as_deref(),
-                if msg.channel == "cli" {
-                    &[]
-                } else {
-                    ctx.non_cli_excluded_tools.as_ref()
-                },
-                ctx.tool_call_dedup_exempt.as_ref(),
-                ctx.activated_tools.as_ref(),
+            crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                cost_tracking_context,
+                run_tool_call_loop(
+                    active_provider.as_ref(),
+                    &mut history,
+                    ctx.tools_registry.as_ref(),
+                    notify_observer.as_ref() as &dyn Observer,
+                    route.provider.as_str(),
+                    route.model.as_str(),
+                    runtime_defaults.temperature,
+                    true,
+                    Some(&*ctx.approval_manager),
+                    msg.channel.as_str(),
+                    &ctx.multimodal,
+                    ctx.max_tool_iterations,
+                    Some(cancellation_token.clone()),
+                    delta_tx,
+                    ctx.hooks.as_deref(),
+                    if msg.channel == "cli" {
+                        &[]
+                    } else {
+                        ctx.non_cli_excluded_tools.as_ref()
+                    },
+                    ctx.tool_call_dedup_exempt.as_ref(),
+                    ctx.activated_tools.as_ref(),
+                ),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -4024,6 +4038,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         },
         approval_manager: Arc::new(ApprovalManager::for_non_interactive(&config.autonomy)),
         activated_tools: ch_activated_handle,
+        cost_tracking: crate::cost::CostTracker::get_or_init_global(
+            config.cost.clone(),
+            &config.workspace_dir,
+        )
+        .map(|tracker| ChannelCostTrackingState {
+            tracker,
+            prices: Arc::new(config.cost.prices.clone()),
+        }),
     });
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.
@@ -4317,6 +4339,7 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -4426,6 +4449,7 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -4491,6 +4515,7 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4575,6 +4600,7 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         };
 
         assert!(rollback_orphan_user_turn(
@@ -5109,6 +5135,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -5182,6 +5209,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -5269,6 +5297,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -5341,6 +5370,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -5423,6 +5453,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -5525,6 +5556,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -5609,6 +5641,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -5708,6 +5741,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -5792,6 +5826,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -5866,6 +5901,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -6051,6 +6087,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -6144,6 +6181,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -6251,6 +6289,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
             query_classification: crate::config::QueryClassificationConfig::default(),
         });
 
@@ -6357,6 +6396,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -6444,6 +6484,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -6516,6 +6557,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -7146,6 +7188,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -7244,6 +7287,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -7342,6 +7386,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -7904,6 +7949,7 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -7983,6 +8029,7 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -8136,6 +8183,7 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -8239,6 +8287,7 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -8334,6 +8383,7 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(
@@ -8449,6 +8499,7 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            cost_tracking: None,
         });
 
         process_channel_message(

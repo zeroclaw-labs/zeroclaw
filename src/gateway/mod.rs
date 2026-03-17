@@ -421,18 +421,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let tools_registry: Arc<Vec<ToolSpec>> =
         Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());
 
-    // Cost tracker (optional)
-    let cost_tracker = if config.cost.enabled {
-        match CostTracker::new(config.cost.clone(), &config.workspace_dir) {
-            Ok(ct) => Some(Arc::new(ct)),
-            Err(e) => {
-                tracing::warn!("Failed to initialize cost tracker: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // Cost tracker — process-global singleton so channels share the same instance
+    let cost_tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.workspace_dir);
 
     // SSE broadcast channel for real-time events
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
