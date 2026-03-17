@@ -231,7 +231,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<St
             if parsed["type"].as_str() == Some("message") {
                 let content = parsed["content"].as_str().unwrap_or("").to_string();
                 if !content.is_empty() {
-                    process_chat_message(&state, &mut agent, &mut sender, &content).await;
+                    // Persist user message
+                    if let Some(ref backend) = state.session_backend {
+                        let user_msg = crate::providers::ChatMessage::user(&content);
+                        let _ = backend.append(&session_key, &user_msg);
+                    }
+                    process_chat_message(&state, &mut agent, &mut sender, &content, &session_key).await;
                 }
             }
         }

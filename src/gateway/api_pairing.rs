@@ -8,8 +8,10 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// Metadata about a paired device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,35 +24,144 @@ pub struct DeviceInfo {
     pub ip_address: Option<String>,
 }
 
-/// Registry of paired devices.
+/// Registry of paired devices backed by SQLite.
 #[derive(Debug)]
 pub struct DeviceRegistry {
-    devices: Mutex<HashMap<String, DeviceInfo>>,
+    cache: Mutex<HashMap<String, DeviceInfo>>,
+    db_path: PathBuf,
 }
 
 impl DeviceRegistry {
-    pub fn new() -> Self {
+    pub fn new(workspace_dir: &Path) -> Self {
+        let db_path = workspace_dir.join("devices.db");
+        let conn = Connection::open(&db_path).expect("Failed to open device registry database");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS devices (
+                token_hash TEXT PRIMARY KEY,
+                id TEXT NOT NULL,
+                name TEXT,
+                device_type TEXT,
+                paired_at TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                ip_address TEXT
+            )",
+        )
+        .expect("Failed to create devices table");
+
+        // Warm the in-memory cache from DB
+        let mut cache = HashMap::new();
+        let mut stmt = conn
+            .prepare("SELECT token_hash, id, name, device_type, paired_at, last_seen, ip_address FROM devices")
+            .expect("Failed to prepare device select");
+        let rows = stmt
+            .query_map([], |row| {
+                let token_hash: String = row.get(0)?;
+                let id: String = row.get(1)?;
+                let name: Option<String> = row.get(2)?;
+                let device_type: Option<String> = row.get(3)?;
+                let paired_at_str: String = row.get(4)?;
+                let last_seen_str: String = row.get(5)?;
+                let ip_address: Option<String> = row.get(6)?;
+                let paired_at = DateTime::parse_from_rfc3339(&paired_at_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                let last_seen = DateTime::parse_from_rfc3339(&last_seen_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                Ok((
+                    token_hash,
+                    DeviceInfo {
+                        id,
+                        name,
+                        device_type,
+                        paired_at,
+                        last_seen,
+                        ip_address,
+                    },
+                ))
+            })
+            .expect("Failed to query devices");
+        for (hash, info) in rows.flatten() {
+            cache.insert(hash, info);
+        }
+
         Self {
-            devices: Mutex::new(HashMap::new()),
+            cache: Mutex::new(cache),
+            db_path,
         }
     }
 
+    fn open_db(&self) -> Connection {
+        Connection::open(&self.db_path).expect("Failed to open device registry database")
+    }
+
     pub fn register(&self, token_hash: String, info: DeviceInfo) {
-        self.devices.lock().insert(token_hash, info);
+        let conn = self.open_db();
+        conn.execute(
+            "INSERT OR REPLACE INTO devices (token_hash, id, name, device_type, paired_at, last_seen, ip_address) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                token_hash,
+                info.id,
+                info.name,
+                info.device_type,
+                info.paired_at.to_rfc3339(),
+                info.last_seen.to_rfc3339(),
+                info.ip_address,
+            ],
+        )
+        .expect("Failed to insert device");
+        self.cache.lock().insert(token_hash, info);
     }
 
     pub fn list(&self) -> Vec<DeviceInfo> {
-        self.devices.lock().values().cloned().collect()
+        let conn = self.open_db();
+        let mut stmt = conn
+            .prepare("SELECT token_hash, id, name, device_type, paired_at, last_seen, ip_address FROM devices")
+            .expect("Failed to prepare device select");
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(1)?;
+                let name: Option<String> = row.get(2)?;
+                let device_type: Option<String> = row.get(3)?;
+                let paired_at_str: String = row.get(4)?;
+                let last_seen_str: String = row.get(5)?;
+                let ip_address: Option<String> = row.get(6)?;
+                let paired_at = DateTime::parse_from_rfc3339(&paired_at_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                let last_seen = DateTime::parse_from_rfc3339(&last_seen_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                Ok(DeviceInfo {
+                    id,
+                    name,
+                    device_type,
+                    paired_at,
+                    last_seen,
+                    ip_address,
+                })
+            })
+            .expect("Failed to query devices");
+        rows.filter_map(|r| r.ok()).collect()
     }
 
     pub fn revoke(&self, device_id: &str) -> bool {
-        let mut devices = self.devices.lock();
-        let key = devices
-            .iter()
-            .find(|(_, v)| v.id == device_id)
-            .map(|(k, _)| k.clone());
-        if let Some(key) = key {
-            devices.remove(&key);
+        let conn = self.open_db();
+        let deleted = conn
+            .execute(
+                "DELETE FROM devices WHERE id = ?1",
+                rusqlite::params![device_id],
+            )
+            .unwrap_or(0);
+        if deleted > 0 {
+            let mut cache = self.cache.lock();
+            let key = cache
+                .iter()
+                .find(|(_, v)| v.id == device_id)
+                .map(|(k, _)| k.clone());
+            if let Some(key) = key {
+                cache.remove(&key);
+            }
             true
         } else {
             false
@@ -58,13 +169,20 @@ impl DeviceRegistry {
     }
 
     pub fn update_last_seen(&self, token_hash: &str) {
-        if let Some(device) = self.devices.lock().get_mut(token_hash) {
-            device.last_seen = Utc::now();
+        let now = Utc::now();
+        let conn = self.open_db();
+        conn.execute(
+            "UPDATE devices SET last_seen = ?1 WHERE token_hash = ?2",
+            rusqlite::params![now.to_rfc3339(), token_hash],
+        )
+        .ok();
+        if let Some(device) = self.cache.lock().get_mut(token_hash) {
+            device.last_seen = now;
         }
     }
 
     pub fn device_count(&self) -> usize {
-        self.devices.lock().len()
+        self.cache.lock().len()
     }
 }
 
@@ -81,6 +199,7 @@ struct PendingPairing {
     created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     client_ip: Option<String>,
+    attempts: u32,
 }
 
 impl PairingStore {
@@ -138,7 +257,7 @@ pub async fn initiate_pairing(
     }
 }
 
-/// POST /api/pairing/submit — submit pairing code (for new device pairing)
+/// POST /api/pair — submit pairing code (for new device pairing)
 pub async fn submit_pairing_enhanced(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -237,7 +356,7 @@ pub async fn revoke_device(
     }
 }
 
-/// POST /api/devices/{id}/rotate — rotate a device's token
+/// POST /api/devices/{id}/token/rotate — rotate a device's token
 pub async fn rotate_token(
     State(state): State<AppState>,
     headers: HeaderMap,
