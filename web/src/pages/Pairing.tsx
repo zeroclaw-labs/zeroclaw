@@ -97,8 +97,14 @@ export default function Pairing() {
           <div className="text-3xl font-mono font-bold tracking-wider text-center py-4">
             {pairingCode}
           </div>
+          <div className="text-center my-3 text-sm text-gray-400">
+            {/* QR code rendering placeholder - will use qrcode.react when available */}
+            <div className="inline-block border-2 border-dashed border-gray-300 p-8 rounded">
+              <span className="text-gray-400">QR Code</span>
+            </div>
+          </div>
           <p className="text-sm text-gray-600 text-center">
-            Enter this code on the new device to complete pairing.
+            Scan the QR code or enter the code manually on the new device.
           </p>
         </div>
       )}

@@ -690,13 +690,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // Device registry and pairing store (only when pairing is required)
     let device_registry = if config.gateway.require_pairing {
-        Some(Arc::new(api_pairing::DeviceRegistry::new()))
+        Some(Arc::new(api_pairing::DeviceRegistry::new(
+            &config.workspace_dir,
+        )))
     } else {
         None
     };
     let pending_pairings = if config.gateway.require_pairing {
         Some(Arc::new(api_pairing::PairingStore::new(
-            config.gateway.pairing_dashboard.max_pending,
+            config.gateway.pairing_dashboard.max_pending_codes,
         )))
     } else {
         None
@@ -781,13 +783,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/sessions/{id}", delete(api::handle_api_session_delete))
         // ── Pairing + Device management API ──
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
-        .route(
-            "/api/pairing/submit",
-            post(api_pairing::submit_pairing_enhanced),
-        )
+        .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
         .route("/api/devices", get(api_pairing::list_devices))
         .route("/api/devices/{id}", delete(api_pairing::revoke_device))
-        .route("/api/devices/{id}/rotate", post(api_pairing::rotate_token))
+        .route(
+            "/api/devices/{id}/token/rotate",
+            post(api_pairing::rotate_token),
+        )
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
         // ── WebSocket agent chat ──
