@@ -73,6 +73,9 @@ pub mod tools;
 pub(crate) mod tunnel;
 pub(crate) mod util;
 
+#[cfg(feature = "plugins-wasm")]
+pub mod plugins;
+
 pub use config::Config;
 
 /// Gateway management subcommands
