@@ -13,7 +13,10 @@
   <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
   <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
   <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
-  <a href="https://www.facebook.com/groups/zeroclaw"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
+  <a href="https://www.facebook.com/groups/zeroclawlabs"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
+  <a href="https://discord.com/invite/wDshRVqRjx"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
+  <a href="https://www.tiktok.com/@zeroclawlabs"><img src="https://img.shields.io/badge/TikTok-%40zeroclawlabs-000000?style=flat&logo=tiktok&logoColor=white" alt="TikTok: @zeroclawlabs" /></a>
+  <a href="https://www.rednote.com/user/profile/69b735e6000000002603927e"><img src="https://img.shields.io/badge/RedNote-Official-FF2442?style=flat" alt="RedNote" /></a>
   <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
 </p>
 
@@ -92,7 +95,7 @@
 | 日期（UTC） | 级别 | 通知 | 处理建议 |
 |---|---|---|---|
 | 2026-02-19 | _紧急_ | 我们与 `openagen/zeroclaw` 及 `zeroclaw.org` **没有任何关系**。`zeroclaw.org` 当前会指向 `openagen/zeroclaw` 这个 fork，并且该域名/仓库正在冒充我们的官网与官方项目。 | 请不要相信上述来源发布的任何信息、二进制、募资活动或官方声明。请仅以[本仓库](https://github.com/zeroclaw-labs/zeroclaw)和已验证官方社媒为准。 |
-| 2026-02-21 | _重要_ | 我们的官网现已上线：[zeroclawlabs.ai](https://zeroclawlabs.ai)。感谢大家一直以来的耐心等待。我们仍在持续发现冒充行为，请勿参与任何未经我们官方渠道发布、但打着 ZeroClaw 名义进行的投资、募资或类似活动。 | 一切信息请以[本仓库](https://github.com/zeroclaw-labs/zeroclaw)为准；也可关注 [X（@zeroclawlabs）](https://x.com/zeroclawlabs?s=21)、[Telegram（@zeroclawlabs）](https://t.me/zeroclawlabs)、[Facebook（群组）](https://www.facebook.com/groups/zeroclaw)、[Reddit（r/zeroclawlabs）](https://www.reddit.com/r/zeroclawlabs/) 与 [小红书账号](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) 获取官方最新动态。 |
+| 2026-02-21 | _重要_ | 我们的官网现已上线：[zeroclawlabs.ai](https://zeroclawlabs.ai)。感谢大家一直以来的耐心等待。我们仍在持续发现冒充行为，请勿参与任何未经我们官方渠道发布、但打着 ZeroClaw 名义进行的投资、募资或类似活动。 | 一切信息请以[本仓库](https://github.com/zeroclaw-labs/zeroclaw)为准；也可关注 [X（@zeroclawlabs）](https://x.com/zeroclawlabs?s=21)、[Telegram（@zeroclawlabs）](https://t.me/zeroclawlabs)、[Facebook（群组）](https://www.facebook.com/groups/zeroclawlabs)、[Reddit（r/zeroclawlabs）](https://www.reddit.com/r/zeroclawlabs/) 与 [小红书账号](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) 获取官方最新动态。 |
 | 2026-02-19 | _重要_ | Anthropic 于 2026-02-19 更新了 Authentication and Credential Use 条款。条款明确：OAuth authentication（用于 Free、Pro、Max）仅适用于 Claude Code 与 Claude.ai；将 Claude Free/Pro/Max 账号获得的 OAuth token 用于其他任何产品、工具或服务（包括 Agent SDK）不被允许，并可能构成对 Consumer Terms of Service 的违规。 | 为避免损失，请暂时不要尝试 Claude Code OAuth 集成；原文见：[Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)。 |
 
 ## 项目简介
