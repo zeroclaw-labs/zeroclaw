@@ -9,6 +9,8 @@
 
 pub mod api;
 pub mod api_pairing;
+#[cfg(feature = "plugins-wasm")]
+pub mod api_plugins;
 pub mod nodes;
 pub mod sse;
 pub mod static_files;
@@ -789,7 +791,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route(
             "/api/devices/{id}/token/rotate",
             post(api_pairing::rotate_token),
-        )
+        );
+
+    // ── Plugin management API (requires plugins-wasm feature) ──
+    #[cfg(feature = "plugins-wasm")]
+    let app = app.route(
+        "/api/plugins",
+        get(api_plugins::plugin_routes::list_plugins),
+    );
+
+    let app = app
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
         // ── WebSocket agent chat ──

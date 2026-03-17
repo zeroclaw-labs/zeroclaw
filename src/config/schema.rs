@@ -335,6 +335,10 @@ pub struct Config {
     /// LinkedIn integration configuration (`[linkedin]`).
     #[serde(default)]
     pub linkedin: LinkedInConfig,
+
+    /// Plugin system configuration (`[plugins]`).
+    #[serde(default)]
+    pub plugins: PluginsConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -2355,6 +2359,42 @@ impl Default for LinkedInConfig {
 
 fn default_linkedin_api_version() -> String {
     "202602".to_string()
+}
+
+/// Plugin system configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PluginsConfig {
+    /// Enable the plugin system (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory where plugins are stored
+    #[serde(default = "default_plugins_dir")]
+    pub plugins_dir: String,
+    /// Auto-discover and load plugins on startup
+    #[serde(default)]
+    pub auto_discover: bool,
+    /// Maximum number of plugins that can be loaded
+    #[serde(default = "default_max_plugins")]
+    pub max_plugins: usize,
+}
+
+fn default_plugins_dir() -> String {
+    "~/.zeroclaw/plugins".to_string()
+}
+
+fn default_max_plugins() -> usize {
+    50
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            plugins_dir: default_plugins_dir(),
+            auto_discover: false,
+            max_plugins: default_max_plugins(),
+        }
+    }
 }
 
 /// Content strategy configuration for LinkedIn auto-posting (`[linkedin.content]`).
@@ -5950,6 +5990,7 @@ impl Default for Config {
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
+            plugins: PluginsConfig::default(),
         }
     }
 }
@@ -8385,6 +8426,7 @@ default_temperature = 0.7
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
+            plugins: PluginsConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -8717,6 +8759,7 @@ tool_dispatcher = "xml"
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
+            plugins: PluginsConfig::default(),
         };
 
         config.save().await.unwrap();
