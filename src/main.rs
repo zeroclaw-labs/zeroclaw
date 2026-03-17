@@ -1024,6 +1024,11 @@ async fn main() -> Result<()> {
             );
             println!("🛡️  Autonomy:      {:?}", config.autonomy.level);
             println!("⚙️  Runtime:       {}", config.runtime.kind);
+            if service::is_running() {
+                println!("🟢 Service:       running");
+            } else {
+                println!("🔴 Service:       stopped");
+            }
             let effective_memory_backend = memory::effective_memory_backend_name(
                 &config.memory.backend,
                 Some(&config.storage.provider.config),

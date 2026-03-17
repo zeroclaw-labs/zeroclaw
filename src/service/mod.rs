@@ -89,6 +89,42 @@ fn windows_task_name() -> &'static str {
     WINDOWS_TASK_NAME
 }
 
+/// Returns whether the ZeroClaw daemon service is currently running.
+pub fn is_running() -> bool {
+    if cfg!(target_os = "macos") {
+        run_capture(Command::new("launchctl").arg("list"))
+            .map(|out| out.lines().any(|l| l.contains(SERVICE_LABEL)))
+            .unwrap_or(false)
+    } else if cfg!(target_os = "linux") {
+        is_running_linux()
+    } else if cfg!(target_os = "windows") {
+        run_capture(Command::new("schtasks").args([
+            "/Query",
+            "/TN",
+            WINDOWS_TASK_NAME,
+            "/FO",
+            "LIST",
+        ]))
+        .map(|out| out.contains("Running"))
+        .unwrap_or(false)
+    } else {
+        false
+    }
+}
+
+fn is_running_linux() -> bool {
+    // Try systemd first, then OpenRC — mirrors detect_init_system() order
+    if run_capture(Command::new("systemctl").args(["--user", "is-active", "zeroclaw.service"]))
+        .map(|out| out.trim() == "active")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    run_capture(Command::new("rc-service").args(["zeroclaw", "status"]))
+        .map(|out| out.contains("started"))
+        .unwrap_or(false)
+}
+
 pub fn handle_command(
     command: &crate::ServiceCommands,
     config: &Config,
