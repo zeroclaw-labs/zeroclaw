@@ -282,7 +282,11 @@ Examples:
     },
 
     /// Show system status (full details)
-    Status,
+    Status {
+        /// Output format: "exit-code" exits 0 if healthy, 1 otherwise (for Docker HEALTHCHECK)
+        #[arg(long)]
+        format: Option<String>,
+    },
 
     /// Engage, inspect, and resume emergency-stop states.
     ///
@@ -984,7 +988,30 @@ async fn main() -> Result<()> {
             Box::pin(daemon::run(config, host, port)).await
         }
 
-        Commands::Status => {
+        Commands::Status { format } => {
+            if format.as_deref() == Some("exit-code") {
+                // Lightweight health probe for Docker HEALTHCHECK
+                let port = config.gateway.port;
+                let host = if config.gateway.host == "[::]" || config.gateway.host == "0.0.0.0" {
+                    "127.0.0.1"
+                } else {
+                    &config.gateway.host
+                };
+                let url = format!("http://{}:{}/health", host, port);
+                match reqwest::Client::new()
+                    .get(&url)
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        std::process::exit(0);
+                    }
+                    _ => {
+                        std::process::exit(1);
+                    }
+                }
+            }
             println!("🦀 ZeroClaw Status");
             println!();
             println!("Version:     {}", env!("CARGO_PKG_VERSION"));
