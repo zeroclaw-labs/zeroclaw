@@ -91,8 +91,11 @@ impl MastodonChannel {
     }
 
     /// Split a message into chunks that fit within the configured character limit.
+    ///
+    /// Mastodon counts **characters**, not bytes, so we use `chars().count()`
+    /// for length checks and `char_indices()` to find valid split positions.
     fn split_status(text: &str, limit: usize) -> Vec<String> {
-        if limit == 0 || text.len() <= limit {
+        if limit == 0 || text.chars().count() <= limit {
             return vec![text.to_string()];
         }
 
@@ -100,32 +103,22 @@ impl MastodonChannel {
         let mut remaining = text;
 
         while !remaining.is_empty() {
-            if remaining.len() <= limit {
+            if remaining.chars().count() <= limit {
                 chunks.push(remaining.to_string());
                 break;
             }
 
-            // Try to split at a whitespace boundary
-            let split_at = remaining[..limit]
-                .rfind(char::is_whitespace)
-                .unwrap_or(limit);
-            let split_at = if split_at == 0 { limit } else { split_at };
+            // Find the byte offset of the character at position `limit`
+            let byte_limit = remaining
+                .char_indices()
+                .nth(limit)
+                .map_or(remaining.len(), |(idx, _)| idx);
 
-            // Ensure we split at a valid char boundary
-            let split_at = {
-                let mut pos = split_at;
-                while pos > 0 && !remaining.is_char_boundary(pos) {
-                    pos -= 1;
-                }
-                if pos == 0 {
-                    // Advance forward
-                    pos = split_at;
-                    while pos < remaining.len() && !remaining.is_char_boundary(pos) {
-                        pos += 1;
-                    }
-                }
-                pos
-            };
+            // Try to split at a whitespace boundary within that range
+            let split_at = remaining[..byte_limit]
+                .rfind(char::is_whitespace)
+                .unwrap_or(byte_limit);
+            let split_at = if split_at == 0 { byte_limit } else { split_at };
 
             chunks.push(remaining[..split_at].to_string());
             remaining = remaining[split_at..].trim_start();
