@@ -45,12 +45,24 @@ spec:
                 fi
               done
               # Always sync skills from ConfigMap (overwrite to pick up updates).
+              # Shared skills ConfigMap (multiple skills in one ConfigMap).
               for f in /etc/zeroclaw-template/skills/*.md; do
                 [ -f "$f" ] || continue
                 skill_name=$(basename "$f" .md)
                 mkdir -p "/data/.zeroclaw/workspace/skills/$skill_name"
                 echo "Syncing skill $skill_name"
                 cp "$f" "/data/.zeroclaw/workspace/skills/$skill_name/SKILL.md"
+              done
+              # Standalone skill ConfigMaps (one skill per ConfigMap).
+              for d in /etc/zeroclaw-template/skills-*/; do
+                [ -d "$d" ] || continue
+                for f in "$d"*.md; do
+                  [ -f "$f" ] || continue
+                  skill_name=$(basename "$f" .md)
+                  mkdir -p "/data/.zeroclaw/workspace/skills/$skill_name"
+                  echo "Syncing standalone skill $skill_name"
+                  cp "$f" "/data/.zeroclaw/workspace/skills/$skill_name/SKILL.md"
+                done
               done
               # Seed Serena project config if missing.
               # This lets activate_project work without auto-detection
@@ -83,6 +95,9 @@ spec:
               readOnly: true
             - name: zeroclaw-skills
               mountPath: /etc/zeroclaw-template/skills
+              readOnly: true
+            - name: skill-meeting-summary
+              mountPath: /etc/zeroclaw-template/skills-meeting-summary
               readOnly: true
       containers:
         - name: zeroclaw
@@ -259,6 +274,9 @@ spec:
         - name: zeroclaw-skills
           configMap:
             name: zeroclaw-skills
+        - name: skill-meeting-summary
+          configMap:
+            name: zeroclaw-skill-meeting-summary
         - name: acp-client
           configMap:
             name: acp-client
