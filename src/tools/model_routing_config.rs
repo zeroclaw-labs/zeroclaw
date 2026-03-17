@@ -940,8 +940,8 @@ impl Tool for ModelRoutingConfigTool {
                 }
 
                 match action.as_str() {
-                    "set_default" => self.handle_set_default(&args).await,
-                    "upsert_scenario" => self.handle_upsert_scenario(&args).await,
+                    "set_default" => Box::pin(self.handle_set_default(&args)).await,
+                    "upsert_scenario" => Box::pin(self.handle_upsert_scenario(&args)).await,
                     "remove_scenario" => self.handle_remove_scenario(&args).await,
                     "upsert_agent" => Box::pin(self.handle_upsert_agent(&args)).await,
                     "remove_agent" => self.handle_remove_agent(&args).await,

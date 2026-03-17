@@ -412,7 +412,7 @@ impl Tool for ProxyConfigTool {
                 }
 
                 match action.as_str() {
-                    "set" => self.handle_set(&args).await,
+                    "set" => Box::pin(self.handle_set(&args)).await,
                     "disable" => self.handle_disable(&args).await,
                     "apply_env" => self.handle_apply_env(),
                     "clear_env" => self.handle_clear_env(),

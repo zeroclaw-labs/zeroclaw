@@ -1191,7 +1191,7 @@ async fn main() -> Result<()> {
         Commands::Channel { channel_command } => match channel_command {
             ChannelCommands::Start => Box::pin(channels::start_channels(config)).await,
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
-            other => channels::handle_command(other, &config).await,
+            other => Box::pin(channels::handle_command(other, &config)).await,
         },
 
         Commands::Integrations {
