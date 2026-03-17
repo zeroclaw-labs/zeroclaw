@@ -234,6 +234,26 @@ fn expand_user_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn rootless_path(path: &Path) -> Option<PathBuf> {
+    let mut relative = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => return None,
+            std::path::Component::Normal(part) => relative.push(part),
+        }
+    }
+
+    if relative.as_os_str().is_empty() {
+        None
+    } else {
+        Some(relative)
+    }
+}
+
 // ── Shell Command Parsing Utilities ───────────────────────────────────────
 // These helpers implement a minimal quote-aware shell lexer. They exist
 // because security validation must reason about the *structure* of a
@@ -1245,6 +1265,16 @@ impl SecurityPolicy {
         let expanded = expand_user_path(path);
         if expanded.is_absolute() {
             expanded
+        } else if let Some(workspace_hint) = rootless_path(&self.workspace_dir) {
+            if let Ok(stripped) = expanded.strip_prefix(&workspace_hint) {
+                if stripped.as_os_str().is_empty() {
+                    self.workspace_dir.clone()
+                } else {
+                    self.workspace_dir.join(stripped)
+                }
+            } else {
+                self.workspace_dir.join(expanded)
+            }
         } else {
             self.workspace_dir.join(expanded)
         }
@@ -2718,6 +2748,19 @@ mod tests {
         };
         let resolved = p.resolve_tool_path("relative/path.txt");
         assert_eq!(resolved, PathBuf::from("/workspace/relative/path.txt"));
+    }
+
+    #[test]
+    fn resolve_tool_path_normalizes_workspace_prefixed_relative_paths() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/zeroclaw-data/workspace"),
+            ..SecurityPolicy::default()
+        };
+        let resolved = p.resolve_tool_path("zeroclaw-data/workspace/scripts/daily.py");
+        assert_eq!(
+            resolved,
+            PathBuf::from("/zeroclaw-data/workspace/scripts/daily.py")
+        );
     }
 
     #[test]

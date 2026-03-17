@@ -495,6 +495,42 @@ mod tests {
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
     }
 
+    #[tokio::test]
+    async fn file_edit_normalizes_workspace_prefixed_relative_path() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_edit_workspace_prefixed");
+        let workspace = root.join("workspace");
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(workspace.join("nested"))
+            .await
+            .unwrap();
+        tokio::fs::write(workspace.join("nested/target.txt"), "hello world")
+            .await
+            .unwrap();
+
+        let tool = FileEditTool::new(test_security(workspace.clone()));
+        let workspace_prefixed = workspace
+            .strip_prefix(std::path::Path::new("/"))
+            .unwrap()
+            .join("nested/target.txt");
+        let result = tool
+            .execute(json!({
+                "path": workspace_prefixed.to_string_lossy(),
+                "old_string": "world",
+                "new_string": "zeroclaw"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let content = tokio::fs::read_to_string(workspace.join("nested/target.txt"))
+            .await
+            .unwrap();
+        assert_eq!(content, "hello zeroclaw");
+        assert!(!workspace.join(workspace_prefixed).exists());
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn file_edit_blocks_symlink_escape() {
