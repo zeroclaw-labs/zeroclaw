@@ -92,48 +92,58 @@ impl BackpressureController {
     /// Returns `Ok(())` if the request is admitted (and increments the queue depth),
     /// or `Err(LoadShed)` if the request should be dropped.
     pub fn admit(&self, priority: Priority) -> Result<(), LoadShed> {
-        let depth = self.current_depth.load(Ordering::Relaxed);
-
         // Critical requests are never shed.
         if priority == Priority::Critical {
-            self.current_depth.fetch_add(1, Ordering::Relaxed);
+            self.current_depth.fetch_add(1, Ordering::AcqRel);
             return Ok(());
         }
 
         // Guard: zero max_queue_depth means shed all non-critical requests immediately.
         if self.config.max_queue_depth == 0 {
             return Err(LoadShed {
-                queue_depth: depth,
+                queue_depth: self.current_depth.load(Ordering::Acquire),
                 priority,
             });
         }
 
-        // Hard cap: reject everything non-critical at max.
-        if depth >= self.config.max_queue_depth {
-            return Err(LoadShed {
-                queue_depth: depth,
-                priority,
-            });
+        // Use compare_exchange loop to atomically check-and-increment,
+        // avoiding the race where two threads both read below threshold
+        // and both increment.
+        loop {
+            let depth = self.current_depth.load(Ordering::Acquire);
+
+            // Hard cap: reject everything non-critical at max.
+            if depth >= self.config.max_queue_depth {
+                return Err(LoadShed {
+                    queue_depth: depth,
+                    priority,
+                });
+            }
+
+            let load_fraction = depth as f64 / self.config.max_queue_depth as f64;
+            let threshold = match priority {
+                Priority::Background => self.config.background_shed_threshold,
+                Priority::Low => self.config.low_shed_threshold,
+                Priority::Normal => self.config.normal_shed_threshold,
+                Priority::High => self.config.high_shed_threshold,
+                Priority::Critical => unreachable!(),
+            };
+
+            if load_fraction >= threshold {
+                return Err(LoadShed {
+                    queue_depth: depth,
+                    priority,
+                });
+            }
+
+            if self
+                .current_depth
+                .compare_exchange(depth, depth + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(());
+            }
         }
-
-        let load_fraction = depth as f64 / self.config.max_queue_depth as f64;
-        let threshold = match priority {
-            Priority::Background => self.config.background_shed_threshold,
-            Priority::Low => self.config.low_shed_threshold,
-            Priority::Normal => self.config.normal_shed_threshold,
-            Priority::High => self.config.high_shed_threshold,
-            Priority::Critical => unreachable!(),
-        };
-
-        if load_fraction >= threshold {
-            return Err(LoadShed {
-                queue_depth: depth,
-                priority,
-            });
-        }
-
-        self.current_depth.fetch_add(1, Ordering::Relaxed);
-        Ok(())
     }
 
     /// Signal that a previously admitted work item has completed.

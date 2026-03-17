@@ -732,10 +732,6 @@ pub struct ResilienceConfig {
     /// Maximum queue depth before non-critical work is shed. Default: 1000.
     #[serde(default = "default_resilience_max_queue_depth")]
     pub backpressure_max_queue_depth: u64,
-
-    /// Graceful shutdown timeout in seconds. Default: 30.
-    #[serde(default = "default_resilience_graceful_shutdown_timeout_secs")]
-    pub graceful_shutdown_timeout_secs: u64,
 }
 
 fn default_resilience_requests_per_minute() -> u32 {
@@ -756,10 +752,6 @@ fn default_resilience_half_open_max() -> u32 {
 fn default_resilience_max_queue_depth() -> u64 {
     1000
 }
-fn default_resilience_graceful_shutdown_timeout_secs() -> u64 {
-    30
-}
-
 impl Default for ResilienceConfig {
     fn default() -> Self {
         Self {
@@ -772,7 +764,6 @@ impl Default for ResilienceConfig {
             circuit_breaker_half_open_max_requests: default_resilience_half_open_max(),
             backpressure_enabled: false,
             backpressure_max_queue_depth: default_resilience_max_queue_depth(),
-            graceful_shutdown_timeout_secs: default_resilience_graceful_shutdown_timeout_secs(),
         }
     }
 }
@@ -6073,6 +6064,7 @@ impl Config {
     }
 }
 
+#[allow(clippy::unused_async)]
 async fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -6098,6 +6090,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    #[cfg(unix)]
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
