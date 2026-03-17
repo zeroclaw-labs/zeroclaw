@@ -7,8 +7,8 @@ data:
   daily-meeting-summary.md: |
     ---
     name: daily-meeting-summary
-    version: 2.2.0
-    description: Fetches and summarizes daily meeting recordings from Speakr (meetings.coffee-anon.com)
+    version: 2.3.0
+    description: Fetches and summarizes daily meeting recordings from Speakr (meetings.coffee-anon.com), extracts action items into Vikunja tasks
     always: true
     ---
 
@@ -17,7 +17,7 @@ data:
     Speakr (https://meetings.coffee-anon.com) is Dan's self-hosted meeting transcription app.
     It records audio, transcribes with WhisperX, diarizes speakers, and generates LLM summaries.
 
-    The cron job produces two assets each run:
+    The cron job produces two assets and creates tasks each run:
 
     1. **Summary Aggregation** (`meetings-YYYY-MM-DD.md`) — a reference file built by a single
        Python script with zero LLM involvement. Contains meeting metadata, Speakr's pre-generated
@@ -25,7 +25,10 @@ data:
 
     2. **Executive Summary** (`meetings-exec-YYYY-MM-DD.md`) — you read the aggregation and
        synthesize: action items for Dan, action items others owe Dan, and key decisions.
-       This is the only step that needs your cognition.
+
+    3. **Vikunja Tasks** — each concrete action item from the executive summary becomes a
+       task in Dan's inbox (project 1) with assignee, due date, and meeting context.
+       This closes the loop between meetings and task tracking.
 
     ## Environment Notes
 
@@ -228,6 +231,29 @@ data:
     so Dan knows what changed since the noon run.
 
     Keep it concise and actionable. Dan (Dan Jacobsen) is the primary reader.
+
+    STEP 2.5 — Create Vikunja tasks from action items.
+
+    For each action item you extracted in the executive summary (both "Action Items
+    for Dan" and "Action Items Others Owe Dan"), create a task in Dan's inbox
+    (project 1) using the vikunja CLI.
+
+    Mapping from summary to task:
+    - --title: the action in imperative form (short, actionable)
+    - --assignee: the person responsible (use vikunja username: dan, sam, or omit
+      if the person isn't a vikunja user)
+    - --due: the deadline if one was mentioned (YYYY-MM-DD format), omit otherwise
+    - --description: "From [meeting title]. [any extra context]"
+
+    Example:
+      vikunja task create 1 --title "Schedule Databricks planning meeting" --assignee dan --due "2026-03-18" --description "From Team Updates meeting. Define business context and prioritize first use cases."
+
+    Dedup rule: before creating tasks, run `vikunja tasks 1` to see what already
+    exists. If a task with the same or very similar title is already there (from
+    the noon run), skip it. This prevents duplicates between the noon and 5 PM runs.
+
+    Only create tasks for concrete actions — skip vague items like "think about X"
+    or "keep an eye on Y" that aren't trackable.
 
     STEP 3 — Store a memory.
 
