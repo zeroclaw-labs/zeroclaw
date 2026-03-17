@@ -3,6 +3,7 @@
 pub mod state;
 pub mod gateway_client;
 pub mod commands;
+pub mod tray;
 
 use state::AppState;
 
@@ -19,6 +20,10 @@ pub fn run() {
             commands::pairing::get_devices,
             commands::agent::send_message,
         ])
+        .setup(|app| {
+            let _ = tray::setup_tray(app);
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
