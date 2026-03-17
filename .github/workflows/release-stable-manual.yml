@@ -214,7 +214,7 @@ jobs:
           if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
           fi
-          cargo build --release --locked --target ${{ matrix.target }}
+          cargo build --release --locked --features channel-matrix --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -387,6 +387,8 @@ jobs:
         with:
           context: docker-ctx
           push: true
+          build-args: |
+            ZEROCLAW_CARGO_FEATURES=channel-matrix
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
