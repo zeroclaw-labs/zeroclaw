@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { t, type Locale } from "../lib/i18n";
 import type { ChatSession } from "../lib/storage";
+import { deriveChatTitle } from "../lib/storage";
 import type { DeviceInfo, ToolInfo, ChannelInfo } from "../lib/api";
 
 interface SidebarProps {
@@ -52,6 +53,46 @@ const CHANNEL_DISPLAY_NAMES: Record<string, string> = {
   webhook: "Webhook",
 };
 
+/** Format a timestamp to a short time string (HH:MM) */
+function formatTime(ts: number): string {
+  const d = new Date(ts);
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/** Format a date for the separator label */
+function formatDateLabel(ts: number, locale: Locale): string {
+  const d = new Date(ts);
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const chatDay = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const diffDays = Math.floor((today.getTime() - chatDay.getTime()) / 86400000);
+
+  if (diffDays === 0) return locale === "ko" ? "오늘" : "Today";
+  if (diffDays === 1) return locale === "ko" ? "어제" : "Yesterday";
+  if (diffDays < 7) {
+    return d.toLocaleDateString(locale === "ko" ? "ko-KR" : "en-US", { weekday: "long" });
+  }
+  return d.toLocaleDateString(locale === "ko" ? "ko-KR" : "en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+}
+
+/** Get a date key for grouping (YYYY-MM-DD) */
+function dateKey(ts: number): string {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/** Get effective display title for a chat */
+function getChatDisplayTitle(chat: ChatSession): string {
+  // If title was properly derived, use it
+  if (chat.title && chat.title !== "New Chat") return chat.title;
+  // Try to derive from first user message
+  return deriveChatTitle(chat.messages);
+}
+
 export function Sidebar({
   chats,
   activeChatId,
@@ -87,6 +128,11 @@ export function Sidebar({
   };
 
   const onlineDevices = devices.filter((d) => d.is_online);
+
+  // Sort chats by updatedAt descending and compute date groups
+  const sortedChats = useMemo(() => {
+    return [...chats].sort((a, b) => b.updatedAt - a.updatedAt);
+  }, [chats]);
 
   return (
     <>
@@ -312,28 +358,54 @@ export function Sidebar({
             </button>
             {expandedSections.chats && (
               <div className="sidebar-section-content sidebar-chats-list">
-                {chats.length === 0 ? (
+                {sortedChats.length === 0 ? (
                   <div className="sidebar-section-empty">{t("no_chats", locale)}</div>
                 ) : (
-                  chats.map((chat) => (
-                    <div
-                      key={chat.id}
-                      className={`sidebar-chat-item ${chat.id === activeChatId ? "active" : ""}`}
-                      onClick={() => onSelectChat(chat.id)}
-                    >
-                      <span className="sidebar-chat-title">{chat.title}</span>
-                      <button
-                        className="sidebar-chat-delete"
-                        onClick={(e) => handleDelete(e, chat.id)}
-                        title={t("delete_chat", locale)}
-                      >
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                          <polyline points="3 6 5 6 21 6" />
-                          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-                        </svg>
-                      </button>
-                    </div>
-                  ))
+                  sortedChats.map((chat, idx) => {
+                    const chatDate = dateKey(chat.updatedAt);
+                    const prevDate = idx > 0 ? dateKey(sortedChats[idx - 1].updatedAt) : null;
+                    const showDateSep = idx === 0 || chatDate !== prevDate;
+                    const displayTitle = getChatDisplayTitle(chat);
+                    const msgCount = chat.messages.length;
+
+                    return (
+                      <div key={chat.id}>
+                        {showDateSep && (
+                          <div className="sidebar-date-separator">
+                            <span>{formatDateLabel(chat.updatedAt, locale)}</span>
+                          </div>
+                        )}
+                        <div
+                          className={`sidebar-chat-item ${chat.id === activeChatId ? "active" : ""}`}
+                          onClick={() => onSelectChat(chat.id)}
+                        >
+                          <div className="sidebar-chat-info">
+                            <span className="sidebar-chat-title">{displayTitle}</span>
+                            <div className="sidebar-chat-meta">
+                              {msgCount > 0 && (
+                                <span className="sidebar-chat-count">
+                                  {msgCount} {locale === "ko" ? "메시지" : "msg"}
+                                </span>
+                              )}
+                              <span className="sidebar-chat-time">
+                                {formatTime(chat.updatedAt)}
+                              </span>
+                            </div>
+                          </div>
+                          <button
+                            className="sidebar-chat-delete"
+                            onClick={(e) => handleDelete(e, chat.id)}
+                            title={t("delete_chat", locale)}
+                          >
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <polyline points="3 6 5 6 21 6" />
+                              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                            </svg>
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })
                 )}
               </div>
             )}

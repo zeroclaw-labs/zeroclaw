@@ -380,18 +380,63 @@ html, body {
   background: var(--color-primary-bg-hover);
 }
 
-.sidebar-chat-title {
+.sidebar-chat-info {
   flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar-chat-title {
   font-size: 13px;
   color: var(--color-text-secondary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+  line-height: 1.3;
 }
 
 .sidebar-chat-item.active .sidebar-chat-title {
   color: var(--color-text-primary);
+}
+
+.sidebar-chat-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+  color: var(--color-text-muted);
+  line-height: 1;
+}
+
+.sidebar-chat-count {
+  opacity: 0.8;
+}
+
+.sidebar-chat-time {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Date separator between chat groups */
+.sidebar-date-separator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px 4px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.sidebar-date-separator::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--color-border);
 }
 
 .sidebar-chat-delete {

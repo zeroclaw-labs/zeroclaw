@@ -43,7 +43,23 @@ try {
 function App() {
   const [page, setPage] = useState<Page>("login");
   const [locale, setLocale] = useState<Locale>(getStoredLocale());
-  const [chats, setChats] = useState<ChatSession[]>(() => loadChats());
+  const [chats, setChats] = useState<ChatSession[]>(() => {
+    const loaded = loadChats();
+    // Fix stale titles: re-derive from first user message
+    let updated = false;
+    const fixed = loaded.map((c) => {
+      if (c.title === "New Chat" && c.messages.length > 0) {
+        const derived = deriveChatTitle(c.messages);
+        if (derived !== "New Chat") {
+          updated = true;
+          return { ...c, title: derived };
+        }
+      }
+      return c;
+    });
+    if (updated) saveChats(fixed);
+    return fixed;
+  });
   const [activeChatId, setActiveChatIdState] = useState<string | null>(() => getActiveChatId());
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 768);
   const [isConnected, setIsConnected] = useState(false);
