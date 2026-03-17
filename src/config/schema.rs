@@ -1437,6 +1437,7 @@ impl Default for PeripheralBoardConfig {
 ///
 /// Controls the HTTP gateway for webhook and pairing endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct GatewayConfig {
     /// Gateway port (default: 42617)
     #[serde(default = "default_gateway_port")]
@@ -1478,6 +1479,14 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
+
+    /// Persist gateway WebSocket chat sessions to SQLite. Default: true.
+    #[serde(default = "default_true")]
+    pub session_persistence: bool,
+
+    /// Auto-archive stale gateway sessions older than N hours. 0 = disabled. Default: 0.
+    #[serde(default)]
+    pub session_ttl_hours: u32,
 }
 
 fn default_gateway_port() -> u16 {
@@ -1530,6 +1539,8 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+            session_persistence: true,
+            session_ttl_hours: 0,
         }
     }
 }
@@ -9388,10 +9399,14 @@ channel_id = "C123"
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
+            session_persistence: true,
+            session_ttl_hours: 0,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
         assert!(parsed.require_pairing);
+        assert!(parsed.session_persistence);
+        assert_eq!(parsed.session_ttl_hours, 0);
         assert!(!parsed.allow_public_bind);
         assert_eq!(parsed.paired_tokens, vec!["zc_test_token"]);
         assert_eq!(parsed.pair_rate_limit_per_minute, 12);

@@ -14,7 +14,8 @@ pub mod static_files;
 pub mod ws;
 
 use crate::channels::{
-    Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel, WhatsAppChannel,
+    session_backend::SessionBackend, session_sqlite::SqliteSessionBackend, Channel, LinqChannel,
+    NextcloudTalkChannel, SendMessage, WatiChannel, WhatsAppChannel,
 };
 use crate::config::Config;
 use crate::cost::CostTracker;
@@ -331,6 +332,8 @@ pub struct AppState {
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// Registry of dynamically connected nodes
     pub node_registry: Arc<nodes::NodeRegistry>,
+    /// Session backend for persisting gateway WS chat sessions
+    pub session_backend: Option<Arc<dyn SessionBackend>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -554,6 +557,29 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             })
             .map(Arc::from);
 
+    // ── Session persistence for WS chat ─────────────────────
+    let session_backend: Option<Arc<dyn SessionBackend>> = if config.gateway.session_persistence {
+        match SqliteSessionBackend::new(&config.workspace_dir) {
+            Ok(b) => {
+                tracing::info!("Gateway session persistence enabled (SQLite)");
+                if config.gateway.session_ttl_hours > 0 {
+                    if let Ok(cleaned) = b.cleanup_stale(config.gateway.session_ttl_hours) {
+                        if cleaned > 0 {
+                            tracing::info!("Cleaned up {cleaned} stale gateway sessions");
+                        }
+                    }
+                }
+                Some(Arc::new(b))
+            }
+            Err(e) => {
+                tracing::warn!("Session persistence disabled: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
@@ -681,6 +707,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         event_tx,
         shutdown_tx,
         node_registry,
+        session_backend,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -728,6 +755,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
+        .route("/api/sessions", get(api::handle_api_sessions_list))
+        .route("/api/sessions/{id}", delete(api::handle_api_session_delete))
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
         // ── WebSocket agent chat ──
@@ -1830,6 +1859,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            session_backend: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1882,6 +1912,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            session_backend: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2258,6 +2289,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            session_backend: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2324,6 +2356,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            session_backend: None,
         };
 
         let headers = HeaderMap::new();
@@ -2402,6 +2435,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            session_backend: None,
         };
 
         let response = handle_webhook(
@@ -2452,6 +2486,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            session_backend: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2507,6 +2542,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            session_backend: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2567,6 +2603,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            session_backend: None,
         };
 
         let response = Box::pin(handle_nextcloud_talk_webhook(
@@ -2623,6 +2660,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            session_backend: None,
         };
 
         let mut headers = HeaderMap::new();

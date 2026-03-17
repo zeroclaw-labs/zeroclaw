@@ -76,6 +76,11 @@ pub trait SessionBackend: Send + Sync {
     fn search(&self, _query: &SessionQuery) -> Vec<SessionMetadata> {
         Vec::new()
     }
+
+    /// Delete all messages for a session. Returns `true` if the session existed.
+    fn delete_session(&self, _session_key: &str) -> std::io::Result<bool> {
+        Ok(false)
+    }
 }
 
 #[cfg(test)]
