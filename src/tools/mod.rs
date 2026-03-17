@@ -37,6 +37,7 @@ pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
 pub mod glob_search;
+pub mod google_workspace;
 #[cfg(feature = "hardware")]
 pub mod hardware_board_info;
 #[cfg(feature = "hardware")]
@@ -45,6 +46,9 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod knowledge_tool;
+pub mod linkedin;
+pub mod linkedin_client;
 pub mod mcp_client;
 pub mod mcp_deferred;
 pub mod mcp_protocol;
@@ -96,6 +100,7 @@ pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
+pub use google_workspace::GoogleWorkspaceTool;
 #[cfg(feature = "hardware")]
 pub use hardware_board_info::HardwareBoardInfoTool;
 #[cfg(feature = "hardware")]
@@ -104,6 +109,8 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+pub use knowledge_tool::KnowledgeTool;
+pub use linkedin::LinkedInTool;
 pub use mcp_client::McpRegistry;
 pub use mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
 pub use mcp_tool::McpToolWrapper;
@@ -433,12 +440,40 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(CloudPatternsTool::new()));
     }
 
+    // Google Workspace CLI (gws) integration — requires shell access
+    if root_config.google_workspace.enabled && has_shell_access {
+        tool_arcs.push(Arc::new(GoogleWorkspaceTool::new(
+            security.clone(),
+            root_config.google_workspace.allowed_services.clone(),
+            root_config.google_workspace.credentials_path.clone(),
+            root_config.google_workspace.default_account.clone(),
+            root_config.google_workspace.rate_limit_per_minute,
+            root_config.google_workspace.timeout_secs,
+            root_config.google_workspace.audit_log,
+        )));
+    } else if root_config.google_workspace.enabled {
+        tracing::warn!(
+            "google_workspace: skipped registration because shell access is unavailable"
+        );
+    }
+
     // PDF extraction (feature-gated at compile time via rag-pdf)
     tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
 
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
+
+    // LinkedIn integration (config-gated)
+    if root_config.linkedin.enabled {
+        tool_arcs.push(Arc::new(LinkedInTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+            root_config.linkedin.api_version.clone(),
+            root_config.linkedin.content.clone(),
+            root_config.linkedin.image.clone(),
+        )));
+    }
 
     if let Some(key) = composio_key {
         if !key.is_empty() {
@@ -502,6 +537,28 @@ pub fn all_tools_with_runtime(
             tracing::warn!(
                 "microsoft365: skipped registration because tenant_id or client_id is empty"
             );
+        }
+    }
+
+    // Knowledge graph tool
+    if root_config.knowledge.enabled {
+        let db_path_str = root_config.knowledge.db_path.replace(
+            '~',
+            &directories::UserDirs::new()
+                .map(|u| u.home_dir().to_string_lossy().to_string())
+                .unwrap_or_else(|| ".".to_string()),
+        );
+        let db_path = std::path::PathBuf::from(&db_path_str);
+        match crate::memory::knowledge_graph::KnowledgeGraph::new(
+            &db_path,
+            root_config.knowledge.max_nodes,
+        ) {
+            Ok(graph) => {
+                tool_arcs.push(Arc::new(KnowledgeTool::new(Arc::new(graph))));
+            }
+            Err(e) => {
+                tracing::warn!("knowledge graph disabled due to init error: {e}");
+            }
         }
     }
 

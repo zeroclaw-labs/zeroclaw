@@ -19,9 +19,12 @@
 pub mod anthropic;
 pub mod azure_openai;
 pub mod bedrock;
+pub mod claude_code;
 pub mod compatible;
 pub mod copilot;
 pub mod gemini;
+pub mod gemini_cli;
+pub mod kilocli;
 pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
@@ -815,6 +818,26 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
                 if let Some(credential) = resolve_minimax_oauth_refresh_token(name) {
                     return Some(credential);
                 }
+            } else if name == "anthropic" || name == "openai" || name == "groq" {
+                // For well-known providers, prefer provider-specific env vars over the
+                // global api_key override, since the global key may belong to a different
+                // provider (e.g. a custom: gateway). This enables multi-provider setups
+                // where the primary uses a custom gateway and fallbacks use named providers.
+                let env_candidates: &[&str] = match name {
+                    "anthropic" => &["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+                    "openai" => &["OPENAI_API_KEY"],
+                    "groq" => &["GROQ_API_KEY"],
+                    _ => &[],
+                };
+                for env_var in env_candidates {
+                    if let Ok(val) = std::env::var(env_var) {
+                        let trimmed = val.trim().to_string();
+                        if !trimmed.is_empty() {
+                            return Some(trimmed);
+                        }
+                    }
+                }
+                return Some(trimmed_override.to_owned());
             } else {
                 return Some(trimmed_override.to_owned());
             }
@@ -1251,6 +1274,9 @@ fn create_provider_with_url_and_options(
             "Cohere", "https://api.cohere.com/compatibility", key, AuthStyle::Bearer,
         ))),
         "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
+        "claude-code" => Ok(Box::new(claude_code::ClaudeCodeProvider::new())),
+        "gemini-cli" => Ok(Box::new(gemini_cli::GeminiCliProvider::new())),
+        "kilocli" | "kilo" => Ok(Box::new(kilocli::KiloCliProvider::new())),
         "lmstudio" | "lm-studio" => {
             let lm_studio_key = key
                 .map(str::trim)
@@ -1901,6 +1927,24 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             display_name: "GitHub Copilot",
             aliases: &["github-copilot"],
             local: false,
+        },
+        ProviderInfo {
+            name: "claude-code",
+            display_name: "Claude Code (CLI)",
+            aliases: &[],
+            local: true,
+        },
+        ProviderInfo {
+            name: "gemini-cli",
+            display_name: "Gemini CLI",
+            aliases: &[],
+            local: true,
+        },
+        ProviderInfo {
+            name: "kilocli",
+            display_name: "KiloCLI",
+            aliases: &["kilo"],
+            local: true,
         },
         ProviderInfo {
             name: "lmstudio",
@@ -2721,6 +2765,22 @@ mod tests {
     }
 
     #[test]
+    fn factory_claude_code() {
+        assert!(create_provider("claude-code", None).is_ok());
+    }
+
+    #[test]
+    fn factory_gemini_cli() {
+        assert!(create_provider("gemini-cli", None).is_ok());
+    }
+
+    #[test]
+    fn factory_kilocli() {
+        assert!(create_provider("kilocli", None).is_ok());
+        assert!(create_provider("kilo", None).is_ok());
+    }
+
+    #[test]
     fn factory_nvidia() {
         assert!(create_provider("nvidia", Some("nvapi-test")).is_ok());
         assert!(create_provider("nvidia-nim", Some("nvapi-test")).is_ok());
@@ -3053,6 +3113,9 @@ mod tests {
             "perplexity",
             "cohere",
             "copilot",
+            "claude-code",
+            "gemini-cli",
+            "kilocli",
             "nvidia",
             "astrai",
             "ovhcloud",

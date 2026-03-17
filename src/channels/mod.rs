@@ -14,6 +14,7 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
+pub mod bluesky;
 pub mod clawdtalk;
 pub mod cli;
 pub mod dingtalk;
@@ -33,6 +34,7 @@ pub mod nextcloud_talk;
 pub mod nostr;
 pub mod notion;
 pub mod qq;
+pub mod reddit;
 pub mod session_backend;
 pub mod session_sqlite;
 pub mod session_store;
@@ -44,6 +46,7 @@ pub mod transcription;
 pub mod tts;
 pub mod twitter;
 pub mod wati;
+pub mod webhook;
 pub mod wecom;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
@@ -51,6 +54,7 @@ pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
+pub use bluesky::BlueskyChannel;
 pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
@@ -70,6 +74,7 @@ pub use nextcloud_talk::NextcloudTalkChannel;
 pub use nostr::NostrChannel;
 pub use notion::NotionChannel;
 pub use qq::QQChannel;
+pub use reddit::RedditChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
@@ -78,6 +83,7 @@ pub use traits::{Channel, SendMessage};
 pub use tts::{TtsManager, TtsProvider};
 pub use twitter::TwitterChannel;
 pub use wati::WatiChannel;
+pub use webhook::WebhookChannel;
 pub use wecom::WeComChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
@@ -329,6 +335,7 @@ struct ChannelRuntimeContext {
     /// `[autonomy]` config; auto-denies tools that would need interactive
     /// approval since no operator is present on channel runs.
     approval_manager: Arc<ApprovalManager>,
+    activated_tools: Option<std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
 }
 
 #[derive(Clone)]
@@ -1492,7 +1499,68 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
         .collect();
-    strip_isolated_tool_json_artifacts(response, &known_tool_names)
+    // Strip XML-style tool-call tags (e.g. <tool_call>...</tool_call>)
+    let stripped_xml = strip_tool_call_tags(response);
+    // Strip isolated tool-call JSON artifacts
+    let stripped_json = strip_isolated_tool_json_artifacts(&stripped_xml, &known_tool_names);
+    // Strip leading narration lines that announce tool usage
+    strip_tool_narration(&stripped_json)
+}
+
+/// Remove leading lines that narrate tool usage (e.g. "Let me check the weather for you.").
+///
+/// Only strips lines from the very beginning of the message that match common
+/// narration patterns, so genuine content is preserved.
+fn strip_tool_narration(message: &str) -> String {
+    let narration_prefixes: &[&str] = &[
+        "let me ",
+        "i'll ",
+        "i will ",
+        "i am going to ",
+        "i'm going to ",
+        "searching ",
+        "looking up ",
+        "fetching ",
+        "checking ",
+        "using the ",
+        "using my ",
+        "one moment",
+        "hold on",
+        "just a moment",
+        "give me a moment",
+        "allow me to ",
+    ];
+
+    let mut result_lines: Vec<&str> = Vec::new();
+    let mut past_narration = false;
+
+    for line in message.lines() {
+        if past_narration {
+            result_lines.push(line);
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_lowercase();
+        if narration_prefixes.iter().any(|p| lower.starts_with(p)) {
+            // Skip this narration line
+            continue;
+        }
+        // First non-narration, non-empty line — keep everything from here
+        past_narration = true;
+        result_lines.push(line);
+    }
+
+    let joined = result_lines.join("\n");
+    let trimmed = joined.trim();
+    if trimmed.is_empty() && !message.trim().is_empty() {
+        // If stripping removed everything, return original to avoid empty reply
+        message.to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn is_tool_call_payload(value: &serde_json::Value, known_tool_names: &HashSet<String>) -> bool {
@@ -2140,6 +2208,7 @@ async fn process_channel_message(
                     ctx.non_cli_excluded_tools.as_ref()
                 },
                 ctx.tool_call_dedup_exempt.as_ref(),
+                ctx.activated_tools.as_ref(),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -2689,6 +2758,17 @@ pub fn build_system_prompt_with_mode(
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
 
+    // ── 0. Anti-narration (top priority) ───────────────────────
+    prompt.push_str(
+        "## CRITICAL: No Tool Narration\n\n\
+         NEVER narrate, announce, describe, or explain your tool usage to the user. \
+         Do NOT say things like 'Let me check...', 'I will use http_request to...', \
+         'I'll fetch that for you', 'Searching now...', or 'Using the web_search tool'. \
+         The user must ONLY see the final answer. Tool calls are invisible infrastructure — \
+         never reference them. If you catch yourself starting a sentence about what tool \
+         you are about to use or just used, DELETE it and give the answer directly.\n\n",
+    );
+
     // ── 1. Tooling ──────────────────────────────────────────────
     if !tools.is_empty() {
         prompt.push_str("## Tools\n\n");
@@ -2828,7 +2908,9 @@ pub fn build_system_prompt_with_mode(
     prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
     prompt.push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
     prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
-    prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n\n");
+    prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
+    prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
+    prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n\n");
 
     if prompt.is_empty() {
         "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct."
@@ -3085,7 +3167,7 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
             anyhow::bail!("Remove channel '{name}' — edit ~/.zeroclaw/config.toml directly");
         }
         crate::ChannelCommands::BindTelegram { identity } => {
-            bind_telegram_identity(config, &identity).await
+            Box::pin(bind_telegram_identity(config, &identity)).await
         }
         crate::ChannelCommands::Send {
             message,
@@ -3236,6 +3318,7 @@ fn collect_configured_channels(
                     Vec::new(),
                     sl.allowed_users.clone(),
                 )
+                .with_group_reply_policy(sl.mention_only, Vec::new())
                 .with_workspace_dir(config.workspace_dir.clone()),
             ),
         });
@@ -3337,7 +3420,8 @@ fn collect_configured_channels(
                                 wa.pair_code.clone(),
                                 wa.allowed_numbers.clone(),
                             )
-                            .with_transcription(config.transcription.clone()),
+                            .with_transcription(config.transcription.clone())
+                            .with_tts(config.tts.clone()),
                         ),
                     });
                 } else {
@@ -3543,6 +3627,43 @@ fn collect_configured_channels(
         }
     }
 
+    if let Some(ref rd) = config.channels_config.reddit {
+        channels.push(ConfiguredChannel {
+            display_name: "Reddit",
+            channel: Arc::new(RedditChannel::new(
+                rd.client_id.clone(),
+                rd.client_secret.clone(),
+                rd.refresh_token.clone(),
+                rd.username.clone(),
+                rd.subreddit.clone(),
+            )),
+        });
+    }
+
+    if let Some(ref bs) = config.channels_config.bluesky {
+        channels.push(ConfiguredChannel {
+            display_name: "Bluesky",
+            channel: Arc::new(BlueskyChannel::new(
+                bs.handle.clone(),
+                bs.app_password.clone(),
+            )),
+        });
+    }
+
+    if let Some(ref wh) = config.channels_config.webhook {
+        channels.push(ConfiguredChannel {
+            display_name: "Webhook",
+            channel: Arc::new(WebhookChannel::new(
+                wh.port,
+                wh.listen_path.clone(),
+                wh.send_url.clone(),
+                wh.send_method.clone(),
+                wh.auth_header.clone(),
+                wh.secret.clone(),
+            )),
+        });
+    }
+
     channels
 }
 
@@ -3699,6 +3820,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // When `deferred_loading` is enabled, MCP tools are NOT added eagerly.
     // Instead, a `tool_search` built-in is registered for on-demand loading.
     let mut deferred_section = String::new();
+    let mut ch_activated_handle: Option<
+        std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
+    > = None;
     if config.mcp.enabled && !config.mcp.servers.is_empty() {
         tracing::info!(
             "Initializing MCP client — {} server(s) configured",
@@ -3722,6 +3846,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                     let activated = std::sync::Arc::new(std::sync::Mutex::new(
                         crate::tools::ActivatedToolSet::new(),
                     ));
+                    ch_activated_handle = Some(std::sync::Arc::clone(&activated));
                     built_tools.push(Box::new(crate::tools::ToolSearchTool::new(
                         deferred_set,
                         activated,
@@ -4016,6 +4141,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             None
         },
         approval_manager: Arc::new(ApprovalManager::for_non_interactive(&config.autonomy)),
+        activated_tools: ch_activated_handle,
     });
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.
@@ -4308,6 +4434,7 @@ mod tests {
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -4416,6 +4543,7 @@ mod tests {
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -4480,6 +4608,7 @@ mod tests {
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4563,6 +4692,7 @@ mod tests {
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         };
 
         assert!(rollback_orphan_user_turn(
@@ -5096,6 +5226,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -5168,6 +5299,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -5254,6 +5386,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -5325,6 +5458,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -5406,6 +5540,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -5507,6 +5642,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -5590,6 +5726,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -5688,6 +5825,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -5771,6 +5909,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -5844,6 +5983,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -6028,6 +6168,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -6120,6 +6261,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -6226,6 +6368,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
             query_classification: crate::config::QueryClassificationConfig::default(),
         });
 
@@ -6331,6 +6474,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -6417,6 +6561,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -6488,6 +6633,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -7117,6 +7263,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -7214,6 +7361,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -7311,6 +7459,7 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -7872,6 +8021,7 @@ This is an example JSON object for profile settings."#;
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -7950,6 +8100,7 @@ This is an example JSON object for profile settings."#;
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -8102,6 +8253,7 @@ This is an example JSON object for profile settings."#;
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -8204,6 +8356,7 @@ This is an example JSON object for profile settings."#;
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -8298,6 +8451,7 @@ This is an example JSON object for profile settings."#;
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(
@@ -8412,6 +8566,7 @@ This is an example JSON object for profile settings."#;
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            activated_tools: None,
         });
 
         process_channel_message(

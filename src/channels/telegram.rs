@@ -751,7 +751,7 @@ impl TelegramChannel {
 
                         if let Some(identity) = bind_identity {
                             self.add_allowed_identity_runtime(&identity);
-                            match self.persist_allowed_identity(&identity).await {
+                            match Box::pin(self.persist_allowed_identity(&identity)).await {
                                 Ok(()) => {
                                     let _ = self
                                         .send(&SendMessage::new(
@@ -2685,7 +2685,7 @@ Ensure only one `zeroclaw` process is using this bot token."
                     } else if let Some(m) = self.try_parse_attachment_message(update).await {
                         m
                     } else {
-                        self.handle_unauthorized_message(update).await;
+                        Box::pin(self.handle_unauthorized_message(update)).await;
                         continue;
                     };
 

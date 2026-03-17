@@ -2152,6 +2152,7 @@ pub(crate) async fn agent_turn(
         None,
         &[],
         &[],
+        None,
     )
     .await
 }
@@ -2160,6 +2161,7 @@ async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
     tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<ToolExecutionOutcome> {
@@ -2170,7 +2172,13 @@ async fn execute_one_tool(
     });
     let start = Instant::now();
 
-    let Some(tool) = find_tool(tools_registry, call_name) else {
+    let static_tool = find_tool(tools_registry, call_name);
+    let activated_arc = if static_tool.is_none() {
+        activated_tools.and_then(|at| at.lock().unwrap().get(call_name))
+    } else {
+        None
+    };
+    let Some(tool) = static_tool.or(activated_arc.as_deref()) else {
         let reason = format!("Unknown tool: {call_name}");
         let duration = start.elapsed();
         observer.record_event(&ObserverEvent::ToolCall {
@@ -2268,6 +2276,7 @@ fn should_execute_tools_in_parallel(
 async fn execute_tools_parallel(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
@@ -2278,6 +2287,7 @@ async fn execute_tools_parallel(
                 &call.name,
                 call.arguments.clone(),
                 tools_registry,
+                activated_tools,
                 observer,
                 cancellation_token,
             )
@@ -2291,6 +2301,7 @@ async fn execute_tools_parallel(
 async fn execute_tools_sequential(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
@@ -2302,6 +2313,7 @@ async fn execute_tools_sequential(
                 &call.name,
                 call.arguments.clone(),
                 tools_registry,
+                activated_tools,
                 observer,
                 cancellation_token,
             )
@@ -2345,6 +2357,7 @@ pub(crate) async fn run_tool_call_loop(
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2352,12 +2365,6 @@ pub(crate) async fn run_tool_call_loop(
         max_tool_iterations
     };
 
-    let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
-        .iter()
-        .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
-        .map(|tool| tool.spec())
-        .collect();
-    let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
@@ -2368,6 +2375,21 @@ pub(crate) async fn run_tool_call_loop(
         {
             return Err(ToolLoopCancelled.into());
         }
+
+        // Rebuild tool_specs each iteration so newly activated deferred tools appear.
+        let mut tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
+            .iter()
+            .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
+            .map(|tool| tool.spec())
+            .collect();
+        if let Some(at) = activated_tools {
+            for spec in at.lock().unwrap().tool_specs() {
+                if !excluded_tools.iter().any(|ex| ex == &spec.name) {
+                    tool_specs.push(spec);
+                }
+            }
+        }
+        let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
         let image_marker_count = multimodal::count_image_markers(history);
         if image_marker_count > 0 && !provider.supports_vision() {
@@ -2847,6 +2869,7 @@ pub(crate) async fn run_tool_call_loop(
             execute_tools_parallel(
                 &executable_calls,
                 tools_registry,
+                activated_tools,
                 observer,
                 cancellation_token.as_ref(),
             )
@@ -2855,6 +2878,7 @@ pub(crate) async fn run_tool_call_loop(
             execute_tools_sequential(
                 &executable_calls,
                 tools_registry,
+                activated_tools,
                 observer,
                 cancellation_token.as_ref(),
             )
@@ -3106,6 +3130,9 @@ pub async fn run(
     // eagerly. Instead, a `tool_search` built-in is registered so the LLM can
     // fetch schemas on demand. This reduces context window waste.
     let mut deferred_section = String::new();
+    let mut activated_handle: Option<
+        std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
+    > = None;
     if config.mcp.enabled && !config.mcp.servers.is_empty() {
         tracing::info!(
             "Initializing MCP client — {} server(s) configured",
@@ -3130,6 +3157,7 @@ pub async fn run(
                     let activated = std::sync::Arc::new(std::sync::Mutex::new(
                         crate::tools::ActivatedToolSet::new(),
                     ));
+                    activated_handle = Some(std::sync::Arc::clone(&activated));
                     tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
                         deferred_set,
                         activated,
@@ -3442,6 +3470,7 @@ pub async fn run(
             None,
             &excluded_tools,
             &config.agent.tool_call_dedup_exempt,
+            activated_handle.as_ref(),
         )
         .await?;
         final_output = response.clone();
@@ -3603,6 +3632,7 @@ pub async fn run(
                 None,
                 &excluded_tools,
                 &config.agent.tool_call_dedup_exempt,
+                activated_handle.as_ref(),
             )
             .await
             {
@@ -3982,7 +4012,8 @@ mod tests {
             .expect("should produce a sample whose byte index 300 is not a char boundary");
 
         let observer = NoopObserver;
-        let result = execute_one_tool("unknown_tool", call_arguments, &[], &observer, None).await;
+        let result =
+            execute_one_tool("unknown_tool", call_arguments, &[], None, &observer, None).await;
         assert!(result.is_ok(), "execute_one_tool should not panic or error");
 
         let outcome = result.unwrap();
@@ -4319,6 +4350,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -4366,6 +4398,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -4407,6 +4440,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -4534,6 +4568,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -4604,6 +4639,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4666,6 +4702,7 @@ mod tests {
             None,
             &[],
             &exempt,
+            None,
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -4743,6 +4780,7 @@ mod tests {
             None,
             &[],
             &exempt,
+            None,
         )
         .await
         .expect("loop should complete");
@@ -4797,6 +4835,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -6698,6 +6737,7 @@ Let me check the result."#;
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect("tool loop should complete");

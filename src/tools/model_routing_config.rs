@@ -940,11 +940,11 @@ impl Tool for ModelRoutingConfigTool {
                 }
 
                 match action.as_str() {
-                    "set_default" => self.handle_set_default(&args).await,
-                    "upsert_scenario" => self.handle_upsert_scenario(&args).await,
-                    "remove_scenario" => self.handle_remove_scenario(&args).await,
-                    "upsert_agent" => self.handle_upsert_agent(&args).await,
-                    "remove_agent" => self.handle_remove_agent(&args).await,
+                    "set_default" => Box::pin(self.handle_set_default(&args)).await,
+                    "upsert_scenario" => Box::pin(self.handle_upsert_scenario(&args)).await,
+                    "remove_scenario" => Box::pin(self.handle_remove_scenario(&args)).await,
+                    "upsert_agent" => Box::pin(self.handle_upsert_agent(&args)).await,
+                    "remove_agent" => Box::pin(self.handle_remove_agent(&args)).await,
                     _ => unreachable!("validated above"),
                 }
             }
@@ -999,7 +999,7 @@ mod tests {
     #[tokio::test]
     async fn set_default_updates_provider_model_and_temperature() {
         let tmp = TempDir::new().unwrap();
-        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let result = tool
             .execute(json!({
@@ -1030,7 +1030,7 @@ mod tests {
     #[tokio::test]
     async fn upsert_scenario_creates_route_and_rule() {
         let tmp = TempDir::new().unwrap();
-        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let result = tool
             .execute(json!({
@@ -1065,7 +1065,7 @@ mod tests {
     #[tokio::test]
     async fn remove_scenario_also_removes_rule() {
         let tmp = TempDir::new().unwrap();
-        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let _ = tool
             .execute(json!({
@@ -1097,7 +1097,7 @@ mod tests {
     #[tokio::test]
     async fn upsert_and_remove_delegate_agent() {
         let tmp = TempDir::new().unwrap();
-        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let upsert = tool
             .execute(json!({
@@ -1136,7 +1136,8 @@ mod tests {
     #[tokio::test]
     async fn read_only_mode_blocks_mutating_actions() {
         let tmp = TempDir::new().unwrap();
-        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, readonly_security());
+        let tool =
+            ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, readonly_security());
 
         let result = tool
             .execute(json!({
@@ -1156,7 +1157,7 @@ mod tests {
         // skipped and any model string is accepted. This verifies the probe-
         // skip path doesn't accidentally reject valid config changes.
         let tmp = TempDir::new().unwrap();
-        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let result = tool
             .execute(json!({
@@ -1180,7 +1181,7 @@ mod tests {
         // Temperature-only changes don't set a new model, so the probe should
         // not fire at all (no provider/model to probe).
         let tmp = TempDir::new().unwrap();
-        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let result = tool
             .execute(json!({

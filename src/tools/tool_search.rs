@@ -107,7 +107,7 @@ impl Tool for ToolSearchTool {
             if let Some(spec) = self.deferred.tool_spec(&stub.prefixed_name) {
                 if !guard.is_activated(&stub.prefixed_name) {
                     if let Some(tool) = self.deferred.activate(&stub.prefixed_name) {
-                        guard.activate(stub.prefixed_name.clone(), tool);
+                        guard.activate(stub.prefixed_name.clone(), Arc::from(tool));
                         activated_count += 1;
                     }
                 }
@@ -152,7 +152,7 @@ impl ToolSearchTool {
                 Some(spec) => {
                     if !guard.is_activated(name) {
                         if let Some(tool) = self.deferred.activate(name) {
-                            guard.activate(name.to_string(), tool);
+                            guard.activate(name.to_string(), Arc::from(tool));
                             activated_count += 1;
                         }
                     }

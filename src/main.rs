@@ -810,13 +810,13 @@ async fn main() -> Result<()> {
         } else if is_tty && !has_provider_flags {
             Box::pin(onboard::run_wizard(force)).await
         } else {
-            onboard::run_quick_setup(
+            Box::pin(onboard::run_quick_setup(
                 api_key.as_deref(),
                 provider.as_deref(),
                 model.as_deref(),
                 memory.as_deref(),
                 force,
-            )
+            ))
             .await
         }?;
 
@@ -854,7 +854,7 @@ async fn main() -> Result<()> {
     }
 
     // All other commands need config loaded first
-    let mut config = Config::load_or_init().await?;
+    let mut config = Box::pin(Config::load_or_init()).await?;
     config.apply_env_overrides();
     observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir);
     if config.security.otp.enabled {
@@ -935,7 +935,7 @@ async fn main() -> Result<()> {
                     }
 
                     log_gateway_start(&host, port);
-                    gateway::run_gateway(&host, port, config).await
+                    Box::pin(gateway::run_gateway(&host, port, config)).await
                 }
                 Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
                     let port = config.gateway.port;
@@ -984,13 +984,13 @@ async fn main() -> Result<()> {
                 Some(zeroclaw::GatewayCommands::Start { port, host }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     log_gateway_start(&host, port);
-                    gateway::run_gateway(&host, port, config).await
+                    Box::pin(gateway::run_gateway(&host, port, config)).await
                 }
                 None => {
                     let port = config.gateway.port;
                     let host = config.gateway.host.clone();
                     log_gateway_start(&host, port);
-                    gateway::run_gateway(&host, port, config).await
+                    Box::pin(gateway::run_gateway(&host, port, config)).await
                 }
             }
         }
@@ -1003,7 +1003,7 @@ async fn main() -> Result<()> {
             } else {
                 info!("🧠 Starting ZeroClaw Daemon on {host}:{port}");
             }
-            daemon::run(config, host, port).await
+            Box::pin(daemon::run(config, host, port)).await
         }
 
         Commands::Status => {
@@ -1127,7 +1127,9 @@ async fn main() -> Result<()> {
             ModelCommands::List { provider } => {
                 onboard::run_models_list(&config, provider.as_deref()).await
             }
-            ModelCommands::Set { model } => onboard::run_models_set(&config, &model).await,
+            ModelCommands::Set { model } => {
+                Box::pin(onboard::run_models_set(&config, &model)).await
+            }
             ModelCommands::Status => onboard::run_models_status(&config).await,
         },
 
@@ -1195,7 +1197,7 @@ async fn main() -> Result<()> {
         Commands::Channel { channel_command } => match channel_command {
             ChannelCommands::Start => Box::pin(channels::start_channels(config)).await,
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
-            other => channels::handle_command(other, &config).await,
+            other => Box::pin(channels::handle_command(other, &config)).await,
         },
 
         Commands::Integrations {
@@ -1219,7 +1221,11 @@ async fn main() -> Result<()> {
         }
 
         Commands::Peripheral { peripheral_command } => {
-            peripherals::handle_command(peripheral_command.clone(), &config).await
+            Box::pin(peripherals::handle_command(
+                peripheral_command.clone(),
+                &config,
+            ))
+            .await
         }
 
         Commands::Config { config_command } => match config_command {
