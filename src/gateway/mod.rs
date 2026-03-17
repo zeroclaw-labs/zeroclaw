@@ -764,32 +764,30 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 /// Prometheus content type for text exposition format.
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-fn prometheus_disabled_hint() -> String {
-    String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
-}
-
 /// GET /metrics — Prometheus text exposition format
+///
+/// Serves the lightweight `MetricsRegistry` counters/gauges unconditionally,
+/// plus the full Prometheus observer output when the feature is compiled in.
 async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let body = {
-        #[cfg(feature = "observability-prometheus")]
+    let mut body = crate::observability::metrics::global().export_prometheus();
+
+    // Append full Prometheus observer output when available.
+    #[cfg(feature = "observability-prometheus")]
+    {
+        if let Some(prom) = state
+            .observer
+            .as_ref()
+            .as_any()
+            .downcast_ref::<crate::observability::PrometheusObserver>()
         {
-            if let Some(prom) = state
-                .observer
-                .as_ref()
-                .as_any()
-                .downcast_ref::<crate::observability::PrometheusObserver>()
-            {
-                prom.encode()
-            } else {
-                prometheus_disabled_hint()
-            }
+            body.push('\n');
+            body.push_str(&prom.encode());
         }
-        #[cfg(not(feature = "observability-prometheus"))]
-        {
-            let _ = &state;
-            prometheus_disabled_hint()
-        }
-    };
+    }
+    #[cfg(not(feature = "observability-prometheus"))]
+    {
+        let _ = &state;
+    }
 
     (
         StatusCode::OK,

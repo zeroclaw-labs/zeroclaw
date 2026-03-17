@@ -66,17 +66,7 @@ impl MetricsRegistry {
             );
         }
 
-        let gauges = [
-            (
-                "request_duration_ms",
-                "Last observed request duration in milliseconds",
-            ),
-            (
-                "provider_latency_ms",
-                "Last observed provider latency in milliseconds",
-            ),
-            ("active_conversations", "Number of active conversations"),
-        ];
+        let gauges = [("active_conversations", "Number of active conversations")];
         for (name, help) in gauges {
             metrics.insert(
                 name,
@@ -269,8 +259,6 @@ mod tests {
             "tool_calls_total",
             "tool_errors_total",
             "provider_requests_total",
-            "request_duration_ms",
-            "provider_latency_ms",
             "active_conversations",
         ];
         for name in expected {

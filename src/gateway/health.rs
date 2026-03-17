@@ -14,12 +14,16 @@ use std::collections::BTreeMap;
 
 use super::AppState;
 
-/// Minimal liveness response — intentionally excludes internal details
-/// (uptime, version, component checks) to avoid information disclosure
-/// to unauthenticated callers.
+/// Liveness response including pairing state and runtime snapshot.
+///
+/// Preserves backward compatibility with existing consumers that expect
+/// `paired`, `require_pairing`, and `runtime` fields alongside `status`.
 #[derive(Debug, Serialize)]
 pub struct LivenessResponse {
     pub status: &'static str,
+    pub paired: bool,
+    pub require_pairing: bool,
+    pub runtime: serde_json::Value,
 }
 
 /// Structured readiness response with component checks.
@@ -39,11 +43,19 @@ pub struct CheckResult {
 
 /// `GET /health` — liveness probe.
 ///
-/// Returns 200 with `{"status": "healthy"}` if the process is alive.
-/// Intentionally minimal to avoid exposing internal details (uptime,
-/// config, version) to unauthenticated callers.
-pub async fn handle_liveness(State(_state): State<AppState>) -> impl IntoResponse {
-    (StatusCode::OK, Json(LivenessResponse { status: "healthy" }))
+/// Returns 200 with `{"status": "ok"}` plus pairing state and runtime
+/// health snapshot. No secrets are leaked — only boolean flags and the
+/// component health registry.
+pub async fn handle_liveness(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(LivenessResponse {
+            status: "ok",
+            paired: state.pairing.is_paired(),
+            require_pairing: state.pairing.require_pairing(),
+            runtime: crate::health::snapshot_json(),
+        }),
+    )
 }
 
 /// `GET /ready` — readiness probe.
@@ -124,14 +136,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn liveness_response_is_minimal() {
-        let resp = LivenessResponse { status: "healthy" };
+    fn liveness_response_includes_required_fields() {
+        let resp = LivenessResponse {
+            status: "ok",
+            paired: true,
+            require_pairing: false,
+            runtime: serde_json::json!({"components": {}}),
+        };
         let json = serde_json::to_value(&resp).expect("should serialize");
-        assert_eq!(json["status"], "healthy");
-        // Must not contain internal details
-        assert!(json.get("uptime_secs").is_none());
-        assert!(json.get("checks").is_none());
-        assert!(json.get("version").is_none());
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["paired"], true);
+        assert_eq!(json["require_pairing"], false);
+        assert!(json.get("runtime").is_some());
     }
 
     #[test]
