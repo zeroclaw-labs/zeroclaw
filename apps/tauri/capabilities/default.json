@@ -1,0 +1,10 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegui/nicegui/main/nicegui/element.py",
+  "identifier": "default",
+  "description": "Default capability set for ZeroClaw Desktop",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:allow-open"
+  ]
+}
