@@ -174,7 +174,15 @@ type TranslationKey =
   | "lock_unlock"
   | "lock_unlocking"
   | "lock_failed"
-  | "lock_logout";
+  | "lock_logout"
+  // Workspace
+  | "connect_folder"
+  | "connect_github"
+  | "connect_folder_hint"
+  | "connect_github_hint"
+  | "connect_github_placeholder"
+  | "workspace_connected"
+  | "repo_cloning";
 
 const translations: Record<Locale, Record<TranslationKey, string>> = {
   en: {
@@ -338,6 +346,13 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     lock_unlocking: "Unlocking...",
     lock_failed: "Incorrect password. Please try again.",
     lock_logout: "Switch Account",
+    connect_folder: "Connect Folder",
+    connect_github: "Connect GitHub",
+    connect_folder_hint: "Connect a local folder as workspace",
+    connect_github_hint: "Clone a GitHub repo as workspace",
+    connect_github_placeholder: "https://github.com/user/repo",
+    workspace_connected: "Workspace connected",
+    repo_cloning: "Cloning repository...",
   },
   ko: {
     app_title: "MoA",
@@ -500,6 +515,13 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     lock_unlocking: "\ud655\uc778 \uc911...",
     lock_failed: "\ube44\ubc00\ubc88\ud638\uac00 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4.",
     lock_logout: "\uacc4\uc815 \uc804\ud658",
+    connect_folder: "\ud3f4\ub354 \uc5f0\uacb0",
+    connect_github: "GitHub \uc5f0\uacb0",
+    connect_folder_hint: "\ub85c\uceec \ud3f4\ub354\ub97c \uc791\uc5c5 \ud3f4\ub354\ub85c \uc5f0\uacb0",
+    connect_github_hint: "GitHub \uc800\uc7a5\uc18c\ub97c \ud074\ub860\ud558\uc5ec \uc791\uc5c5 \ud3f4\ub354\ub85c \uc124\uc815",
+    connect_github_placeholder: "https://github.com/user/repo",
+    workspace_connected: "\uc791\uc5c5 \ud3f4\ub354\uac00 \uc5f0\uacb0\ub418\uc5c8\uc2b5\ub2c8\ub2e4",
+    repo_cloning: "\uc800\uc7a5\uc18c \ud074\ub860 \uc911...",
   },
 };
 

@@ -903,6 +903,47 @@ export class MoAClient {
     }
   }
 
+  // ── Workspace Management ──────────────────────────────────────
+
+  /** Set the workspace directory on the local gateway via shell tool. */
+  async setWorkspaceDir(dirPath: string): Promise<void> {
+    await this.requireGateway();
+    const res = await fetch(`${this.serverUrl}/api/chat`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({
+        message: `[system] The user has connected a workspace folder: ${dirPath}. Remember this as the active project directory. When performing file operations, use this directory as the base path.`,
+        context: { workspace_dir: dirPath },
+      }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: "Failed to set workspace" }));
+      throw new Error(data.error || `Failed to set workspace (${res.status})`);
+    }
+  }
+
+  /** Clone a GitHub repo and set it as workspace. */
+  async connectGitHubRepo(repoUrl: string): Promise<void> {
+    await this.requireGateway();
+    const res = await fetch(`${this.serverUrl}/api/chat`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({
+        message: `Please clone the GitHub repository at ${repoUrl} into my workspace and set it as the active project. Use git_operations to clone it.`,
+      }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: "Failed to connect repo" }));
+      throw new Error(data.error || `Failed to connect repo (${res.status})`);
+    }
+  }
+
   // ── Operator Key Fallback (via relay server) ────────────────
   // When user has no API key, fetch operator's key from relay for use
   // with 2x credit deduction per API call
