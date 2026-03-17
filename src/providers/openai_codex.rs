@@ -613,7 +613,51 @@ impl OpenAiCodexProvider {
             return Err(super::api_error("OpenAI Codex", response).await);
         }
 
-        decode_responses_body(response).await
+        // Try to decode streaming response first
+        match decode_responses_body(response).await {
+            Ok(text) => Ok(text),
+            // If streaming fails, retry with non-streaming request
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "OpenAI Codex streaming failed, retrying with non-streaming request"
+                );
+                let mut non_streaming_request = request.clone();
+                non_streaming_request.stream = false;
+                
+                let non_streaming_response = self
+                    .client
+                    .post(&self.responses_url)
+                    .header("Authorization", format!("Bearer {bearer_token}"))
+                    .header("OpenAI-Beta", "responses=experimental")
+                    .header("originator", "pi")
+                    .header("Content-Type", "application/json");
+                
+                let non_streaming_response = if let Some(account_id) = account_id.as_deref() {
+                    non_streaming_response.header("chatgpt-account-id", account_id)
+                } else {
+                    non_streaming_response
+                };
+                
+                let non_streaming_response = if use_gateway_api_key_auth {
+                    if let Some(access_token) = access_token.as_deref() {
+                        non_streaming_response.header("x-openai-access-token", access_token)
+                    } else {
+                        non_streaming_response
+                    }
+                } else {
+                    non_streaming_response
+                };
+                
+                let response = non_streaming_response.json(&non_streaming_request).send().await?;
+                
+                if !response.status().is_success() {
+                    return Err(super::api_error("OpenAI Codex", response).await);
+                }
+                
+                decode_responses_body(response).await
+            }
+        }
     }
 }
 
