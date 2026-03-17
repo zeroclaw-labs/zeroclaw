@@ -606,7 +606,13 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Browser",
             description: "Chrome/Chromium control",
             category: IntegrationCategory::ToolsAutomation,
-            status_fn: |_| IntegrationStatus::Available,
+            status_fn: |c| {
+                if c.browser.enabled {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         IntegrationEntry {
             name: "Shell",
@@ -624,7 +630,13 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Cron",
             description: "Scheduled tasks",
             category: IntegrationCategory::ToolsAutomation,
-            status_fn: |_| IntegrationStatus::Available,
+            status_fn: |c| {
+                if c.cron.enabled {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         IntegrationEntry {
             name: "Voice",
@@ -913,6 +925,54 @@ mod tests {
         let email = entries.iter().find(|e| e.name == "Email").unwrap();
         assert!(matches!(
             (email.status_fn)(&config),
+            IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
+    fn cron_active_when_enabled() {
+        let mut config = Config::default();
+        config.cron.enabled = true;
+        let entries = all_integrations();
+        let cron = entries.iter().find(|e| e.name == "Cron").unwrap();
+        assert!(matches!(
+            (cron.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+    }
+
+    #[test]
+    fn cron_available_when_disabled() {
+        let mut config = Config::default();
+        config.cron.enabled = false;
+        let entries = all_integrations();
+        let cron = entries.iter().find(|e| e.name == "Cron").unwrap();
+        assert!(matches!(
+            (cron.status_fn)(&config),
+            IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
+    fn browser_active_when_enabled() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        let entries = all_integrations();
+        let browser = entries.iter().find(|e| e.name == "Browser").unwrap();
+        assert!(matches!(
+            (browser.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+    }
+
+    #[test]
+    fn browser_available_when_disabled() {
+        let mut config = Config::default();
+        config.browser.enabled = false;
+        let entries = all_integrations();
+        let browser = entries.iter().find(|e| e.name == "Browser").unwrap();
+        assert!(matches!(
+            (browser.status_fn)(&config),
             IntegrationStatus::Available
         ));
     }
