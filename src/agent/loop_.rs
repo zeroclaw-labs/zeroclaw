@@ -2174,7 +2174,7 @@ async fn execute_one_tool(
 
     let static_tool = find_tool(tools_registry, call_name);
     let activated_arc = if static_tool.is_none() {
-        activated_tools.and_then(|at| at.lock().unwrap().get(call_name))
+        activated_tools.and_then(|at| at.lock().unwrap().get_resolved(call_name))
     } else {
         None
     };
@@ -4021,6 +4021,36 @@ mod tests {
         let outcome = result.unwrap();
         assert!(!outcome.success);
         assert!(outcome.output.contains("Unknown tool: unknown_tool"));
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_resolves_unique_activated_tool_suffix() {
+        let observer = NoopObserver;
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let activated = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+        let activated_tool: Arc<dyn Tool> = Arc::new(CountingTool::new(
+            "docker-mcp__extract_text",
+            Arc::clone(&invocations),
+        ));
+        activated
+            .lock()
+            .unwrap()
+            .activate("docker-mcp__extract_text".into(), activated_tool);
+
+        let outcome = execute_one_tool(
+            "extract_text",
+            serde_json::json!({ "value": "ok" }),
+            &[],
+            Some(&activated),
+            &observer,
+            None,
+        )
+        .await
+        .expect("suffix alias should execute the unique activated tool");
+
+        assert!(outcome.success);
+        assert_eq!(outcome.output, "counted:ok");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
 
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
