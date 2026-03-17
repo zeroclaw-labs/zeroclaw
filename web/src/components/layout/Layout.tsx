@@ -7,11 +7,9 @@ export default function Layout() {
   const { pathname } = useLocation();
 
   return (
-    <div className="min-h-screen text-white" style={{ background: 'linear-gradient(135deg, #050510 0%, #080818 50%, #050510 100%)' }}>
-      {/* Fixed sidebar */}
+    <div className="min-h-screen page-background">
       <Sidebar />
 
-      {/* Main area offset by sidebar width (240px / w-60) */}
       <div className="ml-60 flex flex-col min-h-screen">
         <Header />
 

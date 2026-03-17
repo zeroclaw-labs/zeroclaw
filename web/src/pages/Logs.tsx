@@ -14,24 +14,24 @@ function formatTimestamp(ts?: string): string {
   return new Date(ts).toLocaleTimeString();
 }
 
-function eventTypeBadgeColor(type: string): { classes: string; bg: string } {
+function eventTypeBadgeColor(type: string): { color: string; bg: string; border: string } {
   switch (type.toLowerCase()) {
     case 'error':
-      return { classes: 'text-[#ff4466] border-[#ff446630]', bg: 'rgba(255,68,102,0.06)' };
+      return { color: 'var(--color-status-error)', bg: 'var(--color-status-error)', border: 'var(--color-status-error)' };
     case 'warn':
     case 'warning':
-      return { classes: 'text-[#ffaa00] border-[#ffaa0030]', bg: 'rgba(255,170,0,0.06)' };
+      return { color: 'var(--color-status-warning)', bg: 'var(--color-status-warning)', border: 'var(--color-status-warning)' };
     case 'tool_call':
     case 'tool_result':
-      return { classes: 'text-[#a855f7] border-[#a855f730]', bg: 'rgba(168,85,247,0.06)' };
+      return { color: '#a855f7', bg: '#a855f7', border: '#a855f7' };
     case 'message':
     case 'chat':
-      return { classes: 'text-[#0080ff] border-[#0080ff30]', bg: 'rgba(0,128,255,0.06)' };
+      return { color: 'var(--color-accent-blue)', bg: 'var(--color-accent-blue)', border: 'var(--color-accent-blue)' };
     case 'health':
     case 'status':
-      return { classes: 'text-[#00e68a] border-[#00e68a30]', bg: 'rgba(0,230,138,0.06)' };
+      return { color: 'var(--color-status-success)', bg: 'var(--color-status-success)', border: 'var(--color-status-success)' };
     default:
-      return { classes: 'text-[#556080] border-[#1a1a3e]', bg: 'rgba(26,26,62,0.3)' };
+      return { color: 'var(--color-text-muted)', bg: 'var(--color-text-muted)', border: 'var(--color-border-default)' };
   }
 }
 
@@ -52,7 +52,6 @@ export default function Logs() {
   const pausedRef = useRef(false);
   const entryIdRef = useRef(0);
 
-  // Keep pausedRef in sync
   useEffect(() => {
     pausedRef.current = paused;
   }, [paused]);
@@ -89,14 +88,12 @@ export default function Logs() {
     };
   }, []);
 
-  // Auto-scroll to bottom
   useEffect(() => {
     if (autoScroll && containerRef.current) {
       containerRef.current.scrollTop = containerRef.current.scrollHeight;
     }
   }, [entries, autoScroll]);
 
-  // Detect user scroll to toggle auto-scroll
   const handleScroll = useCallback(() => {
     if (!containerRef.current) return;
     const { scrollTop, scrollHeight, clientHeight } = containerRef.current;
@@ -132,39 +129,33 @@ export default function Logs() {
 
   return (
     <div className="flex flex-col h-[calc(100vh-3.5rem)]">
-      {/* Toolbar */}
-      <div className="flex items-center justify-between px-6 py-3 border-b border-[#1a1a3e]/40 animate-fade-in" style={{ background: 'linear-gradient(90deg, rgba(8,8,24,0.9), rgba(5,5,16,0.9))' }}>
+      <div className="flex items-center justify-between px-6 py-3 border-b animate-fade-in" style={{ borderColor: 'var(--color-border-default)', backgroundColor: 'var(--color-bg-header)' }}>
         <div className="flex items-center gap-3">
-          <Activity className="h-5 w-5 text-[#0080ff]" />
-          <h2 className="text-sm font-semibold text-white uppercase tracking-wider">Live Logs</h2>
+          <Activity className="h-5 w-5" style={{ color: 'var(--color-accent-blue)' }} />
+          <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-primary)' }}>Live Logs</h2>
           <div className="flex items-center gap-2 ml-2">
             <span
-              className={`inline-block h-1.5 w-1.5 rounded-full glow-dot ${
-                connected ? 'text-[#00e68a] bg-[#00e68a]' : 'text-[#ff4466] bg-[#ff4466]'
-              }`}
+              className="inline-block h-1.5 w-1.5 rounded-full"
+              style={{ backgroundColor: connected ? 'var(--color-status-success)' : 'var(--color-status-error)' }}
             />
-            <span className="text-[10px] text-[#334060]">
+            <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
               {connected ? 'Connected' : 'Disconnected'}
             </span>
           </div>
-          <span className="text-[10px] text-[#334060] ml-2 font-mono">
+          <span className="text-xs ml-2 font-mono" style={{ color: 'var(--color-text-muted)' }}>
             {filteredEntries.length} events
           </span>
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Pause/Resume */}
           <button
             onClick={() => setPaused(!paused)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-all duration-300 ${
-              paused
-                ? 'text-white shadow-[0_0_15px_rgba(0,230,138,0.2)]'
-                : 'text-white shadow-[0_0_15px_rgba(255,170,0,0.2)]'
-            }`}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-all duration-300"
             style={{
               background: paused
-                ? 'linear-gradient(135deg, #00e68a, #00cc7a)'
-                : 'linear-gradient(135deg, #ffaa00, #ee9900)'
+                ? 'linear-gradient(135deg, var(--color-status-success), var(--color-status-success-hover, #00cc7a))'
+                : 'linear-gradient(135deg, var(--color-status-warning), #ee9900)',
+              color: 'white'
             }}
           >
             {paused ? (
@@ -178,7 +169,6 @@ export default function Logs() {
             )}
           </button>
 
-          {/* Jump to Bottom */}
           {!autoScroll && (
             <button
               onClick={jumpToBottom}
@@ -191,11 +181,10 @@ export default function Logs() {
         </div>
       </div>
 
-      {/* Event type filters */}
       {allTypes.length > 0 && (
-        <div className="flex items-center gap-2 px-6 py-2 border-b border-[#1a1a3e]/30 overflow-x-auto" style={{ background: 'rgba(5,5,16,0.6)' }}>
-          <Filter className="h-3.5 w-3.5 text-[#334060] flex-shrink-0" />
-          <span className="text-[10px] text-[#334060] flex-shrink-0 uppercase tracking-wider">Filter:</span>
+        <div className="flex items-center gap-2 px-6 py-2 border-b overflow-x-auto" style={{ borderColor: 'var(--color-border-subtle)', backgroundColor: 'var(--color-bg-primary)', opacity: 0.6 }}>
+          <Filter className="h-3.5 w-3.5 flex-shrink-0" style={{ color: 'var(--color-text-muted)' }} />
+          <span className="text-xs flex-shrink-0 uppercase tracking-wider" style={{ color: 'var(--color-text-muted)' }}>Filter:</span>
           {allTypes.map((type) => (
             <label
               key={type}
@@ -205,15 +194,21 @@ export default function Logs() {
                 type="checkbox"
                 checked={typeFilters.has(type)}
                 onChange={() => toggleTypeFilter(type)}
-                className="rounded bg-[#0a0a18] border-[#1a1a3e] text-[#0080ff] focus:ring-[#0080ff] focus:ring-offset-0 h-3 w-3"
+                className="rounded h-3 w-3"
+                style={{ 
+                  backgroundColor: 'var(--color-bg-input)', 
+                  borderColor: 'var(--color-border-default)', 
+                  accentColor: 'var(--color-accent-blue)' 
+                }}
               />
-              <span className="text-[10px] text-[#556080] capitalize">{type}</span>
+              <span className="text-xs capitalize" style={{ color: 'var(--color-text-muted)' }}>{type}</span>
             </label>
           ))}
           {typeFilters.size > 0 && (
             <button
               onClick={() => setTypeFilters(new Set())}
-              className="text-[10px] text-[#0080ff] hover:text-[#00d4ff] flex-shrink-0 ml-1 transition-colors"
+              className="text-xs flex-shrink-0 ml-1 transition-colors"
+              style={{ color: 'var(--color-accent-blue)' }}
             >
               Clear
             </button>
@@ -221,15 +216,14 @@ export default function Logs() {
         </div>
       )}
 
-      {/* Log entries */}
       <div
         ref={containerRef}
         onScroll={handleScroll}
         className="flex-1 overflow-y-auto p-4 space-y-1.5"
       >
         {filteredEntries.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full text-[#334060] animate-fade-in">
-            <Activity className="h-10 w-10 text-[#1a1a3e] mb-3" />
+          <div className="flex flex-col items-center justify-center h-full animate-fade-in" style={{ color: 'var(--color-text-muted)' }}>
+            <Activity className="h-10 w-10 mb-3" style={{ color: 'var(--color-border-default)' }} />
             <p className="text-sm">
               {paused
                 ? 'Log streaming is paused.'
@@ -255,19 +249,24 @@ export default function Logs() {
             return (
               <div
                 key={entry.id}
-                className="glass-card rounded-lg p-3 hover:border-[#0080ff20] transition-all duration-200"
+                className="glass-card rounded-lg p-3 hover:border-[var(--color-accent-blue)] transition-all duration-200"
               >
                 <div className="flex items-start gap-3">
-                  <span className="text-[10px] text-[#334060] font-mono whitespace-nowrap mt-0.5">
+                  <span className="text-xs font-mono whitespace-nowrap mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
                     {formatTimestamp(event.timestamp)}
                   </span>
                   <span
-                    className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold border capitalize flex-shrink-0 ${badge.classes}`}
-                    style={{ background: badge.bg }}
+                    className="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold border capitalize flex-shrink-0"
+                    style={{ 
+                      color: badge.color, 
+                      backgroundColor: badge.bg, 
+                      opacity: 0.15,
+                      borderColor: badge.border
+                    }}
                   >
                     {event.type}
                   </span>
-                  <p className="text-sm text-[#8892a8] break-all min-w-0">
+                  <p className="text-sm break-all min-w-0" style={{ color: 'var(--color-text-secondary)' }}>
                     {typeof detail === 'string' ? detail : JSON.stringify(detail)}
                   </p>
                 </div>

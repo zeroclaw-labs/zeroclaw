@@ -16,6 +16,20 @@ import { AuthProvider, useAuth } from './hooks/useAuth';
 import { DraftContext, useDraftStore } from './hooks/useDraft';
 import { setLocale, type Locale } from './lib/i18n';
 
+export type Theme = 'light' | 'dark';
+
+interface ThemeContextType {
+  theme: Theme;
+  toggleTheme: () => void;
+}
+
+export const ThemeContext = createContext<ThemeContextType>({
+  theme: 'light',
+  toggleTheme: () => {},
+});
+
+export const useTheme = () => useContext(ThemeContext);
+
 // Locale context
 interface LocaleContextType {
   locale: string;
@@ -103,23 +117,21 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center" style={{ background: 'radial-gradient(ellipse at center, #0a0a20 0%, #050510 70%)' }}>
-      {/* Ambient glow */}
-      <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[500px] h-[500px] rounded-full opacity-20 pointer-events-none" style={{ background: 'radial-gradient(circle, #0080ff 0%, transparent 70%)' }} />
+    <div className="min-h-screen flex items-center justify-center page-background">
+      <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[500px] h-[500px] rounded-full opacity-20 pointer-events-none" style={{ background: 'radial-gradient(circle, var(--color-accent-blue) 0%, transparent 70%)' }} />
 
       <div className="relative glass-card p-8 w-full max-w-md animate-fade-in-scale">
-        {/* Top glow accent */}
-        <div className="absolute -top-px left-1/4 right-1/4 h-px" style={{ background: 'linear-gradient(90deg, transparent, #0080ff, transparent)' }} />
+        <div className="absolute -top-px left-1/4 right-1/4 h-px" style={{ background: 'linear-gradient(90deg, transparent, var(--color-accent-blue), transparent)' }} />
 
         <div className="text-center mb-8">
           <img
             src="/_app/logo.png"
             alt="ZeroClaw"
             className="h-20 w-20 rounded-2xl object-cover mx-auto mb-4 animate-float"
-            style={{ boxShadow: '0 0 30px rgba(0,128,255,0.3)' }}
+            style={{ boxShadow: '0 0 30px var(--color-glow-blue)' }}
           />
           <h1 className="text-2xl font-bold text-gradient-blue mb-2">ZeroClaw</h1>
-          <p className="text-[#556080] text-sm">Enter the pairing code from your terminal</p>
+          <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>Enter the pairing code from your terminal</p>
         </div>
         <form onSubmit={handleSubmit}>
           <input
@@ -132,7 +144,7 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
             autoFocus
           />
           {error && (
-            <p className="text-[#ff4466] text-sm mb-4 text-center animate-fade-in" aria-live="polite">{error}</p>
+            <p className="text-sm mb-4 text-center animate-fade-in" style={{ color: 'var(--color-status-error)' }}>{error}</p>
           )}
           <button
             type="submit"
@@ -155,12 +167,35 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 function AppContent() {
   const { isAuthenticated, requiresPairing, loading, pair, logout } = useAuth();
   const [locale, setLocaleState] = useState('tr');
+  const [theme, setTheme] = useState<Theme>('light');
   const draftStore = useDraftStore();
 
   const setAppLocale = (newLocale: string) => {
     setLocaleState(newLocale);
     setLocale(newLocale as Locale);
   };
+
+  const toggleTheme = () => {
+    const newTheme = theme === 'light' ? 'dark' : 'light';
+    setTheme(newTheme);
+    document.documentElement.setAttribute('data-theme', newTheme);
+    localStorage.setItem('theme', newTheme);
+  };
+
+  // Load theme from localStorage on mount
+  useEffect(() => {
+    const savedTheme = localStorage.getItem('theme') as Theme | null;
+    if (savedTheme) {
+      setTheme(savedTheme);
+      document.documentElement.setAttribute('data-theme', savedTheme);
+    } else {
+      // Check system preference
+      const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+      const defaultTheme = prefersDark ? 'dark' : 'light';
+      setTheme(defaultTheme);
+      document.documentElement.setAttribute('data-theme', defaultTheme);
+    }
+  }, []);
 
   // Listen for 401 events to force logout
   useEffect(() => {
@@ -173,10 +208,10 @@ function AppContent() {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center" style={{ background: 'radial-gradient(ellipse at center, #0a0a20 0%, #050510 70%)' }}>
+      <div className="min-h-screen flex items-center justify-center page-background">
         <div className="flex flex-col items-center gap-4 animate-fade-in">
-          <div className="h-10 w-10 border-2 border-[#0080ff30] border-t-[#0080ff] rounded-full animate-spin" />
-          <p className="text-[#556080] text-sm">Connecting...</p>
+          <div className="h-10 w-10 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--color-glow-blue)', borderTopColor: 'var(--color-accent-blue)' }} />
+          <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>Connecting...</p>
         </div>
       </div>
     );
@@ -187,25 +222,27 @@ function AppContent() {
   }
 
   return (
-    <DraftContext.Provider value={draftStore}>
-      <LocaleContext.Provider value={{ locale, setAppLocale }}>
-        <Routes>
-          <Route element={<Layout />}>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/agent" element={<AgentChat />} />
-            <Route path="/tools" element={<Tools />} />
-            <Route path="/cron" element={<Cron />} />
-            <Route path="/integrations" element={<Integrations />} />
-            <Route path="/memory" element={<Memory />} />
-            <Route path="/config" element={<Config />} />
-            <Route path="/cost" element={<Cost />} />
-            <Route path="/logs" element={<Logs />} />
-            <Route path="/doctor" element={<Doctor />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Route>
-        </Routes>
-      </LocaleContext.Provider>
-    </DraftContext.Provider>
+    <ThemeContext.Provider value={{ theme, toggleTheme }}>
+      <DraftContext.Provider value={draftStore}>
+        <LocaleContext.Provider value={{ locale, setAppLocale }}>
+          <Routes>
+            <Route element={<Layout />}>
+              <Route path="/" element={<Dashboard />} />
+              <Route path="/agent" element={<AgentChat />} />
+              <Route path="/tools" element={<Tools />} />
+              <Route path="/cron" element={<Cron />} />
+              <Route path="/integrations" element={<Integrations />} />
+              <Route path="/memory" element={<Memory />} />
+              <Route path="/config" element={<Config />} />
+              <Route path="/cost" element={<Cost />} />
+              <Route path="/logs" element={<Logs />} />
+              <Route path="/doctor" element={<Doctor />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Route>
+          </Routes>
+        </LocaleContext.Provider>
+      </DraftContext.Provider>
+    </ThemeContext.Provider>
   );
 }
 

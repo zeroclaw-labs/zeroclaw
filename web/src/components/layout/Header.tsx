@@ -1,8 +1,9 @@
 import { useLocation } from 'react-router-dom';
-import { LogOut } from 'lucide-react';
+import { LogOut, Sun, Moon } from 'lucide-react';
 import { t } from '@/lib/i18n';
 import { useLocaleContext } from '@/App';
 import { useAuth } from '@/hooks/useAuth';
+import { useTheme } from '@/App';
 
 const routeTitles: Record<string, string> = {
   '/': 'nav.dashboard',
@@ -21,6 +22,7 @@ export default function Header() {
   const location = useLocation();
   const { logout } = useAuth();
   const { locale, setAppLocale } = useLocaleContext();
+  const { theme, toggleTheme } = useTheme();
 
   const titleKey = routeTitles[location.pathname] ?? 'nav.dashboard';
   const pageTitle = t(titleKey);
@@ -30,26 +32,37 @@ export default function Header() {
   };
 
   return (
-    <header className="h-14 flex items-center justify-between px-6 border-b border-[#1a1a3e]/40 animate-fade-in" style={{ background: 'linear-gradient(90deg, rgba(8,8,24,0.9), rgba(5,5,16,0.9))', backdropFilter: 'blur(12px)' }}>
-      {/* Page title */}
-      <h1 className="text-lg font-semibold text-white tracking-tight">{pageTitle}</h1>
+    <header className="h-14 flex items-center justify-between px-6 header animate-fade-in">
+      <h1 className="text-lg font-semibold tracking-tight">{pageTitle}</h1>
 
-      {/* Right-side controls */}
       <div className="flex items-center gap-3">
-        {/* Language switcher */}
+        <button
+          type="button"
+          onClick={toggleTheme}
+          className="theme-toggle"
+          title={theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}
+        >
+          {theme === 'light' ? <Moon className="h-4 w-4" /> : <Sun className="h-4 w-4" />}
+        </button>
+
         <button
           type="button"
           onClick={toggleLanguage}
-          className="px-3 py-1 rounded-lg text-xs font-semibold border border-[#1a1a3e] text-[#8892a8] hover:text-white hover:border-[#0080ff40] hover:bg-[#0080ff10] transition-all duration-300"
+          className="px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all duration-300"
+          style={{ 
+            borderColor: 'var(--color-border-default)', 
+            color: 'var(--color-text-secondary)',
+            backgroundColor: 'var(--color-bg-secondary)'
+          }}
         >
           {locale === 'en' ? 'EN' : 'TR'}
         </button>
 
-        {/* Logout */}
         <button
           type="button"
           onClick={logout}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-[#8892a8] hover:text-[#ff4466] hover:bg-[#ff446610] transition-all duration-300"
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-all duration-300"
+          style={{ color: 'var(--color-text-secondary)' }}
         >
           <LogOut className="h-3.5 w-3.5" />
           <span>{t('auth.logout')}</span>

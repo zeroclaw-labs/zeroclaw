@@ -1,12 +1,7 @@
-import { useState, useEffect } from 'react';
-import {
-  DollarSign,
-  TrendingUp,
-  Hash,
-  Layers,
-} from 'lucide-react';
-import type { CostSummary } from '@/types/api';
-import { getCost } from '@/lib/api';
+import { useEffect, useState } from 'react'
+import { DollarSign, Hash, Layers, TrendingUp, } from 'lucide-react'
+import type { CostSummary } from '@/types/api'
+import { getCost } from '@/lib/api'
 
 function formatUSD(value: number): string {
   return `$${value.toFixed(4)}`;
@@ -27,7 +22,7 @@ export default function Cost() {
   if (error) {
     return (
       <div className="p-6 animate-fade-in">
-        <div className="rounded-xl bg-[#ff446615] border border-[#ff446630] p-4 text-[#ff6680]">
+        <div className="rounded-xl p-4" style={{ backgroundColor: 'var(--color-bg-error-subtle)', border: '1px solid var(--color-status-error)', color: 'var(--color-status-error)' }}>
           Failed to load cost data: {error}
         </div>
       </div>
@@ -37,7 +32,7 @@ export default function Cost() {
   if (loading || !cost) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="h-8 w-8 border-2 border-[#0080ff30] border-t-[#0080ff] rounded-full animate-spin" />
+        <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--color-glow-blue)', borderTopColor: 'var(--color-accent-blue)' }} />
       </div>
     );
   }
@@ -46,29 +41,27 @@ export default function Cost() {
 
   return (
     <div className="p-6 space-y-6 animate-fade-in">
-      {/* Summary Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 stagger-children">
         {[
-          { icon: DollarSign, color: '#0080ff', bg: '#0080ff15', label: 'Session Cost', value: formatUSD(cost.session_cost_usd) },
-          { icon: TrendingUp, color: '#00e68a', bg: '#00e68a15', label: 'Daily Cost', value: formatUSD(cost.daily_cost_usd) },
-          { icon: Layers, color: '#a855f7', bg: '#a855f715', label: 'Monthly Cost', value: formatUSD(cost.monthly_cost_usd) },
-          { icon: Hash, color: '#ff8800', bg: '#ff880015', label: 'Total Requests', value: cost.request_count.toLocaleString() },
+          { icon: DollarSign, color: 'var(--color-accent-blue)', bg: 'var(--color-bg-blue-subtle)', label: 'Session Cost', value: formatUSD(cost.session_cost_usd) },
+          { icon: TrendingUp, color: 'var(--color-status-success)', bg: 'var(--color-bg-green-subtle)', label: 'Daily Cost', value: formatUSD(cost.daily_cost_usd) },
+          { icon: Layers, color: '#a855f7', bg: 'var(--color-bg-purple-subtle)', label: 'Monthly Cost', value: formatUSD(cost.monthly_cost_usd) },
+          { icon: Hash, color: '#ff8800', bg: 'var(--color-bg-orange-subtle)', label: 'Total Requests', value: cost.request_count.toLocaleString() },
         ].map(({ icon: Icon, color, bg, label, value }) => (
           <div key={label} className="glass-card p-5 animate-slide-in-up">
             <div className="flex items-center gap-3 mb-3">
-              <div className="p-2 rounded-xl" style={{ background: bg }}>
+              <div className="p-2 rounded-xl" style={{ backgroundColor: bg }}>
                 <Icon className="h-5 w-5" style={{ color }} />
               </div>
-              <span className="text-xs text-[#556080] uppercase tracking-wider font-medium">{label}</span>
+              <span className="text-xs uppercase tracking-wider font-medium" style={{ color: 'var(--color-text-muted)' }}>{label}</span>
             </div>
-            <p className="text-2xl font-bold text-white font-mono">{value}</p>
+            <p className="text-2xl font-bold font-mono" style={{ color: 'var(--color-text-primary)' }}>{value}</p>
           </div>
         ))}
       </div>
 
-      {/* Token Statistics */}
       <div className="glass-card p-5 animate-slide-in-up" style={{ animationDelay: '200ms' }}>
-        <h3 className="text-sm font-semibold text-white mb-4 uppercase tracking-wider">
+        <h3 className="text-sm font-semibold mb-4 uppercase tracking-wider" style={{ color: 'var(--color-text-primary)' }}>
           Token Statistics
         </h3>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -77,23 +70,22 @@ export default function Cost() {
             { label: 'Avg Tokens / Request', value: cost.request_count > 0 ? Math.round(cost.total_tokens / cost.request_count).toLocaleString() : '0' },
             { label: 'Cost per 1K Tokens', value: cost.total_tokens > 0 ? formatUSD((cost.monthly_cost_usd / cost.total_tokens) * 1000) : '$0.0000' },
           ].map(({ label, value }) => (
-            <div key={label} className="rounded-xl p-4" style={{ background: 'rgba(0,128,255,0.04)', border: '1px solid rgba(0,128,255,0.08)' }}>
-              <p className="text-xs text-[#556080] uppercase tracking-wider">{label}</p>
-              <p className="text-xl font-bold text-white mt-1 font-mono">{value}</p>
+            <div key={label} className="rounded-xl p-4" style={{ backgroundColor: 'var(--color-bg-blue-subtle)', border: '1px solid var(--color-border-default)' }}>
+              <p className="text-xs uppercase tracking-wider" style={{ color: 'var(--color-text-muted)' }}>{label}</p>
+              <p className="text-xl font-bold mt-1 font-mono" style={{ color: 'var(--color-text-primary)' }}>{value}</p>
             </div>
           ))}
         </div>
       </div>
 
-      {/* Model Breakdown Table */}
       <div className="glass-card overflow-hidden animate-slide-in-up" style={{ animationDelay: '300ms' }}>
-        <div className="px-5 py-4 border-b border-[#1a1a3e]">
-          <h3 className="text-sm font-semibold text-white uppercase tracking-wider">
+        <div className="px-5 py-4 border-b" style={{ borderColor: 'var(--color-border-default)' }}>
+          <h3 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-primary)' }}>
             Model Breakdown
           </h3>
         </div>
         {models.length === 0 ? (
-          <div className="p-8 text-center text-[#334060]">
+          <div className="p-8 text-center" style={{ color: 'var(--color-text-muted)' }}>
             No model data available.
           </div>
         ) : (
@@ -118,27 +110,27 @@ export default function Cost() {
                         : 0;
                     return (
                       <tr key={m.model}>
-                        <td className="px-5 py-3 text-white font-medium text-sm">
+                        <td className="px-5 py-3 font-medium text-sm" style={{ color: 'var(--color-text-primary)' }}>
                           {m.model}
                         </td>
-                        <td className="px-5 py-3 text-[#8892a8] text-right font-mono text-sm">
+                        <td className="px-5 py-3 text-right font-mono text-sm" style={{ color: 'var(--color-text-secondary)' }}>
                           {formatUSD(m.cost_usd)}
                         </td>
-                        <td className="px-5 py-3 text-[#8892a8] text-right text-sm">
+                        <td className="px-5 py-3 text-right text-sm" style={{ color: 'var(--color-text-secondary)' }}>
                           {m.total_tokens.toLocaleString()}
                         </td>
-                        <td className="px-5 py-3 text-[#8892a8] text-right text-sm">
+                        <td className="px-5 py-3 text-right text-sm" style={{ color: 'var(--color-text-secondary)' }}>
                           {m.request_count.toLocaleString()}
                         </td>
                         <td className="px-5 py-3">
                           <div className="flex items-center gap-2">
-                            <div className="w-20 h-1.5 bg-[#0a0a18] rounded-full overflow-hidden">
+                            <div className="w-20 h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--color-bg-input)' }}>
                               <div
                                 className="h-full rounded-full progress-bar-animated transition-all duration-700"
-                                style={{ width: `${Math.max(share, 2)}%`, background: '#0080ff' }}
+                                style={{ width: `${Math.max(share, 2)}%`, background: 'var(--color-accent-blue)' }}
                               />
                             </div>
-                            <span className="text-xs text-[#556080] w-10 text-right font-mono">
+                            <span className="text-xs w-10 text-right font-mono" style={{ color: 'var(--color-text-muted)' }}>
                               {share.toFixed(1)}%
                             </span>
                           </div>

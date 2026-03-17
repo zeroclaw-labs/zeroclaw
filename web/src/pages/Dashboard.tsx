@@ -1,15 +1,7 @@
-import { useState, useEffect } from 'react';
-import {
-  Cpu,
-  Clock,
-  Globe,
-  Database,
-  Activity,
-  DollarSign,
-  Radio,
-} from 'lucide-react';
-import type { StatusResponse, CostSummary } from '@/types/api';
-import { getStatus, getCost } from '@/lib/api';
+import { useEffect, useState } from 'react'
+import { Activity, Clock, Cpu, Database, DollarSign, Globe, Radio, } from 'lucide-react'
+import type { CostSummary, StatusResponse } from '@/types/api'
+import { getCost, getStatus } from '@/lib/api'
 
 function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
@@ -28,13 +20,13 @@ function healthColor(status: string): string {
   switch (status.toLowerCase()) {
     case 'ok':
     case 'healthy':
-      return 'bg-[#00e68a]';
+      return 'var(--color-status-success)';
     case 'warn':
     case 'warning':
     case 'degraded':
-      return 'bg-[#ffaa00]';
+      return 'var(--color-status-warning)';
     default:
-      return 'bg-[#ff4466]';
+      return 'var(--color-status-error)';
   }
 }
 
@@ -42,13 +34,13 @@ function healthBorder(status: string): string {
   switch (status.toLowerCase()) {
     case 'ok':
     case 'healthy':
-      return 'border-[#00e68a30]';
+      return 'var(--color-status-success)';
     case 'warn':
     case 'warning':
     case 'degraded':
-      return 'border-[#ffaa0030]';
+      return 'var(--color-status-warning)';
     default:
-      return 'border-[#ff446630]';
+      return 'var(--color-status-error)';
   }
 }
 
@@ -69,7 +61,7 @@ export default function Dashboard() {
   if (error) {
     return (
       <div className="p-6 animate-fade-in">
-        <div className="rounded-xl bg-[#ff446615] border border-[#ff446630] p-4 text-[#ff6680]">
+        <div className="rounded-xl p-4" style={{ backgroundColor: 'var(--color-bg-error-subtle)', border: '1px solid var(--color-status-error)', color: 'var(--color-status-error)' }}>
           Failed to load dashboard: {error}
         </div>
       </div>
@@ -79,7 +71,7 @@ export default function Dashboard() {
   if (!status || !cost) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="h-8 w-8 border-2 border-[#0080ff30] border-t-[#0080ff] rounded-full animate-spin" />
+        <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--color-glow-blue)', borderTopColor: 'var(--color-accent-blue)' }} />
       </div>
     );
   }
@@ -88,46 +80,44 @@ export default function Dashboard() {
 
   return (
     <div className="p-6 space-y-6 animate-fade-in">
-      {/* Status Cards Grid */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 stagger-children">
         {[
-          { icon: Cpu, color: '#0080ff', bg: '#0080ff15', label: 'Provider / Model', value: status.provider ?? 'Unknown', sub: status.model },
-          { icon: Clock, color: '#00e68a', bg: '#00e68a15', label: 'Uptime', value: formatUptime(status.uptime_seconds), sub: 'Since last restart' },
-          { icon: Globe, color: '#a855f7', bg: '#a855f715', label: 'Gateway Port', value: `:${status.gateway_port}`, sub: `Locale: ${status.locale}` },
-          { icon: Database, color: '#ff8800', bg: '#ff880015', label: 'Memory Backend', value: status.memory_backend, sub: `Paired: ${status.paired ? 'Yes' : 'No'}` },
+          { icon: Cpu, color: 'var(--color-accent-blue)', bg: 'var(--color-bg-blue-subtle)', label: 'Provider / Model', value: status.provider ?? 'Unknown', sub: status.model },
+          { icon: Clock, color: 'var(--color-status-success)', bg: 'var(--color-bg-green-subtle)', label: 'Uptime', value: formatUptime(status.uptime_seconds), sub: 'Since last restart' },
+          { icon: Globe, color: '#a855f7', bg: 'var(--color-bg-purple-subtle)', label: 'Gateway Port', value: `:${status.gateway_port}`, sub: `Locale: ${status.locale}` },
+          { icon: Database, color: '#ff8800', bg: 'var(--color-bg-orange-subtle)', label: 'Memory Backend', value: status.memory_backend, sub: `Paired: ${status.paired ? 'Yes' : 'No'}` },
         ].map(({ icon: Icon, color, bg, label, value, sub }) => (
           <div key={label} className="glass-card p-5 animate-slide-in-up">
             <div className="flex items-center gap-3 mb-3">
-              <div className="p-2 rounded-xl" style={{ background: bg }}>
+              <div className="p-2 rounded-xl" style={{ backgroundColor: bg }}>
                 <Icon className="h-5 w-5" style={{ color }} />
               </div>
-              <span className="text-xs text-[#556080] uppercase tracking-wider font-medium">{label}</span>
+              <span className="text-xs uppercase tracking-wider font-medium" style={{ color: 'var(--color-text-muted)' }}>{label}</span>
             </div>
-            <p className="text-lg font-semibold text-white truncate capitalize">{value}</p>
-            <p className="text-sm text-[#556080] truncate">{sub}</p>
+            <p className="text-lg font-semibold truncate capitalize" style={{ color: 'var(--color-text-primary)' }}>{value}</p>
+            <p className="text-sm truncate" style={{ color: 'var(--color-text-muted)' }}>{sub}</p>
           </div>
         ))}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 stagger-children">
-        {/* Cost Widget */}
         <div className="glass-card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
-            <DollarSign className="h-5 w-5 text-[#0080ff]" />
-            <h2 className="text-sm font-semibold text-white uppercase tracking-wider">Cost Overview</h2>
+            <DollarSign className="h-5 w-5" style={{ color: 'var(--color-accent-blue)' }} />
+            <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-primary)' }}>Cost Overview</h2>
           </div>
           <div className="space-y-4">
             {[
-              { label: 'Session', value: cost.session_cost_usd, color: '#0080ff' },
-              { label: 'Daily', value: cost.daily_cost_usd, color: '#00e68a' },
+              { label: 'Session', value: cost.session_cost_usd, color: 'var(--color-accent-blue)' },
+              { label: 'Daily', value: cost.daily_cost_usd, color: 'var(--color-status-success)' },
               { label: 'Monthly', value: cost.monthly_cost_usd, color: '#a855f7' },
             ].map(({ label, value, color }) => (
               <div key={label}>
                 <div className="flex justify-between text-sm mb-1.5">
-                  <span className="text-[#556080]">{label}</span>
-                  <span className="text-white font-medium font-mono">{formatUSD(value)}</span>
+                  <span style={{ color: 'var(--color-text-muted)' }}>{label}</span>
+                  <span className="font-mono font-medium" style={{ color: 'var(--color-text-primary)' }}>{formatUSD(value)}</span>
                 </div>
-                <div className="w-full h-1.5 bg-[#0a0a18] rounded-full overflow-hidden">
+                <div className="w-full h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--color-bg-input)' }}>
                   <div
                     className="h-full rounded-full progress-bar-animated transition-all duration-700 ease-out"
                     style={{ width: `${Math.max((value / maxCost) * 100, 2)}%`, background: color }}
@@ -136,40 +126,38 @@ export default function Dashboard() {
               </div>
             ))}
           </div>
-          <div className="mt-5 pt-4 border-t border-[#1a1a3e]/50 flex justify-between text-sm">
-            <span className="text-[#556080]">Total Tokens</span>
-            <span className="text-white font-mono">{cost.total_tokens.toLocaleString()}</span>
+          <div className="mt-5 pt-4 border-t flex justify-between text-sm" style={{ borderColor: 'var(--color-border-default)' }}>
+            <span style={{ color: 'var(--color-text-muted)' }}>Total Tokens</span>
+            <span className="font-mono" style={{ color: 'var(--color-text-primary)' }}>{cost.total_tokens.toLocaleString()}</span>
           </div>
           <div className="flex justify-between text-sm mt-1">
-            <span className="text-[#556080]">Requests</span>
-            <span className="text-white font-mono">{cost.request_count.toLocaleString()}</span>
+            <span style={{ color: 'var(--color-text-muted)' }}>Requests</span>
+            <span className="font-mono" style={{ color: 'var(--color-text-primary)' }}>{cost.request_count.toLocaleString()}</span>
           </div>
         </div>
 
-        {/* Active Channels */}
         <div className="glass-card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
-            <Radio className="h-5 w-5 text-[#0080ff]" />
-            <h2 className="text-sm font-semibold text-white uppercase tracking-wider">Active Channels</h2>
+            <Radio className="h-5 w-5" style={{ color: 'var(--color-accent-blue)' }} />
+            <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-primary)' }}>Active Channels</h2>
           </div>
           <div className="space-y-2">
             {Object.entries(status.channels).length === 0 ? (
-              <p className="text-sm text-[#334060]">No channels configured</p>
+              <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>No channels configured</p>
             ) : (
               Object.entries(status.channels).map(([name, active]) => (
                 <div
                   key={name}
-                  className="flex items-center justify-between py-2.5 px-3 rounded-xl transition-all duration-300 hover:bg-[#0080ff08]"
-                  style={{ background: 'rgba(10, 10, 26, 0.5)' }}
+                  className="flex items-center justify-between py-2.5 px-3 rounded-xl transition-all duration-300 hover:opacity-80"
+                  style={{ background: 'var(--color-bg-secondary)' }}
                 >
-                  <span className="text-sm text-white capitalize font-medium">{name}</span>
+                  <span className="text-sm font-medium capitalize" style={{ color: 'var(--color-text-primary)' }}>{name}</span>
                   <div className="flex items-center gap-2">
                     <span
-                      className={`inline-block h-2 w-2 rounded-full glow-dot ${
-                        active ? 'text-[#00e68a] bg-[#00e68a]' : 'text-[#334060] bg-[#334060]'
-                      }`}
+                      className="inline-block h-2 w-2 rounded-full"
+                      style={{ backgroundColor: active ? 'var(--color-status-success)' : 'var(--color-text-muted)' }}
                     />
-                    <span className="text-xs text-[#556080]">
+                    <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
                       {active ? 'Active' : 'Inactive'}
                     </span>
                   </div>
@@ -179,31 +167,33 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* Health Grid */}
         <div className="glass-card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
-            <Activity className="h-5 w-5 text-[#0080ff]" />
-            <h2 className="text-sm font-semibold text-white uppercase tracking-wider">Component Health</h2>
+            <Activity className="h-5 w-5" style={{ color: 'var(--color-accent-blue)' }} />
+            <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-primary)' }}>Component Health</h2>
           </div>
           <div className="grid grid-cols-2 gap-3">
             {Object.entries(status.health.components).length === 0 ? (
-              <p className="text-sm text-[#334060] col-span-2">No components reporting</p>
+              <p className="text-sm col-span-2" style={{ color: 'var(--color-text-muted)' }}>No components reporting</p>
             ) : (
               Object.entries(status.health.components).map(([name, comp]) => (
                 <div
                   key={name}
-                  className={`rounded-xl p-3 border ${healthBorder(comp.status)} transition-all duration-300 hover:scale-[1.02]`}
-                  style={{ background: 'rgba(10, 10, 26, 0.5)' }}
+                  className="rounded-xl p-3 border transition-all duration-300 hover:scale-[1.02]"
+                  style={{ 
+                    background: 'var(--color-bg-secondary)', 
+                    borderColor: healthBorder(comp.status)
+                  }}
                 >
                   <div className="flex items-center gap-2 mb-1">
-                    <span className={`inline-block h-2 w-2 rounded-full ${healthColor(comp.status)} glow-dot`} />
-                    <span className="text-sm font-medium text-white capitalize truncate">
+                    <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: healthColor(comp.status) }} />
+                    <span className="text-sm font-medium truncate capitalize" style={{ color: 'var(--color-text-primary)' }}>
                       {name}
                     </span>
                   </div>
-                  <p className="text-xs text-[#556080] capitalize">{comp.status}</p>
+                  <p className="text-xs capitalize" style={{ color: 'var(--color-text-muted)' }}>{comp.status}</p>
                   {comp.restart_count > 0 && (
-                    <p className="text-xs text-[#ffaa00] mt-1">
+                    <p className="text-xs mt-1" style={{ color: 'var(--color-status-warning)' }}>
                       Restarts: {comp.restart_count}
                     </p>
                   )}
