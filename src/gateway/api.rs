@@ -427,6 +427,147 @@ pub async fn handle_api_config_tool_api_key_put(
     Json(serde_json::json!({"status": "ok", "tool": tool})).into_response()
 }
 
+/// PUT /api/workspace — set the active workspace directory at runtime.
+///
+/// Body: `{"path": "/absolute/path"}` or `{"git_url": "https://github.com/user/repo"}`
+///
+/// When `path` is provided, validates the directory exists and updates `workspace_dir`.
+/// When `git_url` is provided, clones the repo into `~/.zeroclaw/workspace/<repo_name>`
+/// and sets it as the active workspace.
+///
+/// After workspace is set, the agent's system prompt automatically includes the
+/// workspace path and coding-aware instructions so file tools are used for
+/// subsequent requests.
+pub async fn handle_api_workspace_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let path = body.get("path").and_then(|v| v.as_str()).map(str::trim);
+    let git_url = body.get("git_url").and_then(|v| v.as_str()).map(str::trim);
+
+    let resolved_path = if let Some(dir) = path {
+        if dir.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "path cannot be empty"})),
+            )
+                .into_response();
+        }
+        let p = std::path::PathBuf::from(dir);
+        if !p.is_absolute() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "path must be absolute"})),
+            )
+                .into_response();
+        }
+        if !p.is_dir() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "path is not a directory or does not exist"})),
+            )
+                .into_response();
+        }
+        p
+    } else if let Some(url) = git_url {
+        if url.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "git_url cannot be empty"})),
+            )
+                .into_response();
+        }
+
+        // Extract repo name from URL
+        let repo_name = url
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("repo")
+            .trim_end_matches(".git");
+
+        let workspace_base = state.config.lock().workspace_dir.clone();
+        let clone_target = workspace_base.join(repo_name);
+
+        if clone_target.is_dir() {
+            // Already cloned — just set as workspace
+            clone_target
+        } else {
+            // Clone the repository
+            let output = match tokio::process::Command::new("git")
+                .args(["clone", "--depth", "1", url, &clone_target.to_string_lossy()])
+                .output()
+                .await
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("Failed to run git clone: {e}")})),
+                    )
+                        .into_response();
+                }
+            };
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("git clone failed: {stderr}")})),
+                )
+                    .into_response();
+            }
+            clone_target
+        }
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Either 'path' or 'git_url' is required"})),
+        )
+            .into_response();
+    };
+
+    // Update workspace_dir in the live config
+    {
+        let mut config = state.config.lock();
+        config.workspace_dir = resolved_path.clone();
+    }
+
+    tracing::info!("Workspace updated to: {}", resolved_path.display());
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "workspace_dir": resolved_path.to_string_lossy(),
+    }))
+    .into_response()
+}
+
+/// GET /api/workspace — get the current active workspace directory.
+pub async fn handle_api_workspace_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+
+    // Check if it's a git repository
+    let is_git = workspace_dir.join(".git").exists();
+
+    Json(serde_json::json!({
+        "workspace_dir": workspace_dir.to_string_lossy(),
+        "is_git": is_git,
+    }))
+    .into_response()
+}
+
 /// GET /api/tools — list registered tool specs
 pub async fn handle_api_tools(
     State(state): State<AppState>,

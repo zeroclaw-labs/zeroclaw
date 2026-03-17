@@ -204,6 +204,45 @@ export class MoAClient {
     return data;
   }
 
+  /**
+   * Verify password for lock screen unlock.
+   * Re-authenticates using the stored username and provided password.
+   * On success, refreshes the session token (server may issue a new one).
+   * Also checks gateway health and updates liveness state.
+   */
+  async verifyPasswordForUnlock(password: string): Promise<void> {
+    const username = this.user?.username;
+    if (!username) {
+      throw new Error("No stored user session");
+    }
+
+    const deviceName = await this.getDeviceName();
+    const res = await fetch(`${this.relayUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username,
+        password,
+        device_id: this.deviceId,
+        device_name: deviceName,
+      }),
+    });
+
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: "Verification failed" }));
+      throw new Error(data.error || `Verification failed (${res.status})`);
+    }
+
+    const data: LoginResponse = await res.json();
+
+    // Refresh token with the new one from server
+    this.token = data.token;
+    localStorage.setItem(STORAGE_KEY_TOKEN, data.token);
+
+    // Check gateway health after unlock — triggers watchdog awareness
+    await this.checkGatewayHealth();
+  }
+
   async logout(): Promise<void> {
     if (this.token) {
       try {
@@ -409,6 +448,46 @@ export class MoAClient {
     };
   }
 
+  // ── Gateway Liveness ─────────────────────────────────────────────
+
+  /** Whether the local gateway was reachable on the last heartbeat check. */
+  private gatewayAlive = true;
+
+  /** Check if the local gateway is currently alive. */
+  isGatewayAlive(): boolean {
+    return this.gatewayAlive;
+  }
+
+  /** Quick health probe against the local gateway (2s timeout). */
+  async checkGatewayHealth(): Promise<boolean> {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 2000);
+      const res = await fetch(`${this.serverUrl}/health`, {
+        method: "GET",
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      this.gatewayAlive = res.ok;
+      return res.ok;
+    } catch {
+      this.gatewayAlive = false;
+      return false;
+    }
+  }
+
+  /**
+   * Assert that the local gateway is reachable.
+   * Throws a user-friendly error if not.
+   */
+  private async requireGateway(): Promise<void> {
+    if (this.gatewayAlive) return; // fast path — last check was ok
+    const alive = await this.checkGatewayHealth();
+    if (!alive) {
+      throw new Error("MoA 에이전트를 먼저 실행시켜주세요");
+    }
+  }
+
   // ── Heartbeat ──────────────────────────────────────────────────
 
   startHeartbeat(): void {
@@ -435,8 +514,10 @@ export class MoAClient {
         },
         body: JSON.stringify({ device_id: this.deviceId }),
       });
+      this.gatewayAlive = true;
     } catch {
-      // Heartbeat failures are non-critical
+      // Track gateway liveness — if heartbeat network-fails, gateway is likely down
+      this.gatewayAlive = false;
     }
   }
 
@@ -568,6 +649,7 @@ export class MoAClient {
       provider,
       model,
       ...(hasSelectedProviderKey ? { api_key: apiKey } : {}),
+      ...(this.workspaceConnected ? { workspace_connected: true } : {}),
     };
 
     // ── Determine routing order with fallback ──
@@ -734,17 +816,26 @@ export class MoAClient {
   // When no key is set, MoA falls back to operator keys via relay.
 
   async saveApiKeyToAgent(provider: string, key: string): Promise<void> {
-    const res = await fetch(`${this.serverUrl}/api/config/api-key`, {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.token}`,
-      },
-      body: JSON.stringify({ provider, api_key: key }),
-    });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({ error: "Save failed" }));
-      throw new Error(data.error || `Save failed (${res.status})`);
+    await this.requireGateway();
+    try {
+      const res = await fetch(`${this.serverUrl}/api/config/api-key`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.token}`,
+        },
+        body: JSON.stringify({ provider, api_key: key }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({ error: "Save failed" }));
+        throw new Error(data.error || `Save failed (${res.status})`);
+      }
+    } catch (err) {
+      if (err instanceof TypeError && err.message === "Failed to fetch") {
+        this.gatewayAlive = false;
+        throw new Error("MoA 에이전트를 먼저 실행시켜주세요");
+      }
+      throw err;
     }
   }
 
@@ -756,17 +847,26 @@ export class MoAClient {
    *  that older server binaries may not serve. */
   async saveToolApiKey(tool: string, apiKey: string): Promise<void> {
     // Reuse the proven /api/config/api-key endpoint with "tool:" prefix
-    const res = await fetch(`${this.serverUrl}/api/config/api-key`, {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.token}`,
-      },
-      body: JSON.stringify({ provider: `tool:${tool}`, api_key: apiKey }),
-    });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({ error: "Save failed" }));
-      throw new Error(data.error || `Save failed (${res.status})`);
+    await this.requireGateway();
+    try {
+      const res = await fetch(`${this.serverUrl}/api/config/api-key`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.token}`,
+        },
+        body: JSON.stringify({ provider: `tool:${tool}`, api_key: apiKey }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({ error: "Save failed" }));
+        throw new Error(data.error || `Save failed (${res.status})`);
+      }
+    } catch (err) {
+      if (err instanceof TypeError && err.message === "Failed to fetch") {
+        this.gatewayAlive = false;
+        throw new Error("MoA 에이전트를 먼저 실행시켜주세요");
+      }
+      throw err;
     }
 
     // Store locally for UI state
@@ -802,6 +902,72 @@ export class MoAClient {
     } catch {
       // Local agent might not be running — preference is still saved in localStorage
     }
+  }
+
+  // ── Workspace Management ──────────────────────────────────────
+
+  /** Whether a workspace (folder or git repo) has been explicitly connected. */
+  private workspaceConnected = false;
+
+  /** The connected workspace directory path (for UI display). */
+  private workspacePath: string | null = null;
+
+  /** Check if a workspace is currently connected. */
+  isWorkspaceConnected(): boolean {
+    return this.workspaceConnected;
+  }
+
+  /** Get the connected workspace path (or null). */
+  getWorkspacePath(): string | null {
+    return this.workspacePath;
+  }
+
+  /** Set the workspace directory on the local gateway. */
+  async setWorkspaceDir(dirPath: string): Promise<string> {
+    await this.requireGateway();
+    const res = await fetch(`${this.serverUrl}/api/workspace`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({ path: dirPath }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: "Failed to set workspace" }));
+      throw new Error(data.error || `Failed to set workspace (${res.status})`);
+    }
+    const data = await res.json();
+    this.workspaceConnected = true;
+    this.workspacePath = data.workspace_dir ?? dirPath;
+    return this.workspacePath!;
+  }
+
+  /** Clone a GitHub repo and set it as workspace. */
+  async connectGitHubRepo(repoUrl: string): Promise<string> {
+    await this.requireGateway();
+    const res = await fetch(`${this.serverUrl}/api/workspace`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({ git_url: repoUrl }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: "Failed to connect repo" }));
+      throw new Error(data.error || `Failed to connect repo (${res.status})`);
+    }
+    const data = await res.json();
+    this.workspaceConnected = true;
+    this.workspacePath = data.workspace_dir ?? repoUrl;
+    return this.workspacePath!;
+  }
+
+  /** Disconnect the workspace (reset to default). */
+  disconnectWorkspace(): void {
+    this.workspaceConnected = false;
+    this.workspacePath = null;
   }
 
   // ── Operator Key Fallback (via relay server) ────────────────

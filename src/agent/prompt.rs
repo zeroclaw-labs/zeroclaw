@@ -43,6 +43,7 @@ impl SystemPromptBuilder {
                 Box::new(DateTimeSection),
                 Box::new(RuntimeSection),
                 Box::new(ChannelMediaSection),
+                Box::new(ToolUsageStrategySection),
             ],
         }
     }
@@ -76,6 +77,7 @@ pub struct RuntimeSection;
 pub struct DateTimeSection;
 pub struct OntologySection;
 pub struct ChannelMediaSection;
+pub struct ToolUsageStrategySection;
 
 impl PromptSection for IdentitySection {
     fn name(&self) -> &str {
@@ -347,6 +349,104 @@ impl PromptSection for ChannelMediaSection {
             - `[IMAGE:<path>]` — An image attachment, processed by the vision pipeline.\n\
             - `[Document: <name>] <path>` — A file attachment saved to the workspace."
             .into())
+    }
+}
+
+impl PromptSection for ToolUsageStrategySection {
+    fn name(&self) -> &str {
+        "tool_usage_strategy"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        if ctx.tools.is_empty() {
+            return Ok(String::new());
+        }
+
+        // Classify tools into free and paid categories based on known paid providers.
+        let paid_tool_info: &[(&str, &str, &str)] = &[
+            ("brave", "Brave Search", "https://brave.com/search/api/"),
+            ("firecrawl", "Firecrawl", "https://firecrawl.dev/"),
+            ("tavily", "Tavily", "https://tavily.com/"),
+            ("perplexity", "Perplexity", "https://www.perplexity.ai/"),
+            ("exa", "Exa", "https://exa.ai/"),
+            ("jina", "Jina AI", "https://jina.ai/"),
+            ("composio", "Composio", "https://composio.dev/"),
+        ];
+
+        let tool_names: Vec<&str> = ctx.tools.iter().map(|t| t.name()).collect();
+
+        let mut out = String::from(
+            "## Tool Usage Strategy\n\n\
+             ### Autonomous Execution Protocol\n\n\
+             When the user makes a request, follow this workflow:\n\n\
+             1. **Analyze** — Understand the request and determine what information or actions are needed.\n\
+             2. **Plan** — Break the task into concrete steps. Identify which tools are needed for each step.\n\
+             3. **Execute** — Use the appropriate tools to carry out each step. Chain tool calls as needed.\n\
+             4. **Verify** — Check the results for correctness and completeness.\n\
+             5. **Respond** — Present the final result clearly and concisely.\n\n\
+             Key principles:\n\
+             - Act autonomously. Do not ask the user for permission to use available tools — just use them.\n\
+             - Prefer parallel execution when steps are independent.\n\
+             - Be cost-efficient: use the minimum number of tool calls needed for accurate results.\n\
+             - If a tool call fails, try an alternative approach before reporting failure.\n\n",
+        );
+
+        // Free-tool-first guidance
+        out.push_str(
+            "### Free-First Tool Selection\n\n\
+             Always prefer free built-in tools over paid alternatives:\n\n\
+             **Free tools (no API key required):**\n\
+             - `web_search` (DuckDuckGo provider) — default web search, always available\n\
+             - `web_fetch` (nanohtml2text provider) — fetch and extract web page content\n\
+             - `http_request` — direct HTTP calls (GET/POST/PUT/DELETE)\n\
+             - `browser` — full browser automation for complex web interactions\n\
+             - `shell` — execute system commands\n\
+             - `file_read`, `file_write`, `file_edit`, `apply_patch` — local file operations\n\
+             - `glob_search`, `content_search` — file and content search\n\
+             - `git_operations` — Git repository operations\n\
+             - `memory_store`, `memory_recall`, `memory_observe` — persistent memory\n\
+             - `pdf_read`, `docx_read`, `xlsx_read`, `pptx_read` — document reading\n\
+             - `screenshot`, `image_info` — screen capture and image analysis\n\
+             - All scheduling, configuration, and process management tools\n\n\
+             Use these tools first. They can handle the vast majority of user requests.\n\n",
+        );
+
+        // Paid tool guidance — only include if relevant tools exist
+        let has_web_search = tool_names.iter().any(|n| *n == "web_search");
+        let has_composio = tool_names.iter().any(|n| *n == "composio");
+
+        if has_web_search || has_composio {
+            out.push_str(
+                "### Paid Tool Guidance\n\n\
+                 Some advanced features require external API keys. \
+                 Only suggest these when free tools genuinely cannot fulfill the request \
+                 (e.g., the user explicitly needs a specific paid service).\n\n\
+                 **Paid providers (require API key setup):**\n",
+            );
+
+            for (key, label, url) in paid_tool_info {
+                // Only list paid tools whose base tool exists
+                let relevant = match *key {
+                    "composio" => has_composio,
+                    _ => has_web_search,
+                };
+                if relevant {
+                    let _ = writeln!(out, "- **{label}** (`{key}`) — Sign up: {url}");
+                }
+            }
+
+            out.push_str(
+                "\nWhen a paid tool is needed:\n\
+                 1. Explain to the user why a paid tool would produce better results.\n\
+                 2. Name the specific provider and its purpose.\n\
+                 3. Provide the signup URL so the user can obtain an API key.\n\
+                 4. Guide the user to enter the API key in MoA Settings → Provider API Keys.\n\
+                 5. After the key is configured, proceed with the task automatically.\n\n\
+                 Never block on a paid tool — always attempt free alternatives first.\n",
+            );
+        }
+
+        Ok(out)
     }
 }
 

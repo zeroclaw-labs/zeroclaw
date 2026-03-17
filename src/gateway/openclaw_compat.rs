@@ -78,6 +78,12 @@ pub struct ApiChatBody {
     /// This allows the client to pass a key from its local storage directly.
     #[serde(default)]
     pub api_key: Option<String>,
+
+    /// When true, signals that the user has explicitly connected a workspace
+    /// (folder or GitHub repo). The agent will receive coding-aware instructions
+    /// to proactively use file tools (file_read, file_write, glob_search, etc.).
+    #[serde(default)]
+    pub workspace_connected: bool,
 }
 
 fn api_chat_memory_key() -> String {
@@ -188,7 +194,7 @@ pub async fn handle_api_chat(
     }
 
     // ── Build enriched message with optional context ──
-    let enriched_message = if chat_body.context.is_empty() {
+    let mut enriched_message = if chat_body.context.is_empty() {
         message.to_string()
     } else {
         let recent: Vec<&String> = chat_body.context.iter().rev().take(10).rev().collect();
@@ -202,6 +208,31 @@ pub async fn handle_api_chat(
             context_block, message
         )
     };
+
+    // ── Inject coding-aware workspace context ──
+    // When the user has explicitly connected a workspace (folder or GitHub repo),
+    // prepend instructions so the agent proactively uses file/coding tools.
+    if chat_body.workspace_connected {
+        let workspace_dir = state.config.lock().workspace_dir.clone();
+        let coding_context = format!(
+            "[Workspace Context]\n\
+             The user has connected workspace: `{}`\n\
+             You have full access to coding tools for this workspace. \
+             When the user asks about code, files, or project-related tasks, \
+             proactively use the appropriate tools:\n\
+             - `glob_search` to find files by pattern\n\
+             - `content_search` to search file contents by regex\n\
+             - `file_read` to read file contents\n\
+             - `file_write` to create or overwrite files\n\
+             - `file_edit` to edit existing files\n\
+             - `shell` to run commands (build, test, lint, etc.)\n\
+             - `git_operations` for git status, diff, commit, etc.\n\
+             Do not ask the user to perform these operations manually — \
+             use the tools directly to inspect, modify, and manage the codebase.\n\n",
+            workspace_dir.display()
+        );
+        enriched_message = format!("{coding_context}{enriched_message}");
+    }
 
     // ── Build config with client-provided overrides ──
     // Reload tool/feature config from disk so runtime changes (e.g. web_search_config

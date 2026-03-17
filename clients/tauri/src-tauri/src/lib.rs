@@ -599,6 +599,9 @@ const MAX_SIDECAR_RETRIES: u32 = 3;
 /// Maximum time to wait for the gateway health endpoint (30 seconds).
 const GATEWAY_READY_TIMEOUT_MS: u64 = 30_000;
 
+/// Interval for the watchdog health check (15 seconds).
+const WATCHDOG_INTERVAL_SECS: u64 = 15;
+
 /// Emit a gateway status event to the frontend so it can display progress.
 fn emit_gateway_status(app_handle: &tauri::AppHandle, status: &str, message: &str) {
     let _ = app_handle.emit(
@@ -709,6 +712,101 @@ fn spawn_zeroclaw_gateway(app: &tauri::App) {
             "failed",
             "Backend service failed to start. Please ensure ZeroClaw is installed or check the logs.",
         );
+    });
+
+    // ── Watchdog: periodically verify the gateway is still alive ──
+    // If it dies after initial startup, mark it as down, notify the
+    // frontend, and attempt a restart.
+    start_gateway_watchdog(app);
+}
+
+/// Background watchdog that monitors the gateway health and restarts it if it dies.
+fn start_gateway_watchdog(app: &tauri::App) {
+    let gateway_url = format!("http://{DEFAULT_GATEWAY_HOST}:{DEFAULT_GATEWAY_PORT}");
+    let state = app.state::<AppState>();
+    let gateway_running = state.gateway_running.clone();
+    let app_handle = app.handle().clone();
+
+    tauri::async_runtime::spawn(async move {
+        // Wait for initial startup to finish (up to 60s)
+        let startup_deadline = MAX_SIDECAR_RETRIES as u64 * (GATEWAY_READY_TIMEOUT_MS / 1000 + 4);
+        tokio::time::sleep(std::time::Duration::from_secs(startup_deadline.min(60))).await;
+
+        let mut consecutive_failures: u32 = 0;
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(WATCHDOG_INTERVAL_SECS)).await;
+
+            if is_gateway_reachable(&gateway_url).await {
+                if !gateway_running.load(Ordering::SeqCst) {
+                    // Gateway recovered (e.g. user restarted it manually)
+                    gateway_running.store(true, Ordering::SeqCst);
+                    emit_gateway_status(&app_handle, "ready", "Backend service reconnected");
+                    eprintln!("[MoA] Watchdog: gateway recovered");
+                }
+                consecutive_failures = 0;
+                continue;
+            }
+
+            // Gateway is unreachable
+            consecutive_failures += 1;
+
+            // Require 2 consecutive failures to avoid false positives from transient hiccups
+            if consecutive_failures < 2 {
+                continue;
+            }
+
+            if gateway_running.load(Ordering::SeqCst) {
+                eprintln!("[MoA] Watchdog: gateway is down, attempting restart...");
+                gateway_running.store(false, Ordering::SeqCst);
+                emit_gateway_status(&app_handle, "starting", "Backend service lost — restarting...");
+            }
+
+            // Attempt restart via sidecar
+            let launched = match app_handle.shell().sidecar("zeroclaw") {
+                Ok(sidecar) => sidecar
+                    .args(["gateway", "--host", DEFAULT_GATEWAY_HOST, "--port", &DEFAULT_GATEWAY_PORT.to_string()])
+                    .spawn()
+                    .is_ok(),
+                Err(_) => {
+                    // Fallback to system PATH
+                    std::process::Command::new("zeroclaw")
+                        .args(["gateway", "--host", DEFAULT_GATEWAY_HOST, "--port", &DEFAULT_GATEWAY_PORT.to_string()])
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                        .is_ok()
+                }
+            };
+
+            if !launched {
+                eprintln!("[MoA] Watchdog: restart launch failed");
+                emit_gateway_status(&app_handle, "failed", "MoA 에이전트를 재시작할 수 없습니다");
+                continue;
+            }
+
+            // Wait for the restarted gateway to become healthy
+            let poll_interval_ms = 500;
+            let max_polls = GATEWAY_READY_TIMEOUT_MS / poll_interval_ms;
+            let mut recovered = false;
+            for _ in 0..max_polls {
+                tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+                if is_gateway_reachable(&gateway_url).await {
+                    recovered = true;
+                    break;
+                }
+            }
+
+            if recovered {
+                eprintln!("[MoA] Watchdog: gateway restarted successfully");
+                gateway_running.store(true, Ordering::SeqCst);
+                emit_gateway_status(&app_handle, "ready", "Backend service restarted");
+                consecutive_failures = 0;
+            } else {
+                eprintln!("[MoA] Watchdog: gateway restart timed out");
+                emit_gateway_status(&app_handle, "failed", "MoA 에이전트가 응답하지 않습니다. 앱을 재시작해주세요.");
+            }
+        }
     });
 }
 

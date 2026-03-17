@@ -2377,7 +2377,7 @@ fn default_http_request_credential_value_prefix() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HttpRequestConfig {
     /// Enable `http_request` tool for API interactions
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Allowed domains for HTTP requests (exact or subdomain match)
     #[serde(default)]
@@ -15918,8 +15918,9 @@ pub struct AuthConfig {
 /// This provides a third authentication factor to protect against full credential compromise.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EmailVerificationConfig {
-    /// Enable email verification for remote device access (default: false).
-    #[serde(default)]
+    /// Enable email verification for remote device access (default: true).
+    /// Requires SMTP configuration to take effect.
+    #[serde(default = "default_email_verification_enabled")]
     pub enabled: bool,
     /// SMTP server host for sending verification emails.
     #[serde(default)]
@@ -15947,6 +15948,10 @@ pub struct EmailVerificationConfig {
     pub max_attempts: u32,
 }
 
+fn default_email_verification_enabled() -> bool {
+    true
+}
+
 fn default_smtp_port() -> u16 {
     587
 }
@@ -15966,7 +15971,7 @@ fn default_email_verify_max_attempts() -> u32 {
 impl Default for EmailVerificationConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             smtp_host: None,
             smtp_port: default_smtp_port(),
             smtp_username: None,

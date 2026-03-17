@@ -5,6 +5,7 @@ import { deriveChatTitle } from "../lib/storage";
 import type { DeviceInfo, ToolInfo, ChannelInfo } from "../lib/api";
 import { apiClient } from "../lib/api";
 import { ChannelGuide } from "./ChannelGuide";
+import { isTauri } from "../lib/tauri-bridge";
 
 interface SidebarProps {
   chats: ChatSession[];
@@ -22,6 +23,7 @@ interface SidebarProps {
   onOpenSettings: () => void;
   onOpenInterpreter: () => void;
   onOpenDocument: () => void;
+  onLogout: () => void;
   onToggle: () => void;
 }
 
@@ -211,6 +213,7 @@ export function Sidebar({
   onOpenSettings,
   onOpenInterpreter,
   onOpenDocument,
+  onLogout,
   onToggle,
 }: SidebarProps) {
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
@@ -272,6 +275,66 @@ export function Sidebar({
 
   // Channel guide modal state
   const [guideChannel, setGuideChannel] = useState<string | null>(null);
+
+  // Workspace connect state
+  const [showGitHubInput, setShowGitHubInput] = useState(false);
+  const [gitHubUrl, setGitHubUrl] = useState("");
+  const [workspaceStatus, setWorkspaceStatus] = useState<string | null>(null);
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+
+  // Track persistent workspace connection state
+  const [connectedWorkspace, setConnectedWorkspace] = useState<string | null>(
+    () => apiClient.getWorkspacePath(),
+  );
+
+  const handleConnectFolder = useCallback(async () => {
+    if (workspaceLoading) return;
+    try {
+      if (isTauri()) {
+        const { open } = await import("@tauri-apps/plugin-dialog");
+        const selected = await open({ directory: true, multiple: false });
+        if (!selected) return;
+        const dirPath = typeof selected === "string" ? selected : selected[0];
+        if (!dirPath) return;
+        setWorkspaceLoading(true);
+        const resolved = await apiClient.setWorkspaceDir(dirPath);
+        setConnectedWorkspace(resolved);
+        setWorkspaceStatus(locale === "ko" ? "폴더가 연결되었습니다" : "Folder connected");
+        setTimeout(() => setWorkspaceStatus(null), 3000);
+      }
+    } catch (err) {
+      setWorkspaceStatus(err instanceof Error ? err.message : "Error");
+      setTimeout(() => setWorkspaceStatus(null), 4000);
+    } finally {
+      setWorkspaceLoading(false);
+    }
+  }, [workspaceLoading, locale]);
+
+  const handleConnectGitHub = useCallback(async () => {
+    const url = gitHubUrl.trim();
+    if (!url || workspaceLoading) return;
+    setWorkspaceLoading(true);
+    setWorkspaceStatus(null);
+    try {
+      const resolved = await apiClient.connectGitHubRepo(url);
+      setConnectedWorkspace(resolved);
+      setWorkspaceStatus(locale === "ko" ? "저장소가 연결되었습니다" : "Repository connected");
+      setGitHubUrl("");
+      setShowGitHubInput(false);
+      setTimeout(() => setWorkspaceStatus(null), 3000);
+    } catch (err) {
+      setWorkspaceStatus(err instanceof Error ? err.message : "Error");
+      setTimeout(() => setWorkspaceStatus(null), 4000);
+    } finally {
+      setWorkspaceLoading(false);
+    }
+  }, [gitHubUrl, workspaceLoading, locale]);
+
+  const handleDisconnectWorkspace = useCallback(() => {
+    apiClient.disconnectWorkspace();
+    setConnectedWorkspace(null);
+    setWorkspaceStatus(null);
+  }, []);
 
   // Merge API-key-requiring tools that aren't in the backend list, then sort A-Z
   const sortedTools = useMemo(() => {
@@ -639,6 +702,108 @@ export function Sidebar({
             </div>
           </div>
 
+          {/* Workspace connect buttons */}
+          <div className="sidebar-section">
+            {/* Show connected workspace indicator */}
+            {connectedWorkspace && (
+              <div className="sidebar-workspace-connected" style={{
+                padding: "6px 10px",
+                margin: "4px 8px",
+                background: "rgba(74, 222, 128, 0.1)",
+                border: "1px solid rgba(74, 222, 128, 0.3)",
+                borderRadius: 6,
+                fontSize: "0.72rem",
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+              }}>
+                <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#4ade80", flexShrink: 0 }} />
+                <span style={{
+                  flex: 1,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                  color: "#4ade80",
+                }} title={connectedWorkspace}>
+                  {connectedWorkspace.split("/").pop() || connectedWorkspace}
+                </span>
+                <button
+                  onClick={handleDisconnectWorkspace}
+                  style={{
+                    background: "none",
+                    border: "none",
+                    color: "#888",
+                    cursor: "pointer",
+                    fontSize: "0.7rem",
+                    padding: "0 2px",
+                    flexShrink: 0,
+                  }}
+                  title={locale === "ko" ? "연결 해제" : "Disconnect"}
+                >
+                  {"\u2715"}
+                </button>
+              </div>
+            )}
+            <div className="sidebar-workspace-buttons" style={{ padding: "4px 8px", display: "flex", gap: 6 }}>
+              <button
+                className="sidebar-workspace-btn"
+                onClick={handleConnectFolder}
+                disabled={workspaceLoading}
+                title={t("connect_folder_hint", locale)}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                </svg>
+                <span>{t("connect_folder", locale)}</span>
+              </button>
+              <button
+                className="sidebar-workspace-btn"
+                onClick={() => setShowGitHubInput((prev) => !prev)}
+                disabled={workspaceLoading}
+                title={t("connect_github_hint", locale)}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22" />
+                </svg>
+                <span>{t("connect_github", locale)}</span>
+              </button>
+            </div>
+            {showGitHubInput && (
+              <div style={{ padding: "0 8px 8px" }}>
+                <div style={{ display: "flex", gap: 4 }}>
+                  <input
+                    className="sidebar-tool-key-input"
+                    type="text"
+                    value={gitHubUrl}
+                    onChange={(e) => setGitHubUrl(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") handleConnectGitHub(); }}
+                    placeholder={t("connect_github_placeholder", locale)}
+                    style={{ flex: 1 }}
+                  />
+                  <button
+                    className="sidebar-tool-key-save-btn"
+                    disabled={!gitHubUrl.trim() || workspaceLoading}
+                    onClick={handleConnectGitHub}
+                  >
+                    {workspaceLoading ? "..." : "OK"}
+                  </button>
+                </div>
+              </div>
+            )}
+            {workspaceStatus && (
+              <div style={{
+                padding: "2px 12px 6px",
+                fontSize: "0.7rem",
+                color: workspaceStatus.includes("Error") || workspaceStatus.includes("failed") ? "#f87171" : "#4ade80",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}>
+                {workspaceStatus}
+              </div>
+            )}
+          </div>
+
           {/* Chats section */}
           <div className="sidebar-section sidebar-section-chats">
             <button
@@ -730,6 +895,19 @@ export function Sidebar({
               </svg>
             </span>
             {t("settings", locale)}
+          </button>
+          <button
+            className="sidebar-footer-btn sidebar-logout-btn"
+            onClick={onLogout}
+          >
+            <span className="icon">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                <polyline points="16 17 21 12 16 7" />
+                <line x1="21" y1="12" x2="9" y2="12" />
+              </svg>
+            </span>
+            {t("logout", locale)}
           </button>
         </div>
       </aside>

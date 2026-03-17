@@ -8,6 +8,7 @@ import { DeviceSelect } from "./components/DeviceSelect";
 import { Interpreter } from "./components/Interpreter";
 import { SetupWizard } from "./components/SetupWizard";
 import { GatewayStatus } from "./components/GatewayStatus";
+import { LockScreen } from "./components/LockScreen";
 import { DocumentEditor } from "./components/DocumentEditor";
 import { apiClient, type DeviceInfo, type ToolInfo, type ChannelInfo } from "./lib/api";
 import { getStoredLocale, setStoredLocale, t, type Locale } from "./lib/i18n";
@@ -29,7 +30,10 @@ import {
   type ChatMessage,
 } from "./lib/storage";
 
-type Page = "setup" | "login" | "signup" | "device_select" | "chat" | "settings" | "interpreter" | "document";
+type Page = "setup" | "login" | "signup" | "device_select" | "locked" | "chat" | "settings" | "interpreter" | "document";
+
+/** Inactivity auto-lock timeout in milliseconds (default: 5 minutes). */
+const AUTO_LOCK_TIMEOUT_MS = 5 * 60 * 1000;
 
 // Lazy-load Tauri invoke for document pre-processing
 let tauriInvoke: ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null = null;
@@ -112,18 +116,10 @@ function App() {
     }
 
     if (apiClient.isLoggedIn()) {
-      // Already have a token → go to chat
-      setIsConnected(true);
-      setPage("chat");
+      // Have a stored token → require password unlock before showing content.
+      // The gateway heartbeat starts, but the UI stays locked.
       apiClient.startHeartbeat();
-
-      // Auto-greet returning user if no active chat
-      const existingChats = loadChats();
-      const savedActiveId = getActiveChatId();
-      const activeExists = existingChats.some((c) => c.id === savedActiveId);
-      if (!activeExists) {
-        sendAutoGreeting(existingChats.length === 0);
-      }
+      setPage("locked");
     } else {
       setPage("login");
     }
@@ -441,6 +437,67 @@ function App() {
     setPage("login");
   }, []);
 
+  // ── Lock / Unlock ───────────────────────────────────────────────
+
+  const handleUnlock = useCallback(() => {
+    setIsConnected(true);
+    setPage("chat");
+
+    // Greet returning user if no active chat
+    const existingChats = loadChats();
+    const savedActiveId = getActiveChatId();
+    const activeExists = existingChats.some((c) => c.id === savedActiveId);
+    if (!activeExists) {
+      sendAutoGreeting(existingChats.length === 0);
+    }
+  }, [sendAutoGreeting]);
+
+  const handleLock = useCallback(() => {
+    setIsConnected(false);
+    setPage("locked");
+  }, []);
+
+  // ── Inactivity auto-lock timer ──────────────────────────────────
+  const inactivityTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    // Only run the inactivity timer while the user is in an authenticated page
+    const authenticatedPages: Page[] = ["chat", "settings", "interpreter", "document"];
+    if (!authenticatedPages.includes(page)) return;
+
+    const resetTimer = () => {
+      if (inactivityTimer.current) clearTimeout(inactivityTimer.current);
+      inactivityTimer.current = setTimeout(() => {
+        handleLock();
+      }, AUTO_LOCK_TIMEOUT_MS);
+    };
+
+    // Events that indicate user activity
+    const events = ["mousedown", "keydown", "touchstart", "scroll", "mousemove"];
+    events.forEach((e) => window.addEventListener(e, resetTimer, { passive: true }));
+    resetTimer(); // Start the timer
+
+    return () => {
+      events.forEach((e) => window.removeEventListener(e, resetTimer));
+      if (inactivityTimer.current) clearTimeout(inactivityTimer.current);
+    };
+  }, [page, handleLock]);
+
+  // Lock when the Tauri window loses focus (user switches away)
+  useEffect(() => {
+    if (!isTauri()) return;
+    const authenticatedPages: Page[] = ["chat", "settings", "interpreter", "document"];
+
+    const handleVisibilityChange = () => {
+      if (document.hidden && authenticatedPages.includes(page)) {
+        handleLock();
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+  }, [page, handleLock]);
+
   // Stable callback for GatewayStatus
   const handleGatewayReady = useCallback(() => setGatewayReady(true), []);
 
@@ -479,6 +536,19 @@ function App() {
           locale={locale}
           onLocaleChange={handleLocaleChange}
           onComplete={() => setPage("login")}
+        />
+      </div>
+    );
+  }
+
+  // Lock screen — user has a session but needs to re-authenticate
+  if (page === "locked") {
+    return (
+      <div className="app">
+        <LockScreen
+          locale={locale}
+          onUnlock={handleUnlock}
+          onLogout={handleLogout}
         />
       </div>
     );
@@ -548,6 +618,7 @@ function App() {
           setPage("document");
           if (window.innerWidth <= 768) setSidebarOpen(false);
         }}
+        onLogout={handleLogout}
         onToggle={() => setSidebarOpen((p) => !p)}
         currentPage={page}
       />
