@@ -83,6 +83,12 @@ nanohtml2text = "0.2"
 # Optional Rust-native browser automation backend
 fantoccini = { version = "0.22.1", optional = true, default-features = false, features = ["rustls-tls"] }
 
+# Progress bars (update pipeline)
+indicatif = "0.17"
+
+# Temp files (update pipeline rollback)
+tempfile = "3.26"
+
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"

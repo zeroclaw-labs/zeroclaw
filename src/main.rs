@@ -75,6 +75,7 @@ mod agent;
 mod approval;
 mod auth;
 mod channels;
+mod commands;
 mod rag {
     pub use zeroclaw::rag::*;
 }
@@ -464,6 +465,23 @@ Examples:
     Config {
         #[command(subcommand)]
         config_command: ConfigCommands,
+    },
+
+    /// Run diagnostic self-tests
+    #[command(long_about = "\
+Run diagnostic self-tests to verify the ZeroClaw installation.
+
+By default, runs the full test suite including network checks \
+(gateway health, memory round-trip). Use --quick to skip network \
+checks for faster offline validation.
+
+Examples:
+  zeroclaw self-test             # full suite
+  zeroclaw self-test --quick     # quick checks only (no network)")]
+    SelfTest {
+        /// Run quick checks only (no network)
+        #[arg(long)]
+        quick: bool,
     },
 
     /// Generate shell completion script to stdout
@@ -1231,6 +1249,20 @@ async fn main() -> Result<()> {
                 &config,
             ))
             .await
+        }
+
+        Commands::SelfTest { quick } => {
+            let results = if quick {
+                commands::self_test::run_quick(&config).await?
+            } else {
+                commands::self_test::run_full(&config).await?
+            };
+            commands::self_test::print_results(&results);
+            let failed = results.iter().filter(|r| !r.passed).count();
+            if failed > 0 {
+                std::process::exit(1);
+            }
+            Ok(())
         }
 
         Commands::Config { config_command } => match config_command {
