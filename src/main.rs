@@ -463,6 +463,25 @@ Examples:
         config_command: ConfigCommands,
     },
 
+    /// Check for and apply updates
+    #[command(long_about = "\
+Check for and apply ZeroClaw updates.
+
+By default, downloads and installs the latest release with a \
+6-phase pipeline: preflight, download, backup, validate, swap, \
+and smoke test. Automatic rollback on failure.
+
+Use --check to only check for updates without installing.
+
+Examples:
+  zeroclaw update             # download and install latest
+  zeroclaw update --check     # check only, don't install")]
+    Update {
+        /// Only check for updates, don't install
+        #[arg(long)]
+        check: bool,
+    },
+
     /// Run diagnostic self-tests
     #[command(long_about = "\
 Run diagnostic self-tests to verify the ZeroClaw installation.
@@ -1222,6 +1241,23 @@ async fn main() -> Result<()> {
                 &config,
             ))
             .await
+        }
+
+        Commands::Update { check } => {
+            if check {
+                let info = commands::update::check().await?;
+                if info.is_newer {
+                    println!(
+                        "Update available: v{} -> v{}",
+                        info.current_version, info.latest_version
+                    );
+                } else {
+                    println!("Already up to date (v{}).", info.current_version);
+                }
+                Ok(())
+            } else {
+                commands::update::run().await
+            }
         }
 
         Commands::SelfTest { quick } => {
