@@ -1487,6 +1487,10 @@ pub struct GatewayConfig {
     /// Auto-archive stale gateway sessions older than N hours. 0 = disabled. Default: 0.
     #[serde(default)]
     pub session_ttl_hours: u32,
+
+    /// Pairing dashboard configuration
+    #[serde(default)]
+    pub pairing_dashboard: PairingDashboardConfig,
 }
 
 fn default_gateway_port() -> u16 {
@@ -1541,6 +1545,55 @@ impl Default for GatewayConfig {
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             session_persistence: true,
             session_ttl_hours: 0,
+            pairing_dashboard: PairingDashboardConfig::default(),
+        }
+    }
+}
+
+/// Pairing dashboard configuration (`[gateway.pairing_dashboard]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PairingDashboardConfig {
+    /// Length of pairing codes (default: 6)
+    #[serde(default = "default_pairing_code_length")]
+    pub code_length: usize,
+    /// Time-to-live for pending pairing requests in seconds (default: 300)
+    #[serde(default = "default_pairing_ttl")]
+    pub ttl_secs: u64,
+    /// Maximum concurrent pending pairing requests (default: 10)
+    #[serde(default = "default_max_pending")]
+    pub max_pending: usize,
+    /// Maximum pairing attempts before lockout (default: 5)
+    #[serde(default = "default_max_pairing_attempts")]
+    pub max_attempts: u32,
+    /// Lockout duration in seconds after max attempts (default: 300)
+    #[serde(default = "default_pairing_lockout_secs")]
+    pub lockout_secs: u64,
+}
+
+fn default_pairing_code_length() -> usize {
+    6
+}
+fn default_pairing_ttl() -> u64 {
+    300
+}
+fn default_max_pending() -> usize {
+    10
+}
+fn default_max_pairing_attempts() -> u32 {
+    5
+}
+fn default_pairing_lockout_secs() -> u64 {
+    300
+}
+
+impl Default for PairingDashboardConfig {
+    fn default() -> Self {
+        Self {
+            code_length: default_pairing_code_length(),
+            ttl_secs: default_pairing_ttl(),
+            max_pending: default_max_pending(),
+            max_attempts: default_max_pairing_attempts(),
+            lockout_secs: default_pairing_lockout_secs(),
         }
     }
 }
