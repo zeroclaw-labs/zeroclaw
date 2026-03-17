@@ -393,6 +393,16 @@ fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
 }
 
+/// Extract the room/channel identifier from a reply_target.
+/// Matrix uses "sender||room_id" format; this returns the room_id portion.
+/// For other channels, returns the reply_target as-is.
+fn extract_room_id(reply_target: &str) -> &str {
+    reply_target
+        .split_once("||")
+        .map(|(_, room)| room)
+        .unwrap_or(reply_target)
+}
+
 /// Strip tool-call XML tags from outgoing messages.
 ///
 /// LLM responses may contain `<function_calls>`, `<function_call>`,
@@ -1841,9 +1851,10 @@ async fn process_channel_message(
     let mut route = get_route_selection(ctx.as_ref(), &history_key);
 
     // ── Per-channel provider override: route specific rooms to different providers ──
+    let room_id = extract_room_id(&msg.reply_target);
     if let Some(override_cfg) = ctx
         .channel_provider_map
-        .get(&msg.reply_target)
+        .get(room_id)
         .or_else(|| ctx.channel_provider_map.get(&msg.channel))
     {
         tracing::info!(
@@ -2005,10 +2016,11 @@ async fn process_channel_message(
     let system_prompt =
         build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
 
-    // Resolve per-channel workspace: check reply_target (room ID) then channel name.
+    // Resolve per-channel workspace: check room ID then channel name.
+    let room_id_for_ws = extract_room_id(&msg.reply_target);
     let workspace_prefix = ctx
         .channel_workspace_map
-        .get(&msg.reply_target)
+        .get(room_id_for_ws)
         .or_else(|| ctx.channel_workspace_map.get(&msg.channel))
         .map(|dir| format!("[ZEROCLAW_CWD:{}]\n", dir.display()));
 
