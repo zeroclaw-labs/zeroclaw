@@ -431,6 +431,7 @@ Chế độ WhatsApp Web (client gốc):
 | `pair_phone` | Tùy chọn | Số điện thoại cho luồng pair-code (chỉ chữ số) |
 | `pair_code` | Tùy chọn | Mã pair tùy chỉnh (nếu không sẽ tự tạo) |
 | `allowed_numbers` | Khuyến nghị | Số điện thoại cho phép gửi đến (`[]` = từ chối tất cả, `"*"` = cho phép tất cả) |
+| `mention_only` | Tùy chọn | Khi `true`, chỉ phản hồi trong nhóm khi được @nhắc đến. Tin nhắn riêng không bị ảnh hưởng. Cần `pair_phone`. Mặc định: `false` |
 
 Lưu ý:
 

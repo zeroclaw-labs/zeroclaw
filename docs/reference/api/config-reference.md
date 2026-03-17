@@ -562,6 +562,7 @@ WhatsApp Web mode (native client):
 | `pair_phone` | Optional | Pair-code flow phone number (digits only) |
 | `pair_code` | Optional | Custom pair code (otherwise auto-generated) |
 | `allowed_numbers` | Recommended | Allowed inbound numbers (`[]` = deny all, `"*"` = allow all) |
+| `mention_only` | Optional | When `true`, only respond in group chats when @mentioned. DMs unaffected. Requires `pair_phone`. Default: `false` |
 
 Notes:
 

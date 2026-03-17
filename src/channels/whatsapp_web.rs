@@ -58,6 +58,8 @@ pub struct WhatsAppWebChannel {
     pair_code: Option<String>,
     /// Allowed phone numbers (E.164 format) or "*" for all
     allowed_numbers: Vec<String>,
+    /// In group chats, only respond when the bot is mentioned
+    mention_only: bool,
     /// Bot handle for shutdown
     bot_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Client handle for sending messages and typing indicators
@@ -98,6 +100,7 @@ impl WhatsAppWebChannel {
             pair_phone,
             pair_code,
             allowed_numbers,
+            mention_only: false,
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
@@ -106,6 +109,57 @@ impl WhatsAppWebChannel {
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Set mention_only mode: in group chats, only respond when mentioned.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_mention_only(mut self, mention_only: bool) -> Self {
+        self.mention_only = mention_only;
+        self
+    }
+
+    /// Check if a JID represents a group chat (ends with @g.us).
+    #[cfg(feature = "whatsapp-web")]
+    fn is_group_chat(chat_jid: &str) -> bool {
+        chat_jid.contains("@g.us")
+    }
+
+    /// Collect all `mentioned_jid` entries from the message's `context_info`.
+    /// Checks every message sub-type that carries a `context_info` (text, image,
+    /// video, audio, document, sticker, location, contact).
+    #[cfg(feature = "whatsapp-web")]
+    fn collect_mentioned_jids(msg: &wa_rs_proto::whatsapp::Message) -> Vec<&str> {
+        use wa_rs_core::proto_helpers::MessageExt;
+
+        let base = msg.get_base_message();
+        let mut jids: Vec<&str> = Vec::new();
+
+        macro_rules! gather {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    if let Some(ref m) = base.$field {
+                        if let Some(ref ctx) = m.context_info {
+                            for jid in &ctx.mentioned_jid {
+                                jids.push(jid.as_str());
+                            }
+                        }
+                    }
+                )+
+            };
+        }
+
+        gather!(
+            extended_text_message,
+            image_message,
+            video_message,
+            audio_message,
+            document_message,
+            sticker_message,
+            location_message,
+            contact_message,
+        );
+
+        jids
     }
 
     /// Configure voice transcription (STT) for incoming voice notes.
@@ -620,6 +674,7 @@ impl Channel for WhatsAppWebChannel {
             // Build the bot
             let tx_clone = tx.clone();
             let allowed_numbers = self.allowed_numbers.clone();
+            let mention_only = self.mention_only;
             let logout_tx_clone = logout_tx.clone();
             let retry_count_clone = retry_count.clone();
             let session_revoked_clone = session_revoked.clone();
@@ -729,6 +784,55 @@ impl Channel for WhatsAppWebChannel {
                                         normalized
                                     );
                                     return;
+                                }
+
+                                // mention_only: in group chats, skip unless mentioned
+                                if mention_only && Self::is_group_chat(&chat) {
+                                    let own_pn = client.get_pn().await;
+                                    let own_lid = client.get_lid().await;
+
+                                    // If we can't determine our own identity yet, let
+                                    // the message through rather than silently dropping it.
+                                    if own_pn.is_none() && own_lid.is_none() {
+                                        tracing::warn!(
+                                            "WhatsApp Web: mention_only enabled but own JID unknown, allowing message"
+                                        );
+                                    } else {
+                                        let mentioned = Self::collect_mentioned_jids(&msg);
+
+                                        let pn_user = own_pn.as_ref().map(|j| j.user.as_str());
+                                        let lid_user = own_lid.as_ref().map(|j| j.user.as_str());
+
+                                        let is_mentioned = mentioned.iter().any(|jid| {
+                                            if let Some(pn) = pn_user {
+                                                if jid.starts_with(pn) {
+                                                    let rest = &jid[pn.len()..];
+                                                    if rest.starts_with('@') || rest.starts_with(':') {
+                                                        return true;
+                                                    }
+                                                }
+                                            }
+                                            if let Some(lid) = lid_user {
+                                                if jid.starts_with(lid) {
+                                                    let rest = &jid[lid.len()..];
+                                                    if rest.starts_with('@') || rest.starts_with(':') {
+                                                        return true;
+                                                    }
+                                                }
+                                            }
+                                            false
+                                        });
+
+                                        if !is_mentioned {
+                                            tracing::debug!(
+                                                "WhatsApp Web: mention_only enabled, skipping group message (not mentioned, mentioned_jids={:?}, own_pn={:?}, own_lid={:?})",
+                                                mentioned,
+                                                pn_user,
+                                                lid_user,
+                                            );
+                                            return;
+                                        }
+                                    }
                                 }
 
                                 if let Err(e) = tx_inner

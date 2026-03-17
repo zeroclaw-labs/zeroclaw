@@ -531,6 +531,7 @@ WhatsApp Web 模式（原生客户端）：
 | `pair_phone` | 可选 | 配对码流程电话号码（仅数字） |
 | `pair_code` | 可选 | 自定义配对码（否则自动生成） |
 | `allowed_numbers` | 推荐 | 允许的入站号码（`[]` = 拒绝所有，`"*"` = 允许所有） |
+| `mention_only` | 可选 | 设为 `true` 时仅在群聊中被 @提及时回复，私聊不受影响。需要 `pair_phone`。默认：`false` |
 
 注意事项：
 

@@ -3420,6 +3420,7 @@ fn collect_configured_channels(
                                 wa.pair_code.clone(),
                                 wa.allowed_numbers.clone(),
                             )
+                            .with_mention_only(wa.mention_only)
                             .with_transcription(config.transcription.clone())
                             .with_tts(config.tts.clone()),
                         ),

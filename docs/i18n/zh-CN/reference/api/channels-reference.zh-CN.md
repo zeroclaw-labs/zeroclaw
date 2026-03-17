@@ -251,6 +251,7 @@ session_path = \"~/.zeroclaw/state/whatsapp-web/session.db\"
 pair_phone = \"15551234567\"         # 可选; 省略使用二维码流程
 pair_code = \"\"                     # 可选自定义配对码
 allowed_numbers = [\"*\"]
+mention_only = false               # 可选; 设为 true 时仅在群聊中被 @提及时回复
 ```
 
 注意事项：
@@ -258,6 +259,7 @@ allowed_numbers = [\"*\"]
 - 使用 `cargo build --features whatsapp-web` 构建（或等效的运行命令）。
 - 将 `session_path` 保留在持久存储上，以避免重启后重新链接。
 - 回复路由使用发起聊天的 JID，因此直接和群组回复都能正常工作。
+- `mention_only`：启用后，机器人在群聊中仅在被 @提及时才会回复，私聊不受影响。需要设置 `pair_phone` 以便机器人在提及列表中识别自己的 JID。
 
 ### 4.8 Webhook 渠道配置（网关）
 

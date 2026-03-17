@@ -251,6 +251,7 @@ session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
 pair_phone = "15551234567"         # optional; omit to use QR flow
 pair_code = ""                     # optional custom pair code
 allowed_numbers = ["*"]
+mention_only = false               # optional; when true, only respond in group chats when @mentioned
 ```
 
 Notes:
@@ -258,6 +259,7 @@ Notes:
 - Build with `cargo build --features whatsapp-web` (or equivalent run command).
 - Keep `session_path` on persistent storage to avoid relinking after restart.
 - Reply routing uses the originating chat JID, so direct and group replies work correctly.
+- `mention_only`: when enabled, the bot ignores group chat messages unless it is explicitly @mentioned. DMs are unaffected. Requires `pair_phone` to be set so the bot can identify its own JID in the mention list.
 
 ### 4.8 Webhook Channel Config (Gateway)
 
