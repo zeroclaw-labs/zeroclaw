@@ -103,7 +103,7 @@ impl Tool for FileEditTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        let full_path = self.security.resolve_tool_path(path);
 
         // ── 5. Canonicalize parent ─────────────────────────────────
         let Some(parent) = full_path.parent() else {
