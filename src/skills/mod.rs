@@ -519,11 +519,20 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
 fn load_open_skill_md(path: &Path) -> Result<Skill> {
     let content = std::fs::read_to_string(path)?;
     let parsed = parse_skill_markdown(&content);
-    let name = path
+    let file_stem = path
         .file_stem()
         .and_then(|n| n.to_str())
         .unwrap_or("open-skill")
         .to_string();
+    let name = if file_stem.eq_ignore_ascii_case("skill") {
+        path.parent()
+            .and_then(|dir| dir.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or(&file_stem)
+            .to_string()
+    } else {
+        file_stem
+    };
     Ok(finalize_open_skill(Skill {
         name: parsed.meta.name.unwrap_or(name),
         description: parsed
