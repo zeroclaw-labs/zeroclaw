@@ -114,6 +114,8 @@ ENV ZEROCLAW_GATEWAY_PORT=42617
 WORKDIR /zeroclaw-data
 USER 65534:65534
 EXPOSE 42617
+HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
+    CMD ["zeroclaw", "status", "--format=exit-code"]
 ENTRYPOINT ["zeroclaw"]
 CMD ["gateway"]
 
@@ -138,5 +140,7 @@ ENV ZEROCLAW_GATEWAY_PORT=42617
 WORKDIR /zeroclaw-data
 USER 65534:65534
 EXPOSE 42617
+HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
+    CMD ["zeroclaw", "status", "--format=exit-code"]
 ENTRYPOINT ["zeroclaw"]
 CMD ["gateway"]
