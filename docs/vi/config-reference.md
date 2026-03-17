@@ -257,9 +257,16 @@ Lưu ý:
 | Khóa | Mặc định | Mục đích |
 |---|---|---|
 | `host` | `127.0.0.1` | Địa chỉ bind |
-| `port` | `3000` | Cổng lắng nghe gateway |
+| `port` | `42617` | Cổng lắng nghe gateway |
 | `require_pairing` | `true` | Yêu cầu ghép nối trước khi xác thực bearer |
 | `allow_public_bind` | `false` | Chặn lộ public do vô ý |
+| `trust_forwarded_headers` | `false` | Tin tưởng `X-Forwarded-For`/`X-Real-IP` để lấy IP client (chỉ bật sau reverse proxy tin cậy) |
+| `pair_rate_limit_per_minute` | `10` | Số yêu cầu `/pair` tối đa mỗi phút mỗi client |
+| `webhook_rate_limit_per_minute` | `60` | Số yêu cầu `/webhook` tối đa mỗi phút mỗi client |
+| `webhook_tools` | `false` | Chạy vòng lặp agent đầy đủ (MCP tools, memory, skills) trên `/webhook` thay vì chat đơn giản |
+| `idempotency_ttl_secs` | `300` | TTL cho khóa idempotency webhook |
+| `idempotency_max_keys` | `10000` | Số khóa idempotency tối đa trong bộ nhớ |
+| `rate_limit_max_keys` | `10000` | Số khóa client tối đa được rate limiter theo dõi |
 
 ## `[autonomy]`
 

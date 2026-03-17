@@ -322,6 +322,13 @@ temperature = 0.2
 | `port` | `42617` | 网关监听端口 |
 | `require_pairing` | `true` | bearer 认证前需要配对 |
 | `allow_public_bind` | `false` | 阻止意外公共暴露 |
+| `trust_forwarded_headers` | `false` | 信任 `X-Forwarded-For`/`X-Real-IP` 获取客户端 IP（仅在受信任的反向代理后启用） |
+| `pair_rate_limit_per_minute` | `10` | 每客户端每分钟最大 `/pair` 请求数 |
+| `webhook_rate_limit_per_minute` | `60` | 每客户端每分钟最大 `/webhook` 请求数 |
+| `webhook_tools` | `false` | 在 `/webhook` 上运行完整代理循环（MCP 工具、记忆、技能）而非简单聊天 |
+| `idempotency_ttl_secs` | `300` | webhook 幂等键 TTL |
+| `idempotency_max_keys` | `10000` | 内存中最大幂等键数 |
+| `rate_limit_max_keys` | `10000` | 速率限制器跟踪的最大客户端键数 |
 
 ## `[autonomy]`
 
