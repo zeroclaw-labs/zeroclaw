@@ -151,6 +151,9 @@ pub struct JiraUpdate {
 // ── Priority helpers ───────────────────────────────────────────
 
 /// Numeric rank for priority comparison. Higher = more urgent.
+///
+/// Unknown priority strings (anything other than "low", "urgent", "high", or
+/// "critical") fall back to normal priority (rank 2).
 fn priority_rank(priority: &str) -> u8 {
     match priority.to_lowercase().as_str() {
         "low" => 1,
