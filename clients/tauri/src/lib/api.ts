@@ -317,17 +317,20 @@ export class MoAClient {
       const effectiveDetail = channels_detail.length > 0
         ? channels_detail
         : (data.channels ?? []).map((name: string) => ({ name, enabled: true }));
+      const tools = data.tools ?? [];
+      // If backend returns empty tools, use fallback list
+      const fallback = this.fallbackAgentInfo();
       return {
         channels: data.channels ?? [],
-        channels_detail: effectiveDetail,
-        tools: data.tools ?? [],
+        channels_detail: effectiveDetail.length > 0 ? effectiveDetail : fallback.channels_detail,
+        tools: tools.length > 0 ? tools : fallback.tools,
       };
     } catch {
       return this.fallbackAgentInfo();
     }
   }
 
-  /** Fallback agent info with all known ZeroClaw channels */
+  /** Fallback agent info with all known ZeroClaw channels and tools */
   private fallbackAgentInfo(): AgentInfo {
     const ALL_CHANNELS = [
       "telegram", "discord", "slack", "mattermost", "whatsapp", "line",
@@ -335,10 +338,74 @@ export class MoAClient {
       "irc", "email", "github", "nostr", "imessage", "bluebubbles",
       "linq", "wati", "nextcloud_talk", "napcat", "acp", "clawdtalk", "webhook",
     ];
+    const ALL_TOOLS: ToolInfo[] = [
+      { name: "shell", description: "Execute a shell command in the workspace directory" },
+      { name: "process", description: "Manage background processes: spawn, check output, terminate" },
+      { name: "git_operations", description: "Git repository operations (status, diff, commit, branch, etc.)" },
+      { name: "file_read", description: "Read a file from the workspace" },
+      { name: "file_write", description: "Write contents to a file in the workspace" },
+      { name: "file_edit", description: "Edit a file by replacing text content" },
+      { name: "apply_patch", description: "Apply a unified diff patch to git repository" },
+      { name: "glob_search", description: "Search for files by glob pattern in the workspace" },
+      { name: "content_search", description: "Search file contents by regex pattern in the workspace" },
+      { name: "browser", description: "Web/browser automation with pluggable backends" },
+      { name: "browser_open", description: "Open an approved HTTPS URL in a browser" },
+      { name: "http_request", description: "Make HTTP requests (GET, POST, PUT, DELETE)" },
+      { name: "web_fetch", description: "Fetch content from a URL" },
+      { name: "web_search_tool", description: "Search the web for information" },
+      { name: "memory_store", description: "Store a fact or note in long-term memory" },
+      { name: "memory_recall", description: "Search long-term memory for relevant facts" },
+      { name: "memory_observe", description: "Observe and record context for memory" },
+      { name: "memory_forget", description: "Remove a memory by key" },
+      { name: "pdf_read", description: "Extract text from PDF files" },
+      { name: "docx_read", description: "Extract text from DOCX (Word) files" },
+      { name: "document_process", description: "Hancom/HWP document viewer and converter" },
+      { name: "pptx_read", description: "Extract text from PPTX (PowerPoint) files" },
+      { name: "xlsx_read", description: "Extract data from XLSX (Excel) files" },
+      { name: "screenshot", description: "Capture a screenshot of the current screen" },
+      { name: "image_info", description: "Read image file metadata and base64 data" },
+      { name: "task_plan", description: "Manage task checklists for the current session" },
+      { name: "cron_list", description: "List scheduled cron jobs" },
+      { name: "cron_add", description: "Add a new cron job" },
+      { name: "cron_remove", description: "Remove a cron job" },
+      { name: "cron_run", description: "Run a cron job immediately" },
+      { name: "cron_runs", description: "List recent cron job run history" },
+      { name: "cron_update", description: "Update an existing cron job" },
+      { name: "bg_run", description: "Execute a tool in the background" },
+      { name: "bg_status", description: "Query background job status" },
+      { name: "subagent_spawn", description: "Spawn a background sub-agent" },
+      { name: "subagent_list", description: "List active sub-agents" },
+      { name: "subagent_manage", description: "Manage sub-agent sessions" },
+      { name: "delegate", description: "Delegate tasks to specialized agents" },
+      { name: "delegate_coordination_status", description: "Inspect delegate coordination state" },
+      { name: "wasm_module", description: "Run WebAssembly modules" },
+      { name: "composio", description: "Execute actions on 1000+ apps via Composio" },
+      { name: "openclaw_migration", description: "OpenClaw migration tool" },
+      { name: "manage_auth_profile", description: "Manage auth profiles and tokens" },
+      { name: "proxy_config", description: "Manage proxy settings" },
+      { name: "web_access_config", description: "Manage network URL access policy" },
+      { name: "web_search_config", description: "Configure web search settings" },
+      { name: "check_provider_quota", description: "Check AI provider rate limits" },
+      { name: "switch_provider", description: "Switch to a different AI provider" },
+      { name: "estimate_quota_cost", description: "Estimate quota cost for operations" },
+      { name: "hardware_board_info", description: "Get connected hardware board info" },
+      { name: "hardware_memory_map", description: "Get hardware memory map" },
+      { name: "hardware_memory_read", description: "Read memory/registers from hardware" },
+      { name: "sop_list", description: "List available SOPs" },
+      { name: "sop_execute", description: "Execute a standard operating procedure" },
+      { name: "sop_status", description: "Query SOP execution status" },
+      { name: "sop_advance", description: "Advance SOP execution to next step" },
+      { name: "sop_approve", description: "Approve a pending SOP step" },
+      { name: "state_get", description: "Get agent runtime state" },
+      { name: "state_set", description: "Set agent runtime state" },
+      { name: "model_routing_config", description: "Configure model routing" },
+      { name: "channel_ack_config", description: "Configure channel acknowledgment" },
+      { name: "schedule", description: "Schedule tasks for future execution" },
+    ];
     return {
       channels: [],
       channels_detail: ALL_CHANNELS.map((name) => ({ name, enabled: false })),
-      tools: [],
+      tools: ALL_TOOLS,
     };
   }
 

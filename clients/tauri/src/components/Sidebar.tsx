@@ -53,6 +53,72 @@ const CHANNEL_DISPLAY_NAMES: Record<string, string> = {
   webhook: "Webhook",
 };
 
+/** Pretty display names for tools */
+const TOOL_DISPLAY_NAMES: Record<string, string> = {
+  shell: "Shell",
+  process: "Process Manager",
+  git_operations: "Git Operations",
+  file_read: "File Read",
+  file_write: "File Write",
+  file_edit: "File Edit",
+  apply_patch: "Apply Patch",
+  glob_search: "Glob Search",
+  content_search: "Content Search",
+  browser: "Browser Automation",
+  browser_open: "Browser Open",
+  http_request: "HTTP Request",
+  web_fetch: "Web Fetch",
+  web_search_tool: "Web Search",
+  memory_store: "Memory Store",
+  memory_recall: "Memory Recall",
+  memory_observe: "Memory Observe",
+  memory_forget: "Memory Forget",
+  pdf_read: "PDF Reader",
+  docx_read: "DOCX Reader",
+  document_process: "Hancom Document Viewer",
+  pptx_read: "PPTX Reader",
+  xlsx_read: "XLSX Reader",
+  screenshot: "Screenshot",
+  image_info: "Image Info",
+  task_plan: "Task Planner",
+  cron_list: "Cron List",
+  cron_add: "Cron Add",
+  cron_remove: "Cron Remove",
+  cron_run: "Cron Run",
+  cron_runs: "Cron History",
+  cron_update: "Cron Update",
+  bg_run: "Background Run",
+  bg_status: "Background Status",
+  subagent_spawn: "Sub-Agent Spawn",
+  subagent_list: "Sub-Agent List",
+  subagent_manage: "Sub-Agent Manage",
+  delegate: "Delegate",
+  delegate_coordination_status: "Delegation Status",
+  wasm_module: "WASM Module",
+  composio: "Composio",
+  openclaw_migration: "OpenClaw Migration",
+  manage_auth_profile: "Auth Profile",
+  proxy_config: "Proxy Config",
+  web_access_config: "Web Access Config",
+  web_search_config: "Web Search Config",
+  check_provider_quota: "Quota Check",
+  switch_provider: "Switch Provider",
+  estimate_quota_cost: "Quota Estimate",
+  hardware_board_info: "Hardware Board Info",
+  hardware_memory_map: "Hardware Memory Map",
+  hardware_memory_read: "Hardware Memory Read",
+  sop_list: "SOP List",
+  sop_execute: "SOP Execute",
+  sop_status: "SOP Status",
+  sop_advance: "SOP Advance",
+  sop_approve: "SOP Approve",
+  state_get: "State Get",
+  state_set: "State Set",
+  model_routing_config: "Model Routing",
+  channel_ack_config: "Channel Ack Config",
+  schedule: "Scheduler",
+};
+
 /** Format a timestamp to a short time string (HH:MM) */
 function formatTime(ts: number): string {
   const d = new Date(ts);
@@ -286,13 +352,10 @@ export function Sidebar({
                 ) : (
                   tools.map((tool) => (
                     <div key={tool.name} className="sidebar-info-item" title={tool.description}>
-                      <span className="sidebar-tool-icon">
-                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                          <polyline points="4 17 10 11 4 5" />
-                          <line x1="12" y1="19" x2="20" y2="19" />
-                        </svg>
+                      <span className="sidebar-device-status active" />
+                      <span className="sidebar-info-label">
+                        {TOOL_DISPLAY_NAMES[tool.name] ?? tool.name}
                       </span>
-                      <span className="sidebar-info-label">{tool.name}</span>
                     </div>
                   ))
                 )}
