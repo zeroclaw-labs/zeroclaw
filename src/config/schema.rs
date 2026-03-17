@@ -93,6 +93,12 @@ pub struct Config {
     #[serde(default)]
     pub channel_workspaces: HashMap<String, String>,
 
+    /// Map channel identifiers to provider+model overrides.
+    /// Enables per-room provider routing (e.g. one Matrix room uses local llama.cpp).
+    /// Example: `{ "!roomXYZ:server" = { provider = "custom:http://localhost:8080", model = "qwen" } }`
+    #[serde(default)]
+    pub channel_providers: HashMap<String, ChannelProviderOverride>,
+
     /// Default model temperature (0.0–2.0). Default: `0.7`.
     #[serde(
         default = "default_temperature",
@@ -3605,6 +3611,15 @@ impl<T: ChannelConfig> crate::config::traits::ConfigHandle for ConfigWrapper<T> 
 
 /// Top-level channel configurations (`[channels_config]` section).
 ///
+/// Per-channel provider+model override for channel_providers routing.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ChannelProviderOverride {
+    /// Provider name (e.g. "ollama", "custom:http://localhost:8080", "anthropic").
+    pub provider: String,
+    /// Model name for this provider.
+    pub model: String,
+}
+
 /// Each channel sub-section (e.g. `telegram`, `discord`) is optional;
 /// setting it to `Some(...)` enables that channel.
 #[allow(clippy::struct_excessive_bools)]
@@ -5241,6 +5256,7 @@ impl Default for Config {
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             model_providers: HashMap::new(),
             channel_workspaces: HashMap::new(),
+            channel_providers: HashMap::new(),
             default_temperature: default_temperature(),
             provider_timeout_secs: default_provider_timeout_secs(),
             extra_headers: HashMap::new(),

@@ -315,6 +315,8 @@ struct ChannelRuntimeContext {
     workspace_dir: Arc<PathBuf>,
     /// Maps channel identifiers (e.g. Matrix room IDs) to local workspace paths.
     channel_workspace_map: Arc<HashMap<String, PathBuf>>,
+    /// Maps channel identifiers to provider+model overrides for per-room routing.
+    channel_provider_map: Arc<HashMap<String, crate::config::schema::ChannelProviderOverride>>,
     message_timeout_secs: u64,
     interrupt_on_new_message: InterruptOnNewMessageConfig,
     multimodal: crate::config::MultimodalConfig,
@@ -1837,6 +1839,24 @@ async fn process_channel_message(
 
     let history_key = conversation_history_key(&msg);
     let mut route = get_route_selection(ctx.as_ref(), &history_key);
+
+    // ── Per-channel provider override: route specific rooms to different providers ──
+    if let Some(override_cfg) = ctx
+        .channel_provider_map
+        .get(&msg.reply_target)
+        .or_else(|| ctx.channel_provider_map.get(&msg.channel))
+    {
+        tracing::info!(
+            provider = override_cfg.provider.as_str(),
+            model = override_cfg.model.as_str(),
+            channel = %msg.channel,
+            "Channel provider override applied"
+        );
+        route = ChannelRouteSelection {
+            provider: override_cfg.provider.clone(),
+            model: override_cfg.model.clone(),
+        };
+    }
 
     // ── Query classification: override route when a rule matches ──
     if let Some(hint) = crate::agent::classifier::classify(&ctx.query_classification, &msg.content)
@@ -4004,6 +4024,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 .map(|(k, v)| (k.clone(), PathBuf::from(v)))
                 .collect(),
         ),
+        channel_provider_map: Arc::new(config.channel_providers.clone()),
         message_timeout_secs,
         interrupt_on_new_message: InterruptOnNewMessageConfig {
             telegram: interrupt_on_new_message,
