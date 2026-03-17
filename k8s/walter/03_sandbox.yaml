@@ -241,8 +241,10 @@ spec:
                 sleep 1
               done
               (echo > /dev/tcp/127.0.0.1/9121) 2>/dev/null || echo "Warning: Serena not ready, starting zeroclaw anyway"
-              # Seed pr-review-monitor cron job if it doesn't exist.
-              python3 /data/.zeroclaw/seed-cron.py || echo "Warning: cron seed failed, continuing"
+              # Seed pr-review-monitor cron job. Run once now, and schedule
+              # a retry 30s after zeroclaw starts in case it recreates the DB.
+              python3 /data/.zeroclaw/seed-cron.py || echo "Warning: initial cron seed failed"
+              (sleep 30 && python3 /data/.zeroclaw/seed-cron.py) &
               exec zeroclaw daemon
           ports:
             - name: http
