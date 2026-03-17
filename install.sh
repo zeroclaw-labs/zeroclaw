@@ -1359,6 +1359,13 @@ else
   echo -e "${BOLD_BLUE}${CRAB} ZeroClaw installed successfully!${RESET}"
 fi
 
+if [[ -x "$HOME/.cargo/bin/zeroclaw" ]] && ! have_cmd zeroclaw; then
+  echo
+  warn "zeroclaw is installed in $HOME/.cargo/bin, but that directory is not in PATH for this shell."
+  warn 'Run: export PATH="$HOME/.cargo/bin:$PATH"'
+  step_dot "To persist it, add that export line to ~/.bashrc, ~/.zshrc, or your shell profile, then open a new shell."
+fi
+
 if [[ "$INSTALL_MODE" == "upgrade" ]]; then
   step_dot "Upgrade complete"
 fi
