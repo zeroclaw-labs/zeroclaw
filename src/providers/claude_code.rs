@@ -368,6 +368,7 @@ impl ClaudeCodeProvider {
     ) -> anyhow::Result<String> {
         let mut cmd = Command::new(&self.binary_path);
         cmd.arg("--print");
+        cmd.arg("--verbose");
         cmd.arg("--dangerously-skip-permissions");
         cmd.arg("--output-format").arg("stream-json");
 
