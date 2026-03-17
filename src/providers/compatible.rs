@@ -41,6 +41,8 @@ pub struct OpenAiCompatibleProvider {
     timeout_secs: u64,
     /// Extra HTTP headers to include in all API requests.
     extra_headers: std::collections::HashMap<String, String>,
+    /// Optional reasoning effort for GPT-5/Codex-compatible backends.
+    reasoning_effort: Option<String>,
     /// Custom API path suffix (e.g. "/v2/generate").
     /// When set, overrides the default `/chat/completions` path detection.
     api_path: Option<String>,
@@ -179,6 +181,7 @@ impl OpenAiCompatibleProvider {
             native_tool_calling: !merge_system_into_user,
             timeout_secs: 120,
             extra_headers: std::collections::HashMap::new(),
+            reasoning_effort: None,
             api_path: None,
         }
     }
@@ -195,6 +198,12 @@ impl OpenAiCompatibleProvider {
         headers: std::collections::HashMap<String, String>,
     ) -> Self {
         self.extra_headers = headers;
+        self
+    }
+
+    /// Set reasoning effort for GPT-5/Codex-compatible chat-completions APIs.
+    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
+        self.reasoning_effort = reasoning_effort;
         self
     }
 
@@ -363,6 +372,14 @@ impl OpenAiCompatibleProvider {
             })
             .collect()
     }
+
+    fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
+        let id = model.rsplit('/').next().unwrap_or(model);
+        let supports_reasoning_effort = id.starts_with("gpt-5") || id.contains("codex");
+        supports_reasoning_effort
+            .then(|| self.reasoning_effort.clone())
+            .flatten()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -372,6 +389,8 @@ struct ApiChatRequest {
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -568,6 +587,8 @@ struct NativeChatRequest {
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1240,6 +1261,7 @@ impl Provider for OpenAiCompatibleProvider {
             messages,
             temperature,
             stream: Some(false),
+            reasoning_effort: self.reasoning_effort_for_model(model),
             tools: None,
             tool_choice: None,
         };
@@ -1362,6 +1384,7 @@ impl Provider for OpenAiCompatibleProvider {
             messages: api_messages,
             temperature,
             stream: Some(false),
+            reasoning_effort: self.reasoning_effort_for_model(model),
             tools: None,
             tool_choice: None,
         };
@@ -1472,6 +1495,7 @@ impl Provider for OpenAiCompatibleProvider {
             messages: api_messages,
             temperature,
             stream: Some(false),
+            reasoning_effort: self.reasoning_effort_for_model(model),
             tools: if tools.is_empty() {
                 None
             } else {
@@ -1577,6 +1601,7 @@ impl Provider for OpenAiCompatibleProvider {
             ),
             temperature,
             stream: Some(false),
+            reasoning_effort: self.reasoning_effort_for_model(model),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
@@ -1720,6 +1745,7 @@ impl Provider for OpenAiCompatibleProvider {
             messages,
             temperature,
             stream: Some(options.enabled),
+            reasoning_effort: self.reasoning_effort_for_model(model),
             tools: None,
             tool_choice: None,
         };
@@ -1861,6 +1887,7 @@ mod tests {
             ],
             temperature: 0.4,
             stream: Some(false),
+            reasoning_effort: None,
             tools: None,
             tool_choice: None,
         };
@@ -2441,6 +2468,22 @@ mod tests {
         assert!(output[0].content.contains("shell_exec"));
     }
 
+    #[test]
+    fn reasoning_effort_only_applies_to_gpt5_and_codex_models() {
+        let provider = make_provider("test", "https://example.com", None)
+            .with_reasoning_effort(Some("high".to_string()));
+
+        assert_eq!(
+            provider.reasoning_effort_for_model("gpt-5.3-codex"),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            provider.reasoning_effort_for_model("openai/gpt-5"),
+            Some("high".to_string())
+        );
+        assert_eq!(provider.reasoning_effort_for_model("llama-3.3-70b"), None);
+    }
+
     #[tokio::test]
     async fn warmup_without_key_is_noop() {
         let provider = make_provider("test", "https://example.com", None);
@@ -2617,6 +2660,7 @@ mod tests {
             }],
             temperature: 0.7,
             stream: Some(false),
+            reasoning_effort: None,
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
         };
