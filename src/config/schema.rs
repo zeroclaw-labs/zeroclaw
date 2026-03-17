@@ -2172,16 +2172,6 @@ impl Default for GoogleWorkspaceConfig {
     }
 }
 
-impl Default for GoogleWorkspaceConfig {
-    #[allow(clippy::derivable_impls)]
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            allowed_services: Vec::new(),
-        }
-    }
-}
-
 // ── Proxy ───────────────────────────────────────────────────────
 
 /// Proxy application scope — determines which outbound traffic uses the proxy.
