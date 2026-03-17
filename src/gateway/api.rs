@@ -322,6 +322,99 @@ pub async fn handle_api_config_api_key_put(
     Json(serde_json::json!({"status": "ok", "provider": backend_provider})).into_response()
 }
 
+/// PUT /api/config/tool-api-key — save or remove an API key for a tool
+pub async fn handle_api_config_tool_api_key_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let tool = body
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let api_key = body
+        .get("api_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if tool.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "tool is required"})),
+        )
+            .into_response();
+    }
+
+    let mut config = state.config.lock().clone();
+
+    let opt_key = if api_key.is_empty() { None } else { Some(api_key.clone()) };
+
+    // Route API key to the correct config section
+    match tool.as_str() {
+        "composio" => {
+            config.composio.api_key = opt_key.clone();
+            if opt_key.is_some() {
+                config.composio.enabled = true;
+            }
+        }
+        "web_search_tool" | "web_search" => {
+            config.web_search.api_key = opt_key.clone();
+            if opt_key.is_some() {
+                config.web_search.enabled = true;
+            }
+        }
+        "web_search_brave" => {
+            config.web_search.brave_api_key = opt_key;
+        }
+        "web_search_perplexity" => {
+            config.web_search.perplexity_api_key = opt_key;
+        }
+        "web_search_exa" => {
+            config.web_search.exa_api_key = opt_key;
+        }
+        "web_search_jina" => {
+            config.web_search.jina_api_key = opt_key;
+        }
+        "web_fetch" => {
+            config.web_fetch.api_key = opt_key.clone();
+            if opt_key.is_some() {
+                config.web_fetch.enabled = true;
+            }
+        }
+        "pushover" => {
+            // Pushover uses env vars; store the token in process env
+            if !api_key.is_empty() {
+                std::env::set_var("PUSHOVER_TOKEN", &api_key);
+            }
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Unknown tool: {tool}")})),
+            )
+                .into_response();
+        }
+    }
+
+    if let Err(e) = config.save().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save: {e}")})),
+        )
+            .into_response();
+    }
+
+    *state.config.lock() = config;
+
+    Json(serde_json::json!({"status": "ok", "tool": tool})).into_response()
+}
+
 /// GET /api/tools — list registered tool specs
 pub async fn handle_api_tools(
     State(state): State<AppState>,

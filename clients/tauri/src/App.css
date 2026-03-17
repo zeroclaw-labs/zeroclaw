@@ -349,6 +349,130 @@ html, body {
   margin-top: 4px;
 }
 
+/* ── Tool API Key UI ───────────────────────────────── */
+
+.sidebar-section-header-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.sidebar-tool-key-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: none;
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  padding: 0;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.sidebar-tool-key-btn:hover {
+  color: var(--color-primary);
+  background: var(--color-primary-bg);
+}
+
+.sidebar-tool-key-dropdown {
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  margin: 4px 8px 8px;
+  padding: 10px;
+}
+
+.sidebar-tool-key-dropdown-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  margin-bottom: 8px;
+}
+
+.sidebar-tool-key-select {
+  width: 100%;
+  padding: 6px 8px;
+  font-size: 11px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  outline: none;
+  cursor: pointer;
+  font-family: var(--font-sans);
+}
+
+.sidebar-tool-key-select:focus {
+  border-color: var(--color-primary);
+}
+
+.sidebar-tool-key-input-row {
+  display: flex;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.sidebar-tool-key-input {
+  flex: 1;
+  padding: 6px 8px;
+  font-size: 11px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  outline: none;
+  font-family: var(--font-mono);
+  min-width: 0;
+}
+
+.sidebar-tool-key-input:focus {
+  border-color: var(--color-primary);
+}
+
+.sidebar-tool-key-save-btn {
+  padding: 6px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--color-primary);
+  color: white;
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: var(--font-sans);
+  transition: opacity var(--transition-fast);
+}
+
+.sidebar-tool-key-save-btn:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.sidebar-tool-key-save-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.sidebar-tool-key-saved-msg {
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--color-success);
+  text-align: center;
+}
+
+.sidebar-tool-needs-key {
+  font-size: 9px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 3px;
+  flex-shrink: 0;
+  background: rgba(251, 191, 36, 0.15);
+  color: #f59e0b;
+  white-space: nowrap;
+}
+
 .sidebar-empty {
   text-align: center;
   padding: 32px 16px;
