@@ -1181,6 +1181,8 @@ impl OpenAiCompatibleProvider {
             "does not support tools",
             "function calling is not supported",
             "tool_choice",
+            "tool call validation failed",
+            "was not in request",
         ]
         .iter()
         .any(|hint| lower.contains(hint))
@@ -2416,6 +2418,14 @@ mod tests {
                 "unknown parameter: tools"
             )
         );
+    }
+
+    #[test]
+    fn native_tool_schema_unsupported_detects_groq_tool_validation_error() {
+        assert!(OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"Groq API error (400 Bad Request): {"error":{"message":"tool call validation failed: attempted to call tool 'memory_recall={\"limit\":5}' which was not in request"}}"#
+        ));
     }
 
     #[test]
