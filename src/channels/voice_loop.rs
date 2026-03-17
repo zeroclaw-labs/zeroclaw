@@ -31,9 +31,6 @@ pub struct VoiceLoopConfig {
     /// Enable voice-loop mode (auto-reply with audio when voice message received).
     #[serde(default)]
     pub enabled: bool,
-    /// TTS provider to use (empty = default from TTS config).
-    #[serde(default)]
-    pub tts_provider: String,
     /// Voice to use for TTS.
     #[serde(default = "default_voice")]
     pub voice: String,
@@ -43,20 +40,15 @@ pub struct VoiceLoopConfig {
     /// Maximum character count to synthesize (longer responses sent as text).
     #[serde(default = "default_max_tts_length")]
     pub max_tts_length: usize,
-    /// Also send text transcription alongside audio.
-    #[serde(default)]
-    pub include_text: bool,
 }
 
 impl Default for VoiceLoopConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            tts_provider: String::new(),
             voice: default_voice(),
             audio_format: default_audio_format(),
             max_tts_length: default_max_tts_length(),
-            include_text: false,
         }
     }
 }
@@ -107,11 +99,9 @@ mod tests {
     fn defaults_are_correct() {
         let config = VoiceLoopConfig::default();
         assert!(!config.enabled);
-        assert!(config.tts_provider.is_empty());
         assert_eq!(config.voice, "alloy");
         assert_eq!(config.audio_format, "opus");
         assert_eq!(config.max_tts_length, 4096);
-        assert!(!config.include_text);
     }
 
     #[test]
