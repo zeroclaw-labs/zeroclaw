@@ -364,15 +364,4 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ── Post-publish: tweet after release + website are live ──────────────
-  # Docker is slow (multi-platform) and can be cancelled by concurrency;
-  # don't let it block the tweet.
-  tweet:
-    name: Tweet Release
-    needs: [version, publish, redeploy-website]
-    if: ${{ !cancelled() && needs.publish.result == 'success' }}
-    uses: ./.github/workflows/tweet-release.yml
-    with:
-      release_tag: ${{ needs.version.outputs.tag }}
-      release_url: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/${{ needs.version.outputs.tag }}
-    secrets: inherit
+  # Tweet removed — only stable releases should tweet (see tweet-release.yml).
