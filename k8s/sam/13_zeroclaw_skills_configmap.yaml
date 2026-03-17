@@ -560,7 +560,10 @@ data:
     team's Vikunja instance (todolist.coffee-anon.com). Use it to track
     work status, create actionable task lists, and report progress.
 
-    The tool is already on your PATH and authenticated via VIKUNJA_API_TOKEN.
+    The tool is already on your PATH and authenticated — just run it
+    directly via your shell tool (e.g., `vikunja projects`). Do not
+    check for tokens or try alternative approaches. If it fails, report
+    the error output.
 
     ## When to use this
 
