@@ -14,8 +14,11 @@
 //!
 //! # Thread safety
 //!
-//! The [`CliSessionManager`] is designed for concurrent use via `Arc<RwLock<>>`.
-//! Multiple agent loops can share a single manager instance.
+//! The [`CliSessionManager`] uses a two-level locking strategy:
+//! - An outer `RwLock<HashMap>` protects the session map (short-lived locks).
+//! - Each session is wrapped in `Arc<Mutex<CliSession>>` for independent I/O.
+//!
+//! This avoids holding the map lock during long-running stdin/stdout operations.
 
 use anyhow::{bail, Result};
 use schemars::JsonSchema;
@@ -24,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 // ── Configuration ────────────────────────────────────────────────
 
@@ -34,7 +37,7 @@ pub struct CliSessionConfig {
     /// Enable session management. When false, no sessions are created.
     #[serde(default)]
     pub enabled: bool,
-    /// Maximum concurrent sessions per CLI type.
+    /// Maximum concurrent sessions (across all CLI types).
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
     /// Session idle timeout in seconds — kill after inactivity.
@@ -73,6 +76,32 @@ impl Default for CliSessionConfig {
     }
 }
 
+impl CliSessionConfig {
+    /// Validate configuration values. Returns an error if any value is out of
+    /// acceptable range.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_sessions < 1 {
+            bail!(
+                "cli_sessions.max_sessions must be >= 1, got {}",
+                self.max_sessions
+            );
+        }
+        if self.idle_timeout_secs < 1 {
+            bail!(
+                "cli_sessions.idle_timeout_secs must be >= 1, got {}",
+                self.idle_timeout_secs
+            );
+        }
+        if self.max_lifetime_secs < 1 {
+            bail!(
+                "cli_sessions.max_lifetime_secs must be >= 1, got {}",
+                self.max_lifetime_secs
+            );
+        }
+        Ok(())
+    }
+}
+
 // ── Session types ────────────────────────────────────────────────
 
 /// A live CLI session backed by a child process with piped stdin/stdout.
@@ -99,8 +128,8 @@ pub struct SessionInfo {
     pub message_count: u64,
 }
 
-impl From<&CliSession> for SessionInfo {
-    fn from(s: &CliSession) -> Self {
+impl SessionInfo {
+    fn from_session(s: &CliSession) -> Self {
         Self {
             id: s.id.clone(),
             cli_name: s.cli_name.clone(),
@@ -122,8 +151,11 @@ const PROMPT_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 // ── Manager ──────────────────────────────────────────────────────
 
 /// Manages long-lived CLI sessions with idle/lifetime pruning.
+///
+/// Sessions are stored as `Arc<Mutex<CliSession>>` so that the outer map lock
+/// can be released before performing I/O on a specific session.
 pub struct CliSessionManager {
-    sessions: Arc<RwLock<HashMap<String, CliSession>>>,
+    sessions: Arc<RwLock<HashMap<String, Arc<Mutex<CliSession>>>>>,
     config: CliSessionConfig,
 }
 
@@ -141,6 +173,9 @@ impl CliSessionManager {
     /// If a live session for `cli_name` already exists, its ID is returned.
     /// Otherwise a new child process is spawned with the given `binary` and `args`.
     ///
+    /// The `max_sessions` limit is enforced *before* checking for an existing
+    /// session, so it correctly caps the total number of concurrent sessions.
+    ///
     /// A single write lock is held for the entire check-then-create operation
     /// to prevent TOCTOU races that could spawn duplicate sessions or exceed
     /// `max_sessions`.
@@ -155,44 +190,55 @@ impl CliSessionManager {
     ) -> Result<String> {
         let mut sessions = self.sessions.write().await;
 
-        // Check for an existing live session.
-        for session in sessions.values() {
+        // Check for an existing live session for this CLI first.
+        for entry in sessions.values() {
+            let session = entry.lock().await;
             if session.cli_name == cli_name {
                 return Ok(session.id.clone());
             }
         }
 
-        // Enforce max-sessions limit.
-        let count = sessions.values().filter(|s| s.cli_name == cli_name).count();
-        if count >= self.config.max_sessions {
+        // Enforce max-sessions limit (total across all CLI types).
+        if sessions.len() >= self.config.max_sessions {
             bail!(
-                "Maximum concurrent sessions ({}) reached for CLI '{cli_name}'",
+                "Maximum concurrent sessions ({}) reached — cannot create new session for CLI '{cli_name}'",
                 self.config.max_sessions
             );
         }
 
         let session = Self::spawn_session(cli_name, binary, args)?;
         let id = session.id.clone();
-        sessions.insert(id.clone(), session);
+        sessions.insert(id.clone(), Arc::new(Mutex::new(session)));
         Ok(id)
     }
 
     /// Send a prompt to an existing session via its stdin pipe and read
     /// the response from stdout until the sentinel line is detected.
     ///
+    /// The outer map lock is held only briefly to clone the `Arc<Mutex<CliSession>>`.
+    /// The actual I/O operates on the per-session mutex, allowing other sessions
+    /// to be accessed concurrently.
+    ///
     /// Returns the collected response text (sentinel stripped).
     pub async fn send_prompt(&self, session_id: &str, prompt: &str) -> Result<String> {
-        // We need write access to mutate last_used and message_count.
-        let mut sessions = self.sessions.write().await;
-        let session = sessions
-            .get_mut(session_id)
-            .ok_or_else(|| anyhow::anyhow!("Session '{session_id}' not found"))?;
+        // Brief read lock to grab the Arc handle.
+        let session_arc = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(session_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Session '{session_id}' not found"))?
+        };
+        // Map lock is now dropped — operate on the session independently.
+
+        let mut session = session_arc.lock().await;
 
         // Check the child is still alive.
         if let Some(status) = session.child.try_wait()? {
             let cli = session.cli_name.clone();
             let binary = session.binary.clone();
             let args = session.args.clone();
+            drop(session); // release session mutex before acquiring map write lock
 
             if self.config.restart_on_crash {
                 let new_session = Self::spawn_session(
@@ -201,13 +247,15 @@ impl CliSessionManager {
                     &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
                 )?;
                 let new_id = new_session.id.clone();
+                let mut sessions = self.sessions.write().await;
                 sessions.remove(session_id);
-                sessions.insert(new_id.clone(), new_session);
+                sessions.insert(new_id.clone(), Arc::new(Mutex::new(new_session)));
                 bail!(
                     "Session '{session_id}' crashed (exit: {status}). \
                      Restarted as '{new_id}'. Please retry the prompt."
                 );
             }
+            let mut sessions = self.sessions.write().await;
             sessions.remove(session_id);
             bail!(
                 "Session '{session_id}' for CLI '{cli}' exited with status {status} \
@@ -215,12 +263,27 @@ impl CliSessionManager {
             );
         }
 
-        let stdin = session.child.stdin.as_mut().ok_or_else(|| {
-            anyhow::anyhow!(
-                "CLI '{}' session has no stdin pipe — interactive mode not supported",
-                session.cli_name
-            )
-        })?;
+        // Clone cli_name before taking mutable borrows on child's pipes.
+        let cli_name = session.cli_name.clone();
+
+        // Take stdin/stdout out of the child to avoid overlapping mutable borrows.
+        // They are restored after I/O completes.
+        let mut stdin = match session.child.stdin.take() {
+            Some(s) => s,
+            None => {
+                bail!("CLI '{cli_name}' session has no stdin pipe — interactive mode not supported")
+            }
+        };
+
+        let stdout = match session.child.stdout.take() {
+            Some(s) => s,
+            None => {
+                session.child.stdin = Some(stdin);
+                bail!(
+                    "CLI '{cli_name}' session has no stdout pipe — interactive mode not supported"
+                );
+            }
+        };
 
         // Write the prompt with an instruction to emit the sentinel at the end
         // of the response. This works for AI CLIs that interpret stdin as prompt
@@ -231,13 +294,6 @@ impl CliSessionManager {
         );
         stdin.write_all(payload.as_bytes()).await?;
         stdin.flush().await?;
-
-        let stdout = session.child.stdout.as_mut().ok_or_else(|| {
-            anyhow::anyhow!(
-                "CLI '{}' session has no stdout pipe — interactive mode not supported",
-                session.cli_name
-            )
-        })?;
 
         let mut reader = BufReader::new(stdout);
         let mut response_lines: Vec<String> = Vec::new();
@@ -261,6 +317,10 @@ impl CliSessionManager {
         })
         .await;
 
+        // Restore stdin/stdout back into the child for future prompts.
+        session.child.stdin = Some(stdin);
+        session.child.stdout = Some(reader.into_inner());
+
         match read_result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => bail!("Error reading from CLI session stdout: {e}"),
@@ -278,19 +338,25 @@ impl CliSessionManager {
 
     /// Kill a specific session by ID.
     pub async fn kill_session(&self, session_id: &str) -> Result<()> {
-        let mut sessions = self.sessions.write().await;
-        if let Some(mut session) = sessions.remove(session_id) {
-            let _ = session.child.kill().await;
-            Ok(())
-        } else {
-            bail!("Session '{session_id}' not found")
-        }
+        let session_arc = {
+            let mut sessions = self.sessions.write().await;
+            sessions
+                .remove(session_id)
+                .ok_or_else(|| anyhow::anyhow!("Session '{session_id}' not found"))?
+        };
+        let mut session = session_arc.lock().await;
+        let _ = session.child.kill().await;
+        Ok(())
     }
 
     /// Kill all managed sessions.
     pub async fn kill_all(&self) -> Result<()> {
-        let mut sessions = self.sessions.write().await;
-        for (_, mut session) in sessions.drain() {
+        let drained: Vec<Arc<Mutex<CliSession>>> = {
+            let mut sessions = self.sessions.write().await;
+            sessions.drain().map(|(_, v)| v).collect()
+        };
+        for entry in drained {
+            let mut session = entry.lock().await;
             let _ = session.child.kill().await;
         }
         Ok(())
@@ -308,21 +374,31 @@ impl CliSessionManager {
         let idle_limit = chrono::Duration::seconds(self.config.idle_timeout_secs as i64);
         let lifetime_limit = chrono::Duration::seconds(self.config.max_lifetime_secs as i64);
 
-        let mut sessions = self.sessions.write().await;
-        let mut pruned = Vec::new();
-
-        let stale_ids: Vec<String> = sessions
-            .values()
-            .filter(|s| {
+        // Collect stale IDs under read lock.
+        let stale_ids: Vec<String> = {
+            let sessions = self.sessions.read().await;
+            let mut ids = Vec::new();
+            for entry in sessions.values() {
+                let s = entry.lock().await;
                 let idle = now.signed_duration_since(s.last_used) > idle_limit;
                 let expired = now.signed_duration_since(s.started_at) > lifetime_limit;
-                idle || expired
-            })
-            .map(|s| s.id.clone())
-            .collect();
+                if idle || expired {
+                    ids.push(s.id.clone());
+                }
+            }
+            ids
+        };
 
+        if stale_ids.is_empty() {
+            return Vec::new();
+        }
+
+        // Remove and kill under write lock.
+        let mut pruned = Vec::new();
+        let mut sessions = self.sessions.write().await;
         for id in stale_ids {
-            if let Some(mut session) = sessions.remove(&id) {
+            if let Some(entry) = sessions.remove(&id) {
+                let mut session = entry.lock().await;
                 let _ = session.child.kill().await;
                 pruned.push(id);
             }
@@ -334,7 +410,12 @@ impl CliSessionManager {
     /// List all active sessions (public info only).
     pub async fn list_sessions(&self) -> Vec<SessionInfo> {
         let sessions = self.sessions.read().await;
-        sessions.values().map(SessionInfo::from).collect()
+        let mut infos = Vec::with_capacity(sessions.len());
+        for entry in sessions.values() {
+            let s = entry.lock().await;
+            infos.push(SessionInfo::from_session(&s));
+        }
+        infos
     }
 
     /// Return the current config.
@@ -379,10 +460,12 @@ impl Drop for CliSessionManager {
     fn drop(&mut self) {
         // Best-effort synchronous cleanup: try to kill child processes.
         // Because Drop is sync, we use try_lock and synchronous kill.
-        if let Ok(mut sessions) = self.sessions.try_write() {
-            for (_, session) in sessions.iter_mut() {
-                // Child::start_kill is non-async and signals the process to exit.
-                let _ = session.child.start_kill();
+        if let Ok(sessions) = self.sessions.try_write() {
+            for entry in sessions.values() {
+                if let Ok(mut session) = entry.try_lock() {
+                    // Child::start_kill is non-async and signals the process to exit.
+                    let _ = session.child.start_kill();
+                }
             }
         }
     }
@@ -426,6 +509,42 @@ restart_on_crash = false
         assert_eq!(config.idle_timeout_secs, 600);
         assert_eq!(config.max_lifetime_secs, 7200);
         assert!(!config.restart_on_crash);
+    }
+
+    #[test]
+    fn config_validate_accepts_defaults() {
+        let config = CliSessionConfig::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_validate_rejects_zero_max_sessions() {
+        let config = CliSessionConfig {
+            max_sessions: 0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_sessions"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn config_validate_rejects_zero_idle_timeout() {
+        let config = CliSessionConfig {
+            idle_timeout_secs: 0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("idle_timeout_secs"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn config_validate_rejects_zero_max_lifetime() {
+        let config = CliSessionConfig {
+            max_lifetime_secs: 0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_lifetime_secs"), "unexpected error: {err}");
     }
 
     #[test]
@@ -587,17 +706,27 @@ restart_on_crash = false
 
         #[cfg(unix)]
         {
-            let id1 = manager
-                .get_or_create("limit-cli", "cat", &[])
+            // First session should succeed.
+            let _id1 = manager
+                .get_or_create("limit-cli-a", "cat", &[])
                 .await
                 .unwrap();
-            // The second call for the same CLI should return the existing session,
-            // not fail, because get_or_create reuses existing sessions.
-            let id2 = manager
-                .get_or_create("limit-cli", "cat", &[])
+
+            // Second session for a *different* CLI should fail (global cap = 1).
+            let result = manager.get_or_create("limit-cli-b", "cat", &[]).await;
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("Maximum concurrent sessions"),
+                "unexpected error: {msg}"
+            );
+
+            // Same CLI reuses existing session (not blocked by limit).
+            let id_reuse = manager
+                .get_or_create("limit-cli-a", "cat", &[])
                 .await
                 .unwrap();
-            assert_eq!(id1, id2);
+            assert_eq!(_id1, id_reuse);
 
             manager.kill_all().await.unwrap();
         }
