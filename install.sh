@@ -177,10 +177,28 @@ get_available_disk_mb() {
   fi
 }
 
+is_musl_linux() {
+  [[ "$(uname -s)" == "Linux" ]] || return 1
+
+  if [[ -f /etc/alpine-release ]]; then
+    return 0
+  fi
+
+  if have_cmd ldd && ldd --version 2>&1 | grep -qi 'musl'; then
+    return 0
+  fi
+
+  return 1
+}
+
 detect_release_target() {
   local os arch
   os="$(uname -s)"
   arch="$(uname -m)"
+
+  if is_musl_linux; then
+    return 1
+  fi
 
   case "$os:$arch" in
     Linux:x86_64)
@@ -280,6 +298,12 @@ install_prebuilt_binary() {
   fi
   if ! have_cmd tar; then
     warn "tar is required for pre-built binary installation."
+    return 1
+  fi
+
+  if is_musl_linux; then
+    warn "Pre-built release binaries are not published for musl/Alpine yet."
+    warn "Falling back to source build."
     return 1
   fi
 
@@ -1145,7 +1169,11 @@ if [[ "$FORCE_SOURCE_BUILD" == false ]]; then
       SKIP_BUILD=true
       SKIP_INSTALL=true
     elif [[ "$PREBUILT_ONLY" == true ]]; then
-      error "Pre-built-only mode requested, but no compatible release asset is available."
+      if is_musl_linux; then
+        error "Pre-built-only mode is not supported on musl/Alpine because releases do not include musl assets yet."
+      else
+        error "Pre-built-only mode requested, but no compatible release asset is available."
+      fi
       error "Try again later, or run with --force-source-build on a machine with enough RAM/disk."
       exit 1
     else
