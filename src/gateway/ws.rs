@@ -20,6 +20,28 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use tracing::debug;
+
+/// Optional connection parameters sent as the first WebSocket message.
+///
+/// If the first message after upgrade is `{"type":"connect",...}`, these
+/// parameters are extracted and an acknowledgement is sent back. Old clients
+/// that send `{"type":"message",...}` as the first frame still work — the
+/// message is processed normally (backward-compatible).
+#[derive(Debug, Deserialize)]
+struct ConnectParams {
+    #[serde(rename = "type")]
+    msg_type: String,
+    /// Client-chosen session ID for memory persistence
+    #[serde(default)]
+    session_id: Option<String>,
+    /// Device name for device registry tracking
+    #[serde(default)]
+    device_name: Option<String>,
+    /// Client capabilities
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
 
 /// The sub-protocol we support for the chat WebSocket.
 const WS_PROTOCOL: &str = "zeroclaw.v1";
@@ -161,6 +183,65 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<St
         .send(Message::Text(session_start.to_string().into()))
         .await;
 
+    // ── Optional connect handshake ──────────────────────────────────
+    // The first message may be a `{"type":"connect",...}` frame carrying
+    // connection parameters.  If it is, we extract the params, send an
+    // ack, and proceed to the normal message loop.  If the first message
+    // is a regular `{"type":"message",...}` frame, we fall through and
+    // process it immediately (backward-compatible).
+    let mut first_msg_fallback: Option<String> = None;
+
+    if let Some(first) = receiver.next().await {
+        match first {
+            Ok(Message::Text(text)) => {
+                if let Ok(cp) = serde_json::from_str::<ConnectParams>(&text) {
+                    if cp.msg_type == "connect" {
+                        debug!(
+                            session_id = ?cp.session_id,
+                            device_name = ?cp.device_name,
+                            capabilities = ?cp.capabilities,
+                            "WebSocket connect params received"
+                        );
+                        // Override session_id if provided in connect params
+                        if let Some(sid) = &cp.session_id {
+                            agent.set_memory_session_id(Some(sid.clone()));
+                        }
+                        let ack = serde_json::json!({
+                            "type": "connected",
+                            "message": "Connection established"
+                        });
+                        let _ = sender.send(Message::Text(ack.to_string().into())).await;
+                    } else {
+                        // Not a connect message — fall through to normal processing
+                        first_msg_fallback = Some(text.to_string());
+                    }
+                } else {
+                    // Not parseable as ConnectParams — fall through
+                    first_msg_fallback = Some(text.to_string());
+                }
+            }
+            Ok(Message::Close(_)) | Err(_) => return,
+            _ => {}
+        }
+    }
+
+    // Process the first message if it was not a connect frame
+    if let Some(ref text) = first_msg_fallback {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+            if parsed["type"].as_str() == Some("message") {
+                let content = parsed["content"].as_str().unwrap_or("").to_string();
+                if !content.is_empty() {
+                    // Persist user message
+                    if let Some(ref backend) = state.session_backend {
+                        let user_msg = crate::providers::ChatMessage::user(&content);
+                        let _ = backend.append(&session_key, &user_msg);
+                    }
+                    process_chat_message(&state, &mut agent, &mut sender, &content, &session_key).await;
+                }
+            }
+        }
+    }
+
     while let Some(msg) = receiver.next().await {
         let msg = match msg {
             Ok(Message::Text(text)) => text,
@@ -194,59 +275,68 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<St
             let _ = backend.append(&session_key, &user_msg);
         }
 
-        // Process message with the LLM provider
-        let provider_label = state
-            .config
-            .lock()
-            .default_provider
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
+        process_chat_message(&state, &mut agent, &mut sender, &content, &session_key).await;
+    }
+}
 
-        // Broadcast agent_start event
-        let _ = state.event_tx.send(serde_json::json!({
-            "type": "agent_start",
-            "provider": provider_label,
-            "model": state.model,
-        }));
+/// Process a single chat message through the agent and send the response.
+async fn process_chat_message(
+    state: &AppState,
+    agent: &mut crate::agent::Agent,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    content: &str,
+    session_key: &str,
+) {
+    let provider_label = state
+        .config
+        .lock()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
 
-        // Multi-turn chat via persistent Agent (history is maintained across turns)
-        match agent.turn(&content).await {
-            Ok(response) => {
-                // Persist assistant response
-                if let Some(ref backend) = state.session_backend {
-                    let assistant_msg = crate::providers::ChatMessage::assistant(&response);
-                    let _ = backend.append(&session_key, &assistant_msg);
-                }
+    // Broadcast agent_start event
+    let _ = state.event_tx.send(serde_json::json!({
+        "type": "agent_start",
+        "provider": provider_label,
+        "model": state.model,
+    }));
 
-                // Send the full response as a done message
-                let done = serde_json::json!({
-                    "type": "done",
-                    "full_response": response,
-                });
-                let _ = sender.send(Message::Text(done.to_string().into())).await;
-
-                // Broadcast agent_end event
-                let _ = state.event_tx.send(serde_json::json!({
-                    "type": "agent_end",
-                    "provider": provider_label,
-                    "model": state.model,
-                }));
+    // Multi-turn chat via persistent Agent (history is maintained across turns)
+    match agent.turn(content).await {
+        Ok(response) => {
+            // Persist assistant response
+            if let Some(ref backend) = state.session_backend {
+                let assistant_msg = crate::providers::ChatMessage::assistant(&response);
+                let _ = backend.append(session_key, &assistant_msg);
             }
-            Err(e) => {
-                let sanitized = crate::providers::sanitize_api_error(&e.to_string());
-                let err = serde_json::json!({
-                    "type": "error",
-                    "message": sanitized,
-                });
-                let _ = sender.send(Message::Text(err.to_string().into())).await;
 
-                // Broadcast error event
-                let _ = state.event_tx.send(serde_json::json!({
-                    "type": "error",
-                    "component": "ws_chat",
-                    "message": sanitized,
-                }));
-            }
+            let done = serde_json::json!({
+                "type": "done",
+                "full_response": response,
+            });
+            let _ = sender.send(Message::Text(done.to_string().into())).await;
+
+            // Broadcast agent_end event
+            let _ = state.event_tx.send(serde_json::json!({
+                "type": "agent_end",
+                "provider": provider_label,
+                "model": state.model,
+            }));
+        }
+        Err(e) => {
+            let sanitized = crate::providers::sanitize_api_error(&e.to_string());
+            let err = serde_json::json!({
+                "type": "error",
+                "message": sanitized,
+            });
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
+
+            // Broadcast error event
+            let _ = state.event_tx.send(serde_json::json!({
+                "type": "error",
+                "component": "ws_chat",
+                "message": sanitized,
+            }));
         }
     }
 }
