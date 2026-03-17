@@ -15,8 +15,8 @@
 # Or with docker compose:
 #   docker compose -f docker-compose.yml -f docker-compose.debian.yml up
 
-# ── Stage 1: Build (identical to main Dockerfile) ───────────
-FROM rust:1.94-slim@sha256:da9dab7a6b8dd428e71718402e97207bb3e54167d37b5708616050b1e8f60ed6 AS builder
+# ── Stage 1: Build (match runtime glibc baseline) ───────────
+FROM rust:1.94-bookworm AS builder
 
 WORKDIR /app
 ARG ZEROCLAW_CARGO_FEATURES=""
