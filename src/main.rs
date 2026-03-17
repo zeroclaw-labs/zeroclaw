@@ -806,13 +806,13 @@ async fn main() -> Result<()> {
         } else if is_tty && !has_provider_flags {
             Box::pin(onboard::run_wizard(force)).await
         } else {
-            onboard::run_quick_setup(
+            Box::pin(onboard::run_quick_setup(
                 api_key.as_deref(),
                 provider.as_deref(),
                 model.as_deref(),
                 memory.as_deref(),
                 force,
-            )
+            ))
             .await
         }?;
 
@@ -1215,7 +1215,11 @@ async fn main() -> Result<()> {
         }
 
         Commands::Peripheral { peripheral_command } => {
-            peripherals::handle_command(peripheral_command.clone(), &config).await
+            Box::pin(peripherals::handle_command(
+                peripheral_command.clone(),
+                &config,
+            ))
+            .await
         }
 
         Commands::Config { config_command } => match config_command {
