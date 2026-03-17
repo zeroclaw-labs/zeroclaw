@@ -288,6 +288,39 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(count)
     }
 
+    fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
+        let conn = self.conn.lock();
+
+        // Check if session exists
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if !exists {
+            return Ok(false);
+        }
+
+        // Delete messages (FTS5 trigger handles sessions_fts cleanup)
+        conn.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+
+        // Delete metadata
+        conn.execute(
+            "DELETE FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+
+        Ok(true)
+    }
+
     fn search(&self, query: &SessionQuery) -> Vec<SessionMetadata> {
         let Some(keyword) = &query.keyword else {
             return self.list_sessions_with_metadata();
@@ -471,6 +504,28 @@ mod tests {
         let sessions = backend.list_sessions();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0], "new_session");
+    }
+
+    #[test]
+    fn delete_session_removes_all_data() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.append("s1", &ChatMessage::assistant("hi")).unwrap();
+        backend.append("s2", &ChatMessage::user("other")).unwrap();
+
+        assert!(backend.delete_session("s1").unwrap());
+        assert!(backend.load("s1").is_empty());
+        assert_eq!(backend.list_sessions().len(), 1);
+        assert_eq!(backend.list_sessions()[0], "s2");
+    }
+
+    #[test]
+    fn delete_session_returns_false_for_missing() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert!(!backend.delete_session("nonexistent").unwrap());
     }
 
     #[test]

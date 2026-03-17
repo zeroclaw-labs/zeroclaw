@@ -111,13 +111,20 @@ pub async fn handle_ws_chat(
         ws
     };
 
-    let session_id = params.session_id.clone();
+    let session_id = params.session_id;
     ws.on_upgrade(move |socket| handle_socket(socket, state, session_id))
         .into_response()
 }
 
+/// Gateway session key prefix to avoid collisions with channel sessions.
+const GW_SESSION_PREFIX: &str = "gw_";
+
 async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<String>) {
     let (mut sender, mut receiver) = socket.split();
+
+    // Resolve session ID: use provided or generate a new UUID
+    let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
 
     // Build a persistent Agent for this connection so history is maintained across turns.
     let config = state.config.lock().clone();
@@ -129,7 +136,30 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<St
             return;
         }
     };
-    agent.set_memory_session_id(session_id.clone());
+    agent.set_memory_session_id(Some(session_id.clone()));
+
+    // Hydrate agent from persisted session (if available)
+    let mut resumed = false;
+    let mut message_count: usize = 0;
+    if let Some(ref backend) = state.session_backend {
+        let messages = backend.load(&session_key);
+        if !messages.is_empty() {
+            message_count = messages.len();
+            agent.seed_history(&messages);
+            resumed = true;
+        }
+    }
+
+    // Send session_start message to client
+    let session_start = serde_json::json!({
+        "type": "session_start",
+        "session_id": session_id,
+        "resumed": resumed,
+        "message_count": message_count,
+    });
+    let _ = sender
+        .send(Message::Text(session_start.to_string().into()))
+        .await;
 
     while let Some(msg) = receiver.next().await {
         let msg = match msg {
@@ -158,6 +188,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<St
             continue;
         }
 
+        // Persist user message
+        if let Some(ref backend) = state.session_backend {
+            let user_msg = crate::providers::ChatMessage::user(&content);
+            let _ = backend.append(&session_key, &user_msg);
+        }
+
         // Process message with the LLM provider
         let provider_label = state
             .config
@@ -176,6 +212,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<St
         // Multi-turn chat via persistent Agent (history is maintained across turns)
         match agent.turn(&content).await {
             Ok(response) => {
+                // Persist assistant response
+                if let Some(ref backend) = state.session_backend {
+                    let assistant_msg = crate::providers::ChatMessage::assistant(&response);
+                    let _ = backend.append(&session_key, &assistant_msg);
+                }
+
                 // Send the full response as a done message
                 let done = serde_json::json!({
                     "type": "done",

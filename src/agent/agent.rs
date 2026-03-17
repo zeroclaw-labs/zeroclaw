@@ -278,6 +278,25 @@ impl Agent {
         self.memory_session_id = session_id;
     }
 
+    /// Hydrate the agent with prior chat messages (e.g. from a session backend).
+    ///
+    /// Ensures a system prompt is prepended if history is empty, then appends all
+    /// non-system messages from the seed. System messages in the seed are skipped
+    /// to avoid duplicating the system prompt.
+    pub fn seed_history(&mut self, messages: &[ChatMessage]) {
+        if self.history.is_empty() {
+            if let Ok(sys) = self.build_system_prompt() {
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::system(sys)));
+            }
+        }
+        for msg in messages {
+            if msg.role != "system" {
+                self.history.push(ConversationMessage::Chat(msg.clone()));
+            }
+        }
+    }
+
     pub fn from_config(config: &Config) -> Result<Self> {
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
@@ -1157,5 +1176,51 @@ mod tests {
             agent.tool_specs.is_empty(),
             "No tools should match a non-existent allowlist entry"
         );
+    }
+
+    #[test]
+    fn seed_history_prepends_system_and_skips_system_from_seed() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let seed = vec![
+            ChatMessage::system("old system prompt"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi there"),
+        ];
+        agent.seed_history(&seed);
+
+        let history = agent.history();
+        // First message should be a freshly built system prompt (not the seed one)
+        assert!(matches!(&history[0], ConversationMessage::Chat(m) if m.role == "system"));
+        // System message from seed should be skipped, so next is user
+        assert!(
+            matches!(&history[1], ConversationMessage::Chat(m) if m.role == "user" && m.content == "hello")
+        );
+        assert!(
+            matches!(&history[2], ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi there")
+        );
+        assert_eq!(history.len(), 3);
     }
 }
