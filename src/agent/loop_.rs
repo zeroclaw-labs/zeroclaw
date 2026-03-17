@@ -2384,6 +2384,7 @@ pub(crate) async fn run_tool_call_loop(
             serde_json::json!({
                 "iteration": iteration + 1,
                 "messages_count": history.len(),
+                "prompt": history,
             }),
         );
 

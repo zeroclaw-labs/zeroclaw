@@ -2296,13 +2296,7 @@ async fn process_channel_message(
                         .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
                         .await
                     {
-                        tracing::warn!("Failed to finalize draft: {e}; sending as new message");
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(&delivered_response, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
+                        tracing::warn!("Failed to finalize draft on {}: {e}", channel.name());
                     }
                 } else if let Err(e) = channel
                     .send(

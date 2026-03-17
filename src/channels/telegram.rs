@@ -1579,6 +1579,17 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
             let markdown_status = markdown_resp.status();
             let markdown_err = markdown_resp.text().await.unwrap_or_default();
+
+            // Only retry without parse_mode if it was a 400 Bad Request,
+            // which usually indicates invalid Markdown/HTML entities.
+            // For 5xx or network errors, retrying with a different body
+            // is risky as the message might have been delivered.
+            if markdown_status != reqwest::StatusCode::BAD_REQUEST {
+                anyhow::bail!(
+                    "Telegram sendMessage failed with status {markdown_status}: {markdown_err}"
+                );
+            }
+
             tracing::warn!(
                 status = ?markdown_status,
                 "Telegram sendMessage with Markdown failed; retrying without parse_mode"
@@ -2378,6 +2389,16 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
+        let edit_status = resp.status();
+        let edit_err = resp.text().await.unwrap_or_default();
+
+        // Only retry without parse_mode if it was a 400 Bad Request (invalid HTML/Markdown).
+        // For other errors (5xx, timeouts, 429), retrying with a different body is
+        // not appropriate and risky for duplication.
+        if edit_status != reqwest::StatusCode::BAD_REQUEST {
+            anyhow::bail!("Telegram finalize_draft edit failed ({}): {}", edit_status, edit_err);
+        }
+
         // Markdown failed — retry without parse_mode
         let plain_body = serde_json::json!({
             "chat_id": chat_id,
@@ -2396,8 +2417,14 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        // Edit failed entirely — fall back to new message
-        tracing::warn!("Telegram finalize_draft edit failed; falling back to sendMessage");
+        // Edit failed entirely (even plain text) — fall back to new message
+        let final_status = resp.status();
+        let final_err = resp.text().await.unwrap_or_default();
+        tracing::warn!(
+            "Telegram finalize_draft edit failed (plain {}): {}; falling back to sendMessage",
+            final_status,
+            final_err
+        );
         self.send_text_chunks(text, &chat_id, thread_id.as_deref())
             .await
     }
