@@ -243,6 +243,7 @@ struct ChannelRuntimeDefaults {
     api_key: Option<String>,
     api_url: Option<String>,
     reliability: crate::config::ReliabilityConfig,
+    model_routes: Vec<crate::config::ModelRouteConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +294,7 @@ struct ChannelRuntimeContext {
     observer: Arc<dyn Observer>,
     system_prompt: Arc<String>,
     model: Arc<String>,
+    model_routes: Arc<Vec<crate::config::ModelRouteConfig>>,
     temperature: f64,
     auto_save_memory: bool,
     max_tool_iterations: usize,
@@ -311,7 +313,6 @@ struct ChannelRuntimeContext {
     hooks: Option<Arc<crate::hooks::HookRunner>>,
     non_cli_excluded_tools: Arc<Vec<String>>,
     tool_call_dedup_exempt: Arc<Vec<String>>,
-    model_routes: Arc<Vec<crate::config::ModelRouteConfig>>,
     query_classification: crate::config::QueryClassificationConfig,
     ack_reactions: bool,
     show_tool_calls: bool,
@@ -711,6 +712,7 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         api_key: config.api_key.clone(),
         api_url: config.api_url.clone(),
         reliability: config.reliability.clone(),
+        model_routes: config.model_routes.clone(),
     }
 }
 
@@ -738,6 +740,7 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         api_key: ctx.api_key.clone(),
         api_url: ctx.api_url.clone(),
         reliability: (*ctx.reliability).clone(),
+        model_routes: (*ctx.model_routes).clone(),
     }
 }
 
@@ -827,13 +830,16 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     }
 
     let next_defaults = load_runtime_defaults_from_config_file(&config_path).await?;
-    let next_default_provider = providers::create_resilient_provider_with_options(
+    let next_default_provider = create_routed_provider_nonblocking(
         &next_defaults.default_provider,
-        next_defaults.api_key.as_deref(),
-        next_defaults.api_url.as_deref(),
-        &next_defaults.reliability,
-        &ctx.provider_runtime_options,
-    )?;
+        next_defaults.api_key.clone(),
+        next_defaults.api_url.clone(),
+        next_defaults.reliability.clone(),
+        next_defaults.model_routes.clone(),
+        &next_defaults.model,
+        ctx.provider_runtime_options.clone(),
+    )
+    .await?;
     let next_default_provider: Arc<dyn Provider> = Arc::from(next_default_provider);
 
     if let Err(err) = next_default_provider.warmup().await {
@@ -1111,11 +1117,13 @@ async fn get_or_create_provider(
         None
     };
 
-    let provider = create_resilient_provider_nonblocking(
+    let provider = create_routed_provider_nonblocking(
         provider_name,
         ctx.api_key.clone(),
         api_url.map(ToString::to_string),
         ctx.reliability.as_ref().clone(),
+        ctx.model_routes.as_ref().clone(),
+        &ctx.model,
         ctx.provider_runtime_options.clone(),
     )
     .await?;
@@ -1151,6 +1159,32 @@ async fn create_resilient_provider_nonblocking(
     })
     .await
     .context("failed to join provider initialization task")?
+}
+
+async fn create_routed_provider_nonblocking(
+    provider_name: &str,
+    api_key: Option<String>,
+    api_url: Option<String>,
+    reliability: crate::config::ReliabilityConfig,
+    model_routes: Vec<crate::config::ModelRouteConfig>,
+    default_model: &str,
+    provider_runtime_options: providers::ProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn Provider>> {
+    let provider_name = provider_name.to_string();
+    let default_model = default_model.to_string();
+    tokio::task::spawn_blocking(move || {
+        providers::create_routed_provider_with_options(
+            &provider_name,
+            api_key.as_deref(),
+            api_url.as_deref(),
+            &reliability,
+            &model_routes,
+            &default_model,
+            &provider_runtime_options,
+        )
+    })
+    .await
+    .context("failed to join routed provider initialization task")?
 }
 
 fn build_models_help_response(
@@ -1268,15 +1302,17 @@ async fn handle_runtime_command_if_needed(
             }
         }
         ChannelRuntimeCommand::ShowModel => {
-            build_models_help_response(&current, ctx.workspace_dir.as_path(), &ctx.model_routes)
+            let defaults = runtime_defaults_snapshot(ctx);
+            build_models_help_response(&current, ctx.workspace_dir.as_path(), &defaults.model_routes)
         }
         ChannelRuntimeCommand::SetModel(raw_model) => {
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
                 "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
             } else {
+                let defaults = runtime_defaults_snapshot(ctx);
                 // Resolve provider+model from model_routes (match by model name or hint)
-                if let Some(route) = ctx.model_routes.iter().find(|r| {
+                if let Some(route) = defaults.model_routes.iter().find(|r| {
                     r.model.eq_ignore_ascii_case(&model) || r.hint.eq_ignore_ascii_case(&model)
                 }) {
                     current.provider = route.provider.clone();
@@ -3480,6 +3516,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
+    let model = resolved_default_model(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
@@ -3491,11 +3528,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
         api_path: config.api_path.clone(),
     };
     let provider: Arc<dyn Provider> = Arc::from(
-        create_resilient_provider_nonblocking(
+        create_routed_provider_nonblocking(
             &provider_name,
             config.api_key.clone(),
             config.api_url.clone(),
             config.reliability.clone(),
+            config.model_routes.clone(),
+            &model,
             provider_runtime_options.clone(),
         )
         .await?,
