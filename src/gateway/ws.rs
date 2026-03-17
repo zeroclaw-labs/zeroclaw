@@ -236,7 +236,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<St
                         let user_msg = crate::providers::ChatMessage::user(&content);
                         let _ = backend.append(&session_key, &user_msg);
                     }
-                    process_chat_message(&state, &mut agent, &mut sender, &content, &session_key).await;
+                    process_chat_message(&state, &mut agent, &mut sender, &content, &session_key)
+                        .await;
                 }
             }
         }
