@@ -337,9 +337,42 @@ jobs:
     name: Push Docker Image
     needs: [validate, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zeroclaw-x86_64-unknown-linux-gnu
+          path: artifacts/
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zeroclaw-aarch64-unknown-linux-gnu
+          path: artifacts/
+
+      - name: Prepare Docker context with pre-built binaries
+        run: |
+          mkdir -p docker-ctx/bin/amd64 docker-ctx/bin/arm64
+          tar xzf artifacts/zeroclaw-x86_64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/amd64
+          tar xzf artifacts/zeroclaw-aarch64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/arm64
+
+          mkdir -p docker-ctx/zeroclaw-data/.zeroclaw docker-ctx/zeroclaw-data/workspace
+          printf '%s\n' \
+            'workspace_dir = "/zeroclaw-data/workspace"' \
+            'config_path = "/zeroclaw-data/.zeroclaw/config.toml"' \
+            'api_key = ""' \
+            'default_provider = "openrouter"' \
+            'default_model = "anthropic/claude-sonnet-4-20250514"' \
+            'default_temperature = 0.7' \
+            '' \
+            '[gateway]' \
+            'port = 42617' \
+            'host = "[::]"' \
+            'allow_public_bind = true' \
+            > docker-ctx/zeroclaw-data/.zeroclaw/config.toml
+
+          cp Dockerfile.ci docker-ctx/Dockerfile
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
@@ -352,14 +385,12 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
-          context: .
+          context: docker-ctx
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           platforms: linux/amd64,linux/arm64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
   # ── Post-publish: package manager auto-sync ─────────────────────────
   scoop:

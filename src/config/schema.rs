@@ -524,6 +524,28 @@ where
     validate_temperature(value).map_err(serde::de::Error::custom)
 }
 
+fn normalize_reasoning_effort(value: &str) -> std::result::Result<String, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "minimal" | "low" | "medium" | "high" | "xhigh" => Ok(normalized),
+        _ => Err(format!(
+            "reasoning_effort {value:?} is invalid (expected one of: minimal, low, medium, high, xhigh)"
+        )),
+    }
+}
+
+fn deserialize_reasoning_effort_opt<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<String> = Option::deserialize(deserializer)?;
+    value
+        .map(|raw| normalize_reasoning_effort(&raw).map_err(serde::de::Error::custom))
+        .transpose()
+}
+
 fn default_max_depth() -> u32 {
     3
 }
@@ -1488,6 +1510,10 @@ fn default_gateway_idempotency_max_keys() -> usize {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 impl Default for GatewayConfig {
@@ -3566,6 +3592,9 @@ pub struct RuntimeConfig {
     /// - `Some(false)`: disable reasoning/thinking when supported
     #[serde(default)]
     pub reasoning_enabled: Option<bool>,
+    /// Optional reasoning effort for providers that expose a level control.
+    #[serde(default, deserialize_with = "deserialize_reasoning_effort_opt")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Docker runtime configuration (`[runtime.docker]` section).
@@ -3640,6 +3669,7 @@ impl Default for RuntimeConfig {
             kind: default_runtime_kind(),
             docker: DockerRuntimeConfig::default(),
             reasoning_enabled: None,
+            reasoning_effort: None,
         }
     }
 }
@@ -4169,8 +4199,8 @@ pub struct ChannelsConfig {
     pub ack_reactions: bool,
     /// Whether to send tool-call notification messages (e.g. `🔧 web_search_tool: …`)
     /// to channel users. When `false`, tool calls are still logged server-side but
-    /// not forwarded as individual channel messages. Default: `true`.
-    #[serde(default = "default_true")]
+    /// not forwarded as individual channel messages. Default: `false`.
+    #[serde(default = "default_false")]
     pub show_tool_calls: bool,
     /// Persist channel conversation history to JSONL files so sessions survive
     /// daemon restarts. Files are stored in `{workspace}/sessions/`. Default: `true`.
@@ -4332,7 +4362,7 @@ impl Default for ChannelsConfig {
             bluesky: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
-            show_tool_calls: true,
+            show_tool_calls: false,
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
@@ -7310,6 +7340,16 @@ impl Config {
             }
         }
 
+        if let Ok(raw) = std::env::var("ZEROCLAW_REASONING_EFFORT")
+            .or_else(|_| std::env::var("REASONING_EFFORT"))
+            .or_else(|_| std::env::var("ZEROCLAW_CODEX_REASONING_EFFORT"))
+        {
+            match normalize_reasoning_effort(&raw) {
+                Ok(effort) => self.runtime.reasoning_effort = Some(effort),
+                Err(message) => tracing::warn!("Ignoring reasoning effort env override: {message}"),
+            }
+        }
+
         // Web search enabled: ZEROCLAW_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
         if let Ok(enabled) = std::env::var("ZEROCLAW_WEB_SEARCH_ENABLED")
             .or_else(|_| std::env::var("WEB_SEARCH_ENABLED"))
@@ -8141,6 +8181,7 @@ default_temperature = 0.7
         assert!(c.cli);
         assert!(c.telegram.is_none());
         assert!(c.discord.is_none());
+        assert!(!c.show_tool_calls);
     }
 
     // ── Serde round-trip ─────────────────────────────────────
@@ -8471,6 +8512,32 @@ reasoning_enabled = false
 
         let parsed: Config = toml::from_str(raw).unwrap();
         assert_eq!(parsed.runtime.reasoning_enabled, Some(false));
+    }
+
+    #[test]
+    async fn runtime_reasoning_effort_deserializes() {
+        let raw = r#"
+default_temperature = 0.7
+
+[runtime]
+reasoning_effort = "HIGH"
+"#;
+
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.runtime.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    async fn runtime_reasoning_effort_rejects_invalid_values() {
+        let raw = r#"
+default_temperature = 0.7
+
+[runtime]
+reasoning_effort = "turbo"
+"#;
+
+        let error = toml::from_str::<Config>(raw).expect_err("invalid value should fail");
+        assert!(error.to_string().contains("reasoning_effort"));
     }
 
     #[test]
@@ -10452,6 +10519,31 @@ default_model = "legacy-model"
         assert_eq!(config.runtime.reasoning_enabled, Some(false));
 
         std::env::remove_var("ZEROCLAW_REASONING_ENABLED");
+    }
+
+    #[test]
+    async fn env_override_reasoning_effort() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        assert_eq!(config.runtime.reasoning_effort, None);
+
+        std::env::set_var("ZEROCLAW_REASONING_EFFORT", "HIGH");
+        config.apply_env_overrides();
+        assert_eq!(config.runtime.reasoning_effort.as_deref(), Some("high"));
+
+        std::env::remove_var("ZEROCLAW_REASONING_EFFORT");
+    }
+
+    #[test]
+    async fn env_override_reasoning_effort_legacy_codex_env() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+
+        std::env::set_var("ZEROCLAW_CODEX_REASONING_EFFORT", "minimal");
+        config.apply_env_overrides();
+        assert_eq!(config.runtime.reasoning_effort.as_deref(), Some("minimal"));
+
+        std::env::remove_var("ZEROCLAW_CODEX_REASONING_EFFORT");
     }
 
     #[test]
