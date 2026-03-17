@@ -97,6 +97,8 @@ mod multimodal;
 mod observability;
 mod onboard;
 mod peripherals;
+#[cfg(feature = "plugins-wasm")]
+mod plugins;
 mod providers;
 mod runtime;
 mod security;
