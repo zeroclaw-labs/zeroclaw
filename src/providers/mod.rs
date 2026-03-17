@@ -2369,7 +2369,10 @@ mod tests {
         assert_eq!(canonical_china_provider_name("doubao"), Some("doubao"));
         assert_eq!(canonical_china_provider_name("volcengine"), Some("doubao"));
         assert_eq!(canonical_china_provider_name("bailian"), Some("bailian"));
-        assert_eq!(canonical_china_provider_name("aliyun-bailian"), Some("bailian"));
+        assert_eq!(
+            canonical_china_provider_name("aliyun-bailian"),
+            Some("bailian")
+        );
         assert_eq!(canonical_china_provider_name("aliyun"), Some("bailian"));
         assert_eq!(canonical_china_provider_name("openai"), None);
     }
