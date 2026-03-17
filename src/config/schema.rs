@@ -264,6 +264,10 @@ pub struct Config {
     #[serde(default)]
     pub project_intel: ProjectIntelConfig,
 
+    /// Google Workspace CLI (`gws`) tool configuration (`[google_workspace]`).
+    #[serde(default)]
+    pub google_workspace: GoogleWorkspaceConfig,
+
     /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]`).
     #[serde(default)]
     pub proxy: ProxyConfig,
@@ -323,6 +327,14 @@ pub struct Config {
     /// Secure inter-node transport configuration (`[node_transport]`).
     #[serde(default)]
     pub node_transport: NodeTransportConfig,
+
+    /// Knowledge graph configuration (`[knowledge]`).
+    #[serde(default)]
+    pub knowledge: KnowledgeConfig,
+
+    /// LinkedIn integration configuration (`[linkedin]`).
+    #[serde(default)]
+    pub linkedin: LinkedInConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -604,19 +616,46 @@ fn default_transcription_max_duration_secs() -> u64 {
     120
 }
 
-/// Voice transcription configuration (Whisper API via Groq).
+fn default_transcription_provider() -> String {
+    "groq".into()
+}
+
+fn default_openai_stt_model() -> String {
+    "whisper-1".into()
+}
+
+fn default_deepgram_stt_model() -> String {
+    "nova-2".into()
+}
+
+fn default_google_stt_language_code() -> String {
+    "en-US".into()
+}
+
+/// Voice transcription configuration with multi-provider support.
+///
+/// The top-level `api_url`, `model`, and `api_key` fields remain for backward
+/// compatibility with existing Groq-based configurations.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
     #[serde(default)]
     pub enabled: bool,
-    /// Whisper API endpoint URL.
+    /// Default STT provider: "groq", "openai", "deepgram", "assemblyai", "google".
+    #[serde(default = "default_transcription_provider")]
+    pub default_provider: String,
+    /// API key used for transcription requests (Groq provider).
+    ///
+    /// If unset, runtime falls back to `GROQ_API_KEY` for backward compatibility.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Whisper API endpoint URL (Groq provider).
     #[serde(default = "default_transcription_api_url")]
     pub api_url: String,
-    /// Whisper model name.
+    /// Whisper model name (Groq provider).
     #[serde(default = "default_transcription_model")]
     pub model: String,
-    /// Optional language hint (ISO-639-1, e.g. "en", "ru").
+    /// Optional language hint (ISO-639-1, e.g. "en", "ru") for Groq provider.
     #[serde(default)]
     pub language: Option<String>,
     /// Optional initial prompt to bias transcription toward expected vocabulary
@@ -627,17 +666,35 @@ pub struct TranscriptionConfig {
     /// Maximum voice duration in seconds (messages longer than this are skipped).
     #[serde(default = "default_transcription_max_duration_secs")]
     pub max_duration_secs: u64,
+    /// OpenAI Whisper STT provider configuration.
+    #[serde(default)]
+    pub openai: Option<OpenAiSttConfig>,
+    /// Deepgram STT provider configuration.
+    #[serde(default)]
+    pub deepgram: Option<DeepgramSttConfig>,
+    /// AssemblyAI STT provider configuration.
+    #[serde(default)]
+    pub assemblyai: Option<AssemblyAiSttConfig>,
+    /// Google Cloud Speech-to-Text provider configuration.
+    #[serde(default)]
+    pub google: Option<GoogleSttConfig>,
 }
 
 impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            default_provider: default_transcription_provider(),
+            api_key: None,
             api_url: default_transcription_api_url(),
             model: default_transcription_model(),
             language: None,
             initial_prompt: None,
             max_duration_secs: default_transcription_max_duration_secs(),
+            openai: None,
+            deepgram: None,
+            assemblyai: None,
+            google: None,
         }
     }
 }
@@ -936,6 +993,47 @@ pub struct ToolFilterGroup {
     /// Ignored when `mode = "always"`.
     #[serde(default)]
     pub keywords: Vec<String>,
+}
+
+/// OpenAI Whisper STT provider configuration (`[transcription.openai]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OpenAiSttConfig {
+    /// OpenAI API key for Whisper transcription.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Whisper model name (default: "whisper-1").
+    #[serde(default = "default_openai_stt_model")]
+    pub model: String,
+}
+
+/// Deepgram STT provider configuration (`[transcription.deepgram]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DeepgramSttConfig {
+    /// Deepgram API key.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Deepgram model name (default: "nova-2").
+    #[serde(default = "default_deepgram_stt_model")]
+    pub model: String,
+}
+
+/// AssemblyAI STT provider configuration (`[transcription.assemblyai]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AssemblyAiSttConfig {
+    /// AssemblyAI API key.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+/// Google Cloud Speech-to-Text provider configuration (`[transcription.google]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GoogleSttConfig {
+    /// Google Cloud API key.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// BCP-47 language code (default: "en-US").
+    #[serde(default = "default_google_stt_language_code")]
+    pub language_code: String,
 }
 
 /// Agent orchestration configuration (`[agent]` section).
@@ -1990,6 +2088,407 @@ impl Default for DataRetentionConfig {
             retention_days: default_retention_days(),
             dry_run: false,
             categories: Vec::new(),
+        }
+    }
+}
+
+// ── Google Workspace ─────────────────────────────────────────────
+
+/// Google Workspace CLI (`gws`) tool configuration (`[google_workspace]` section).
+///
+/// ## Defaults
+/// - `enabled`: `false` (tool is not registered unless explicitly opted-in).
+/// - `allowed_services`: empty vector, which grants access to the full default
+///   service set: `drive`, `sheets`, `gmail`, `calendar`, `docs`, `slides`,
+///   `tasks`, `people`, `chat`, `classroom`, `forms`, `keep`, `meet`, `events`.
+/// - `credentials_path`: `None` (uses default `gws` credential discovery).
+/// - `default_account`: `None` (uses the `gws` active account).
+/// - `rate_limit_per_minute`: `60`.
+/// - `timeout_secs`: `30`.
+/// - `audit_log`: `false`.
+/// - `credentials_path`: `None` (uses default `gws` credential discovery).
+/// - `default_account`: `None` (uses the `gws` active account).
+/// - `rate_limit_per_minute`: `60`.
+/// - `timeout_secs`: `30`.
+/// - `audit_log`: `false`.
+///
+/// ## Compatibility
+/// Configs that omit the `[google_workspace]` section entirely are treated as
+/// `GoogleWorkspaceConfig::default()` (disabled, all defaults allowed). Adding
+/// the section is purely opt-in and does not affect other config sections.
+///
+/// ## Rollback / Migration
+/// To revert, remove the `[google_workspace]` section from the config file (or
+/// set `enabled = false`). No data migration is required; the tool simply stops
+/// being registered.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GoogleWorkspaceConfig {
+    /// Enable the `google_workspace` tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Restrict which Google Workspace services the agent can access.
+    ///
+    /// When empty (the default), the full default service set is allowed (see
+    /// struct-level docs). When non-empty, only the listed service IDs are
+    /// permitted. Each entry must be non-empty, lowercase alphanumeric with
+    /// optional underscores/hyphens, and unique.
+    #[serde(default)]
+    pub allowed_services: Vec<String>,
+    /// Path to service account JSON or OAuth client credentials file.
+    ///
+    /// When `None`, the tool relies on the default `gws` credential discovery
+    /// (`gws auth login`). Set this to point at a service-account key or an
+    /// OAuth client-secrets JSON for headless / CI environments.
+    #[serde(default)]
+    pub credentials_path: Option<String>,
+    /// Default Google account email to pass to `gws --account`.
+    ///
+    /// When `None`, the currently active `gws` account is used.
+    #[serde(default)]
+    pub default_account: Option<String>,
+    /// Maximum number of `gws` API calls allowed per minute. Default: `60`.
+    #[serde(default = "default_gws_rate_limit")]
+    pub rate_limit_per_minute: u32,
+    /// Command execution timeout in seconds. Default: `30`.
+    #[serde(default = "default_gws_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Enable audit logging of every `gws` invocation (service, resource,
+    /// method, timestamp). Default: `false`.
+    #[serde(default)]
+    pub audit_log: bool,
+}
+
+fn default_gws_rate_limit() -> u32 {
+    60
+}
+
+fn default_gws_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for GoogleWorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_services: Vec::new(),
+            credentials_path: None,
+            default_account: None,
+            rate_limit_per_minute: default_gws_rate_limit(),
+            timeout_secs: default_gws_timeout_secs(),
+            audit_log: false,
+        }
+    }
+}
+
+// ── Knowledge ───────────────────────────────────────────────────
+
+/// Knowledge graph configuration for capturing and reusing expertise.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct KnowledgeConfig {
+    /// Enable the knowledge graph tool. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the knowledge graph SQLite database.
+    #[serde(default = "default_knowledge_db_path")]
+    pub db_path: String,
+    /// Maximum number of knowledge nodes. Default: 100000.
+    #[serde(default = "default_knowledge_max_nodes")]
+    pub max_nodes: usize,
+    /// Automatically capture knowledge from conversations. Default: false.
+    #[serde(default)]
+    pub auto_capture: bool,
+    /// Proactively suggest relevant knowledge on queries. Default: true.
+    #[serde(default = "default_true")]
+    pub suggest_on_query: bool,
+    /// Allow searching across workspaces (disabled by default for client data isolation).
+    #[serde(default)]
+    pub cross_workspace_search: bool,
+}
+
+fn default_knowledge_db_path() -> String {
+    "~/.zeroclaw/knowledge.db".into()
+}
+
+fn default_knowledge_max_nodes() -> usize {
+    100_000
+}
+
+impl Default for KnowledgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            db_path: default_knowledge_db_path(),
+            max_nodes: default_knowledge_max_nodes(),
+            auto_capture: false,
+            suggest_on_query: true,
+            cross_workspace_search: false,
+        }
+    }
+}
+
+// ── LinkedIn ────────────────────────────────────────────────────
+
+/// LinkedIn integration configuration (`[linkedin]` section).
+///
+/// When enabled, the `linkedin` tool is registered in the agent tool surface.
+/// Requires `LINKEDIN_*` credentials in the workspace `.env` file.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LinkedInConfig {
+    /// Enable the LinkedIn tool.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// LinkedIn REST API version header (YYYYMM format).
+    #[serde(default = "default_linkedin_api_version")]
+    pub api_version: String,
+
+    /// Content strategy for automated posting.
+    #[serde(default)]
+    pub content: LinkedInContentConfig,
+
+    /// Image generation for posts (`[linkedin.image]`).
+    #[serde(default)]
+    pub image: LinkedInImageConfig,
+}
+
+impl Default for LinkedInConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_version: default_linkedin_api_version(),
+            content: LinkedInContentConfig::default(),
+            image: LinkedInImageConfig::default(),
+        }
+    }
+}
+
+fn default_linkedin_api_version() -> String {
+    "202602".to_string()
+}
+
+/// Content strategy configuration for LinkedIn auto-posting (`[linkedin.content]`).
+///
+/// The agent reads this via the `linkedin get_content_strategy` action to know
+/// what feeds to check, which repos to highlight, and how to write posts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct LinkedInContentConfig {
+    /// RSS feed URLs to monitor for topic inspiration (titles only).
+    #[serde(default)]
+    pub rss_feeds: Vec<String>,
+
+    /// GitHub usernames whose public activity to reference.
+    #[serde(default)]
+    pub github_users: Vec<String>,
+
+    /// GitHub repositories to highlight (format: `owner/repo`).
+    #[serde(default)]
+    pub github_repos: Vec<String>,
+
+    /// Topics of expertise and interest for post themes.
+    #[serde(default)]
+    pub topics: Vec<String>,
+
+    /// Professional persona description (name, role, expertise).
+    #[serde(default)]
+    pub persona: String,
+
+    /// Freeform posting instructions for the AI agent.
+    #[serde(default)]
+    pub instructions: String,
+}
+
+/// Image generation configuration for LinkedIn posts (`[linkedin.image]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LinkedInImageConfig {
+    /// Enable image generation for posts.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Provider priority order. Tried in sequence; first success wins.
+    #[serde(default = "default_image_providers")]
+    pub providers: Vec<String>,
+
+    /// Generate a branded SVG text card when all AI providers fail.
+    #[serde(default = "default_true")]
+    pub fallback_card: bool,
+
+    /// Accent color for the fallback card (CSS hex).
+    #[serde(default = "default_card_accent_color")]
+    pub card_accent_color: String,
+
+    /// Temp directory for generated images, relative to workspace.
+    #[serde(default = "default_image_temp_dir")]
+    pub temp_dir: String,
+
+    /// Stability AI provider settings.
+    #[serde(default)]
+    pub stability: ImageProviderStabilityConfig,
+
+    /// Google Imagen (Vertex AI) provider settings.
+    #[serde(default)]
+    pub imagen: ImageProviderImagenConfig,
+
+    /// OpenAI DALL-E provider settings.
+    #[serde(default)]
+    pub dalle: ImageProviderDalleConfig,
+
+    /// Flux (fal.ai) provider settings.
+    #[serde(default)]
+    pub flux: ImageProviderFluxConfig,
+}
+
+fn default_image_providers() -> Vec<String> {
+    vec![
+        "stability".into(),
+        "imagen".into(),
+        "dalle".into(),
+        "flux".into(),
+    ]
+}
+
+fn default_card_accent_color() -> String {
+    "#0A66C2".into()
+}
+
+fn default_image_temp_dir() -> String {
+    "linkedin/images".into()
+}
+
+impl Default for LinkedInImageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            providers: default_image_providers(),
+            fallback_card: true,
+            card_accent_color: default_card_accent_color(),
+            temp_dir: default_image_temp_dir(),
+            stability: ImageProviderStabilityConfig::default(),
+            imagen: ImageProviderImagenConfig::default(),
+            dalle: ImageProviderDalleConfig::default(),
+            flux: ImageProviderFluxConfig::default(),
+        }
+    }
+}
+
+/// Stability AI image generation settings (`[linkedin.image.stability]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ImageProviderStabilityConfig {
+    /// Environment variable name holding the API key.
+    #[serde(default = "default_stability_api_key_env")]
+    pub api_key_env: String,
+    /// Stability model identifier.
+    #[serde(default = "default_stability_model")]
+    pub model: String,
+}
+
+fn default_stability_api_key_env() -> String {
+    "STABILITY_API_KEY".into()
+}
+fn default_stability_model() -> String {
+    "stable-diffusion-xl-1024-v1-0".into()
+}
+
+impl Default for ImageProviderStabilityConfig {
+    fn default() -> Self {
+        Self {
+            api_key_env: default_stability_api_key_env(),
+            model: default_stability_model(),
+        }
+    }
+}
+
+/// Google Imagen (Vertex AI) settings (`[linkedin.image.imagen]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ImageProviderImagenConfig {
+    /// Environment variable name holding the API key.
+    #[serde(default = "default_imagen_api_key_env")]
+    pub api_key_env: String,
+    /// Environment variable for the Google Cloud project ID.
+    #[serde(default = "default_imagen_project_id_env")]
+    pub project_id_env: String,
+    /// Vertex AI region.
+    #[serde(default = "default_imagen_region")]
+    pub region: String,
+}
+
+fn default_imagen_api_key_env() -> String {
+    "GOOGLE_VERTEX_API_KEY".into()
+}
+fn default_imagen_project_id_env() -> String {
+    "GOOGLE_CLOUD_PROJECT".into()
+}
+fn default_imagen_region() -> String {
+    "us-central1".into()
+}
+
+impl Default for ImageProviderImagenConfig {
+    fn default() -> Self {
+        Self {
+            api_key_env: default_imagen_api_key_env(),
+            project_id_env: default_imagen_project_id_env(),
+            region: default_imagen_region(),
+        }
+    }
+}
+
+/// OpenAI DALL-E settings (`[linkedin.image.dalle]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ImageProviderDalleConfig {
+    /// Environment variable name holding the OpenAI API key.
+    #[serde(default = "default_dalle_api_key_env")]
+    pub api_key_env: String,
+    /// DALL-E model identifier.
+    #[serde(default = "default_dalle_model")]
+    pub model: String,
+    /// Image dimensions.
+    #[serde(default = "default_dalle_size")]
+    pub size: String,
+}
+
+fn default_dalle_api_key_env() -> String {
+    "OPENAI_API_KEY".into()
+}
+fn default_dalle_model() -> String {
+    "dall-e-3".into()
+}
+fn default_dalle_size() -> String {
+    "1024x1024".into()
+}
+
+impl Default for ImageProviderDalleConfig {
+    fn default() -> Self {
+        Self {
+            api_key_env: default_dalle_api_key_env(),
+            model: default_dalle_model(),
+            size: default_dalle_size(),
+        }
+    }
+}
+
+/// Flux (fal.ai) image generation settings (`[linkedin.image.flux]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ImageProviderFluxConfig {
+    /// Environment variable name holding the fal.ai API key.
+    #[serde(default = "default_flux_api_key_env")]
+    pub api_key_env: String,
+    /// Flux model identifier.
+    #[serde(default = "default_flux_model")]
+    pub model: String,
+}
+
+fn default_flux_api_key_env() -> String {
+    "FAL_API_KEY".into()
+}
+fn default_flux_model() -> String {
+    "fal-ai/flux/schnell".into()
+}
+
+impl Default for ImageProviderFluxConfig {
+    fn default() -> Self {
+        Self {
+            api_key_env: default_flux_api_key_env(),
+            model: default_flux_model(),
         }
     }
 }
@@ -3653,6 +4152,10 @@ pub struct ChannelsConfig {
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
     pub clawdtalk: Option<crate::channels::ClawdTalkConfig>,
+    /// Reddit channel configuration (OAuth2 bot).
+    pub reddit: Option<RedditConfig>,
+    /// Bluesky channel configuration (AT Protocol).
+    pub bluesky: Option<BlueskyConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -3768,6 +4271,14 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.clawdtalk.as_ref())),
                 self.clawdtalk.is_some(),
             ),
+            (
+                Box::new(ConfigWrapper::new(self.reddit.as_ref())),
+                self.reddit.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(self.bluesky.as_ref())),
+                self.bluesky.is_some(),
+            ),
         ]
     }
 
@@ -3817,6 +4328,8 @@ impl Default for ChannelsConfig {
             #[cfg(feature = "channel-nostr")]
             nostr: None,
             clawdtalk: None,
+            reddit: None,
+            bluesky: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
             show_tool_calls: true,
@@ -3967,11 +4480,26 @@ impl ChannelConfig for MattermostConfig {
 }
 
 /// Webhook channel configuration.
+///
+/// Receives messages via HTTP POST and sends replies to a configurable outbound URL.
+/// This is the "universal adapter" for any system that supports webhooks.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebhookConfig {
     /// Port to listen on for incoming webhooks.
     pub port: u16,
-    /// Optional shared secret for webhook signature verification.
+    /// URL path to listen on (default: `/webhook`).
+    #[serde(default)]
+    pub listen_path: Option<String>,
+    /// URL to POST/PUT outbound messages to.
+    #[serde(default)]
+    pub send_url: Option<String>,
+    /// HTTP method for outbound messages (`POST` or `PUT`). Default: `POST`.
+    #[serde(default)]
+    pub send_method: Option<String>,
+    /// Optional `Authorization` header value for outbound requests.
+    #[serde(default)]
+    pub auth_header: Option<String>,
+    /// Optional shared secret for webhook signature verification (HMAC-SHA256).
     pub secret: Option<String>,
 }
 
@@ -4885,6 +5413,50 @@ impl ChannelConfig for MochatConfig {
     }
 }
 
+/// Reddit channel configuration (OAuth2 bot).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RedditConfig {
+    /// Reddit OAuth2 client ID.
+    pub client_id: String,
+    /// Reddit OAuth2 client secret.
+    pub client_secret: String,
+    /// Reddit OAuth2 refresh token for persistent access.
+    pub refresh_token: String,
+    /// Reddit bot username (without `u/` prefix).
+    pub username: String,
+    /// Optional subreddit to filter messages (without `r/` prefix).
+    /// When set, only messages from this subreddit are processed.
+    #[serde(default)]
+    pub subreddit: Option<String>,
+}
+
+impl ChannelConfig for RedditConfig {
+    fn name() -> &'static str {
+        "Reddit"
+    }
+    fn desc() -> &'static str {
+        "Reddit bot (OAuth2)"
+    }
+}
+
+/// Bluesky channel configuration (AT Protocol).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BlueskyConfig {
+    /// Bluesky handle (e.g. `"mybot.bsky.social"`).
+    pub handle: String,
+    /// App-specific password (from Bluesky settings).
+    pub app_password: String,
+}
+
+impl ChannelConfig for BlueskyConfig {
+    fn name() -> &'static str {
+        "Bluesky"
+    }
+    fn desc() -> &'static str {
+        "AT Protocol"
+    }
+}
+
 /// Nostr channel configuration (NIP-04 + NIP-17 private messages)
 #[cfg(feature = "channel-nostr")]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -5264,6 +5836,7 @@ impl Default for Config {
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
             project_intel: ProjectIntelConfig::default(),
+            google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
@@ -5280,6 +5853,8 @@ impl Default for Config {
             workspace: WorkspaceConfig::default(),
             notion: NotionConfig::default(),
             node_transport: NodeTransportConfig::default(),
+            knowledge: KnowledgeConfig::default(),
+            linkedin: LinkedInConfig::default(),
         }
     }
 }
@@ -5796,6 +6371,41 @@ impl Config {
             }
             if let Some(ref mut google) = config.tts.google {
                 decrypt_optional_secret(&store, &mut google.api_key, "config.tts.google.api_key")?;
+            }
+
+            // Decrypt nested STT provider API keys
+            decrypt_optional_secret(
+                &store,
+                &mut config.transcription.api_key,
+                "config.transcription.api_key",
+            )?;
+            if let Some(ref mut openai) = config.transcription.openai {
+                decrypt_optional_secret(
+                    &store,
+                    &mut openai.api_key,
+                    "config.transcription.openai.api_key",
+                )?;
+            }
+            if let Some(ref mut deepgram) = config.transcription.deepgram {
+                decrypt_optional_secret(
+                    &store,
+                    &mut deepgram.api_key,
+                    "config.transcription.deepgram.api_key",
+                )?;
+            }
+            if let Some(ref mut assemblyai) = config.transcription.assemblyai {
+                decrypt_optional_secret(
+                    &store,
+                    &mut assemblyai.api_key,
+                    "config.transcription.assemblyai.api_key",
+                )?;
+            }
+            if let Some(ref mut google) = config.transcription.google {
+                decrypt_optional_secret(
+                    &store,
+                    &mut google.api_key,
+                    "config.transcription.google.api_key",
+                )?;
             }
 
             #[cfg(feature = "channel-nostr")]
@@ -6421,6 +7031,38 @@ impl Config {
             validate_mcp_config(&self.mcp)?;
         }
 
+        // Knowledge graph
+        if self.knowledge.enabled {
+            if self.knowledge.max_nodes == 0 {
+                anyhow::bail!("knowledge.max_nodes must be greater than 0");
+            }
+            if self.knowledge.db_path.trim().is_empty() {
+                anyhow::bail!("knowledge.db_path must not be empty");
+            }
+        }
+
+        // Google Workspace allowed_services validation
+        let mut seen_gws_services = std::collections::HashSet::new();
+        for (i, service) in self.google_workspace.allowed_services.iter().enumerate() {
+            let normalized = service.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("google_workspace.allowed_services[{i}] must not be empty");
+            }
+            if !normalized
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+            {
+                anyhow::bail!(
+                    "google_workspace.allowed_services[{i}] contains invalid characters: {normalized}"
+                );
+            }
+            if !seen_gws_services.insert(normalized.to_string()) {
+                anyhow::bail!(
+                    "google_workspace.allowed_services contains duplicate entry: {normalized}"
+                );
+            }
+        }
+
         // Project intelligence
         if self.project_intel.enabled {
             let lang = &self.project_intel.default_language;
@@ -6472,6 +7114,19 @@ impl Config {
         // Nevis IAM — delegate to NevisConfig::validate() for field-level checks
         if let Err(msg) = self.security.nevis.validate() {
             anyhow::bail!("security.nevis: {msg}");
+        }
+
+        // Transcription
+        {
+            let dp = self.transcription.default_provider.trim();
+            match dp {
+                "groq" | "openai" | "deepgram" | "assemblyai" | "google" => {}
+                other => {
+                    anyhow::bail!(
+                        "transcription.default_provider must be one of: groq, openai, deepgram, assemblyai, google (got '{other}')"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -6881,6 +7536,41 @@ impl Config {
         }
         if let Some(ref mut google) = config_to_save.tts.google {
             encrypt_optional_secret(&store, &mut google.api_key, "config.tts.google.api_key")?;
+        }
+
+        // Encrypt nested STT provider API keys
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.transcription.api_key,
+            "config.transcription.api_key",
+        )?;
+        if let Some(ref mut openai) = config_to_save.transcription.openai {
+            encrypt_optional_secret(
+                &store,
+                &mut openai.api_key,
+                "config.transcription.openai.api_key",
+            )?;
+        }
+        if let Some(ref mut deepgram) = config_to_save.transcription.deepgram {
+            encrypt_optional_secret(
+                &store,
+                &mut deepgram.api_key,
+                "config.transcription.deepgram.api_key",
+            )?;
+        }
+        if let Some(ref mut assemblyai) = config_to_save.transcription.assemblyai {
+            encrypt_optional_secret(
+                &store,
+                &mut assemblyai.api_key,
+                "config.transcription.assemblyai.api_key",
+            )?;
+        }
+        if let Some(ref mut google) = config_to_save.transcription.google {
+            encrypt_optional_secret(
+                &store,
+                &mut google.api_key,
+                "config.transcription.google.api_key",
+            )?;
         }
 
         #[cfg(feature = "channel-nostr")]
@@ -7547,6 +8237,8 @@ default_temperature = 0.7
                 #[cfg(feature = "channel-nostr")]
                 nostr: None,
                 clawdtalk: None,
+                reddit: None,
+                bluesky: None,
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
@@ -7568,6 +8260,7 @@ default_temperature = 0.7
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
             project_intel: ProjectIntelConfig::default(),
+            google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
@@ -7584,6 +8277,8 @@ default_temperature = 0.7
             workspace: WorkspaceConfig::default(),
             notion: NotionConfig::default(),
             node_transport: NodeTransportConfig::default(),
+            knowledge: KnowledgeConfig::default(),
+            linkedin: LinkedInConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -7871,6 +8566,7 @@ tool_dispatcher = "xml"
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
             project_intel: ProjectIntelConfig::default(),
+            google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
@@ -7887,6 +8583,8 @@ tool_dispatcher = "xml"
             workspace: WorkspaceConfig::default(),
             notion: NotionConfig::default(),
             node_transport: NodeTransportConfig::default(),
+            knowledge: KnowledgeConfig::default(),
+            linkedin: LinkedInConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -8285,6 +8983,8 @@ allowed_users = ["@ops:matrix.org"]
             mochat: None,
             nostr: None,
             clawdtalk: None,
+            reddit: None,
+            bluesky: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
@@ -8529,6 +9229,8 @@ channel_id = "C123"
             mochat: None,
             nostr: None,
             clawdtalk: None,
+            reddit: None,
+            bluesky: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
@@ -9398,7 +10100,7 @@ requires_openai_auth = true
         std::env::set_var("HOME", &temp_home);
         std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
 
-        let config = Config::load_or_init().await.unwrap();
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
 
         assert_eq!(config.workspace_dir, workspace_dir.join("workspace"));
         assert_eq!(config.config_path, workspace_dir.join("config.toml"));
@@ -9425,7 +10127,7 @@ requires_openai_auth = true
         std::env::set_var("HOME", &temp_home);
         std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
 
-        let config = Config::load_or_init().await.unwrap();
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
 
         assert_eq!(config.workspace_dir, workspace_dir);
         assert_eq!(config.config_path, legacy_config_path);
@@ -9463,7 +10165,7 @@ default_model = "legacy-model"
         std::env::set_var("HOME", &temp_home);
         std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
 
-        let config = Config::load_or_init().await.unwrap();
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
 
         assert_eq!(config.workspace_dir, workspace_dir);
         assert_eq!(config.config_path, legacy_config_path);
@@ -9507,7 +10209,7 @@ default_model = "legacy-model"
         });
         config.save().await.unwrap();
 
-        let loaded = Config::load_or_init().await.unwrap();
+        let loaded = Box::pin(Config::load_or_init()).await.unwrap();
         let feishu = loaded.channels_config.feishu.as_ref().unwrap();
         assert_eq!(feishu.app_secret, "feishu-secret");
         assert_eq!(feishu.encrypt_key.as_deref(), Some("feishu-encrypt"));
@@ -9544,7 +10246,7 @@ default_model = "legacy-model"
             .await
             .unwrap();
 
-        let config = Config::load_or_init().await.unwrap();
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
 
         assert_eq!(config.config_path, custom_config_dir.join("config.toml"));
         assert_eq!(config.workspace_dir, custom_config_dir.join("workspace"));
@@ -9581,7 +10283,7 @@ default_model = "legacy-model"
             .unwrap();
         std::env::set_var("ZEROCLAW_WORKSPACE", &env_workspace_dir);
 
-        let config = Config::load_or_init().await.unwrap();
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
 
         assert_eq!(config.workspace_dir, env_workspace_dir.join("workspace"));
         assert_eq!(config.config_path, env_workspace_dir.join("config.toml"));

@@ -72,7 +72,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             move || {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
-                async move { crate::gateway::run_gateway(&host, port, cfg).await }
+                async move { Box::pin(crate::gateway::run_gateway(&host, port, cfg)).await }
             },
         ));
     }
@@ -116,7 +116,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             max_backoff,
             move || {
                 let cfg = scheduler_cfg.clone();
-                async move { crate::cron::scheduler::run(cfg).await }
+                async move { Box::pin(crate::cron::scheduler::run(cfg)).await }
             },
         ));
     } else {
