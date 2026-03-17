@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -55,7 +55,7 @@ impl Tool for GlobSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::FileSystem),
             });
         }
 
@@ -67,7 +67,7 @@ impl Tool for GlobSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Absolute paths are not allowed. Use a relative glob pattern.".into()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::FileSystem),
             });
         }
 
@@ -77,7 +77,7 @@ impl Tool for GlobSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Path traversal ('..') is not allowed in glob patterns.".into()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::FileSystem),
             });
         }
 
@@ -87,7 +87,7 @@ impl Tool for GlobSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::FileSystem),
             });
         }
 
@@ -106,7 +106,7 @@ impl Tool for GlobSearchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Invalid glob pattern: {e}")),
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::FileSystem),
                 });
             }
         };
@@ -119,7 +119,7 @@ impl Tool for GlobSearchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Cannot resolve workspace directory: {e}")),
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::FileSystem),
                 });
             }
         };
@@ -180,7 +180,7 @@ impl Tool for GlobSearchTool {
             success: true,
             output,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::FileSystem),
         })
     }
 }

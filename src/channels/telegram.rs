@@ -1,7 +1,7 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use crate::config::{Config, StreamMode};
 use crate::security::pairing::PairingGuard;
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use anyhow::Context;
 use async_trait::async_trait;
 use directories::UserDirs;
@@ -1054,7 +1054,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         })
     }
 
@@ -1172,7 +1172,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         })
     }
 
@@ -1329,7 +1329,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         })
     }
 

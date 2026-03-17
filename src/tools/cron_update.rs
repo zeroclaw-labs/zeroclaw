@@ -1,7 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron::{self, CronJobPatch};
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -25,7 +25,7 @@ impl CronUpdateTool {
                 error: Some(format!(
                     "Security policy: read-only mode, cannot perform '{action}'"
                 )),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -34,7 +34,7 @@ impl CronUpdateTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -43,7 +43,7 @@ impl CronUpdateTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -83,7 +83,7 @@ impl Tool for CronUpdateTool {
                 success: false,
                 output: String::new(),
                 error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -94,7 +94,7 @@ impl Tool for CronUpdateTool {
                     success: false,
                     output: String::new(),
                     error: Some("Missing 'job_id' parameter".to_string()),
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 });
             }
         };
@@ -106,7 +106,7 @@ impl Tool for CronUpdateTool {
                     success: false,
                     output: String::new(),
                     error: Some("Missing 'patch' parameter".to_string()),
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 });
             }
         };
@@ -118,7 +118,7 @@ impl Tool for CronUpdateTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Invalid patch payload: {e}")),
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 });
             }
         };
@@ -136,13 +136,13 @@ impl Tool for CronUpdateTool {
                 success: true,
                 output: serde_json::to_string_pretty(&job)?,
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(e.to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
         }
     }

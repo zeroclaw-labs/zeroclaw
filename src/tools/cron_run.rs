@@ -1,7 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron::{self, JobType};
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -50,7 +50,7 @@ impl Tool for CronRunTool {
                 success: false,
                 output: String::new(),
                 error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -61,7 +61,7 @@ impl Tool for CronRunTool {
                     success: false,
                     output: String::new(),
                     error: Some("Missing 'job_id' parameter".to_string()),
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 });
             }
         };
@@ -75,7 +75,7 @@ impl Tool for CronRunTool {
                 success: false,
                 output: String::new(),
                 error: Some("Security policy: read-only mode, cannot perform 'cron_run'".into()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -84,7 +84,7 @@ impl Tool for CronRunTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -95,7 +95,7 @@ impl Tool for CronRunTool {
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 });
             }
         };
@@ -109,7 +109,7 @@ impl Tool for CronRunTool {
                     success: false,
                     output: String::new(),
                     error: Some(reason),
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 });
             }
         }
@@ -119,7 +119,7 @@ impl Tool for CronRunTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -153,7 +153,7 @@ impl Tool for CronRunTool {
             } else {
                 Some("cron job execution failed".to_string())
             },
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 }

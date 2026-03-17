@@ -4,7 +4,7 @@ use crate::config::DelegateAgentConfig;
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::security::policy::ToolOperation;
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -179,7 +179,7 @@ impl Tool for DelegateTool {
                 success: false,
                 output: String::new(),
                 error: Some("'agent' parameter must not be empty".into()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -194,7 +194,7 @@ impl Tool for DelegateTool {
                 success: false,
                 output: String::new(),
                 error: Some("'prompt' parameter must not be empty".into()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -221,7 +221,7 @@ impl Tool for DelegateTool {
                             available.join(", ")
                         }
                     )),
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 });
             }
         };
@@ -237,7 +237,7 @@ impl Tool for DelegateTool {
                     depth = self.depth,
                     max = agent_config.max_depth
                 )),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -249,7 +249,7 @@ impl Tool for DelegateTool {
                 success: false,
                 output: String::new(),
                 error: Some(error),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -275,7 +275,7 @@ impl Tool for DelegateTool {
                         "Failed to create provider '{}' for agent '{agent_name}': {e}",
                         agent_config.provider
                     )),
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 });
             }
         };
@@ -323,7 +323,7 @@ impl Tool for DelegateTool {
                     error: Some(format!(
                         "Agent '{agent_name}' timed out after {DELEGATE_TIMEOUT_SECS}s"
                     )),
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 });
             }
         };
@@ -343,14 +343,14 @@ impl Tool for DelegateTool {
                         model = agent_config.model
                     ),
                     error: None,
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Agent '{agent_name}' failed: {e}",)),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
         }
     }
@@ -372,7 +372,7 @@ impl DelegateTool {
                 error: Some(format!(
                     "Agent '{agent_name}' has agentic=true but allowed_tools is empty"
                 )),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -401,7 +401,7 @@ impl DelegateTool {
                     "Agent '{agent_name}' has no executable tools after filtering allowlist ({})",
                     agent_config.allowed_tools.join(", ")
                 )),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -453,14 +453,14 @@ impl DelegateTool {
                         model = agent_config.model
                     ),
                     error: None,
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 })
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Agent '{agent_name}' failed: {e}")),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -468,7 +468,7 @@ impl DelegateTool {
                 error: Some(format!(
                     "Agent '{agent_name}' timed out after {DELEGATE_AGENTIC_TIMEOUT_SECS}s"
                 )),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
         }
     }
@@ -596,7 +596,7 @@ mod tests {
                 success: true,
                 output: format!("echo:{value}"),
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             })
         }
     }
@@ -1150,7 +1150,7 @@ mod tests {
                 success: true,
                 output: "mcp_fake_output".into(),
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             })
         }
     }

@@ -50,6 +50,7 @@ pub trait Tool: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::taint::TaintSource;
 
     struct DummyTool;
 
@@ -81,7 +82,7 @@ mod tests {
                     .unwrap_or_default()
                     .to_string(),
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             })
         }
     }
@@ -116,7 +117,7 @@ mod tests {
             success: false,
             output: String::new(),
             error: Some("boom".into()),
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         };
 
         let json = serde_json::to_string(&result).unwrap();

@@ -161,6 +161,7 @@ pub trait Channel: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::taint::TaintSource;
 
     struct DummyChannel;
 
@@ -186,7 +187,7 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -203,7 +204,7 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         };
 
         let cloned = message.clone();

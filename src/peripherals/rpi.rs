@@ -5,7 +5,7 @@
 
 use crate::config::PeripheralBoardConfig;
 use crate::peripherals::Peripheral;
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use crate::tools::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -108,7 +108,7 @@ impl Tool for RpiGpioReadTool {
             success: true,
             output: format!("pin {} = {}", pin, value),
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 }
@@ -170,7 +170,7 @@ impl Tool for RpiGpioWriteTool {
             success: true,
             output: format!("pin {} = {}", pin, value),
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 }

@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn activated_set_tracks_activation() {
-        use crate::security::taint::TaintLabel;
+        use crate::security::taint::{TaintLabel, TaintSource};
         use crate::tools::traits::ToolResult;
         use async_trait::async_trait;
 
@@ -275,7 +275,7 @@ mod tests {
                     success: true,
                     output: String::new(),
                     error: None,
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 })
             }
         }

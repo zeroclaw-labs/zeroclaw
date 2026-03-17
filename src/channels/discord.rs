@@ -1,5 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -785,7 +785,7 @@ impl Channel for DiscordChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: None,
-                        taint: TaintLabel::default(),
+                        taint: TaintLabel::untrusted(TaintSource::UserInput),
                     };
 
                     if tx.send(channel_msg).await.is_err() {

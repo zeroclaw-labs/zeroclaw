@@ -35,7 +35,7 @@ use crate::providers::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ToolCall,
     ToolResultMessage,
 };
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use crate::tools::{Tool, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -159,7 +159,7 @@ impl Tool for EchoTool {
             success: true,
             output: msg,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         })
     }
 }
@@ -186,7 +186,7 @@ impl Tool for FailingTool {
             success: false,
             output: String::new(),
             error: Some("intentional failure".into()),
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         })
     }
 }
@@ -251,7 +251,7 @@ impl Tool for CountingTool {
             success: true,
             output: format!("call #{}", *c),
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         })
     }
 }

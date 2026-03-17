@@ -4,7 +4,7 @@
 //! Requires probe feature and Nucleo connected via USB.
 
 use super::traits::{Tool, ToolResult};
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use async_trait::async_trait;
 use serde_json::json;
 
@@ -69,7 +69,7 @@ impl Tool for HardwareMemoryReadTool {
                     "No peripherals configured. Add nucleo-f401re to config.toml [peripherals.boards]."
                         .into(),
                 ),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -89,7 +89,7 @@ impl Tool for HardwareMemoryReadTool {
                     "Memory read only supports nucleo-f401re, nucleo-f411re. Got: {}",
                     board
                 )),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -112,7 +112,7 @@ impl Tool for HardwareMemoryReadTool {
                         success: true,
                         output,
                         error: None,
-                        taint: TaintLabel::default(),
+                        taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                     });
                 }
                 Err(e) => {
@@ -123,7 +123,7 @@ impl Tool for HardwareMemoryReadTool {
                             "probe-rs read failed: {}. Ensure Nucleo is connected via USB and built with --features probe.",
                             e
                         )),
-                        taint: TaintLabel::default(),
+                        taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                     });
                 }
             }
@@ -138,7 +138,7 @@ impl Tool for HardwareMemoryReadTool {
                     "Memory read requires probe feature. Build with: cargo build --features hardware,probe"
                         .into(),
                 ),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             })
         }
     }

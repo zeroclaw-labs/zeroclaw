@@ -400,7 +400,7 @@ pub fn all_tools_with_runtime(
 mod tests {
     use super::*;
     use crate::config::{BrowserConfig, Config, MemoryConfig};
-    use crate::security::taint::TaintLabel;
+    use crate::security::taint::{TaintLabel, TaintSource};
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -565,7 +565,7 @@ mod tests {
             success: true,
             output: "hello".into(),
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: ToolResult = serde_json::from_str(&json).unwrap();
@@ -580,7 +580,7 @@ mod tests {
             success: false,
             output: String::new(),
             error: Some("boom".into()),
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: ToolResult = serde_json::from_str(&json).unwrap();

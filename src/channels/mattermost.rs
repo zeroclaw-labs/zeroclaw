@@ -1,5 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -323,7 +323,7 @@ impl MattermostChannel {
             #[allow(clippy::cast_sign_loss)]
             timestamp: (create_at / 1000) as u64,
             thread_ts: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         })
     }
 }

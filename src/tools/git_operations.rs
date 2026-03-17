@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use async_trait::async_trait;
 use serde_json::json;
@@ -129,7 +129,7 @@ impl GitOperationsTool {
             success: true,
             output: serde_json::to_string_pretty(&result).unwrap_or_default(),
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 
@@ -209,7 +209,7 @@ impl GitOperationsTool {
             success: true,
             output: serde_json::to_string_pretty(&result).unwrap_or_default(),
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 
@@ -247,7 +247,7 @@ impl GitOperationsTool {
             output: serde_json::to_string_pretty(&json!({ "commits": commits }))
                 .unwrap_or_default(),
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 
@@ -280,7 +280,7 @@ impl GitOperationsTool {
             }))
             .unwrap_or_default(),
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 
@@ -320,13 +320,13 @@ impl GitOperationsTool {
                 success: true,
                 output: format!("Committed: {message}"),
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Commit failed: {e}")),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
         }
     }
@@ -347,13 +347,13 @@ impl GitOperationsTool {
                 success: true,
                 output: format!("Staged: {paths}"),
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Add failed: {e}")),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
         }
     }
@@ -385,13 +385,13 @@ impl GitOperationsTool {
                 success: true,
                 output: format!("Switched to branch: {branch_name}"),
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Checkout failed: {e}")),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
         }
     }
@@ -424,13 +424,13 @@ impl GitOperationsTool {
                 success: true,
                 output: out,
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Stash {action} failed: {e}")),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
         }
     }
@@ -501,7 +501,7 @@ impl Tool for GitOperationsTool {
                     success: false,
                     output: String::new(),
                     error: Some("Missing 'operation' parameter".into()),
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 });
             }
         };
@@ -524,7 +524,7 @@ impl Tool for GitOperationsTool {
                     success: false,
                     output: String::new(),
                     error: Some("Not in a git repository".into()),
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 });
             }
         }
@@ -538,7 +538,7 @@ impl Tool for GitOperationsTool {
                     error: Some(
                         "Action blocked: git write operations require higher autonomy level".into(),
                     ),
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 });
             }
 
@@ -548,7 +548,7 @@ impl Tool for GitOperationsTool {
                         success: false,
                         output: String::new(),
                         error: Some("Action blocked: read-only mode".into()),
-                        taint: TaintLabel::default(),
+                        taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                     });
                 }
                 AutonomyLevel::Supervised | AutonomyLevel::Full => {}
@@ -561,7 +561,7 @@ impl Tool for GitOperationsTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -579,7 +579,7 @@ impl Tool for GitOperationsTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Unknown operation: {operation}")),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
         }
     }

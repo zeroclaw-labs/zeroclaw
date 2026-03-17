@@ -5,7 +5,7 @@
 //! - `select:name1,name2` — fetch exact tools by prefixed name.
 //! - Free-text keyword search — returns the best-matching stubs.
 
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
 
@@ -79,7 +79,7 @@ impl Tool for ToolSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("query parameter is required".into()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -97,7 +97,7 @@ impl Tool for ToolSearchTool {
                 success: true,
                 output: "No matching deferred tools found.".into(),
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -136,7 +136,7 @@ impl Tool for ToolSearchTool {
             success: true,
             output,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 }
@@ -191,7 +191,7 @@ impl ToolSearchTool {
             success: true,
             output,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 }

@@ -652,7 +652,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::taint::TaintLabel;
+    use crate::security::taint::{TaintLabel, TaintSource};
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::collections::HashMap;
@@ -750,7 +750,7 @@ mod tests {
                 success: true,
                 output: "tool-out".into(),
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             })
         }
     }

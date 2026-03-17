@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::{ClassificationRule, Config, DelegateAgentConfig, ModelRouteConfig};
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use crate::security::SecurityPolicy;
 use crate::util::MaybeSet;
 use async_trait::async_trait;
@@ -47,7 +47,7 @@ impl ModelRoutingConfigTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -56,7 +56,7 @@ impl ModelRoutingConfigTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -329,7 +329,7 @@ impl ModelRoutingConfigTool {
             success: true,
             output: serde_json::to_string_pretty(&Self::snapshot(&cfg))?,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 
@@ -375,7 +375,7 @@ impl ModelRoutingConfigTool {
                 }
             }))?,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 
@@ -428,7 +428,7 @@ impl ModelRoutingConfigTool {
                 "config": Self::snapshot(&cfg),
             }))?,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 
@@ -562,7 +562,7 @@ impl ModelRoutingConfigTool {
                 "config": Self::snapshot(&cfg),
             }))?,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 
@@ -608,7 +608,7 @@ impl ModelRoutingConfigTool {
                 "config": Self::snapshot(&cfg),
             }))?,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 
@@ -719,7 +719,7 @@ impl ModelRoutingConfigTool {
                 "config": Self::snapshot(&cfg),
             }))?,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 
@@ -741,7 +741,7 @@ impl ModelRoutingConfigTool {
                 "config": Self::snapshot(&cfg),
             }))?,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 }
@@ -902,7 +902,7 @@ impl Tool for ModelRoutingConfigTool {
                 success: false,
                 output: String::new(),
                 error: Some(error.to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
         }
     }

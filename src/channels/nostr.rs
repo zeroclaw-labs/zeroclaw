@@ -1,5 +1,5 @@
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use nostr_sdk::prelude::*;
@@ -254,7 +254,7 @@ impl Channel for NostrChannel {
                             channel: "nostr".to_string(),
                             timestamp,
                             thread_ts: None,
-                            taint: TaintLabel::default(),
+                            taint: TaintLabel::untrusted(TaintSource::UserInput),
                         };
                         if tx.send(msg).await.is_err() {
                             tracing::info!("Nostr listener: message bus closed, stopping");

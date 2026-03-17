@@ -1,5 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use async_trait::async_trait;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 use uuid::Uuid;
@@ -49,7 +49,7 @@ impl Channel for CliChannel {
                     .unwrap_or_default()
                     .as_secs(),
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             };
 
             if tx.send(msg).await.is_err() {
@@ -113,7 +113,7 @@ mod tests {
             channel: "cli".into(),
             timestamp: 1_234_567_890,
             thread_ts: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         };
         assert_eq!(msg.id, "test-id");
         assert_eq!(msg.sender, "user");
@@ -133,7 +133,7 @@ mod tests {
             channel: "ch".into(),
             timestamp: 0,
             thread_ts: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         };
         let cloned = msg.clone();
         assert_eq!(cloned.id, msg.id);

@@ -5,7 +5,7 @@
 //! returns static maps from datasheets.
 
 use super::traits::{Tool, ToolResult};
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use async_trait::async_trait;
 use serde_json::json;
 
@@ -90,7 +90,7 @@ impl Tool for HardwareMemoryMapTool {
                     "No peripherals configured. Add boards to config.toml [peripherals.boards]."
                         .into(),
                 ),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -141,7 +141,7 @@ impl Tool for HardwareMemoryMapTool {
             success: true,
             output,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 }

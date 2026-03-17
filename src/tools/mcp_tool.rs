@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use crate::tools::mcp_client::McpRegistry;
 use crate::tools::mcp_protocol::McpToolDef;
 use crate::tools::traits::{Tool, ToolResult};
@@ -70,13 +70,13 @@ impl Tool for McpToolWrapper {
                 success: true,
                 output,
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(e.to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
         }
     }
@@ -184,7 +184,7 @@ mod tests {
             success: true,
             output: "hello".to_string(),
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         };
     }
 

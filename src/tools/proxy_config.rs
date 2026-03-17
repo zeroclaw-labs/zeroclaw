@@ -2,7 +2,7 @@ use super::traits::{Tool, ToolResult};
 use crate::config::{
     runtime_proxy_config, set_runtime_proxy_config, Config, ProxyConfig, ProxyScope,
 };
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use crate::security::SecurityPolicy;
 use crate::util::MaybeSet;
 use async_trait::async_trait;
@@ -45,7 +45,7 @@ impl ProxyConfigTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -54,7 +54,7 @@ impl ProxyConfigTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -152,7 +152,7 @@ impl ProxyConfigTool {
                 "environment": Self::env_snapshot(),
             }))?,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 
@@ -169,7 +169,7 @@ impl ProxyConfigTool {
                 }
             }))?,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 
@@ -267,7 +267,7 @@ impl ProxyConfigTool {
                 "environment": Self::env_snapshot(),
             }))?,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 
@@ -295,7 +295,7 @@ impl ProxyConfigTool {
                 "environment": Self::env_snapshot(),
             }))?,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 
@@ -326,7 +326,7 @@ impl ProxyConfigTool {
                 "environment": Self::env_snapshot(),
             }))?,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 
@@ -339,7 +339,7 @@ impl ProxyConfigTool {
                 "environment": Self::env_snapshot(),
             }))?,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 }
@@ -439,7 +439,7 @@ impl Tool for ProxyConfigTool {
                 success: false,
                 output: String::new(),
                 error: Some(error.to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
         }
     }

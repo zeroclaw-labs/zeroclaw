@@ -3889,7 +3889,7 @@ mod tests {
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::{ChatMessage, Provider};
-    use crate::security::taint::TaintLabel;
+    use crate::security::taint::{TaintLabel, TaintSource};
     use crate::tools::{Tool, ToolResult};
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -4769,7 +4769,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     success: false,
                     output: String::new(),
                     error: Some("unexpected symbol".to_string()),
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::UserInput),
                 });
             }
 
@@ -4777,7 +4777,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 success: true,
                 output: r#"{"symbol":"BTC","price_usd":65000}"#.to_string(),
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             })
         }
     }
@@ -4836,7 +4836,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )
@@ -4905,7 +4905,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )
@@ -4988,7 +4988,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 3,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )
@@ -5056,7 +5056,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )
@@ -5134,7 +5134,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )
@@ -5232,7 +5232,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )
@@ -5312,7 +5312,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 3,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )
@@ -5407,7 +5407,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 4,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )
@@ -5487,7 +5487,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )
@@ -5557,7 +5557,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )
@@ -5737,7 +5737,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         })
         .await
         .unwrap();
@@ -5749,7 +5749,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 2,
             thread_ts: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         })
         .await
         .unwrap();
@@ -5828,7 +5828,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             })
             .await
             .unwrap();
@@ -5841,7 +5841,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             })
             .await
             .unwrap();
@@ -5933,7 +5933,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "slack".to_string(),
                 timestamp: 1,
                 thread_ts: Some("1741234567.100001".to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             })
             .await
             .unwrap();
@@ -5946,7 +5946,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "slack".to_string(),
                 timestamp: 2,
                 thread_ts: Some("1741234567.100001".to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             })
             .await
             .unwrap();
@@ -6035,7 +6035,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             })
             .await
             .unwrap();
@@ -6048,7 +6048,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             })
             .await
             .unwrap();
@@ -6119,7 +6119,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )
@@ -6187,7 +6187,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )
@@ -6591,7 +6591,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -6607,7 +6607,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: Some("1741234567.123456".into()),
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         };
 
         assert_eq!(
@@ -6626,7 +6626,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "cli".into(),
             timestamp: 1,
             thread_ts: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         };
 
         assert_eq!(followup_thread_id(&msg).as_deref(), Some("msg_abc123"));
@@ -6642,7 +6642,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -6652,7 +6652,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         };
 
         assert_ne!(
@@ -6674,7 +6674,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -6684,7 +6684,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         };
 
         mem.store(
@@ -6820,7 +6820,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )
@@ -6836,7 +6836,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )
@@ -6915,7 +6915,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )
@@ -7009,7 +7009,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )
@@ -7568,7 +7568,7 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )
@@ -7642,7 +7642,7 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )
@@ -7658,7 +7658,7 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::UserInput),
             },
             CancellationToken::new(),
         )

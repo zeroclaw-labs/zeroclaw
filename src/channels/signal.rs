@@ -1,5 +1,5 @@
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -267,7 +267,7 @@ impl SignalChannel {
             channel: "signal".to_string(),
             timestamp: timestamp / 1000, // millis → secs
             thread_ts: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::UserInput),
         })
     }
 }

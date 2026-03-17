@@ -46,7 +46,7 @@ pub enum TaintSource {
 /// An empty source set means the data is trusted (system-generated).
 /// Any non-empty set indicates potentially untrusted data that should
 /// be treated with care when flowing into sensitive operations.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaintLabel {
     #[serde(default)]
     pub sources: HashSet<TaintSource>,

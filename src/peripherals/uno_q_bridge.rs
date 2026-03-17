@@ -3,7 +3,7 @@
 //! When ZeroClaw runs on Uno Q, the Bridge app (Python + MCU) exposes
 //! digitalWrite/digitalRead over a local socket. These tools connect to it.
 
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -69,14 +69,14 @@ impl Tool for UnoQGpioReadTool {
                         success: false,
                         output: resp.clone(),
                         error: Some(resp),
-                        taint: TaintLabel::default(),
+                        taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                     })
                 } else {
                     Ok(ToolResult {
                         success: true,
                         output: resp,
                         error: None,
-                        taint: TaintLabel::default(),
+                        taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                     })
                 }
             }
@@ -84,7 +84,7 @@ impl Tool for UnoQGpioReadTool {
                 success: false,
                 output: format!("Bridge error: {}", e),
                 error: Some(e.to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
         }
     }
@@ -136,14 +136,14 @@ impl Tool for UnoQGpioWriteTool {
                         success: false,
                         output: resp.clone(),
                         error: Some(resp),
-                        taint: TaintLabel::default(),
+                        taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                     })
                 } else {
                     Ok(ToolResult {
                         success: true,
                         output: "done".into(),
                         error: None,
-                        taint: TaintLabel::default(),
+                        taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                     })
                 }
             }
@@ -151,7 +151,7 @@ impl Tool for UnoQGpioWriteTool {
                 success: false,
                 output: format!("Bridge error: {}", e),
                 error: Some(e.to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
         }
     }

@@ -110,14 +110,14 @@ impl Tool for SopApproveTool {
                     success: true,
                     output,
                     error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Approval failed: {e}")),
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
         }
     }
@@ -130,7 +130,7 @@ mod tests {
     use crate::memory::Memory;
     use crate::sop::engine::SopEngine;
     use crate::sop::types::*;
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 
     fn test_sop() -> Sop {
         Sop {

@@ -7,7 +7,7 @@ use crate::providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
 };
 use crate::runtime;
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
@@ -2842,7 +2842,7 @@ pub(crate) async fn run_tool_call_loop(
                     success: outcome.success,
                     output: outcome.output.clone(),
                     error: None,
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 };
                 hooks
                     .fire_after_tool_call(&call.name, &tool_result_obj, outcome.duration)
@@ -4065,7 +4065,7 @@ mod tests {
                 success: true,
                 output: format!("counted:{value}"),
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             })
         }
     }
@@ -4134,7 +4134,7 @@ mod tests {
                 success: true,
                 output: format!("ok:{value}"),
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             })
         }
     }

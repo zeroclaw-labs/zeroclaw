@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -167,7 +167,7 @@ impl Tool for ImageInfoTool {
                 error: Some(format!(
                     "Path not allowed: {path_str} (must be within workspace)"
                 )),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::FileSystem),
             });
         }
 
@@ -176,7 +176,7 @@ impl Tool for ImageInfoTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("File not found: {path_str}")),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::FileSystem),
             });
         }
 
@@ -193,7 +193,7 @@ impl Tool for ImageInfoTool {
                 error: Some(format!(
                     "Image too large: {file_size} bytes (max {MAX_IMAGE_BYTES} bytes)"
                 )),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::FileSystem),
             });
         }
 
@@ -228,7 +228,7 @@ impl Tool for ImageInfoTool {
             success: true,
             output,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::FileSystem),
         })
     }
 }

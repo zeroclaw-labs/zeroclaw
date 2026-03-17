@@ -1,7 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron::{self, DeliveryConfig, JobType, Schedule, SessionTarget};
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -25,7 +25,7 @@ impl CronAddTool {
                 error: Some(format!(
                     "Security policy: read-only mode, cannot perform '{action}'"
                 )),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -34,7 +34,7 @@ impl CronAddTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -43,7 +43,7 @@ impl CronAddTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -106,7 +106,7 @@ impl Tool for CronAddTool {
                 success: false,
                 output: String::new(),
                 error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -118,7 +118,7 @@ impl Tool for CronAddTool {
                         success: false,
                         output: String::new(),
                         error: Some(format!("Invalid schedule: {e}")),
-                        taint: TaintLabel::default(),
+                        taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                     });
                 }
             },
@@ -127,7 +127,7 @@ impl Tool for CronAddTool {
                     success: false,
                     output: String::new(),
                     error: Some("Missing 'schedule' parameter".to_string()),
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 });
             }
         };
@@ -145,7 +145,7 @@ impl Tool for CronAddTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Invalid job_type: {other}")),
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 });
             }
             None => {
@@ -176,7 +176,7 @@ impl Tool for CronAddTool {
                             success: false,
                             output: String::new(),
                             error: Some("Missing 'command' for shell job".to_string()),
-                            taint: TaintLabel::default(),
+                            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                         });
                     }
                 };
@@ -186,7 +186,7 @@ impl Tool for CronAddTool {
                         success: false,
                         output: String::new(),
                         error: Some(reason),
-                        taint: TaintLabel::default(),
+                        taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                     });
                 }
 
@@ -204,7 +204,7 @@ impl Tool for CronAddTool {
                             success: false,
                             output: String::new(),
                             error: Some("Missing 'prompt' for agent job".to_string()),
-                            taint: TaintLabel::default(),
+                            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                         });
                     }
                 };
@@ -217,7 +217,7 @@ impl Tool for CronAddTool {
                                 success: false,
                                 output: String::new(),
                                 error: Some(format!("Invalid session_target: {e}")),
-                                taint: TaintLabel::default(),
+                                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                             });
                         }
                     },
@@ -237,7 +237,7 @@ impl Tool for CronAddTool {
                                 success: false,
                                 output: String::new(),
                                 error: Some(format!("Invalid delivery config: {e}")),
-                                taint: TaintLabel::default(),
+                                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                             });
                         }
                     },
@@ -273,13 +273,13 @@ impl Tool for CronAddTool {
                     "enabled": job.enabled
                 }))?,
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(e.to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
         }
     }

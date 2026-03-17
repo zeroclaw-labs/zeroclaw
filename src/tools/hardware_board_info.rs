@@ -4,7 +4,7 @@
 //! Uses probe-rs for Nucleo when available; otherwise static datasheet info.
 
 use super::traits::{Tool, ToolResult};
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use async_trait::async_trait;
 use serde_json::json;
 
@@ -104,7 +104,7 @@ impl Tool for HardwareBoardInfoTool {
                     "No peripherals configured. Add boards to config.toml [peripherals.boards]."
                         .into(),
                 ),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -123,7 +123,7 @@ impl Tool for HardwareBoardInfoTool {
                         success: true,
                         output: info,
                         error: None,
-                        taint: TaintLabel::default(),
+                        taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                     });
                 }
                 Err(e) => {
@@ -154,7 +154,7 @@ impl Tool for HardwareBoardInfoTool {
             success: true,
             output,
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 }

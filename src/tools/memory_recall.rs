@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::memory::Memory;
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
@@ -61,7 +61,7 @@ impl Tool for MemoryRecallTool {
                 success: true,
                 output: "No memories found matching that query.".into(),
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::Memory),
             }),
             Ok(entries) => {
                 let mut output = format!("Found {} memories:\n", entries.len());
@@ -79,14 +79,14 @@ impl Tool for MemoryRecallTool {
                     success: true,
                     output,
                     error: None,
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::Memory),
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Memory recall failed: {e}")),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::Memory),
             }),
         }
     }

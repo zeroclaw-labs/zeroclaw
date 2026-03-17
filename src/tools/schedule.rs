@@ -1,7 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron;
-use crate::security::taint::TaintLabel;
+use crate::security::taint::{TaintLabel, TaintSource};
 use crate::security::SecurityPolicy;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -134,7 +134,7 @@ impl Tool for ScheduleTool {
                 error: Some(format!(
                     "Unknown action '{other}'. Use create/add/once/list/get/cancel/remove/pause/resume."
                 )),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
         }
     }
@@ -149,7 +149,7 @@ impl ScheduleTool {
                 error: Some(format!(
                     "cron is disabled by config (cron.enabled=false); cannot perform '{action}'"
                 )),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -160,7 +160,7 @@ impl ScheduleTool {
                 error: Some(format!(
                     "Security policy: read-only mode, cannot perform '{action}'"
                 )),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -169,7 +169,7 @@ impl ScheduleTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -183,7 +183,7 @@ impl ScheduleTool {
                 success: true,
                 output: "No scheduled jobs.".to_string(),
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -217,7 +217,7 @@ impl ScheduleTool {
             success: true,
             output: format!("Scheduled jobs ({}):\n{}", lines.len(), lines.join("\n")),
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 
@@ -238,14 +238,14 @@ impl ScheduleTool {
                     success: true,
                     output: serde_json::to_string_pretty(&detail)?,
                     error: None,
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 })
             }
             Err(_) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Job '{id}' not found")),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             }),
         }
     }
@@ -273,7 +273,7 @@ impl ScheduleTool {
                         success: false,
                         output: String::new(),
                         error: Some("'add' requires 'expression' and forbids delay/run_at".into()),
-                        taint: TaintLabel::default(),
+                        taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                     });
                 }
             }
@@ -283,7 +283,7 @@ impl ScheduleTool {
                         success: false,
                         output: String::new(),
                         error: Some("'once' requires exactly one of 'delay' or 'run_at'".into()),
-                        taint: TaintLabel::default(),
+                        taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                     });
                 }
                 if delay.is_some() && run_at.is_some() {
@@ -291,7 +291,7 @@ impl ScheduleTool {
                         success: false,
                         output: String::new(),
                         error: Some("'once' supports either delay or run_at, not both".into()),
-                        taint: TaintLabel::default(),
+                        taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                     });
                 }
             }
@@ -308,7 +308,7 @@ impl ScheduleTool {
                             "Exactly one of 'expression', 'delay', or 'run_at' must be provided"
                                 .into(),
                         ),
-                        taint: TaintLabel::default(),
+                        taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                     });
                 }
             }
@@ -333,7 +333,7 @@ impl ScheduleTool {
                         success: false,
                         output: String::new(),
                         error: Some(error.to_string()),
-                        taint: TaintLabel::default(),
+                        taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                     });
                 }
             };
@@ -347,7 +347,7 @@ impl ScheduleTool {
                     job.command
                 ),
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -359,7 +359,7 @@ impl ScheduleTool {
                         success: false,
                         output: String::new(),
                         error: Some(error.to_string()),
-                        taint: TaintLabel::default(),
+                        taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                     });
                 }
             };
@@ -372,7 +372,7 @@ impl ScheduleTool {
                     job.command
                 ),
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             });
         }
 
@@ -389,7 +389,7 @@ impl ScheduleTool {
                     success: false,
                     output: String::new(),
                     error: Some(error.to_string()),
-                    taint: TaintLabel::default(),
+                    taint: TaintLabel::untrusted(TaintSource::ToolOutput),
                 });
             }
         };
@@ -402,7 +402,7 @@ impl ScheduleTool {
                 job.command
             ),
             error: None,
-            taint: TaintLabel::default(),
+            taint: TaintLabel::untrusted(TaintSource::ToolOutput),
         })
     }
 
@@ -412,13 +412,13 @@ impl ScheduleTool {
                 success: true,
                 output: format!("Cancelled job {id}"),
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             },
             Err(error) => ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(error.to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             },
         }
     }
@@ -439,13 +439,13 @@ impl ScheduleTool {
                     format!("Resumed job {id}")
                 },
                 error: None,
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             },
             Err(error) => ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(error.to_string()),
-                taint: TaintLabel::default(),
+                taint: TaintLabel::untrusted(TaintSource::ToolOutput),
             },
         }
     }
