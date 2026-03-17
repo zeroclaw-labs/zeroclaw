@@ -9,6 +9,7 @@ import {
 } from 'lucide-react';
 import type { DiagResult } from '@/types/api';
 import { runDoctor } from '@/lib/api';
+import { t } from '@/lib/i18n';
 
 function severityIcon(severity: DiagResult['severity']) {
   switch (severity) {
@@ -80,7 +81,7 @@ export default function Doctor() {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <Stethoscope className="h-5 w-5 text-[#0080ff]" />
-          <h2 className="text-sm font-semibold text-white uppercase tracking-wider">Diagnostics</h2>
+          <h2 className="text-sm font-semibold text-white uppercase tracking-wider">{t('doctor.diagnostics_title')}</h2>
         </div>
         <button
           onClick={handleRun}
@@ -90,12 +91,12 @@ export default function Doctor() {
           {loading ? (
             <>
               <Loader2 className="h-4 w-4 animate-spin" />
-              Running...
+              {t('doctor.running_btn')}
             </>
           ) : (
             <>
               <Play className="h-4 w-4" />
-              Run Diagnostics
+              {t('doctor.run_diagnostics')}
             </>
           )}
         </button>
@@ -112,9 +113,9 @@ export default function Doctor() {
       {loading && (
         <div className="flex flex-col items-center justify-center py-16 animate-fade-in">
           <div className="h-12 w-12 border-2 border-[#0080ff30] border-t-[#0080ff] rounded-full animate-spin mb-4" />
-          <p className="text-[#8892a8]">Running diagnostics...</p>
+          <p className="text-[#8892a8]">{t('doctor.running_desc')}</p>
           <p className="text-sm text-[#334060] mt-1">
-            This may take a few seconds.
+            {t('doctor.running_hint')}
           </p>
         </div>
       )}
@@ -155,15 +156,15 @@ export default function Doctor() {
             <div className="ml-auto">
               {errorCount > 0 ? (
                 <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-semibold border text-[#ff4466] border-[#ff446630]" style={{ background: 'rgba(255,68,102,0.06)' }}>
-                  Issues Found
+                  {t('doctor.issues_found')}
                 </span>
               ) : warnCount > 0 ? (
                 <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-semibold border text-[#ffaa00] border-[#ffaa0030]" style={{ background: 'rgba(255,170,0,0.06)' }}>
-                  Warnings
+                  {t('doctor.warnings_summary')}
                 </span>
               ) : (
                 <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-semibold border text-[#00e68a] border-[#00e68a30]" style={{ background: 'rgba(0,230,138,0.06)' }}>
-                  All Clear
+                  {t('doctor.all_clear')}
                 </span>
               )}
             </div>
@@ -205,9 +206,9 @@ export default function Doctor() {
           <div className="h-16 w-16 rounded-2xl flex items-center justify-center mb-4 animate-float" style={{ background: 'linear-gradient(135deg, #0080ff15, #0080ff08)' }}>
             <Stethoscope className="h-8 w-8 text-[#0080ff]" />
           </div>
-          <p className="text-lg font-semibold text-white mb-1">System Diagnostics</p>
+          <p className="text-lg font-semibold text-white mb-1">{t('doctor.system_diagnostics')}</p>
           <p className="text-sm text-[#556080]">
-            Click "Run Diagnostics" to check your ZeroClaw installation.
+            {t('doctor.empty_hint')}
           </p>
         </div>
       )}
