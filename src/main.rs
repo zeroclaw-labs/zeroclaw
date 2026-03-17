@@ -1669,12 +1669,13 @@ async fn import_openai_codex_auth_profile(
         .with_context(|| format!("Failed to read import file {}", import_path.display()))?;
     let imported: CodexAuthFile = serde_json::from_str(&raw)
         .with_context(|| format!("Failed to parse import file {}", import_path.display()))?;
+    let expires_at = auth::openai_oauth::extract_expiry_from_jwt(&imported.tokens.access_token);
 
     let token_set = auth::profiles::TokenSet {
         access_token: imported.tokens.access_token,
         refresh_token: imported.tokens.refresh_token,
         id_token: imported.tokens.id_token,
-        expires_at: Some(chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")?.into()),
+        expires_at,
         token_type: Some("Bearer".to_string()),
         scope: None,
     };
