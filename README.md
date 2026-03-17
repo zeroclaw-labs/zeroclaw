@@ -424,6 +424,74 @@ zeroclaw agent --provider openai-codex --auth-profile openai-codex:work -m "hell
 zeroclaw agent --provider anthropic -m "hello"
 ```
 
+## Local Speech-to-Text (Parakeet TDT)
+
+ZeroClaw supports local voice message transcription via a bundled STT service
+that wraps [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) with the
+[Parakeet TDT 0.6B v3](https://k2-fsa.github.io/sherpa/onnx/pretrained_models/offline-transducer/nemo-transducer-models.html)
+(INT8) model from NVIDIA NeMo. The service exposes an OpenAI Whisper-compatible
+HTTP endpoint that ZeroClaw's transcription module calls directly.
+
+**Performance (Apple M4, 16 GB):** RTF 0.029 (35x real-time), 242 ms average
+latency, 2.8 GB RAM, zero errors on technical vocabulary (Kubernetes,
+PostgreSQL, JIRA, etc.).
+
+### Prerequisites
+
+- Python 3.10+
+- ffmpeg (`brew install ffmpeg` on macOS)
+
+### Setup
+
+```bash
+cd services/parakeet-stt
+./setup.sh          # creates venv, installs deps, downloads model (~465 MB)
+./run.sh            # starts server on http://127.0.0.1:6008
+```
+
+Environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PARAKEET_PORT` | `6008` | HTTP listen port |
+| `PARAKEET_THREADS` | `4` | ONNX Runtime inference threads |
+| `PARAKEET_MODEL_DIR` | `services/parakeet-stt/models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8` | Path to model directory |
+
+### ZeroClaw Configuration
+
+Point the transcription endpoint at the local server in `~/.zeroclaw/config.toml`:
+
+```toml
+[transcription]
+enabled = true
+api_url = "http://127.0.0.1:6008/v1/audio/transcriptions"
+model = "parakeet-tdt-0.6b-v3"
+language = "en"
+max_duration_secs = 120
+```
+
+### API
+
+The server implements the OpenAI audio transcription endpoint:
+
+```bash
+curl -X POST http://localhost:6008/v1/audio/transcriptions \
+  -F "file=@voice_message.ogg" \
+  -F "model=parakeet" \
+  -F "response_format=json"
+# => {"text": "The transcribed text here."}
+```
+
+- `POST /v1/audio/transcriptions` — transcribe audio (multipart form, accepts any ffmpeg-supported format)
+- `GET /health` — service health check
+- `GET /docs` — interactive API documentation
+
+### Running as a Daemon
+
+```bash
+nohup ./run.sh > /tmp/parakeet-stt.log 2>&1 &
+```
+
 ## Collaboration & Docs
 
 Start from the docs hub for a task-oriented map:

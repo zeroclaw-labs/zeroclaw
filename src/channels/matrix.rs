@@ -1,4 +1,5 @@
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
+use crate::config::{TranscriptionConfig, TtsConfig};
 use async_trait::async_trait;
 use matrix_sdk::{
     authentication::matrix::MatrixSession,
@@ -40,6 +41,9 @@ pub struct MatrixChannel {
     http_client: Client,
     reaction_events: Arc<RwLock<HashMap<String, String>>>,
     voice_mode: Arc<AtomicBool>,
+    transcription_config: Option<TranscriptionConfig>,
+    tts_config: Option<TtsConfig>,
+    tts_api_url: Option<String>,
 }
 
 impl std::fmt::Debug for MatrixChannel {
@@ -174,7 +178,90 @@ impl MatrixChannel {
             http_client: Client::new(),
             reaction_events: Arc::new(RwLock::new(HashMap::new())),
             voice_mode: Arc::new(AtomicBool::new(false)),
+            transcription_config: None,
+            tts_config: None,
+            tts_api_url: None,
         }
+    }
+
+    pub fn with_transcription(mut self, config: Option<TranscriptionConfig>) -> Self {
+        self.transcription_config = config;
+        self
+    }
+
+    pub fn with_tts(mut self, config: Option<TtsConfig>) -> Self {
+        if let Some(ref cfg) = config {
+            if cfg.enabled {
+                self.tts_api_url = cfg.openai.as_ref().map(|o| {
+                    format!("{}/v1/audio/speech", o.base_url.trim_end_matches('/'))
+                });
+            }
+        }
+        self.tts_config = config;
+        self
+    }
+
+    /// Prepare text for TTS synthesis: strip markdown formatting, normalize
+    /// whitespace, and truncate to `max_chars` at the nearest sentence boundary.
+    fn prepare_tts_text(raw: &str, max_chars: usize) -> String {
+        let mut text = raw.to_string();
+
+        // Strip markdown block-level syntax
+        text = text
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                // Drop code fences, horizontal rules, HTML tags
+                !trimmed.starts_with("```")
+                    && !trimmed.starts_with("---")
+                    && !trimmed.starts_with("<")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // Strip markdown inline formatting
+        text = text
+            .replace("**", "")
+            .replace("__", "")
+            .replace(['*', '`', '~'], "")
+            .replace("[Voice message]:", "")
+            .replace("# ", "")
+            .replace("## ", "")
+            .replace("### ", "");
+
+        // Normalize dashes and whitespace
+        text = text
+            .replace("—", ", ")
+            .replace("–", ", ")
+            .replace('\n', " ")
+            .replace('\r', " ");
+
+        // Collapse multiple spaces
+        while text.contains("  ") {
+            text = text.replace("  ", " ");
+        }
+        text = text.trim().to_string();
+
+        // Truncate at a sentence boundary using char indices (UTF-8 safe)
+        if text.chars().count() > max_chars {
+            let byte_limit = text
+                .char_indices()
+                .nth(max_chars)
+                .map(|(i, _)| i)
+                .unwrap_or(text.len());
+
+            let truncation_point = text[..byte_limit]
+                .rfind(". ")
+                .or_else(|| text[..byte_limit].rfind("! "))
+                .or_else(|| text[..byte_limit].rfind("? "))
+                .map(|i| i + 1)
+                .unwrap_or(byte_limit);
+
+            text.truncate(truncation_point);
+            text = text.trim().to_string();
+        }
+
+        text
     }
 
     fn encode_path_segment(value: &str) -> String {
@@ -580,49 +667,152 @@ impl Channel for MatrixChannel {
 
         room.send(content).await?;
 
-        // Voice reply: generate TTS audio and send as m.audio when voice_mode is active
+        // Voice reply: synthesize TTS and send as m.audio
         if self.voice_mode.load(Ordering::Relaxed) {
             self.voice_mode.store(false, Ordering::Relaxed);
             tracing::info!("Voice mode active, generating TTS reply");
-            let voice_work = std::path::PathBuf::from("/tmp/zeroclaw-voice");
-            let _ = tokio::fs::create_dir_all(&voice_work).await;
-            let mp3_path = voice_work.join("reply.mp3");
 
-            let tts_text = message
-                .content
-                .replace("**", "")
-                .replace(['*', '`'], "")
-                .replace("# ", "");
+            let max_chars = self
+                .tts_config
+                .as_ref()
+                .map(|c| c.max_text_length)
+                .unwrap_or(800);
+            let tts_text = Self::prepare_tts_text(&message.content, max_chars);
+            tracing::info!("TTS synthesizing {} chars", tts_text.len());
 
-            let tts_ok = tokio::process::Command::new("edge-tts")
-                .arg("--text")
-                .arg(&tts_text)
-                .arg("--write-media")
-                .arg(&mp3_path)
-                .output()
-                .await
-                .map(|o| o.status.success())
-                .unwrap_or(false);
+            // Synthesize audio: try Kokoro API first, then macOS say, then edge-tts
+            let audio_result: Option<(Vec<u8>, &str, &str)> = {
+                let mut result = None;
 
-            if tts_ok && mp3_path.exists() {
-                if let Ok(audio_data) = tokio::fs::read(&mp3_path).await {
-                    let upload_url = format!(
-                        "{}/_matrix/media/v3/upload?filename=voice-reply.mp3",
-                        self.homeserver
-                    );
-                    if let Ok(resp) = self
+                // Try Kokoro/OpenAI-compatible TTS API
+                if let Some(ref tts_url) = self.tts_api_url {
+                    let voice = self
+                        .tts_config
+                        .as_ref()
+                        .map(|c| c.default_voice.as_str())
+                        .unwrap_or("echo");
+                    let speed = self
+                        .tts_config
+                        .as_ref()
+                        .map(|c| c.speed)
+                        .unwrap_or(1.0);
+                    let tts_body = serde_json::json!({
+                        "model": "tts-1",
+                        "input": &tts_text,
+                        "voice": voice,
+                        "response_format": "wav",
+                        "speed": speed
+                    });
+                    match self
                         .http_client
-                        .post(&upload_url)
-                        .header("Authorization", self.auth_header_value())
-                        .header("Content-Type", "audio/mpeg")
-                        .body(audio_data)
+                        .post(tts_url)
+                        .json(&tts_body)
+                        .timeout(std::time::Duration::from_secs(120))
                         .send()
                         .await
                     {
-                        if resp.status().is_success() {
-                            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            if let Ok(bytes) = resp.bytes().await {
+                                result =
+                                    Some((bytes.to_vec(), "audio/wav", "voice-reply.wav"));
+                            }
+                        }
+                        Ok(resp) => {
+                            tracing::warn!("TTS API error: {}", resp.status());
+                        }
+                        Err(e) => {
+                            tracing::warn!("TTS API unavailable: {}", e);
+                        }
+                    }
+                }
+
+                // Fallback: macOS say
+                if result.is_none() {
+                    tracing::info!("Falling back to macOS say");
+                    let voice_dir = std::path::PathBuf::from("/tmp/zeroclaw-voice");
+                    let _ = tokio::fs::create_dir_all(&voice_dir).await;
+                    let aiff_path = voice_dir.join("reply.aiff");
+                    let wav_path = voice_dir.join("reply.wav");
+
+                    let say_ok = tokio::process::Command::new("say")
+                        .args(["-v", "Reed (English (US))", "-o"])
+                        .arg(&aiff_path)
+                        .arg(&tts_text)
+                        .output()
+                        .await
+                        .map(|o| o.status.success())
+                        .unwrap_or(false);
+
+                    if say_ok {
+                        let convert_ok = tokio::process::Command::new("ffmpeg")
+                            .args([
+                                "-hide_banner", "-loglevel", "error", "-y",
+                                "-i", aiff_path.to_str().unwrap_or_default(),
+                                "-ar", "24000", "-ac", "1",
+                                wav_path.to_str().unwrap_or_default(),
+                            ])
+                            .output()
+                            .await
+                            .map(|o| o.status.success())
+                            .unwrap_or(false);
+                        if convert_ok {
+                            result = tokio::fs::read(&wav_path)
+                                .await
+                                .ok()
+                                .map(|d| (d, "audio/wav", "voice-reply.wav"));
+                        }
+                    }
+                }
+
+                // Last resort: edge-tts (cloud)
+                if result.is_none() {
+                    tracing::info!("Falling back to edge-tts");
+                    let mp3_path =
+                        std::path::PathBuf::from("/tmp/zeroclaw-voice/reply.mp3");
+                    let edge_ok = tokio::process::Command::new("edge-tts")
+                        .args(["--text", &tts_text, "--write-media"])
+                        .arg(&mp3_path)
+                        .output()
+                        .await
+                        .map(|o| o.status.success())
+                        .unwrap_or(false);
+                    if edge_ok {
+                        result = tokio::fs::read(&mp3_path)
+                            .await
+                            .ok()
+                            .map(|d| (d, "audio/mpeg", "voice-reply.mp3"));
+                    }
+                }
+
+                result
+            };
+
+            // Upload audio to Matrix and send as voice message
+            if let Some((audio_data, mime, filename)) = audio_result {
+                let upload_url = format!(
+                    "{}/_matrix/media/v3/upload?filename={}",
+                    self.homeserver, filename
+                );
+                let audio_len = audio_data.len();
+                match self
+                    .http_client
+                    .post(&upload_url)
+                    .header("Authorization", self.auth_header_value())
+                    .header("Content-Type", mime)
+                    .body(audio_data)
+                    .send()
+                    .await
+                {
+                    Ok(upload_resp) if upload_resp.status().is_success() => {
+                        match upload_resp.json::<serde_json::Value>().await {
+                            Ok(body) => {
                                 if let Some(content_uri) = body["content_uri"].as_str() {
-                                    let encoded_room = Self::encode_path_segment(&target_room_id);
+                                    tracing::info!(
+                                        "Audio uploaded: {} ({} bytes) -> {}",
+                                        filename, audio_len, content_uri
+                                    );
+                                    let encoded_room =
+                                        Self::encode_path_segment(&target_room_id);
                                     let txn_id = format!(
                                         "voice_{}",
                                         std::time::SystemTime::now()
@@ -634,22 +824,52 @@ impl Channel for MatrixChannel {
                                         "msgtype": "m.audio",
                                         "body": "Voice reply",
                                         "url": content_uri,
-                                        "info": { "mimetype": "audio/mpeg" }
+                                        "info": {
+                                            "mimetype": mime,
+                                            "duration": 0
+                                        },
+                                        "org.matrix.msc3245.voice": {}
                                     });
                                     let send_url = format!(
                                         "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
                                         self.homeserver, encoded_room, txn_id
                                     );
-                                    let _ = self
+                                    match self
                                         .http_client
                                         .put(&send_url)
                                         .header("Authorization", self.auth_header_value())
                                         .json(&audio_msg)
                                         .send()
-                                        .await;
+                                        .await
+                                    {
+                                        Ok(put_resp) => {
+                                            let status = put_resp.status();
+                                            let resp_body = put_resp.text().await.unwrap_or_default();
+                                            if status.is_success() {
+                                                tracing::info!("Voice reply sent to Matrix");
+                                            } else {
+                                                tracing::warn!(
+                                                    "Voice PUT failed ({}): {}",
+                                                    status, resp_body
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Voice PUT request error: {}", e);
+                                        }
+                                    }
                                 }
                             }
+                            Err(e) => {
+                                tracing::warn!("Failed to parse upload response: {}", e);
+                            }
                         }
+                    }
+                    Ok(resp) => {
+                        tracing::warn!("Audio upload failed: {}", resp.status());
+                    }
+                    Err(e) => {
+                        tracing::warn!("Audio upload request error: {}", e);
                     }
                 }
             }
@@ -701,6 +921,7 @@ impl Channel for MatrixChannel {
         let homeserver_for_handler = self.homeserver.clone();
         let access_token_for_handler = self.access_token.clone();
         let voice_mode_for_handler = Arc::clone(&self.voice_mode);
+        let transcription_config_for_handler = self.transcription_config.clone();
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
@@ -711,6 +932,7 @@ impl Channel for MatrixChannel {
             let homeserver = homeserver_for_handler.clone();
             let access_token = access_token_for_handler.clone();
             let voice_mode = Arc::clone(&voice_mode_for_handler);
+            let transcription_config = transcription_config_for_handler.clone();
 
             async move {
                 if false
@@ -794,50 +1016,57 @@ impl Channel for MatrixChannel {
                     body
                 };
 
-                // Voice transcription: if this was an audio message, transcribe it
+                // Voice transcription: if this was an audio message, transcribe via API
                 let body = if body.starts_with("[audio:") {
-                    if let Some(path_start) = body.find("saved to ") {
-                        let audio_path = body[path_start + 9..].to_string();
-                        let wav_path = format!("{}.16k.wav", audio_path);
-                        let convert_ok = tokio::process::Command::new("ffmpeg")
-                            .args([
-                                "-y",
-                                "-i",
-                                &audio_path,
-                                "-ar",
-                                "16000",
-                                "-ac",
-                                "1",
-                                "-f",
-                                "wav",
-                                &wav_path,
-                            ])
-                            .stderr(std::process::Stdio::null())
-                            .output()
-                            .await
-                            .map(|o| o.status.success())
-                            .unwrap_or(false);
-                        if convert_ok {
-                            let transcription = tokio::process::Command::new("whisper-cpp")
-                                .args([
-                                    "-m",
-                                    "/tmp/ggml-base.en.bin",
-                                    "-f",
-                                    &wav_path,
-                                    "--no-timestamps",
-                                    "-nt",
-                                ])
-                                .output()
-                                .await
-                                .ok()
-                                .filter(|o| o.status.success())
-                                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                                .filter(|s| !s.is_empty());
-                            if let Some(text) = transcription {
-                                voice_mode.store(true, Ordering::Relaxed);
-                                format!("[Voice message]: {}", text)
-                            } else {
-                                body
+                    if let (Some(config), Some(path_start)) =
+                        (&transcription_config, body.find("saved to "))
+                    {
+                        if config.enabled {
+                            let audio_path = body[path_start + 9..].to_string();
+                            let file_name = std::path::Path::new(&audio_path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "audio.ogg".to_string());
+                            match tokio::fs::read(&audio_path).await {
+                                Ok(audio_data) => {
+                                    match super::transcription::transcribe_audio(
+                                        audio_data, &file_name, config,
+                                    )
+                                    .await
+                                    {
+                                        Ok(text) if !text.trim().is_empty() => {
+                                            voice_mode.store(true, Ordering::Relaxed);
+                                            tracing::info!(
+                                                "Matrix voice transcription: {:?}",
+                                                text.trim()
+                                            );
+                                            format!("[Voice message]: {}", text.trim())
+                                        }
+                                        Ok(_) => {
+                                            tracing::warn!(
+                                                "Transcription returned empty text for {}",
+                                                file_name
+                                            );
+                                            body
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Transcription failed for {}: {}",
+                                                file_name,
+                                                e
+                                            );
+                                            body
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to read audio file {}: {}",
+                                        audio_path,
+                                        e
+                                    );
+                                    body
+                                }
                             }
                         } else {
                             body

@@ -779,6 +779,10 @@ fn default_tts_max_text_length() -> usize {
     4096
 }
 
+fn default_tts_speed() -> f64 {
+    1.0
+}
+
 fn default_openai_tts_model() -> String {
     "tts-1".into()
 }
@@ -825,6 +829,9 @@ pub struct TtsConfig {
     /// Maximum input text length in characters (default 4096).
     #[serde(default = "default_tts_max_text_length")]
     pub max_text_length: usize,
+    /// Playback speed multiplier (default `1.0`, range `0.25`–`4.0`).
+    #[serde(default = "default_tts_speed")]
+    pub speed: f64,
     /// OpenAI TTS provider configuration (`[tts.openai]`).
     #[serde(default)]
     pub openai: Option<OpenAiTtsConfig>,
@@ -847,6 +854,7 @@ impl Default for TtsConfig {
             default_voice: default_tts_voice(),
             default_format: default_tts_format(),
             max_text_length: default_tts_max_text_length(),
+            speed: default_tts_speed(),
             openai: None,
             elevenlabs: None,
             google: None,
@@ -858,6 +866,11 @@ impl Default for TtsConfig {
 /// OpenAI TTS provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct OpenAiTtsConfig {
+    /// API base URL (default `"https://api.openai.com"`). Set to a local
+    /// endpoint (e.g. `"http://127.0.0.1:6009"`) for VibeVoice or other
+    /// OpenAI-compatible TTS servers.
+    #[serde(default = "default_openai_tts_base_url")]
+    pub base_url: String,
     /// API key for OpenAI TTS.
     #[serde(default)]
     pub api_key: Option<String>,
@@ -867,6 +880,10 @@ pub struct OpenAiTtsConfig {
     /// Playback speed multiplier (default `1.0`).
     #[serde(default = "default_openai_tts_speed")]
     pub speed: f64,
+}
+
+fn default_openai_tts_base_url() -> String {
+    "https://api.openai.com".to_string()
 }
 
 /// ElevenLabs TTS provider configuration.

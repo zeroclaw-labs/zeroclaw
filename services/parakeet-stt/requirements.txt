@@ -1,0 +1,5 @@
+sherpa-onnx
+fastapi
+uvicorn[standard]
+python-multipart
+numpy
