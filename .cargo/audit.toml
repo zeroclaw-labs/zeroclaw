@@ -1,0 +1,10 @@
+# cargo-audit configuration
+# https://rustsec.org/
+
+[advisories]
+ignore = [
+    # wasmtime vulns via extism 1.13.0 — no upstream fix; plugins feature-gated
+    "RUSTSEC-2026-0006",  # wasmtime f64.copysign segfault on x86-64
+    "RUSTSEC-2026-0020",  # WASI guest-controlled resource exhaustion
+    "RUSTSEC-2026-0021",  # WASI http fields panic
+]
