@@ -2,27 +2,28 @@ import { useState, useEffect } from 'react';
 import { Puzzle, Check, Zap, Clock } from 'lucide-react';
 import type { Integration } from '@/types/api';
 import { getIntegrations } from '@/lib/api';
+import { t } from '@/lib/i18n';
 
 function statusBadge(status: Integration['status']) {
   switch (status) {
     case 'Active':
       return {
         icon: Check,
-        label: 'Active',
+        label: t('integrations.status_active'),
         classes: 'text-[#00e68a] border-[#00e68a30]',
         bg: 'rgba(0,230,138,0.06)',
       };
     case 'Available':
       return {
         icon: Zap,
-        label: 'Available',
+        label: t('integrations.status_available'),
         classes: 'text-[#0080ff] border-[#0080ff30]',
         bg: 'rgba(0,128,255,0.06)',
       };
     case 'ComingSoon':
       return {
         icon: Clock,
-        label: 'Coming Soon',
+        label: t('integrations.status_coming_soon'),
         classes: 'text-[#556080] border-[#1a1a3e]',
         bg: 'rgba(26,26,62,0.3)',
       };
@@ -64,7 +65,7 @@ export default function Integrations() {
     return (
       <div className="p-6 animate-fade-in">
         <div className="rounded-xl bg-[#ff446615] border border-[#ff446630] p-4 text-[#ff6680]">
-          Failed to load integrations: {error}
+          {t('integrations.load_error')}: {error}
         </div>
       </div>
     );
@@ -84,7 +85,7 @@ export default function Integrations() {
       <div className="flex items-center gap-2">
         <Puzzle className="h-5 w-5 text-[#0080ff]" />
         <h2 className="text-sm font-semibold text-white uppercase tracking-wider">
-          Integrations ({integrations.length})
+          {t('integrations.title')} ({integrations.length})
         </h2>
       </div>
 
@@ -94,11 +95,10 @@ export default function Integrations() {
           <button
             key={cat}
             onClick={() => setActiveCategory(cat)}
-            className={`px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-all duration-300 capitalize ${
-              activeCategory === cat
+            className={`px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-all duration-300 capitalize ${activeCategory === cat
                 ? 'text-white shadow-[0_0_15px_rgba(0,128,255,0.2)]'
                 : 'text-[#556080] border border-[#1a1a3e] hover:text-white hover:border-[#0080ff40]'
-            }`}
+              }`}
             style={activeCategory === cat ? { background: 'linear-gradient(135deg, #0080ff, #0066cc)' } : {}}
           >
             {cat}
@@ -110,7 +110,7 @@ export default function Integrations() {
       {Object.keys(grouped).length === 0 ? (
         <div className="glass-card p-8 text-center">
           <Puzzle className="h-10 w-10 text-[#1a1a3e] mx-auto mb-3" />
-          <p className="text-[#556080]">No integrations found.</p>
+          <p className="text-[#556080]">{t('integrations.empty')}</p>
         </div>
       ) : (
         Object.entries(grouped)

@@ -7,6 +7,7 @@ import {
   ShieldAlert,
 } from 'lucide-react';
 import { getConfig, putConfig } from '@/lib/api';
+import { t } from '@/lib/i18n';
 
 export default function Config() {
   const [config, setConfig] = useState('');
@@ -30,9 +31,9 @@ export default function Config() {
     setSuccess(null);
     try {
       await putConfig(config);
-      setSuccess('Configuration saved successfully.');
+      setSuccess(t('config.save_success'));
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to save configuration');
+      setError(err instanceof Error ? err.message : t('config.save_error'));
     } finally {
       setSaving(false);
     }
@@ -59,7 +60,7 @@ export default function Config() {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <Settings className="h-5 w-5 text-[#0080ff]" />
-          <h2 className="text-sm font-semibold text-white uppercase tracking-wider">Configuration</h2>
+          <h2 className="text-sm font-semibold text-white uppercase tracking-wider">{t('config.configuration_title')}</h2>
         </div>
         <button
           onClick={handleSave}
@@ -67,7 +68,7 @@ export default function Config() {
           className="btn-electric flex items-center gap-2 text-sm px-4 py-2"
         >
           <Save className="h-4 w-4" />
-          {saving ? 'Saving...' : 'Save'}
+          {saving ? t('config.saving') : t('config.save')}
         </button>
       </div>
 
@@ -76,11 +77,10 @@ export default function Config() {
         <ShieldAlert className="h-5 w-5 text-[#ffaa00] flex-shrink-0 mt-0.5" />
         <div>
           <p className="text-sm text-[#ffaa00] font-medium">
-            Sensitive fields are masked
+            {t('config.sensitive_title')}
           </p>
           <p className="text-sm text-[#ffaa0080] mt-0.5">
-            API keys, tokens, and passwords are hidden for security. To update a
-            masked field, replace the entire masked value with your new value.
+            {t('config.sensitive_hint')}
           </p>
         </div>
       </div>
@@ -105,10 +105,10 @@ export default function Config() {
       <div className="glass-card overflow-hidden">
         <div className="flex items-center justify-between px-4 py-2.5 border-b border-[#1a1a3e]" style={{ background: 'rgba(0,128,255,0.03)' }}>
           <span className="text-[10px] text-[#334060] font-semibold uppercase tracking-wider">
-            TOML Configuration
+            {t('config.toml_label')}
           </span>
           <span className="text-[10px] text-[#334060]">
-            {config.split('\n').length} lines
+            {config.split('\n').length} {t('config.lines')}
           </span>
         </div>
         <textarea

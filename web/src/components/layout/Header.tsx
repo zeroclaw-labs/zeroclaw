@@ -26,7 +26,9 @@ export default function Header() {
   const pageTitle = t(titleKey);
 
   const toggleLanguage = () => {
-    setAppLocale(locale === 'en' ? 'tr' : 'en');
+    // Cycle through: en -> zh -> tr -> en
+    const nextLocale = locale === 'en' ? 'zh' : locale === 'zh' ? 'tr' : 'en';
+    setAppLocale(nextLocale);
   };
 
   return (
