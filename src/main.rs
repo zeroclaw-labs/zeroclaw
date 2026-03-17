@@ -931,7 +931,7 @@ async fn main() -> Result<()> {
                     }
 
                     log_gateway_start(&host, port);
-                    gateway::run_gateway(&host, port, config).await
+                    Box::pin(gateway::run_gateway(&host, port, config)).await
                 }
                 Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
                     let port = config.gateway.port;
@@ -980,13 +980,13 @@ async fn main() -> Result<()> {
                 Some(zeroclaw::GatewayCommands::Start { port, host }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     log_gateway_start(&host, port);
-                    gateway::run_gateway(&host, port, config).await
+                    Box::pin(gateway::run_gateway(&host, port, config)).await
                 }
                 None => {
                     let port = config.gateway.port;
                     let host = config.gateway.host.clone();
                     log_gateway_start(&host, port);
-                    gateway::run_gateway(&host, port, config).await
+                    Box::pin(gateway::run_gateway(&host, port, config)).await
                 }
             }
         }
@@ -999,7 +999,7 @@ async fn main() -> Result<()> {
             } else {
                 info!("🧠 Starting ZeroClaw Daemon on {host}:{port}");
             }
-            daemon::run(config, host, port).await
+            Box::pin(daemon::run(config, host, port)).await
         }
 
         Commands::Status => {
@@ -1123,7 +1123,9 @@ async fn main() -> Result<()> {
             ModelCommands::List { provider } => {
                 onboard::run_models_list(&config, provider.as_deref()).await
             }
-            ModelCommands::Set { model } => onboard::run_models_set(&config, &model).await,
+            ModelCommands::Set { model } => {
+                Box::pin(onboard::run_models_set(&config, &model)).await
+            }
             ModelCommands::Status => onboard::run_models_status(&config).await,
         },
 

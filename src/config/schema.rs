@@ -3882,6 +3882,10 @@ pub struct ChannelsConfig {
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
     pub clawdtalk: Option<crate::channels::ClawdTalkConfig>,
+    /// Reddit channel configuration (OAuth2 bot).
+    pub reddit: Option<RedditConfig>,
+    /// Bluesky channel configuration (AT Protocol).
+    pub bluesky: Option<BlueskyConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -3997,6 +4001,14 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.clawdtalk.as_ref())),
                 self.clawdtalk.is_some(),
             ),
+            (
+                Box::new(ConfigWrapper::new(self.reddit.as_ref())),
+                self.reddit.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(self.bluesky.as_ref())),
+                self.bluesky.is_some(),
+            ),
         ]
     }
 
@@ -4046,6 +4058,8 @@ impl Default for ChannelsConfig {
             #[cfg(feature = "channel-nostr")]
             nostr: None,
             clawdtalk: None,
+            reddit: None,
+            bluesky: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
             show_tool_calls: true,
@@ -4196,11 +4210,26 @@ impl ChannelConfig for MattermostConfig {
 }
 
 /// Webhook channel configuration.
+///
+/// Receives messages via HTTP POST and sends replies to a configurable outbound URL.
+/// This is the "universal adapter" for any system that supports webhooks.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebhookConfig {
     /// Port to listen on for incoming webhooks.
     pub port: u16,
-    /// Optional shared secret for webhook signature verification.
+    /// URL path to listen on (default: `/webhook`).
+    #[serde(default)]
+    pub listen_path: Option<String>,
+    /// URL to POST/PUT outbound messages to.
+    #[serde(default)]
+    pub send_url: Option<String>,
+    /// HTTP method for outbound messages (`POST` or `PUT`). Default: `POST`.
+    #[serde(default)]
+    pub send_method: Option<String>,
+    /// Optional `Authorization` header value for outbound requests.
+    #[serde(default)]
+    pub auth_header: Option<String>,
+    /// Optional shared secret for webhook signature verification (HMAC-SHA256).
     pub secret: Option<String>,
 }
 
@@ -5111,6 +5140,50 @@ impl ChannelConfig for MochatConfig {
     }
     fn desc() -> &'static str {
         "Mochat Customer Service"
+    }
+}
+
+/// Reddit channel configuration (OAuth2 bot).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RedditConfig {
+    /// Reddit OAuth2 client ID.
+    pub client_id: String,
+    /// Reddit OAuth2 client secret.
+    pub client_secret: String,
+    /// Reddit OAuth2 refresh token for persistent access.
+    pub refresh_token: String,
+    /// Reddit bot username (without `u/` prefix).
+    pub username: String,
+    /// Optional subreddit to filter messages (without `r/` prefix).
+    /// When set, only messages from this subreddit are processed.
+    #[serde(default)]
+    pub subreddit: Option<String>,
+}
+
+impl ChannelConfig for RedditConfig {
+    fn name() -> &'static str {
+        "Reddit"
+    }
+    fn desc() -> &'static str {
+        "Reddit bot (OAuth2)"
+    }
+}
+
+/// Bluesky channel configuration (AT Protocol).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BlueskyConfig {
+    /// Bluesky handle (e.g. `"mybot.bsky.social"`).
+    pub handle: String,
+    /// App-specific password (from Bluesky settings).
+    pub app_password: String,
+}
+
+impl ChannelConfig for BlueskyConfig {
+    fn name() -> &'static str {
+        "Bluesky"
+    }
+    fn desc() -> &'static str {
+        "AT Protocol"
     }
 }
 
@@ -7893,6 +7966,8 @@ default_temperature = 0.7
                 #[cfg(feature = "channel-nostr")]
                 nostr: None,
                 clawdtalk: None,
+                reddit: None,
+                bluesky: None,
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
@@ -8635,6 +8710,8 @@ allowed_users = ["@ops:matrix.org"]
             mochat: None,
             nostr: None,
             clawdtalk: None,
+            reddit: None,
+            bluesky: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
@@ -8879,6 +8956,8 @@ channel_id = "C123"
             mochat: None,
             nostr: None,
             clawdtalk: None,
+            reddit: None,
+            bluesky: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,

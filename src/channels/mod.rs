@@ -14,6 +14,7 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
+pub mod bluesky;
 pub mod clawdtalk;
 pub mod cli;
 pub mod dingtalk;
@@ -33,6 +34,7 @@ pub mod nextcloud_talk;
 pub mod nostr;
 pub mod notion;
 pub mod qq;
+pub mod reddit;
 pub mod session_backend;
 pub mod session_sqlite;
 pub mod session_store;
@@ -44,6 +46,7 @@ pub mod transcription;
 pub mod tts;
 pub mod twitter;
 pub mod wati;
+pub mod webhook;
 pub mod wecom;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
@@ -51,6 +54,7 @@ pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
+pub use bluesky::BlueskyChannel;
 pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
@@ -70,6 +74,7 @@ pub use nextcloud_talk::NextcloudTalkChannel;
 pub use nostr::NostrChannel;
 pub use notion::NotionChannel;
 pub use qq::QQChannel;
+pub use reddit::RedditChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
@@ -78,6 +83,7 @@ pub use traits::{Channel, SendMessage};
 pub use tts::{TtsManager, TtsProvider};
 pub use twitter::TwitterChannel;
 pub use wati::WatiChannel;
+pub use webhook::WebhookChannel;
 pub use wecom::WeComChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
@@ -3087,7 +3093,7 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
             anyhow::bail!("Remove channel '{name}' — edit ~/.zeroclaw/config.toml directly");
         }
         crate::ChannelCommands::BindTelegram { identity } => {
-            bind_telegram_identity(config, &identity).await
+            Box::pin(bind_telegram_identity(config, &identity)).await
         }
         crate::ChannelCommands::Send {
             message,
@@ -3544,6 +3550,43 @@ fn collect_configured_channels(
                 )),
             });
         }
+    }
+
+    if let Some(ref rd) = config.channels_config.reddit {
+        channels.push(ConfiguredChannel {
+            display_name: "Reddit",
+            channel: Arc::new(RedditChannel::new(
+                rd.client_id.clone(),
+                rd.client_secret.clone(),
+                rd.refresh_token.clone(),
+                rd.username.clone(),
+                rd.subreddit.clone(),
+            )),
+        });
+    }
+
+    if let Some(ref bs) = config.channels_config.bluesky {
+        channels.push(ConfiguredChannel {
+            display_name: "Bluesky",
+            channel: Arc::new(BlueskyChannel::new(
+                bs.handle.clone(),
+                bs.app_password.clone(),
+            )),
+        });
+    }
+
+    if let Some(ref wh) = config.channels_config.webhook {
+        channels.push(ConfiguredChannel {
+            display_name: "Webhook",
+            channel: Arc::new(WebhookChannel::new(
+                wh.port,
+                wh.listen_path.clone(),
+                wh.send_url.clone(),
+                wh.send_method.clone(),
+                wh.auth_header.clone(),
+                wh.secret.clone(),
+            )),
+        });
     }
 
     channels
