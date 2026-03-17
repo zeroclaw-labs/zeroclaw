@@ -748,6 +748,33 @@ export class MoAClient {
     }
   }
 
+  /** Save an API key for a specific tool (e.g. composio, web_search_tool, web_fetch) */
+  async saveToolApiKey(tool: string, apiKey: string): Promise<void> {
+    const res = await fetch(`${this.serverUrl}/api/config/tool-api-key`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({ tool, api_key: apiKey }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: "Save failed" }));
+      throw new Error(data.error || `Save failed (${res.status})`);
+    }
+    // Also store locally for UI state
+    if (apiKey) {
+      localStorage.setItem(`zeroclaw_tool_api_key_${tool}`, "configured");
+    } else {
+      localStorage.removeItem(`zeroclaw_tool_api_key_${tool}`);
+    }
+  }
+
+  /** Check if a tool has an API key configured (local cache check) */
+  hasToolApiKey(tool: string): boolean {
+    return localStorage.getItem(`zeroclaw_tool_api_key_${tool}`) === "configured";
+  }
+
   /**
    * Sync provider and model selection to the local MoA agent config.
    * This ensures the server uses the correct provider/model for chat requests

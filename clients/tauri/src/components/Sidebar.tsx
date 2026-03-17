@@ -1,8 +1,9 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useCallback } from "react";
 import { t, type Locale } from "../lib/i18n";
 import type { ChatSession } from "../lib/storage";
 import { deriveChatTitle } from "../lib/storage";
 import type { DeviceInfo, ToolInfo, ChannelInfo } from "../lib/api";
+import { apiClient } from "../lib/api";
 
 interface SidebarProps {
   chats: ChatSession[];
@@ -119,6 +120,32 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   schedule: "Scheduler",
 };
 
+/** Tools that require an API key, with display info */
+interface ToolApiKeyInfo {
+  toolId: string;         // key sent to backend
+  displayName: string;    // shown in dropdown
+  placeholder: string;    // input placeholder
+}
+
+const TOOLS_REQUIRING_API_KEY: ToolApiKeyInfo[] = [
+  { toolId: "composio", displayName: "Composio", placeholder: "Composio API Key" },
+  { toolId: "web_search_tool", displayName: "Web Search (Firecrawl/Tavily)", placeholder: "Firecrawl or Tavily API Key" },
+  { toolId: "web_search_brave", displayName: "Web Search (Brave)", placeholder: "Brave Search API Key" },
+  { toolId: "web_search_perplexity", displayName: "Web Search (Perplexity)", placeholder: "Perplexity API Key" },
+  { toolId: "web_search_exa", displayName: "Web Search (Exa)", placeholder: "Exa API Key" },
+  { toolId: "web_search_jina", displayName: "Web Search (Jina)", placeholder: "Jina API Key" },
+  { toolId: "web_fetch", displayName: "Web Fetch (Firecrawl/Tavily)", placeholder: "Firecrawl or Tavily API Key" },
+  { toolId: "pushover", displayName: "Pushover", placeholder: "Pushover Token" },
+];
+
+/** Set of tool names that need API keys (for sidebar label display) */
+const TOOLS_NEEDING_KEY = new Set([
+  "composio",
+  "web_search_tool",
+  "web_fetch",
+  "pushover",
+]);
+
 /** Format a timestamp to a short time string (HH:MM) */
 function formatTime(ts: number): string {
   const d = new Date(ts);
@@ -191,6 +218,20 @@ export function Sidebar({
     chats: true,
   });
 
+  // Tool API key dropdown state
+  const [showToolKeyDropdown, setShowToolKeyDropdown] = useState(false);
+  const [selectedToolForKey, setSelectedToolForKey] = useState<string>("");
+  const [toolKeyInput, setToolKeyInput] = useState("");
+  const [toolKeySaving, setToolKeySaving] = useState(false);
+  const [toolKeySaved, setToolKeySaved] = useState<string | null>(null);
+  const [configuredToolKeys, setConfiguredToolKeys] = useState<Set<string>>(() => {
+    const set = new Set<string>();
+    for (const info of TOOLS_REQUIRING_API_KEY) {
+      if (apiClient.hasToolApiKey(info.toolId)) set.add(info.toolId);
+    }
+    return set;
+  });
+
   const toggleSection = (key: string) => {
     setExpandedSections((prev) => ({ ...prev, [key]: !prev[key] }));
   };
@@ -199,6 +240,28 @@ export function Sidebar({
     e.stopPropagation();
     onDeleteChat(id);
   };
+
+  const handleSaveToolKey = useCallback(async () => {
+    if (!selectedToolForKey || !toolKeyInput.trim()) return;
+    setToolKeySaving(true);
+    try {
+      await apiClient.saveToolApiKey(selectedToolForKey, toolKeyInput.trim());
+      setConfiguredToolKeys((prev) => new Set([...prev, selectedToolForKey]));
+      setToolKeySaved(selectedToolForKey);
+      setToolKeyInput("");
+      setTimeout(() => setToolKeySaved(null), 2000);
+    } catch {
+      // silently fail — user can retry
+    } finally {
+      setToolKeySaving(false);
+    }
+  }, [selectedToolForKey, toolKeyInput]);
+
+  /** Check if a tool needs an API key and doesn't have one configured */
+  const toolNeedsKey = useCallback(
+    (toolName: string) => TOOLS_NEEDING_KEY.has(toolName) && !configuredToolKeys.has(toolName),
+    [configuredToolKeys],
+  );
 
   const onlineDevices = devices.filter((d) => d.is_online);
 
@@ -325,10 +388,7 @@ export function Sidebar({
 
           {/* Tools section */}
           <div className="sidebar-section">
-            <button
-              className="sidebar-section-header"
-              onClick={() => toggleSection("tools")}
-            >
+            <div className="sidebar-section-header" onClick={() => toggleSection("tools")}>
               <div className="sidebar-section-header-left">
                 <svg className="sidebar-section-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
@@ -338,13 +398,91 @@ export function Sidebar({
                   <span className="sidebar-section-badge">{tools.length}</span>
                 )}
               </div>
-              <svg
-                className={`sidebar-section-chevron ${expandedSections.tools ? "expanded" : ""}`}
-                width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
-              >
-                <polyline points="9 18 15 12 9 6" />
-              </svg>
-            </button>
+              <div className="sidebar-section-header-right">
+                {/* API Key config icon */}
+                <button
+                  className="sidebar-tool-key-btn"
+                  title={locale === "ko" ? "도구 API Key 설정" : "Tool API Key Settings"}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setShowToolKeyDropdown((prev) => !prev);
+                  }}
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" />
+                  </svg>
+                </button>
+                <svg
+                  className={`sidebar-section-chevron ${expandedSections.tools ? "expanded" : ""}`}
+                  width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+                >
+                  <polyline points="9 18 15 12 9 6" />
+                </svg>
+              </div>
+            </div>
+
+            {/* Tool API Key Dropdown */}
+            {showToolKeyDropdown && (
+              <div className="sidebar-tool-key-dropdown">
+                <div className="sidebar-tool-key-dropdown-title">
+                  {locale === "ko" ? "도구 API Key 설정" : "Tool API Key Settings"}
+                </div>
+                <select
+                  className="sidebar-tool-key-select"
+                  value={selectedToolForKey}
+                  onChange={(e) => {
+                    setSelectedToolForKey(e.target.value);
+                    setToolKeyInput("");
+                    setToolKeySaved(null);
+                  }}
+                >
+                  <option value="">
+                    {locale === "ko" ? "-- 도구 선택 --" : "-- Select Tool --"}
+                  </option>
+                  {TOOLS_REQUIRING_API_KEY.map((info) => (
+                    <option key={info.toolId} value={info.toolId}>
+                      {info.displayName}
+                      {configuredToolKeys.has(info.toolId) ? " \u2713" : ""}
+                    </option>
+                  ))}
+                </select>
+                {selectedToolForKey && (
+                  <div className="sidebar-tool-key-input-row">
+                    <input
+                      type="password"
+                      className="sidebar-tool-key-input"
+                      placeholder={
+                        TOOLS_REQUIRING_API_KEY.find((t) => t.toolId === selectedToolForKey)?.placeholder ?? "API Key"
+                      }
+                      value={toolKeyInput}
+                      onChange={(e) => setToolKeyInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") handleSaveToolKey();
+                      }}
+                    />
+                    <button
+                      className="sidebar-tool-key-save-btn"
+                      disabled={toolKeySaving || !toolKeyInput.trim()}
+                      onClick={handleSaveToolKey}
+                    >
+                      {toolKeySaving
+                        ? "..."
+                        : toolKeySaved === selectedToolForKey
+                          ? "\u2713"
+                          : locale === "ko"
+                            ? "저장"
+                            : "Save"}
+                    </button>
+                  </div>
+                )}
+                {toolKeySaved && (
+                  <div className="sidebar-tool-key-saved-msg">
+                    {locale === "ko" ? "API Key가 저장되었습니다" : "API Key saved"}
+                  </div>
+                )}
+              </div>
+            )}
+
             {expandedSections.tools && (
               <div className="sidebar-section-content">
                 {tools.length === 0 ? (
@@ -356,6 +494,11 @@ export function Sidebar({
                       <span className="sidebar-info-label">
                         {TOOL_DISPLAY_NAMES[tool.name] ?? tool.name}
                       </span>
+                      {toolNeedsKey(tool.name) && (
+                        <span className="sidebar-tool-needs-key">
+                          {locale === "ko" ? "API Key 입력필요" : "API Key required"}
+                        </span>
+                      )}
                     </div>
                   ))
                 )}
