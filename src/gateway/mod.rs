@@ -632,6 +632,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("     Send: POST /pair with header X-Pairing-Code: {code}");
     } else if pairing.require_pairing() {
         println!("  🔒 Pairing: ACTIVE (bearer token required)");
+        println!("     To pair a new device: zeroclaw gateway get-paircode --new");
     } else {
         println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
     }

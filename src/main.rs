@@ -816,30 +816,12 @@ async fn main() -> Result<()> {
             .await
         }?;
 
-        // Display pairing code — user enters it in the dashboard to pair securely.
-        // The code is one-time use and brute-force protected (5 attempts → lockout).
-        // No auth material is placed in URLs to prevent leakage via browser history,
-        // Referer headers, clipboard, or proxy logs.
         if config.gateway.require_pairing {
-            let pairing = security::PairingGuard::new(true, &config.gateway.paired_tokens);
-            if let Some(code) = pairing.pairing_code() {
-                println!();
-                println!("  \x1b[1;34m🦀 Gateway Pairing Code\x1b[0m");
-                println!();
-                println!("  \x1b[1;34m┌──────────────┐\x1b[0m");
-                println!("  \x1b[1;34m│\x1b[0m  \x1b[1m{code}\x1b[0m  \x1b[1;34m│\x1b[0m");
-                println!("  \x1b[1;34m└──────────────┘\x1b[0m");
-                println!();
-                println!("  Enter this code in the dashboard to pair your device.");
-                println!("  The code is single-use and expires after pairing.");
-                println!();
-                println!(
-                    "  \x1b[2mDashboard: http://127.0.0.1:{}\x1b[0m",
-                    config.gateway.port
-                );
-                println!("  \x1b[2mDocs: https://www.zeroclawlabs.ai/docs\x1b[0m");
-                println!();
-            }
+            println!();
+            println!("  Pairing is enabled. A one-time pairing code will be");
+            println!("  displayed when the gateway starts.");
+            println!("  Dashboard: http://127.0.0.1:{}", config.gateway.port);
+            println!();
         }
 
         // Auto-start channels if user said yes during wizard
