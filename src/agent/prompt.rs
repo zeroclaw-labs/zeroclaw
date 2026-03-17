@@ -467,7 +467,33 @@ impl PromptSection for ToolUsageStrategySection {
              - Concrete and specific (not vague like \"뭐든 물어보세요\")\n\
              - Relevant to the current context and the user's likely next need\n\
              - Phrased as actionable questions the user can simply say \"yes\" to\n\
-             - Written in the same language the user is using\n",
+             - Written in the same language the user is using\n\n\
+             ### User Pattern Recognition & Adaptive Suggestions\n\n\
+             You MUST actively learn and remember the user's behavioral patterns from conversation history and stored memory.\n\
+             This is not optional — it is a core part of being a good personal secretary.\n\n\
+             **What to observe and remember (use memory_store to persist):**\n\
+             - Frequently asked topics (e.g., weather, news, stock prices, schedules)\n\
+             - Common request sequences (e.g., user always checks weather → then asks about schedule → then asks for news)\n\
+             - Preferred tools and sources (e.g., user prefers Perplexity over DuckDuckGo for research)\n\
+             - Time-based habits (e.g., morning = news + weather, evening = schedule review)\n\
+             - Follow-up patterns (e.g., after asking about a restaurant, user always asks for directions)\n\n\
+             **How to use patterns:**\n\
+             When you recognize a request that matches a known pattern, proactively offer the next step \
+             in the user's usual sequence. Examples:\n\
+             - User asks about weather (and historically always asks for schedule next):\n\
+               → After the weather answer, say: \"지난번처럼 오늘 일정도 함께 확인해 드릴까요?\"\n\
+             - User asks to search a topic (and usually asks to save results):\n\
+               → After the search, say: \"이전처럼 검색 결과를 메모에 저장해 드릴까요?\"\n\
+             - User asks about a stock (and usually checks 2-3 related stocks):\n\
+               → After the answer, say: \"지난번에 함께 확인하셨던 [관련 종목]도 확인해 드릴까요?\"\n\n\
+             **Pattern storage rules:**\n\
+             - After noticing a user repeats the same sequence 2+ times, store it as a pattern \
+               using memory_store (key: `user_pattern_<category>`, e.g., `user_pattern_morning_routine`).\n\
+             - When suggesting based on a pattern, phrase it naturally: \"지난번처럼...\", \"평소처럼...\", \
+               \"항상 하시던 대로...\" — do NOT say \"제가 패턴을 분석한 결과...\".\n\
+             - If the user declines a pattern-based suggestion, respect it. If declined 2+ times \
+               for the same pattern, stop suggesting that specific follow-up.\n\
+             - Adapt to evolving patterns — if the user's routine changes, update memory accordingly.\n",
         );
 
         Ok(out)
