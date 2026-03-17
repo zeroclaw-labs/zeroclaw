@@ -1318,8 +1318,14 @@ if [[ -n "$ZEROCLAW_BIN" ]]; then
       step_ok "Gateway service restarted"
 
       # Fetch and display pairing code from running gateway
-      sleep 1  # brief wait for service to start
-      if PAIR_CODE=$("$ZEROCLAW_BIN" gateway get-paircode 2>/dev/null | grep -oE '[0-9]{6}'); then
+      PAIR_CODE=""
+      for i in 1 2 3 4 5; do
+        sleep 2
+        if PAIR_CODE=$("$ZEROCLAW_BIN" gateway get-paircode 2>/dev/null | grep -oE '[0-9]{6}'); then
+          break
+        fi
+      done
+      if [[ -n "$PAIR_CODE" ]]; then
         echo
         echo -e "  ${BOLD_BLUE}🔐 Gateway Pairing Code${RESET}"
         echo
@@ -1328,6 +1334,7 @@ if [[ -n "$ZEROCLAW_BIN" ]]; then
         echo -e "  ${BOLD_BLUE}└──────────────┘${RESET}"
         echo
         echo -e "  ${DIM}Enter this code in the dashboard to pair your device.${RESET}"
+        echo -e "  ${DIM}Run 'zeroclaw gateway get-paircode --new' anytime to generate a fresh code.${RESET}"
       fi
     else
       step_fail "Gateway service restart failed — re-run with zeroclaw service start"
