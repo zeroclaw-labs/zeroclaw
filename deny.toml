@@ -15,6 +15,10 @@ ignore = [
     { id = "RUSTSEC-2024-0388", reason = "derivative via extism → wasmtime transitive dep" },
     { id = "RUSTSEC-2025-0057", reason = "fxhash via extism → wasmtime transitive dep" },
     { id = "RUSTSEC-2025-0119", reason = "number_prefix via indicatif — cosmetic dep" },
+    # wasmtime vulns via extism 1.13.0 — no upstream fix yet; plugins feature-gated
+    { id = "RUSTSEC-2026-0006", reason = "wasmtime segfault via extism; awaiting extism upgrade" },
+    { id = "RUSTSEC-2026-0020", reason = "WASI resource exhaustion via extism; awaiting extism upgrade" },
+    { id = "RUSTSEC-2026-0021", reason = "WASI http fields panic via extism; awaiting extism upgrade" },
 ]
 
 [licenses]
