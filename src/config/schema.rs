@@ -1414,6 +1414,7 @@ impl Default for PeripheralBoardConfig {
 /// Gateway server configuration (`[gateway]` section).
 ///
 /// Controls the HTTP gateway for webhook and pairing endpoints.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayConfig {
     /// Gateway port (default: 42617)
@@ -1456,6 +1457,11 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
+
+    /// Run the full agent loop (with tools, memory, MCP) on `/webhook`.
+    /// When false (default), webhook uses simple chat with no tool execution.
+    #[serde(default)]
+    pub webhook_tools: bool,
 }
 
 fn default_gateway_port() -> u16 {
@@ -1504,6 +1510,7 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+            webhook_tools: false,
         }
     }
 }
@@ -9321,6 +9328,7 @@ channel_id = "C123"
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
+            webhook_tools: false,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();

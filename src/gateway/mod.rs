@@ -331,6 +331,8 @@ pub struct AppState {
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// Registry of dynamically connected nodes
     pub node_registry: Arc<nodes::NodeRegistry>,
+    /// Run full agent loop with tools on /webhook (default: false)
+    pub webhook_tools: bool,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -680,6 +682,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         event_tx,
         shutdown_tx,
         node_registry,
+        webhook_tools: config.gateway.webhook_tools,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -1026,7 +1029,8 @@ async fn handle_webhook(
     let message = &webhook_body.message;
     let session_id = webhook_session_id(&headers);
 
-    if state.auto_save && !memory::should_skip_autosave_content(message) {
+    // Skip autosave when using full agent loop — process_message handles memory internally.
+    if !state.webhook_tools && state.auto_save && !memory::should_skip_autosave_content(message) {
         let key = webhook_memory_key();
         let _ = state
             .mem
@@ -1062,7 +1066,14 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_simple(&state, message).await {
+    // Full agent loop with tools (MCP, memory, etc.) or simple chat.
+    let result = if state.webhook_tools {
+        run_gateway_chat_with_tools(&state, message, session_id.as_deref()).await
+    } else {
+        run_gateway_chat_simple(&state, message).await
+    };
+
+    match result {
         Ok(response) => {
             let duration = started_at.elapsed();
             state
@@ -1829,6 +1840,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            webhook_tools: false,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1881,6 +1893,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            webhook_tools: false,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2257,6 +2270,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            webhook_tools: false,
         };
 
         let mut headers = HeaderMap::new();
@@ -2323,6 +2337,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            webhook_tools: false,
         };
 
         let headers = HeaderMap::new();
@@ -2401,6 +2416,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            webhook_tools: false,
         };
 
         let response = handle_webhook(
@@ -2451,6 +2467,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            webhook_tools: false,
         };
 
         let mut headers = HeaderMap::new();
@@ -2506,6 +2523,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            webhook_tools: false,
         };
 
         let mut headers = HeaderMap::new();
@@ -2566,6 +2584,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            webhook_tools: false,
         };
 
         let response = Box::pin(handle_nextcloud_talk_webhook(
@@ -2622,6 +2641,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            webhook_tools: false,
         };
 
         let mut headers = HeaderMap::new();
