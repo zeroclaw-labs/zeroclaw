@@ -1,0 +1,247 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zeroclaw-vikunja-tool
+  namespace: ai-agents
+data:
+  vikunja.py: |
+    #!/usr/bin/env python3
+    """Vikunja CLI for Sam (ZeroClaw Agent).
+
+    Manages projects and tasks on the Vikunja instance at todolist.coffee-anon.com
+    for project status tracking and coordination.
+
+    Commands:
+      vikunja projects                        List all projects
+      vikunja project create --title "..."    Create a project
+      vikunja tasks <project-id>              List tasks in a project
+      vikunja task create <project-id> --title "..." [--description "..."] [--due "YYYY-MM-DD"] [--priority 1-5]
+      vikunja task update <task-id> [--done] [--title "..."] [--description "..."]
+      vikunja task comment <task-id> --body "..."
+      vikunja help
+
+    Environment:
+      VIKUNJA_API_TOKEN  — JWT token for the sam user (required)
+      VIKUNJA_BASE_URL   — Vikunja URL (default: http://vikunja.todolist.svc.cluster.local:3456)
+    """
+    import json
+    import os
+    import sys
+    import urllib.request
+    import urllib.error
+
+    BASE_URL = os.environ.get("VIKUNJA_BASE_URL", "http://vikunja.todolist.svc.cluster.local:3456")
+    API_URL = f"{BASE_URL}/api/v1"
+    TOKEN = os.environ.get("VIKUNJA_API_TOKEN", "")
+
+
+    def _api(method, path, data=None, timeout=15):
+        """Make an authenticated Vikunja API request."""
+        if not TOKEN:
+            print("ERROR: VIKUNJA_API_TOKEN not set", file=sys.stderr)
+            sys.exit(1)
+        url = f"{API_URL}{path}"
+        headers = {
+            "Authorization": f"Bearer {TOKEN}",
+            "Content-Type": "application/json",
+        }
+        body = json.dumps(data).encode() if data else None
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+            raw = resp.read().decode()
+            return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode() if e.fp else ""
+            print(f"ERROR: HTTP {e.code} — {e.reason}", file=sys.stderr)
+            if error_body:
+                try:
+                    detail = json.loads(error_body)
+                    print(f"Detail: {detail.get('message', error_body)}", file=sys.stderr)
+                except json.JSONDecodeError:
+                    print(f"Detail: {error_body[:500]}", file=sys.stderr)
+            sys.exit(1)
+        except urllib.error.URLError as e:
+            print(f"ERROR: {e.reason}", file=sys.stderr)
+            sys.exit(1)
+
+
+    def _parse_args(args, flags):
+        """Parse --flag value pairs from args list. Returns (parsed_dict, positional_list)."""
+        parsed = {}
+        positional = []
+        i = 0
+        while i < len(args):
+            if args[i].startswith("--"):
+                key = args[i][2:]
+                if key in flags and flags[key] == "bool":
+                    parsed[key] = True
+                    i += 1
+                elif key in flags and i + 1 < len(args):
+                    parsed[key] = args[i + 1]
+                    i += 2
+                else:
+                    print(f"Unknown or incomplete flag: {args[i]}", file=sys.stderr)
+                    sys.exit(1)
+            else:
+                positional.append(args[i])
+                i += 1
+        return parsed, positional
+
+
+    def cmd_projects(args):
+        """List all projects."""
+        projects = _api("GET", "/projects")
+        if not projects:
+            print("No projects found.")
+            return
+        for p in projects:
+            pid = p.get("id", "?")
+            title = p.get("title", "Untitled")
+            desc = p.get("description", "")
+            desc_preview = f" — {desc[:60]}" if desc else ""
+            print(f"  #{pid}: {title}{desc_preview}")
+
+
+    def cmd_project_create(args):
+        """Create a new project."""
+        flags, _ = _parse_args(args, {"title": "str", "description": "str"})
+        title = flags.get("title")
+        if not title:
+            print('Usage: vikunja project create --title "..." [--description "..."]', file=sys.stderr)
+            sys.exit(1)
+        data = {"title": title}
+        if "description" in flags:
+            data["description"] = flags["description"]
+        result = _api("PUT", "/projects", data)
+        print(f"Project #{result.get('id', '?')} created: {result.get('title', title)}")
+
+
+    def cmd_tasks(args):
+        """List tasks in a project."""
+        if not args:
+            print("Usage: vikunja tasks <project-id>", file=sys.stderr)
+            sys.exit(1)
+        project_id = args[0]
+        # Get the list view (first view) for this project
+        views = _api("GET", f"/projects/{project_id}/views")
+        if not views:
+            print("No views found for this project.")
+            return
+        view_id = views[0].get("id")
+        task_list = _api("GET", f"/projects/{project_id}/views/{view_id}/tasks")
+        if not task_list:
+            print(f"No tasks in project #{project_id}.")
+            return
+        for t in task_list:
+            tid = t.get("id", "?")
+            title = t.get("title", "Untitled")
+            done = "DONE" if t.get("done") else "TODO"
+            due = t.get("due_date", "")
+            due_str = f" (due: {due[:10]})" if due and due != "0001-01-01T00:00:00Z" else ""
+            priority = t.get("priority", 0)
+            pri_str = f" [P{priority}]" if priority else ""
+            print(f"  #{tid} [{done}]{pri_str} {title}{due_str}")
+
+
+    def cmd_task_create(args):
+        """Create a task in a project."""
+        flags, positional = _parse_args(args, {
+            "title": "str", "description": "str", "due": "str",
+            "priority": "str",
+        })
+        if not positional:
+            print('Usage: vikunja task create <project-id> --title "..." [--description "..."] [--due "YYYY-MM-DD"] [--priority 1-5]',
+                  file=sys.stderr)
+            sys.exit(1)
+        project_id = positional[0]
+        title = flags.get("title")
+        if not title:
+            print("ERROR: --title is required", file=sys.stderr)
+            sys.exit(1)
+        data = {"title": title, "project_id": int(project_id)}
+        if "description" in flags:
+            data["description"] = flags["description"]
+        if "due" in flags:
+            data["due_date"] = flags["due"] + "T00:00:00Z"
+        if "priority" in flags:
+            data["priority"] = int(flags["priority"])
+        result = _api("PUT", f"/projects/{project_id}/tasks", data)
+        print(f"Task #{result.get('id', '?')} created: {result.get('title', title)}")
+
+
+    def cmd_task_update(args):
+        """Update a task."""
+        flags, positional = _parse_args(args, {
+            "done": "bool", "title": "str", "description": "str",
+            "due": "str", "priority": "str",
+        })
+        if not positional:
+            print('Usage: vikunja task update <task-id> [--done] [--title "..."] [--description "..."]',
+                  file=sys.stderr)
+            sys.exit(1)
+        task_id = positional[0]
+        data = {}
+        if flags.get("done"):
+            data["done"] = True
+        if "title" in flags:
+            data["title"] = flags["title"]
+        if "description" in flags:
+            data["description"] = flags["description"]
+        if "due" in flags:
+            data["due_date"] = flags["due"] + "T00:00:00Z"
+        if "priority" in flags:
+            data["priority"] = int(flags["priority"])
+        if not data:
+            print("Nothing to update. Use --done, --title, --description, --due, or --priority.",
+                  file=sys.stderr)
+            sys.exit(1)
+        result = _api("POST", f"/tasks/{task_id}", data)
+        status = "DONE" if result.get("done") else "TODO"
+        print(f"Task #{task_id} updated [{status}]: {result.get('title', '?')}")
+
+
+    def cmd_task_comment(args):
+        """Add a comment to a task."""
+        flags, positional = _parse_args(args, {"body": "str"})
+        if not positional or "body" not in flags:
+            print('Usage: vikunja task comment <task-id> --body "..."', file=sys.stderr)
+            sys.exit(1)
+        task_id = positional[0]
+        result = _api("PUT", f"/tasks/{task_id}/comments", {"comment": flags["body"]})
+        print(f"Comment added to task #{task_id} (comment id: {result.get('id', '?')})")
+
+
+    def main():
+        if len(sys.argv) < 2 or sys.argv[1] in ("help", "--help", "-h"):
+            print(__doc__)
+            sys.exit(0)
+
+        cmd = sys.argv[1]
+        rest = sys.argv[2:]
+
+        if cmd == "projects":
+            cmd_projects(rest)
+        elif cmd == "project" and rest and rest[0] == "create":
+            cmd_project_create(rest[1:])
+        elif cmd == "tasks":
+            cmd_tasks(rest)
+        elif cmd == "task" and rest:
+            subcmd = rest[0]
+            if subcmd == "create":
+                cmd_task_create(rest[1:])
+            elif subcmd == "update":
+                cmd_task_update(rest[1:])
+            elif subcmd == "comment":
+                cmd_task_comment(rest[1:])
+            else:
+                print(f"Unknown task subcommand: {subcmd}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print(f"Unknown command: {cmd}", file=sys.stderr)
+            print(__doc__)
+            sys.exit(1)
+
+
+    if __name__ == "__main__":
+        main()

@@ -143,6 +143,14 @@ spec:
                   name: zeroclaw-config-secrets
                   key: SPEAKR_API_TOKEN
                   optional: true
+            - name: VIKUNJA_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: zeroclaw-config-secrets
+                  key: VIKUNJA_API_TOKEN
+                  optional: true
+            - name: VIKUNJA_BASE_URL
+              value: "http://vikunja.todolist.svc.cluster.local:3456"
             - name: ACP_AUTH_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -169,6 +177,10 @@ spec:
             - name: acp-client
               mountPath: /usr/local/bin/acp-client
               subPath: acp-client.py
+              readOnly: true
+            - name: vikunja-tool
+              mountPath: /usr/local/bin/vikunja
+              subPath: vikunja.py
               readOnly: true
         - name: serena
           image: citizendaniel/zeroclaw-sam:v1.4.12
@@ -250,6 +262,10 @@ spec:
         - name: acp-client
           configMap:
             name: acp-client
+            defaultMode: 0755
+        - name: vikunja-tool
+          configMap:
+            name: zeroclaw-vikunja-tool
             defaultMode: 0755
   volumeClaimTemplates:
     - metadata:
