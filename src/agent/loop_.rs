@@ -2131,8 +2131,12 @@ pub(crate) async fn agent_turn(
     model: &str,
     temperature: f64,
     silent: bool,
+    channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    excluded_tools: &[String],
+    dedup_exempt_tools: &[String],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -2144,15 +2148,15 @@ pub(crate) async fn agent_turn(
         temperature,
         silent,
         None,
-        "channel",
+        channel_name,
         multimodal_config,
         max_tool_iterations,
         None,
         None,
         None,
-        &[],
-        &[],
-        None,
+        excluded_tools,
+        dedup_exempt_tools,
+        activated_tools,
     )
     .await
 }
@@ -3744,6 +3748,10 @@ pub async fn process_message(
     // NOTE: Same ordering contract as the CLI path above — MCP tools must be
     // injected after filter_primary_agent_tools_or_fail (or equivalent built-in
     // tool allow/deny filtering) to avoid MCP tools being silently dropped.
+    let mut deferred_section = String::new();
+    let mut activated_handle_pm: Option<
+        std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
+    > = None;
     if config.mcp.enabled && !config.mcp.servers.is_empty() {
         tracing::info!(
             "Initializing MCP client — {} server(s) configured",
@@ -3752,28 +3760,50 @@ pub async fn process_message(
         match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
             Ok(registry) => {
                 let registry = std::sync::Arc::new(registry);
-                let names = registry.tool_names();
-                let mut registered = 0usize;
-                for name in names {
-                    if let Some(def) = registry.get_tool_def(&name).await {
-                        let wrapper: std::sync::Arc<dyn Tool> =
-                            std::sync::Arc::new(crate::tools::McpToolWrapper::new(
-                                name,
-                                def,
-                                std::sync::Arc::clone(&registry),
-                            ));
-                        if let Some(ref handle) = delegate_handle_pm {
-                            handle.write().push(std::sync::Arc::clone(&wrapper));
+                if config.mcp.deferred_loading {
+                    let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
+                        std::sync::Arc::clone(&registry),
+                    )
+                    .await;
+                    tracing::info!(
+                        "MCP deferred: {} tool stub(s) from {} server(s)",
+                        deferred_set.len(),
+                        registry.server_count()
+                    );
+                    deferred_section =
+                        crate::tools::mcp_deferred::build_deferred_tools_section(&deferred_set);
+                    let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::tools::ActivatedToolSet::new(),
+                    ));
+                    activated_handle_pm = Some(std::sync::Arc::clone(&activated));
+                    tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
+                        deferred_set,
+                        activated,
+                    )));
+                } else {
+                    let names = registry.tool_names();
+                    let mut registered = 0usize;
+                    for name in names {
+                        if let Some(def) = registry.get_tool_def(&name).await {
+                            let wrapper: std::sync::Arc<dyn Tool> =
+                                std::sync::Arc::new(crate::tools::McpToolWrapper::new(
+                                    name,
+                                    def,
+                                    std::sync::Arc::clone(&registry),
+                                ));
+                            if let Some(ref handle) = delegate_handle_pm {
+                                handle.write().push(std::sync::Arc::clone(&wrapper));
+                            }
+                            tools_registry.push(Box::new(crate::tools::ArcToolRef(wrapper)));
+                            registered += 1;
                         }
-                        tools_registry.push(Box::new(crate::tools::ArcToolRef(wrapper)));
-                        registered += 1;
                     }
+                    tracing::info!(
+                        "MCP: {} tool(s) registered from {} server(s)",
+                        registered,
+                        registry.server_count()
+                    );
                 }
-                tracing::info!(
-                    "MCP: {} tool(s) registered from {} server(s)",
-                    registered,
-                    registry.server_count()
-                );
             }
             Err(e) => {
                 tracing::error!("MCP registry failed to initialize: {e:#}");
@@ -3889,6 +3919,10 @@ pub async fn process_message(
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
+    if !deferred_section.is_empty() {
+        system_prompt.push('\n');
+        system_prompt.push_str(&deferred_section);
+    }
 
     let mem_context = build_context(
         mem.as_ref(),
@@ -3914,6 +3948,8 @@ pub async fn process_message(
         ChatMessage::system(&system_prompt),
         ChatMessage::user(&enriched),
     ];
+    let excluded_tools =
+        compute_excluded_mcp_tools(&tools_registry, &config.agent.tool_filter_groups, message);
 
     agent_turn(
         provider.as_ref(),
@@ -3924,8 +3960,12 @@ pub async fn process_message(
         &model_name,
         config.default_temperature,
         true,
+        "daemon",
         &config.multimodal,
         config.agent.max_tool_iterations,
+        &excluded_tools,
+        &config.agent.tool_call_dedup_exempt,
+        activated_handle_pm.as_ref(),
     )
     .await
 }
@@ -4886,6 +4926,63 @@ mod tests {
                 .all(|msg| !(msg.role == "user" && msg.content.starts_with("[Tool results]"))),
             "native mode should use role=tool history instead of prompt fallback wrapper"
         );
+    }
+
+    #[test]
+    fn agent_turn_executes_activated_tool_from_wrapper() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should initialize");
+
+        runtime.block_on(async {
+            let provider = ScriptedProvider::from_text_responses(vec![
+                r#"<tool_call>
+{"name":"pixel__get_api_health","arguments":{"value":"ok"}}
+</tool_call>"#,
+                "done",
+            ]);
+
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let activated = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+            let activated_tool: Arc<dyn Tool> = Arc::new(CountingTool::new(
+                "pixel__get_api_health",
+                Arc::clone(&invocations),
+            ));
+            activated
+                .lock()
+                .unwrap()
+                .activate("pixel__get_api_health".into(), activated_tool);
+
+            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let mut history = vec![
+                ChatMessage::system("test-system"),
+                ChatMessage::user("use the activated MCP tool"),
+            ];
+            let observer = NoopObserver;
+
+            let result = agent_turn(
+                &provider,
+                &mut history,
+                &tools_registry,
+                &observer,
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                "daemon",
+                &crate::config::MultimodalConfig::default(),
+                4,
+                &[],
+                &[],
+                Some(&activated),
+            )
+            .await
+            .expect("wrapper path should execute activated tools");
+
+            assert_eq!(result, "done");
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        });
     }
 
     #[test]
