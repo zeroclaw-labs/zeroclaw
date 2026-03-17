@@ -46,6 +46,7 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod knowledge_tool;
 pub mod mcp_client;
 pub mod mcp_deferred;
 pub mod mcp_protocol;
@@ -106,6 +107,7 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+pub use knowledge_tool::KnowledgeTool;
 pub use mcp_client::McpRegistry;
 pub use mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
 pub use mcp_tool::McpToolWrapper;
@@ -521,6 +523,28 @@ pub fn all_tools_with_runtime(
             tracing::warn!(
                 "microsoft365: skipped registration because tenant_id or client_id is empty"
             );
+        }
+    }
+
+    // Knowledge graph tool
+    if root_config.knowledge.enabled {
+        let db_path_str = root_config.knowledge.db_path.replace(
+            '~',
+            &directories::UserDirs::new()
+                .map(|u| u.home_dir().to_string_lossy().to_string())
+                .unwrap_or_else(|| ".".to_string()),
+        );
+        let db_path = std::path::PathBuf::from(&db_path_str);
+        match crate::memory::knowledge_graph::KnowledgeGraph::new(
+            &db_path,
+            root_config.knowledge.max_nodes,
+        ) {
+            Ok(graph) => {
+                tool_arcs.push(Arc::new(KnowledgeTool::new(Arc::new(graph))));
+            }
+            Err(e) => {
+                tracing::warn!("knowledge graph disabled due to init error: {e}");
+            }
         }
     }
 
