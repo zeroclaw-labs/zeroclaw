@@ -77,9 +77,6 @@ pub struct EscalationRules {
     pub explicit_request_phrases: Vec<String>,
     /// Topic patterns that trigger topic-match escalation.
     pub escalation_topics: Vec<String>,
-    /// Sentiment score below which escalation is triggered (if sentiment
-    /// analysis is available). None = sentiment trigger disabled.
-    pub sentiment_threshold: Option<f64>,
 }
 
 impl Default for EscalationRules {
@@ -92,7 +89,6 @@ impl Default for EscalationRules {
                 "human agent".into(),
             ],
             escalation_topics: Vec::new(),
-            sentiment_threshold: None,
         }
     }
 }

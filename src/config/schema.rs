@@ -3980,10 +3980,6 @@ pub struct ConversationalAiConfig {
     /// Enable conversation analytics tracking. Default: true.
     #[serde(default = "default_true")]
     pub analytics_enabled: bool,
-
-    /// Optional tool name for RAG-based knowledge base lookup during conversations.
-    #[serde(default)]
-    pub knowledge_base_tool: Option<String>,
 }
 
 impl Default for ConversationalAiConfig {
@@ -3997,7 +3993,6 @@ impl Default for ConversationalAiConfig {
             max_conversation_turns: default_conversational_ai_max_turns(),
             conversation_timeout_secs: default_conversational_ai_timeout_secs(),
             analytics_enabled: true,
-            knowledge_base_tool: None,
         }
     }
 }
@@ -6055,7 +6050,7 @@ impl Config {
     }
 }
 
-#[allow(clippy::unused_async)]
+#[allow(clippy::unused_async)] // async needed on unix for tokio File I/O; no-op on other platforms
 async fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -6081,7 +6076,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    #[allow(unused_imports)]
+    #[cfg(unix)]
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;

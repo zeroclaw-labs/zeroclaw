@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 /// Escalation status for a conversation.
@@ -83,9 +84,12 @@ impl ConversationState {
 }
 
 /// Manages active conversations keyed by conversation ID.
-#[derive(Debug)]
+///
+/// Thread-safe: internal state is wrapped in `Arc<RwLock<...>>` so the manager
+/// can be shared across async tasks.
+#[derive(Debug, Clone)]
 pub struct ConversationManager {
-    conversations: HashMap<String, ConversationState>,
+    conversations: Arc<RwLock<HashMap<String, ConversationState>>>,
     default_language: String,
     timeout: Duration,
     max_turns: usize,
@@ -94,46 +98,48 @@ pub struct ConversationManager {
 impl ConversationManager {
     pub fn new(default_language: String, timeout_secs: u64, max_turns: usize) -> Self {
         Self {
-            conversations: HashMap::new(),
+            conversations: Arc::new(RwLock::new(HashMap::new())),
             default_language,
             timeout: Duration::from_secs(timeout_secs),
             max_turns,
         }
     }
 
-    /// Get or create conversation state for the given ID and channel.
-    pub fn get_or_create(
-        &mut self,
-        conversation_id: &str,
-        channel: &str,
-    ) -> &mut ConversationState {
+    /// Get or create conversation state for the given ID and channel, then
+    /// apply `f` to the mutable state while the write lock is held.
+    pub fn with_conversation<F, R>(&self, conversation_id: &str, channel: &str, f: F) -> R
+    where
+        F: FnOnce(&mut ConversationState) -> R,
+    {
+        let mut map = self.conversations.write().expect("lock poisoned");
         let default_lang = self.default_language.clone();
-        self.conversations
-            .entry(conversation_id.to_string())
-            .or_insert_with(|| {
-                ConversationState::new(
-                    conversation_id.to_string(),
-                    channel.to_string(),
-                    default_lang,
-                )
-            })
+        let state = map.entry(conversation_id.to_string()).or_insert_with(|| {
+            ConversationState::new(
+                conversation_id.to_string(),
+                channel.to_string(),
+                default_lang,
+            )
+        });
+        f(state)
     }
 
-    /// Get an existing conversation, if present.
-    pub fn get(&self, conversation_id: &str) -> Option<&ConversationState> {
-        self.conversations.get(conversation_id)
+    /// Read an existing conversation snapshot, if present.
+    pub fn get_snapshot(&self, conversation_id: &str) -> Option<ConversationState> {
+        let map = self.conversations.read().expect("lock poisoned");
+        map.get(conversation_id).cloned()
     }
 
     /// Remove a conversation (e.g. on completion or timeout).
-    pub fn remove(&mut self, conversation_id: &str) -> Option<ConversationState> {
-        self.conversations.remove(conversation_id)
+    pub fn remove(&self, conversation_id: &str) -> Option<ConversationState> {
+        let mut map = self.conversations.write().expect("lock poisoned");
+        map.remove(conversation_id)
     }
 
     /// Prune all conversations that have timed out.
-    pub fn prune_timed_out(&mut self) -> Vec<ConversationState> {
+    pub fn prune_timed_out(&self) -> Vec<ConversationState> {
         let timeout = self.timeout;
-        let timed_out_ids: Vec<String> = self
-            .conversations
+        let mut map = self.conversations.write().expect("lock poisoned");
+        let timed_out_ids: Vec<String> = map
             .iter()
             .filter(|(_, state)| state.is_timed_out(timeout))
             .map(|(id, _)| id.clone())
@@ -141,13 +147,14 @@ impl ConversationManager {
 
         timed_out_ids
             .into_iter()
-            .filter_map(|id| self.conversations.remove(&id))
+            .filter_map(|id| map.remove(&id))
             .collect()
     }
 
     /// Check if a conversation should be ended (timeout or turn limit).
     pub fn should_end(&self, conversation_id: &str) -> bool {
-        match self.conversations.get(conversation_id) {
+        let map = self.conversations.read().expect("lock poisoned");
+        match map.get(conversation_id) {
             Some(state) => {
                 state.is_timed_out(self.timeout) || state.is_over_turn_limit(self.max_turns)
             }
@@ -157,13 +164,19 @@ impl ConversationManager {
 
     /// Number of active conversations.
     pub fn active_count(&self) -> usize {
-        self.conversations.len()
+        let map = self.conversations.read().expect("lock poisoned");
+        map.len()
     }
 }
 
 /// Simple language detection heuristic based on Unicode script ranges.
-/// Returns a BCP-47 language tag hint. For production use, delegate to the
-/// provider for proper NLU-based detection.
+///
+/// Returns a BCP-47 language tag hint for **non-Latin scripts only** (CJK -> `"zh"`,
+/// Cyrillic -> `"ru"`, Arabic -> `"ar"`). Returns `None` for Latin-script text
+/// because script analysis alone cannot distinguish e.g. English from French.
+///
+/// This is a **placeholder**: callers should fall back to provider-based NLU
+/// detection when this returns `None`.
 pub fn detect_language_hint(text: &str) -> Option<&'static str> {
     let sample: String = text
         .chars()
@@ -248,17 +261,17 @@ mod tests {
     }
 
     #[test]
-    fn manager_get_or_create_returns_existing() {
-        let mut mgr = ConversationManager::new("en".into(), 1800, 50);
-        mgr.get_or_create("conv-1", "telegram");
-        mgr.get_or_create("conv-1", "telegram").record_turn();
-        assert_eq!(mgr.get("conv-1").unwrap().turn_count, 1);
+    fn manager_with_conversation_returns_existing() {
+        let mgr = ConversationManager::new("en".into(), 1800, 50);
+        mgr.with_conversation("conv-1", "telegram", |_| {});
+        mgr.with_conversation("conv-1", "telegram", |state| state.record_turn());
+        assert_eq!(mgr.get_snapshot("conv-1").unwrap().turn_count, 1);
     }
 
     #[test]
     fn manager_remove_clears_conversation() {
-        let mut mgr = ConversationManager::new("en".into(), 1800, 50);
-        mgr.get_or_create("conv-1", "telegram");
+        let mgr = ConversationManager::new("en".into(), 1800, 50);
+        mgr.with_conversation("conv-1", "telegram", |_| {});
         assert_eq!(mgr.active_count(), 1);
         mgr.remove("conv-1");
         assert_eq!(mgr.active_count(), 0);
@@ -266,12 +279,11 @@ mod tests {
 
     #[test]
     fn manager_should_end_over_turn_limit() {
-        let mut mgr = ConversationManager::new("en".into(), 1800, 2);
-        {
-            let state = mgr.get_or_create("conv-1", "telegram");
+        let mgr = ConversationManager::new("en".into(), 1800, 2);
+        mgr.with_conversation("conv-1", "telegram", |state| {
             state.record_turn();
             state.record_turn();
-        }
+        });
         assert!(mgr.should_end("conv-1"));
     }
 
