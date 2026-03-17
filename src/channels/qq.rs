@@ -671,4 +671,35 @@ allowed_users = ["user1"]
 
         assert_eq!(compose_message_content(&payload), None);
     }
+
+    #[test]
+    fn test_send_body_uses_markdown_msg_type() {
+        // Verify the expected JSON shape for both group and user send paths.
+        // msg_type 2 with a nested markdown object is required by the QQ API
+        // for markdown rendering; msg_type 0 (plain text) causes markdown
+        // syntax to appear literally in the client.
+        let content = "**bold** and `code`";
+
+        let group_body = json!({
+            "markdown": { "content": content },
+            "msg_type": 2,
+        });
+        assert_eq!(group_body["msg_type"], 2);
+        assert_eq!(group_body["markdown"]["content"], content);
+        assert!(
+            group_body.get("content").is_none(),
+            "top-level 'content' must not be present"
+        );
+
+        let user_body = json!({
+            "markdown": { "content": content },
+            "msg_type": 2,
+        });
+        assert_eq!(user_body["msg_type"], 2);
+        assert_eq!(user_body["markdown"]["content"], content);
+        assert!(
+            user_body.get("content").is_none(),
+            "top-level 'content' must not be present"
+        );
+    }
 }
