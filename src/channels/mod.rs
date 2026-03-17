@@ -2122,10 +2122,9 @@ async fn process_channel_message(
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
-    let cost_tracking_context = ctx
-        .cost_tracking
-        .clone()
-        .map(|state| crate::agent::loop_::ToolLoopCostTrackingContext::new(state.tracker, state.prices));
+    let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
+        crate::agent::loop_::ToolLoopCostTrackingContext::new(state.tracker, state.prices)
+    });
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(

@@ -1,5 +1,8 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
+use crate::config::schema::ModelPricing;
 use crate::config::Config;
+use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
+use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
@@ -21,9 +24,6 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use crate::cost::CostTracker;
-use crate::cost::types::{TokenUsage as CostTokenUsage, BudgetCheck};
-use crate::config::schema::ModelPricing;
 
 // ── Cost tracking via task-local ──
 
@@ -120,7 +120,11 @@ pub(crate) fn check_tool_loop_budget() -> Option<BudgetCheck> {
         .try_with(Clone::clone)
         .ok()
         .flatten()
-        .map(|ctx| ctx.tracker.check_budget(0.0).unwrap_or(BudgetCheck::Allowed))
+        .map(|ctx| {
+            ctx.tracker
+                .check_budget(0.0)
+                .unwrap_or(BudgetCheck::Allowed)
+        })
 }
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -2544,7 +2548,12 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         // Budget enforcement — block if limit exceeded (no-op when not scoped)
-        if let Some(BudgetCheck::Exceeded { current_usd, limit_usd, period }) = check_tool_loop_budget() {
+        if let Some(BudgetCheck::Exceeded {
+            current_usd,
+            limit_usd,
+            period,
+        }) = check_tool_loop_budget()
+        {
             return Err(anyhow::anyhow!(
                 "Budget exceeded: ${:.4} of ${:.2} {:?} limit. Cannot make further API calls until the budget resets.",
                 current_usd, limit_usd, period
@@ -6969,17 +6978,12 @@ Let me check the result."#;
                 output: 15.0,
             },
         )]);
-        let tracker = Arc::new(
-            CostTracker::new(cost_config.clone(), workspace.path()).unwrap(),
-        );
+        let tracker = Arc::new(CostTracker::new(cost_config.clone(), workspace.path()).unwrap());
         let ctx = ToolLoopCostTrackingContext::new(
             Arc::clone(&tracker),
             Arc::new(cost_config.prices.clone()),
         );
-        let mut history = vec![
-            ChatMessage::system("test"),
-            ChatMessage::user("hello"),
-        ];
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
@@ -7033,13 +7037,15 @@ Let me check the result."#;
             daily_limit_usd: 0.001, // very low limit
             ..crate::config::CostConfig::default()
         };
-        let tracker = Arc::new(
-            CostTracker::new(cost_config.clone(), workspace.path()).unwrap(),
-        );
+        let tracker = Arc::new(CostTracker::new(cost_config.clone(), workspace.path()).unwrap());
         // Record a usage that already exceeds the limit
         tracker
             .record_usage(crate::cost::types::TokenUsage::new(
-                "mock-model", 100_000, 50_000, 1.0, 1.0,
+                "mock-model",
+                100_000,
+                50_000,
+                1.0,
+                1.0,
             ))
             .unwrap();
 
@@ -7047,13 +7053,13 @@ Let me check the result."#;
             Arc::clone(&tracker),
             Arc::new(HashMap::from([(
                 "mock-model".to_string(),
-                ModelPricing { input: 1.0, output: 1.0 },
+                ModelPricing {
+                    input: 1.0,
+                    output: 1.0,
+                },
             )])),
         );
-        let mut history = vec![
-            ChatMessage::system("test"),
-            ChatMessage::user("hello"),
-        ];
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let err = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
@@ -7108,10 +7114,7 @@ Let me check the result."#;
             capabilities: ProviderCapabilities::default(),
         };
         let observer = NoopObserver;
-        let mut history = vec![
-            ChatMessage::system("test"),
-            ChatMessage::user("hello"),
-        ];
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = run_tool_call_loop(
             &provider,
