@@ -47,8 +47,13 @@ data:
 
     **Decision rule:**
     - Need to read, search, or interact → snapshot
-    - Need to verify something looks right visually → screenshot
+    - Need to send Dan a visual → screenshot (save to file, attach via Signal)
     - Starting a new page → always snapshot first
+
+    **Vision limitation:** Your LLM backend cannot process inline images. Do
+    not use `image_info(include_base64: true)` to "view" screenshots — it will
+    error. If you need to understand what's on the page, use snapshot (text).
+    Screenshots are for sending to Dan, not for your own analysis.
 
     ## Navigation Sequence
 
@@ -115,3 +120,5 @@ data:
     - Using browser for API calls — use Python urllib instead
     - Letting snapshots accumulate — large snapshots (10-70KB each) grow the
       context fast. If visiting multiple sites, `action: close` between them
+    - Using image_info(include_base64: true) to view images — your backend
+      can't process inline images. Use snapshot for content, screenshot for Dan
