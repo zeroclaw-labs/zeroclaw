@@ -31,6 +31,8 @@ export default function Config() {
   const [modelCatalog, setModelCatalog] = useState<ProviderModelCatalog | null>(null);
   const [selectedProvider, setSelectedProvider] = useState('');
   const [selectedModel, setSelectedModel] = useState('');
+  const [modelFilter, setModelFilter] = useState('');
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [providerSaving, setProviderSaving] = useState(false);
   const [providerError, setProviderError] = useState<string | null>(null);
   const [providerSuccess, setProviderSuccess] = useState<string | null>(null);
@@ -101,6 +103,7 @@ export default function Config() {
       setModelCatalog(catalog);
       setModelOptions(nextOptions);
       setSelectedModel(nextModel);
+      setModelFilter('');
 
       if (seedInitial) {
         setInitialProvider(providerId);
@@ -199,19 +202,24 @@ export default function Config() {
     setModelCatalog(null);
     setProviderSuccess(null);
     setProviderError(null);
+    setModelFilter('');
     await loadModels(nextProvider, null);
   };
 
   const handleModelSelect = (nextModel: string) => {
     setSelectedModel(nextModel);
+    setModelFilter('');
     setProviderSuccess(null);
     setProviderError(null);
+    setModelMenuOpen(false);
   };
 
   const handleModelInput = (nextModel: string) => {
     setSelectedModel(nextModel);
+    setModelFilter(nextModel);
     setProviderSuccess(null);
     setProviderError(null);
+    setModelMenuOpen(true);
   };
 
   // Auto-dismiss success after 4 seconds
@@ -236,6 +244,17 @@ export default function Config() {
     modelOptions,
     selectedModel.trim(),
   );
+  const normalizedModelSearch = modelFilter.trim().toLowerCase();
+  const filteredModelOptions =
+    normalizedModelSearch.length === 0
+      ? renderedModelOptions
+      : renderedModelOptions.filter((model) => {
+          if (model.id === selectedModel.trim()) {
+            return true;
+          }
+          const haystack = `${model.id} ${model.label}`.toLowerCase();
+          return haystack.includes(normalizedModelSearch);
+        });
   const modelAgeLabel = formatAge(modelCatalog?.source_age_secs);
   const modelSourceLabel = modelCatalog
     ? `${modelCatalog.source}${modelAgeLabel ? ` • ${modelAgeLabel} ago` : ''}`
@@ -336,30 +355,53 @@ export default function Config() {
             <label className="block text-sm font-medium text-gray-300 mb-1">
               Model
             </label>
-            <select
-              value={selectedModel}
-              onChange={(e) => handleModelSelect(e.target.value)}
-              disabled={loadingModels}
-              className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-white appearance-none focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
-            >
-              {loadingModels && <option value="">Loading models...</option>}
-              {!loadingModels && renderedModelOptions.length === 0 && (
-                <option value="">No models available</option>
+            <div className="relative">
+              <input
+                type="text"
+                value={selectedModel}
+                onChange={(e) => handleModelInput(e.target.value)}
+                onFocus={() => {
+                  setModelMenuOpen(true);
+                  setModelFilter('');
+                }}
+                onBlur={() => {
+                  window.setTimeout(() => setModelMenuOpen(false), 120);
+                }}
+                placeholder="Search or enter a model id"
+                className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              {modelMenuOpen && (
+                <div className="absolute z-20 mt-1 w-full max-h-64 overflow-y-auto rounded-lg border border-gray-700 bg-gray-900 shadow-lg">
+                  {loadingModels && (
+                    <div className="px-3 py-2 text-sm text-gray-400">
+                      Loading models...
+                    </div>
+                  )}
+                  {!loadingModels && filteredModelOptions.length === 0 && (
+                    <div className="px-3 py-2 text-sm text-gray-400">
+                      No models available
+                    </div>
+                  )}
+                  {!loadingModels &&
+                    filteredModelOptions.map((model) => (
+                      <button
+                        key={model.id}
+                        type="button"
+                        onMouseDown={(event) => {
+                          event.preventDefault();
+                          handleModelSelect(model.id);
+                        }}
+                        className="w-full text-left px-3 py-2 text-sm text-gray-200 hover:bg-gray-800"
+                      >
+                        {model.label}
+                      </button>
+                    ))}
+                </div>
               )}
-              {!loadingModels &&
-                renderedModelOptions.map((model) => (
-                  <option key={model.id} value={model.id}>
-                    {model.label}
-                  </option>
-                ))}
-            </select>
-            <input
-              type="text"
-              value={selectedModel}
-              onChange={(e) => handleModelInput(e.target.value)}
-              placeholder="Or enter a custom model id"
-              className="mt-2 w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
-            />
+            </div>
+            <p className="mt-2 text-[11px] text-gray-500">
+              Type to search or enter a custom model id.
+            </p>
             {modelSourceLabel && (
               <p className="text-xs text-gray-500 mt-2">
                 Models source: {modelSourceLabel}

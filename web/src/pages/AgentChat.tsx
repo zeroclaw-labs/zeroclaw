@@ -34,7 +34,8 @@ export default function AgentChat() {
   const [modelCatalog, setModelCatalog] = useState<ProviderModelCatalog | null>(null);
   const [selectedProvider, setSelectedProvider] = useState('');
   const [selectedModel, setSelectedModel] = useState('');
-  const [modelSearch, setModelSearch] = useState('');
+  const [modelFilter, setModelFilter] = useState('');
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [modelSaving, setModelSaving] = useState(false);
   const [modelError, setModelError] = useState<string | null>(null);
   const [modelSaved, setModelSaved] = useState<string | null>(null);
@@ -114,7 +115,7 @@ export default function AgentChat() {
       setModelCatalog(catalog);
       setModelOptions(nextOptions);
       setSelectedModel(nextModel);
-      setModelSearch('');
+      setModelFilter('');
 
       if (seedInitial) {
         setInitialProvider(providerId);
@@ -289,20 +290,24 @@ export default function AgentChat() {
     setModelCatalog(null);
     setModelSaved(null);
     setModelError(null);
-    setModelSearch('');
+    setModelFilter('');
     await loadModels(nextProvider, null);
   };
 
   const handleModelSelect = (nextModel: string) => {
     setSelectedModel(nextModel);
+    setModelFilter('');
     setModelSaved(null);
     setModelError(null);
+    setModelMenuOpen(false);
   };
 
   const handleModelInput = (nextModel: string) => {
     setSelectedModel(nextModel);
+    setModelFilter(nextModel);
     setModelSaved(null);
     setModelError(null);
+    setModelMenuOpen(true);
   };
 
   const handleModelSave = async () => {
@@ -326,7 +331,7 @@ export default function AgentChat() {
 
   const handleRestart = async () => {
     const confirmed = window.confirm(
-      'Restart the gateway now? Active chats will disconnect until it comes back up.',
+      'This will stop the gateway. If you are not running under a supervisor, you will need to start it again manually. Continue?',
     );
     if (!confirmed) return;
     setRestarting(true);
@@ -334,7 +339,10 @@ export default function AgentChat() {
     setRestartMessage(null);
     try {
       const result = await adminShutdown();
-      setRestartMessage(result.message || 'Gateway shutdown initiated.');
+      setRestartMessage(
+        result.message ||
+          'Gateway shutdown initiated. If it does not restart automatically, run `zeroclaw gateway`.',
+      );
     } catch (err: unknown) {
       setRestartError(err instanceof Error ? err.message : 'Failed to restart gateway');
     } finally {
@@ -383,7 +391,7 @@ export default function AgentChat() {
     modelOptions,
     selectedModel.trim(),
   );
-  const normalizedModelSearch = modelSearch.trim().toLowerCase();
+  const normalizedModelSearch = modelFilter.trim().toLowerCase();
   const filteredModelOptions =
     normalizedModelSearch.length === 0
       ? renderedModelOptions
@@ -530,37 +538,53 @@ export default function AgentChat() {
                 <label className="block text-xs font-medium text-gray-400 mb-1">
                   Model
                 </label>
-                <input
-                  type="text"
-                  value={modelSearch}
-                  onChange={(e) => setModelSearch(e.target.value)}
-                  placeholder="Search models..."
-                  className="mb-2 w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-                <select
-                  value={selectedModel}
-                  onChange={(e) => handleModelSelect(e.target.value)}
-                  disabled={loadingModels}
-                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white appearance-none focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
-                >
-                  {loadingModels && <option value="">Loading models...</option>}
-                  {!loadingModels && filteredModelOptions.length === 0 && (
-                    <option value="">No models available</option>
+                <div className="relative">
+                  <input
+                    type="text"
+                    value={selectedModel}
+                    onChange={(e) => handleModelInput(e.target.value)}
+                    onFocus={() => {
+                      setModelMenuOpen(true);
+                      setModelFilter('');
+                    }}
+                    onBlur={() => {
+                      window.setTimeout(() => setModelMenuOpen(false), 120);
+                    }}
+                    placeholder="Search or enter a model id"
+                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  {modelMenuOpen && (
+                    <div className="absolute z-20 mt-1 w-full max-h-64 overflow-y-auto rounded-lg border border-gray-700 bg-gray-800 shadow-lg">
+                      {loadingModels && (
+                        <div className="px-3 py-2 text-sm text-gray-400">
+                          Loading models...
+                        </div>
+                      )}
+                      {!loadingModels && filteredModelOptions.length === 0 && (
+                        <div className="px-3 py-2 text-sm text-gray-400">
+                          No models available
+                        </div>
+                      )}
+                      {!loadingModels &&
+                        filteredModelOptions.map((model) => (
+                          <button
+                            key={model.id}
+                            type="button"
+                            onMouseDown={(event) => {
+                              event.preventDefault();
+                              handleModelSelect(model.id);
+                            }}
+                            className="w-full text-left px-3 py-2 text-sm text-gray-200 hover:bg-gray-700"
+                          >
+                            {model.label}
+                          </button>
+                        ))}
+                    </div>
                   )}
-                  {!loadingModels &&
-                    filteredModelOptions.map((model) => (
-                      <option key={model.id} value={model.id}>
-                        {model.label}
-                      </option>
-                    ))}
-                </select>
-                <input
-                  type="text"
-                  value={selectedModel}
-                  onChange={(e) => handleModelInput(e.target.value)}
-                  placeholder="Or enter a custom model id"
-                  className="mt-2 w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
+                </div>
+                <p className="mt-2 text-[11px] text-gray-500">
+                  Type to search or enter a custom model id.
+                </p>
                 {modelSourceLabel && (
                   <p className="text-xs text-gray-500 mt-1">
                     Models source: {modelSourceLabel}
@@ -582,7 +606,7 @@ export default function AgentChat() {
                 disabled={restarting}
                 className="flex items-center justify-center gap-2 border border-gray-700 bg-gray-900 text-gray-200 text-sm font-medium px-4 py-2 rounded-lg transition-colors hover:border-gray-600 hover:bg-gray-800 disabled:opacity-50"
               >
-                {restarting ? 'Restarting...' : 'Restart gateway'}
+                {restarting ? 'Restarting...' : 'Restart gateway (requires supervisor)'}
               </button>
             </div>
           </div>

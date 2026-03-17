@@ -1,11 +1,13 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use crate::config::{Config, StreamMode};
+use crate::onboard::{get_provider_model_catalog, ProviderModelOption};
 use crate::security::pairing::PairingGuard;
 use anyhow::Context;
 use async_trait::async_trait;
 use directories::UserDirs;
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -18,6 +20,12 @@ const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 /// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 30 extra chars
 const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
 const TELEGRAM_ACK_REACTIONS: &[&str] = &["⚡️", "👌", "👀", "🔥", "👍"];
+const TELEGRAM_MODELS_BUTTON: &str = "Models";
+const TELEGRAM_MODEL_BUTTON_PREFIX: &str = "Model: ";
+const TELEGRAM_INIT_BUTTONS_COMMAND: &str = "initetelegrambuttons";
+const TELEGRAM_CALLBACK_MODELS: &str = "models";
+const TELEGRAM_CALLBACK_INIT: &str = "init";
+const TELEGRAM_CALLBACK_MODEL_PREFIX: &str = "model_idx:";
 
 /// Metadata for an incoming document or photo attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +44,18 @@ enum IncomingAttachmentKind {
     Photo,
 }
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
+
+enum TelegramCommand {
+    Start,
+    Models,
+    SetModel(String),
+}
+
+struct TelegramCommandContext {
+    chat_id: String,
+    thread_id: Option<String>,
+    content: String,
+}
 
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
@@ -313,6 +333,7 @@ pub struct TelegramChannel {
     transcription: Option<crate::config::TranscriptionConfig>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
+    model_menu_cache: Mutex<HashMap<String, Vec<ProviderModelOption>>>,
 }
 
 impl TelegramChannel {
@@ -344,6 +365,7 @@ impl TelegramChannel {
             transcription: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
+            model_menu_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -399,6 +421,450 @@ impl TelegramChannel {
             .get("message_id")
             .and_then(serde_json::Value::as_i64)?;
         Some((chat_id, message_id))
+    }
+
+    fn extract_command_context(&self, update: &serde_json::Value) -> Option<TelegramCommandContext> {
+        let message = update.get("message")?;
+        let text = message.get("text").and_then(serde_json::Value::as_str)?;
+
+        let (username, sender_id, _sender_identity) = Self::extract_sender_info(message);
+        let mut identities = vec![username.as_str()];
+        if let Some(id) = sender_id.as_deref() {
+            identities.push(id);
+        }
+
+        if !self.is_any_user_allowed(identities.iter().copied()) {
+            return None;
+        }
+
+        let is_group = Self::is_group_message(message);
+        if self.mention_only && is_group {
+            let bot_username = self.bot_username.lock();
+            let Some(ref bot_username) = *bot_username else {
+                return None;
+            };
+            if !Self::contains_bot_mention(text, bot_username) {
+                return None;
+            }
+        }
+
+        let chat_id = message
+            .get("chat")
+            .and_then(|chat| chat.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string())?;
+
+        let thread_id = message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string());
+
+        let content = if self.mention_only && is_group {
+            let bot_username = self.bot_username.lock();
+            let bot_username = bot_username.as_ref()?;
+            Self::normalize_incoming_content(text, bot_username)?
+        } else {
+            text.to_string()
+        };
+
+        Some(TelegramCommandContext {
+            chat_id,
+            thread_id,
+            content,
+        })
+    }
+
+    fn parse_command(content: &str) -> Option<TelegramCommand> {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        if let Some(model) = trimmed.strip_prefix(TELEGRAM_MODEL_BUTTON_PREFIX) {
+            let model = model.trim();
+            if !model.is_empty() {
+                return Some(TelegramCommand::SetModel(model.to_string()));
+            }
+        }
+
+        if trimmed.eq_ignore_ascii_case(TELEGRAM_MODELS_BUTTON) {
+            return Some(TelegramCommand::Models);
+        }
+
+        if !trimmed.starts_with('/') {
+            return None;
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        let command_token = parts.next()?;
+        let command = command_token
+            .trim_start_matches('/')
+            .split('@')
+            .next()
+            .unwrap_or(command_token)
+            .to_ascii_lowercase();
+
+        match command.as_str() {
+            "start" => Some(TelegramCommand::Start),
+            "models" => Some(TelegramCommand::Models),
+            TELEGRAM_INIT_BUTTONS_COMMAND => Some(TelegramCommand::Start),
+            "model" => {
+                let model = parts.collect::<Vec<_>>().join(" ");
+                let model = model.trim();
+                if model.is_empty() {
+                    Some(TelegramCommand::Models)
+                } else {
+                    Some(TelegramCommand::SetModel(model.to_string()))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn build_init_keyboard() -> serde_json::Value {
+        serde_json::json!({
+            "inline_keyboard": [[
+                { "text": TELEGRAM_MODELS_BUTTON, "callback_data": TELEGRAM_CALLBACK_MODELS }
+            ]]
+        })
+    }
+
+    fn build_models_keyboard(&self, chat_id: &str, models: &[ProviderModelOption]) -> serde_json::Value {
+        let mut cached = Vec::new();
+        let mut rows = Vec::new();
+        for (idx, model) in models.iter().take(8).enumerate() {
+            cached.push(model.clone());
+            rows.push(vec![serde_json::json!({
+                "text": model.label,
+                "callback_data": format!("{TELEGRAM_CALLBACK_MODEL_PREFIX}{idx}")
+            })]);
+        }
+        rows.push(vec![serde_json::json!({
+            "text": "<< Back",
+            "callback_data": TELEGRAM_CALLBACK_INIT
+        })]);
+        if !cached.is_empty() {
+            self.model_menu_cache.lock().insert(chat_id.to_string(), cached);
+        }
+        serde_json::json!({ "inline_keyboard": rows })
+    }
+
+    async fn send_text_with_reply_markup(
+        &self,
+        text: &str,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        reply_markup: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let mut markdown_body = serde_json::json!({
+            "chat_id": chat_id,
+            "text": Self::markdown_to_telegram_html(text),
+            "parse_mode": "HTML",
+            "reply_markup": reply_markup
+        });
+
+        if let Some(tid) = thread_id {
+            markdown_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+        }
+
+        let markdown_resp = self
+            .http_client()
+            .post(self.api_url("sendMessage"))
+            .json(&markdown_body)
+            .send()
+            .await?;
+
+        if markdown_resp.status().is_success() {
+            return Ok(());
+        }
+
+        let mut plain_body = serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+            "reply_markup": reply_markup
+        });
+
+        if let Some(tid) = thread_id {
+            plain_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+        }
+
+        let plain_resp = self
+            .http_client()
+            .post(self.api_url("sendMessage"))
+            .json(&plain_body)
+            .send()
+            .await?;
+
+        if !plain_resp.status().is_success() {
+            let status = plain_resp.status();
+            let body = plain_resp.text().await.unwrap_or_default();
+            anyhow::bail!("Telegram sendMessage failed: {status}: {body}");
+        }
+
+        Ok(())
+    }
+
+    async fn try_handle_command(&self, update: &serde_json::Value) -> bool {
+        let Some(ctx) = self.extract_command_context(update) else {
+            return false;
+        };
+        let Some(command) = Self::parse_command(&ctx.content) else {
+            return false;
+        };
+
+        let thread_id = ctx.thread_id.as_deref();
+        match command {
+            TelegramCommand::Start => {
+                let message = "Welcome to ZeroClaw.\n\nTap the buttons below to pick a model.";
+                if let Err(err) = self
+                    .send_text_with_reply_markup(
+                        message,
+                        &ctx.chat_id,
+                        thread_id,
+                        Self::build_init_keyboard(),
+                    )
+                    .await
+                {
+                    tracing::warn!("Telegram /start response failed: {err}");
+                }
+                true
+            }
+            TelegramCommand::Models => {
+                let response = async {
+                    let config = Config::load_or_init().await?;
+                    let provider = config
+                        .default_provider
+                        .clone()
+                        .unwrap_or_else(|| "openrouter".to_string());
+                    let catalog = get_provider_model_catalog(&config, &provider).await?;
+                    let current_model = config
+                        .default_model
+                        .clone()
+                        .unwrap_or_else(|| catalog.default_model.clone());
+                    let provider_label = if catalog.effective_provider != catalog.requested_provider
+                    {
+                        format!(
+                            "{} (resolved to {})",
+                            catalog.requested_provider, catalog.effective_provider
+                        )
+                    } else {
+                        catalog.requested_provider.clone()
+                    };
+
+                    let message = format!(
+                        "Models ({provider_label}) — {} available\nCurrent model: {current_model}\n\nChoose a model below.",
+                        catalog.models.len()
+                    );
+
+                    self.send_text_with_reply_markup(
+                        &message,
+                        &ctx.chat_id,
+                        thread_id,
+                        self.build_models_keyboard(&ctx.chat_id, &catalog.models),
+                    )
+                    .await
+                }
+                .await;
+
+                if let Err(err) = response {
+                    tracing::warn!("Telegram /models response failed: {err}");
+                    let _ = self
+                        .send_text_chunks(
+                            "Failed to load models. Try again later.",
+                            &ctx.chat_id,
+                            thread_id,
+                        )
+                        .await;
+                }
+                true
+            }
+            TelegramCommand::SetModel(model) => {
+                let response = async {
+                    let mut config = Config::load_or_init().await?;
+                    config.default_model = Some(model.clone());
+                    if config.default_provider.is_none() {
+                        config.default_provider = Some("openrouter".to_string());
+                    }
+                    config.save().await?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+
+                if let Err(err) = response {
+                    tracing::warn!("Telegram /model save failed: {err}");
+                    let _ = self
+                        .send_text_chunks(
+                            "Failed to save model selection. Check logs for details.",
+                            &ctx.chat_id,
+                            thread_id,
+                        )
+                        .await;
+                } else {
+                    let _ = self
+                        .send_text_chunks(
+                            &format!(
+                                "Model set to {model}.\nRestart zeroclaw daemon/gateway to apply."
+                            ),
+                            &ctx.chat_id,
+                            thread_id,
+                        )
+                        .await;
+                }
+                true
+            }
+        }
+    }
+
+    fn extract_callback_context(
+        &self,
+        update: &serde_json::Value,
+    ) -> Option<(String, Option<String>, String, String)> {
+        let callback = update.get("callback_query")?;
+        let data = callback.get("data").and_then(serde_json::Value::as_str)?;
+        let from = callback.get("from")?;
+
+        let username = from
+            .get("username")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let sender_id = from
+            .get("id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string());
+
+        let mut identities = vec![username];
+        if let Some(ref id) = sender_id {
+            identities.push(id);
+        }
+
+        if !self.is_any_user_allowed(identities.iter().copied()) {
+            return None;
+        }
+
+        let message = callback.get("message")?;
+        let chat_id = message
+            .get("chat")
+            .and_then(|chat| chat.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string())?;
+        let thread_id = message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string());
+
+        Some((chat_id, thread_id, data.to_string(), callback.get("id")?.as_str()?.to_string()))
+    }
+
+    async fn answer_callback_query(&self, callback_id: &str, text: &str) -> anyhow::Result<()> {
+        let body = serde_json::json!({
+            "callback_query_id": callback_id,
+            "text": text,
+            "show_alert": false
+        });
+        let _ = self
+            .http_client()
+            .post(self.api_url("answerCallbackQuery"))
+            .json(&body)
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    async fn try_handle_callback(&self, update: &serde_json::Value) -> bool {
+        let Some((chat_id, thread_id, data, callback_id)) =
+            self.extract_callback_context(update)
+        else {
+            return false;
+        };
+
+        let response = async {
+            match data.as_str() {
+                TELEGRAM_CALLBACK_INIT => {
+                    self.send_text_with_reply_markup(
+                        "Tap a button to continue.",
+                        &chat_id,
+                        thread_id.as_deref(),
+                        Self::build_init_keyboard(),
+                    )
+                    .await?;
+                    self.answer_callback_query(&callback_id, "Ready.").await?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                TELEGRAM_CALLBACK_MODELS => {
+                    let config = Config::load_or_init().await?;
+                    let provider = config
+                        .default_provider
+                        .clone()
+                        .unwrap_or_else(|| "openrouter".to_string());
+                    let catalog = get_provider_model_catalog(&config, &provider).await?;
+                    let current_model = config
+                        .default_model
+                        .clone()
+                        .unwrap_or_else(|| catalog.default_model.clone());
+                    let provider_label = if catalog.effective_provider != catalog.requested_provider
+                    {
+                        format!(
+                            "{} (resolved to {})",
+                            catalog.requested_provider, catalog.effective_provider
+                        )
+                    } else {
+                        catalog.requested_provider.clone()
+                    };
+                    let message = format!(
+                        "Models ({provider_label}) — {} available\nCurrent model: {current_model}\n\nChoose a model below.",
+                        catalog.models.len()
+                    );
+                    self.send_text_with_reply_markup(
+                        &message,
+                        &chat_id,
+                        thread_id.as_deref(),
+                        self.build_models_keyboard(&chat_id, &catalog.models),
+                    )
+                    .await?;
+                    self.answer_callback_query(&callback_id, "Models loaded.").await?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                _ => {
+                    if let Some(idx_str) = data.strip_prefix(TELEGRAM_CALLBACK_MODEL_PREFIX) {
+                        let idx: usize = idx_str.parse().unwrap_or(usize::MAX);
+                        let model = self
+                            .model_menu_cache
+                            .lock()
+                            .get(&chat_id)
+                            .and_then(|models| models.get(idx))
+                            .map(|m| m.id.clone());
+
+                        if let Some(model) = model {
+                            let mut config = Config::load_or_init().await?;
+                            config.default_model = Some(model.clone());
+                            if config.default_provider.is_none() {
+                                config.default_provider = Some("openrouter".to_string());
+                            }
+                            config.save().await?;
+                            self.send_text_chunks(
+                                &format!(
+                                    "Model set to {model}.\nRestart zeroclaw daemon/gateway to apply."
+                                ),
+                                &chat_id,
+                                thread_id.as_deref(),
+                            )
+                            .await?;
+                            self.answer_callback_query(&callback_id, "Model updated.").await?;
+                        } else {
+                            self.answer_callback_query(&callback_id, "Model list expired. Tap Models again.").await?;
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(())
+                }
+            }
+        }
+        .await;
+
+        if let Err(err) = response {
+            tracing::warn!("Telegram callback handling failed: {err}");
+        }
+
+        true
     }
 
     fn try_add_ack_reaction_nonblocking(&self, chat_id: String, message_id: i64) {
@@ -2467,7 +2933,7 @@ impl Channel for TelegramChannel {
             let probe = serde_json::json!({
                 "offset": offset,
                 "timeout": 0,
-                "allowed_updates": ["message"]
+                "allowed_updates": ["message", "callback_query"]
             });
             match self.http_client().post(&url).json(&probe).send().await {
                 Err(e) => {
@@ -2540,7 +3006,7 @@ impl Channel for TelegramChannel {
             let body = serde_json::json!({
                 "offset": offset,
                 "timeout": 30,
-                "allowed_updates": ["message"]
+                "allowed_updates": ["message", "callback_query"]
             });
 
             let resp = match self.http_client().post(&url).json(&body).send().await {
@@ -2599,6 +3065,14 @@ Ensure only one `zeroclaw` process is using this bot token."
                     // Advance offset past this update
                     if let Some(uid) = update.get("update_id").and_then(serde_json::Value::as_i64) {
                         offset = uid + 1;
+                    }
+
+                    if self.try_handle_callback(update).await {
+                        continue;
+                    }
+
+                    if self.try_handle_command(update).await {
+                        continue;
                     }
 
                     let msg = if let Some(m) = self.parse_update_message(update) {
