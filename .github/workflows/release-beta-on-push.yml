@@ -318,6 +318,19 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Build and push Debian compatibility image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile.debian
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.tag }}-debian
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:beta-debian
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   # ── Post-publish: tweet after release + website are live ──────────────
   # Docker is slow (multi-platform) and can be cancelled by concurrency;
   # don't let it block the tweet.
