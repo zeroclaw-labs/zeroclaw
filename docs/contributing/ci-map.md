@@ -38,10 +38,10 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
     - Purpose: manual, bot-owned Homebrew core formula bump PR flow for tagged releases
     - Guardrail: release tag must match `Cargo.toml` version
 - `.github/workflows/pub-scoop.yml` (`Pub Scoop Manifest`)
-    - Purpose: manual Scoop bucket manifest update for Windows distribution
+    - Purpose: Scoop bucket manifest update for Windows; auto-called by stable release, also manual dispatch
     - Guardrail: release tag must be `vX.Y.Z` format; Windows binary hash extracted from `SHA256SUMS`
 - `.github/workflows/pub-aur.yml` (`Pub AUR Package`)
-    - Purpose: manual AUR PKGBUILD push for Arch Linux distribution
+    - Purpose: AUR PKGBUILD push for Arch Linux; auto-called by stable release, also manual dispatch
     - Guardrail: release tag must be `vX.Y.Z` format; source tarball SHA256 computed at publish time
 - `.github/workflows/pr-label-policy-check.yml` (`Label Policy Sanity`)
     - Purpose: validate shared contributor-tier policy in `.github/label-policy.json` and ensure label workflows consume that policy
@@ -81,8 +81,8 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `Docker`: tag push (`v*`) for publish, matching PRs to `master` for smoke build, manual dispatch for smoke only
 - `Release`: tag push (`v*`), weekly schedule (verification-only), manual dispatch (verification or publish)
 - `Pub Homebrew Core`: manual dispatch only
-- `Pub Scoop Manifest`: manual dispatch only
-- `Pub AUR Package`: manual dispatch only
+- `Pub Scoop Manifest`: auto-called by stable release, also manual dispatch
+- `Pub AUR Package`: auto-called by stable release, also manual dispatch
 - `Security Audit`: push to `master`, PRs to `master`, weekly schedule
 - `Sec Vorpal Reviewdog`: manual dispatch only
 - `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change

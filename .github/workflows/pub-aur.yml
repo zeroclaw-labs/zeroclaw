@@ -1,6 +1,20 @@
 name: Pub AUR Package
 
 on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Existing release tag (vX.Y.Z)"
+        required: true
+        type: string
+      dry_run:
+        description: "Generate PKGBUILD only (no push)"
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      AUR_SSH_KEY:
+        required: false
   workflow_dispatch:
     inputs:
       release_tag:
