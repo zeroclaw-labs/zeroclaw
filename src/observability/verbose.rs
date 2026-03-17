@@ -101,4 +101,22 @@ mod tests {
         });
         obs.record_event(&ObserverEvent::TurnComplete);
     }
+
+    #[test]
+    fn verbose_hand_events_do_not_panic() {
+        let obs = VerboseObserver::new();
+        obs.record_event(&ObserverEvent::HandStarted {
+            hand_name: "review".into(),
+        });
+        obs.record_event(&ObserverEvent::HandCompleted {
+            hand_name: "review".into(),
+            duration_ms: 1500,
+            findings_count: 3,
+        });
+        obs.record_event(&ObserverEvent::HandFailed {
+            hand_name: "review".into(),
+            error: "timeout".into(),
+            duration_ms: 5000,
+        });
+    }
 }

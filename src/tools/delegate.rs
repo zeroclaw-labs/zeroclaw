@@ -6,6 +6,7 @@ use crate::providers::{self, ChatMessage, Provider};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,7 +31,7 @@ pub struct DelegateTool {
     /// Depth at which this tool instance lives in the delegation chain.
     depth: u32,
     /// Parent tool registry for agentic sub-agents.
-    parent_tools: Arc<Vec<Arc<dyn Tool>>>,
+    parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
 }
@@ -61,7 +62,7 @@ impl DelegateTool {
             fallback_credential,
             provider_runtime_options,
             depth: 0,
-            parent_tools: Arc::new(Vec::new()),
+            parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
         }
     }
@@ -97,13 +98,13 @@ impl DelegateTool {
             fallback_credential,
             provider_runtime_options,
             depth,
-            parent_tools: Arc::new(Vec::new()),
+            parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
         }
     }
 
     /// Attach parent tools used to build sub-agent allowlist registries.
-    pub fn with_parent_tools(mut self, parent_tools: Arc<Vec<Arc<dyn Tool>>>) -> Self {
+    pub fn with_parent_tools(mut self, parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>) -> Self {
         self.parent_tools = parent_tools;
         self
     }
@@ -112,6 +113,12 @@ impl DelegateTool {
     pub fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
         self.multimodal_config = config;
         self
+    }
+
+    /// Return a shared handle to the parent tools list.
+    /// Callers can push additional tools (e.g. MCP wrappers) after construction.
+    pub fn parent_tools_handle(&self) -> Arc<RwLock<Vec<Arc<dyn Tool>>>> {
+        Arc::clone(&self.parent_tools)
     }
 }
 
@@ -365,13 +372,15 @@ impl DelegateTool {
             .filter(|name| !name.is_empty())
             .collect::<std::collections::HashSet<_>>();
 
-        let sub_tools: Vec<Box<dyn Tool>> = self
-            .parent_tools
-            .iter()
-            .filter(|tool| allowed.contains(tool.name()))
-            .filter(|tool| tool.name() != "delegate")
-            .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
-            .collect();
+        let sub_tools: Vec<Box<dyn Tool>> = {
+            let parent_tools = self.parent_tools.read();
+            parent_tools
+                .iter()
+                .filter(|tool| allowed.contains(tool.name()))
+                .filter(|tool| tool.name() != "delegate")
+                .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
+                .collect()
+        };
 
         if sub_tools.is_empty() {
             return Ok(ToolResult {
@@ -412,6 +421,7 @@ impl DelegateTool {
                 None,
                 &[],
                 &[],
+                None,
             ),
         )
         .await;
@@ -1001,7 +1011,7 @@ mod tests {
         );
 
         let tool = DelegateTool::new(agents, None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
         let result = tool
             .execute(json!({"agent": "agentic", "prompt": "test"}))
             .await
@@ -1019,10 +1029,10 @@ mod tests {
     async fn execute_agentic_runs_tool_call_loop_with_filtered_tools() {
         let config = agentic_config(vec!["echo_tool".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
-            Arc::new(vec![
+            Arc::new(RwLock::new(vec![
                 Arc::new(EchoTool),
                 Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
-            ]),
+            ])),
         );
 
         let provider = OneToolThenFinalProvider;
@@ -1040,11 +1050,11 @@ mod tests {
     async fn execute_agentic_excludes_delegate_even_if_allowlisted() {
         let config = agentic_config(vec!["delegate".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
-            Arc::new(vec![Arc::new(DelegateTool::new(
+            Arc::new(RwLock::new(vec![Arc::new(DelegateTool::new(
                 HashMap::new(),
                 None,
                 test_security(),
-            ))]),
+            ))])),
         );
 
         let provider = OneToolThenFinalProvider;
@@ -1065,7 +1075,7 @@ mod tests {
     async fn execute_agentic_respects_max_iterations() {
         let config = agentic_config(vec!["echo_tool".to_string()], 2);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
 
         let provider = InfiniteToolCallProvider;
         let result = tool
@@ -1085,7 +1095,7 @@ mod tests {
     async fn execute_agentic_propagates_provider_errors() {
         let config = agentic_config(vec!["echo_tool".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
 
         let provider = FailingProvider;
         let result = tool
@@ -1099,5 +1109,115 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("provider boom"));
+    }
+
+    /// MCP tools pushed into the shared parent_tools handle after DelegateTool
+    /// construction must be visible to the sub-agent tool list.
+    #[derive(Default)]
+    struct FakeMcpTool;
+
+    #[async_trait]
+    impl Tool for FakeMcpTool {
+        fn name(&self) -> &str {
+            "mcp_fake"
+        }
+
+        fn description(&self) -> &str {
+            "Fake MCP tool for testing."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "mcp_fake_output".into(),
+                error: None,
+            })
+        }
+    }
+
+    struct McpToolThenFinalProvider;
+
+    #[async_trait]
+    impl Provider for McpToolThenFinalProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let has_tool_message = request.messages.iter().any(|m| m.role == "tool");
+            if has_tool_message {
+                Ok(ChatResponse {
+                    text: Some("mcp done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_mcp".to_string(),
+                        name: "mcp_fake".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_included_in_subagent_tool_list() {
+        // Build DelegateTool with NO parent tools initially
+        let config = agentic_config(vec!["mcp_fake".to_string()], 10);
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        // Simulate late MCP tool injection via the shared handle
+        let handle = tool.parent_tools_handle();
+        handle.write().push(Arc::new(FakeMcpTool));
+
+        let provider = McpToolThenFinalProvider;
+        let result = tool
+            .execute_agentic("agentic", &config, &provider, "run mcp", 0.2)
+            .await
+            .unwrap();
+
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+        assert!(
+            result.output.contains("mcp done"),
+            "Expected output containing 'mcp done', got: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn parent_tools_handle_returns_shared_reference() {
+        let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
+            Arc::new(RwLock::new(vec![Arc::new(EchoTool) as Arc<dyn Tool>])),
+        );
+
+        let handle = tool.parent_tools_handle();
+        assert_eq!(handle.read().len(), 1);
+
+        // Push a new tool via the handle
+        handle.write().push(Arc::new(FakeMcpTool));
+        assert_eq!(handle.read().len(), 2);
     }
 }

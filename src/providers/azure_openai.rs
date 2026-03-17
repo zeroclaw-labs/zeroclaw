@@ -312,6 +312,7 @@ impl Provider for AzureOpenAiProvider {
         ProviderCapabilities {
             native_tool_calling: true,
             vision: true,
+            prompt_caching: false,
         }
     }
 
@@ -431,6 +432,7 @@ impl Provider for AzureOpenAiProvider {
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
+            cached_input_tokens: None,
         });
         let message = native_response
             .choices
@@ -491,6 +493,7 @@ impl Provider for AzureOpenAiProvider {
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
+            cached_input_tokens: None,
         });
         let message = native_response
             .choices

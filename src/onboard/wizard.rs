@@ -95,7 +95,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     match resolve_interactive_onboarding_mode(&config_path, force)? {
         InteractiveOnboardingMode::FullOnboarding => {}
         InteractiveOnboardingMode::UpdateProviderOnly => {
-            return run_provider_update_wizard(&workspace_dir, &config_path).await;
+            return Box::pin(run_provider_update_wizard(&workspace_dir, &config_path)).await;
         }
     }
 
@@ -134,14 +134,21 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
             Some(api_key)
         },
         api_url: provider_api_url,
+        api_path: None,
         default_provider: Some(provider),
         default_model: Some(model),
         model_providers: std::collections::HashMap::new(),
         default_temperature: 0.7,
         provider_timeout_secs: 120,
+        extra_headers: std::collections::HashMap::new(),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
+        backup: crate::config::BackupConfig::default(),
+        data_retention: crate::config::DataRetentionConfig::default(),
+        cloud_ops: crate::config::CloudOpsConfig::default(),
+        conversational_ai: crate::config::ConversationalAiConfig::default(),
         security: crate::config::SecurityConfig::default(),
+        security_ops: crate::config::SecurityOpsConfig::default(),
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
@@ -157,22 +164,34 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         tunnel: tunnel_config,
         gateway: crate::config::GatewayConfig::default(),
         composio: composio_config,
+        microsoft365: crate::config::Microsoft365Config::default(),
         secrets: secrets_config,
         browser: BrowserConfig::default(),
+        browser_delegate: crate::tools::browser_delegate::BrowserDelegateConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
         multimodal: crate::config::MultimodalConfig::default(),
         web_fetch: crate::config::WebFetchConfig::default(),
         web_search: crate::config::WebSearchConfig::default(),
+        project_intel: crate::config::ProjectIntelConfig::default(),
+        google_workspace: crate::config::GoogleWorkspaceConfig::default(),
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
+        swarms: std::collections::HashMap::new(),
         hooks: crate::config::HooksConfig::default(),
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
         tts: crate::config::TtsConfig::default(),
+        mcp: crate::config::McpConfig::default(),
+        nodes: crate::config::NodesConfig::default(),
+        workspace: crate::config::WorkspaceConfig::default(),
+        notion: crate::config::NotionConfig::default(),
+        node_transport: crate::config::NodeTransportConfig::default(),
+        knowledge: crate::config::KnowledgeConfig::default(),
+        linkedin: crate::config::LinkedInConfig::default(),
     };
 
     println!(
@@ -232,7 +251,7 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
     );
     println!();
 
-    let mut config = Config::load_or_init().await?;
+    let mut config = Box::pin(Config::load_or_init()).await?;
 
     print_step(1, 1, "Channels (How You Talk to ZeroClaw)");
     config.channels_config = setup_channels()?;
@@ -356,7 +375,6 @@ fn apply_provider_update(
 
 /// Non-interactive setup: generates a sensible default config instantly.
 /// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite|lucid`.
-/// Use `zeroclaw onboard --interactive` for the full wizard.
 fn backend_key_from_choice(choice: usize) -> &'static str {
     selectable_memory_backends()
         .get(choice)
@@ -388,6 +406,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         response_cache_enabled: false,
         response_cache_ttl_minutes: 60,
         response_cache_max_entries: 5_000,
+        response_cache_hot_entries: 256,
         snapshot_enabled: false,
         snapshot_on_hygiene: false,
         auto_hydrate: true,
@@ -408,14 +427,14 @@ pub async fn run_quick_setup(
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
 
-    run_quick_setup_with_home(
+    Box::pin(run_quick_setup_with_home(
         credential_override,
         provider,
         model_override,
         memory_backend,
         force,
         &home,
-    )
+    ))
     .await
 }
 
@@ -423,7 +442,7 @@ fn resolve_quick_setup_dirs_with_home(home: &Path) -> (PathBuf, PathBuf) {
     if let Ok(custom_config_dir) = std::env::var("ZEROCLAW_CONFIG_DIR") {
         let trimmed = custom_config_dir.trim();
         if !trimmed.is_empty() {
-            let config_dir = PathBuf::from(trimmed);
+            let config_dir = PathBuf::from(shellexpand::tilde(trimmed).as_ref());
             return (config_dir.clone(), config_dir.join("workspace"));
         }
     }
@@ -431,8 +450,9 @@ fn resolve_quick_setup_dirs_with_home(home: &Path) -> (PathBuf, PathBuf) {
     if let Ok(custom_workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
         let trimmed = custom_workspace.trim();
         if !trimmed.is_empty() {
+            let expanded = shellexpand::tilde(trimmed);
             return crate::config::schema::resolve_config_dir_for_workspace(&PathBuf::from(
-                trimmed,
+                expanded.as_ref(),
             ));
         }
     }
@@ -487,14 +507,21 @@ async fn run_quick_setup_with_home(
             s
         }),
         api_url: None,
+        api_path: None,
         default_provider: Some(provider_name.clone()),
         default_model: Some(model.clone()),
         model_providers: std::collections::HashMap::new(),
         default_temperature: 0.7,
         provider_timeout_secs: 120,
+        extra_headers: std::collections::HashMap::new(),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
+        backup: crate::config::BackupConfig::default(),
+        data_retention: crate::config::DataRetentionConfig::default(),
+        cloud_ops: crate::config::CloudOpsConfig::default(),
+        conversational_ai: crate::config::ConversationalAiConfig::default(),
         security: crate::config::SecurityConfig::default(),
+        security_ops: crate::config::SecurityOpsConfig::default(),
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
@@ -510,22 +537,34 @@ async fn run_quick_setup_with_home(
         tunnel: crate::config::TunnelConfig::default(),
         gateway: crate::config::GatewayConfig::default(),
         composio: ComposioConfig::default(),
+        microsoft365: crate::config::Microsoft365Config::default(),
         secrets: SecretsConfig::default(),
         browser: BrowserConfig::default(),
+        browser_delegate: crate::tools::browser_delegate::BrowserDelegateConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
         multimodal: crate::config::MultimodalConfig::default(),
         web_fetch: crate::config::WebFetchConfig::default(),
         web_search: crate::config::WebSearchConfig::default(),
+        project_intel: crate::config::ProjectIntelConfig::default(),
+        google_workspace: crate::config::GoogleWorkspaceConfig::default(),
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
+        swarms: std::collections::HashMap::new(),
         hooks: crate::config::HooksConfig::default(),
         hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
         transcription: crate::config::TranscriptionConfig::default(),
         tts: crate::config::TtsConfig::default(),
+        mcp: crate::config::McpConfig::default(),
+        nodes: crate::config::NodesConfig::default(),
+        workspace: crate::config::WorkspaceConfig::default(),
+        notion: crate::config::NotionConfig::default(),
+        node_transport: crate::config::NodeTransportConfig::default(),
+        knowledge: crate::config::KnowledgeConfig::default(),
+        linkedin: crate::config::LinkedInConfig::default(),
     };
 
     config.save().await?;
@@ -2037,26 +2076,37 @@ fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<(
         return Ok(());
     }
 
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    #[cfg(test)]
+    {
         bail!(
-            "Refusing to overwrite existing config at {} in non-interactive mode. Re-run with --force if overwrite is intentional.",
+            "Refusing to overwrite existing config at {} in test mode. Re-run with --force if overwrite is intentional.",
             config_path.display()
         );
     }
 
-    let confirmed = Confirm::new()
-        .with_prompt(format!(
-            "  Existing config found at {}. Re-running onboarding will overwrite config.toml and may create missing workspace files (including BOOTSTRAP.md). Continue?",
-            config_path.display()
-        ))
-        .default(false)
-        .interact()?;
+    #[cfg(not(test))]
+    {
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            bail!(
+                "Refusing to overwrite existing config at {} in non-interactive mode. Re-run with --force if overwrite is intentional.",
+                config_path.display()
+            );
+        }
 
-    if !confirmed {
-        bail!("Onboarding canceled: existing configuration was left unchanged.");
+        let confirmed = Confirm::new()
+            .with_prompt(format!(
+                "  Existing config found at {}. Re-running onboarding will overwrite config.toml and may create missing workspace files (including BOOTSTRAP.md). Continue?",
+                config_path.display()
+            ))
+            .default(false)
+            .interact()?;
+
+        if !confirmed {
+            bail!("Onboarding canceled: existing configuration was left unchanged.");
+        }
+
+        Ok(())
     }
-
-    Ok(())
 }
 
 async fn persist_workspace_selection(config_path: &Path) -> Result<()> {
@@ -3857,6 +3907,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         Some(channel)
                     },
                     allowed_users,
+                    interrupt_on_new_message: false,
+                    mention_only: false,
                 });
             }
             ChannelMenuChoice::IMessage => {
@@ -4127,6 +4179,23 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .interact()?;
 
                 if mode_idx == 0 {
+                    // Compile-time check: warn early if the feature is not enabled.
+                    #[cfg(not(feature = "whatsapp-web"))]
+                    {
+                        println!();
+                        println!(
+                            "  {} {}",
+                            style("⚠").yellow().bold(),
+                            style("The 'whatsapp-web' feature is not compiled in. WhatsApp Web will not work at runtime.").yellow()
+                        );
+                        println!(
+                            "  {} Rebuild with: {}",
+                            style("→").dim(),
+                            style("cargo build --features whatsapp-web").white().bold()
+                        );
+                        println!();
+                    }
+
                     println!("  {}", style("Mode: WhatsApp Web").dim());
                     print_bullet("1. Build with --features whatsapp-web");
                     print_bullet(
@@ -4542,6 +4611,10 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 config.webhook = Some(WebhookConfig {
                     port: port.parse().unwrap_or(8080),
+                    listen_path: None,
+                    send_url: None,
+                    send_method: None,
+                    auth_header: None,
                     secret: if secret.is_empty() {
                         None
                     } else {
@@ -5849,14 +5922,14 @@ mod tests {
         let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
         let tmp = TempDir::new().unwrap();
 
-        let config = run_quick_setup_with_home(
+        let config = Box::pin(run_quick_setup_with_home(
             Some("sk-issue946"),
             Some("openrouter"),
             Some("custom-model-946"),
             Some("sqlite"),
             false,
             tmp.path(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -5876,14 +5949,14 @@ mod tests {
         let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
         let tmp = TempDir::new().unwrap();
 
-        let config = run_quick_setup_with_home(
+        let config = Box::pin(run_quick_setup_with_home(
             Some("sk-issue946"),
             Some("anthropic"),
             None,
             Some("sqlite"),
             false,
             tmp.path(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -5906,14 +5979,14 @@ mod tests {
             .await
             .unwrap();
 
-        let err = run_quick_setup_with_home(
+        let err = Box::pin(run_quick_setup_with_home(
             Some("sk-existing"),
             Some("openrouter"),
             Some("custom-model"),
             Some("sqlite"),
             false,
             tmp.path(),
-        )
+        ))
         .await
         .expect_err("quick setup should refuse overwrite without --force");
 
@@ -5939,14 +6012,14 @@ mod tests {
         .await
         .unwrap();
 
-        let config = run_quick_setup_with_home(
+        let config = Box::pin(run_quick_setup_with_home(
             Some("sk-force"),
             Some("openrouter"),
             Some("custom-model-fresh"),
             Some("sqlite"),
             true,
             tmp.path(),
-        )
+        ))
         .await
         .expect("quick setup should overwrite existing config with --force");
 
@@ -5973,14 +6046,14 @@ mod tests {
         );
         let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
 
-        let config = run_quick_setup_with_home(
+        let config = Box::pin(run_quick_setup_with_home(
             Some("sk-env"),
             Some("openrouter"),
             Some("model-env"),
             Some("sqlite"),
             false,
             tmp.path(),
-        )
+        ))
         .await
         .expect("quick setup should honor ZEROCLAW_WORKSPACE");
 

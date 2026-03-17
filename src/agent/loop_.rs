@@ -12,9 +12,11 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -30,6 +32,109 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+
+fn glob_match(pattern: &str, name: &str) -> bool {
+    match pattern.find('*') {
+        None => pattern == name,
+        Some(star) => {
+            let prefix = &pattern[..star];
+            let suffix = &pattern[star + 1..];
+            name.starts_with(prefix)
+                && name.ends_with(suffix)
+                && name.len() >= prefix.len() + suffix.len()
+        }
+    }
+}
+
+/// Returns the subset of `tool_specs` that should be sent to the LLM for this turn.
+///
+/// Rules (mirrors NullClaw `filterToolSpecsForTurn`):
+/// - Built-in tools (names that do not start with `"mcp_"`) always pass through.
+/// - When `groups` is empty, all tools pass through (backward compatible default).
+/// - An MCP tool is included if at least one group matches it:
+///   - `always` group: included unconditionally if any pattern matches the tool name.
+///   - `dynamic` group: included if any pattern matches AND the user message contains
+///     at least one keyword (case-insensitive substring).
+pub(crate) fn filter_tool_specs_for_turn(
+    tool_specs: Vec<crate::tools::ToolSpec>,
+    groups: &[crate::config::schema::ToolFilterGroup],
+    user_message: &str,
+) -> Vec<crate::tools::ToolSpec> {
+    use crate::config::schema::ToolFilterGroupMode;
+
+    if groups.is_empty() {
+        return tool_specs;
+    }
+
+    let msg_lower = user_message.to_ascii_lowercase();
+
+    tool_specs
+        .into_iter()
+        .filter(|spec| {
+            // Built-in tools always pass through.
+            if !spec.name.starts_with("mcp_") {
+                return true;
+            }
+            // MCP tool: include if any active group matches.
+            groups.iter().any(|group| {
+                let pattern_matches = group.tools.iter().any(|pat| glob_match(pat, &spec.name));
+                if !pattern_matches {
+                    return false;
+                }
+                match group.mode {
+                    ToolFilterGroupMode::Always => true,
+                    ToolFilterGroupMode::Dynamic => group
+                        .keywords
+                        .iter()
+                        .any(|kw| msg_lower.contains(&kw.to_ascii_lowercase())),
+                }
+            })
+        })
+        .collect()
+}
+
+/// Filters a tool spec list by an optional capability allowlist.
+///
+/// When `allowed` is `None`, all specs pass through unchanged.
+/// When `allowed` is `Some(list)`, only specs whose name appears in the list
+/// are retained. Unknown names in the allowlist are silently ignored.
+pub(crate) fn filter_by_allowed_tools(
+    specs: Vec<crate::tools::ToolSpec>,
+    allowed: Option<&[String]>,
+) -> Vec<crate::tools::ToolSpec> {
+    match allowed {
+        None => specs,
+        Some(list) => specs
+            .into_iter()
+            .filter(|spec| list.iter().any(|name| name == &spec.name))
+            .collect(),
+    }
+}
+
+/// Computes the list of MCP tool names that should be excluded for a given turn
+/// based on `tool_filter_groups` and the user message.
+///
+/// Returns an empty `Vec` when `groups` is empty (no filtering).
+fn compute_excluded_mcp_tools(
+    tools_registry: &[Box<dyn Tool>],
+    groups: &[crate::config::schema::ToolFilterGroup],
+    user_message: &str,
+) -> Vec<String> {
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let filtered_specs = filter_tool_specs_for_turn(
+        tools_registry.iter().map(|t| t.spec()).collect(),
+        groups,
+        user_message,
+    );
+    let included: HashSet<&str> = filtered_specs.iter().map(|s| s.name.as_str()).collect();
+    tools_registry
+        .iter()
+        .filter(|t| t.name().starts_with("mcp_") && !included.contains(t.name()))
+        .map(|t| t.name().to_string())
+        .collect()
+}
 
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
@@ -108,6 +213,18 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 /// Max characters retained in stored compaction summary.
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 
+/// Estimate token count for a message history using ~4 chars/token heuristic.
+/// Includes a small overhead per message for role/framing tokens.
+fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
+    history
+        .iter()
+        .map(|m| {
+            // ~4 chars per token + ~4 framing tokens per message (role, delimiters)
+            m.content.len().div_ceil(4) + 4
+        })
+        .sum()
+}
+
 /// Minimum interval between progress sends to avoid flooding the draft channel.
 pub(crate) const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
 
@@ -150,6 +267,15 @@ fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::V
 
 fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4())
+}
+
+fn memory_session_id_from_state_file(path: &Path) -> Option<String> {
+    let raw = path.to_string_lossy().trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+
+    Some(format!("cli:{raw}"))
 }
 
 /// Trim conversation history to prevent unbounded growth.
@@ -201,6 +327,7 @@ async fn auto_compact_history(
     provider: &dyn Provider,
     model: &str,
     max_history: usize,
+    max_context_tokens: usize,
 ) -> Result<bool> {
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
@@ -209,7 +336,10 @@ async fn auto_compact_history(
         history.len()
     };
 
-    if non_system_count <= max_history {
+    let estimated_tokens = estimate_history_tokens(history);
+
+    // Trigger compaction when either token budget OR message count is exceeded.
+    if estimated_tokens <= max_context_tokens && non_system_count <= max_history {
         return Ok(false);
     }
 
@@ -220,7 +350,16 @@ async fn auto_compact_history(
         return Ok(false);
     }
 
-    let compact_end = start + compact_count;
+    let mut compact_end = start + compact_count;
+
+    // Snap compact_end to a user-turn boundary so we don't split mid-conversation.
+    while compact_end > start && history.get(compact_end).map_or(false, |m| m.role != "user") {
+        compact_end -= 1;
+    }
+    if compact_end <= start {
+        return Ok(false);
+    }
+
     let to_compact: Vec<ChatMessage> = history[start..compact_end].to_vec();
     let transcript = build_compaction_transcript(&to_compact);
 
@@ -245,14 +384,60 @@ async fn auto_compact_history(
     Ok(true)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InteractiveSessionState {
+    version: u32,
+    history: Vec<ChatMessage>,
+}
+
+impl InteractiveSessionState {
+    fn from_history(history: &[ChatMessage]) -> Self {
+        Self {
+            version: 1,
+            history: history.to_vec(),
+        }
+    }
+}
+
+fn load_interactive_session_history(path: &Path, system_prompt: &str) -> Result<Vec<ChatMessage>> {
+    if !path.exists() {
+        return Ok(vec![ChatMessage::system(system_prompt)]);
+    }
+
+    let raw = std::fs::read_to_string(path)?;
+    let mut state: InteractiveSessionState = serde_json::from_str(&raw)?;
+    if state.history.is_empty() {
+        state.history.push(ChatMessage::system(system_prompt));
+    } else if state.history.first().map(|msg| msg.role.as_str()) != Some("system") {
+        state.history.insert(0, ChatMessage::system(system_prompt));
+    }
+
+    Ok(state.history)
+}
+
+fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(history))?;
+    std::fs::write(path, payload)?;
+    Ok(())
+}
+
 /// Build context preamble by searching memory for relevant entries.
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
-async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> String {
+async fn build_context(
+    mem: &dyn Memory,
+    user_msg: &str,
+    min_relevance_score: f64,
+    session_id: Option<&str>,
+) -> String {
     let mut context = String::new();
 
     // Pull relevant memories for this message
-    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+    if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
         let relevant: Vec<_> = entries
             .iter()
             .filter(|e| match e.score {
@@ -265,6 +450,15 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
             context.push_str("[Memory context]\n");
             for entry in &relevant {
                 if memory::is_assistant_autosave_key(&entry.key) {
+                    continue;
+                }
+                if memory::should_skip_autosave_content(&entry.content) {
+                    continue;
+                }
+                // Skip entries containing tool_result blocks — they can leak
+                // stale tool output from previous heartbeat ticks into new
+                // sessions, presenting the LLM with orphan tool_result data.
+                if entry.content.contains("<tool_result") {
                     continue;
                 }
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
@@ -1103,15 +1297,6 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
                     }
                 }
             }
-        }
-
-        // Plain URL
-        if let Some(command) = build_curl_command(line) {
-            calls.push((
-                "shell".to_string(),
-                serde_json::json!({ "command": command }),
-                Some(line.to_string()),
-            ));
         }
     }
 
@@ -1967,6 +2152,7 @@ pub(crate) async fn agent_turn(
         None,
         &[],
         &[],
+        None,
     )
     .await
 }
@@ -1975,24 +2161,24 @@ async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
     tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<ToolExecutionOutcome> {
-    let args_summary = {
-        let raw = call_arguments.to_string();
-        if raw.len() > 300 {
-            format!("{}…", &raw[..300])
-        } else {
-            raw
-        }
-    };
+    let args_summary = truncate_with_ellipsis(&call_arguments.to_string(), 300);
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
         arguments: Some(args_summary),
     });
     let start = Instant::now();
 
-    let Some(tool) = find_tool(tools_registry, call_name) else {
+    let static_tool = find_tool(tools_registry, call_name);
+    let activated_arc = if static_tool.is_none() {
+        activated_tools.and_then(|at| at.lock().unwrap().get(call_name))
+    } else {
+        None
+    };
+    let Some(tool) = static_tool.or(activated_arc.as_deref()) else {
         let reason = format!("Unknown tool: {call_name}");
         let duration = start.elapsed();
         observer.record_event(&ObserverEvent::ToolCall {
@@ -2090,6 +2276,7 @@ fn should_execute_tools_in_parallel(
 async fn execute_tools_parallel(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
@@ -2100,6 +2287,7 @@ async fn execute_tools_parallel(
                 &call.name,
                 call.arguments.clone(),
                 tools_registry,
+                activated_tools,
                 observer,
                 cancellation_token,
             )
@@ -2113,6 +2301,7 @@ async fn execute_tools_parallel(
 async fn execute_tools_sequential(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
@@ -2124,6 +2313,7 @@ async fn execute_tools_sequential(
                 &call.name,
                 call.arguments.clone(),
                 tools_registry,
+                activated_tools,
                 observer,
                 cancellation_token,
             )
@@ -2167,6 +2357,7 @@ pub(crate) async fn run_tool_call_loop(
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2174,12 +2365,6 @@ pub(crate) async fn run_tool_call_loop(
         max_tool_iterations
     };
 
-    let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
-        .iter()
-        .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
-        .map(|tool| tool.spec())
-        .collect();
-    let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
@@ -2190,6 +2375,21 @@ pub(crate) async fn run_tool_call_loop(
         {
             return Err(ToolLoopCancelled.into());
         }
+
+        // Rebuild tool_specs each iteration so newly activated deferred tools appear.
+        let mut tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
+            .iter()
+            .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
+            .map(|tool| tool.spec())
+            .collect();
+        if let Some(at) = activated_tools {
+            for spec in at.lock().unwrap().tool_specs() {
+                if !excluded_tools.iter().any(|ex| ex == &spec.name) {
+                    tool_specs.push(spec);
+                }
+            }
+        }
+        let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
         let image_marker_count = multimodal::count_image_markers(history);
         if image_marker_count > 0 && !provider.supports_vision() {
@@ -2508,6 +2708,15 @@ pub(crate) async fn run_tool_call_loop(
                                 "arguments": scrub_credentials(&tool_args.to_string()),
                             }),
                         );
+                        if let Some(ref tx) = on_delta {
+                            let _ = tx
+                                .send(format!(
+                                    "\u{274c} {}: {}\n",
+                                    call.name,
+                                    truncate_with_ellipsis(&scrub_credentials(&cancelled), 200)
+                                ))
+                                .await;
+                        }
                         ordered_results[idx] = Some((
                             call.name.clone(),
                             call.tool_call_id.clone(),
@@ -2535,11 +2744,13 @@ pub(crate) async fn run_tool_call_loop(
                         arguments: tool_args.clone(),
                     };
 
-                    // Only prompt interactively on CLI; auto-approve on other channels.
-                    let decision = if channel_name == "cli" {
-                        mgr.prompt_cli(&request)
+                    // Interactive CLI: prompt the operator.
+                    // Non-interactive (channels): auto-deny since no operator
+                    // is present to approve.
+                    let decision = if mgr.is_non_interactive() {
+                        ApprovalResponse::No
                     } else {
-                        ApprovalResponse::Yes
+                        mgr.prompt_cli(&request)
                     };
 
                     mgr.record_decision(&tool_name, &tool_args, decision, channel_name);
@@ -2560,6 +2771,11 @@ pub(crate) async fn run_tool_call_loop(
                                 "arguments": scrub_credentials(&tool_args.to_string()),
                             }),
                         );
+                        if let Some(ref tx) = on_delta {
+                            let _ = tx
+                                .send(format!("\u{274c} {}: {}\n", tool_name, denied))
+                                .await;
+                        }
                         ordered_results[idx] = Some((
                             tool_name.clone(),
                             call.tool_call_id.clone(),
@@ -2596,6 +2812,11 @@ pub(crate) async fn run_tool_call_loop(
                         "deduplicated": true,
                     }),
                 );
+                if let Some(ref tx) = on_delta {
+                    let _ = tx
+                        .send(format!("\u{274c} {}: {}\n", tool_name, duplicate))
+                        .await;
+                }
                 ordered_results[idx] = Some((
                     tool_name.clone(),
                     call.tool_call_id.clone(),
@@ -2648,6 +2869,7 @@ pub(crate) async fn run_tool_call_loop(
             execute_tools_parallel(
                 &executable_calls,
                 tools_registry,
+                activated_tools,
                 observer,
                 cancellation_token.as_ref(),
             )
@@ -2656,6 +2878,7 @@ pub(crate) async fn run_tool_call_loop(
             execute_tools_sequential(
                 &executable_calls,
                 tools_registry,
+                activated_tools,
                 observer,
                 cancellation_token.as_ref(),
             )
@@ -2698,13 +2921,19 @@ pub(crate) async fn run_tool_call_loop(
             // ── Progress: tool completion ───────────────────────
             if let Some(ref tx) = on_delta {
                 let secs = outcome.duration.as_secs();
-                let icon = if outcome.success {
-                    "\u{2705}"
+                let progress_msg = if outcome.success {
+                    format!("\u{2705} {} ({secs}s)\n", call.name)
+                } else if let Some(ref reason) = outcome.error_reason {
+                    format!(
+                        "\u{274c} {} ({secs}s): {}\n",
+                        call.name,
+                        truncate_with_ellipsis(reason, 200)
+                    )
                 } else {
-                    "\u{274c}"
+                    format!("\u{274c} {} ({secs}s)\n", call.name)
                 };
                 tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
-                let _ = tx.send(format!("{icon} {} ({secs}s)\n", call.name)).await;
+                let _ = tx.send(progress_msg).await;
             }
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
@@ -2814,6 +3043,8 @@ pub async fn run(
     temperature: f64,
     peripheral_overrides: Vec<String>,
     interactive: bool,
+    session_state_file: Option<PathBuf>,
+    allowed_tools: Option<Vec<String>>,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -2826,8 +3057,9 @@ pub async fn run(
     ));
 
     // ── Memory (the brain) ────────────────────────────────────────
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
         &config.memory,
+        &config.embedding_routes,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
@@ -2851,7 +3083,7 @@ pub async fn run(
     } else {
         (None, None)
     };
-    let mut tools_registry = tools::all_tools_with_runtime(
+    let (mut tools_registry, delegate_handle) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -2874,6 +3106,94 @@ pub async fn run(
         tools_registry.extend(peripheral_tools);
     }
 
+    // ── Capability-based tool access control ─────────────────────
+    // When `allowed_tools` is `Some(list)`, restrict the tool registry to only
+    // those tools whose name appears in the list. Unknown names are silently
+    // ignored. When `None`, all tools remain available (backward compatible).
+    if let Some(ref allow_list) = allowed_tools {
+        tools_registry.retain(|t| allow_list.iter().any(|name| name == t.name()));
+        tracing::info!(
+            allowed = allow_list.len(),
+            retained = tools_registry.len(),
+            "Applied capability-based tool access filter"
+        );
+    }
+
+    // ── Wire MCP tools (non-fatal) — CLI path ────────────────────
+    // NOTE: MCP tools are injected after built-in tool filtering
+    // (filter_primary_agent_tools_or_fail / agent.allowed_tools / agent.denied_tools).
+    // MCP servers are user-declared external integrations; the built-in allow/deny
+    // filter is not appropriate for them and would silently drop all MCP tools when
+    // a restrictive allowlist is configured. Keep this block after any such filter call.
+    //
+    // When `deferred_loading` is enabled, MCP tools are NOT added to the registry
+    // eagerly. Instead, a `tool_search` built-in is registered so the LLM can
+    // fetch schemas on demand. This reduces context window waste.
+    let mut deferred_section = String::new();
+    let mut activated_handle: Option<
+        std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
+    > = None;
+    if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        tracing::info!(
+            "Initializing MCP client — {} server(s) configured",
+            config.mcp.servers.len()
+        );
+        match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
+            Ok(registry) => {
+                let registry = std::sync::Arc::new(registry);
+                if config.mcp.deferred_loading {
+                    // Deferred path: build stubs and register tool_search
+                    let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
+                        std::sync::Arc::clone(&registry),
+                    )
+                    .await;
+                    tracing::info!(
+                        "MCP deferred: {} tool stub(s) from {} server(s)",
+                        deferred_set.len(),
+                        registry.server_count()
+                    );
+                    deferred_section =
+                        crate::tools::mcp_deferred::build_deferred_tools_section(&deferred_set);
+                    let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::tools::ActivatedToolSet::new(),
+                    ));
+                    activated_handle = Some(std::sync::Arc::clone(&activated));
+                    tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
+                        deferred_set,
+                        activated,
+                    )));
+                } else {
+                    // Eager path: register all MCP tools directly
+                    let names = registry.tool_names();
+                    let mut registered = 0usize;
+                    for name in names {
+                        if let Some(def) = registry.get_tool_def(&name).await {
+                            let wrapper: std::sync::Arc<dyn Tool> =
+                                std::sync::Arc::new(crate::tools::McpToolWrapper::new(
+                                    name,
+                                    def,
+                                    std::sync::Arc::clone(&registry),
+                                ));
+                            if let Some(ref handle) = delegate_handle {
+                                handle.write().push(std::sync::Arc::clone(&wrapper));
+                            }
+                            tools_registry.push(Box::new(crate::tools::ArcToolRef(wrapper)));
+                            registered += 1;
+                        }
+                    }
+                    tracing::info!(
+                        "MCP: {} tool(s) registered from {} server(s)",
+                        registered,
+                        registry.server_count()
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!("MCP registry failed to initialize: {e:#}");
+            }
+        }
+    }
+
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
         .as_deref()
@@ -2891,7 +3211,10 @@ pub async fn run(
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        reasoning_effort: config.runtime.reasoning_effort.clone(),
         provider_timeout_secs: Some(config.provider_timeout_secs),
+        extra_headers: config.extra_headers.clone(),
+        api_path: config.api_path.clone(),
     };
 
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
@@ -3061,6 +3384,12 @@ pub async fn run(
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
+    // Append deferred MCP tool names so the LLM knows what is available
+    if !deferred_section.is_empty() {
+        system_prompt.push('\n');
+        system_prompt.push_str(&deferred_section);
+    }
+
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = if interactive {
         Some(ApprovalManager::from_config(&config.autonomy))
@@ -3068,6 +3397,9 @@ pub async fn run(
         None
     };
     let channel_name = if interactive { "cli" } else { "daemon" };
+    let memory_session_id = session_state_file
+        .as_deref()
+        .and_then(memory_session_id_from_state_file);
 
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
@@ -3076,16 +3408,29 @@ pub async fn run(
 
     if let Some(msg) = message {
         // Auto-save user message to memory (skip short/trivial messages)
-        if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+        if config.memory.auto_save
+            && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+            && !memory::should_skip_autosave_content(&msg)
+        {
             let user_key = autosave_memory_key("user_msg");
             let _ = mem
-                .store(&user_key, &msg, MemoryCategory::Conversation, None)
+                .store(
+                    &user_key,
+                    &msg,
+                    MemoryCategory::Conversation,
+                    memory_session_id.as_deref(),
+                )
                 .await;
         }
 
         // Inject memory + hardware RAG context into user message
-        let mem_context =
-            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
+        let mem_context = build_context(
+            mem.as_ref(),
+            &msg,
+            config.memory.min_relevance_score,
+            memory_session_id.as_deref(),
+        )
+        .await;
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
@@ -3104,6 +3449,10 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
+        // Compute per-turn excluded MCP tools from tool_filter_groups.
+        let excluded_tools =
+            compute_excluded_mcp_tools(&tools_registry, &config.agent.tool_filter_groups, &msg);
+
         let response = run_tool_call_loop(
             provider.as_ref(),
             &mut history,
@@ -3120,8 +3469,9 @@ pub async fn run(
             None,
             None,
             None,
-            &[],
+            &excluded_tools,
             &config.agent.tool_call_dedup_exempt,
+            activated_handle.as_ref(),
         )
         .await?;
         final_output = response.clone();
@@ -3133,7 +3483,11 @@ pub async fn run(
         let cli = crate::channels::CliChannel::new();
 
         // Persistent conversation history across turns
-        let mut history = vec![ChatMessage::system(&system_prompt)];
+        let mut history = if let Some(path) = session_state_file.as_deref() {
+            load_interactive_session_history(path, &system_prompt)?
+        } else {
+            vec![ChatMessage::system(&system_prompt)]
+        };
 
         loop {
             print!("> ");
@@ -3207,22 +3561,38 @@ pub async fn run(
                     } else {
                         println!("Conversation cleared.\n");
                     }
+                    if let Some(path) = session_state_file.as_deref() {
+                        save_interactive_session_history(path, &history)?;
+                    }
                     continue;
                 }
                 _ => {}
             }
 
             // Auto-save conversation turns (skip short/trivial messages)
-            if config.memory.auto_save && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+            if config.memory.auto_save
+                && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+                && !memory::should_skip_autosave_content(&user_input)
+            {
                 let user_key = autosave_memory_key("user_msg");
                 let _ = mem
-                    .store(&user_key, &user_input, MemoryCategory::Conversation, None)
+                    .store(
+                        &user_key,
+                        &user_input,
+                        MemoryCategory::Conversation,
+                        memory_session_id.as_deref(),
+                    )
                     .await;
             }
 
             // Inject memory + hardware RAG context into user message
-            let mem_context =
-                build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
+            let mem_context = build_context(
+                mem.as_ref(),
+                &user_input,
+                config.memory.min_relevance_score,
+                memory_session_id.as_deref(),
+            )
+            .await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
@@ -3237,6 +3607,13 @@ pub async fn run(
             };
 
             history.push(ChatMessage::user(&enriched));
+
+            // Compute per-turn excluded MCP tools from tool_filter_groups.
+            let excluded_tools = compute_excluded_mcp_tools(
+                &tools_registry,
+                &config.agent.tool_filter_groups,
+                &user_input,
+            );
 
             let response = match run_tool_call_loop(
                 provider.as_ref(),
@@ -3254,8 +3631,9 @@ pub async fn run(
                 None,
                 None,
                 None,
-                &[],
+                &excluded_tools,
                 &config.agent.tool_call_dedup_exempt,
+                activated_handle.as_ref(),
             )
             .await
             {
@@ -3282,6 +3660,7 @@ pub async fn run(
                 provider.as_ref(),
                 model_name,
                 config.agent.max_history_messages,
+                config.agent.max_context_tokens,
             )
             .await
             {
@@ -3292,6 +3671,10 @@ pub async fn run(
 
             // Hard cap as a safety net.
             trim_history(&mut history, config.agent.max_history_messages);
+
+            if let Some(path) = session_state_file.as_deref() {
+                save_interactive_session_history(path, &history)?;
+            }
         }
     }
 
@@ -3309,7 +3692,11 @@ pub async fn run(
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
-pub async fn process_message(config: Config, message: &str) -> Result<String> {
+pub async fn process_message(
+    config: Config,
+    message: &str,
+    session_id: Option<&str>,
+) -> Result<String> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -3318,8 +3705,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.autonomy,
         &config.workspace_dir,
     ));
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
         &config.memory,
+        &config.embedding_routes,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
@@ -3333,7 +3721,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         (None, None)
     };
-    let mut tools_registry = tools::all_tools_with_runtime(
+    let (mut tools_registry, delegate_handle_pm) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -3352,6 +3740,47 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
 
+    // ── Wire MCP tools (non-fatal) — process_message path ────────
+    // NOTE: Same ordering contract as the CLI path above — MCP tools must be
+    // injected after filter_primary_agent_tools_or_fail (or equivalent built-in
+    // tool allow/deny filtering) to avoid MCP tools being silently dropped.
+    if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        tracing::info!(
+            "Initializing MCP client — {} server(s) configured",
+            config.mcp.servers.len()
+        );
+        match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
+            Ok(registry) => {
+                let registry = std::sync::Arc::new(registry);
+                let names = registry.tool_names();
+                let mut registered = 0usize;
+                for name in names {
+                    if let Some(def) = registry.get_tool_def(&name).await {
+                        let wrapper: std::sync::Arc<dyn Tool> =
+                            std::sync::Arc::new(crate::tools::McpToolWrapper::new(
+                                name,
+                                def,
+                                std::sync::Arc::clone(&registry),
+                            ));
+                        if let Some(ref handle) = delegate_handle_pm {
+                            handle.write().push(std::sync::Arc::clone(&wrapper));
+                        }
+                        tools_registry.push(Box::new(crate::tools::ArcToolRef(wrapper)));
+                        registered += 1;
+                    }
+                }
+                tracing::info!(
+                    "MCP: {} tool(s) registered from {} server(s)",
+                    registered,
+                    registry.server_count()
+                );
+            }
+            Err(e) => {
+                tracing::error!("MCP registry failed to initialize: {e:#}");
+            }
+        }
+    }
+
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config
         .default_model
@@ -3363,7 +3792,10 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        reasoning_effort: config.runtime.reasoning_effort.clone(),
         provider_timeout_secs: Some(config.provider_timeout_secs),
+        extra_headers: config.extra_headers.clone(),
+        api_path: config.api_path.clone(),
     };
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,
@@ -3458,7 +3890,13 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
-    let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
+    let mem_context = build_context(
+        mem.as_ref(),
+        message,
+        config.memory.min_relevance_score,
+        session_id,
+    )
+    .await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
     let hw_context = hardware_rag
         .as_ref()
@@ -3494,6 +3932,50 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        apply_compaction_summary, build_compaction_transcript, load_interactive_session_history,
+        save_interactive_session_history, InteractiveSessionState,
+    };
+    use crate::providers::ChatMessage;
+    use tempfile::tempdir;
+
+    #[test]
+    fn interactive_session_state_round_trips_history() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+        ];
+
+        save_interactive_session_history(&path, &history).unwrap();
+        let restored = load_interactive_session_history(&path, "fallback").unwrap();
+
+        assert_eq!(restored.len(), 3);
+        assert_eq!(restored[0].role, "system");
+        assert_eq!(restored[1].content, "hello");
+        assert_eq!(restored[2].content, "hi");
+    }
+
+    #[test]
+    fn interactive_session_state_adds_missing_system_prompt() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let payload = serde_json::to_string_pretty(&InteractiveSessionState {
+            version: 1,
+            history: vec![ChatMessage::user("orphan")],
+        })
+        .unwrap();
+        std::fs::write(&path, payload).unwrap();
+
+        let restored = load_interactive_session_history(&path, "fallback system").unwrap();
+
+        assert_eq!(restored[0].role, "system");
+        assert_eq!(restored[0].content, "fallback system");
+        assert_eq!(restored[1].content, "orphan");
+    }
+
     use super::*;
     use async_trait::async_trait;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -3503,7 +3985,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn test_scrub_credentials() {
+    fn scrub_credentials_redacts_bearer_token() {
         let input = "API_KEY=sk-1234567890abcdef; token: 1234567890; password=\"secret123456\"";
         let scrubbed = scrub_credentials(input);
         assert!(scrubbed.contains("API_KEY=sk-1*[REDACTED]"));
@@ -3514,12 +3996,33 @@ mod tests {
     }
 
     #[test]
-    fn test_scrub_credentials_json() {
+    fn scrub_credentials_redacts_json_api_key() {
         let input = r#"{"api_key": "sk-1234567890", "other": "public"}"#;
         let scrubbed = scrub_credentials(input);
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
         assert!(scrubbed.contains("public"));
     }
+
+    #[tokio::test]
+    async fn execute_one_tool_does_not_panic_on_utf8_boundary() {
+        let call_arguments = (0..600)
+            .map(|n| serde_json::json!({ "content": format!("{}：tail", "a".repeat(n)) }))
+            .find(|args| {
+                let raw = args.to_string();
+                raw.len() > 300 && !raw.is_char_boundary(300)
+            })
+            .expect("should produce a sample whose byte index 300 is not a char boundary");
+
+        let observer = NoopObserver;
+        let result =
+            execute_one_tool("unknown_tool", call_arguments, &[], None, &observer, None).await;
+        assert!(result.is_ok(), "execute_one_tool should not panic or error");
+
+        let outcome = result.unwrap();
+        assert!(!outcome.success);
+        assert!(outcome.output.contains("Unknown tool: unknown_tool"));
+    }
+
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::traits::ProviderCapabilities;
@@ -3554,6 +4057,7 @@ mod tests {
             ProviderCapabilities {
                 native_tool_calling: false,
                 vision: true,
+                prompt_caching: false,
             }
         }
 
@@ -3771,6 +4275,52 @@ mod tests {
         }
     }
 
+    /// A tool that always returns a failure with a given error reason.
+    struct FailingTool {
+        tool_name: String,
+        error_reason: String,
+    }
+
+    impl FailingTool {
+        fn new(name: &str, error_reason: &str) -> Self {
+            Self {
+                tool_name: name.to_string(),
+                error_reason: error_reason.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for FailingTool {
+        fn name(&self) -> &str {
+            &self.tool_name
+        }
+
+        fn description(&self) -> &str {
+            "A tool that always fails for testing failure surfacing"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(self.error_reason.clone()),
+            })
+        }
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -3802,6 +4352,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3849,6 +4400,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3890,6 +4442,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -4017,6 +4570,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -4087,6 +4641,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4149,6 +4704,7 @@ mod tests {
             None,
             &[],
             &exempt,
+            None,
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -4226,6 +4782,7 @@ mod tests {
             None,
             &[],
             &exempt,
+            None,
         )
         .await
         .expect("loop should complete");
@@ -4280,6 +4837,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -5020,7 +5578,7 @@ Tail"#;
         .await
         .unwrap();
 
-        let context = build_context(&mem, "status updates", 0.0).await;
+        let context = build_context(&mem, "status updates", 0.0, None).await;
         assert!(context.contains("user_msg_real"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));
@@ -5446,12 +6004,15 @@ Final answer."#;
     }
 
     #[test]
-    fn parse_glm_style_plain_url() {
+    fn parse_glm_style_ignores_plain_url() {
+        // A bare URL should NOT be interpreted as a tool call — this was
+        // causing false positives when LLMs included URLs in normal text.
         let response = "https://example.com/api";
         let calls = parse_glm_style_tool_calls(response);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "shell");
-        assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
+        assert!(
+            calls.is_empty(),
+            "plain URL must not be parsed as tool call"
+        );
     }
 
     #[test]
@@ -5991,5 +6552,269 @@ Let me check the result."#;
         let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert!(parsed.get("reasoning_content").is_none());
+    }
+
+    // ── glob_match tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn glob_match_exact_no_wildcard() {
+        assert!(glob_match("mcp_browser_navigate", "mcp_browser_navigate"));
+        assert!(!glob_match("mcp_browser_navigate", "mcp_browser_click"));
+    }
+
+    #[test]
+    fn glob_match_prefix_wildcard() {
+        // Suffix pattern: mcp_browser_*
+        assert!(glob_match("mcp_browser_*", "mcp_browser_navigate"));
+        assert!(glob_match("mcp_browser_*", "mcp_browser_click"));
+        assert!(!glob_match("mcp_browser_*", "mcp_filesystem_read"));
+
+        // Prefix pattern: *_read
+        assert!(glob_match("*_read", "mcp_filesystem_read"));
+        assert!(!glob_match("*_read", "mcp_filesystem_write"));
+
+        // Infix: mcp_*_navigate
+        assert!(glob_match("mcp_*_navigate", "mcp_browser_navigate"));
+        assert!(!glob_match("mcp_*_navigate", "mcp_browser_click"));
+    }
+
+    #[test]
+    fn glob_match_star_matches_everything() {
+        assert!(glob_match("*", "anything_at_all"));
+        assert!(glob_match("*", ""));
+    }
+
+    // ── filter_tool_specs_for_turn tests ──────────────────────────────────────
+
+    fn make_spec(name: &str) -> crate::tools::ToolSpec {
+        crate::tools::ToolSpec {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn filter_tool_specs_no_groups_returns_all() {
+        let specs = vec![
+            make_spec("shell_exec"),
+            make_spec("mcp_browser_navigate"),
+            make_spec("mcp_filesystem_read"),
+        ];
+        let result = filter_tool_specs_for_turn(specs, &[], "hello");
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn filter_tool_specs_always_group_includes_matching_mcp_tool() {
+        use crate::config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let specs = vec![
+            make_spec("shell_exec"),
+            make_spec("mcp_browser_navigate"),
+            make_spec("mcp_filesystem_read"),
+        ];
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Always,
+            tools: vec!["mcp_filesystem_*".into()],
+            keywords: vec![],
+        }];
+        let result = filter_tool_specs_for_turn(specs, &groups, "anything");
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        // Built-in passes through, matched MCP passes, unmatched MCP excluded.
+        assert!(names.contains(&"shell_exec"));
+        assert!(names.contains(&"mcp_filesystem_read"));
+        assert!(!names.contains(&"mcp_browser_navigate"));
+    }
+
+    #[test]
+    fn filter_tool_specs_dynamic_group_included_on_keyword_match() {
+        use crate::config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let specs = vec![make_spec("shell_exec"), make_spec("mcp_browser_navigate")];
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Dynamic,
+            tools: vec!["mcp_browser_*".into()],
+            keywords: vec!["browse".into(), "website".into()],
+        }];
+        let result = filter_tool_specs_for_turn(specs, &groups, "please browse this page");
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"shell_exec"));
+        assert!(names.contains(&"mcp_browser_navigate"));
+    }
+
+    #[test]
+    fn filter_tool_specs_dynamic_group_excluded_on_no_keyword_match() {
+        use crate::config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let specs = vec![make_spec("shell_exec"), make_spec("mcp_browser_navigate")];
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Dynamic,
+            tools: vec!["mcp_browser_*".into()],
+            keywords: vec!["browse".into(), "website".into()],
+        }];
+        let result = filter_tool_specs_for_turn(specs, &groups, "read the file /etc/hosts");
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"shell_exec"));
+        assert!(!names.contains(&"mcp_browser_navigate"));
+    }
+
+    #[test]
+    fn filter_tool_specs_dynamic_keyword_match_is_case_insensitive() {
+        use crate::config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let specs = vec![make_spec("mcp_browser_navigate")];
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Dynamic,
+            tools: vec!["mcp_browser_*".into()],
+            keywords: vec!["Browse".into()],
+        }];
+        let result = filter_tool_specs_for_turn(specs, &groups, "BROWSE the site");
+        assert_eq!(result.len(), 1);
+    }
+
+    // ── Token-based compaction tests ──────────────────────────
+
+    #[test]
+    fn estimate_history_tokens_empty() {
+        assert_eq!(super::estimate_history_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn estimate_history_tokens_single_message() {
+        let history = vec![ChatMessage::user("hello world")]; // 11 chars
+        let tokens = super::estimate_history_tokens(&history);
+        // 11.div_ceil(4) + 4 = 3 + 4 = 7
+        assert_eq!(tokens, 7);
+    }
+
+    #[test]
+    fn estimate_history_tokens_multiple_messages() {
+        let history = vec![
+            ChatMessage::system("You are helpful."), // 16 chars → 4 + 4 = 8
+            ChatMessage::user("What is Rust?"),      // 13 chars → 4 + 4 = 8
+            ChatMessage::assistant("A language."),   // 11 chars → 3 + 4 = 7
+        ];
+        let tokens = super::estimate_history_tokens(&history);
+        assert_eq!(tokens, 23);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_surfaces_tool_failure_reason_in_on_delta() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"failing_shell","arguments":{"command":"rm -rf /"}}
+</tool_call>"#,
+            "I could not execute that command.",
+        ]);
+
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(FailingTool::new(
+            "failing_shell",
+            "Command not allowed by security policy: rm -rf /",
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("delete everything"),
+        ];
+        let observer = NoopObserver;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+        )
+        .await
+        .expect("tool loop should complete");
+
+        // Collect all messages sent to the on_delta channel.
+        let mut deltas = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            deltas.push(msg);
+        }
+
+        let all_deltas = deltas.join("");
+
+        // The failure reason should appear in the progress messages.
+        assert!(
+            all_deltas.contains("Command not allowed by security policy"),
+            "on_delta messages should include the tool failure reason, got: {all_deltas}"
+        );
+
+        // Should also contain the cross mark (❌) icon to indicate failure.
+        assert!(
+            all_deltas.contains('\u{274c}'),
+            "on_delta messages should include ❌ for failed tool calls, got: {all_deltas}"
+        );
+
+        assert_eq!(result, "I could not execute that command.");
+    }
+
+    // ── filter_by_allowed_tools tests ─────────────────────────────────────
+
+    #[test]
+    fn filter_by_allowed_tools_none_passes_all() {
+        let specs = vec![
+            make_spec("shell"),
+            make_spec("memory_store"),
+            make_spec("file_read"),
+        ];
+        let result = filter_by_allowed_tools(specs, None);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn filter_by_allowed_tools_some_restricts_to_listed() {
+        let specs = vec![
+            make_spec("shell"),
+            make_spec("memory_store"),
+            make_spec("file_read"),
+        ];
+        let allowed = vec!["shell".to_string(), "memory_store".to_string()];
+        let result = filter_by_allowed_tools(specs, Some(&allowed));
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"shell"));
+        assert!(names.contains(&"memory_store"));
+        assert!(!names.contains(&"file_read"));
+    }
+
+    #[test]
+    fn filter_by_allowed_tools_unknown_names_silently_ignored() {
+        let specs = vec![make_spec("shell"), make_spec("file_read")];
+        let allowed = vec![
+            "shell".to_string(),
+            "nonexistent_tool".to_string(),
+            "another_missing".to_string(),
+        ];
+        let result = filter_by_allowed_tools(specs, Some(&allowed));
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names.len(), 1);
+        assert!(names.contains(&"shell"));
+    }
+
+    #[test]
+    fn filter_by_allowed_tools_empty_list_excludes_all() {
+        let specs = vec![make_spec("shell"), make_spec("file_read")];
+        let allowed: Vec<String> = vec![];
+        let result = filter_by_allowed_tools(specs, Some(&allowed));
+        assert!(result.is_empty());
     }
 }

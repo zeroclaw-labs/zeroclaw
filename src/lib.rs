@@ -48,6 +48,7 @@ pub(crate) mod cron;
 pub(crate) mod daemon;
 pub(crate) mod doctor;
 pub mod gateway;
+pub mod hands;
 pub(crate) mod hardware;
 pub(crate) mod health;
 pub(crate) mod heartbeat;
@@ -57,6 +58,7 @@ pub(crate) mod integrations;
 pub mod memory;
 pub(crate) mod migration;
 pub(crate) mod multimodal;
+pub mod nodes;
 pub mod observability;
 pub(crate) mod onboard;
 pub mod peripherals;
@@ -280,15 +282,19 @@ Times are evaluated in UTC by default; use --tz with an IANA \
 timezone name to override.
 
 Examples:
-  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
-  zeroclaw cron add '*/30 * * * *' 'Check system health'")]
+  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
+  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
+  zeroclaw cron add '*/5 * * * *' 'echo ok'")]
     Add {
         /// Cron expression
         expression: String,
         /// Optional IANA timezone (e.g. America/Los_Angeles)
         #[arg(long)]
         tz: Option<String>,
-        /// Command to run
+        /// Treat the argument as an agent prompt instead of a shell command
+        #[arg(long)]
+        agent: bool,
+        /// Command (shell) or prompt (agent) to run
         command: String,
     },
     /// Add a one-shot scheduled task at an RFC3339 timestamp
@@ -303,7 +309,10 @@ Examples:
     AddAt {
         /// One-shot timestamp in RFC3339 format
         at: String,
-        /// Command to run
+        /// Treat the argument as an agent prompt instead of a shell command
+        #[arg(long)]
+        agent: bool,
+        /// Command (shell) or prompt (agent) to run
         command: String,
     },
     /// Add a fixed-interval scheduled task
@@ -318,7 +327,10 @@ Examples:
     AddEvery {
         /// Interval in milliseconds
         every_ms: u64,
-        /// Command to run
+        /// Treat the argument as an agent prompt instead of a shell command
+        #[arg(long)]
+        agent: bool,
+        /// Command (shell) or prompt (agent) to run
         command: String,
     },
     /// Add a one-shot delayed task (e.g. "30m", "2h", "1d")
@@ -335,7 +347,10 @@ Examples:
     Once {
         /// Delay duration
         delay: String,
-        /// Command to run
+        /// Treat the argument as an agent prompt instead of a shell command
+        #[arg(long)]
+        agent: bool,
+        /// Command (shell) or prompt (agent) to run
         command: String,
     },
     /// Remove a scheduled task

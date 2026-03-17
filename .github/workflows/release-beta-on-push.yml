@@ -5,8 +5,8 @@ on:
     branches: [master]
 
 concurrency:
-  group: release
-  cancel-in-progress: false
+  group: release-beta
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -37,6 +37,96 @@ jobs:
           echo "tag=${beta_tag}" >> "$GITHUB_OUTPUT"
           echo "Beta release: ${beta_tag}"
 
+  release-notes:
+    name: Generate Release Notes
+    runs-on: ubuntu-latest
+    outputs:
+      notes: ${{ steps.notes.outputs.body }}
+      features: ${{ steps.notes.outputs.features }}
+      contributors: ${{ steps.notes.outputs.contributors }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Build release notes
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Use a wider range — find the previous stable tag to capture all
+          # contributors across the full release cycle, not just one beta bump
+          PREV_TAG=$(git tag --sort=-creatordate \
+            | grep -vE '\-beta\.' \
+            | head -1 || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="${PREV_TAG}..HEAD"
+          fi
+
+          # Extract features only (feat commits) — skip bug fixes for clean notes
+          FEATURES=$(git log "$RANGE" --pretty=format:"%s" --no-merges \
+            | grep -iE '^feat(\(|:)' \
+            | sed 's/^feat(\([^)]*\)): /\1: /' \
+            | sed 's/^feat: //' \
+            | sed 's/ (#[0-9]*)$//' \
+            | sort -uf \
+            | while IFS= read -r line; do echo "- ${line}"; done || true)
+
+          if [ -z "$FEATURES" ]; then
+            FEATURES="- Incremental improvements and polish"
+          fi
+
+          # Collect ALL unique contributors: git authors + Co-Authored-By
+          GIT_AUTHORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges | sort -uf || true)
+          CO_AUTHORS=$(git log "$RANGE" --pretty=format:"%b" --no-merges \
+            | grep -ioE 'Co-Authored-By: *[^<]+' \
+            | sed 's/Co-Authored-By: *//i' \
+            | sed 's/ *$//' \
+            | sort -uf || true)
+
+          # Merge, deduplicate, and filter out bots
+          ALL_CONTRIBUTORS=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
+            | sort -uf \
+            | grep -v '^$' \
+            | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^ZeroClaw Bot|^ZeroClaw Runner|^ZeroClaw Agent|^blacksmith' \
+            | while IFS= read -r name; do echo "- ${name}"; done || true)
+
+          # Build release body
+          BODY=$(cat <<NOTES_EOF
+          ## What's New
+
+          ${FEATURES}
+
+          ## Contributors
+
+          ${ALL_CONTRIBUTORS}
+
+          ---
+          *Full changelog: ${PREV_TAG}...HEAD*
+          NOTES_EOF
+          )
+
+          # Output multiline values
+          {
+            echo "body<<BODY_EOF"
+            echo "$BODY"
+            echo "BODY_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "features<<FEAT_EOF"
+            echo "$FEATURES"
+            echo "FEAT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "contributors<<CONTRIB_EOF"
+            echo "$ALL_CONTRIBUTORS"
+            echo "CONTRIB_EOF"
+          } >> "$GITHUB_OUTPUT"
+
   web:
     name: Build Web Dashboard
     runs-on: ubuntu-latest
@@ -65,11 +155,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Use ubuntu-22.04 for Linux builds to link against glibc 2.35,
+          # ensuring compatibility with Ubuntu 22.04+ (#3573).
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: zeroclaw
             ext: tar.gz
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             artifact: zeroclaw
             ext: tar.gz
@@ -80,6 +172,11 @@ jobs:
             target: aarch64-apple-darwin
             artifact: zeroclaw
             ext: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+            artifact: zeroclaw
+            ext: tar.gz
+            ndk: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: zeroclaw.exe
@@ -92,6 +189,8 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         if: runner.os != 'Windows'
+        with:
+          prefix-key: ${{ matrix.os }}-${{ matrix.target }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -103,6 +202,10 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ${{ matrix.cross_compiler }}
+
+      - name: Setup Android NDK
+        if: matrix.ndk
+        run: echo "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
 
       - name: Build release
         shell: bash
@@ -132,7 +235,7 @@ jobs:
 
   publish:
     name: Publish Beta Release
-    needs: [version, build]
+    needs: [version, release-notes, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -148,25 +251,85 @@ jobs:
           find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec sha256sum {} + | sed 's|  \./[^/]*/|  |' > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe # v2.4.2
-        with:
-          tag_name: ${{ needs.version.outputs.tag }}
-          name: ${{ needs.version.outputs.tag }}
-          prerelease: true
-          generate_release_notes: true
-          files: |
-            artifacts/**/*
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name 'SHA256SUMS' \) -exec cp {} release-assets/ \;
+          cp install.sh release-assets/
+          echo "--- Assets ---"
+          ls -lh release-assets/
+
+      - name: Write release notes
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NOTES: ${{ needs.release-notes.outputs.notes }}
+        run: printf '%s\n' "$NOTES" > release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" release-assets/* \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --notes-file release-notes.md \
+            --prerelease
+
+  redeploy-website:
+    name: Trigger Website Redeploy
+    needs: [publish]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger website redeploy
+        env:
+          PAT: ${{ secrets.WEBSITE_REPO_PAT }}
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: token $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/zeroclaw-labs/zeroclaw-website/dispatches \
+            -d '{"event_type":"new-release","client_payload":{"install_script_url":"https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh"}}'
 
   docker:
     name: Push Docker Image
     needs: [version, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zeroclaw-x86_64-unknown-linux-gnu
+          path: artifacts/
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zeroclaw-aarch64-unknown-linux-gnu
+          path: artifacts/
+
+      - name: Prepare Docker context with pre-built binaries
+        run: |
+          mkdir -p docker-ctx/bin/amd64 docker-ctx/bin/arm64
+          tar xzf artifacts/zeroclaw-x86_64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/amd64
+          tar xzf artifacts/zeroclaw-aarch64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/arm64
+
+          mkdir -p docker-ctx/zeroclaw-data/.zeroclaw docker-ctx/zeroclaw-data/workspace
+          printf '%s\n' \
+            'workspace_dir = "/zeroclaw-data/workspace"' \
+            'config_path = "/zeroclaw-data/.zeroclaw/config.toml"' \
+            'api_key = ""' \
+            'default_provider = "openrouter"' \
+            'default_model = "anthropic/claude-sonnet-4-20250514"' \
+            'default_temperature = 0.7' \
+            '' \
+            '[gateway]' \
+            'port = 42617' \
+            'host = "[::]"' \
+            'allow_public_bind = true' \
+            > docker-ctx/zeroclaw-data/.zeroclaw/config.toml
+
+          cp Dockerfile.ci docker-ctx/Dockerfile
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
@@ -179,11 +342,22 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
-          context: .
+          context: docker-ctx
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:beta
           platforms: linux/amd64,linux/arm64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+
+  # ── Post-publish: tweet after release + website are live ──────────────
+  # Docker is slow (multi-platform) and can be cancelled by concurrency;
+  # don't let it block the tweet.
+  tweet:
+    name: Tweet Release
+    needs: [version, publish, redeploy-website]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    uses: ./.github/workflows/tweet-release.yml
+    with:
+      release_tag: ${{ needs.version.outputs.tag }}
+      release_url: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/${{ needs.version.outputs.tag }}
+    secrets: inherit

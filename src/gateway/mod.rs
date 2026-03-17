@@ -8,6 +8,7 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api;
+pub mod nodes;
 pub mod sse;
 pub mod static_files;
 pub mod ws;
@@ -72,6 +73,22 @@ fn wati_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
 
 fn nextcloud_talk_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
     format!("nextcloud_talk_{}_{}", msg.sender, msg.id)
+}
+
+fn sender_session_id(channel: &str, msg: &crate::channels::traits::ChannelMessage) -> String {
+    match &msg.thread_ts {
+        Some(thread_id) => format!("{channel}_{thread_id}_{}", msg.sender),
+        None => format!("{channel}_{}", msg.sender),
+    }
+}
+
+fn webhook_session_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("X-Session-Id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn hash_webhook_secret(value: &str) -> String {
@@ -312,6 +329,8 @@ pub struct AppState {
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     /// Shutdown signal sender for graceful shutdown
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Registry of dynamically connected nodes
+    pub node_registry: Arc<nodes::NodeRegistry>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -351,7 +370,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
             secrets_encrypt: config.secrets.encrypt,
             reasoning_enabled: config.runtime.reasoning_enabled,
+            reasoning_effort: config.runtime.reasoning_effort.clone(),
             provider_timeout_secs: Some(config.provider_timeout_secs),
+            extra_headers: config.extra_headers.clone(),
+            api_path: config.api_path.clone(),
         },
     )?);
     let model = config
@@ -359,8 +381,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
     let temperature = config.default_temperature;
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
         &config.memory,
+        &config.embedding_routes,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
         config.api_key.as_deref(),
@@ -381,7 +404,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let tools_registry_raw = tools::all_tools_with_runtime(
+    let (tools_registry_raw, _delegate_handle_gw) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -595,6 +618,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     }
     println!("  GET  /api/*     — REST API (bearer token required)");
     println!("  GET  /ws/chat   — WebSocket agent chat");
+    if config.nodes.enabled {
+        println!("  GET  /ws/nodes  — WebSocket node discovery");
+    }
     println!("  GET  /health    — health check");
     println!("  GET  /metrics   — Prometheus metrics");
     if let Some(code) = pairing.pairing_code() {
@@ -627,6 +653,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // Node registry for dynamic node discovery
+    let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
+
     let state = AppState {
         config: config_state,
         provider,
@@ -651,6 +680,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         cost_tracker,
         event_tx,
         shutdown_tx,
+        node_registry,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -682,6 +712,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cron", get(api::handle_api_cron_list))
         .route("/api/cron", post(api::handle_api_cron_add))
         .route("/api/cron/{id}", delete(api::handle_api_cron_delete))
+        .route("/api/cron/{id}/runs", get(api::handle_api_cron_runs))
         .route("/api/integrations", get(api::handle_api_integrations))
         .route(
             "/api/integrations/settings",
@@ -701,6 +732,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/events", get(sse::handle_sse_events))
         // ── WebSocket agent chat ──
         .route("/ws/chat", get(ws::handle_ws_chat))
+        // ── WebSocket node discovery ──
+        .route("/ws/nodes", get(nodes::handle_ws_nodes))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
         // ── Config PUT with larger body limit ──
@@ -746,17 +779,31 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 /// Prometheus content type for text exposition format.
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
+fn prometheus_disabled_hint() -> String {
+    String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
+}
+
 /// GET /metrics — Prometheus text exposition format
 async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let body = if let Some(prom) = state
-        .observer
-        .as_ref()
-        .as_any()
-        .downcast_ref::<crate::observability::PrometheusObserver>()
-    {
-        prom.encode()
-    } else {
-        String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
+    let body = {
+        #[cfg(feature = "observability-prometheus")]
+        {
+            if let Some(prom) = state
+                .observer
+                .as_ref()
+                .as_any()
+                .downcast_ref::<crate::observability::PrometheusObserver>()
+            {
+                prom.encode()
+            } else {
+                prometheus_disabled_hint()
+            }
+        }
+        #[cfg(not(feature = "observability-prometheus"))]
+        {
+            let _ = &state;
+            prometheus_disabled_hint()
+        }
     };
 
     (
@@ -792,7 +839,9 @@ async fn handle_pair(
     match state.pairing.try_pair(code, &rate_key).await {
         Ok(Some(token)) => {
             tracing::info!("🔐 New client paired successfully");
-            if let Err(err) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+            if let Err(err) =
+                Box::pin(persist_pairing_tokens(state.config.clone(), &state.pairing)).await
+            {
                 tracing::error!("🔐 Pairing succeeded but token persistence failed: {err:#}");
                 let body = serde_json::json!({
                     "paired": true,
@@ -878,9 +927,13 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
 }
 
 /// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
-async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow::Result<String> {
+async fn run_gateway_chat_with_tools(
+    state: &AppState,
+    message: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<String> {
     let config = state.config.lock().clone();
-    crate::agent::process_message(config, message).await
+    Box::pin(crate::agent::process_message(config, message, session_id)).await
 }
 
 /// Webhook request body
@@ -972,12 +1025,18 @@ async fn handle_webhook(
     }
 
     let message = &webhook_body.message;
+    let session_id = webhook_session_id(&headers);
 
-    if state.auto_save {
+    if state.auto_save && !memory::should_skip_autosave_content(message) {
         let key = webhook_memory_key();
         let _ = state
             .mem
-            .store(&key, message, MemoryCategory::Conversation, None)
+            .store(
+                &key,
+                message,
+                MemoryCategory::Conversation,
+                session_id.as_deref(),
+            )
             .await;
     }
 
@@ -1198,17 +1257,29 @@ async fn handle_whatsapp_message(
             msg.sender,
             truncate_with_ellipsis(&msg.content, 50)
         );
+        let session_id = sender_session_id("whatsapp", msg);
 
         // Auto-save to memory
-        if state.auto_save {
+        if state.auto_save && !memory::should_skip_autosave_content(&msg.content) {
             let key = whatsapp_memory_key(msg);
             let _ = state
                 .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .store(
+                    &key,
+                    &msg.content,
+                    MemoryCategory::Conversation,
+                    Some(&session_id),
+                )
                 .await;
         }
 
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match Box::pin(run_gateway_chat_with_tools(
+            &state,
+            &msg.content,
+            Some(&session_id),
+        ))
+        .await
+        {
             Ok(response) => {
                 // Send reply via WhatsApp
                 if let Err(e) = wa
@@ -1305,18 +1376,30 @@ async fn handle_linq_webhook(
             msg.sender,
             truncate_with_ellipsis(&msg.content, 50)
         );
+        let session_id = sender_session_id("linq", msg);
 
         // Auto-save to memory
-        if state.auto_save {
+        if state.auto_save && !memory::should_skip_autosave_content(&msg.content) {
             let key = linq_memory_key(msg);
             let _ = state
                 .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .store(
+                    &key,
+                    &msg.content,
+                    MemoryCategory::Conversation,
+                    Some(&session_id),
+                )
                 .await;
         }
 
         // Call the LLM
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match Box::pin(run_gateway_chat_with_tools(
+            &state,
+            &msg.content,
+            Some(&session_id),
+        ))
+        .await
+        {
             Ok(response) => {
                 // Send reply via Linq
                 if let Err(e) = linq
@@ -1397,18 +1480,30 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
             msg.sender,
             truncate_with_ellipsis(&msg.content, 50)
         );
+        let session_id = sender_session_id("wati", msg);
 
         // Auto-save to memory
-        if state.auto_save {
+        if state.auto_save && !memory::should_skip_autosave_content(&msg.content) {
             let key = wati_memory_key(msg);
             let _ = state
                 .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .store(
+                    &key,
+                    &msg.content,
+                    MemoryCategory::Conversation,
+                    Some(&session_id),
+                )
                 .await;
         }
 
         // Call the LLM
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match Box::pin(run_gateway_chat_with_tools(
+            &state,
+            &msg.content,
+            Some(&session_id),
+        ))
+        .await
+        {
             Ok(response) => {
                 // Send reply via WATI
                 if let Err(e) = wati
@@ -1503,16 +1598,28 @@ async fn handle_nextcloud_talk_webhook(
             msg.sender,
             truncate_with_ellipsis(&msg.content, 50)
         );
+        let session_id = sender_session_id("nextcloud_talk", msg);
 
-        if state.auto_save {
+        if state.auto_save && !memory::should_skip_autosave_content(&msg.content) {
             let key = nextcloud_talk_memory_key(msg);
             let _ = state
                 .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .store(
+                    &key,
+                    &msg.content,
+                    MemoryCategory::Conversation,
+                    Some(&session_id),
+                )
                 .await;
         }
 
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match Box::pin(run_gateway_chat_with_tools(
+            &state,
+            &msg.content,
+            Some(&session_id),
+        ))
+        .await
+        {
             Ok(response) => {
                 if let Err(e) = nextcloud_talk
                     .send(&SendMessage::new(response, &msg.reply_target))
@@ -1722,6 +1829,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1739,6 +1847,7 @@ mod tests {
         assert!(text.contains("Prometheus backend not enabled"));
     }
 
+    #[cfg(feature = "observability-prometheus")]
     #[tokio::test]
     async fn metrics_endpoint_renders_prometheus_output() {
         let prom = Arc::new(crate::observability::PrometheusObserver::new());
@@ -1772,6 +1881,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1934,7 +2044,7 @@ mod tests {
         assert!(guard.is_authenticated(&token));
 
         let shared_config = Arc::new(Mutex::new(config));
-        persist_pairing_tokens(shared_config.clone(), &guard)
+        Box::pin(persist_pairing_tokens(shared_config.clone(), &guard))
             .await
             .unwrap();
 
@@ -2147,6 +2257,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
         let mut headers = HeaderMap::new();
@@ -2212,6 +2323,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
         let headers = HeaderMap::new();
@@ -2289,6 +2401,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
         let response = handle_webhook(
@@ -2338,6 +2451,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
         let mut headers = HeaderMap::new();
@@ -2392,6 +2506,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
         let mut headers = HeaderMap::new();
@@ -2451,13 +2566,14 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
-        let response = handle_nextcloud_talk_webhook(
+        let response = Box::pin(handle_nextcloud_talk_webhook(
             State(state),
             HeaderMap::new(),
             Bytes::from_static(br#"{"type":"message"}"#),
-        )
+        ))
         .await
         .into_response();
 
@@ -2506,6 +2622,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
         let mut headers = HeaderMap::new();
@@ -2518,9 +2635,13 @@ mod tests {
             HeaderValue::from_str(invalid_signature).unwrap(),
         );
 
-        let response = handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body))
-            .await
-            .into_response();
+        let response = Box::pin(handle_nextcloud_talk_webhook(
+            State(state),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }

@@ -56,7 +56,7 @@ impl Tool for CronAddTool {
     fn description(&self) -> &str {
         "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
          Use job_type='agent' with a prompt to run the AI agent on schedule. \
-         To deliver output to a channel (Discord, Telegram, Slack, Mattermost), set \
+         To deliver output to a channel (Discord, Telegram, Slack, Mattermost, Matrix), set \
          delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
          This is the preferred tool for sending scheduled/delayed messages to users via channels."
     }
@@ -65,27 +65,97 @@ impl Tool for CronAddTool {
         json!({
             "type": "object",
             "properties": {
-                "name": { "type": "string" },
-                "schedule": {
-                    "type": "object",
-                    "description": "Schedule object: {kind:'cron',expr,tz?} | {kind:'at',at} | {kind:'every',every_ms}"
+                "name": {
+                    "type": "string",
+                    "description": "Optional human-readable name for the job"
                 },
-                "job_type": { "type": "string", "enum": ["shell", "agent"] },
-                "command": { "type": "string" },
-                "prompt": { "type": "string" },
-                "session_target": { "type": "string", "enum": ["isolated", "main"] },
-                "model": { "type": "string" },
+                // NOTE: oneOf is correct for OpenAI-compatible APIs (including OpenRouter).
+                // Gemini does not support oneOf in tool schemas; if Gemini native tool calling
+                // is ever wired up, SchemaCleanr::clean_for_gemini must be applied before
+                // tool specs are sent. See src/tools/schema.rs.
+                "schedule": {
+                    "description": "When to run the job. Exactly one of three forms must be used.",
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "description": "Cron expression schedule (repeating). Example: {\"kind\":\"cron\",\"expr\":\"0 9 * * 1-5\",\"tz\":\"America/New_York\"}",
+                            "properties": {
+                                "kind": { "type": "string", "enum": ["cron"] },
+                                "expr": { "type": "string", "description": "Standard 5-field cron expression, e.g. '*/5 * * * *'" },
+                                "tz": { "type": "string", "description": "Optional IANA timezone name, e.g. 'America/New_York'. Defaults to UTC." }
+                            },
+                            "required": ["kind", "expr"]
+                        },
+                        {
+                            "type": "object",
+                            "description": "One-shot schedule at a specific UTC datetime. Example: {\"kind\":\"at\",\"at\":\"2025-12-31T23:59:00Z\"}",
+                            "properties": {
+                                "kind": { "type": "string", "enum": ["at"] },
+                                "at": { "type": "string", "description": "ISO 8601 UTC datetime string, e.g. '2025-12-31T23:59:00Z'" }
+                            },
+                            "required": ["kind", "at"]
+                        },
+                        {
+                            "type": "object",
+                            "description": "Repeating interval schedule in milliseconds. Example: {\"kind\":\"every\",\"every_ms\":3600000} runs every hour.",
+                            "properties": {
+                                "kind": { "type": "string", "enum": ["every"] },
+                                "every_ms": { "type": "integer", "description": "Interval in milliseconds, e.g. 3600000 for every hour" }
+                            },
+                            "required": ["kind", "every_ms"]
+                        }
+                    ]
+                },
+                "job_type": {
+                    "type": "string",
+                    "enum": ["shell", "agent"],
+                    "description": "Type of job: 'shell' runs a command, 'agent' runs the AI agent with a prompt"
+                },
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to run (required when job_type is 'shell')"
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "Agent prompt to run on schedule (required when job_type is 'agent')"
+                },
+                "session_target": {
+                    "type": "string",
+                    "enum": ["isolated", "main"],
+                    "description": "Agent session context: 'isolated' starts a fresh session each run, 'main' reuses the primary session"
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional model override for agent jobs, e.g. 'x-ai/grok-4-1-fast'"
+                },
                 "delivery": {
                     "type": "object",
-                    "description": "Delivery config to send job output to a channel. Example: {\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id>\"}",
+                    "description": "Optional delivery config to send job output to a channel after each run. When provided, all three of mode, channel, and to are expected.",
                     "properties": {
-                        "mode": { "type": "string", "enum": ["none", "announce"], "description": "Set to 'announce' to deliver output to a channel" },
-                        "channel": { "type": "string", "enum": ["telegram", "discord", "slack", "mattermost"], "description": "Channel type to deliver to" },
-                        "to": { "type": "string", "description": "Target: Discord channel ID, Telegram chat ID, Slack channel, etc." },
-                        "best_effort": { "type": "boolean", "description": "If true, delivery failure does not fail the job" }
+                        "mode": {
+                            "type": "string",
+                            "enum": ["none", "announce"],
+                            "description": "'announce' sends output to the specified channel; 'none' disables delivery"
+                        },
+                        "channel": {
+                            "type": "string",
+                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix"],
+                            "description": "Channel type to deliver output to"
+                        },
+                        "to": {
+                            "type": "string",
+                            "description": "Destination ID: Discord channel ID, Telegram chat ID, Slack channel name, etc."
+                        },
+                        "best_effort": {
+                            "type": "boolean",
+                            "description": "If true, a delivery failure does not fail the job itself. Defaults to true."
+                        }
                     }
                 },
-                "delete_after_run": { "type": "boolean" },
+                "delete_after_run": {
+                    "type": "boolean",
+                    "description": "If true, the job is automatically deleted after its first successful run. Defaults to true for 'at' schedules."
+                },
                 "approved": {
                     "type": "boolean",
                     "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
@@ -481,5 +551,87 @@ mod tests {
             .error
             .unwrap_or_default()
             .contains("Missing 'prompt'"));
+    }
+
+    #[tokio::test]
+    async fn delivery_schema_includes_matrix_channel() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let values = tool.parameters_schema()["properties"]["delivery"]["properties"]["channel"]
+            ["enum"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+
+        assert!(values.iter().any(|value| value == "matrix"));
+    }
+
+    #[test]
+    fn schedule_schema_is_oneof_with_cron_at_every_variants() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = Arc::new(Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        });
+        let security = Arc::new(SecurityPolicy::from_config(
+            &cfg.autonomy,
+            &cfg.workspace_dir,
+        ));
+        let tool = CronAddTool::new(cfg, security);
+        let schema = tool.parameters_schema();
+
+        // Top-level: schedule is required
+        let top_required = schema["required"].as_array().expect("top-level required");
+        assert!(top_required.iter().any(|v| v == "schedule"));
+
+        // schedule is a oneOf with exactly 3 variants: cron, at, every
+        let one_of = schema["properties"]["schedule"]["oneOf"]
+            .as_array()
+            .expect("schedule.oneOf must be an array");
+        assert_eq!(one_of.len(), 3, "expected cron, at, and every variants");
+
+        let kinds: Vec<&str> = one_of
+            .iter()
+            .filter_map(|v| v["properties"]["kind"]["enum"][0].as_str())
+            .collect();
+        assert!(kinds.contains(&"cron"), "missing cron variant");
+        assert!(kinds.contains(&"at"), "missing at variant");
+        assert!(kinds.contains(&"every"), "missing every variant");
+
+        // Each variant declares its required fields and every_ms is typed integer
+        for variant in one_of {
+            let kind = variant["properties"]["kind"]["enum"][0]
+                .as_str()
+                .expect("variant kind");
+            let req: Vec<&str> = variant["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{kind} variant must have required"))
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert!(
+                req.contains(&"kind"),
+                "{kind} variant missing 'kind' in required"
+            );
+            match kind {
+                "cron" => assert!(req.contains(&"expr"), "cron variant missing 'expr'"),
+                "at" => assert!(req.contains(&"at"), "at variant missing 'at'"),
+                "every" => {
+                    assert!(
+                        req.contains(&"every_ms"),
+                        "every variant missing 'every_ms'"
+                    );
+                    assert_eq!(
+                        variant["properties"]["every_ms"]["type"].as_str(),
+                        Some("integer"),
+                        "every_ms must be typed as integer"
+                    );
+                }
+                _ => panic!("unexpected kind: {kind}"),
+            }
+        }
     }
 }

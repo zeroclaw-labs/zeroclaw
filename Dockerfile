@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ── Stage 1: Build ────────────────────────────────────────────
-FROM rust:1.93-slim@sha256:9663b80a1621253d30b146454f903de48f0af925c967be48c84745537cd35d8b AS builder
+FROM rust:1.94-slim@sha256:da9dab7a6b8dd428e71718402e97207bb3e54167d37b5708616050b1e8f60ed6 AS builder
 
 WORKDIR /app
 
@@ -18,6 +18,7 @@ COPY crates/robot-kit/Cargo.toml crates/robot-kit/Cargo.toml
 # Create dummy targets declared in Cargo.toml so manifest parsing succeeds.
 RUN mkdir -p src benches crates/robot-kit/src \
     && echo "fn main() {}" > src/main.rs \
+    && echo "" > src/lib.rs \
     && echo "fn main() {}" > benches/agent_benchmarks.rs \
     && echo "pub fn placeholder() {}" > crates/robot-kit/src/lib.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
@@ -32,6 +33,7 @@ COPY benches/ benches/
 COPY crates/ crates/
 COPY firmware/ firmware/
 COPY web/ web/
+COPY *.rs .
 # Keep release builds resilient when frontend dist assets are not prebuilt in Git.
 RUN mkdir -p web/dist && \
     if [ ! -f web/dist/index.html ]; then \
@@ -49,12 +51,18 @@ RUN mkdir -p web/dist && \
         '  </body>' \
         '</html>' > web/dist/index.html; \
     fi
+RUN touch src/main.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
+    rm -rf target/release/.fingerprint/zeroclawlabs-* \
+           target/release/deps/zeroclawlabs-* \
+           target/release/incremental/zeroclawlabs-* && \
     cargo build --release --locked && \
     cp target/release/zeroclaw /app/zeroclaw && \
     strip /app/zeroclaw
+RUN size=$(stat -c%s /app/zeroclaw 2>/dev/null || stat -f%z /app/zeroclaw) && \
+    if [ "$size" -lt 1000000 ]; then echo "ERROR: binary too small (${size} bytes), likely dummy build artifact" && exit 1; fi
 
 # Prepare runtime directory structure and default config inline (no extra stage)
 RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \

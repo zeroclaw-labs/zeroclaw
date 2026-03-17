@@ -57,6 +57,16 @@
 
 ---
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.3.1 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| ci | add Termux (aarch64-linux-android) release target |
+
+<!-- END:WHATS_NEW -->
+
 ## Apa itu ZeroClaw?
 
 ZeroClaw adalah infrastruktur asisten AI yang ringan, dapat diubah, dan dapat diperluas yang dibangun dengan Rust. Ini menghubungkan berbagai penyedia LLM (Anthropic, OpenAI, Google, Ollama, dll.) melalui antarmuka terpadu dan mendukung banyak saluran (Telegram, Matrix, CLI, dll.).
@@ -177,3 +187,17 @@ Lihat [LICENSE-APACHE](LICENSE-APACHE) dan [LICENSE-MIT](LICENSE-MIT) untuk deta
 Jika ZeroClaw berguna bagi Anda, mohon pertimbangkan untuk membelikan kami kopi:
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee)](https://buymeacoffee.com/argenistherose)
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.3.1)
+
+3 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+- **argenis de la rosa**
+- **Claude Opus 4.6**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->

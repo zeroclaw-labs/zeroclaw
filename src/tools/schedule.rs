@@ -29,7 +29,7 @@ impl Tool for ScheduleTool {
     fn description(&self) -> &str {
         "Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. \
          WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. \
-         To send a scheduled message to Discord/Telegram/Slack, use the cron_add tool with job_type='agent' \
+         To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' \
          and a delivery config like {\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id>\"}."
     }
 
@@ -88,9 +88,6 @@ impl Tool for ScheduleTool {
                 self.handle_get(id)
             }
             "create" | "add" | "once" => {
-                if let Some(blocked) = self.enforce_mutation_allowed(action) {
-                    return Ok(blocked);
-                }
                 let approved = args
                     .get("approved")
                     .and_then(serde_json::Value::as_bool)
@@ -299,6 +296,12 @@ impl ScheduleTool {
                     });
                 }
             }
+        }
+
+        // Enforce rate-limiting AFTER command/args validation so that invalid
+        // requests do not consume the action budget.  (Fixes #3699)
+        if let Some(blocked) = self.enforce_mutation_allowed(action) {
+            return Ok(blocked);
         }
 
         // All job creation routes through validated cron helpers, which enforce
