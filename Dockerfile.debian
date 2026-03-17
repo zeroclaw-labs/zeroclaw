@@ -19,6 +19,7 @@
 FROM rust:1.94-slim@sha256:da9dab7a6b8dd428e71718402e97207bb3e54167d37b5708616050b1e8f60ed6 AS builder
 
 WORKDIR /app
+ARG ZEROCLAW_CARGO_FEATURES=""
 
 # Install build dependencies
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -39,7 +40,11 @@ RUN mkdir -p src benches crates/robot-kit/src \
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    cargo build --release --locked
+    if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
+      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
+    else \
+      cargo build --release --locked; \
+    fi
 RUN rm -rf src benches crates/robot-kit/src
 
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
@@ -69,7 +74,11 @@ RUN touch src/main.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    cargo build --release --locked && \
+    if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
+      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
+    else \
+      cargo build --release --locked; \
+    fi && \
     cp target/release/zeroclaw /app/zeroclaw && \
     strip /app/zeroclaw
 RUN size=$(stat -c%s /app/zeroclaw 2>/dev/null || stat -f%z /app/zeroclaw) && \
