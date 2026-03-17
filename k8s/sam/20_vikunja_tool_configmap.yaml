@@ -15,8 +15,9 @@ data:
       vikunja projects                        List all projects
       vikunja project create --title "..."    Create a project
       vikunja tasks <project-id>              List tasks in a project
-      vikunja task create <project-id> --title "..." [--description "..."] [--due "YYYY-MM-DD"] [--priority 1-5]
-      vikunja task update <task-id> [--done] [--title "..."] [--description "..."]
+      vikunja task create <project-id> --title "..." [--description "..."] [--due "YYYY-MM-DD"] [--priority 1-5] [--assignee <username>]
+      vikunja task update <task-id> [--done] [--title "..."] [--description "..."] [--assignee <username>]
+      vikunja task assign <task-id> --user <username>
       vikunja task comment <task-id> --body "..."
       vikunja help
 
@@ -141,17 +142,36 @@ data:
             due_str = f" (due: {due[:10]})" if due and due != "0001-01-01T00:00:00Z" else ""
             priority = t.get("priority", 0)
             pri_str = f" [P{priority}]" if priority else ""
-            print(f"  #{tid} [{done}]{pri_str} {title}{due_str}")
+            assignees = t.get("assignees") or []
+            assign_str = f" @{','.join(a.get('username','?') for a in assignees)}" if assignees else ""
+            print(f"  #{tid} [{done}]{pri_str} {title}{due_str}{assign_str}")
+
+
+    def _resolve_user_id(username):
+        """Resolve a username to a numeric user ID via search."""
+        results = _api("GET", f"/users?s={username}")
+        for u in results:
+            if u.get("username") == username:
+                return u.get("id")
+        print(f"ERROR: User '{username}' not found", file=sys.stderr)
+        sys.exit(1)
+
+
+    def _assign_user(task_id, username):
+        """Assign a user to a task by username."""
+        user_id = _resolve_user_id(username)
+        _api("PUT", f"/tasks/{task_id}/assignees", {"user_id": user_id})
+        print(f"  Assigned @{username} to task #{task_id}")
 
 
     def cmd_task_create(args):
         """Create a task in a project."""
         flags, positional = _parse_args(args, {
             "title": "str", "description": "str", "due": "str",
-            "priority": "str",
+            "priority": "str", "assignee": "str",
         })
         if not positional:
-            print('Usage: vikunja task create <project-id> --title "..." [--description "..."] [--due "YYYY-MM-DD"] [--priority 1-5]',
+            print('Usage: vikunja task create <project-id> --title "..." [--description "..."] [--due "YYYY-MM-DD"] [--priority 1-5] [--assignee <username>]',
                   file=sys.stderr)
             sys.exit(1)
         project_id = positional[0]
@@ -167,20 +187,24 @@ data:
         if "priority" in flags:
             data["priority"] = int(flags["priority"])
         result = _api("PUT", f"/projects/{project_id}/tasks", data)
-        print(f"Task #{result.get('id', '?')} created: {result.get('title', title)}")
+        task_id = result.get("id", "?")
+        print(f"Task #{task_id} created: {result.get('title', title)}")
+        if "assignee" in flags:
+            _assign_user(task_id, flags["assignee"])
 
 
     def cmd_task_update(args):
         """Update a task."""
         flags, positional = _parse_args(args, {
             "done": "bool", "title": "str", "description": "str",
-            "due": "str", "priority": "str",
+            "due": "str", "priority": "str", "assignee": "str",
         })
         if not positional:
-            print('Usage: vikunja task update <task-id> [--done] [--title "..."] [--description "..."]',
+            print('Usage: vikunja task update <task-id> [--done] [--title "..."] [--description "..."] [--assignee <username>]',
                   file=sys.stderr)
             sys.exit(1)
         task_id = positional[0]
+        assignee = flags.pop("assignee", None)
         data = {}
         if flags.get("done"):
             data["done"] = True
@@ -192,13 +216,25 @@ data:
             data["due_date"] = flags["due"] + "T00:00:00Z"
         if "priority" in flags:
             data["priority"] = int(flags["priority"])
-        if not data:
-            print("Nothing to update. Use --done, --title, --description, --due, or --priority.",
+        if data:
+            result = _api("POST", f"/tasks/{task_id}", data)
+            status = "DONE" if result.get("done") else "TODO"
+            print(f"Task #{task_id} updated [{status}]: {result.get('title', '?')}")
+        if assignee:
+            _assign_user(task_id, assignee)
+        if not data and not assignee:
+            print("Nothing to update. Use --done, --title, --description, --due, --priority, or --assignee.",
                   file=sys.stderr)
             sys.exit(1)
-        result = _api("POST", f"/tasks/{task_id}", data)
-        status = "DONE" if result.get("done") else "TODO"
-        print(f"Task #{task_id} updated [{status}]: {result.get('title', '?')}")
+
+
+    def cmd_task_assign(args):
+        """Assign a user to a task."""
+        flags, positional = _parse_args(args, {"user": "str"})
+        if not positional or "user" not in flags:
+            print('Usage: vikunja task assign <task-id> --user <username>', file=sys.stderr)
+            sys.exit(1)
+        _assign_user(positional[0], flags["user"])
 
 
     def cmd_task_comment(args):
@@ -232,6 +268,8 @@ data:
                 cmd_task_create(rest[1:])
             elif subcmd == "update":
                 cmd_task_update(rest[1:])
+            elif subcmd == "assign":
+                cmd_task_assign(rest[1:])
             elif subcmd == "comment":
                 cmd_task_comment(rest[1:])
             else:

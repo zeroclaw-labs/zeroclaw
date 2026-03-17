@@ -578,10 +578,18 @@ data:
     vikunja projects                        # List all projects
     vikunja project create --title "..."    # Create a new project
     vikunja tasks <project-id>              # List tasks in a project
-    vikunja task create <project-id> --title "..." [--description "..."] [--due "YYYY-MM-DD"] [--priority 1-5]
-    vikunja task update <task-id> [--done] [--title "..."] [--description "..."]
+    vikunja task create <project-id> --title "..." [--description "..."] [--due "YYYY-MM-DD"] [--priority 1-5] [--assignee <username>]
+    vikunja task update <task-id> [--done] [--title "..."] [--assignee <username>]
+    vikunja task assign <task-id> --user <username>
     vikunja task comment <task-id> --body "..."
     ```
+
+    ## Users
+
+    Known usernames: `dan`, `sam`, `admin`. Use these with `--assignee`
+    when creating tasks or `--user` when assigning. Tasks show assignees
+    as `@username` in the listing. Assign Dan to tasks that are his
+    action items; assign yourself to tasks you're tracking.
 
     ## Workflow
 
