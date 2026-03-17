@@ -37,10 +37,12 @@ spec:
               echo "Syncing config.toml from ConfigMap template"
               cp /etc/zeroclaw-template/config.toml /data/.zeroclaw/config.toml
               chmod 600 /data/.zeroclaw/config.toml
-              # Seed identity files into workspace if missing.
-              for f in IDENTITY.md SOUL.md USER.md AGENTS.md TOOLS.md MEMORY.md BOOTSTRAP.md HEARTBEAT.md; do
+              # Read-only identity files are mounted directly into the zeroclaw
+              # container. Writable files (MEMORY.md, USER.md, BOOTSTRAP.md) are
+              # seeded to the PVC only if missing, so Sam can update them.
+              for f in MEMORY.md USER.md BOOTSTRAP.md; do
                 if [ ! -f "/data/.zeroclaw/workspace/$f" ] && [ -f "/etc/zeroclaw-template/identity/$f" ]; then
-                  echo "Seeding $f"
+                  echo "Seeding writable $f"
                   cp "/etc/zeroclaw-template/identity/$f" "/data/.zeroclaw/workspace/$f"
                 fi
               done
@@ -178,8 +180,28 @@ spec:
               mountPath: /usr/local/bin/vikunja
               subPath: vikunja.py
               readOnly: true
+            # Identity files mounted directly from ConfigMap.
+            - name: zeroclaw-identity
+              mountPath: /data/.zeroclaw/workspace/AGENTS.md
+              subPath: AGENTS.md
+              readOnly: true
+            - name: zeroclaw-identity
+              mountPath: /data/.zeroclaw/workspace/TOOLS.md
+              subPath: TOOLS.md
+              readOnly: true
+            - name: zeroclaw-identity
+              mountPath: /data/.zeroclaw/workspace/IDENTITY.md
+              subPath: IDENTITY.md
+              readOnly: true
+            - name: zeroclaw-identity
+              mountPath: /data/.zeroclaw/workspace/SOUL.md
+              subPath: SOUL.md
+              readOnly: true
+            - name: zeroclaw-identity
+              mountPath: /data/.zeroclaw/workspace/HEARTBEAT.md
+              subPath: HEARTBEAT.md
+              readOnly: true
             # Skills mounted directly — no init container copy needed.
-            # Sam can still create her own skills in the PVC-backed skills dir.
             - name: zeroclaw-skills
               mountPath: /data/.zeroclaw/workspace/skills/k8s-delegation/SKILL.md
               subPath: k8s-delegation.md
