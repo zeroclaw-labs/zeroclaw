@@ -4660,6 +4660,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_allows_low_risk_shell_in_non_interactive_mode() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"echo hello"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let tmp = TempDir::new().expect("temp dir");
+        let security = Arc::new(crate::security::SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Supervised,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..crate::security::SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn crate::runtime::RuntimeAdapter> =
+            Arc::new(crate::runtime::NativeRuntime::new());
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(
+            crate::tools::shell::ShellTool::new(security, runtime),
+        )];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run shell"),
+        ];
+        let observer = NoopObserver;
+        let approval_mgr =
+            ApprovalManager::for_non_interactive(&crate::config::AutonomyConfig::default());
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(&approval_mgr),
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+        )
+        .await
+        .expect("non-interactive shell should succeed for low-risk command");
+
+        assert_eq!(result, "done");
+
+        let tool_results = history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("tool results message should be present");
+        assert!(tool_results.content.contains("hello"));
+        assert!(!tool_results.content.contains("Denied by user."));
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_dedup_exempt_allows_repeated_calls() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>
