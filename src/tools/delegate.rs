@@ -296,8 +296,9 @@ impl Tool for DelegateTool {
         }
 
         // Wrap the provider call in a timeout to prevent indefinite blocking
+        let timeout_secs = agent_config.timeout_secs.unwrap_or(DELEGATE_TIMEOUT_SECS);
         let result = tokio::time::timeout(
-            Duration::from_secs(DELEGATE_TIMEOUT_SECS),
+            Duration::from_secs(timeout_secs),
             provider.chat_with_system(
                 agent_config.system_prompt.as_deref(),
                 &full_prompt,
@@ -314,7 +315,7 @@ impl Tool for DelegateTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!(
-                        "Agent '{agent_name}' timed out after {DELEGATE_TIMEOUT_SECS}s"
+                        "Agent '{agent_name}' timed out after {timeout_secs}s"
                     )),
                 });
             }
@@ -401,8 +402,11 @@ impl DelegateTool {
 
         let noop_observer = NoopObserver;
 
+        let agentic_timeout_secs = agent_config
+            .agentic_timeout_secs
+            .unwrap_or(DELEGATE_AGENTIC_TIMEOUT_SECS);
         let result = tokio::time::timeout(
-            Duration::from_secs(DELEGATE_AGENTIC_TIMEOUT_SECS),
+            Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(
                 provider,
                 &mut history,
@@ -454,7 +458,7 @@ impl DelegateTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Agent '{agent_name}' timed out after {DELEGATE_AGENTIC_TIMEOUT_SECS}s"
+                    "Agent '{agent_name}' timed out after {agentic_timeout_secs}s"
                 )),
             }),
         }
@@ -531,6 +535,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
         agents.insert(
@@ -545,6 +551,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
         agents
@@ -698,6 +706,8 @@ mod tests {
             agentic: true,
             allowed_tools,
             max_iterations,
+            timeout_secs: None,
+            agentic_timeout_secs: None,
         }
     }
 
@@ -806,6 +816,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -912,6 +924,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -947,6 +961,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1220,5 +1236,227 @@ mod tests {
         // Push a new tool via the handle
         handle.write().push(Arc::new(FakeMcpTool));
         assert_eq!(handle.read().len(), 2);
+    }
+
+    // ── Configurable timeout tests ──────────────────────────────────
+
+    #[test]
+    fn default_timeout_values_used_when_config_unset() {
+        let config = DelegateAgentConfig {
+            provider: "ollama".to_string(),
+            model: "llama3".to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: false,
+            allowed_tools: Vec::new(),
+            max_iterations: 10,
+            timeout_secs: None,
+            agentic_timeout_secs: None,
+        };
+        assert_eq!(config.timeout_secs.unwrap_or(DELEGATE_TIMEOUT_SECS), 120);
+        assert_eq!(
+            config
+                .agentic_timeout_secs
+                .unwrap_or(DELEGATE_AGENTIC_TIMEOUT_SECS),
+            300
+        );
+    }
+
+    #[test]
+    fn custom_timeout_values_are_respected() {
+        let config = DelegateAgentConfig {
+            provider: "ollama".to_string(),
+            model: "llama3".to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: false,
+            allowed_tools: Vec::new(),
+            max_iterations: 10,
+            timeout_secs: Some(60),
+            agentic_timeout_secs: Some(600),
+        };
+        assert_eq!(config.timeout_secs.unwrap_or(DELEGATE_TIMEOUT_SECS), 60);
+        assert_eq!(
+            config
+                .agentic_timeout_secs
+                .unwrap_or(DELEGATE_AGENTIC_TIMEOUT_SECS),
+            600
+        );
+    }
+
+    #[test]
+    fn timeout_deserialization_defaults_to_none() {
+        let toml_str = r#"
+            provider = "ollama"
+            model = "llama3"
+        "#;
+        let config: DelegateAgentConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.timeout_secs.is_none());
+        assert!(config.agentic_timeout_secs.is_none());
+    }
+
+    #[test]
+    fn timeout_deserialization_with_custom_values() {
+        let toml_str = r#"
+            provider = "ollama"
+            model = "llama3"
+            timeout_secs = 45
+            agentic_timeout_secs = 900
+        "#;
+        let config: DelegateAgentConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.timeout_secs, Some(45));
+        assert_eq!(config.agentic_timeout_secs, Some(900));
+    }
+
+    #[test]
+    fn config_validation_rejects_zero_timeout() {
+        let mut config = crate::config::Config::default();
+        config.agents.insert(
+            "bad".into(),
+            DelegateAgentConfig {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                timeout_secs: Some(0),
+                agentic_timeout_secs: None,
+            },
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("timeout_secs must be greater than 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_validation_rejects_zero_agentic_timeout() {
+        let mut config = crate::config::Config::default();
+        config.agents.insert(
+            "bad".into(),
+            DelegateAgentConfig {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: Some(0),
+            },
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("agentic_timeout_secs must be greater than 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_validation_rejects_excessive_timeout() {
+        let mut config = crate::config::Config::default();
+        config.agents.insert(
+            "bad".into(),
+            DelegateAgentConfig {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                timeout_secs: Some(7200),
+                agentic_timeout_secs: None,
+            },
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("exceeds max 3600"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_validation_rejects_excessive_agentic_timeout() {
+        let mut config = crate::config::Config::default();
+        config.agents.insert(
+            "bad".into(),
+            DelegateAgentConfig {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: Some(5000),
+            },
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("exceeds max 3600"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_validation_accepts_max_boundary_timeout() {
+        let mut config = crate::config::Config::default();
+        config.agents.insert(
+            "ok".into(),
+            DelegateAgentConfig {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                timeout_secs: Some(3600),
+                agentic_timeout_secs: Some(3600),
+            },
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_validation_accepts_none_timeouts() {
+        let mut config = crate::config::Config::default();
+        config.agents.insert(
+            "ok".into(),
+            DelegateAgentConfig {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
+            },
+        );
+        assert!(config.validate().is_ok());
     }
 }

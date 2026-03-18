@@ -460,6 +460,14 @@ pub struct DelegateAgentConfig {
     /// Maximum tool-call iterations in agentic mode.
     #[serde(default = "default_max_tool_iterations")]
     pub max_iterations: usize,
+    /// Timeout in seconds for non-agentic provider calls.
+    /// Defaults to 120 when unset. Must be between 1 and 3600.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Timeout in seconds for agentic sub-agent loops.
+    /// Defaults to 300 when unset. Must be between 1 and 3600.
+    #[serde(default)]
+    pub agentic_timeout_secs: Option<u64>,
 }
 
 // ── Swarms ──────────────────────────────────────────────────────
@@ -7269,6 +7277,31 @@ impl Config {
             anyhow::bail!("security.nevis: {msg}");
         }
 
+        // Delegate agent timeouts
+        const MAX_DELEGATE_TIMEOUT_SECS: u64 = 3600;
+        for (name, agent) in &self.agents {
+            if let Some(timeout) = agent.timeout_secs {
+                if timeout == 0 {
+                    anyhow::bail!("agents.{name}.timeout_secs must be greater than 0");
+                }
+                if timeout > MAX_DELEGATE_TIMEOUT_SECS {
+                    anyhow::bail!(
+                        "agents.{name}.timeout_secs exceeds max {MAX_DELEGATE_TIMEOUT_SECS}"
+                    );
+                }
+            }
+            if let Some(timeout) = agent.agentic_timeout_secs {
+                if timeout == 0 {
+                    anyhow::bail!("agents.{name}.agentic_timeout_secs must be greater than 0");
+                }
+                if timeout > MAX_DELEGATE_TIMEOUT_SECS {
+                    anyhow::bail!(
+                        "agents.{name}.agentic_timeout_secs exceeds max {MAX_DELEGATE_TIMEOUT_SECS}"
+                    );
+                }
+            }
+        }
+
         // Transcription
         {
             let dp = self.transcription.default_provider.trim();
@@ -8838,6 +8871,8 @@ tool_dispatcher = "xml"
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
 
