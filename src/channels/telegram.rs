@@ -332,6 +332,7 @@ pub struct TelegramChannel {
     transcription: Option<crate::config::TranscriptionConfig>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
+    ack_reactions: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,7 +371,14 @@ impl TelegramChannel {
             transcription: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
+            ack_reactions: true,
         }
+    }
+
+    /// Configure whether Telegram-native acknowledgement reactions are sent.
+    pub fn with_ack_reactions(mut self, enabled: bool) -> Self {
+        self.ack_reactions = enabled;
+        self
     }
 
     /// Configure workspace directory for saving downloaded attachments.
@@ -2689,13 +2697,15 @@ Ensure only one `zeroclaw` process is using this bot token."
                         continue;
                     };
 
-                    if let Some((reaction_chat_id, reaction_message_id)) =
-                        Self::extract_update_message_target(update)
-                    {
-                        self.try_add_ack_reaction_nonblocking(
-                            reaction_chat_id,
-                            reaction_message_id,
-                        );
+                    if self.ack_reactions {
+                        if let Some((reaction_chat_id, reaction_message_id)) =
+                            Self::extract_update_message_target(update)
+                        {
+                            self.try_add_ack_reaction_nonblocking(
+                                reaction_chat_id,
+                                reaction_message_id,
+                            );
+                        }
                     }
 
                     // Send "typing" indicator immediately when we receive a message
@@ -4680,5 +4690,25 @@ mod tests {
         // The combination of marker_count > 0 && !supports_vision() means
         // the agent loop will return ProviderCapabilityError before calling
         // the provider, and the channel will send "⚠️ Error: ..." to the user.
+    }
+
+    #[test]
+    fn ack_reactions_defaults_to_true() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        assert!(ch.ack_reactions);
+    }
+
+    #[test]
+    fn with_ack_reactions_false_disables_reactions() {
+        let ch =
+            TelegramChannel::new("token".into(), vec!["*".into()], false).with_ack_reactions(false);
+        assert!(!ch.ack_reactions);
+    }
+
+    #[test]
+    fn with_ack_reactions_true_keeps_reactions() {
+        let ch =
+            TelegramChannel::new("token".into(), vec!["*".into()], false).with_ack_reactions(true);
+        assert!(ch.ack_reactions);
     }
 }
