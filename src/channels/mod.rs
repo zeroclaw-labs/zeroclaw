@@ -289,6 +289,7 @@ const OPENRC_RESTART_ARGS: [&str; 2] = ["zeroclaw", "restart"];
 struct InterruptOnNewMessageConfig {
     telegram: bool,
     slack: bool,
+    matrix: bool,
 }
 
 impl InterruptOnNewMessageConfig {
@@ -296,6 +297,7 @@ impl InterruptOnNewMessageConfig {
         match channel {
             "telegram" => self.telegram,
             "slack" => self.slack,
+            "matrix" => self.matrix,
             _ => false,
         }
     }
@@ -4192,6 +4194,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .slack
         .as_ref()
         .is_some_and(|sl| sl.interrupt_on_new_message);
+    let interrupt_on_new_message_matrix = config
+        .channels_config
+        .matrix
+        .as_ref()
+        .is_some_and(|mx| mx.interrupt_on_new_message);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -4218,6 +4225,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         interrupt_on_new_message: InterruptOnNewMessageConfig {
             telegram: interrupt_on_new_message,
             slack: interrupt_on_new_message_slack,
+            matrix: interrupt_on_new_message_matrix,
         },
         multimodal: config.multimodal.clone(),
         hooks: if config.hooks.enabled {
@@ -4532,6 +4540,7 @@ mod tests {
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -4641,6 +4650,7 @@ mod tests {
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -4706,6 +4716,7 @@ mod tests {
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -4790,6 +4801,7 @@ mod tests {
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -4902,6 +4914,41 @@ mod tests {
     impl Channel for SlackRecordingChannel {
         fn name(&self) -> &str {
             "slack"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct MatrixRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for MatrixRecordingChannel {
+        fn name(&self) -> &str {
+            "matrix"
         }
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -5327,6 +5374,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
@@ -5400,6 +5448,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
@@ -5487,6 +5536,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5559,6 +5609,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5641,6 +5692,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5744,6 +5796,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5828,6 +5881,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5927,6 +5981,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6011,6 +6066,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6085,6 +6141,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6270,6 +6327,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6363,6 +6421,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6471,6 +6530,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: true,
+                matrix: false,
             },
             ack_reactions: true,
             show_tool_calls: true,
@@ -6542,6 +6602,115 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn message_dispatch_interrupts_in_flight_matrix_request_and_preserves_context() {
+        let channel_impl = Arc::new(MatrixRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(DelayedHistoryCaptureProvider {
+            delay: Duration::from_millis(250),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                matrix: true,
+            },
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            query_classification: crate::config::QueryClassificationConfig::default(),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
+        let send_task = tokio::spawn(async move {
+            tx.send(traits::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "!room:example.org".to_string(),
+                content: "first question".to_string(),
+                channel: "matrix".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            tx.send(traits::ChannelMessage {
+                id: "msg-2".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "!room:example.org".to_string(),
+                content: "second question".to_string(),
+                channel: "matrix".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            })
+            .await
+            .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+        send_task.await.unwrap();
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].starts_with("!room:example.org:"));
+        assert!(sent_messages[0].contains("response-2"));
+        drop(sent_messages);
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 2);
+        let second_call = &calls[1];
+        assert!(second_call
+            .iter()
+            .any(|(role, content)| { role == "user" && content.contains("first question") }));
+        assert!(second_call
+            .iter()
+            .any(|(role, content)| { role == "user" && content.contains("second question") }));
+        assert!(
+            !second_call.iter().any(|(role, _)| role == "assistant"),
+            "cancelled turn should not persist an assistant response"
+        );
+    }
+
+    #[tokio::test]
     async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -6576,6 +6745,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6663,6 +6833,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6735,6 +6906,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -7365,6 +7537,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -7463,6 +7636,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -7561,6 +7735,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8123,6 +8298,7 @@ This is an example JSON object for profile settings."#;
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8202,6 +8378,7 @@ This is an example JSON object for profile settings."#;
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8355,6 +8532,7 @@ This is an example JSON object for profile settings."#;
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8458,6 +8636,7 @@ This is an example JSON object for profile settings."#;
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8553,6 +8732,7 @@ This is an example JSON object for profile settings."#;
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8668,6 +8848,7 @@ This is an example JSON object for profile settings."#;
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
