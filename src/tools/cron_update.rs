@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
-use crate::cron::{self, CronJobPatch};
+use crate::cron::{self, deserialize_maybe_stringified, CronJobPatch};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -202,7 +202,7 @@ impl Tool for CronUpdateTool {
             }
         };
 
-        let patch = match serde_json::from_value::<CronJobPatch>(patch_val) {
+        let patch = match deserialize_maybe_stringified::<CronJobPatch>(&patch_val) {
             Ok(patch) => patch,
             Err(e) => {
                 return Ok(ToolResult {
