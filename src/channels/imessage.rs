@@ -294,6 +294,7 @@ end tell"#
                                 .unwrap_or_default()
                                 .as_secs(),
                             thread_ts: None,
+                    observe_group: false,
                         };
 
                         if tx.send(msg).await.is_err() {

@@ -12,6 +12,26 @@ pub struct ChannelMessage {
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
+    /// When true, the message is stored in session history for context
+    /// but the agent does not generate a response.  Used by channels with
+    /// `mention_only` to passively observe group conversation.
+    #[cfg_attr(test, allow(dead_code))]
+    pub observe_group: bool,
+}
+
+impl Default for ChannelMessage {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            sender: String::new(),
+            reply_target: String::new(),
+            content: String::new(),
+            channel: String::new(),
+            timestamp: 0,
+            thread_ts: None,
+            observe_group: false,
+        }
+    }
 }
 
 /// Message to send through a channel

@@ -163,6 +163,7 @@ impl WatiChannel {
             channel: "wati".to_string(),
             timestamp,
             thread_ts: None,
+                    observe_group: false,
         });
 
         messages
