@@ -232,15 +232,24 @@ impl Default for ActivatedToolSet {
 // ── System prompt helper ─────────────────────────────────────────────────
 
 /// Build the `<available-deferred-tools>` section for the system prompt.
-/// Lists only tool names so the LLM knows what is available without
-/// consuming context window on full schemas.
+/// Lists tool names with descriptions so the LLM knows what is available without
+/// consuming context window on full schemas. Includes instructions to call
+/// `tool_search` before using these tools.
 pub fn build_deferred_tools_section(deferred: &DeferredMcpToolSet) -> String {
     if deferred.is_empty() {
         return String::new();
     }
-    let mut out = String::from("<available-deferred-tools>\n");
+    let mut out = String::from(
+        "<available-deferred-tools>\n\
+         IMPORTANT: These tools are deferred and CANNOT be called directly. \
+         You MUST call `tool_search` first to activate them before use.\n\
+         Example: tool_search({\"query\": \"select:tool_name\"}) or \
+         tool_search({\"query\": \"keywords to search\"})\n\n",
+    );
     for stub in &deferred.stubs {
         out.push_str(&stub.prefixed_name);
+        out.push_str(" - ");
+        out.push_str(&stub.description);
         out.push('\n');
     }
     out.push_str("</available-deferred-tools>\n");
@@ -395,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn build_deferred_section_lists_names() {
+    fn build_deferred_section_lists_names_with_descriptions() {
         let stubs = vec![
             make_stub("fs__read_file", "Read a file"),
             make_stub("git__status", "Git status"),
@@ -411,8 +420,10 @@ mod tests {
         };
         let section = build_deferred_tools_section(&set);
         assert!(section.contains("<available-deferred-tools>"));
-        assert!(section.contains("fs__read_file"));
-        assert!(section.contains("git__status"));
+        assert!(section.contains("IMPORTANT: These tools are deferred"));
+        assert!(section.contains("MUST call `tool_search` first"));
+        assert!(section.contains("fs__read_file - Read a file"));
+        assert!(section.contains("git__status - Git status"));
         assert!(section.contains("</available-deferred-tools>"));
     }
 
