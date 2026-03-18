@@ -14,6 +14,12 @@ Full pre-PR validation (recommended):
 ./dev/ci.sh all
 ```
 
+Or using Just (if installed):
+
+```bash
+just ci
+```
+
 Docs-only changes: run markdown lint and link-integrity checks. If touching bootstrap scripts: `bash -n install.sh`.
 
 ## Project Snapshot
