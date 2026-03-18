@@ -339,6 +339,17 @@ pub struct Config {
     /// Plugin system configuration (`[plugins]`).
     #[serde(default)]
     pub plugins: PluginsConfig,
+
+    /// Locale for tool descriptions (e.g. `"en"`, `"zh-CN"`).
+    ///
+    /// When set, tool descriptions shown in system prompts are loaded from
+    /// `tool_descriptions/<locale>.toml`. Falls back to English, then to
+    /// hardcoded descriptions.
+    ///
+    /// If omitted or empty, the locale is auto-detected from `ZEROCLAW_LOCALE`,
+    /// `LANG`, or `LC_ALL` environment variables (defaulting to `"en"`).
+    #[serde(default)]
+    pub locale: Option<String>,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -5996,6 +6007,7 @@ impl Default for Config {
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             plugins: PluginsConfig::default(),
+            locale: None,
         }
     }
 }
@@ -8433,6 +8445,7 @@ default_temperature = 0.7
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             plugins: PluginsConfig::default(),
+            locale: None,
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -8766,6 +8779,7 @@ tool_dispatcher = "xml"
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             plugins: PluginsConfig::default(),
+            locale: None,
         };
 
         config.save().await.unwrap();

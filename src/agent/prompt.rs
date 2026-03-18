@@ -1,4 +1,5 @@
 use crate::config::IdentityConfig;
+use crate::i18n::ToolDescriptions;
 use crate::identity;
 use crate::skills::Skill;
 use crate::tools::Tool;
@@ -17,6 +18,9 @@ pub struct PromptContext<'a> {
     pub skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     pub identity_config: Option<&'a IdentityConfig>,
     pub dispatcher_instructions: &'a str,
+    /// Locale-aware tool descriptions. When present, tool descriptions in
+    /// prompts are resolved from the locale file instead of hardcoded values.
+    pub tool_descriptions: Option<&'a ToolDescriptions>,
 }
 
 pub trait PromptSection: Send + Sync {
@@ -124,11 +128,15 @@ impl PromptSection for ToolsSection {
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         let mut out = String::from("## Tools\n\n");
         for tool in ctx.tools {
+            let desc = ctx
+                .tool_descriptions
+                .and_then(|td: &ToolDescriptions| td.get(tool.name()))
+                .unwrap_or_else(|| tool.description());
             let _ = writeln!(
                 out,
                 "- **{}**: {}\n  Parameters: `{}`",
                 tool.name(),
-                tool.description(),
+                desc,
                 tool.parameters_schema()
             );
         }
@@ -317,6 +325,7 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: Some(&identity_config),
             dispatcher_instructions: "",
+            tool_descriptions: None,
         };
 
         let section = IdentitySection;
@@ -345,6 +354,7 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
+            tool_descriptions: None,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Tools"));
@@ -380,6 +390,7 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
+            tool_descriptions: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -418,6 +429,7 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Compact,
             identity_config: None,
             dispatcher_instructions: "",
+            tool_descriptions: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -439,6 +451,7 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
+            tool_descriptions: None,
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
@@ -477,6 +490,7 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
+            tool_descriptions: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();

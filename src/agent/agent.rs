@@ -4,6 +4,7 @@ use crate::agent::dispatcher::{
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
+use crate::i18n::ToolDescriptions;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
@@ -40,6 +41,7 @@ pub struct Agent {
     route_model_by_hint: HashMap<String, String>,
     allowed_tools: Option<Vec<String>>,
     response_cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
+    tool_descriptions: Option<ToolDescriptions>,
 }
 
 pub struct AgentBuilder {
@@ -64,6 +66,7 @@ pub struct AgentBuilder {
     route_model_by_hint: Option<HashMap<String, String>>,
     allowed_tools: Option<Vec<String>>,
     response_cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
+    tool_descriptions: Option<ToolDescriptions>,
 }
 
 impl AgentBuilder {
@@ -90,6 +93,7 @@ impl AgentBuilder {
             route_model_by_hint: None,
             allowed_tools: None,
             response_cache: None,
+            tool_descriptions: None,
         }
     }
 
@@ -207,6 +211,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn tool_descriptions(mut self, tool_descriptions: Option<ToolDescriptions>) -> Self {
+        self.tool_descriptions = tool_descriptions;
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self
             .tools
@@ -257,6 +266,7 @@ impl AgentBuilder {
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
             allowed_tools: allowed,
             response_cache: self.response_cache,
+            tool_descriptions: self.tool_descriptions,
         })
     }
 }
@@ -456,6 +466,7 @@ impl Agent {
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
+            tool_descriptions: self.tool_descriptions.as_ref(),
         };
         self.prompt_builder.build(&ctx)
     }
