@@ -238,14 +238,7 @@ impl WhatsAppWebChannel {
                             if let Some(ref quoted) = ctx.quoted_message {
                                 if let Some(preview) = quoted_preview(quoted) {
                                     let stanza = ctx.stanza_id.clone();
-                                    // Include quoted sender's phone if available
-                                    let from = ctx.participant.as_deref()
-                                        .and_then(|p| p.split('@').next())
-                                        .filter(|p| !p.is_empty());
-                                    let header = match from {
-                                        Some(phone) => format!("[Replying to +{phone}: \"{preview}\"]"),
-                                        None => format!("[Replying to: \"{preview}\"]"),
-                                    };
+                                    let header = format!("[Replying to: \"{preview}\"]");
                                     return Some((header, stanza));
                                 }
                             }
@@ -954,7 +947,7 @@ impl Channel for WhatsAppWebChannel {
         }
 
         // Extract @phone mentions from the message content.
-        let mention_re = regex::Regex::new(r"@(\d{8,15})").unwrap();
+        let mention_re = regex::Regex::new(r"@\+?(\d{8,15})").unwrap();
         let mentioned_jids: Vec<String> = mention_re
             .captures_iter(&message.content)
             .map(|cap| format!("{}@s.whatsapp.net", &cap[1]))
