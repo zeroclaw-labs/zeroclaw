@@ -143,17 +143,22 @@ Add two new dicts to `providers.py`:
 
 ### TOOLS.md Updates
 
-Expand the bootstrap file with:
+Full rewrite of TOOLS.md with:
 
-1. **New tool documentation** for `provider_test` and `provider_models`
-2. **New workflow: "протестируй модель X"** — provider_test flow
-3. **New workflow: "какие модели у X?"** — provider_models flow
-4. **New workflow: "удали X из фоллбэков"** — remove_fallback flow
-5. **New workflow: "валидируй ключ"** — provider_test with explicit key
-6. **Multi-turn examples** showing contextual chains:
-   - "сколько ключей deepseek?" → "какие модели там?" → "установи deepseek-reasoner основной"
-   - "найди ключи groq" → "проверь первый" → "добавь его"
-7. **Updated provider ↔ model table** — only providers present in `providers.py`. zhipu/alibaba/sambanova/cohere noted as "planned, not yet supported"
+1. **Complete tool reference** — all 6 tools with full parameter signatures, types, and descriptions
+2. **Provider ↔ Model reference table** — exact model IDs, case-sensitivity notes, test prompt hints per provider (e.g. "deepseek-reasoner is slow, use short prompt", "MiniMax IDs are case-sensitive")
+3. **Per-provider testing guide** — which model to use for quick checks, which to avoid, key format notes
+4. **All workflows** with concrete parameter examples:
+   - "добавь провайдера X" (key_store → provider_apply → provider_test)
+   - "переключи на модель Y" (provider_apply set_default)
+   - "удали X из фоллбэков" (provider_apply remove_fallback)
+   - "протестируй модель X" (provider_test)
+   - "валидируй ключ" (provider_test with key param)
+   - "какие модели у X?" (provider_models)
+   - "проверь/почини провайдеры" (provider_health)
+   - "статус провайдеров" (provider_status)
+5. **Multi-turn examples** showing contextual chains with actual tool calls
+6. **Critical rules** — string types, case-sensitivity, key sourcing, cheapest model preference
 
 ### Multi-turn Context
 
