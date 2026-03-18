@@ -1,6 +1,8 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
-use crate::cron::{self, DeliveryConfig, JobType, Schedule, SessionTarget};
+use crate::cron::{
+    self, deserialize_maybe_stringified, DeliveryConfig, JobType, Schedule, SessionTarget,
+};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -176,7 +178,7 @@ impl Tool for CronAddTool {
         }
 
         let schedule = match args.get("schedule") {
-            Some(v) => match serde_json::from_value::<Schedule>(v.clone()) {
+            Some(v) => match deserialize_maybe_stringified::<Schedule>(v) {
                 Ok(schedule) => schedule,
                 Err(e) => {
                     return Ok(ToolResult {
@@ -509,6 +511,63 @@ mod tests {
             .await
             .unwrap();
         assert!(approved.success, "{:?}", approved.error);
+    }
+
+    #[tokio::test]
+    async fn accepts_schedule_passed_as_json_string() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        // Simulate the LLM double-serializing the schedule: the value arrives
+        // as a JSON string containing a JSON object, rather than an object.
+        let result = tool
+            .execute(json!({
+                "schedule": r#"{"kind":"cron","expr":"*/5 * * * *"}"#,
+                "job_type": "shell",
+                "command": "echo string-schedule"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("next_run"));
+    }
+
+    #[tokio::test]
+    async fn accepts_stringified_interval_schedule() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "schedule": r#"{"kind":"every","every_ms":60000}"#,
+                "job_type": "shell",
+                "command": "echo interval"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+    }
+
+    #[tokio::test]
+    async fn accepts_stringified_schedule_with_timezone() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "schedule": r#"{"kind":"cron","expr":"*/30 9-15 * * 1-5","tz":"Asia/Shanghai"}"#,
+                "job_type": "shell",
+                "command": "echo tz-test"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
     }
 
     #[tokio::test]
