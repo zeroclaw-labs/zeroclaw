@@ -867,7 +867,9 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
                 if let Some(credential) = resolve_minimax_oauth_refresh_token(name) {
                     return Some(credential);
                 }
-            } else if name == "anthropic" || name == "openai" || name == "groq" {
+            } else if name == "anthropic" || name == "openai" || name == "groq"
+                || is_qwen_coding_alias(name)
+            {
                 // For well-known providers, prefer provider-specific env vars over the
                 // global api_key override, since the global key may belong to a different
                 // provider (e.g. a custom: gateway). This enables multi-provider setups
@@ -876,6 +878,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
                     "anthropic" => &["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
                     "openai" => &["OPENAI_API_KEY"],
                     "groq" => &["GROQ_API_KEY"],
+                    name if is_qwen_coding_alias(name) => &["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY", "BAILIAN_API_KEY"],
                     _ => &[],
                 };
                 for env_var in env_candidates {
@@ -1295,12 +1298,21 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        name if is_qwen_coding_alias(name) && qwen_base_url(name).is_some() => {
-            Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
-                "Qwen Coding",
-                qwen_base_url(name).expect("checked in guard"),
+        name if is_qwen_coding_alias(name) => {
+            // Alibaba Coding Plan uses Anthropic Messages API format,
+            // not OpenAI Chat Completions.
+            let base_url = if is_qwen_coding_cn_alias(name) {
+                QWEN_CODING_CN_BASE_URL
+            } else {
+                QWEN_CODING_INTL_BASE_URL
+            };
+            // The base URL includes /v1 but AnthropicProvider appends /v1/messages,
+            // so we need to strip /v1 and use /apps/anthropic as the base.
+            let anthropic_base = base_url.trim_end_matches("/v1");
+            let anthropic_url = format!("{}/apps/anthropic", anthropic_base);
+            Ok(Box::new(anthropic::AnthropicProvider::with_base_url(
                 key,
-                AuthStyle::Bearer,
+                Some(&anthropic_url),
             )))
         }
         name if qwen_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new_with_vision(

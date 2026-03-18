@@ -188,6 +188,13 @@ impl AnthropicProvider {
         }
     }
 
+    /// The user-agent string used in all Anthropic API requests.
+    /// Some Anthropic-compatible endpoints (e.g. Alibaba Coding Plan) require
+    /// a non-empty User-Agent header.
+    fn user_agent() -> &'static str {
+        "zeroclaw/0.5"
+    }
+
     fn is_setup_token(token: &str) -> bool {
         token.starts_with("sk-ant-oat01-")
     }
@@ -522,7 +529,21 @@ impl AnthropicProvider {
     }
 
     fn http_client(&self) -> Client {
-        crate::config::build_runtime_proxy_client_with_timeouts("provider.anthropic", 120, 10)
+        // Build via the standard proxy-aware builder, but ensure a non-empty
+        // User-Agent is always set.  Some Anthropic-compatible endpoints
+        // (e.g. Alibaba Coding Plan) reject requests without one.
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .user_agent(Self::user_agent())
+            .build()
+            .unwrap_or_else(|_| {
+                crate::config::build_runtime_proxy_client_with_timeouts(
+                    "provider.anthropic",
+                    120,
+                    10,
+                )
+            })
     }
 }
 
@@ -552,18 +573,38 @@ impl Provider for AnthropicProvider {
             temperature,
         };
 
+        let url = format!("{}/v1/messages", self.base_url);
+        let request_body = serde_json::to_string(&request).unwrap_or_default();
+        tracing::debug!(
+            base_url = %self.base_url,
+            url = %url,
+            model = %model,
+            has_credential = credential.len() > 0,
+            credential_prefix = %&credential[..credential.len().min(10)],
+            request_body_len = request_body.len(),
+            "Anthropic chat_with_system: sending request"
+        );
+        tracing::debug!(request_body = %request_body, "Anthropic request body");
         let mut request = self
             .http_client()
-            .post(format!("{}/v1/messages", self.base_url))
+            .post(&url)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&request);
+            .body(request_body);
 
         request = self.apply_auth(request, credential);
 
         let response = request.send().await?;
 
         if !response.status().is_success() {
+            let status = response.status();
+            tracing::warn!(
+                base_url = %self.base_url,
+                url = %url,
+                status = %status,
+                credential_prefix = %&credential[..credential.len().min(10)],
+                "Anthropic chat_with_system: request failed"
+            );
             return Err(super::api_error("Anthropic", response).await);
         }
 
@@ -599,15 +640,31 @@ impl Provider for AnthropicProvider {
             tools: Self::convert_tools(request.tools),
         };
 
+        let url = format!("{}/v1/messages", self.base_url);
+        tracing::debug!(
+            base_url = %self.base_url,
+            url = %url,
+            model = %model,
+            has_credential = credential.len() > 0,
+            credential_prefix = %&credential[..credential.len().min(10)],
+            "Anthropic provider: sending request"
+        );
         let req = self
             .http_client()
-            .post(format!("{}/v1/messages", self.base_url))
+            .post(&url)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&native_request);
 
         let response = self.apply_auth(req, credential).send().await?;
         if !response.status().is_success() {
+            let status = response.status();
+            tracing::warn!(
+                base_url = %self.base_url,
+                url = %url,
+                status = %status,
+                "Anthropic provider: request failed"
+            );
             return Err(super::api_error("Anthropic", response).await);
         }
 
