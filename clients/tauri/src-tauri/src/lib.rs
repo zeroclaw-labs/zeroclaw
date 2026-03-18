@@ -648,6 +648,11 @@ fn spawn_zeroclaw_gateway(app: &tauri::App) {
                 &format!("Starting backend service (attempt {attempt}/{MAX_SIDECAR_RETRIES})..."),
             );
 
+            // Track sidecar event receiver (Tauri sidecar) or std Child (PATH fallback)
+            // so we can detect early termination and capture stderr.
+            let mut sidecar_rx: Option<tauri::async_runtime::Receiver<tauri_plugin_shell::process::CommandEvent>> = None;
+            let mut std_child: Option<std::process::Child> = None;
+
             // Create a fresh sidecar command each attempt (Command is consumed on spawn)
             let launch_result = match app_handle.shell().sidecar("zeroclaw") {
                 Ok(sidecar) => {
@@ -655,7 +660,10 @@ fn spawn_zeroclaw_gateway(app: &tauri::App) {
                         .args(["gateway", "--host", DEFAULT_GATEWAY_HOST, "--port", &DEFAULT_GATEWAY_PORT.to_string()])
                         .spawn()
                     {
-                        Ok(_) => Ok(()),
+                        Ok((rx, _child)) => {
+                            sidecar_rx = Some(rx);
+                            Ok(())
+                        }
                         Err(e) => Err(format!("Sidecar spawn failed: {e}")),
                     }
                 }
@@ -668,7 +676,11 @@ fn spawn_zeroclaw_gateway(app: &tauri::App) {
                         .stderr(std::process::Stdio::piped())
                         .spawn()
                     {
-                        Ok(_) => Ok(()),
+                        Ok(child) => {
+                            eprintln!("[MoA] Launched backend via system PATH (pid: {})", child.id());
+                            std_child = Some(child);
+                            Ok(())
+                        }
                         Err(e2) => Err(format!("System PATH fallback failed: {e2}")),
                     }
                 }
@@ -688,10 +700,95 @@ fn spawn_zeroclaw_gateway(app: &tauri::App) {
             }
 
             // Step 3: Wait for gateway health (up to GATEWAY_READY_TIMEOUT_MS)
+            // Also check if the process died early to avoid wasting 30s.
             let poll_interval_ms = 500;
             let max_polls = GATEWAY_READY_TIMEOUT_MS / poll_interval_ms;
+            let mut process_died = false;
+            let mut stderr_output = String::new();
+
             for i in 0..max_polls {
                 tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+
+                // Check if sidecar process terminated early (Tauri sidecar path)
+                if let Some(ref mut rx) = sidecar_rx {
+                    use tauri_plugin_shell::process::CommandEvent;
+                    while let Ok(event) = rx.try_recv() {
+                        match event {
+                            CommandEvent::Stderr(data) => {
+                                let line = String::from_utf8_lossy(&data);
+                                let trimmed = line.trim();
+                                if !trimmed.is_empty() {
+                                    eprintln!("[MoA backend] {trimmed}");
+                                    // Keep last 1024 chars for error reporting
+                                    if stderr_output.len() < 1024 {
+                                        stderr_output.push_str(trimmed);
+                                        stderr_output.push('\n');
+                                    }
+                                }
+                            }
+                            CommandEvent::Stdout(data) => {
+                                let line = String::from_utf8_lossy(&data);
+                                let trimmed = line.trim();
+                                if !trimmed.is_empty() {
+                                    eprintln!("[MoA backend] {trimmed}");
+                                }
+                            }
+                            CommandEvent::Error(msg) => {
+                                eprintln!("[MoA] Backend process error: {msg}");
+                                if stderr_output.len() < 1024 {
+                                    stderr_output.push_str(&msg);
+                                    stderr_output.push('\n');
+                                }
+                            }
+                            CommandEvent::Terminated(payload) => {
+                                eprintln!(
+                                    "[MoA] Backend process terminated early (code: {:?}, signal: {:?})",
+                                    payload.code, payload.signal
+                                );
+                                process_died = true;
+                            }
+                        }
+                    }
+                }
+
+                // Check if std::process child terminated early (PATH fallback)
+                if let Some(ref mut child) = std_child {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            eprintln!("[MoA] Backend process exited early with status: {status}");
+                            // Capture stderr from the dead process
+                            if let Some(mut stderr) = child.stderr.take() {
+                                use std::io::Read;
+                                let mut buf = vec![0u8; 4096];
+                                if let Ok(n) = stderr.read(&mut buf) {
+                                    let msg = String::from_utf8_lossy(&buf[..n]);
+                                    let trimmed = msg.trim();
+                                    if !trimmed.is_empty() {
+                                        eprintln!("[MoA backend stderr] {trimmed}");
+                                        stderr_output = trimmed.to_string();
+                                    }
+                                }
+                            }
+                            process_died = true;
+                        }
+                        Ok(None) => {} // still running
+                        Err(e) => {
+                            eprintln!("[MoA] Failed to check backend process status: {e}");
+                        }
+                    }
+                }
+
+                if process_died {
+                    let detail = if stderr_output.is_empty() {
+                        "Backend process crashed. Check ZeroClaw logs or run 'zeroclaw gateway' manually.".to_string()
+                    } else {
+                        format!("Backend process crashed: {}", stderr_output.lines().last().unwrap_or("unknown error"))
+                    };
+                    eprintln!("[MoA] {detail}");
+                    emit_gateway_status(&app_handle, "starting", &detail);
+                    break;
+                }
+
                 if is_gateway_reachable(&gateway_url).await {
                     eprintln!("[MoA] Backend service ready after {}ms", (i + 1) * poll_interval_ms);
                     gateway_running.store(true, Ordering::SeqCst);
@@ -700,17 +797,21 @@ fn spawn_zeroclaw_gateway(app: &tauri::App) {
                 }
             }
 
-            eprintln!("[MoA] Backend service not responding after {GATEWAY_READY_TIMEOUT_MS}ms (attempt {attempt})");
+            if !process_died {
+                eprintln!("[MoA] Backend service not responding after {GATEWAY_READY_TIMEOUT_MS}ms (attempt {attempt})");
+            }
             if attempt < MAX_SIDECAR_RETRIES {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         }
 
         eprintln!("[MoA] Error: Backend service failed to start after {MAX_SIDECAR_RETRIES} attempts");
+        eprintln!("[MoA] Troubleshooting: run 'cargo build' from the workspace root, then retry.");
+        eprintln!("[MoA] Or run 'zeroclaw gateway --host 127.0.0.1 --port 3000' manually to see errors.");
         emit_gateway_status(
             &app_handle,
             "failed",
-            "Backend service failed to start. Please ensure ZeroClaw is installed or check the logs.",
+            "Backend service failed to start. Run 'cargo build' first or check logs.",
         );
     });
 
