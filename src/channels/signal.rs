@@ -26,6 +26,7 @@ pub struct SignalChannel {
     account: String,
     group_id: Option<String>,
     allowed_from: Vec<String>,
+    mention_only: bool,
     ignore_attachments: bool,
     ignore_stories: bool,
 }
@@ -61,7 +62,17 @@ struct DataMessage {
     #[serde(rename = "groupInfo", default)]
     group_info: Option<GroupInfo>,
     #[serde(default)]
+    mentions: Option<Vec<Mention>>,
+    #[serde(default)]
     attachments: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Mention {
+    #[serde(default)]
+    number: Option<String>,
+    #[serde(default)]
+    uuid: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +87,7 @@ impl SignalChannel {
         account: String,
         group_id: Option<String>,
         allowed_from: Vec<String>,
+        mention_only: bool,
         ignore_attachments: bool,
         ignore_stories: bool,
     ) -> Self {
@@ -85,6 +97,7 @@ impl SignalChannel {
             account,
             group_id,
             allowed_from,
+            mention_only,
             ignore_attachments,
             ignore_stories,
         }
@@ -167,6 +180,23 @@ impl SignalChannel {
         }
     }
 
+    fn is_group_message(data_msg: &DataMessage) -> bool {
+        data_msg
+            .group_info
+            .as_ref()
+            .and_then(|g| g.group_id.as_deref())
+            .is_some()
+    }
+
+    fn is_account_mentioned(&self, data_msg: &DataMessage) -> bool {
+        data_msg.mentions.as_ref().is_some_and(|mentions| {
+            mentions.iter().any(|mention| {
+                mention.number.as_deref() == Some(self.account.as_str())
+                    || mention.uuid.as_deref() == Some(self.account.as_str())
+            })
+        })
+    }
+
     /// Send a JSON-RPC request to signal-cli daemon.
     async fn rpc_request(
         &self,
@@ -240,6 +270,13 @@ impl SignalChannel {
         }
 
         if !self.matches_group(data_msg) {
+            return None;
+        }
+
+        if self.mention_only
+            && Self::is_group_message(data_msg)
+            && !self.is_account_mentioned(data_msg)
+        {
             return None;
         }
 
@@ -461,6 +498,7 @@ mod tests {
             vec!["+1111111111".to_string()],
             false,
             false,
+            false,
         )
     }
 
@@ -470,6 +508,7 @@ mod tests {
             "+1234567890".to_string(),
             Some(group_id.to_string()),
             vec!["*".to_string()],
+            false,
             true,
             true,
         )
@@ -483,6 +522,7 @@ mod tests {
                 message: Some(m.to_string()),
                 timestamp: Some(1_700_000_000_000),
                 group_info: None,
+                mentions: None,
                 attachments: None,
             }),
             story_message: None,
@@ -497,6 +537,7 @@ mod tests {
         assert_eq!(ch.account, "+1234567890");
         assert!(ch.group_id.is_none());
         assert_eq!(ch.allowed_from.len(), 1);
+        assert!(!ch.mention_only);
         assert!(!ch.ignore_attachments);
         assert!(!ch.ignore_stories);
     }
@@ -508,6 +549,7 @@ mod tests {
             "+1234567890".to_string(),
             None,
             vec![],
+            false,
             false,
             false,
         );
@@ -541,6 +583,7 @@ mod tests {
             vec![],
             false,
             false,
+            false,
         );
         assert!(!ch.is_sender_allowed("+1111111111"));
     }
@@ -558,6 +601,7 @@ mod tests {
             message: Some("hi".to_string()),
             timestamp: Some(1000),
             group_info: None,
+            mentions: None,
             attachments: None,
         };
         assert!(ch.matches_group(&dm));
@@ -568,6 +612,7 @@ mod tests {
             group_info: Some(GroupInfo {
                 group_id: Some("group123".to_string()),
             }),
+            mentions: None,
             attachments: None,
         };
         assert!(ch.matches_group(&group));
@@ -582,6 +627,7 @@ mod tests {
             group_info: Some(GroupInfo {
                 group_id: Some("group123".to_string()),
             }),
+            mentions: None,
             attachments: None,
         };
         assert!(ch.matches_group(&matching));
@@ -592,6 +638,7 @@ mod tests {
             group_info: Some(GroupInfo {
                 group_id: Some("other_group".to_string()),
             }),
+            mentions: None,
             attachments: None,
         };
         assert!(!ch.matches_group(&non_matching));
@@ -604,6 +651,7 @@ mod tests {
             message: Some("hi".to_string()),
             timestamp: Some(1000),
             group_info: None,
+            mentions: None,
             attachments: None,
         };
         assert!(ch.matches_group(&dm));
@@ -614,6 +662,7 @@ mod tests {
             group_info: Some(GroupInfo {
                 group_id: Some("group123".to_string()),
             }),
+            mentions: None,
             attachments: None,
         };
         assert!(!ch.matches_group(&group));
@@ -626,6 +675,7 @@ mod tests {
             message: Some("hi".to_string()),
             timestamp: Some(1000),
             group_info: None,
+            mentions: None,
             attachments: None,
         };
         assert_eq!(ch.reply_target(&dm, "+1111111111"), "+1111111111");
@@ -640,6 +690,7 @@ mod tests {
             group_info: Some(GroupInfo {
                 group_id: Some("group123".to_string()),
             }),
+            mentions: None,
             attachments: None,
         };
         assert_eq!(ch.reply_target(&group, "+1111111111"), "group:group123");
@@ -730,6 +781,7 @@ mod tests {
             vec!["*".to_string()],
             false,
             false,
+            false,
         );
         let env = Envelope {
             source: Some(uuid.to_string()),
@@ -738,6 +790,7 @@ mod tests {
                 message: Some("Hello from privacy user".to_string()),
                 timestamp: Some(1_700_000_000_000),
                 group_info: None,
+                mentions: None,
                 attachments: None,
             }),
             story_message: None,
@@ -763,6 +816,7 @@ mod tests {
             vec!["*".to_string()],
             false,
             false,
+            false,
         );
         let env = Envelope {
             source: Some(uuid.to_string()),
@@ -773,6 +827,7 @@ mod tests {
                 group_info: Some(GroupInfo {
                     group_id: Some("testgroup".to_string()),
                 }),
+                mentions: None,
                 attachments: None,
             }),
             story_message: None,
@@ -848,12 +903,101 @@ mod tests {
                 message: None,
                 timestamp: Some(1_700_000_000_000),
                 group_info: None,
+                mentions: None,
                 attachments: Some(vec![serde_json::json!({"contentType": "image/png"})]),
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
         };
         assert!(ch.process_envelope(&env).is_none());
+    }
+
+    #[test]
+    fn mention_only_group_without_mention_is_rejected() {
+        let ch = SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            None,
+            vec!["*".to_string()],
+            true,
+            false,
+            false,
+        );
+        let env = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            data_message: Some(DataMessage {
+                message: Some("hello group".to_string()),
+                timestamp: Some(1_700_000_000_000),
+                group_info: Some(GroupInfo {
+                    group_id: Some("group123".to_string()),
+                }),
+                mentions: None,
+                attachments: None,
+            }),
+            story_message: None,
+            timestamp: Some(1_700_000_000_000),
+        };
+        assert!(ch.process_envelope(&env).is_none());
+    }
+
+    #[test]
+    fn mention_only_group_with_matching_number_passes() {
+        let ch = SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            None,
+            vec!["*".to_string()],
+            true,
+            false,
+            false,
+        );
+        let env = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            data_message: Some(DataMessage {
+                message: Some("hello @bot".to_string()),
+                timestamp: Some(1_700_000_000_000),
+                group_info: Some(GroupInfo {
+                    group_id: Some("group123".to_string()),
+                }),
+                mentions: Some(vec![Mention {
+                    number: Some("+1234567890".to_string()),
+                    uuid: None,
+                }]),
+                attachments: None,
+            }),
+            story_message: None,
+            timestamp: Some(1_700_000_000_000),
+        };
+        assert!(ch.process_envelope(&env).is_some());
+    }
+
+    #[test]
+    fn mention_only_direct_message_bypasses_gate() {
+        let ch = SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            None,
+            vec!["*".to_string()],
+            true,
+            false,
+            false,
+        );
+        let env = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            data_message: Some(DataMessage {
+                message: Some("hello in dm".to_string()),
+                timestamp: Some(1_700_000_000_000),
+                group_info: None,
+                mentions: None,
+                attachments: None,
+            }),
+            story_message: None,
+            timestamp: Some(1_700_000_000_000),
+        };
+        assert!(ch.process_envelope(&env).is_some());
     }
 
     #[test]

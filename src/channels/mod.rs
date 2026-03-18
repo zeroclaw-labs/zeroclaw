@@ -3473,6 +3473,7 @@ fn collect_configured_channels(
                 sig.account.clone(),
                 sig.group_id.clone(),
                 sig.allowed_from.clone(),
+                sig.mention_only,
                 sig.ignore_attachments,
                 sig.ignore_stories,
             )),

@@ -4731,6 +4731,10 @@ pub struct SignalConfig {
     /// Allowed sender phone numbers (E.164) or "*" for all.
     #[serde(default)]
     pub allowed_from: Vec<String>,
+    /// In group chats, only respond when the Signal account is explicitly mentioned.
+    /// Direct messages bypass this gate.
+    #[serde(default)]
+    pub mention_only: bool,
     /// Skip messages that are attachment-only (no text body).
     #[serde(default)]
     pub ignore_attachments: bool,
@@ -9123,6 +9127,7 @@ allowed_users = ["@ops:matrix.org"]
             account: "+1234567890".into(),
             group_id: Some("group123".into()),
             allowed_from: vec!["+1111111111".into()],
+            mention_only: true,
             ignore_attachments: true,
             ignore_stories: false,
         };
@@ -9132,6 +9137,7 @@ allowed_users = ["@ops:matrix.org"]
         assert_eq!(parsed.account, "+1234567890");
         assert_eq!(parsed.group_id.as_deref(), Some("group123"));
         assert_eq!(parsed.allowed_from.len(), 1);
+        assert!(parsed.mention_only);
         assert!(parsed.ignore_attachments);
         assert!(!parsed.ignore_stories);
     }
@@ -9143,6 +9149,7 @@ allowed_users = ["@ops:matrix.org"]
             account: "+9876543210".into(),
             group_id: None,
             allowed_from: vec!["*".into()],
+            mention_only: false,
             ignore_attachments: false,
             ignore_stories: true,
         };
@@ -9160,6 +9167,7 @@ allowed_users = ["@ops:matrix.org"]
         let parsed: SignalConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.group_id.is_none());
         assert!(parsed.allowed_from.is_empty());
+        assert!(!parsed.mention_only);
         assert!(!parsed.ignore_attachments);
         assert!(!parsed.ignore_stories);
     }

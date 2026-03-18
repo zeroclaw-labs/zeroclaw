@@ -411,6 +411,7 @@ pub(crate) async fn deliver_announcement(
                 sg.account.clone(),
                 sg.group_id.clone(),
                 sg.allowed_from.clone(),
+                sg.mention_only,
                 sg.ignore_attachments,
                 sg.ignore_stories,
             );

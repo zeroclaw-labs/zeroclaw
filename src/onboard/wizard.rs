@@ -4151,6 +4151,11 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         .collect()
                 };
 
+                let mention_only = Confirm::new()
+                    .with_prompt("  In groups, only respond when explicitly mentioned?")
+                    .default(false)
+                    .interact()?;
+
                 let ignore_attachments = Confirm::new()
                     .with_prompt("  Ignore attachment-only messages?")
                     .default(false)
@@ -4166,6 +4171,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     account: account.trim().to_string(),
                     group_id,
                     allowed_from,
+                    mention_only,
                     ignore_attachments,
                     ignore_stories,
                 });
@@ -7251,6 +7257,7 @@ mod tests {
             account: "+1234567890".into(),
             group_id: None,
             allowed_from: vec!["*".into()],
+            mention_only: false,
             ignore_attachments: false,
             ignore_stories: true,
         });
