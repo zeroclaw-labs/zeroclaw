@@ -4731,6 +4731,10 @@ pub struct MattermostConfig {
     /// Other messages in the channel are silently ignored.
     #[serde(default)]
     pub mention_only: Option<bool>,
+    /// When true, a newer Mattermost message from the same sender in the same channel
+    /// cancels the in-flight request and starts a fresh response with preserved history.
+    #[serde(default)]
+    pub interrupt_on_new_message: bool,
 }
 
 impl ChannelConfig for MattermostConfig {
@@ -9711,6 +9715,21 @@ channel_id = "C123"
         assert_eq!(parsed.thread_replies, None);
         assert!(!parsed.mention_only);
         assert_eq!(parsed.channel_id.as_deref(), Some("C123"));
+    }
+
+    #[test]
+    async fn mattermost_config_default_interrupt_on_new_message_is_false() {
+        let json = r#"{"url":"https://mm.example.com","bot_token":"tok"}"#;
+        let parsed: MattermostConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.interrupt_on_new_message);
+    }
+
+    #[test]
+    async fn mattermost_config_deserializes_interrupt_on_new_message_true() {
+        let json =
+            r#"{"url":"https://mm.example.com","bot_token":"tok","interrupt_on_new_message":true}"#;
+        let parsed: MattermostConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.interrupt_on_new_message);
     }
 
     #[test]
