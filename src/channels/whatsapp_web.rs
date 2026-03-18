@@ -172,23 +172,23 @@ impl WhatsAppWebChannel {
     /// a human-readable prefix like `[Replying to: "original text"]` so the
     /// agent can see what message the user is responding to.
     #[cfg(feature = "whatsapp-web")]
-    fn extract_reply_context(msg: &wa_rs_proto::whatsapp::Message) -> Option<String> {
+    /// Extract reply context from a quoted message.
+    /// Returns `(preview_text, quoted_stanza_id)`.
+    fn extract_reply_context(
+        msg: &wa_rs_proto::whatsapp::Message,
+    ) -> Option<(String, Option<String>)> {
         use wa_rs_core::proto_helpers::MessageExt;
 
         let base = msg.get_base_message();
 
         /// Try to extract a displayable preview from a quoted message.
-        /// Checks text content first, then falls back to image/video caption,
-        /// and finally to a media-type placeholder.
         fn quoted_preview(quoted: &wa_rs_proto::whatsapp::Message) -> Option<String> {
             use wa_rs_core::proto_helpers::MessageExt as _;
-            // 1. Text content (conversation or extended_text_message)
             if let Some(text) = quoted.text_content() {
                 if !text.is_empty() {
                     return Some(truncate_reply_preview(text, 200));
                 }
             }
-            // 2. Image caption
             if let Some(ref img) = quoted.image_message {
                 return Some(
                     img.caption
@@ -198,7 +198,6 @@ impl WhatsAppWebChannel {
                         .unwrap_or_else(|| "[Photo]".to_string()),
                 );
             }
-            // 3. Video caption
             if let Some(ref vid) = quoted.video_message {
                 return Some(
                     vid.caption
@@ -208,7 +207,6 @@ impl WhatsAppWebChannel {
                         .unwrap_or_else(|| "[Video]".to_string()),
                 );
             }
-            // 4. Document filename
             if let Some(ref doc) = quoted.document_message {
                 return Some(
                     doc.file_name
@@ -217,19 +215,15 @@ impl WhatsAppWebChannel {
                         .unwrap_or_else(|| "[Document]".to_string()),
                 );
             }
-            // 5. Audio / voice note
             if quoted.audio_message.is_some() {
                 return Some("[Voice message]".to_string());
             }
-            // 6. Sticker
             if quoted.sticker_message.is_some() {
                 return Some("[Sticker]".to_string());
             }
-            // 7. Location
             if quoted.location_message.is_some() {
                 return Some("[Location]".to_string());
             }
-            // 8. Contact
             if quoted.contact_message.is_some() {
                 return Some("[Contact]".to_string());
             }
@@ -243,8 +237,10 @@ impl WhatsAppWebChannel {
                         if let Some(ref ctx) = m.context_info {
                             if let Some(ref quoted) = ctx.quoted_message {
                                 if let Some(preview) = quoted_preview(quoted) {
-                                    return Some(format!(
-                                        "[Replying to: \"{preview}\"]",
+                                    let stanza = ctx.stanza_id.clone();
+                                    return Some((
+                                        format!("[Replying to: \"{preview}\"]"),
+                                        stanza,
                                     ));
                                 }
                             }
@@ -265,8 +261,27 @@ impl WhatsAppWebChannel {
             contact_message,
         );
 
-        // Plain `conversation` messages don't carry context_info in the proto;
-        // they cannot be quote-replies.
+        None
+    }
+
+    /// Look up a previously downloaded image by the quoted message's stanza ID.
+    /// Checks for `img_{stanza_id}.*` in the whatsapp_files directory.
+    fn find_image_by_stanza_id(
+        workspace_dir: Option<&std::path::Path>,
+        stanza_id: &str,
+    ) -> Option<std::path::PathBuf> {
+        let workspace = workspace_dir?;
+        let save_dir = workspace.join("whatsapp_files");
+        let safe_id: String = stanza_id
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        for ext in &["jpg", "png", "webp", "gif", "bmp"] {
+            let path = save_dir.join(format!("img_{safe_id}.{ext}"));
+            if path.exists() {
+                return Some(path);
+            }
+        }
         None
     }
 
@@ -279,6 +294,7 @@ impl WhatsAppWebChannel {
         client: &wa_rs::Client,
         image: &wa_rs_proto::whatsapp::message::ImageMessage,
         workspace_dir: Option<&std::path::Path>,
+        message_id: &str,
     ) -> Option<std::path::PathBuf> {
         let workspace = workspace_dir.or_else(|| {
             tracing::warn!("WhatsApp Web: cannot save image — workspace_dir not configured");
@@ -315,10 +331,12 @@ impl WhatsAppWebChannel {
             _ => "jpg", // WhatsApp default
         };
 
-        let filename = format!(
-            "img_{}.{ext}",
-            chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f")
-        );
+        // Sanitize message_id for filesystem safety
+        let safe_id: String = message_id
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let filename = format!("img_{safe_id}.{ext}");
         let local_path = save_dir.join(&filename);
 
         if let Err(e) = tokio::fs::write(&local_path, &data).await {
@@ -884,6 +902,7 @@ impl Channel for WhatsAppWebChannel {
                                 let sender_alt = info.source.sender_alt.clone();
                                 let sender = sender_jid.user().to_string();
                                 let chat = info.source.chat.to_string();
+                                let wa_message_id = info.id.to_string();
 
                                 let mapped_phone = if sender_jid.is_lid() {
                                     client.get_phone_number_from_lid(&sender_jid.user).await
@@ -950,6 +969,7 @@ impl Channel for WhatsAppWebChannel {
                                         &client,
                                         image,
                                         workspace_dir.as_deref(),
+                                        &wa_message_id,
                                     )
                                     .await
                                     {
@@ -980,12 +1000,24 @@ impl Channel for WhatsAppWebChannel {
 
                                 // Prepend reply/quote context so the agent knows
                                 // what message the user is responding to.
-                                if let Some(quote) = Self::extract_reply_context(&msg) {
-                                    if content.is_empty() {
-                                        content = quote;
-                                    } else {
-                                        content = format!("{quote}\n\n{content}");
+                                // If replying to an image, resolve the cached file.
+                                if let Some((quote, stanza_id)) = Self::extract_reply_context(&msg) {
+                                    // Check if the quoted message has a cached image
+                                    let image_ref = stanza_id.as_deref().and_then(|sid| {
+                                        Self::find_image_by_stanza_id(
+                                            workspace_dir.as_deref(),
+                                            sid,
+                                        )
+                                    });
+                                    let mut parts = Vec::new();
+                                    if let Some(img_path) = image_ref {
+                                        parts.push(format!("[IMAGE:{}]", img_path.display()));
                                     }
+                                    parts.push(quote);
+                                    if !content.is_empty() {
+                                        parts.push(content);
+                                    }
+                                    content = parts.join("\n\n");
                                 }
 
                                 tracing::info!(
@@ -1044,11 +1076,26 @@ impl Channel for WhatsAppWebChannel {
 
                                         if !is_mentioned {
                                             tracing::debug!(
-                                                "WhatsApp Web: mention_only enabled, skipping group message (not mentioned, mentioned_jids={:?}, own_pn={:?}, own_lid={:?})",
+                                                "WhatsApp Web: mention_only — storing group message as observe_group (mentioned_jids={:?}, own_pn={:?}, own_lid={:?})",
                                                 mentioned,
                                                 pn_user,
                                                 lid_user,
                                             );
+                                            // Store in session for context but don't respond.
+                                            if !content.is_empty() {
+                                                let _ = tx_inner
+                                                    .send(ChannelMessage {
+                                                        id: wa_message_id.clone(),
+                                                        channel: "whatsapp".to_string(),
+                                                        sender: normalized.clone(),
+                                                        reply_target: chat,
+                                                        content,
+                                                        timestamp: chrono::Utc::now().timestamp().cast_unsigned(),
+                                                        thread_ts: None,
+                                                        observe_group: true,
+                                                    })
+                                                    .await;
+                                            }
                                             return;
                                         }
                                     }
@@ -1056,7 +1103,7 @@ impl Channel for WhatsAppWebChannel {
 
                                 if let Err(e) = tx_inner
                                     .send(ChannelMessage {
-                                        id: uuid::Uuid::new_v4().to_string(),
+                                        id: wa_message_id,
                                         channel: "whatsapp".to_string(),
                                         sender: normalized.clone(),
                                         // Reply to the originating chat JID (DM or group).
@@ -1064,6 +1111,7 @@ impl Channel for WhatsAppWebChannel {
                                         content,
                                         timestamp: chrono::Utc::now().timestamp().cast_unsigned(),
                                         thread_ts: None,
+                                        observe_group: false,
                                     })
                                     .await
                                 {
