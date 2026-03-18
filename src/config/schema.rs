@@ -1163,6 +1163,34 @@ pub struct SkillsConfig {
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
+    /// Autonomous skill creation from successful multi-step task executions.
+    #[serde(default)]
+    pub skill_creation: SkillCreationConfig,
+}
+
+/// Autonomous skill creation configuration (`[skills.skill_creation]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct SkillCreationConfig {
+    /// Enable automatic skill creation after successful multi-step tasks.
+    /// Default: `false`.
+    pub enabled: bool,
+    /// Maximum number of auto-generated skills to keep.
+    /// When exceeded, the oldest auto-generated skill is removed (LRU eviction).
+    pub max_skills: usize,
+    /// Embedding similarity threshold for deduplication.
+    /// Skills with descriptions more similar than this value are skipped.
+    pub similarity_threshold: f64,
+}
+
+impl Default for SkillCreationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_skills: 500,
+            similarity_threshold: 0.85,
+        }
+    }
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
