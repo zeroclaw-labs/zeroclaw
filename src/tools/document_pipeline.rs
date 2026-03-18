@@ -229,6 +229,14 @@ impl DocumentPipelineTool {
         Self { security }
     }
 
+    /// Estimate credit cost for image PDF OCR based on file size.
+    /// Approximation: ~6 credits per page, estimate pages from file size
+    /// (average ~100KB per scanned page), minimum 10 credits.
+    fn estimate_pdf_credits(file_size_bytes: u64) -> u32 {
+        let estimated_pages = (file_size_bytes / 100_000).max(1) as u32;
+        (estimated_pages * 6).max(10)
+    }
+
     /// Get the file extension (lowercase, without dot).
     fn get_extension(path: &Path) -> Option<String> {
         path.extension()
@@ -632,6 +640,10 @@ impl Tool for DocumentPipelineTool {
                 "output_dir": {
                     "type": "string",
                     "description": "Optional directory to save output files (HTML/Markdown)"
+                },
+                "classify_only": {
+                    "type": "boolean",
+                    "description": "If true, only classify the document type and return cost estimate without processing. Use this first for image PDFs to check credit cost before asking user consent."
                 }
             },
             "required": ["file_path"]
@@ -643,6 +655,11 @@ impl Tool for DocumentPipelineTool {
             .get("file_path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("file_path is required"))?;
+
+        let classify_only = args
+            .get("classify_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let path = Path::new(file_path);
 
@@ -663,10 +680,64 @@ impl Tool for DocumentPipelineTool {
             });
         }
 
-        // Classify and process
+        // Classify document type
         let doc_type = Self::classify_document(path);
 
-        // Get API keys from environment (operator keys on Railway,
+        // If classify_only, return classification and cost estimate without processing
+        if classify_only {
+            let (type_name, engine, requires_credits, estimated_credits) = match &doc_type {
+                DocumentType::ImagePdf => (
+                    "image_pdf",
+                    "upstage_document_parse (OCR)",
+                    true,
+                    Self::estimate_pdf_credits(metadata.len()),
+                ),
+                DocumentType::DigitalPdf => (
+                    "digital_pdf",
+                    "pdf-extract (local, free)",
+                    false,
+                    0u32,
+                ),
+                DocumentType::OfficeDocument(ext) => (
+                    "office_document",
+                    "hancom_docs_converter",
+                    false,
+                    0u32,
+                ),
+                DocumentType::Unsupported(ext) => (
+                    "unsupported",
+                    "none",
+                    false,
+                    0u32,
+                ),
+            };
+
+            let ext_str = match &doc_type {
+                DocumentType::OfficeDocument(ext) | DocumentType::Unsupported(ext) => ext.clone(),
+                _ => Self::get_extension(path).unwrap_or_default(),
+            };
+
+            let output = json!({
+                "classify_only": true,
+                "file_path": file_path,
+                "extension": ext_str,
+                "doc_type": type_name,
+                "engine": engine,
+                "file_size_bytes": metadata.len(),
+                "requires_credits": requires_credits,
+                "estimated_credits": estimated_credits,
+                "user_consent_required": requires_credits,
+            });
+
+            return Ok(ToolResult {
+                success: true,
+                output: serde_json::to_string_pretty(&output).unwrap_or_default(),
+                error: None,
+            });
+        }
+
+        // Full processing from here
+        // Get API keys from environment
         // or user keys from local config)
         let upstage_key = std::env::var("UPSTAGE_API_KEY").ok();
         let gemini_key = std::env::var("GEMINI_API_KEY").ok();

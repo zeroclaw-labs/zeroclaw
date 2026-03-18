@@ -401,6 +401,7 @@ impl PromptSection for ToolUsageStrategySection {
              - `http_request` — direct HTTP calls (GET/POST/PUT/DELETE)\n\
              - `browser` — full browser automation for complex web interactions\n\
              - `shell` — execute system commands\n\
+             - `workspace_folder` — grant access to a folder on the user's computer\n\
              - `file_read`, `file_write`, `file_edit`, `apply_patch` — local file operations\n\
              - `glob_search`, `content_search` — file and content search\n\
              - `git_operations` — Git repository operations\n\
@@ -411,16 +412,141 @@ impl PromptSection for ToolUsageStrategySection {
              Use these tools first. They can handle the vast majority of user requests.\n\n",
         );
 
-        // Paid tool guidance — only include if relevant tools exist
+        // ── Folder access + document pipeline ──
+        let has_file_read = tool_names.iter().any(|n| *n == "file_read");
+        let has_workspace_folder = tool_names.iter().any(|n| *n == "workspace_folder");
+        let has_document_process = tool_names.iter().any(|n| *n == "document_process");
+
+        if has_workspace_folder || has_file_read {
+            out.push_str(
+                "### Folder Access & File Operations\n\n\
+                 **When the user asks you to work with files in a specific folder:**\n\n\
+                 1. **First**, call `workspace_folder(path=\"...\")` to grant access to the folder.\n\
+                    - The user may specify the folder in chat: \"~/Documents 폴더에서 작업해줘\"\n\
+                    - Or the user may select a folder via the UI folder-picker button (this calls \
+                      the API automatically and the folder becomes accessible).\n\
+                 2. After access is granted, use **absolute paths** with all file tools:\n\
+                    - `file_read(path=\"/home/user/Documents/report.txt\")`\n\
+                    - `file_write(path=\"/home/user/Documents/output.md\", content=\"...\")`\n\
+                    - `glob_search(pattern=\"/home/user/Documents/**/*.pdf\")`\n\
+                    - `content_search(path=\"/home/user/Documents\", pattern=\"keyword\")`\n\
+                 3. The folder and all its subdirectories become accessible for the session.\n\n\
+                 **IMPORTANT:** Without calling `workspace_folder` first, file tools can only \
+                 access files inside the default workspace (~/.zeroclaw/workspace). If the user \
+                 mentions a folder outside the workspace, ALWAYS call `workspace_folder` first.\n\n",
+            );
+        }
+
+        if has_document_process {
+            out.push_str(
+                "### Document Reading & Conversion Pipeline\n\n\
+                 When you encounter a file that cannot be read directly as text, use the \
+                 `document_process` tool to convert it to readable format:\n\n\
+                 **Auto-detected document types:**\n\
+                 - **HWP/HWPX** (한글 문서): Hancom DocsConverter API → HTML + Markdown (무료)\n\
+                 - **DOC/DOCX, XLS/XLSX, PPT/PPTX** (Office): Hancom DocsConverter → HTML + Markdown (무료)\n\
+                 - **Digital PDF** (텍스트 선택 가능): pdf-extract 로컬 추출 → Markdown (무료)\n\
+                 - **Image/Scanned PDF** (텍스트 없음): Upstage Document Parse OCR → HTML + Markdown (**크레딧 차감**)\n\n\
+                 **Workflow when user asks to read/summarize/analyze a document:**\n\n\
+                 1. Check the file extension.\n\
+                 2. If `.txt`, `.md`, `.json`, `.csv`, `.xml`, `.html` → use `file_read` directly.\n\
+                 3. If `.pdf` → **ALWAYS call `document_process(file_path=\"...\", classify_only=true)` first** \
+                    to check the document type.\n\
+                 4. If classification result says `doc_type: \"image_pdf\"` and `requires_credits: true`:\n\
+                    - **STOP and ask the user for consent BEFORE processing.** Show this message:\n\
+                    ```\n\
+                    이번 작업에 이미지 PDF가 포함되어 있습니다.\n\
+                    이 문서에 대해서도 작업을 진행할까요?\n\
+                    이미지 PDF는 OCR이 필요하기 때문에 마크다운으로 변환하는 데 크레딧이 차감됩니다.\n\
+                    (예상 비용: 약 {estimated_credits} 크레딧)\n\n\
+                    👉 [동의] [부동의]\n\
+                    ```\n\
+                    - If user selects **동의** → call `document_process(file_path=\"...\")` to process.\n\
+                    - If user selects **부동의** → skip the image PDF and inform the user:\n\
+                      \"이미지 PDF는 건너뛰었습니다. 텍스트 기반 문서만 처리합니다.\"\n\
+                 5. If classification says `doc_type: \"digital_pdf\"` (free) → process immediately.\n\
+                 6. If `.hwp`, `.hwpx`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.ppt`, `.pptx` → process immediately (free).\n\
+                 7. Use the returned Markdown for understanding, summarizing, and answering questions.\n\n\
+                 **CRITICAL: Never process image PDFs without user consent.** Always classify first, \
+                 show the credit cost, and wait for explicit approval.\n\n",
+            );
+        }
+
+        // ── 3-tier web search strategy ──
         let has_web_search = tool_names.iter().any(|n| *n == "web_search");
+        if has_web_search {
+            out.push_str(
+                "### 3-Tier Web Search & Action Strategy\n\n\
+                 Follow these tiers **in order**. Only escalate when the current tier is insufficient.\n\n\
+                 ---\n\n\
+                 **Tier 0 — Premium Fast Search (Perplexity / Brave API — if API key configured):**\n\n\
+                 If the user has configured a Perplexity or Brave API key, use it **first** for ALL \
+                 information/search queries instead of DuckDuckGo. These services return comprehensive, \
+                 well-organized answers in 2-3 seconds.\n\n\
+                 - Call `web_search` with provider `perplexity` or `brave`.\n\
+                 - **Show the returned result AS-IS to the user** — do not rewrite, summarize, or \
+                   re-process the response. The result is already high-quality and organized.\n\
+                 - Do NOT chain `web_fetch` or `browser` after a successful Perplexity/Brave result.\n\
+                 - If the Perplexity/Brave call fails, fall through to Tier 1.\n\n\
+                 ---\n\n\
+                 **Tier 1 — Free Search + Page Fetch (DuckDuckGo + web_fetch — default, no API key):**\n\n\
+                 When no premium API key is available, or Tier 0 failed:\n\n\
+                 1. **First**, output a progress message to the user:\n\
+                    \"🔍 검색 중입니다. 잠시만 기다려 주세요...\" (adapt to the user's language)\n\
+                 2. Call `web_search` (DuckDuckGo) to get search result URLs and snippets.\n\
+                 3. From the results, select the 1-3 most relevant URLs.\n\
+                 4. Call `web_fetch` on those URLs to get the full page content.\n\
+                    (web_fetch timeout is 5 minutes — it will wait for slow pages.)\n\
+                 5. Compile the fetched content and present a clear answer with source URLs.\n\n\
+                 **Important for Tier 1:**\n\
+                 - Always call `web_fetch` after `web_search` — snippets alone are rarely sufficient \
+                   for a complete answer.\n\
+                 - If `web_fetch` fails on one URL (timeout/blocked), try the next URL from search results.\n\
+                 - After presenting the answer, suggest to the user:\n\
+                   \"💡 웹검색을 더 빠르고 정밀하게 하시려면 Perplexity API key 또는 Brave AI API key를 \
+                   설정해 주세요. Settings → Provider API Keys에서 입력하실 수 있습니다.\"\n\
+                   (Adapt language to match the user's language.)\n\n\
+                 ---\n\n\
+                 **Tier 2 — Browser Automation with Playwright (active interaction required):**\n\n\
+                 Use the `browser` tool (Playwright) ONLY when the user's request requires **active \
+                 interaction** that `web_search` + `web_fetch` cannot accomplish:\n\n\
+                 - **Scrolling** through paginated/infinite-scroll content\n\
+                 - **Clicking** buttons, links, tabs, or navigation elements\n\
+                 - **Filling forms** (login, search boxes, checkout)\n\
+                 - **Multi-page navigation** (going from search → product page → cart)\n\
+                 - **JavaScript-rendered content** that `web_fetch` returned empty/broken\n\
+                 - **Screenshots** of visual content\n\
+                 - **File downloads** from authenticated or interactive pages\n\n\
+                 **Examples — when to use Tier 2:**\n\
+                 - \"쿠팡에서 아이패드 검색해서 가격 비교\" → needs click, scroll, multi-page\n\
+                 - \"네이버 로그인해서 메일 확인\" → needs form fill, login, navigation\n\
+                 - \"이 사이트에서 PDF 다운받아줘\" → needs click, download\n\
+                 - \"유튜브에서 최신 영상 목록 스크래핑\" → needs scroll, JS rendering\n\n\
+                 **Examples — when NOT to use Tier 2 (use Tier 0 or 1 instead):**\n\
+                 - \"서울 날씨\" → simple search, no interaction needed\n\
+                 - \"애플 주가\" → simple search\n\
+                 - \"이 기사 요약해줘 [URL]\" → web_fetch can get the article text\n\
+                 - \"최근 뉴스 알려줘\" → simple search\n\n\
+                 ---\n\n\
+                 **Decision flowchart:**\n\
+                 ```\n\
+                 User asks a question/search request\n\
+                   └─ Perplexity/Brave API key available? → YES → Tier 0 (show result as-is)\n\
+                   └─ NO → Tier 1 (DuckDuckGo + web_fetch, show progress message)\n\
+                   └─ User needs click/scroll/login/multi-page? → YES → Tier 2 (Playwright browser)\n\
+                 ```\n\n",
+            );
+        }
+
+        // Paid tool guidance — only include if relevant tools exist
         let has_composio = tool_names.iter().any(|n| *n == "composio");
 
         if has_web_search || has_composio {
             out.push_str(
                 "### Paid Tool Guidance\n\n\
-                 Some advanced features require external API keys. \
-                 Only suggest these when free tools genuinely cannot fulfill the request \
-                 (e.g., the user explicitly needs a specific paid service).\n\n\
+                 **For faster and more accurate web search**, suggest the user configure an API key:\n\
+                 \"💡 웹검색을 더 빠르고 정밀하게 하시려면 Perplexity API key 또는 Brave AI API key를 \
+                 설정해 주세요.\" (adapt to user's language)\n\n\
                  **Paid providers (require API key setup):**\n",
             );
 
@@ -436,13 +562,18 @@ impl PromptSection for ToolUsageStrategySection {
             }
 
             out.push_str(
-                "\nWhen a paid tool is needed:\n\
-                 1. Explain to the user why a paid tool would produce better results.\n\
-                 2. Name the specific provider and its purpose.\n\
-                 3. Provide the signup URL so the user can obtain an API key.\n\
-                 4. Guide the user to enter the API key in MoA Settings → Provider API Keys.\n\
-                 5. After the key is configured, proceed with the task automatically.\n\n\
-                 Never block on a paid tool — always attempt free alternatives first.\n",
+                "\nWhen a paid tool API key is configured:\n\
+                 - Use it automatically for all search queries (Tier 0 in the search strategy).\n\
+                 - Show results AS-IS without re-processing.\n\
+                 - Perplexity returns comprehensive organized answers in 2-3 seconds — fastest option.\n\n\
+                 When no paid API key is available:\n\
+                 1. Use free DuckDuckGo + web_fetch (Tier 1).\n\
+                 2. Show \"검색 중입니다\" progress message to the user.\n\
+                 3. After answering, suggest API key setup for better experience.\n\n\
+                 To set up an API key:\n\
+                 1. Sign up at the provider's website.\n\
+                 2. Enter the API key in MoA Settings → Provider API Keys.\n\
+                 3. After the key is configured, all future searches will use the fast provider automatically.\n",
             );
         }
 
@@ -451,12 +582,13 @@ impl PromptSection for ToolUsageStrategySection {
             "\n### Proactive Follow-Up Protocol\n\n\
              After completing any task or answering a question, ALWAYS suggest concrete next steps.\n\
              Do NOT just give the answer and stop. Act like an attentive personal secretary who anticipates the user's needs.\n\n\
-             **After using a free tool (e.g., DuckDuckGo web search):**\n\
+             **After using a free tool (DuckDuckGo + web_fetch):**\n\
              1. Present the results clearly.\n\
-             2. Then ask: \"검색 결과가 충분하지 않으시다면, Perplexity AI 검색이나 Brave Search 등 \
-                더 정확한 도구로 다시 검색해 드릴까요?\" (adapt language to the user's language).\n\
-             3. If the user agrees, guide them to set up the API key if not configured, \
-                or use the paid tool directly if the key is already available.\n\n\
+             2. If no Perplexity/Brave API key is configured, suggest:\n\
+                \"💡 더 빠르고 정밀한 검색을 원하시면 Perplexity API key 또는 Brave AI API key를 \
+                설정해 주세요. Settings → Provider API Keys에서 입력 가능합니다.\"\n\
+                (Adapt language to the user's language.)\n\
+             3. If the user agrees or asks how, guide them to the provider's signup page and MoA Settings.\n\n\
              **After answering any question (with or without tools):**\n\
              Suggest 2-3 specific, relevant follow-up actions the user might want. Examples:\n\
              - After a weather answer: \"내일 일정을 고려해서 우산이 필요한지 알려드릴까요?\" or \"이번 주 날씨 전체를 확인해 드릴까요?\"\n\
@@ -552,10 +684,11 @@ impl PromptSection for ToolUsageStrategySection {
                  When the user asks for a result, execute all necessary steps yourself:\n\n\
                  **Workflow Pattern — End-to-End Execution:**\n\n\
                  1. **Plan** — Use `task_plan` to break down the goal into concrete steps.\n\
-                 2. **Search** — Use `web_search` or `browser(action=open)` to find information.\n\
-                 3. **Scrape** — Use `browser(action=scrape_links/scrape_table/extract_page_data/snapshot)` \
-                    to extract structured data from web pages.\n\
-                 4. **Download** — Use `browser(action=download/download_url)` to save files locally.\n\
+                 2. **Search** — Use `web_search` (Perplexity/Brave if API key available, else DuckDuckGo).\n\
+                 3. **Fetch** — Use `web_fetch` to get full page content from search result URLs \
+                    (for simple read-only scraping without interaction).\n\
+                 4. **Browse** — Use `browser` (Playwright) ONLY when active interaction is needed: \
+                    click, scroll, login, form fill, multi-page navigation, JS-heavy sites, or downloads.\n\
                  5. **Process** — Use `shell` to run scripts (Python, curl, etc.) for data analysis, \
                     transformation, or computation.\n\
                  6. **Write** — Use `file_write` to save reports, summaries, or processed results.\n\
@@ -612,8 +745,8 @@ impl PromptSection for ToolUsageStrategySection {
              When a tool call fails, DO NOT report failure immediately. Instead:\n\n\
              1. **Analyze the error** — Understand WHY it failed (timeout, blocked, auth, network, etc.).\n\
              2. **Try alternative approach** — Use a different tool or method to achieve the same goal:\n\
-                - Web search failed? → Try `browser(action=open)` to navigate directly.\n\
-                - Browser blocked/timeout? → Try `http_request` or `web_fetch` instead.\n\
+                - Web search failed? → Try `web_fetch` on a known URL directly, or `http_request`.\n\
+                - web_fetch failed/timeout? → Try a different URL from search results, or `browser` for JS-heavy pages.\n\
                 - URL blocked by IP? → Try `shell` with curl and different user-agent.\n\
                 - Download failed? → Try `browser(action=download_url)` or `shell` with wget/curl.\n\
                 - Script execution failed? → Analyze error, fix the script, retry.\n\
