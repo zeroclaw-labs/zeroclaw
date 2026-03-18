@@ -71,6 +71,13 @@ cargo test --locked
 
 # Release build
 cargo build --release --locked
+
+# Using Just (alternative command runner - see Justfile)
+just ci          # Run full CI quality gate
+just fmt         # Format code
+just lint        # Run clippy
+just test        # Run tests
+just build       # Build release binary
 ```
 
 ### Pre-push hook
