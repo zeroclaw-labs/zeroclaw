@@ -408,14 +408,30 @@ fn has_shell_shebang(path: &Path) -> bool {
     let Ok(content) = fs::read(path) else {
         return false;
     };
-    let prefix = &content[..content.len().min(128)];
+    let prefix = &content[..content.len().min(512)]; // Read more to get full first line
     let shebang = String::from_utf8_lossy(prefix).to_ascii_lowercase();
-    shebang.starts_with("#!")
-        && (shebang.contains("sh")
-            || shebang.contains("bash")
-            || shebang.contains("zsh")
-            || shebang.contains("pwsh")
-            || shebang.contains("powershell"))
+    
+    // Extract just the first line (the shebang line)
+    let first_line = shebang.lines().next().unwrap_or("");
+    
+    if !first_line.starts_with("#!") {
+        return false;
+    }
+    
+    // If the shebang points to a Python interpreter, it's not a shell script
+    // This prevents false positives like Python files containing "refresh" (has "sh")
+    if first_line.contains("python") || first_line.contains("pypy") || first_line.contains("jython") {
+        return false;
+    }
+    
+    // Check for shell interpreters in the shebang line itself
+    first_line.contains("sh")
+        || first_line.contains("bash")
+        || first_line.contains("zsh")
+        || first_line.contains("ksh")
+        || first_line.contains("fish")
+        || first_line.contains("pwsh")
+        || first_line.contains("powershell")
 }
 
 fn extract_markdown_links(content: &str) -> Vec<String> {
