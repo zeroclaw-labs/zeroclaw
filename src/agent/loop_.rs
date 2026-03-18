@@ -7853,4 +7853,67 @@ Let me check the result."#;
             .any(|msg| msg.content.contains("[Mid-turn message from user]"));
         assert!(!injected, "no injection messages should be present");
     }
+
+    // ── strip_unparsed_tool_call_tags tests ─────────────────
+
+    #[test]
+    fn strip_unparsed_tool_call_tags_removes_empty_tags() {
+        let input = "Let me check.\n<tool_call>\n</tool_call>\nDone.";
+        let result = parsing::strip_unparsed_tool_call_tags(input);
+        assert!(!result.contains("<tool_call>"), "empty tag should be stripped");
+        assert!(result.contains("Let me check."), "surrounding text preserved");
+        assert!(result.contains("Done."), "surrounding text preserved");
+    }
+
+    #[test]
+    fn strip_unparsed_tool_call_tags_removes_whitespace_only_tags() {
+        let input = "Before\n<tool_call>\n   \n</tool_call>\nAfter";
+        let result = parsing::strip_unparsed_tool_call_tags(input);
+        assert!(!result.contains("<tool_call>"));
+        assert!(result.contains("Before"));
+        assert!(result.contains("After"));
+    }
+
+    #[test]
+    fn strip_unparsed_tool_call_tags_removes_malformed_json_tags() {
+        let input = "Text\n<tool_call>\n{broken json\n</tool_call>\nMore text";
+        let result = parsing::strip_unparsed_tool_call_tags(input);
+        assert!(!result.contains("<tool_call>"));
+        assert!(result.contains("Text"));
+        assert!(result.contains("More text"));
+    }
+
+    #[test]
+    fn strip_unparsed_tool_call_tags_preserves_text_without_tags() {
+        let input = "Just normal text with no tool calls.";
+        let result = parsing::strip_unparsed_tool_call_tags(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn strip_unparsed_tool_call_tags_handles_cross_alias_tags() {
+        let input = "A\n<toolcall>\n</toolcall>\nB";
+        let result = parsing::strip_unparsed_tool_call_tags(input);
+        assert!(!result.contains("<toolcall>"));
+        assert!(result.contains("A"));
+        assert!(result.contains("B"));
+    }
+
+    #[test]
+    fn strip_unparsed_tool_call_tags_handles_multiple_malformed() {
+        let input = "A\n<tool_call>\n</tool_call>\nB\n<tool_call>\n</tool_call>\nC";
+        let result = parsing::strip_unparsed_tool_call_tags(input);
+        assert!(!result.contains("<tool_call>"));
+        assert!(result.contains("A"));
+        assert!(result.contains("B"));
+        assert!(result.contains("C"));
+    }
+
+    #[test]
+    fn strip_unparsed_tool_call_tags_handles_unclosed_tag() {
+        let input = "Text\n<tool_call>\nno close tag here";
+        let result = parsing::strip_unparsed_tool_call_tags(input);
+        assert!(!result.contains("<tool_call>"));
+        assert!(result.contains("Text"));
+    }
 }
