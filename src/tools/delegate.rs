@@ -422,6 +422,7 @@ impl DelegateTool {
                 &[],
                 &[],
                 None,
+                0, // delegate sub-agent: no pre-flight compaction
             ),
         )
         .await;

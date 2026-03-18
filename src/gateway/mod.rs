@@ -2088,6 +2088,7 @@ mod tests {
             channel: "whatsapp".into(),
             timestamp: 1,
             thread_ts: None,
+            observe_group: false,
         };
 
         let key = whatsapp_memory_key(&msg);
