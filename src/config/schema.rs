@@ -4511,6 +4511,11 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// Override for the top-level `ack_reactions` setting. When `None`, the
+    /// channel falls back to `[channels_config].ack_reactions`. When set
+    /// explicitly, it takes precedence.
+    #[serde(default)]
+    pub ack_reactions: Option<bool>,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -8360,6 +8365,7 @@ default_temperature = 0.7
                     draft_update_interval_ms: default_draft_update_interval_ms(),
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    ack_reactions: None,
                 }),
                 discord: None,
                 slack: None,
@@ -8942,6 +8948,7 @@ tool_dispatcher = "xml"
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
             mention_only: false,
+            ack_reactions: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -11256,6 +11263,7 @@ require_otp_to_resume = true
             draft_update_interval_ms: default_draft_update_interval_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
+            ack_reactions: None,
         });
 
         // Save (triggers encryption)
@@ -11809,6 +11817,69 @@ require_otp_to_resume = true
         assert!(
             debug_output.contains("[REDACTED]"),
             "Debug output must show [REDACTED] for client_secret"
+        );
+    }
+
+    #[test]
+    async fn telegram_config_ack_reactions_false_deserializes() {
+        let toml_str = r#"
+            bot_token = "123:ABC"
+            allowed_users = ["alice"]
+            ack_reactions = false
+        "#;
+        let cfg: TelegramConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.ack_reactions, Some(false));
+    }
+
+    #[test]
+    async fn telegram_config_ack_reactions_true_deserializes() {
+        let toml_str = r#"
+            bot_token = "123:ABC"
+            allowed_users = ["alice"]
+            ack_reactions = true
+        "#;
+        let cfg: TelegramConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.ack_reactions, Some(true));
+    }
+
+    #[test]
+    async fn telegram_config_ack_reactions_missing_defaults_to_none() {
+        let toml_str = r#"
+            bot_token = "123:ABC"
+            allowed_users = ["alice"]
+        "#;
+        let cfg: TelegramConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.ack_reactions, None);
+    }
+
+    #[test]
+    async fn telegram_config_ack_reactions_channel_overrides_top_level() {
+        let tg_toml = r#"
+            bot_token = "123:ABC"
+            allowed_users = ["alice"]
+            ack_reactions = false
+        "#;
+        let tg: TelegramConfig = toml::from_str(tg_toml).unwrap();
+        let top_level_ack = true;
+        let effective = tg.ack_reactions.unwrap_or(top_level_ack);
+        assert!(
+            !effective,
+            "channel-level false must override top-level true"
+        );
+    }
+
+    #[test]
+    async fn telegram_config_ack_reactions_falls_back_to_top_level() {
+        let tg_toml = r#"
+            bot_token = "123:ABC"
+            allowed_users = ["alice"]
+        "#;
+        let tg: TelegramConfig = toml::from_str(tg_toml).unwrap();
+        let top_level_ack = false;
+        let effective = tg.ack_reactions.unwrap_or(top_level_ack);
+        assert!(
+            !effective,
+            "must fall back to top-level false when channel omits field"
         );
     }
 }

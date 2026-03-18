@@ -3228,12 +3228,16 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .telegram
                 .as_ref()
                 .context("Telegram channel is not configured")?;
+            let ack = tg
+                .ack_reactions
+                .unwrap_or(config.channels_config.ack_reactions);
             Ok(Arc::new(
                 TelegramChannel::new(
                     tg.bot_token.clone(),
                     tg.allowed_users.clone(),
                     tg.mention_only,
                 )
+                .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
                 .with_workspace_dir(config.workspace_dir.clone()),
@@ -3321,6 +3325,9 @@ fn collect_configured_channels(
     let mut channels = Vec::new();
 
     if let Some(ref tg) = config.channels_config.telegram {
+        let ack = tg
+            .ack_reactions
+            .unwrap_or(config.channels_config.ack_reactions);
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
             channel: Arc::new(
@@ -3329,6 +3336,7 @@ fn collect_configured_channels(
                     tg.allowed_users.clone(),
                     tg.mention_only,
                 )
+                .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
                 .with_workspace_dir(config.workspace_dir.clone()),
@@ -8667,6 +8675,7 @@ This is an example JSON object for profile settings."#;
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            ack_reactions: None,
         });
         match build_channel_by_id(&config, "telegram") {
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
