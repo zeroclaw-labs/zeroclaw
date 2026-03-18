@@ -59,7 +59,6 @@ RUN rm -rf src benches crates/robot-kit/src
 COPY src/ src/
 COPY benches/ benches/
 COPY crates/ crates/
-COPY firmware/ firmware/
 COPY --from=web-builder /web/dist web/dist
 RUN touch src/main.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \

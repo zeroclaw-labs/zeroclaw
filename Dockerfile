@@ -44,7 +44,6 @@ RUN rm -rf src benches crates/robot-kit/src
 COPY src/ src/
 COPY benches/ benches/
 COPY crates/ crates/
-COPY firmware/ firmware/
 COPY --from=web-builder /web/dist web/dist
 COPY *.rs .
 RUN touch src/main.rs
