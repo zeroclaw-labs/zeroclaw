@@ -659,7 +659,10 @@ fn strip_tool_result_content(text: &str) -> String {
 }
 
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
-    matches!(channel_name, "telegram" | "discord" | "matrix")
+    matches!(
+        channel_name,
+        "telegram" | "discord" | "matrix" | "whatsapp" | "whatsapp_web"
+    )
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
