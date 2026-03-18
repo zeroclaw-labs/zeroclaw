@@ -24,7 +24,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF; other binary files are read with lossy UTF-8 conversion."
+        "Read text file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF. Rejects binary/image files — use `image_info` for images."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -196,6 +196,7 @@ impl Tool for FileReadTool {
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to read file: {e}"))?;
 
+                // PDF extraction (keep existing behaviour)
                 if let Some(text) = try_extract_pdf_text(&bytes) {
                     return Ok(ToolResult {
                         success: true,
@@ -204,16 +205,81 @@ impl Tool for FileReadTool {
                     });
                 }
 
-                // Lossy fallback — replaces invalid bytes with U+FFFD
-                let lossy = String::from_utf8_lossy(&bytes).into_owned();
+                // Detect common image formats by magic bytes and reject them
+                // so the agent uses `image_info` instead, avoiding huge lossy
+                // output that can blow up the context window.
+                if is_known_image_magic(&bytes) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: format!(
+                            "Binary image file detected: {path}. \
+                             Use the `image_info` tool instead to read image metadata and content."
+                        ),
+                        error: None,
+                    });
+                }
+
+                // PDF that we failed to extract text from (e.g. rag-pdf feature
+                // disabled, or the PDF contains only scanned images).
+                if bytes.len() >= 5 && &bytes[..5] == b"%PDF-" {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: format!(
+                            "PDF file detected but text extraction failed: {path}. \
+                             The file may be a scanned/image-only PDF, or PDF text \
+                             extraction support is not enabled. File size: {} bytes.",
+                            bytes.len()
+                        ),
+                        error: None,
+                    });
+                }
+
+                // Reject other non-UTF-8 binary files
                 Ok(ToolResult {
-                    success: true,
-                    output: lossy,
+                    success: false,
+                    output: format!(
+                        "Binary file detected: {path}. \
+                         This tool only supports text files and PDFs. \
+                         File size: {} bytes.",
+                        bytes.len()
+                    ),
                     error: None,
                 })
             }
         }
     }
+}
+
+/// Detect common image formats by file-header magic bytes.
+fn is_known_image_magic(bytes: &[u8]) -> bool {
+    if bytes.len() < 4 {
+        return false;
+    }
+    // PNG
+    if bytes.starts_with(b"\x89PNG") {
+        return true;
+    }
+    // JPEG (FFD8FF)
+    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+        return true;
+    }
+    // GIF87a / GIF89a
+    if bytes.starts_with(b"GIF8") {
+        return true;
+    }
+    // WebP (RIFF....WEBP)
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return true;
+    }
+    // BMP
+    if bytes.starts_with(b"BM") && bytes.len() > 14 {
+        return true;
+    }
+    // TIFF (little-endian II or big-endian MM)
+    if bytes.starts_with(b"II\x2A\x00") || bytes.starts_with(b"MM\x00\x2A") {
+        return true;
+    }
+    false
 }
 
 #[cfg(feature = "rag-pdf")]
@@ -623,6 +689,7 @@ mod tests {
     }
 
     /// PDF files should be readable via pdf-extract text extraction.
+    #[cfg(feature = "rag-pdf")]
     #[tokio::test]
     async fn file_read_extracts_pdf_text() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_pdf");
@@ -652,14 +719,14 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// Non-UTF-8 binary files should be read with lossy conversion.
+    /// Non-UTF-8 binary files should be rejected (not read with lossy conversion).
     #[tokio::test]
-    async fn file_read_lossy_reads_binary_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_lossy");
+    async fn file_read_rejects_binary_file() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_binary_reject");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        // Write bytes that are not valid UTF-8 and not a PDF
+        // Write bytes that are not valid UTF-8, not a PDF, and not a known image
         let binary_data: Vec<u8> = vec![0x00, 0x80, 0xFF, 0xFE, b'h', b'i', 0x80];
         tokio::fs::write(dir.join("data.bin"), &binary_data)
             .await
@@ -669,18 +736,112 @@ mod tests {
         let result = tool.execute(json!({"path": "data.bin"})).await.unwrap();
 
         assert!(
-            result.success,
-            "lossy read must succeed, error: {:?}",
-            result.error
-        );
-        assert!(
-            result.output.contains('\u{FFFD}'),
-            "lossy output must contain replacement character, got: {:?}",
+            !result.success,
+            "binary file read must fail, got success with output: {:?}",
             result.output
         );
         assert!(
-            result.output.contains("hi"),
-            "lossy output must preserve valid ASCII, got: {:?}",
+            result.output.contains("Binary file detected"),
+            "output must indicate binary rejection, got: {:?}",
+            result.output
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Image files (PNG) should be rejected with guidance to use image_info.
+    #[tokio::test]
+    async fn file_read_rejects_png_image() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_png_reject");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Minimal PNG header (magic bytes + enough to be recognized)
+        let png_data: Vec<u8> = vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, // PNG magic
+            0x00, 0x00, 0x00, 0x0D, // IHDR length
+        ];
+        tokio::fs::write(dir.join("image.png"), &png_data)
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = tool.execute(json!({"path": "image.png"})).await.unwrap();
+
+        assert!(
+            !result.success,
+            "PNG read must fail, got success with output: {:?}",
+            result.output
+        );
+        assert!(
+            result.output.contains("image_info"),
+            "output must suggest image_info tool, got: {:?}",
+            result.output
+        );
+        assert!(
+            result.output.contains("Binary image file detected"),
+            "output must indicate image rejection, got: {:?}",
+            result.output
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// JPEG files should also be rejected with guidance to use image_info.
+    #[tokio::test]
+    async fn file_read_rejects_jpeg_image() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_jpeg_reject");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // JPEG magic bytes
+        let jpeg_data: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        tokio::fs::write(dir.join("photo.jpg"), &jpeg_data)
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = tool.execute(json!({"path": "photo.jpg"})).await.unwrap();
+
+        assert!(
+            !result.success,
+            "JPEG read must fail, got success with output: {:?}",
+            result.output
+        );
+        assert!(
+            result.output.contains("image_info"),
+            "output must suggest image_info tool, got: {:?}",
+            result.output
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// PDF files without rag-pdf feature should be rejected with a clear message.
+    #[cfg(not(feature = "rag-pdf"))]
+    #[tokio::test]
+    async fn file_read_rejects_pdf_without_feature() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_pdf_no_feature");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Minimal PDF header
+        let pdf_data = b"%PDF-1.4 fake pdf content \x00\x80\xFF";
+        tokio::fs::write(dir.join("doc.pdf"), &pdf_data[..])
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = tool.execute(json!({"path": "doc.pdf"})).await.unwrap();
+
+        assert!(
+            !result.success,
+            "PDF without rag-pdf feature must fail, got success with: {:?}",
+            result.output
+        );
+        assert!(
+            result.output.contains("PDF file detected but text extraction failed"),
+            "output must explain PDF extraction failure, got: {:?}",
             result.output
         );
 
@@ -766,6 +927,7 @@ mod tests {
     /// End-to-end test: scripted provider calls `file_read` on a real PDF
     /// fixture, the tool extracts text via pdf-extract, and the extracted
     /// content reaches the provider in the tool result message.
+    #[cfg(feature = "rag-pdf")]
     #[tokio::test]
     async fn e2e_agent_file_read_pdf_extraction() {
         use crate::agent::agent::Agent;
@@ -862,16 +1024,16 @@ mod tests {
     }
 
     /// End-to-end test: agent calls `file_read` on a binary file, gets
-    /// lossy UTF-8 output with replacement characters in the tool result.
+    /// a rejection message (not lossy output) in the tool result.
     #[tokio::test]
-    async fn e2e_agent_file_read_lossy_binary() {
+    async fn e2e_agent_file_read_rejects_binary() {
         use crate::agent::agent::Agent;
         use crate::agent::dispatcher::NativeToolDispatcher;
         use crate::providers::{ChatResponse, Provider, ToolCall};
         use e2e_helpers::*;
 
         // ── Set up workspace with binary file ──
-        let workspace = std::env::temp_dir().join("zeroclaw_test_e2e_file_read_lossy");
+        let workspace = std::env::temp_dir().join("zeroclaw_test_e2e_file_read_binary_reject");
         let _ = tokio::fs::remove_dir_all(&workspace).await;
         tokio::fs::create_dir_all(&workspace).await.unwrap();
 
@@ -923,7 +1085,7 @@ mod tests {
             "agent response must mention binary, got: {response}",
         );
 
-        // Verify tool result contains lossy output with replacement chars
+        // Verify tool result contains rejection message, not lossy content
         {
             let all_requests = recorded.lock().unwrap();
             assert!(
@@ -938,13 +1100,14 @@ mod tests {
                 .expect("second request must contain a tool result message");
 
             assert!(
-                tool_result_msg.content.contains("valid"),
-                "tool result must preserve valid ASCII from binary file, got: {}",
+                tool_result_msg.content.contains("Binary file detected"),
+                "tool result must contain binary rejection message, got: {}",
                 tool_result_msg.content,
             );
+            // Should NOT contain replacement characters (no lossy output)
             assert!(
-                tool_result_msg.content.contains('\u{FFFD}'),
-                "tool result must contain replacement character for invalid bytes, got: {}",
+                !tool_result_msg.content.contains('\u{FFFD}'),
+                "tool result must NOT contain lossy replacement characters, got: {}",
                 tool_result_msg.content,
             );
         }
