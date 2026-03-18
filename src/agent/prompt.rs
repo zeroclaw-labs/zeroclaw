@@ -411,8 +411,49 @@ impl PromptSection for ToolUsageStrategySection {
              Use these tools first. They can handle the vast majority of user requests.\n\n",
         );
 
-        // Paid tool guidance — only include if relevant tools exist
+        // ── Tiered web search strategy: snippet-first, deep-scrape only when needed ──
         let has_web_search = tool_names.iter().any(|n| *n == "web_search");
+        if has_web_search {
+            out.push_str(
+                "### Tiered Web Search Strategy (Snippet-First)\n\n\
+                 **CRITICAL: Do NOT automatically call `web_fetch` or `browser` after `web_search`.**\n\
+                 Most simple questions (weather, facts, definitions, current events) can be answered \
+                 directly from DuckDuckGo search result snippets without any additional fetching.\n\n\
+                 **Tier 1 — Snippet-Based Fast Answer (default):**\n\
+                 1. Call `web_search` with the query.\n\
+                 2. Read the returned titles, URLs, and snippets.\n\
+                 3. If the snippets contain enough information to answer the question → \
+                    **answer immediately** using only the snippet data. Do NOT call `web_fetch`.\n\
+                 4. Present the answer with source URLs for reference.\n\n\
+                 **Examples of Tier 1 questions (snippet is sufficient):**\n\
+                 - \"서울 날씨\" → snippet shows temperature, conditions — answer directly\n\
+                 - \"애플 주가\" → snippet shows current price — answer directly\n\
+                 - \"대한민국 대통령\" → snippet shows the answer — answer directly\n\
+                 - \"USD/KRW 환율\" → snippet shows exchange rate — answer directly\n\
+                 - \"오늘 뉴스\" → snippets show headlines — summarize directly\n\n\
+                 **Tier 2 — Targeted Deep Scraping (only when snippets are insufficient):**\n\
+                 Use this tier ONLY when:\n\
+                 - Snippets are too short or vague to answer the question properly\n\
+                 - The user needs detailed/structured data (tables, lists, full articles)\n\
+                 - The question requires information from within a specific page (not just search results)\n\n\
+                 When Tier 2 is needed:\n\
+                 1. From the `web_search` results, select 1-3 most promising target URLs.\n\
+                 2. Plan which URLs to scrape and what data to extract.\n\
+                 3. Prefer `browser` with Playwright for pages that need JS rendering, scrolling, or clicking.\n\
+                 4. Use `web_fetch` only for simple static HTML pages where full text extraction is needed.\n\
+                 5. Set a short timeout expectation — if a page is slow, move to the next URL.\n\n\
+                 **Examples of Tier 2 questions (deep scraping needed):**\n\
+                 - \"이번 주 서울 시간별 날씨 예보\" → need detailed forecast table from weather site\n\
+                 - \"비트코인 120일 이동평균선 분석\" → need price data download and processing\n\
+                 - \"쿠팡에서 아이패드 가격 비교\" → need to browse and scrape product listings\n\
+                 - \"이 논문 요약해줘 [URL]\" → need full article text from specific page\n\n\
+                 **Why this matters:** `web_fetch` can timeout on slow/JS-heavy websites and many modern sites \
+                 require JavaScript rendering that `web_fetch` cannot handle, causing unnecessary delays. \
+                 DuckDuckGo snippets arrive in 1-2 seconds and often contain the answer already.\n\n",
+            );
+        }
+
+        // Paid tool guidance — only include if relevant tools exist
         let has_composio = tool_names.iter().any(|n| *n == "composio");
 
         if has_web_search || has_composio {

@@ -2475,7 +2475,9 @@ pub struct WebFetchConfig {
     /// Maximum response size in bytes (default: 500KB, plain text is much smaller than raw HTML)
     #[serde(default = "default_web_fetch_max_response_size")]
     pub max_response_size: usize,
-    /// Request timeout in seconds (default: 30)
+    /// Request timeout in seconds (default: 10).
+    /// Lowered from 30s to avoid long waits on JS-heavy or unresponsive pages;
+    /// most static HTML fetches complete well within 10s.
     #[serde(default = "default_web_fetch_timeout_secs")]
     pub timeout_secs: u64,
     /// User-Agent string sent with fetch requests (env: ZEROCLAW_WEB_FETCH_USER_AGENT)
@@ -2492,7 +2494,7 @@ fn default_web_fetch_provider() -> String {
 }
 
 fn default_web_fetch_timeout_secs() -> u64 {
-    30
+    10
 }
 
 impl Default for WebFetchConfig {

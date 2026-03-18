@@ -122,11 +122,11 @@ impl WebFetchTool {
         }
     }
 
-    /// Returns the configured timeout, substituting a safe 30 s default if zero is set.
+    /// Returns the configured timeout, substituting a safe 10 s default if zero is set.
     fn effective_timeout_secs(&self) -> u64 {
         if self.timeout_secs == 0 {
-            tracing::warn!("web_fetch: timeout_secs is 0, using safe default of 30s");
-            30
+            tracing::warn!("web_fetch: timeout_secs is 0, using safe default of 10s");
+            10
         } else {
             self.timeout_secs
         }
