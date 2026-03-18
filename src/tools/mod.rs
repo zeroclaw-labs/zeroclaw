@@ -41,6 +41,7 @@ pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
 pub mod memory_forget;
+pub mod mqtt_publish;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
@@ -80,6 +81,7 @@ pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
+pub use mqtt_publish::MqttPublishTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
@@ -226,6 +228,7 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
+        Arc::new(MqttPublishTool::new_no_defaults()),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
             security.clone(),
