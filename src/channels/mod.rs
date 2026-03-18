@@ -536,6 +536,17 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
+        "whatsapp" => Some(
+            "When responding on WhatsApp:\n\
+             - Be concise and conversational.\n\
+             - To mention/tag someone in a group, write @<phone_number> (e.g. @85251159218). \
+               The number is visible in the sender field of each message in the conversation. \
+               The mention will be rendered as a native WhatsApp @mention.\n\
+             - In group chats, the conversation history includes messages from all participants. \
+               Each message shows who sent it via the sender field.\n\
+             - When you see [IMAGE:<path>] with [Image description: ...], an image was shared and described for you.\n\
+             - When you see [Replying to: \"...\"], the user is replying to a previous message.",
+        ),
         _ => None,
     }
 }
@@ -1096,6 +1107,7 @@ fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
         "token limit exceeded",
         "prompt is too long",
         "input is too long",
+        "prompt exceeds max length",
     ]
     .iter()
     .any(|hint| lower.contains(hint))
@@ -2223,6 +2235,8 @@ async fn process_channel_message(
                 },
                 ctx.tool_call_dedup_exempt.as_ref(),
                 ctx.activated_tools.as_ref(),
+                // Pre-flight context guard: use char-budget / 4 as token estimate
+                PROACTIVE_CONTEXT_BUDGET_CHARS / 4,
             ),
         ) => LlmExecutionResult::Completed(result),
     };

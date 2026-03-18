@@ -238,10 +238,15 @@ impl WhatsAppWebChannel {
                             if let Some(ref quoted) = ctx.quoted_message {
                                 if let Some(preview) = quoted_preview(quoted) {
                                     let stanza = ctx.stanza_id.clone();
-                                    return Some((
-                                        format!("[Replying to: \"{preview}\"]"),
-                                        stanza,
-                                    ));
+                                    // Include quoted sender's phone if available
+                                    let from = ctx.participant.as_deref()
+                                        .and_then(|p| p.split('@').next())
+                                        .filter(|p| !p.is_empty());
+                                    let header = match from {
+                                        Some(phone) => format!("[Replying to +{phone}: \"{preview}\"]"),
+                                        None => format!("[Replying to: \"{preview}\"]"),
+                                    };
+                                    return Some((header, stanza));
                                 }
                             }
                         }
@@ -799,10 +804,36 @@ impl Channel for WhatsAppWebChannel {
             // Fall through to send text normally (voice chat gets BOTH)
         }
 
-        // Send text message
-        let outgoing = wa_rs_proto::whatsapp::Message {
-            conversation: Some(message.content.clone()),
-            ..Default::default()
+        // Extract @phone mentions from the message content.
+        let mention_re = regex::Regex::new(r"@(\d{8,15})").unwrap();
+        let mentioned_jids: Vec<String> = mention_re
+            .captures_iter(&message.content)
+            .map(|cap| format!("{}@s.whatsapp.net", &cap[1]))
+            .collect();
+
+        // Use extended_text_message with mentions if any @phone patterns found,
+        // otherwise send as plain conversation.
+        let outgoing = if mentioned_jids.is_empty() {
+            wa_rs_proto::whatsapp::Message {
+                conversation: Some(message.content.clone()),
+                ..Default::default()
+            }
+        } else {
+            wa_rs_proto::whatsapp::Message {
+                extended_text_message: Some(Box::new(
+                    wa_rs_proto::whatsapp::message::ExtendedTextMessage {
+                        text: Some(message.content.clone()),
+                        context_info: Some(Box::new(
+                            wa_rs_proto::whatsapp::ContextInfo {
+                                mentioned_jid: mentioned_jids,
+                                ..Default::default()
+                            },
+                        )),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }
         };
 
         let message_id = client.send_message(to, outgoing).await?;
@@ -1018,6 +1049,12 @@ impl Channel for WhatsAppWebChannel {
                                         parts.push(content);
                                     }
                                     content = parts.join("\n\n");
+                                }
+
+                                // In group chats, prepend sender phone so the agent
+                                // can identify who said what and @mention them.
+                                if Self::is_group_chat(&chat) {
+                                    content = format!("[From: {normalized}] {content}");
                                 }
 
                                 tracing::info!(
