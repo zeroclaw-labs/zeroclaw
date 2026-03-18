@@ -234,11 +234,17 @@ fn hash_output(output: &str) -> u64 {
 fn format_warning(reason: &str) -> String {
     format!(
         "IMPORTANT: A loop pattern has been detected in your tool usage. {reason}. \
-         You must change your approach: \
-         (1) Try a different tool or different arguments, \
-         (2) If polling a process, increase wait time or check if it's stuck, \
-         (3) If the task cannot be completed, explain why and stop. \
-         Do NOT repeat the same tool call with the same arguments."
+         You MUST change your approach — do NOT repeat the same call. Try these alternatives:\n\
+         (1) Use a DIFFERENT tool for the same goal (e.g., web_search → browser, browser → http_request, \
+             shell curl → browser download_url).\n\
+         (2) Try a DIFFERENT source or website for the same information.\n\
+         (3) Try a DIFFERENT method (e.g., HTML scraping → JSON API, direct download → browser automation).\n\
+         (4) Break the task into SMALLER sub-steps that are individually achievable.\n\
+         (5) If a website is blocking you, try changing the approach entirely \
+             (different user-agent via shell curl, different URL, or use delegate for a sub-agent).\n\
+         (6) If the task genuinely cannot be completed after trying 3+ alternatives, \
+             explain what was tried and ask the user for guidance.\n\
+         Be PERSISTENT — a good assistant finds a way, not an excuse."
     )
 }
 

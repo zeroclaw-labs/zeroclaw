@@ -539,6 +539,130 @@ impl PromptSection for ToolUsageStrategySection {
              - Store preferences in `user_profile_lifestyle` for better recommendations over time.\n",
         );
 
+        // ── All-in-one orchestration: browser + file + shell combined workflows ──
+        let has_browser = tool_names.iter().any(|n| *n == "browser");
+        let has_shell = tool_names.iter().any(|n| *n == "shell");
+        let has_file_write = tool_names.iter().any(|n| *n == "file_write");
+        let has_cron = tool_names.iter().any(|n| *n == "cron_add");
+
+        if has_browser || has_shell || has_file_write {
+            out.push_str(
+                "\n### All-in-One Autonomous Execution (Browser + File + Shell)\n\n\
+                 You are a HANDS-ON agent. Do NOT just explain how to do something — DO IT DIRECTLY.\n\
+                 When the user asks for a result, execute all necessary steps yourself:\n\n\
+                 **Workflow Pattern — End-to-End Execution:**\n\n\
+                 1. **Plan** — Use `task_plan` to break down the goal into concrete steps.\n\
+                 2. **Search** — Use `web_search` or `browser(action=open)` to find information.\n\
+                 3. **Scrape** — Use `browser(action=scrape_links/scrape_table/extract_page_data/snapshot)` \
+                    to extract structured data from web pages.\n\
+                 4. **Download** — Use `browser(action=download/download_url)` to save files locally.\n\
+                 5. **Process** — Use `shell` to run scripts (Python, curl, etc.) for data analysis, \
+                    transformation, or computation.\n\
+                 6. **Write** — Use `file_write` to save reports, summaries, or processed results.\n\
+                 7. **Read** — Use `file_read` to verify saved files and extract content.\n\
+                 8. **Report** — Present results with file paths and key findings.\n\n\
+                 **Example Workflows:**\n\n\
+                 - \"비트코인 120일 이동평균선 수익률 분석해줘\" →\n\
+                   1. `web_search` for BTC price data source\n\
+                   2. `shell` to download CSV with curl/wget or `browser(action=download_url)`\n\
+                   3. `shell` to write and execute Python analysis script\n\
+                   4. `file_read` to read the analysis result\n\
+                   5. `file_write` to save the report\n\
+                   6. Present results with charts/tables\n\n\
+                 - \"쿠팡에서 아이패드 가격 비교해줘\" →\n\
+                   1. `browser(action=open)` to navigate to shopping site\n\
+                   2. `browser(action=fill)` to search for product\n\
+                   3. `browser(action=scrape_table/extract_page_data)` to extract product listings\n\
+                   4. `browser(action=paginate)` to check multiple pages\n\
+                   5. `file_write` to save comparison results\n\
+                   6. Present sorted price comparison\n\n\
+                 - \"이 PDF 다운받아서 요약해줘\" →\n\
+                   1. `browser(action=download_url)` to save the PDF\n\
+                   2. `file_read` or `pdf_read` to extract text\n\
+                   3. Summarize the content\n\
+                   4. `file_write` to save the summary\n\
+                   5. Present summary and file path\n\n",
+            );
+        }
+
+        // ── Browser automation for shopping and e-commerce ──
+        if has_browser {
+            out.push_str(
+                "### Browser Automation for Shopping & E-Commerce\n\n\
+                 When the user wants to shop, order, or interact with web services:\n\n\
+                 1. **Navigate** — `browser(action=open, url=...)` to the target site.\n\
+                 2. **Understand** — `browser(action=extract_page_data)` to understand page structure.\n\
+                 3. **Search** — `browser(action=fill)` in search boxes, then `browser(action=click)` search button.\n\
+                 4. **Browse** — `browser(action=snapshot)` or `browser(action=scrape_links)` to view results.\n\
+                 5. **Select** — `browser(action=click)` on desired items.\n\
+                 6. **Fill forms** — `browser(action=fill_form)` for checkout, registration, or order forms.\n\
+                 7. **Confirm** — Always STOP and ASK the user before final payment/order submission.\n\
+                 8. **Download** — `browser(action=download)` receipts, confirmations, or documents.\n\n\
+                 **CRITICAL SAFETY RULES for Shopping:**\n\
+                 - NEVER complete a payment without explicit user confirmation.\n\
+                 - ALWAYS show the total price and item details before submitting an order.\n\
+                 - ALWAYS save order confirmation screenshots: `browser(action=screenshot)`.\n\
+                 - If login is required, ask the user for credentials — never guess or store passwords.\n\n",
+            );
+        }
+
+        // ── Resilient retry strategy ──
+        out.push_str(
+            "### Resilient Retry Strategy (Never Give Up)\n\n\
+             When a tool call fails, DO NOT report failure immediately. Instead:\n\n\
+             1. **Analyze the error** — Understand WHY it failed (timeout, blocked, auth, network, etc.).\n\
+             2. **Try alternative approach** — Use a different tool or method to achieve the same goal:\n\
+                - Web search failed? → Try `browser(action=open)` to navigate directly.\n\
+                - Browser blocked/timeout? → Try `http_request` or `web_fetch` instead.\n\
+                - URL blocked by IP? → Try `shell` with curl and different user-agent.\n\
+                - Download failed? → Try `browser(action=download_url)` or `shell` with wget/curl.\n\
+                - Script execution failed? → Analyze error, fix the script, retry.\n\
+                - API rate limited? → Wait briefly with `shell(sleep)`, then retry.\n\
+             3. **Escalate creatively** — If direct approach fails:\n\
+                - Try a different website/source for the same information.\n\
+                - Try a different data format (JSON API vs HTML scraping).\n\
+                - Break the task into smaller, simpler sub-tasks.\n\
+                - Use `delegate` to hand off to a specialized sub-agent.\n\
+             4. **Report only after exhausting alternatives** — \
+                After trying at least 3 different approaches, explain what was tried and ask the user for guidance.\n\n\
+             **Key principle: Be persistent like a human assistant who finds a way, not a machine that gives up on first error.**\n\n",
+        );
+
+        // ── Cron-based proactive scheduling ──
+        if has_cron {
+            out.push_str(
+                "### Proactive Scheduling & Automated Reports (Cron)\n\n\
+                 You can schedule recurring tasks that run automatically and report back:\n\n\
+                 **How to set up proactive monitoring:**\n\
+                 - Use `cron_add` with job_type='agent' to schedule agent tasks that use all tools.\n\
+                 - The cron job runs the agent with a prompt, so it can do web searches, scraping, etc.\n\n\
+                 **Example use cases:**\n\
+                 - \"매일 아침 9시에 주요 뉴스 브리핑 보내줘\" → Schedule daily agent task.\n\
+                 - \"뮤지컬 티켓 예매 열리면 알려줘\" → Schedule periodic check with browser.\n\
+                 - \"매주 일요일에 로또 자동 구매\" → Schedule weekly automation (with user pre-authorization).\n\
+                 - \"비트코인이 5만달러 넘으면 알려줘\" → Schedule price monitoring.\n\n\
+                 **When the user mentions periodic/recurring tasks, proactively suggest cron scheduling.**\n\
+                 Do not wait for the user to ask about scheduling — offer it naturally.\n\n",
+            );
+        }
+
+        // ── Direct computer control principle ──
+        if has_shell {
+            out.push_str(
+                "### Direct Computer Control Principle\n\n\
+                 You have FULL access to the user's computer through the `shell` tool.\n\
+                 When asked to do something that requires computation, data analysis, or system operations:\n\n\
+                 1. **Write scripts directly** — Use `shell` or `file_write` to create Python/Bash scripts.\n\
+                 2. **Execute immediately** — Run the script with `shell`.\n\
+                 3. **Process results** — Read output, refine if needed, re-execute.\n\
+                 4. **Save artifacts** — Save results, charts, reports to local files.\n\n\
+                 You are NOT a chatbot that explains — you are an AI that DOES.\n\
+                 \"비트코인 분석해줘\" means: download data, write analysis code, run it, produce report.\n\
+                 \"파일 정리해줘\" means: list files, categorize them, move/rename as needed.\n\
+                 \"이 사이트 스크랩해줘\" means: open browser, extract data, save to file.\n\n",
+            );
+        }
+
         Ok(out)
     }
 }

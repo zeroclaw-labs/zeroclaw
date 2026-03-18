@@ -75,6 +75,9 @@ pub struct BrowserTool {
     native_headless: bool,
     native_webdriver_url: String,
     native_chrome_path: Option<String>,
+    playwright_command: String,
+    playwright_headless: bool,
+    playwright_timeout_ms: u64,
     computer_use: ComputerUseConfig,
     #[cfg(feature = "browser-native")]
     native_state: tokio::sync::Mutex<native_backend::NativeBrowserState>,
@@ -84,6 +87,7 @@ pub struct BrowserTool {
 enum BrowserBackendKind {
     AgentBrowser,
     RustNative,
+    Playwright,
     ComputerUse,
     Auto,
 }
@@ -92,6 +96,7 @@ enum BrowserBackendKind {
 enum ResolvedBackend {
     AgentBrowser,
     RustNative,
+    Playwright,
     ComputerUse,
 }
 
@@ -101,10 +106,11 @@ impl BrowserBackendKind {
         match key.as_str() {
             "agent_browser" | "agentbrowser" => Ok(Self::AgentBrowser),
             "rust_native" | "native" => Ok(Self::RustNative),
+            "playwright" => Ok(Self::Playwright),
             "computer_use" | "computeruse" => Ok(Self::ComputerUse),
             "auto" => Ok(Self::Auto),
             _ => anyhow::bail!(
-                "Unsupported browser backend '{raw}'. Use 'agent_browser', 'rust_native', 'computer_use', or 'auto'"
+                "Unsupported browser backend '{raw}'. Use 'agent_browser', 'rust_native', 'playwright', 'computer_use', or 'auto'"
             ),
         }
     }
@@ -113,6 +119,7 @@ impl BrowserBackendKind {
         match self {
             Self::AgentBrowser => "agent_browser",
             Self::RustNative => "rust_native",
+            Self::Playwright => "playwright",
             Self::ComputerUse => "computer_use",
             Self::Auto => "auto",
         }
@@ -224,6 +231,9 @@ impl BrowserTool {
             true,
             "http://127.0.0.1:9515".into(),
             None,
+            "node".into(),
+            true,
+            60_000,
             ComputerUseConfig::default(),
         )
     }
@@ -241,6 +251,9 @@ impl BrowserTool {
         native_headless: bool,
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
+        playwright_command: String,
+        playwright_headless: bool,
+        playwright_timeout_ms: u64,
         computer_use: ComputerUseConfig,
     ) -> Self {
         Self::new_with_backend_and_url_access(
@@ -256,6 +269,9 @@ impl BrowserTool {
             native_headless,
             native_webdriver_url,
             native_chrome_path,
+            playwright_command,
+            playwright_headless,
+            playwright_timeout_ms,
             computer_use,
         )
     }
@@ -274,6 +290,9 @@ impl BrowserTool {
         native_headless: bool,
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
+        playwright_command: String,
+        playwright_headless: bool,
+        playwright_timeout_ms: u64,
         computer_use: ComputerUseConfig,
     ) -> Self {
         Self {
@@ -289,6 +308,9 @@ impl BrowserTool {
             native_headless,
             native_webdriver_url,
             native_chrome_path,
+            playwright_command,
+            playwright_headless,
+            playwright_timeout_ms,
             computer_use,
             #[cfg(feature = "browser-native")]
             native_state: tokio::sync::Mutex::new(native_backend::NativeBrowserState::default()),
@@ -315,6 +337,43 @@ impl BrowserTool {
     /// Backward-compatible alias.
     pub async fn is_available() -> bool {
         Self::is_agent_browser_available().await
+    }
+
+    /// Check if Playwright bridge is available (node + playwright installed).
+    async fn is_playwright_available_with_command(command: &str) -> bool {
+        Command::new(command)
+            .args(["-e", "require('playwright')"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Resolve the path to the playwright-bridge.js script.
+    fn playwright_bridge_script() -> String {
+        // Look for the bridge script relative to the executable, then fallback
+        let candidates = [
+            // Relative to project root (dev mode)
+            "scripts/playwright-bridge.js".to_string(),
+            // Installed alongside binary
+            {
+                let mut path = std::env::current_exe()
+                    .unwrap_or_default()
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf();
+                path.push("scripts/playwright-bridge.js");
+                path.to_string_lossy().into_owned()
+            },
+        ];
+        for c in &candidates {
+            if Path::new(c).exists() {
+                return c.clone();
+            }
+        }
+        candidates[0].clone()
     }
 
     fn configured_backend(&self) -> anyhow::Result<BrowserBackendKind> {
@@ -390,6 +449,7 @@ impl BrowserTool {
         if self.auto_backend_priority.is_empty() {
             return Ok(vec![
                 BrowserBackendKind::AgentBrowser,
+                BrowserBackendKind::Playwright,
                 BrowserBackendKind::RustNative,
                 BrowserBackendKind::ComputerUse,
             ]);
@@ -450,6 +510,15 @@ impl BrowserTool {
                 }
                 Ok(ResolvedBackend::RustNative)
             }
+            BrowserBackendKind::Playwright => {
+                if Self::is_playwright_available_with_command(&self.playwright_command).await {
+                    Ok(ResolvedBackend::Playwright)
+                } else {
+                    anyhow::bail!(
+                        "browser.backend='playwright' but Playwright is not installed. Run: npm install playwright && npx playwright install chromium"
+                    )
+                }
+            }
             BrowserBackendKind::ComputerUse => {
                 if !self.computer_use_available()? {
                     anyhow::bail!(
@@ -488,6 +557,18 @@ impl BrowserTool {
                                         .into(),
                                 );
                             }
+                        }
+                        BrowserBackendKind::Playwright => {
+                            if Self::is_playwright_available_with_command(
+                                &self.playwright_command,
+                            )
+                            .await
+                            {
+                                return Ok(ResolvedBackend::Playwright);
+                            }
+                            reasons.push(
+                                "playwright unavailable (Playwright not installed)".into(),
+                            );
                         }
                         BrowserBackendKind::ComputerUse => match self.computer_use_available() {
                             Ok(true) => return Ok(ResolvedBackend::ComputerUse),
@@ -794,6 +875,105 @@ impl BrowserTool {
         }
     }
 
+    /// Execute a browser action via the Playwright bridge script.
+    async fn execute_playwright_action(
+        &self,
+        action: BrowserAction,
+        raw_args: &Value,
+    ) -> anyhow::Result<ToolResult> {
+        let bridge_script = Self::playwright_bridge_script();
+
+        // Build the command payload from raw args, injecting headless config
+        let mut payload = raw_args
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        payload.insert(
+            "headless".to_string(),
+            Value::Bool(self.playwright_headless),
+        );
+        if !payload.contains_key("timeout_ms") {
+            payload.insert(
+                "timeout_ms".to_string(),
+                Value::Number(self.playwright_timeout_ms.into()),
+            );
+        }
+
+        // For open action, validate URL
+        if let BrowserAction::Open { ref url } = action {
+            self.validate_url(url)?;
+        }
+
+        // For screenshot, validate output path
+        if let BrowserAction::Screenshot {
+            path: Some(ref path),
+            ..
+        } = action
+        {
+            self.validate_output_path("path", path)?;
+        }
+
+        let payload_json = serde_json::to_string(&payload)?;
+        let encoded = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            payload_json.as_bytes(),
+        );
+
+        debug!(
+            "Running playwright-bridge: {} {} <base64-payload>",
+            self.playwright_command, bridge_script
+        );
+
+        let output = tokio::time::timeout(
+            Duration::from_millis(self.playwright_timeout_ms),
+            Command::new(&self.playwright_command)
+                .arg(&bridge_script)
+                .arg(&encoded)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Playwright action timed out after {} ms",
+                self.playwright_timeout_ms
+            )
+        })??;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if !stderr.is_empty() {
+            debug!("playwright-bridge stderr: {}", stderr);
+        }
+
+        if let Ok(resp) = serde_json::from_str::<AgentBrowserResponse>(&stdout) {
+            return self.to_result(resp);
+        }
+
+        if output.status.success() {
+            Ok(ToolResult {
+                success: true,
+                output: stdout.trim().to_string(),
+                error: None,
+            })
+        } else {
+            Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Playwright bridge failed: {}",
+                    if stderr.is_empty() {
+                        stdout.trim().to_string()
+                    } else {
+                        stderr.trim().to_string()
+                    }
+                )),
+            })
+        }
+    }
+
     fn validate_coordinate(&self, key: &str, value: i64, max: Option<i64>) -> anyhow::Result<()> {
         if value < 0 {
             anyhow::bail!("'{key}' must be >= 0")
@@ -1080,10 +1260,14 @@ impl BrowserTool {
         &self,
         action: BrowserAction,
         backend: ResolvedBackend,
+        raw_args: &Value,
     ) -> anyhow::Result<ToolResult> {
         match backend {
             ResolvedBackend::AgentBrowser => self.execute_agent_browser_action(action).await,
             ResolvedBackend::RustNative => self.execute_rust_native_action(action).await,
+            ResolvedBackend::Playwright => {
+                self.execute_playwright_action(action, raw_args).await
+            }
             ResolvedBackend::ComputerUse => anyhow::bail!(
                 "Internal error: computer_use backend must be handled before BrowserAction parsing"
             ),
@@ -1120,7 +1304,8 @@ impl Tool for BrowserTool {
 
     fn description(&self) -> &str {
         concat!(
-            "Web/browser automation with pluggable backends (agent-browser, rust-native, computer_use). ",
+            "Web/browser automation with pluggable backends (agent-browser, rust-native, playwright, computer_use). ",
+            "Playwright backend enables full web automation including shopping, form filling, and navigation. ",
             "Supports DOM actions plus optional OS-level actions (mouse_move, mouse_click, mouse_drag, ",
             "key_type, key_press, screen_capture) through a computer-use sidecar. Use 'snapshot' to map ",
             "interactive elements to refs (@e1, @e2). Enforces browser.allowed_domains for open actions."
@@ -1320,7 +1505,7 @@ impl Tool for BrowserTool {
             }
         }
 
-        self.execute_action(action, backend).await
+        self.execute_action(action, backend, &args).await
     }
 }
 
@@ -2359,6 +2544,7 @@ fn backend_name(backend: ResolvedBackend) -> &'static str {
     match backend {
         ResolvedBackend::AgentBrowser => "agent_browser",
         ResolvedBackend::RustNative => "rust_native",
+        ResolvedBackend::Playwright => "playwright",
         ResolvedBackend::ComputerUse => "computer_use",
     }
 }
@@ -2675,14 +2861,26 @@ mod tests {
             BrowserBackendKind::ComputerUse
         );
         assert_eq!(
+            BrowserBackendKind::parse("playwright").unwrap(),
+            BrowserBackendKind::Playwright
+        );
+        assert_eq!(
             BrowserBackendKind::parse("auto").unwrap(),
             BrowserBackendKind::Auto
         );
     }
 
     #[test]
+    fn browser_backend_parser_accepts_playwright() {
+        assert_eq!(
+            BrowserBackendKind::parse("playwright").unwrap(),
+            BrowserBackendKind::Playwright
+        );
+    }
+
+    #[test]
     fn browser_backend_parser_rejects_unknown_values() {
-        assert!(BrowserBackendKind::parse("playwright").is_err());
+        assert!(BrowserBackendKind::parse("puppeteer").is_err());
     }
 
     #[test]
@@ -2710,6 +2908,9 @@ mod tests {
             true,
             "http://127.0.0.1:9515".into(),
             None,
+            "node".into(),
+            true,
+            60_000,
             ComputerUseConfig::default(),
         );
         assert_eq!(tool.configured_backend().unwrap(), BrowserBackendKind::Auto);
@@ -2730,6 +2931,9 @@ mod tests {
             true,
             "http://127.0.0.1:9515".into(),
             None,
+            "node".into(),
+            true,
+            60_000,
             ComputerUseConfig::default(),
         );
         assert_eq!(
@@ -2753,6 +2957,9 @@ mod tests {
             true,
             "http://127.0.0.1:9515".into(),
             None,
+            "node".into(),
+            true,
+            60_000,
             ComputerUseConfig::default(),
         );
 
@@ -2760,6 +2967,7 @@ mod tests {
             tool.auto_backend_priority().unwrap(),
             vec![
                 BrowserBackendKind::AgentBrowser,
+                BrowserBackendKind::Playwright,
                 BrowserBackendKind::RustNative,
                 BrowserBackendKind::ComputerUse
             ]
@@ -2785,6 +2993,9 @@ mod tests {
             true,
             "http://127.0.0.1:9515".into(),
             None,
+            "node".into(),
+            true,
+            60_000,
             ComputerUseConfig::default(),
         );
 
@@ -2812,6 +3023,9 @@ mod tests {
             true,
             "http://127.0.0.1:9515".into(),
             None,
+            "node".into(),
+            true,
+            60_000,
             ComputerUseConfig::default(),
         );
 
@@ -2833,6 +3047,9 @@ mod tests {
             true,
             "http://127.0.0.1:9515".into(),
             None,
+            "node".into(),
+            true,
+            60_000,
             ComputerUseConfig {
                 endpoint: "http://computer-use.example.com/v1/actions".into(),
                 ..ComputerUseConfig::default()
@@ -2857,6 +3074,9 @@ mod tests {
             true,
             "http://127.0.0.1:9515".into(),
             None,
+            "node".into(),
+            true,
+            60_000,
             ComputerUseConfig {
                 endpoint: "https://computer-use.example.com/v1/actions".into(),
                 allow_remote_endpoint: true,
@@ -2882,6 +3102,9 @@ mod tests {
             true,
             "http://127.0.0.1:9515".into(),
             None,
+            "node".into(),
+            true,
+            60_000,
             ComputerUseConfig {
                 max_coordinate_x: Some(100),
                 max_coordinate_y: Some(100),
@@ -2926,6 +3149,9 @@ mod tests {
             true,
             "http://127.0.0.1:9515".into(),
             None,
+            "node".into(),
+            true,
+            60_000,
             ComputerUseConfig::default(),
         );
 

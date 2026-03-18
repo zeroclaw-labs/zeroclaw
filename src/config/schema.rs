@@ -2265,11 +2265,11 @@ pub struct BrowserConfig {
     /// Browser session name (for agent-browser automation)
     #[serde(default)]
     pub session_name: Option<String>,
-    /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "auto"
+    /// Browser automation backend: "agent_browser" | "rust_native" | "playwright" | "computer_use" | "auto"
     #[serde(default = "default_browser_backend")]
     pub backend: String,
     /// Auto backend priority order (only used when backend = "auto")
-    /// Supported values: "agent_browser", "rust_native", "computer_use"
+    /// Supported values: "agent_browser", "rust_native", "playwright", "computer_use"
     #[serde(default)]
     pub auto_backend_priority: Vec<String>,
     /// Agent-browser executable path/name
@@ -2290,6 +2290,15 @@ pub struct BrowserConfig {
     /// Optional Chrome/Chromium executable path for rust-native backend
     #[serde(default)]
     pub native_chrome_path: Option<String>,
+    /// Playwright bridge script path/command
+    #[serde(default = "default_playwright_command")]
+    pub playwright_command: String,
+    /// Playwright headless mode (default: true)
+    #[serde(default = "default_true")]
+    pub playwright_headless: bool,
+    /// Timeout in milliseconds for each Playwright action
+    #[serde(default = "default_playwright_timeout_ms")]
+    pub playwright_timeout_ms: u64,
     /// Computer-use sidecar configuration
     #[serde(default)]
     pub computer_use: BrowserComputerUseConfig,
@@ -2315,6 +2324,14 @@ fn default_browser_webdriver_url() -> String {
     "http://127.0.0.1:9515".into()
 }
 
+fn default_playwright_command() -> String {
+    "node".into()
+}
+
+fn default_playwright_timeout_ms() -> u64 {
+    60_000
+}
+
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
@@ -2330,6 +2347,9 @@ impl Default for BrowserConfig {
             native_headless: default_true(),
             native_webdriver_url: default_browser_webdriver_url(),
             native_chrome_path: None,
+            playwright_command: default_playwright_command(),
+            playwright_headless: default_true(),
+            playwright_timeout_ms: default_playwright_timeout_ms(),
             computer_use: BrowserComputerUseConfig::default(),
         }
     }
@@ -12619,6 +12639,9 @@ default_temperature = 0.7
             native_headless: false,
             native_webdriver_url: "http://localhost:4444".into(),
             native_chrome_path: Some("/usr/bin/chromium".into()),
+            playwright_command: "node".into(),
+            playwright_headless: true,
+            playwright_timeout_ms: 60_000,
             computer_use: BrowserComputerUseConfig {
                 endpoint: "https://computer-use.example.com/v1/actions".into(),
                 api_key: Some("test-token".into()),
