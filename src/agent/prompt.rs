@@ -401,6 +401,7 @@ impl PromptSection for ToolUsageStrategySection {
              - `http_request` — direct HTTP calls (GET/POST/PUT/DELETE)\n\
              - `browser` — full browser automation for complex web interactions\n\
              - `shell` — execute system commands\n\
+             - `workspace_folder` — grant access to a folder on the user's computer\n\
              - `file_read`, `file_write`, `file_edit`, `apply_patch` — local file operations\n\
              - `glob_search`, `content_search` — file and content search\n\
              - `git_operations` — Git repository operations\n\
@@ -410,6 +411,53 @@ impl PromptSection for ToolUsageStrategySection {
              - All scheduling, configuration, and process management tools\n\n\
              Use these tools first. They can handle the vast majority of user requests.\n\n",
         );
+
+        // ── Folder access + document pipeline ──
+        let has_file_read = tool_names.iter().any(|n| *n == "file_read");
+        let has_workspace_folder = tool_names.iter().any(|n| *n == "workspace_folder");
+        let has_document_process = tool_names.iter().any(|n| *n == "document_process");
+
+        if has_workspace_folder || has_file_read {
+            out.push_str(
+                "### Folder Access & File Operations\n\n\
+                 **When the user asks you to work with files in a specific folder:**\n\n\
+                 1. **First**, call `workspace_folder(path=\"...\")` to grant access to the folder.\n\
+                    - The user may specify the folder in chat: \"~/Documents 폴더에서 작업해줘\"\n\
+                    - Or the user may select a folder via the UI folder-picker button (this calls \
+                      the API automatically and the folder becomes accessible).\n\
+                 2. After access is granted, use **absolute paths** with all file tools:\n\
+                    - `file_read(path=\"/home/user/Documents/report.txt\")`\n\
+                    - `file_write(path=\"/home/user/Documents/output.md\", content=\"...\")`\n\
+                    - `glob_search(pattern=\"/home/user/Documents/**/*.pdf\")`\n\
+                    - `content_search(path=\"/home/user/Documents\", pattern=\"keyword\")`\n\
+                 3. The folder and all its subdirectories become accessible for the session.\n\n\
+                 **IMPORTANT:** Without calling `workspace_folder` first, file tools can only \
+                 access files inside the default workspace (~/.zeroclaw/workspace). If the user \
+                 mentions a folder outside the workspace, ALWAYS call `workspace_folder` first.\n\n",
+            );
+        }
+
+        if has_document_process {
+            out.push_str(
+                "### Document Reading & Conversion Pipeline\n\n\
+                 When you encounter a file that cannot be read directly as text, use the \
+                 `document_process` tool to convert it to readable format:\n\n\
+                 **Auto-detected document types:**\n\
+                 - **HWP/HWPX** (한글 문서): Converted via Hancom DocsConverter API → HTML + Markdown\n\
+                 - **DOC/DOCX, XLS/XLSX, PPT/PPTX** (Office): Converted via Hancom DocsConverter → HTML + Markdown\n\
+                 - **Digital PDF** (text-based): Extracted locally via PyMuPDF/pdf-extract → Markdown\n\
+                 - **Image/Scanned PDF** (no selectable text): OCR via Upstage Document Parse API → HTML + Markdown\n\n\
+                 **Workflow when user asks to read/summarize/analyze a document:**\n\n\
+                 1. Check the file extension.\n\
+                 2. If `.txt`, `.md`, `.json`, `.csv`, `.xml`, `.html` → use `file_read` directly.\n\
+                 3. If `.pdf`, `.hwp`, `.hwpx`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.ppt`, `.pptx` \
+                    → call `document_process(file_path=\"...\")` to get HTML + Markdown.\n\
+                 4. Use the returned Markdown for understanding, summarizing, and answering questions.\n\
+                 5. If the user wants to edit, use the returned HTML for WYSIWYG display.\n\n\
+                 **The conversion happens automatically** — just call `document_process` with the \
+                 file path and it will detect the type and use the right engine.\n\n",
+            );
+        }
 
         // ── 3-tier web search strategy ──
         let has_web_search = tool_names.iter().any(|n| *n == "web_search");

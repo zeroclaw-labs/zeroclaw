@@ -1,4 +1,4 @@
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -93,14 +93,17 @@ impl Clone for ActionTracker {
 }
 
 /// Security policy enforced on all tool executions
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SecurityPolicy {
     pub autonomy: AutonomyLevel,
     pub workspace_dir: PathBuf,
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
-    pub allowed_roots: Vec<PathBuf>,
+    /// Extra directory roots the agent may access outside the workspace.
+    /// Wrapped in `RwLock` so roots can be added at runtime (e.g. user picks a folder
+    /// via chat or the UI folder-picker).
+    pub allowed_roots: RwLock<Vec<PathBuf>>,
     pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
     pub require_approval_for_medium_risk: bool,
@@ -109,6 +112,27 @@ pub struct SecurityPolicy {
     pub allow_sensitive_file_reads: bool,
     pub allow_sensitive_file_writes: bool,
     pub tracker: ActionTracker,
+}
+
+impl Clone for SecurityPolicy {
+    fn clone(&self) -> Self {
+        Self {
+            autonomy: self.autonomy,
+            workspace_dir: self.workspace_dir.clone(),
+            workspace_only: self.workspace_only,
+            allowed_commands: self.allowed_commands.clone(),
+            forbidden_paths: self.forbidden_paths.clone(),
+            allowed_roots: RwLock::new(self.allowed_roots.read().clone()),
+            max_actions_per_hour: self.max_actions_per_hour,
+            max_cost_per_day_cents: self.max_cost_per_day_cents,
+            require_approval_for_medium_risk: self.require_approval_for_medium_risk,
+            block_high_risk_commands: self.block_high_risk_commands,
+            shell_env_passthrough: self.shell_env_passthrough.clone(),
+            allow_sensitive_file_reads: self.allow_sensitive_file_reads,
+            allow_sensitive_file_writes: self.allow_sensitive_file_writes,
+            tracker: self.tracker.clone(),
+        }
+    }
 }
 
 impl Default for SecurityPolicy {
@@ -155,7 +179,7 @@ impl Default for SecurityPolicy {
                 "~/.aws".into(),
                 "~/.config".into(),
             ],
-            allowed_roots: Vec::new(),
+            allowed_roots: RwLock::new(Vec::new()),
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
@@ -1047,9 +1071,19 @@ impl SecurityPolicy {
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
 
-        // Block absolute paths when workspace_only is set
+        // Block absolute paths when workspace_only is set — but allow paths
+        // that fall under an explicitly configured `allowed_roots` entry so that
+        // runtime-granted folder access (via `workspace_folder` tool or the UI
+        // folder-picker) works with absolute paths.
         if self.workspace_only && expanded_path.is_absolute() {
-            return false;
+            let roots = self.allowed_roots.read();
+            let under_allowed_root = roots.iter().any(|root| {
+                let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+                expanded_path.starts_with(&canonical) || expanded_path.starts_with(root)
+            });
+            if !under_allowed_root {
+                return false;
+            }
         }
 
         // Block forbidden paths using path-component-aware matching
@@ -1079,10 +1113,13 @@ impl SecurityPolicy {
         // Check extra allowed roots (e.g. shared skills directories) before
         // forbidden checks so explicit allowlists can coexist with broad
         // default forbidden roots such as `/home` and `/tmp`.
-        for root in &self.allowed_roots {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return true;
+        {
+            let roots = self.allowed_roots.read();
+            for root in roots.iter() {
+                let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+                if resolved.starts_with(&canonical) {
+                    return true;
+                }
             }
         }
 
@@ -1105,7 +1142,7 @@ impl SecurityPolicy {
     }
 
     pub fn resolved_path_violation_message(&self, resolved: &Path) -> String {
-        let guidance = if self.allowed_roots.is_empty() {
+        let guidance = if self.allowed_roots.read().is_empty() {
             "Add the directory to [autonomy].allowed_roots (for example: allowed_roots = [\"/absolute/path\"]), or move the file into the workspace."
         } else {
             "Add a matching parent directory to [autonomy].allowed_roots, or move the file into the workspace."
@@ -1116,6 +1153,29 @@ impl SecurityPolicy {
             resolved.display(),
             guidance
         )
+    }
+
+    /// Add a directory to `allowed_roots` at runtime so that the agent can
+    /// access files inside it.  Returns `true` if the root was actually added
+    /// (i.e. it was not already present).  The path is canonicalized first so
+    /// that subsequent `is_resolved_path_allowed` checks match reliably.
+    pub fn add_allowed_root(&self, path: &Path) -> bool {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let mut roots = self.allowed_roots.write();
+        if roots.iter().any(|r| {
+            let r_canon = r.canonicalize().unwrap_or_else(|_| r.clone());
+            r_canon == canonical
+        }) {
+            return false; // already present
+        }
+        tracing::info!("Runtime allowed_root added: {}", canonical.display());
+        roots.push(canonical);
+        true
+    }
+
+    /// Return a snapshot of the current allowed roots (for diagnostics / API).
+    pub fn allowed_roots_snapshot(&self) -> Vec<PathBuf> {
+        self.allowed_roots.read().clone()
     }
 
     /// Check if autonomy level permits any action at all
@@ -1241,18 +1301,20 @@ impl SecurityPolicy {
             workspace_only: autonomy_config.workspace_only,
             allowed_commands: autonomy_config.allowed_commands.clone(),
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
-            allowed_roots: autonomy_config
-                .allowed_roots
-                .iter()
-                .map(|root| {
-                    let expanded = expand_user_path(root);
-                    if expanded.is_absolute() {
-                        expanded
-                    } else {
-                        workspace_dir.join(expanded)
-                    }
-                })
-                .collect(),
+            allowed_roots: RwLock::new(
+                autonomy_config
+                    .allowed_roots
+                    .iter()
+                    .map(|root| {
+                        let expanded = expand_user_path(root);
+                        if expanded.is_absolute() {
+                            expanded
+                        } else {
+                            workspace_dir.join(expanded)
+                        }
+                    })
+                    .collect(),
+            ),
             max_actions_per_hour: autonomy_config.max_actions_per_hour,
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
@@ -1659,8 +1721,9 @@ mod tests {
             PathBuf::from("~/Desktop")
         };
 
-        assert_eq!(policy.allowed_roots[0], expected_home_root);
-        assert_eq!(policy.allowed_roots[1], workspace.join("shared-data"));
+        let roots = policy.allowed_roots.read();
+        assert_eq!(roots[0], expected_home_root);
+        assert_eq!(roots[1], workspace.join("shared-data"));
     }
 
     #[test]
@@ -2600,7 +2663,7 @@ mod tests {
         // Without allowed_roots — blocked (symlink escape)
         let policy_without = SecurityPolicy {
             workspace_dir: workspace.clone(),
-            allowed_roots: vec![],
+            allowed_roots: RwLock::new(vec![]),
             ..SecurityPolicy::default()
         };
         assert!(
@@ -2611,7 +2674,7 @@ mod tests {
         // With allowed_roots — permitted
         let policy_with = SecurityPolicy {
             workspace_dir: workspace.clone(),
-            allowed_roots: vec![extra.clone()],
+            allowed_roots: RwLock::new(vec![extra.clone()]),
             ..SecurityPolicy::default()
         };
         assert!(

@@ -81,6 +81,7 @@ pub mod url_validation;
 pub mod wasm_module;
 pub mod wasm_tool;
 pub mod web_access_config;
+pub mod workspace_folder;
 pub mod web_fetch;
 pub mod web_search_config;
 pub mod web_search_tool;
@@ -279,6 +280,9 @@ pub fn default_tools_with_runtime(
         tools.push(Box::new(ApplyPatchTool::new()));
         tools.push(Box::new(GlobSearchTool::new(security.clone())));
         tools.push(Box::new(ContentSearchTool::new(security.clone())));
+        tools.push(Box::new(workspace_folder::WorkspaceFolderTool::new(
+            security.clone(),
+        )));
     }
     if runtime.as_any().is::<crate::runtime::WasmRuntime>() {
         tools.push(Box::new(WasmModuleTool::new(security, runtime)));
@@ -412,6 +416,9 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(ApplyPatchTool::new()));
         tool_arcs.push(Arc::new(GlobSearchTool::new(security.clone())));
         tool_arcs.push(Arc::new(ContentSearchTool::new(security.clone())));
+        tool_arcs.push(Arc::new(workspace_folder::WorkspaceFolderTool::new(
+            security.clone(),
+        )));
     }
     if runtime.as_any().is::<crate::runtime::WasmRuntime>() {
         tool_arcs.push(Arc::new(WasmModuleTool::new(

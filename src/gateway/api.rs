@@ -568,6 +568,138 @@ pub async fn handle_api_workspace_get(
     .into_response()
 }
 
+/// PUT /api/workspace/folder — grant the agent runtime access to a user-selected folder.
+///
+/// Body: `{"path": "/absolute/path/to/folder"}`
+///
+/// Called by the UI folder-picker button. Validates the folder, adds it to
+/// the SecurityPolicy `allowed_roots`, and returns the folder listing.
+pub async fn handle_api_workspace_folder_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let path = match body.get("path").and_then(|v| v.as_str()).map(str::trim) {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "path is required"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Expand ~ to home dir
+    let expanded = if path.starts_with("~/") || path == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            std::path::PathBuf::from(home).join(path.strip_prefix("~/").unwrap_or(""))
+        } else {
+            std::path::PathBuf::from(&path)
+        }
+    } else {
+        std::path::PathBuf::from(&path)
+    };
+
+    if !expanded.is_absolute() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "path must be absolute"})),
+        )
+            .into_response();
+    }
+
+    if !expanded.is_dir() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "path is not a directory or does not exist"})),
+        )
+            .into_response();
+    }
+
+    // Block sensitive directories
+    let path_str = expanded.to_string_lossy();
+    let sensitive = ["/.ssh", "/.gnupg", "/.aws", "/etc", "/root", "/proc", "/sys"];
+    for s in &sensitive {
+        if path_str.contains(s) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": format!("Cannot grant access to sensitive directory: {}", expanded.display())})),
+            )
+                .into_response();
+        }
+    }
+
+    // Add to SecurityPolicy allowed_roots
+    let added = state.security.add_allowed_root(&expanded);
+
+    // List directory contents (top-level, max 100 entries)
+    let entries: Vec<String> = match tokio::fs::read_dir(&expanded).await {
+        Ok(mut reader) => {
+            let mut items = Vec::new();
+            while let Ok(Some(entry)) = reader.next_entry().await {
+                if items.len() >= 100 {
+                    items.push("... (more files)".into());
+                    break;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+                items.push(if is_dir {
+                    format!("{name}/")
+                } else {
+                    name
+                });
+            }
+            items.sort();
+            items
+        }
+        Err(_) => vec![],
+    };
+
+    tracing::info!(
+        "Workspace folder access {}: {}",
+        if added { "granted" } else { "already active" },
+        expanded.display()
+    );
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "folder": expanded.to_string_lossy(),
+        "added": added,
+        "file_count": entries.len(),
+        "contents": entries,
+    }))
+    .into_response()
+}
+
+/// GET /api/workspace/folders — list all currently accessible folders (allowed_roots).
+pub async fn handle_api_workspace_folders_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let roots = state.security.allowed_roots_snapshot();
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+
+    let folders: Vec<String> = roots
+        .iter()
+        .map(|r| r.to_string_lossy().to_string())
+        .collect();
+
+    Json(serde_json::json!({
+        "workspace_dir": workspace_dir.to_string_lossy(),
+        "allowed_folders": folders,
+    }))
+    .into_response()
+}
+
 /// GET /api/tools — list registered tool specs
 pub async fn handle_api_tools(
     State(state): State<AppState>,
