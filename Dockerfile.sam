@@ -73,7 +73,7 @@ RUN mkdir -p /opt/sam-tools/node /opt/sam-tools/npm-global /opt/sam-tools/home/.
 
 # npm global packages
 RUN npm config set prefix /opt/sam-tools/npm-global \
-    && npm install -g @upstash/context7-mcp agent-browser
+    && npm install -g @upstash/context7-mcp agent-browser@0.18.0
 
 # Playwright Chromium + system deps (fixes the 21 missing shared libraries)
 RUN npx playwright install --with-deps chromium

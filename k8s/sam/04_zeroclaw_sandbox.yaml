@@ -85,7 +85,7 @@ spec:
             # Skills are mounted directly into the zeroclaw container, not here.
       containers:
         - name: zeroclaw
-          image: citizendaniel/zeroclaw-sam:v1.4.12
+          image: citizendaniel/zeroclaw-sam:v1.4.14
           imagePullPolicy: IfNotPresent
           command:
             - bash
@@ -224,7 +224,7 @@ spec:
               subPath: browser-navigation.md
               readOnly: true
         - name: serena
-          image: citizendaniel/zeroclaw-sam:v1.4.12
+          image: citizendaniel/zeroclaw-sam:v1.4.14
           imagePullPolicy: IfNotPresent
           command:
             - sh
