@@ -2439,8 +2439,8 @@ pub(crate) async fn run_tool_call_loop(
                 } else {
                     None
                 };
-                let vision_tool: Option<&dyn Tool> = static_match
-                    .or_else(|| activated_arc.as_deref());
+                let vision_tool: Option<&dyn Tool> =
+                    static_match.or_else(|| activated_arc.as_deref());
                 let vision_tool_name = vision_tool
                     .map(|t| t.name().to_string())
                     .unwrap_or_else(|| format!("{prefix}vision"));
@@ -2460,7 +2460,10 @@ pub(crate) async fn run_tool_call_loop(
                             } else if props.contains_key("image") {
                                 Some("image")
                             } else {
-                                props.keys().find(|k| k.contains("image")).map(|k| k.as_str())
+                                props
+                                    .keys()
+                                    .find(|k| k.contains("image"))
+                                    .map(|k| k.as_str())
                             }
                         })
                         .unwrap_or("image_source");
@@ -4941,6 +4944,7 @@ mod tests {
             &[],
             &[],
             None,
+            0,
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");

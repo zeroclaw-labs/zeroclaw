@@ -66,6 +66,8 @@ const MOONSHOT_CN_BASE_URL: &str = "https://api.moonshot.cn/v1";
 const QWEN_CN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const QWEN_INTL_BASE_URL: &str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
 const QWEN_US_BASE_URL: &str = "https://dashscope-us.aliyuncs.com/compatible-mode/v1";
+const QWEN_CODING_INTL_BASE_URL: &str = "https://coding-intl.dashscope.aliyuncs.com/v1";
+const QWEN_CODING_CN_BASE_URL: &str = "https://coding.dashscope.aliyuncs.com/v1";
 const QWEN_OAUTH_BASE_FALLBACK_URL: &str = QWEN_CN_BASE_URL;
 const QWEN_OAUTH_TOKEN_ENDPOINT: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
 const QWEN_OAUTH_PLACEHOLDER: &str = "qwen-oauth";
@@ -145,6 +147,21 @@ pub(crate) fn is_qwen_intl_alias(name: &str) -> bool {
     )
 }
 
+pub(crate) fn is_qwen_coding_intl_alias(name: &str) -> bool {
+    matches!(
+        name,
+        "qwen-coding" | "modelstudio" | "qwen-coding-intl" | "modelstudio-intl"
+    )
+}
+
+pub(crate) fn is_qwen_coding_cn_alias(name: &str) -> bool {
+    matches!(name, "qwen-coding-cn" | "modelstudio-cn")
+}
+
+pub(crate) fn is_qwen_coding_alias(name: &str) -> bool {
+    is_qwen_coding_intl_alias(name) || is_qwen_coding_cn_alias(name)
+}
+
 pub(crate) fn is_qwen_us_alias(name: &str) -> bool {
     matches!(name, "qwen-us" | "dashscope-us")
 }
@@ -158,6 +175,7 @@ pub(crate) fn is_qwen_alias(name: &str) -> bool {
         || is_qwen_intl_alias(name)
         || is_qwen_us_alias(name)
         || is_qwen_oauth_alias(name)
+        || is_qwen_coding_alias(name)
 }
 
 pub(crate) fn is_zai_global_alias(name: &str) -> bool {
@@ -505,6 +523,9 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
         .map(ToString::to_string);
 
     if credential.is_none() && !placeholder_requested {
+        credential = read_non_empty_env("MODELSTUDIO_API_KEY");
+    }
+    if credential.is_none() && !placeholder_requested {
         credential = read_non_empty_env("DASHSCOPE_API_KEY");
     }
     if credential.is_none() && !placeholder_requested {
@@ -658,7 +679,11 @@ fn moonshot_base_url(name: &str) -> Option<&'static str> {
 }
 
 fn qwen_base_url(name: &str) -> Option<&'static str> {
-    if is_qwen_cn_alias(name) || is_qwen_oauth_alias(name) {
+    if is_qwen_coding_intl_alias(name) {
+        Some(QWEN_CODING_INTL_BASE_URL)
+    } else if is_qwen_coding_cn_alias(name) {
+        Some(QWEN_CODING_CN_BASE_URL)
+    } else if is_qwen_cn_alias(name) || is_qwen_oauth_alias(name) {
         Some(QWEN_CN_BASE_URL)
     } else if is_qwen_intl_alias(name) {
         Some(QWEN_INTL_BASE_URL)
@@ -896,6 +921,11 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         name if is_doubao_alias(name) => {
             vec!["ARK_API_KEY", "VOLCENGINE_API_KEY", "DOUBAO_API_KEY"]
         }
+        name if is_qwen_coding_alias(name) => vec![
+            "MODELSTUDIO_API_KEY",
+            "DASHSCOPE_API_KEY",
+            "BAILIAN_API_KEY",
+        ],
         name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY", "BAILIAN_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
@@ -1265,6 +1295,14 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
+        name if is_qwen_coding_alias(name) && qwen_base_url(name).is_some() => {
+            Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
+                "Qwen Coding",
+                qwen_base_url(name).expect("checked in guard"),
+                key,
+                AuthStyle::Bearer,
+            )))
+        }
         name if qwen_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new_with_vision(
             "Qwen",
             qwen_base_url(name).expect("checked in guard"),
@@ -1894,6 +1932,18 @@ pub fn list_providers() -> Vec<ProviderInfo> {
                 "qwen-code",
                 "qwen-oauth",
                 "qwen_oauth",
+            ],
+            local: false,
+        },
+        ProviderInfo {
+            name: "qwen-coding",
+            display_name: "Qwen Coding (ModelStudio / coding-intl)",
+            aliases: &[
+                "modelstudio",
+                "qwen-coding-intl",
+                "modelstudio-intl",
+                "qwen-coding-cn",
+                "modelstudio-cn",
             ],
             local: false,
         },

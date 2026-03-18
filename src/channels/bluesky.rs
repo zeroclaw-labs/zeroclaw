@@ -251,7 +251,7 @@ impl BlueskyChannel {
             channel: "bluesky".to_string(),
             timestamp,
             thread_ts: Some(notif.uri.clone()),
-                    observe_group: false,
+            observe_group: false,
         })
     }
 

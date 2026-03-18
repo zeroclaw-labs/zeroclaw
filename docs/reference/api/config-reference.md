@@ -416,6 +416,7 @@ Use route hints so integrations can keep stable names while model IDs evolve.
 | `provider` | _required_ | Provider to route to (must match a known provider name) |
 | `model` | _required_ | Model to use with that provider |
 | `api_key` | unset | Optional API key override for this route's provider |
+| `max_context_tokens` | unset | Optional context window size (tokens) for this model. Overrides global `[agent] max_context_tokens` for pre-flight compaction. |
 
 ### `[[embedding_routes]]`
 

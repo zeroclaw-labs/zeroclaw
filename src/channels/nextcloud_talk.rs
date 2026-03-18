@@ -193,7 +193,7 @@ impl NextcloudTalkChannel {
             channel: "nextcloud_talk".to_string(),
             timestamp: Self::now_unix_secs(),
             thread_ts: None,
-                    observe_group: false,
+            observe_group: false,
         });
 
         messages
@@ -295,7 +295,7 @@ impl NextcloudTalkChannel {
             channel: "nextcloud_talk".to_string(),
             timestamp,
             thread_ts: None,
-                    observe_group: false,
+            observe_group: false,
         });
 
         messages

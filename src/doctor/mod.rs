@@ -1166,6 +1166,7 @@ mod tests {
             provider: "groq".into(),
             model: String::new(),
             api_key: None,
+            max_context_tokens: None,
         }];
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);

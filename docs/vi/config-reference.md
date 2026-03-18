@@ -312,6 +312,7 @@ Route hint giúp tên tích hợp ổn định khi model ID thay đổi.
 | `provider` | _bắt buộc_ | Provider đích (phải khớp tên provider đã biết) |
 | `model` | _bắt buộc_ | Model sử dụng với provider đó |
 | `api_key` | chưa đặt | API key tùy chỉnh cho provider của route này (tùy chọn) |
+| `max_context_tokens` | chưa đặt | Kích thước context window tùy chọn (token). Ghi đè `[agent] max_context_tokens` toàn cục cho pre-flight compaction. |
 
 ### `[[embedding_routes]]`
 

@@ -237,7 +237,7 @@ impl Channel for WebhookChannel {
                 channel: "webhook".to_string(),
                 timestamp,
                 thread_ts: payload.thread_id,
-                    observe_group: false,
+                observe_group: false,
             };
 
             if state.tx.send(msg).await.is_err() {

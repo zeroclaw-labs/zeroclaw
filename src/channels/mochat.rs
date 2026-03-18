@@ -198,7 +198,7 @@ impl Channel for MochatChannel {
                                     .unwrap_or_default()
                                     .as_secs(),
                                 thread_ts: None,
-                    observe_group: false,
+                                observe_group: false,
                             };
 
                             if tx.send(channel_msg).await.is_err() {

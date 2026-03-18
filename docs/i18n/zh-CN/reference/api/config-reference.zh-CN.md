@@ -385,6 +385,7 @@ allowed_roots = [\"~/Desktop/projects\", \"/opt/shared-repo\"]
 | `provider` | _必填_ | 要路由到的提供商（必须匹配已知提供商名称） |
 | `model` | _必填_ | 与该提供商一起使用的模型 |
 | `api_key` | 未设置 | 此路由提供商的可选 API 密钥覆盖 |
+| `max_context_tokens` | 未设置 | 可选的上下文窗口大小（token 数）。覆盖全局 `[agent] max_context_tokens` 用于预检压缩。 |
 
 ### `[[embedding_routes]]`
 

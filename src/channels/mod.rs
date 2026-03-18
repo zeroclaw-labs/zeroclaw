@@ -388,7 +388,10 @@ fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
     // gets an independent session.  Include thread_ts for per-topic
     // isolation in forum groups.
     match &msg.thread_ts {
-        Some(tid) => format!("{}_{}_{}_{}", msg.channel, msg.reply_target, tid, msg.sender),
+        Some(tid) => format!(
+            "{}_{}_{}_{}",
+            msg.channel, msg.reply_target, tid, msg.sender
+        ),
         None => format!("{}_{}", msg.channel, msg.reply_target),
     }
 }
@@ -1336,9 +1339,8 @@ async fn handle_runtime_command_if_needed(
                 }) {
                     current.provider = route.provider.clone();
                     current.model = route.model.clone();
-                    current.max_context_tokens = route
-                        .max_context_tokens
-                        .unwrap_or(ctx.max_context_tokens);
+                    current.max_context_tokens =
+                        route.max_context_tokens.unwrap_or(ctx.max_context_tokens);
                 } else {
                     current.model = model.clone();
                 }
@@ -4477,6 +4479,7 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -4586,6 +4589,7 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -4651,6 +4655,7 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4735,6 +4740,7 @@ mod tests {
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         };
 
         assert!(rollback_orphan_user_turn(
@@ -5269,6 +5275,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -5281,7 +5288,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -5343,6 +5350,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -5355,7 +5363,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -5431,6 +5439,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -5443,7 +5452,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 3,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -5504,6 +5513,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -5516,7 +5526,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -5587,6 +5597,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -5599,7 +5610,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -5648,6 +5659,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ChannelRouteSelection {
                 provider: "openrouter".to_string(),
                 model: "route-model".to_string(),
+                max_context_tokens: 32_000,
             },
         );
 
@@ -5690,6 +5702,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -5702,7 +5715,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -5775,6 +5788,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -5787,7 +5801,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 3,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -5875,6 +5889,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -5887,7 +5902,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 4,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -5960,6 +5975,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -5972,7 +5988,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -6035,6 +6051,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -6047,7 +6064,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -6221,6 +6238,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -6232,7 +6250,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
-                    observe_group: false,
+            observe_group: false,
         })
         .await
         .unwrap();
@@ -6244,7 +6262,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 2,
             thread_ts: None,
-                    observe_group: false,
+            observe_group: false,
         })
         .await
         .unwrap();
@@ -6316,6 +6334,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -6328,7 +6347,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             })
             .await
             .unwrap();
@@ -6341,7 +6360,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             })
             .await
             .unwrap();
@@ -6425,6 +6444,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
             query_classification: crate::config::QueryClassificationConfig::default(),
         });
 
@@ -6438,7 +6458,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "slack".to_string(),
                 timestamp: 1,
                 thread_ts: Some("1741234567.100001".to_string()),
-                    observe_group: false,
+                observe_group: false,
             })
             .await
             .unwrap();
@@ -6451,7 +6471,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "slack".to_string(),
                 timestamp: 2,
                 thread_ts: Some("1741234567.100001".to_string()),
-                    observe_group: false,
+                observe_group: false,
             })
             .await
             .unwrap();
@@ -6533,6 +6553,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -6545,7 +6566,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             })
             .await
             .unwrap();
@@ -6558,7 +6579,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             })
             .await
             .unwrap();
@@ -6622,6 +6643,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -6634,7 +6656,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -6695,6 +6717,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -6707,7 +6730,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -7111,7 +7134,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
-                    observe_group: false,
+            observe_group: false,
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -7127,7 +7150,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: Some("1741234567.123456".into()),
-                    observe_group: false,
+            observe_group: false,
         };
 
         assert_eq!(
@@ -7146,7 +7169,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "cli".into(),
             timestamp: 1,
             thread_ts: None,
-                    observe_group: false,
+            observe_group: false,
         };
 
         assert_eq!(followup_thread_id(&msg).as_deref(), Some("msg_abc123"));
@@ -7162,7 +7185,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
-                    observe_group: false,
+            observe_group: false,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -7172,7 +7195,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
-                    observe_group: false,
+            observe_group: false,
         };
 
         assert_ne!(
@@ -7194,7 +7217,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
-                    observe_group: false,
+            observe_group: false,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -7204,7 +7227,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
-                    observe_group: false,
+            observe_group: false,
         };
 
         mem.store(
@@ -7333,6 +7356,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -7345,7 +7369,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -7361,7 +7385,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -7433,6 +7457,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -7445,7 +7470,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -7532,6 +7557,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -7544,7 +7570,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -8095,6 +8121,7 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -8108,7 +8135,7 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -8175,6 +8202,7 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -8187,7 +8215,7 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -8203,7 +8231,7 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -8289,6 +8317,7 @@ This is an example JSON object for profile settings."#;
             provider: "vision-provider".into(),
             model: "gpt-4-vision".into(),
             api_key: None,
+            max_context_tokens: None,
         }];
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -8330,6 +8359,7 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -8342,7 +8372,7 @@ This is an example JSON object for profile settings."#;
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -8393,6 +8423,7 @@ This is an example JSON object for profile settings."#;
             provider: "vision-provider".into(),
             model: "gpt-4-vision".into(),
             api_key: None,
+            max_context_tokens: None,
         }];
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -8434,6 +8465,7 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -8446,7 +8478,7 @@ This is an example JSON object for profile settings."#;
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -8489,6 +8521,7 @@ This is an example JSON object for profile settings."#;
             provider: "vision-provider".into(),
             model: "gpt-4-vision".into(),
             api_key: None,
+            max_context_tokens: None,
         }];
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -8530,6 +8563,7 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -8542,7 +8576,7 @@ This is an example JSON object for profile settings."#;
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -8598,12 +8632,14 @@ This is an example JSON object for profile settings."#;
                 provider: "fast-provider".into(),
                 model: "fast-model".into(),
                 api_key: None,
+                max_context_tokens: None,
             },
             crate::config::ModelRouteConfig {
                 hint: "code".into(),
                 provider: "code-provider".into(),
                 model: "code-model".into(),
                 api_key: None,
+                max_context_tokens: None,
             },
         ];
 
@@ -8646,6 +8682,7 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            max_context_tokens: 32_000,
         });
 
         process_channel_message(
@@ -8658,7 +8695,7 @@ This is an example JSON object for profile settings."#;
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
-                    observe_group: false,
+                observe_group: false,
             },
             CancellationToken::new(),
         )
