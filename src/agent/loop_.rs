@@ -342,6 +342,11 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 /// Max characters retained in stored compaction summary.
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 
+/// Maximum characters kept per individual tool result when adding to history.
+/// Prevents a single oversized tool output (e.g. binary file read) from
+/// blowing up the context window beyond recovery.  ~25k tokens at 4 chars/tok.
+const MAX_TOOL_RESULT_CHARS: usize = 100_000;
+
 /// Estimate token count for a message history using ~4 chars/token heuristic.
 /// Includes a small overhead per message for role/framing tokens.
 fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
@@ -3326,14 +3331,25 @@ pub(crate) async fn run_tool_call_loop(
         // Only non-ignored tool outputs contribute to the identical-output hash.
         let mut detection_relevant_output = String::new();
         for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
+            let output = if outcome.output.len() > MAX_TOOL_RESULT_CHARS {
+                tracing::warn!(
+                    tool = %tool_name,
+                    original_len = outcome.output.len(),
+                    cap = MAX_TOOL_RESULT_CHARS,
+                    "Truncating oversized tool output before adding to history"
+                );
+                truncate_with_ellipsis(&outcome.output, MAX_TOOL_RESULT_CHARS)
+            } else {
+                outcome.output.clone()
+            };
             if !loop_ignore_tools.contains(tool_name.as_str()) {
-                detection_relevant_output.push_str(&outcome.output);
+                detection_relevant_output.push_str(&output);
             }
-            individual_results.push((tool_call_id, outcome.output.clone()));
+            individual_results.push((tool_call_id, output.clone()));
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                tool_name, outcome.output
+                tool_name, output
             );
         }
 
