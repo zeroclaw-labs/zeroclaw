@@ -7,6 +7,7 @@ import {
 import { marked } from 'marked';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
+import { getToken } from '@/lib/auth';
 
 // Configure marked for safe rendering
 marked.setOptions({
@@ -49,101 +50,300 @@ function renderMarkdown(content: string): string {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Language detection — covers all languages supported by modern AI models
+// ---------------------------------------------------------------------------
+
+const LANG_PREF_MEMORY_KEY = 'user_profile_language';
+const LANG_PREF_LOCAL_KEY = 'zeroclaw.user.lang';
+const UNDETECTED_LANG = '__undetected__';
+
+/** Save language preference to MoA long-term memory (fire-and-forget). */
+function persistLangToMemory(lang: string): void {
+  const token = getToken();
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  fetch('/api/memory', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      key: LANG_PREF_MEMORY_KEY,
+      content: `User's primary language: ${lang}`,
+      category: 'core',
+    }),
+  }).catch(() => { /* best-effort */ });
+  try { localStorage.setItem(LANG_PREF_LOCAL_KEY, lang); } catch { /* ok */ }
+}
+
+/** Load language preference from MoA memory. Returns null if not found. */
+async function loadLangFromMemory(): Promise<string | null> {
+  // Fast path: localStorage cache
+  try {
+    const cached = localStorage.getItem(LANG_PREF_LOCAL_KEY);
+    if (cached && cached.length >= 2) return cached;
+  } catch { /* ok */ }
+
+  // Slow path: ask backend memory
+  try {
+    const token = getToken();
+    const headers: Record<string, string> = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const res = await fetch(`/api/memory?query=${encodeURIComponent(LANG_PREF_MEMORY_KEY)}`, { headers });
+    if (!res.ok) return null;
+    const data = await res.json() as { entries?: Array<{ key: string; content: string }> };
+    const entry = data.entries?.find((e) => e.key === LANG_PREF_MEMORY_KEY);
+    if (!entry) return null;
+    // Extract lang code from content like "User's primary language: ko-KR"
+    const match = entry.content.match(/:\s*([a-z]{2,3}(?:-[A-Za-z]{2,4})?)\s*$/);
+    if (match) {
+      try { localStorage.setItem(LANG_PREF_LOCAL_KEY, match[1]); } catch { /* ok */ }
+      return match[1];
+    }
+  } catch { /* ok */ }
+  return null;
+}
+
 /**
- * Detect the BCP-47 language tag from text content using Unicode script
- * analysis and common word/pattern heuristics. Returns a lang code suitable
- * for Web Speech API (e.g. 'ko-KR', 'en-US', 'ja-JP').
+ * Comprehensive language detection using Unicode script analysis + word-level
+ * heuristics. Covers 70+ languages across all major script families.
+ * Returns BCP-47 tag for Web Speech API, or UNDETECTED_LANG if uncertain.
  */
 function detectLanguage(text: string): string {
-  // Strip markdown / code blocks so they don't skew detection
   const clean = text
     .replace(/```[\s\S]*?```/g, '')
     .replace(/`[^`]+`/g, '')
     .replace(/https?:\/\/\S+/g, '')
     .replace(/[#*_~>\[\]()!|`]/g, '')
+    .replace(/\s+/g, ' ')
     .trim();
 
-  if (!clean) return navigator.language || 'en-US';
+  if (!clean || clean.length < 2) return UNDETECTED_LANG;
 
-  // Count characters by Unicode script range
-  let ko = 0, ja = 0, zh = 0, cyrillic = 0, arabic = 0, thai = 0;
-  let devanagari = 0, greek = 0, latin = 0, vietnamese = 0;
+  // ── Unicode script counters ──
+  let ko = 0, ja = 0, zh = 0;
+  let cyrillic = 0, arabic = 0, hebrew = 0;
+  let thai = 0, lao = 0, khmer = 0, myanmar = 0;
+  let devanagari = 0, bengali = 0, gujarati = 0, gurmukhi = 0;
+  let tamil = 0, telugu = 0, kannada = 0, malayalam = 0, sinhala = 0, odia = 0;
+  let greek = 0, armenian = 0, georgian = 0;
+  let ethiopic = 0, tibetan = 0, mongolian = 0;
+  let latin = 0, vietnamese = 0;
 
   for (const ch of clean) {
     const cp = ch.codePointAt(0) ?? 0;
-    // Korean Hangul
+    // Hangul
     if ((cp >= 0xAC00 && cp <= 0xD7AF) || (cp >= 0x1100 && cp <= 0x11FF) ||
         (cp >= 0x3130 && cp <= 0x318F)) { ko++; continue; }
     // Japanese Hiragana / Katakana
     if ((cp >= 0x3040 && cp <= 0x309F) || (cp >= 0x30A0 && cp <= 0x30FF) ||
-        (cp >= 0x31F0 && cp <= 0x31FF)) { ja++; continue; }
-    // CJK Unified (shared by zh/ja/ko — counted separately below)
-    if (cp >= 0x4E00 && cp <= 0x9FFF) { zh++; continue; }
-    // Cyrillic
-    if (cp >= 0x0400 && cp <= 0x04FF) { cyrillic++; continue; }
-    // Arabic
-    if (cp >= 0x0600 && cp <= 0x06FF) { arabic++; continue; }
+        (cp >= 0x31F0 && cp <= 0x31FF) || (cp >= 0xFF65 && cp <= 0xFF9F)) { ja++; continue; }
+    // CJK Unified
+    if ((cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0x3400 && cp <= 0x4DBF) ||
+        (cp >= 0x20000 && cp <= 0x2A6DF)) { zh++; continue; }
+    // Cyrillic + Extended
+    if ((cp >= 0x0400 && cp <= 0x04FF) || (cp >= 0x0500 && cp <= 0x052F)) { cyrillic++; continue; }
+    // Arabic + Extended
+    if ((cp >= 0x0600 && cp <= 0x06FF) || (cp >= 0x0750 && cp <= 0x077F) ||
+        (cp >= 0x08A0 && cp <= 0x08FF) || (cp >= 0xFB50 && cp <= 0xFDFF) ||
+        (cp >= 0xFE70 && cp <= 0xFEFF)) { arabic++; continue; }
+    // Hebrew
+    if ((cp >= 0x0590 && cp <= 0x05FF) || (cp >= 0xFB1D && cp <= 0xFB4F)) { hebrew++; continue; }
     // Thai
     if (cp >= 0x0E00 && cp <= 0x0E7F) { thai++; continue; }
-    // Devanagari (Hindi etc.)
-    if (cp >= 0x0900 && cp <= 0x097F) { devanagari++; continue; }
-    // Greek
-    if (cp >= 0x0370 && cp <= 0x03FF) { greek++; continue; }
-    // Vietnamese diacritics on Latin letters
+    // Lao
+    if (cp >= 0x0E80 && cp <= 0x0EFF) { lao++; continue; }
+    // Khmer
+    if ((cp >= 0x1780 && cp <= 0x17FF) || (cp >= 0x19E0 && cp <= 0x19FF)) { khmer++; continue; }
+    // Myanmar (Burmese)
+    if ((cp >= 0x1000 && cp <= 0x109F) || (cp >= 0xAA60 && cp <= 0xAA7F)) { myanmar++; continue; }
+    // Devanagari (Hindi, Marathi, Nepali, Sanskrit)
+    if ((cp >= 0x0900 && cp <= 0x097F) || (cp >= 0xA8E0 && cp <= 0xA8FF)) { devanagari++; continue; }
+    // Bengali / Assamese
+    if (cp >= 0x0980 && cp <= 0x09FF) { bengali++; continue; }
+    // Gujarati
+    if (cp >= 0x0A80 && cp <= 0x0AFF) { gujarati++; continue; }
+    // Gurmukhi (Punjabi)
+    if (cp >= 0x0A00 && cp <= 0x0A7F) { gurmukhi++; continue; }
+    // Tamil
+    if (cp >= 0x0B80 && cp <= 0x0BFF) { tamil++; continue; }
+    // Telugu
+    if (cp >= 0x0C00 && cp <= 0x0C7F) { telugu++; continue; }
+    // Kannada
+    if (cp >= 0x0C80 && cp <= 0x0CFF) { kannada++; continue; }
+    // Malayalam
+    if (cp >= 0x0D00 && cp <= 0x0D7F) { malayalam++; continue; }
+    // Sinhala
+    if (cp >= 0x0D80 && cp <= 0x0DFF) { sinhala++; continue; }
+    // Odia (Oriya)
+    if (cp >= 0x0B00 && cp <= 0x0B7F) { odia++; continue; }
+    // Greek + Extended
+    if ((cp >= 0x0370 && cp <= 0x03FF) || (cp >= 0x1F00 && cp <= 0x1FFF)) { greek++; continue; }
+    // Armenian
+    if ((cp >= 0x0530 && cp <= 0x058F) || (cp >= 0xFB00 && cp <= 0xFB17)) { armenian++; continue; }
+    // Georgian
+    if ((cp >= 0x10A0 && cp <= 0x10FF) || (cp >= 0x2D00 && cp <= 0x2D2F)) { georgian++; continue; }
+    // Ethiopic (Amharic, Tigrinya)
+    if ((cp >= 0x1200 && cp <= 0x137F) || (cp >= 0x1380 && cp <= 0x139F) ||
+        (cp >= 0x2D80 && cp <= 0x2DDF)) { ethiopic++; continue; }
+    // Tibetan
+    if (cp >= 0x0F00 && cp <= 0x0FFF) { tibetan++; continue; }
+    // Mongolian
+    if (cp >= 0x1800 && cp <= 0x18AF) { mongolian++; continue; }
+    // Vietnamese diacritics
     if ('àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ'
         .includes(ch.toLowerCase())) { vietnamese++; continue; }
     // Basic Latin
-    if (cp >= 0x0041 && cp <= 0x007A) { latin++; continue; }
+    if ((cp >= 0x0041 && cp <= 0x005A) || (cp >= 0x0061 && cp <= 0x007A)) { latin++; continue; }
   }
 
-  // If Japanese kana present, CJK chars are likely kanji → add to ja
+  // CJK disambiguation: kana → Japanese, Hangul → Korean, else Chinese
   if (ja > 0) ja += zh;
-  // If Korean present with CJK, likely hanja
   else if (ko > 0 && zh > 0 && ja === 0) ko += zh;
 
-  // Build scored candidates
-  const scores: [string, number][] = [
+  // ── Script-based scoring ──
+  const scriptScores: [string, number][] = [
     ['ko-KR', ko],
     ['ja-JP', ja],
     ['zh-CN', (ja === 0 && ko === 0) ? zh : 0],
-    ['ru-RU', cyrillic],
+    ['el-GR', greek],
+    ['hy-AM', armenian],
+    ['ka-GE', georgian],
+    ['he-IL', hebrew],
     ['ar-SA', arabic],
     ['th-TH', thai],
+    ['lo-LA', lao],
+    ['km-KH', khmer],
+    ['my-MM', myanmar],
     ['hi-IN', devanagari],
-    ['el-GR', greek],
+    ['bn-BD', bengali],
+    ['gu-IN', gujarati],
+    ['pa-IN', gurmukhi],
+    ['ta-IN', tamil],
+    ['te-IN', telugu],
+    ['kn-IN', kannada],
+    ['ml-IN', malayalam],
+    ['si-LK', sinhala],
+    ['or-IN', odia],
+    ['am-ET', ethiopic],
+    ['bo-CN', tibetan],
+    ['mn-MN', mongolian],
     ['vi-VN', vietnamese],
   ];
 
-  // Pick highest non-Latin script
-  scores.sort((a, b) => b[1] - a[1]);
-  if (scores[0][1] > 0) return scores[0][0];
+  // Cyrillic needs word-level disambiguation (Russian vs Ukrainian vs others)
+  if (cyrillic > 0) {
+    const lower = clean.toLowerCase();
+    if (/[іїєґ]/.test(lower) || /\b(і|та|це|що|як|але|не|від|або|ще|їх|ці)\b/.test(lower))
+      scriptScores.push(['uk-UA', cyrillic]);
+    else if (/[ўі]/.test(lower) || /\b(і|ў|але|як|гэта|што|яна|яны|таксама)\b/.test(lower))
+      scriptScores.push(['be-BY', cyrillic]);
+    else if (/\b(и|на|от|за|се|да|не|с|е|по|от|тя|ли|бъ|ще)\b/.test(lower))
+      scriptScores.push(['bg-BG', cyrillic]);
+    else if (/\b(је|и|на|да|у|се|за|од|су|као|али|има|не|то|са)\b/.test(lower))
+      scriptScores.push(['sr-RS', cyrillic]);
+    else if (/[ңғүұқәөһ]/.test(lower))
+      scriptScores.push(['kk-KZ', cyrillic]);
+    else
+      scriptScores.push(['ru-RU', cyrillic]);
+  }
 
-  // All Latin — use word-level heuristics for European languages
+  scriptScores.sort((a, b) => b[1] - a[1]);
+  if (scriptScores[0][1] > 0) return scriptScores[0][0];
+
+  // ── Latin-script word-level heuristics ──
+  if (latin === 0) return UNDETECTED_LANG;
   const lower = clean.toLowerCase();
-  // French
-  if (/\b(le|la|les|un|une|des|est|sont|avec|dans|pour|que|qui|nous|vous|ils|elles|ce|cette|je|tu|il|elle|ne|pas|mais|ou|et|donc|car)\b/.test(lower))
-    return 'fr-FR';
-  // Spanish
-  if (/\b(el|los|las|una|unos|unas|es|son|está|están|con|por|para|que|como|pero|más|este|esta|yo|tú|él|ella|nosotros)\b/.test(lower))
-    return 'es-ES';
-  // German
-  if (/\b(der|die|das|ein|eine|ist|sind|haben|mit|und|oder|aber|für|von|ich|du|er|sie|wir|ihr|nicht|auch|noch)\b/.test(lower))
-    return 'de-DE';
-  // Portuguese
-  if (/\b(o|os|as|um|uma|uns|umas|é|são|está|estão|com|por|para|que|como|mas|mais|este|esta|eu|tu|ele|ela|nós|vocês)\b/.test(lower))
-    return 'pt-BR';
-  // Italian
-  if (/\b(il|lo|la|gli|le|un|uno|una|è|sono|con|per|che|come|ma|più|questo|questa|io|tu|lui|lei|noi|voi|loro|anche|non)\b/.test(lower))
-    return 'it-IT';
-  // Indonesian / Malay
-  if (/\b(yang|dan|di|ini|itu|dengan|untuk|dari|pada|adalah|tidak|akan|sudah|bisa|kami|mereka|saya|anda)\b/.test(lower))
-    return 'id-ID';
-  // Turkish
-  if (/\b(bir|ve|bu|da|de|için|ile|ben|sen|biz|onlar|değil|var|yok|olan|gibi|ama|çok|daha)\b/.test(lower))
-    return 'tr-TR';
 
-  // Default: English
-  return 'en-US';
+  // Ordered from most distinctive to least (reduces false positives)
+  const latinRules: [string, RegExp][] = [
+    // Finnish — very distinctive
+    ['fi-FI', /\b(ja|on|ei|se|hän|tämä|että|mutta|tai|niin|ovat|oli|olla|myös|kun|vain|hänen|siitä|minä|sinä|meillä|ääni|ään)\b/],
+    // Hungarian — distinctive
+    ['hu-HU', /\b(és|egy|az|nem|van|hogy|ezt|meg|volt|még|csak|már|mint|igen|lesz|vagy|itt|ott|ami|aki|nagyon|köszön)\b/],
+    // Polish — distinctive diacritics
+    ['pl-PL', /\b(nie|jest|się|na|to|jak|ale|czy|tak|już|też|może|tylko|gdzie|kiedy|bardzo|dobrze|proszę|dziękuję)\b/],
+    // Czech
+    ['cs-CZ', /\b(je|to|na|se|že|ale|jak|tak|jsem|není|jsou|byl|bude|může|tento|tato|toto|také|nebo|když|kde|kdo|proč)\b/],
+    // Slovak
+    ['sk-SK', /\b(je|na|sa|to|že|ale|som|nie|ako|tak|bol|bude|môže|tento|táto|toto|tiež|alebo|keď|kde|kto|prečo)\b/],
+    // Romanian
+    ['ro-RO', /\b(este|sunt|care|pentru|sau|dar|mai|cum|când|unde|acest|această|între|poate|acum|foarte|despre|prin|ați|sunt)\b/],
+    // Croatian / Bosnian
+    ['hr-HR', /\b(je|i|na|da|u|se|za|od|su|kao|ali|ima|ne|to|sa|ovaj|koji|što|može|biti)\b/],
+    // Slovenian
+    ['sl-SI', /\b(je|in|na|da|se|za|od|so|kot|ali|ne|to|ta|ki|lahko|biti|tudi|sem|smo|ste)\b/],
+    // Lithuanian
+    ['lt-LT', /\b(ir|yra|kad|bet|tai|su|ar|iš|jis|ji|mes|jie|jos|buvo|gali|labai|dabar|kaip|kur|kas|tik)\b/],
+    // Latvian
+    ['lv-LV', /\b(ir|un|ka|bet|tas|ar|no|vai|viņš|viņa|mēs|viņi|bija|var|ļoti|tagad|kā|kur|kas|tikai)\b/],
+    // Estonian
+    ['et-EE', /\b(on|ja|et|ei|see|mis|kui|aga|ka|veel|oli|olla|saab|väga|nüüd|kuidas|kus|kes|ainult)\b/],
+    // Vietnamese (Latin-based with unique diacritics - already scored above but add word check)
+    ['vi-VN', /\b(là|và|của|không|có|được|trong|cho|này|đã|với|một|những|các|từ|đó|người|khi|cũng)\b/],
+    // Swahili
+    ['sw-KE', /\b(ni|na|ya|wa|kwa|katika|hii|hiyo|au|lakini|pia|sana|kwamba|kama|hakuna|watu|nchi|moja|yake|wake)\b/],
+    // Malay
+    ['ms-MY', /\b(yang|dan|di|ini|itu|dengan|untuk|dari|pada|adalah|tidak|akan|sudah|boleh|kami|mereka|saya|anda|telah|juga)\b/],
+    // Indonesian
+    ['id-ID', /\b(yang|dan|di|ini|itu|dengan|untuk|dari|pada|adalah|tidak|akan|sudah|bisa|kami|mereka|saya|anda|juga|atau)\b/],
+    // Tagalog / Filipino
+    ['fil-PH', /\b(ang|ng|sa|na|at|ay|mga|ito|iyon|ko|mo|niya|kami|sila|hindi|oo|ano|kung|pero|din|lang|po)\b/],
+    // Dutch
+    ['nl-NL', /\b(de|het|een|en|van|in|is|dat|op|te|voor|met|niet|zijn|worden|ook|maar|als|nog|wel|deze|die|wat|naar)\b/],
+    // Swedish
+    ['sv-SE', /\b(och|det|är|en|att|för|som|med|den|har|jag|inte|var|kan|till|av|på|hade|från|men|hon|han|vi|dem)\b/],
+    // Norwegian
+    ['nb-NO', /\b(og|det|er|en|at|for|som|med|den|har|jeg|ikke|var|kan|til|av|på|hadde|fra|men|hun|han|vi|dem)\b/],
+    // Danish
+    ['da-DK', /\b(og|det|er|en|at|for|som|med|den|har|jeg|ikke|var|kan|til|af|på|havde|fra|men|hun|han|vi|dem)\b/],
+    // Icelandic
+    ['is-IS', /\b(og|er|að|það|sem|en|ekki|hann|hún|við|þeir|var|vera|geta|til|á|í|frá|með|um|þetta)\b/],
+    // French
+    ['fr-FR', /\b(le|la|les|un|une|des|est|sont|avec|dans|pour|que|qui|nous|vous|ils|elles|ce|cette|je|tu|il|elle|ne|pas|mais|et)\b/],
+    // Spanish
+    ['es-ES', /\b(el|los|las|una|unos|unas|es|son|está|están|con|por|para|que|como|pero|más|este|esta|yo|tú|él|ella|nosotros)\b/],
+    // Portuguese
+    ['pt-BR', /\b(o|os|as|um|uma|uns|umas|é|são|está|estão|com|por|para|que|como|mas|mais|este|esta|eu|tu|ele|ela|nós|vocês)\b/],
+    // Italian
+    ['it-IT', /\b(il|lo|la|gli|le|un|uno|una|è|sono|con|per|che|come|ma|più|questo|questa|io|tu|lui|lei|noi|voi|loro|anche|non)\b/],
+    // German
+    ['de-DE', /\b(der|die|das|ein|eine|ist|sind|haben|mit|und|oder|aber|für|von|ich|du|er|sie|wir|ihr|nicht|auch|noch)\b/],
+    // Turkish
+    ['tr-TR', /\b(bir|ve|bu|da|de|için|ile|ben|sen|biz|onlar|değil|var|yok|olan|gibi|ama|çok|daha)\b/],
+    // Azerbaijani
+    ['az-AZ', /\b(bir|və|bu|da|dəqiq|amma|ilə|mən|sən|biz|onlar|deyil|var|yox|olan|kimi|amma|çox|daha)\b/],
+    // Uzbek (Latin)
+    ['uz-UZ', /\b(va|bir|bu|ham|bilan|men|sen|biz|ular|emas|bor|yoq|kabi|lekin|juda|endi)\b/],
+    // Catalan
+    ['ca-ES', /\b(el|la|els|les|un|una|és|són|amb|per|que|com|però|més|aquest|aquesta|jo|tu|ell|ella|nosaltres|vosaltres)\b/],
+    // Galician
+    ['gl-ES', /\b(o|a|os|as|un|unha|é|son|con|por|para|que|como|pero|máis|este|esta|eu|ti|el|ela|nós|vós)\b/],
+    // Basque
+    ['eu-ES', /\b(da|eta|bat|ez|hau|hori|nire|zure|bere|gure|haien|baina|ere|oso|orain|nola|non|nor|bakarrik)\b/],
+    // Welsh
+    ['cy-GB', /\b(y|yr|a|i|yn|mae|ei|eu|ond|hefyd|gyda|gan|ar|am|o|fe|hi|ni|nhw|bod|wedi|roedd)\b/],
+    // Irish Gaelic
+    ['ga-IE', /\b(an|na|agus|is|ar|le|i|ag|go|tá|ní|sé|sí|muid|siad|ach|freisin|anois|conas|cá|cad)\b/],
+    // Maltese
+    ['mt-MT', /\b(il|u|ta|li|ma|jew|fuq|hija|huwa|aħna|huma|mhux|ukoll|issa|kif|fejn|min|biss)\b/],
+    // Hausa
+    ['ha-NG', /\b(da|na|ya|ta|ne|ce|ba|shi|ita|mu|su|amma|kuma|ko|sosai|yanzu|yadda|ina|wane|kawai)\b/],
+    // Yoruba
+    ['yo-NG', /\b(ni|ti|si|ati|ko|se|je|mo|re|wa|won|sugbon|pelu|gidigidi|bayi|bi|nibo|tani|nikan)\b/],
+    // Zulu
+    ['zu-ZA', /\b(ukuthi|futhi|kodwa|noma|kakhulu|manje|kanjani|kuphi|ubani|kuphela|yebo|cha)\b/],
+    // Afrikaans
+    ['af-ZA', /\b(die|en|van|in|is|dat|op|te|vir|met|nie|het|het|ook|maar|as|nog|hierdie|wat|na|hulle|ons)\b/],
+  ];
+
+  for (const [lang, re] of latinRules) {
+    if (re.test(lower)) return lang;
+  }
+
+  // If significant Latin chars but no heuristic match, default English
+  if (latin > 3) return 'en-US';
+
+  return UNDETECTED_LANG;
 }
 
 /** Create a SpeechRecognition instance (cross-browser) */
@@ -154,8 +354,9 @@ function createSpeechRecognition(lang: string) {
   if (!SpeechRecognition) return null;
   const recognition = new SpeechRecognition();
   recognition.lang = lang;
-  recognition.interimResults = false;
-  recognition.continuous = true;
+  recognition.interimResults = true;   // Real-time transcription for speed
+  recognition.continuous = true;       // Keep listening until explicitly stopped
+  recognition.maxAlternatives = 1;     // Fastest: single best result
   return recognition;
 }
 
@@ -344,6 +545,7 @@ export default function AgentChat() {
   const [listening, setListening] = useState(false);
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
   const [chatLang, setChatLang] = useState(() => navigator.language || 'en-US');
+  const [voiceMode, setVoiceMode] = useState(false); // Persistent voice conversation mode
 
   const wsRef = useRef<WebSocketClient | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -351,6 +553,22 @@ export default function AgentChat() {
   const pendingContentRef = useRef('');
   const recognitionRef = useRef<ReturnType<typeof createSpeechRecognition> | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const langLoadedRef = useRef(false);
+  const voiceModeRef = useRef(false);             // Sync ref for async callbacks
+  const chatLangRef = useRef(chatLang);            // Sync ref for lang in callbacks
+
+  // Keep refs in sync with state
+  useEffect(() => { voiceModeRef.current = voiceMode; }, [voiceMode]);
+  useEffect(() => { chatLangRef.current = chatLang; }, [chatLang]);
+
+  // Load saved language preference on mount
+  useEffect(() => {
+    if (langLoadedRef.current) return;
+    langLoadedRef.current = true;
+    loadLangFromMemory().then((saved) => {
+      if (saved) setChatLang(saved);
+    });
+  }, []);
 
   useEffect(() => {
     const ws = new WebSocketClient();
@@ -408,6 +626,18 @@ export default function AgentChat() {
 
           pendingContentRef.current = '';
           setTyping(false);
+
+          // Auto-TTS in voice mode: speak the response, then resume STT
+          if (voiceModeRef.current && finalContent !== EMPTY_DONE_FALLBACK) {
+            // Pause STT while speaking to avoid echo
+            recognitionRef.current?.stop();
+            speakContent(finalContent, chatLangRef.current, () => {
+              // Resume STT after speech ends (if still in voice mode)
+              if (voiceModeRef.current) {
+                startListening(chatLangRef.current);
+              }
+            });
+          }
           break;
         }
 
@@ -471,13 +701,33 @@ export default function AgentChat() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, typing]);
 
-  const handleSend = () => {
+  const handleSend = useCallback(() => {
     const trimmed = input.trim();
     if (!trimmed || !wsRef.current?.connected) return;
 
     // Detect language from user's message and update session language
     const detected = detectLanguage(trimmed);
-    setChatLang(detected);
+    if (detected === UNDETECTED_LANG) {
+      // First message and can't detect — ask user
+      if (messages.length === 0) {
+        setMessages((prev) => [
+          ...prev,
+          { id: makeMessageId(), role: 'user', content: trimmed, timestamp: new Date() },
+          {
+            id: makeMessageId(),
+            role: 'agent',
+            content: "I couldn't detect your language. Which language would you like me to respond in?\n\n(Please type your answer in your preferred language, e.g. \"한국어\", \"日本語\", \"Français\", \"Español\", etc.)",
+            timestamp: new Date(),
+          },
+        ]);
+        setInput('');
+        return;
+      }
+      // Otherwise keep current lang
+    } else if (detected !== chatLang) {
+      setChatLang(detected);
+      persistLangToMemory(detected);
+    }
 
     setMessages((prev) => [
       ...prev,
@@ -499,7 +749,7 @@ export default function AgentChat() {
 
     setInput('');
     inputRef.current?.focus();
-  };
+  }, [input, messages.length, chatLang]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -518,45 +768,86 @@ export default function AgentChat() {
     inputRef.current?.focus();
   };
 
-  // --- STT (Speech-to-Text) ---
-  const toggleListening = useCallback(() => {
-    if (listening) {
-      recognitionRef.current?.stop();
-      setListening(false);
-      return;
-    }
+  // --- STT (Speech-to-Text) with continuous voice mode ---
 
-    const recognition = createSpeechRecognition(chatLang);
+  /** Start STT listening (internal helper). */
+  const startListening = useCallback((lang: string) => {
+    const recognition = createSpeechRecognition(lang);
     if (!recognition) {
       setError('Speech recognition is not supported in this browser.');
       return;
     }
 
+    let finalTranscript = '';
+
     recognition.onresult = (event: { results: SpeechRecognitionResultList }) => {
-      let transcript = '';
+      let interim = '';
+      finalTranscript = '';
       for (let i = 0; i < event.results.length; i++) {
-        transcript += event.results[i][0].transcript;
+        const r = event.results[i];
+        if (r.isFinal) {
+          finalTranscript += r[0].transcript;
+        } else {
+          interim += r[0].transcript;
+        }
       }
-      setInput((prev) => (prev ? prev + ' ' + transcript : transcript));
+      // Show real-time transcription (final + interim)
+      setInput(finalTranscript + (interim ? interim : ''));
     };
 
-    recognition.onerror = () => {
+    recognition.onerror = (e: { error?: string }) => {
+      // 'no-speech' and 'aborted' are not real errors — auto-restart in voice mode
+      if (e.error === 'no-speech' || e.error === 'aborted') return;
       setListening(false);
+      setVoiceMode(false);
     };
 
     recognition.onend = () => {
-      setListening(false);
+      // In voice mode: auto-send final transcript, then the response handler
+      // will restart listening after TTS completes
+      if (voiceModeRef.current && finalTranscript.trim()) {
+        setInput(finalTranscript.trim());
+        // Trigger send on next tick so state is updated
+        setTimeout(() => {
+          const sendBtn = document.querySelector('[data-voice-send]') as HTMLButtonElement | null;
+          sendBtn?.click();
+        }, 50);
+      } else if (voiceModeRef.current) {
+        // No speech detected but still in voice mode — restart
+        setTimeout(() => {
+          if (voiceModeRef.current) startListening(chatLangRef.current);
+        }, 300);
+      } else {
+        setListening(false);
+      }
     };
 
     recognitionRef.current = recognition;
     recognition.start();
     setListening(true);
-  }, [listening, chatLang]);
+  }, []);
 
-  // Cleanup STT on unmount
+  /** Toggle voice mode on/off. */
+  const toggleListening = useCallback(() => {
+    if (listening || voiceMode) {
+      // Stop everything
+      recognitionRef.current?.stop();
+      window.speechSynthesis.cancel();
+      setListening(false);
+      setVoiceMode(false);
+      return;
+    }
+
+    // Enter voice mode: continuous STT ↔ TTS loop
+    setVoiceMode(true);
+    startListening(chatLang);
+  }, [listening, voiceMode, chatLang, startListening]);
+
+  // Cleanup STT + TTS on unmount
   useEffect(() => {
     return () => {
       recognitionRef.current?.stop();
+      window.speechSynthesis.cancel();
     };
   }, []);
 
@@ -776,22 +1067,25 @@ export default function AgentChat() {
             />
           </div>
 
-          {/* Right: Mic (STT) button */}
+          {/* Right: Mic (STT/Voice mode) button */}
           <button
             onClick={toggleListening}
             disabled={!connected}
             className={`flex-shrink-0 p-2.5 rounded-xl transition-colors ${
-              listening
+              voiceMode
                 ? 'bg-red-600 text-white animate-pulse'
-                : 'text-gray-400 hover:text-white hover:bg-gray-700/60'
+                : listening
+                  ? 'bg-orange-500 text-white animate-pulse'
+                  : 'text-gray-400 hover:text-white hover:bg-gray-700/60'
             } disabled:opacity-50 disabled:cursor-not-allowed`}
-            title={listening ? 'Stop recording' : 'Voice input'}
+            title={voiceMode ? 'Stop voice mode (STT+TTS)' : 'Start voice mode (STT+TTS)'}
           >
-            {listening ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
+            {voiceMode || listening ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
           </button>
 
           {/* Send button */}
           <button
+            data-voice-send
             onClick={handleSend}
             disabled={!connected || !input.trim()}
             className="flex-shrink-0 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-xl p-3 transition-colors"
@@ -799,15 +1093,22 @@ export default function AgentChat() {
             <Send className="h-5 w-5" />
           </button>
         </div>
-        <div className="flex items-center justify-center mt-2 gap-2">
-          <span
-            className={`inline-block h-2 w-2 rounded-full ${
-              connected ? 'bg-green-500' : 'bg-red-500'
-            }`}
-          />
-          <span className="text-xs text-gray-500">
-            {connected ? 'Connected' : 'Disconnected'}
-          </span>
+        <div className="flex items-center justify-center mt-2 gap-3">
+          <div className="flex items-center gap-1.5">
+            <span
+              className={`inline-block h-2 w-2 rounded-full ${
+                connected ? 'bg-green-500' : 'bg-red-500'
+              }`}
+            />
+            <span className="text-xs text-gray-500">
+              {connected ? 'Connected' : 'Disconnected'}
+            </span>
+          </div>
+          {voiceMode && (
+            <span className="text-xs text-red-400 animate-pulse">
+              Voice mode ({chatLang.split('-')[0].toUpperCase()})
+            </span>
+          )}
         </div>
       </div>
     </div>
