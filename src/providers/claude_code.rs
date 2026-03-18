@@ -376,31 +376,36 @@ mod tests {
     /// Helper: create a provider that uses a shell script echoing stdin back.
     /// The script ignores CLI flags (`--print`, `--model`, `-`) and just cats stdin.
     ///
-    /// Uses `OnceLock` to write the script file exactly once, avoiding
-    /// "Text file busy" (ETXTBSY) races when parallel tests try to
-    /// overwrite a script that another test is currently executing.
+    /// Creates a unique temp file per invocation to avoid race conditions when
+    /// tests run in parallel. Each test gets its own script file, eliminating
+    /// "Text file busy" (ETXTBSY) and "Broken pipe" (EPIPE) errors.
     fn echo_provider() -> ClaudeCodeProvider {
-        use std::sync::OnceLock;
+        use std::io::Write;
 
-        static SCRIPT_PATH: OnceLock<PathBuf> = OnceLock::new();
-        let script = SCRIPT_PATH.get_or_init(|| {
-            use std::io::Write;
-            let dir = std::env::temp_dir().join("zeroclaw_test_claude_code");
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("fake_claude.sh");
-            let mut f = std::fs::File::create(&path).unwrap();
-            writeln!(f, "#!/bin/sh\ncat /dev/stdin").unwrap();
-            drop(f);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-            path
-        });
-        ClaudeCodeProvider {
-            binary_path: script.clone(),
+        let dir = std::env::temp_dir().join("zeroclaw_test_claude_code");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Use thread ID + high-resolution timestamp for uniqueness
+        let thread_id = std::thread::current().id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = dir.join(format!("fake_claude_{:?}_{}.sh", thread_id, nanos));
+
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "#!/bin/sh\nexec cat /dev/stdin").unwrap();
+        // Force sync to disk before marking executable
+        f.sync_all().unwrap();
+        drop(f);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+
+        ClaudeCodeProvider { binary_path: path }
     }
 
     #[tokio::test]
