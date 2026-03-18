@@ -5387,7 +5387,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("telegram_alice")
+            .get("telegram_chat-telegram")
             .expect("telegram history should be stored");
         let assistant_turn = turns
             .iter()
@@ -5628,14 +5628,14 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(sent.len(), 1);
         assert!(sent[0].contains("Provider switched to `openrouter`"));
 
-        let route_key = "telegram_alice";
+        let route_key = "telegram_chat-1";
         let route = runtime_ctx
             .route_overrides
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(route_key)
             .cloned()
-            .expect("route should be stored for sender");
+            .expect("route should be stored for chat");
         assert_eq!(route.provider, "openrouter");
         assert_eq!(route.model, "default-model");
 
@@ -5660,7 +5660,7 @@ BTC is currently around $65,000 based on latest tool output."#
         provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
         provider_cache_seed.insert("openrouter".to_string(), routed_provider);
 
-        let route_key = "telegram_alice".to_string();
+        let route_key = "telegram_chat-1".to_string();
         let mut route_overrides = HashMap::new();
         route_overrides.insert(
             route_key,
@@ -7518,7 +7518,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(HistoryCaptureProvider::default());
         let mut histories = HashMap::new();
         histories.insert(
-            "telegram_alice".to_string(),
+            "telegram_chat-telegram".to_string(),
             vec![
                 ChatMessage::assistant("stale assistant"),
                 ChatMessage::user("earlier user question"),
