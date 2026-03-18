@@ -1,5 +1,5 @@
 use crate::config::Config;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use chrono::Utc;
 use std::future::Future;
 use std::path::PathBuf;
@@ -8,9 +8,20 @@ use tokio::time::Duration;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
-/// Wait for shutdown signal (SIGINT or SIGTERM).
-/// SIGHUP is explicitly ignored so the daemon survives terminal/SSH disconnects.
-async fn wait_for_shutdown_signal() -> Result<()> {
+/// Signal delivered to the daemon run-loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonSignal {
+    /// SIGINT or SIGTERM — stop the daemon.
+    Shutdown,
+    /// SIGHUP — reload config without stopping.
+    Reload,
+}
+
+/// Wait for the next daemon-relevant OS signal and return its meaning.
+///
+/// - SIGINT / SIGTERM → [`DaemonSignal::Shutdown`]
+/// - SIGHUP           → [`DaemonSignal::Reload`]
+async fn wait_for_signal() -> Result<DaemonSignal> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -19,39 +30,74 @@ async fn wait_for_shutdown_signal() -> Result<()> {
         let mut sigterm = signal(SignalKind::terminate())?;
         let mut sighup = signal(SignalKind::hangup())?;
 
-        loop {
-            tokio::select! {
-                _ = sigint.recv() => {
-                    tracing::info!("Received SIGINT, shutting down...");
-                    break;
-                }
-                _ = sigterm.recv() => {
-                    tracing::info!("Received SIGTERM, shutting down...");
-                    break;
-                }
-                _ = sighup.recv() => {
-                    tracing::info!("Received SIGHUP, ignoring (daemon stays running)");
-                }
+        let sig = tokio::select! {
+            _ = sigint.recv() => {
+                tracing::info!("Received SIGINT, shutting down...");
+                DaemonSignal::Shutdown
             }
-        }
+            _ = sigterm.recv() => {
+                tracing::info!("Received SIGTERM, shutting down...");
+                DaemonSignal::Shutdown
+            }
+            _ = sighup.recv() => {
+                tracing::info!("Received SIGHUP, reloading configuration...");
+                DaemonSignal::Reload
+            }
+        };
+        Ok(sig)
     }
 
     #[cfg(not(unix))]
     {
         tokio::signal::ctrl_c().await?;
         tracing::info!("Received Ctrl+C, shutting down...");
+        Ok(DaemonSignal::Shutdown)
     }
+}
 
-    Ok(())
+/// Reload config from `config_path`, preserving runtime-computed fields.
+async fn reload_config(current: &Config) -> Result<Config> {
+    let path = &current.config_path;
+    let contents = tokio::fs::read_to_string(path)
+        .await
+        .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+
+    let mut new_cfg: Config = toml::from_str(&contents)
+        .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+
+    // Restore runtime-computed paths that are not serialised.
+    new_cfg.config_path = current.config_path.clone();
+    new_cfg.workspace_dir = current.workspace_dir.clone();
+
+    Ok(new_cfg)
+}
+
+/// Log a human-readable diff of the top-level provider/model/channel settings.
+fn log_config_diff(old: &Config, new: &Config) {
+    if old.default_provider != new.default_provider {
+        tracing::info!(
+            "Config reload: default_provider {} → {}",
+            old.default_provider.as_deref().unwrap_or("<none>"),
+            new.default_provider.as_deref().unwrap_or("<none>"),
+        );
+    }
+    if old.default_model != new.default_model {
+        tracing::info!(
+            "Config reload: default_model {} → {}",
+            old.default_model.as_deref().unwrap_or("<none>"),
+            new.default_model.as_deref().unwrap_or("<none>"),
+        );
+    }
+    if old.default_temperature != new.default_temperature {
+        tracing::info!(
+            "Config reload: default_temperature {:.2} → {:.2}",
+            old.default_temperature,
+            new.default_temperature,
+        );
+    }
 }
 
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
-    let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
-    let max_backoff = config
-        .reliability
-        .channel_max_backoff_secs
-        .max(initial_backoff);
-
     crate::health::mark_component_ok("daemon");
 
     if config.heartbeat.enabled {
@@ -60,39 +106,106 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 .await;
     }
 
-    let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
+    println!("🧠 ZeroClaw daemon started");
+    println!("   Gateway:  http://{host}:{port}");
+    println!("   Components: gateway, channels, heartbeat, scheduler");
+    if config.gateway.require_pairing {
+        println!("   Pairing:    enabled (code appears in gateway output above)");
+    }
+    println!("   Ctrl+C or SIGTERM to stop  |  SIGHUP to reload config");
+
+    let mut active_config = config;
+
+    loop {
+        // Spawn the state writer once; it will be rebuilt on each reload so it
+        // picks up the latest config snapshot.
+        let state_handle = spawn_state_writer(active_config.clone());
+
+        let component_handles = spawn_components(&active_config, &host, port);
+
+        // Block until the next OS signal.
+        let sig = wait_for_signal().await?;
+
+        // Abort all supervised tasks before proceeding.
+        state_handle.abort();
+        for handle in &component_handles {
+            handle.abort();
+        }
+        for handle in component_handles {
+            let _ = handle.await;
+        }
+        let _ = state_handle.await;
+
+        match sig {
+            DaemonSignal::Shutdown => {
+                crate::health::mark_component_error("daemon", "shutdown requested");
+                break;
+            }
+            DaemonSignal::Reload => {
+                match reload_config(&active_config).await {
+                    Ok(new_cfg) => {
+                        tracing::info!("Configuration reloaded successfully");
+                        log_config_diff(&active_config, &new_cfg);
+                        active_config = new_cfg;
+                        crate::health::mark_component_ok("daemon");
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to reload configuration, keeping current config: {e}"
+                        );
+                        crate::health::mark_component_error(
+                            "daemon",
+                            format!("config reload failed: {e}"),
+                        );
+                        // Components will be respawned with the unchanged active_config.
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Spawn supervised components for `config` and return their handles.
+fn spawn_components(config: &Config, host: &str, port: u16) -> Vec<JoinHandle<()>> {
+    let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
+    let max_backoff = config
+        .reliability
+        .channel_max_backoff_secs
+        .max(initial_backoff);
+
+    let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
     {
         let gateway_cfg = config.clone();
-        let gateway_host = host.clone();
+        let gateway_host = host.to_string();
         handles.push(spawn_component_supervisor(
             "gateway",
             initial_backoff,
             max_backoff,
             move || {
                 let cfg = gateway_cfg.clone();
-                let host = gateway_host.clone();
-                async move { Box::pin(crate::gateway::run_gateway(&host, port, cfg)).await }
+                let h = gateway_host.clone();
+                async move { Box::pin(crate::gateway::run_gateway(&h, port, cfg)).await }
             },
         ));
     }
 
-    {
-        if has_supervised_channels(&config) {
-            let channels_cfg = config.clone();
-            handles.push(spawn_component_supervisor(
-                "channels",
-                initial_backoff,
-                max_backoff,
-                move || {
-                    let cfg = channels_cfg.clone();
-                    async move { Box::pin(crate::channels::start_channels(cfg)).await }
-                },
-            ));
-        } else {
-            crate::health::mark_component_ok("channels");
-            tracing::info!("No real-time channels configured; channel supervisor disabled");
-        }
+    if has_supervised_channels(config) {
+        let channels_cfg = config.clone();
+        handles.push(spawn_component_supervisor(
+            "channels",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let cfg = channels_cfg.clone();
+                async move { Box::pin(crate::channels::start_channels(cfg)).await }
+            },
+        ));
+    } else {
+        crate::health::mark_component_ok("channels");
+        tracing::info!("No real-time channels configured; channel supervisor disabled");
     }
 
     if config.heartbeat.enabled {
@@ -124,26 +237,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         tracing::info!("Cron disabled; scheduler supervisor not started");
     }
 
-    println!("🧠 ZeroClaw daemon started");
-    println!("   Gateway:  http://{host}:{port}");
-    println!("   Components: gateway, channels, heartbeat, scheduler");
-    if config.gateway.require_pairing {
-        println!("   Pairing:    enabled (code appears in gateway output above)");
-    }
-    println!("   Ctrl+C or SIGTERM to stop");
-
-    // Wait for shutdown signal (SIGINT or SIGTERM)
-    wait_for_shutdown_signal().await?;
-    crate::health::mark_component_error("daemon", "shutdown requested");
-
-    for handle in &handles {
-        handle.abort();
-    }
-    for handle in handles {
-        let _ = handle.await;
-    }
-
-    Ok(())
+    handles
 }
 
 pub fn state_file_path(config: &Config) -> PathBuf {
@@ -993,27 +1087,25 @@ mod tests {
         assert!(target.is_none());
     }
 
-    /// Verify that SIGHUP does not cause shutdown — the daemon should ignore it
-    /// and only terminate on SIGINT or SIGTERM.
+    /// Verify that SIGHUP returns `DaemonSignal::Reload` (not Shutdown).
     #[cfg(unix)]
     #[tokio::test]
-    async fn sighup_does_not_shut_down_daemon() {
+    async fn sighup_returns_reload_signal() {
         use libc;
         use tokio::time::{timeout, Duration};
 
-        let handle = tokio::spawn(wait_for_shutdown_signal());
+        let handle = tokio::spawn(wait_for_signal());
 
-        // Give the signal handler time to register
+        // Give the signal handler time to register.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Send SIGHUP to ourselves — should be ignored by the handler
         unsafe { libc::raise(libc::SIGHUP) };
 
-        // The future should NOT complete within a short window
-        let result = timeout(Duration::from_millis(200), handle).await;
-        assert!(
-            result.is_err(),
-            "wait_for_shutdown_signal should not return after SIGHUP"
-        );
+        // The future should complete quickly and return Reload.
+        let result = timeout(Duration::from_millis(500), handle).await;
+        match result {
+            Ok(Ok(Ok(sig))) => assert_eq!(sig, DaemonSignal::Reload),
+            _ => panic!("expected DaemonSignal::Reload from SIGHUP"),
+        }
     }
 }
