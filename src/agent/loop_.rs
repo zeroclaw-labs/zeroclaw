@@ -281,6 +281,53 @@ fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
         .sum()
 }
 
+/// Budget-based selective trim: remove messages from oldest to newest until
+/// estimated tokens fit within `token_budget`.
+///
+/// Two passes, following the OpenClaw pattern:
+///   1. Remove **tool** messages first (they are usually the largest).
+///   2. If still over budget, remove non-system messages (user/assistant) oldest-first.
+///
+/// The system prompt (first message with role "system") is always preserved.
+/// Returns the number of messages removed.
+fn budget_based_trim(history: &mut Vec<ChatMessage>, token_budget: usize) -> usize {
+    if token_budget == 0 || estimate_history_tokens(history) <= token_budget {
+        return 0;
+    }
+
+    let has_system = history.first().map_or(false, |m| m.role == "system");
+    let start = if has_system { 1 } else { 0 };
+    let mut removed = 0usize;
+
+    // Pass 1: remove tool messages oldest-first
+    let mut i = start;
+    while i < history.len() {
+        if estimate_history_tokens(history) <= token_budget {
+            break;
+        }
+        if history[i].role == "tool" {
+            history.remove(i);
+            removed += 1;
+            // don't increment i — next element shifted into position
+        } else {
+            i += 1;
+        }
+    }
+
+    // Pass 2: remove remaining non-system messages oldest-first
+    let i = start;
+    while i < history.len() {
+        if estimate_history_tokens(history) <= token_budget {
+            break;
+        }
+        history.remove(i);
+        removed += 1;
+        // don't increment — next element shifted into position
+    }
+
+    removed
+}
+
 /// Minimum interval between progress sends to avoid flooding the draft channel.
 pub(crate) const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
 
@@ -2524,57 +2571,55 @@ pub(crate) async fn run_tool_call_loop(
                         })
                         .unwrap_or("image_source");
 
-                    // Replace each image marker with a description from the MCP
-                    // vision tool.
-                    for msg in history.iter_mut() {
-                        if msg.role != "user" {
-                            continue;
-                        }
+                    // Only describe images in the LATEST user message.
+                    // Older messages keep raw [IMAGE:path] so the agent can
+                    // see the file path and use tools if needed (avoids slow
+                    // MCP calls for every historical image).
+                    if let Some(msg) = history.iter_mut().rev().find(|m| m.role == "user") {
                         let (cleaned, refs) = multimodal::parse_image_markers(&msg.content);
-                        if refs.is_empty() {
-                            continue;
-                        }
-                        let mut descriptions = Vec::new();
-                        for image_ref in &refs {
-                            let args = serde_json::json!({
-                                image_param: image_ref,
-                                "prompt": "Briefly describe this image in 2-3 sentences. Mention key objects, text, and context."
-                            });
-                            match tool.execute(args).await {
-                                Ok(result) if result.success => {
-                                    let desc = result.output.trim();
-                                    let desc = truncate_with_ellipsis(desc, 800);
-                                    descriptions.push(format!(
-                                        "[Image file: {image_ref}]\n[Image description: {desc}]",
-                                    ));
-                                }
-                                Ok(result) => {
-                                    tracing::warn!(
-                                        image = %image_ref,
-                                        error = ?result.error,
-                                        "MCP vision fallback returned failure for image"
-                                    );
-                                    descriptions.push(format!(
-                                        "[Image file: {image_ref}]\n[Image: could not describe]",
-                                    ));
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        image = %image_ref,
-                                        error = %e,
-                                        "MCP vision fallback failed for image"
-                                    );
-                                    descriptions.push(format!(
-                                        "[Image file: {image_ref}]\n[Image: could not describe]",
-                                    ));
+                        if !refs.is_empty() {
+                            let mut descriptions = Vec::new();
+                            for image_ref in &refs {
+                                let args = serde_json::json!({
+                                    image_param: image_ref,
+                                    "prompt": "Briefly describe this image in 2-3 sentences. Mention key objects, text, and context."
+                                });
+                                match tool.execute(args).await {
+                                    Ok(result) if result.success => {
+                                        let desc = result.output.trim();
+                                        let desc = truncate_with_ellipsis(desc, 800);
+                                        descriptions.push(format!(
+                                            "[Image file: {image_ref}]\n[Image description: {desc}]",
+                                        ));
+                                    }
+                                    Ok(result) => {
+                                        tracing::warn!(
+                                            image = %image_ref,
+                                            error = ?result.error,
+                                            "MCP vision fallback returned failure for image"
+                                        );
+                                        descriptions.push(format!(
+                                            "[Image file: {image_ref}]\n[Image: could not describe]",
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            image = %image_ref,
+                                            error = %e,
+                                            "MCP vision fallback failed for image"
+                                        );
+                                        descriptions.push(format!(
+                                            "[Image file: {image_ref}]\n[Image: could not describe]",
+                                        ));
+                                    }
                                 }
                             }
+                            msg.content = if cleaned.is_empty() {
+                                descriptions.join("\n\n")
+                            } else {
+                                format!("{}\n\n{}", descriptions.join("\n\n"), cleaned)
+                            };
                         }
-                        msg.content = if cleaned.is_empty() {
-                            descriptions.join("\n\n")
-                        } else {
-                            format!("{}\n\n{}", descriptions.join("\n\n"), cleaned)
-                        };
                     }
                 } else {
                     tracing::warn!(
@@ -2641,14 +2686,17 @@ pub(crate) async fn run_tool_call_loop(
                     }
                 }
 
-                // Layer 3: Hard trim — remove oldest messages entirely
+                // Layer 3: Budget-based selective trim — remove tool msgs
+                // first, then oldest non-system messages, stopping once
+                // within budget.
                 let still_estimated = estimate_history_tokens(history);
                 if still_estimated > max_context_tokens {
-                    trim_history(history, DEFAULT_MAX_HISTORY_MESSAGES);
+                    let trimmed = budget_based_trim(history, max_context_tokens);
                     tracing::warn!(
                         before = still_estimated,
                         after = estimate_history_tokens(history),
-                        "Fallback hard trim applied in tool loop"
+                        trimmed,
+                        "Budget-based selective trim applied in tool loop"
                     );
                 }
             }
@@ -2833,8 +2881,19 @@ pub(crate) async fn run_tool_call_loop(
 
                     // Aggressive tool result compaction — keep only 2 most recent
                     compact_old_tool_results(history, 2);
-                    // Aggressive message trim
-                    trim_history(history, DEFAULT_MAX_HISTORY_MESSAGES / 2);
+                    // Budget-based selective trim: remove tool msgs first, then
+                    // oldest non-system messages, stopping as soon as we fit.
+                    // When max_context_tokens is 0 (unlimited), fall back to
+                    // halving the current estimated token count as the budget.
+                    let emergency_budget = if max_context_tokens > 0 {
+                        max_context_tokens
+                    } else {
+                        estimate_history_tokens(history) / 2
+                    };
+                    let trimmed = budget_based_trim(history, emergency_budget);
+                    if trimmed > 0 {
+                        tracing::info!(trimmed, "Budget-based selective trim removed messages");
+                    }
 
                     let after_tokens = estimate_history_tokens(history);
                     tracing::info!(
@@ -7386,5 +7445,205 @@ Let me check the result."#;
         let allowed: Vec<String> = vec![];
         let result = filter_by_allowed_tools(specs, Some(&allowed));
         assert!(result.is_empty());
+    }
+
+    // ── budget_based_trim tests ─────────────────────────────────────
+
+    fn make_msg(role: &str, content: &str) -> ChatMessage {
+        match role {
+            "system" => ChatMessage::system(content),
+            "assistant" => ChatMessage::assistant(content),
+            "tool" => ChatMessage::tool(content.to_string()),
+            // "user" and any unknown role default to user message
+            _ => ChatMessage::user(content),
+        }
+    }
+
+    #[test]
+    fn budget_trim_noop_when_within_budget() {
+        let mut history = vec![
+            make_msg("system", "sys"),
+            make_msg("user", "hi"),
+            make_msg("assistant", "hello"),
+        ];
+        let removed = super::budget_based_trim(&mut history, 999_999);
+        assert_eq!(removed, 0);
+        assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn budget_trim_noop_when_budget_zero() {
+        let mut history = vec![make_msg("system", "sys"), make_msg("user", "hi")];
+        let removed = super::budget_based_trim(&mut history, 0);
+        assert_eq!(removed, 0);
+        assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn budget_trim_removes_tool_messages_first() {
+        // Build history: system + user + tool(big) + assistant + tool(big) + user
+        let big = "x".repeat(4000); // ~1000 tokens each
+        let mut history = vec![
+            make_msg("system", "sys"),
+            make_msg("user", "q1"),
+            make_msg("tool", &big),
+            make_msg("assistant", "a1"),
+            make_msg("tool", &big),
+            make_msg("user", "q2"),
+        ];
+        // Budget that fits everything minus the 2 big tool msgs
+        // system(~5) + user(~5) + assistant(~5) + user(~5) = ~20 tokens
+        // Each tool msg = ~1004 tokens. Total = ~2028 tokens.
+        // Set budget to 100 tokens — should remove both tool msgs.
+        let removed = super::budget_based_trim(&mut history, 100);
+        assert!(
+            removed >= 2,
+            "should remove at least 2 tool messages, removed {removed}"
+        );
+        // Verify no tool messages remain
+        assert!(
+            history.iter().all(|m| m.role != "tool"),
+            "all tool messages should be removed, remaining roles: {:?}",
+            history.iter().map(|m| &m.role).collect::<Vec<_>>()
+        );
+        // System prompt must survive
+        assert_eq!(history[0].role, "system");
+    }
+
+    #[test]
+    fn budget_trim_removes_user_assistant_after_tools() {
+        let big = "x".repeat(4000);
+        let mut history = vec![
+            make_msg("system", "sys"),
+            make_msg("user", &big),
+            make_msg("assistant", &big),
+        ];
+        // Budget tiny — must remove user + assistant, keep only system
+        let removed = super::budget_based_trim(&mut history, 10);
+        assert_eq!(removed, 2);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "system");
+    }
+
+    #[test]
+    fn budget_trim_stops_early_when_budget_met() {
+        let big = "x".repeat(4000);
+        let small = "ok";
+        let mut history = vec![
+            make_msg("system", "sys"),
+            make_msg("tool", &big),       // ~1004 tokens
+            make_msg("user", small),      // ~5 tokens
+            make_msg("tool", &big),       // ~1004 tokens
+            make_msg("assistant", small), // ~5 tokens
+        ];
+        // Budget: 1020 tokens — removing just the first tool msg should be enough
+        let removed = super::budget_based_trim(&mut history, 1020);
+        assert_eq!(
+            removed, 1,
+            "should only remove 1 tool message to fit budget"
+        );
+        assert_eq!(history.len(), 4);
+    }
+
+    #[test]
+    fn budget_trim_preserves_system_prompt() {
+        let big = "x".repeat(80000); // huge system prompt
+        let mut history = vec![make_msg("system", &big), make_msg("user", "hi")];
+        // Budget tiny — should remove user but never system
+        let removed = super::budget_based_trim(&mut history, 10);
+        assert_eq!(removed, 1);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "system");
+    }
+
+    #[test]
+    fn budget_trim_empty_history() {
+        let mut history: Vec<ChatMessage> = vec![];
+        let removed = super::budget_based_trim(&mut history, 100);
+        assert_eq!(removed, 0);
+    }
+
+    // ── compact_old_tool_results tests ──────────────────────────────
+
+    #[test]
+    fn compact_tool_results_replaces_old_tool_msgs() {
+        let mut history = vec![
+            make_msg("system", "sys"),
+            make_msg("tool", "result1"),
+            make_msg("tool", "result2"),
+            make_msg("tool", "result3"),
+            make_msg("tool", "result4"),
+        ];
+        let compacted = super::compact_old_tool_results(&mut history, 2);
+        assert!(compacted);
+        // Last 2 tool msgs should be kept verbatim
+        assert_eq!(history[3].content, "result3");
+        assert_eq!(history[4].content, "result4");
+        // First 2 should be placeholders
+        assert_eq!(history[1].content, super::TOOL_RESULT_PLACEHOLDER);
+        assert_eq!(history[2].content, super::TOOL_RESULT_PLACEHOLDER);
+    }
+
+    #[test]
+    fn compact_tool_results_noop_when_few_tools() {
+        let mut history = vec![
+            make_msg("system", "sys"),
+            make_msg("tool", "result1"),
+            make_msg("tool", "result2"),
+        ];
+        let compacted = super::compact_old_tool_results(&mut history, 5);
+        assert!(!compacted);
+        assert_eq!(history[1].content, "result1");
+        assert_eq!(history[2].content, "result2");
+    }
+
+    #[test]
+    fn compact_tool_results_skips_already_compacted() {
+        let mut history = vec![
+            make_msg("system", "sys"),
+            make_msg("tool", super::TOOL_RESULT_PLACEHOLDER),
+            make_msg("tool", "result2"),
+            make_msg("tool", "result3"),
+        ];
+        // keep_recent = 1, only result3 should stay. result2 should be compacted.
+        // The already-compacted msg at index 1 should not count toward keep_recent.
+        let compacted = super::compact_old_tool_results(&mut history, 1);
+        assert!(compacted);
+        assert_eq!(history[1].content, super::TOOL_RESULT_PLACEHOLDER); // was already
+        assert_eq!(history[2].content, super::TOOL_RESULT_PLACEHOLDER); // newly compacted
+        assert_eq!(history[3].content, "result3"); // kept
+    }
+
+    #[test]
+    fn compact_tool_results_no_tool_messages() {
+        let mut history = vec![
+            make_msg("system", "sys"),
+            make_msg("user", "hi"),
+            make_msg("assistant", "hello"),
+        ];
+        let compacted = super::compact_old_tool_results(&mut history, 2);
+        assert!(!compacted);
+    }
+
+    // ── max_tool_result_chars tests ─────────────────────────────────
+
+    #[test]
+    fn max_tool_result_chars_proportional() {
+        // 128K tokens * 30% * 3 chars/tok = 115,200 chars
+        let cap = super::max_tool_result_chars(128_000);
+        assert_eq!(cap, 115_200);
+    }
+
+    #[test]
+    fn max_tool_result_chars_capped_at_hard_max() {
+        // Huge context: 2M tokens * 30% * 3 = 1,800,000 > 400K hard cap
+        let cap = super::max_tool_result_chars(2_000_000);
+        assert_eq!(cap, super::HARD_MAX_TOOL_RESULT_CHARS);
+    }
+
+    #[test]
+    fn max_tool_result_chars_zero_returns_hard_max() {
+        let cap = super::max_tool_result_chars(0);
+        assert_eq!(cap, super::HARD_MAX_TOOL_RESULT_CHARS);
     }
 }
