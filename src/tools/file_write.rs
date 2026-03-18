@@ -78,7 +78,7 @@ impl Tool for FileWriteTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        let full_path = self.security.resolve_tool_path(path);
 
         let Some(parent) = full_path.parent() else {
             return Ok(ToolResult {
@@ -297,6 +297,38 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn file_write_absolute_path_under_workspace_no_double_prefix() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_write_abs_workspace");
+        let workspace = root.join("workspace");
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(workspace.join("scripts"))
+            .await
+            .unwrap();
+
+        let tool = FileWriteTool::new(test_security(workspace.clone()));
+        let abs_path = workspace.join("scripts").join("daily_market_news.py");
+        let abs_path_str = abs_path.to_string_lossy().to_string();
+
+        let result = tool
+            .execute(json!({"path": abs_path_str, "content": "# script"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "absolute path under workspace should succeed, error: {:?}",
+            result.error
+        );
+        let content = tokio::fs::read_to_string(&abs_path).await.unwrap();
+        assert_eq!(content, "# script");
+
+        // Regression guard: ensure we didn't create workspace/workspace/...
+        assert!(!workspace.join("workspace").exists());
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[tokio::test]
