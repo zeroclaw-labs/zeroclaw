@@ -747,6 +747,7 @@ fn spawn_zeroclaw_gateway(app: &tauri::App) {
                                 );
                                 process_died = true;
                             }
+                            _ => {}
                         }
                     }
                 }

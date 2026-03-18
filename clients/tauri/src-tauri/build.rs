@@ -2,8 +2,10 @@ fn main() {
     // In development mode, try to locate the zeroclaw binary from the workspace
     // cargo build output and copy it to the sidecar binaries directory with the
     // correct target-triple suffix that Tauri expects.
-    #[cfg(not(feature = "custom-protocol"))]
-    {
+    //
+    // Skip this in release/production builds (detected via PROFILE env var).
+    let profile = std::env::var("PROFILE").unwrap_or_default();
+    if profile == "debug" {
         let target_triple = std::env::var("TARGET").unwrap_or_default();
         if !target_triple.is_empty() {
             let ext = if target_triple.contains("windows") {
