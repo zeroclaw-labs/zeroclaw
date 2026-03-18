@@ -16027,6 +16027,17 @@ pub struct SyncConfig {
     /// Maximum deltas per sync_response batch (default: 50).
     #[serde(default = "default_sync_batch_size")]
     pub batch_size: usize,
+    /// The user's **home timezone** (IANA name, e.g. "Asia/Seoul").
+    ///
+    /// When devices are in different timezones (e.g. phone in US,
+    /// desktop PC in Korea), all `occurred_at_home` values are
+    /// converted to this timezone so the timeline is consistent
+    /// from the user's primary perspective.
+    ///
+    /// Defaults to "Asia/Seoul". Change to match the user's primary
+    /// location (e.g. "America/New_York", "Europe/London").
+    #[serde(default = "default_home_timezone")]
+    pub home_timezone: String,
 }
 
 fn default_relay_ttl_secs() -> u64 {
@@ -16041,6 +16052,10 @@ fn default_sync_batch_size() -> usize {
     50
 }
 
+fn default_home_timezone() -> String {
+    "Asia/Seoul".to_string()
+}
+
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
@@ -16049,6 +16064,7 @@ impl Default for SyncConfig {
             relay_ttl_secs: default_relay_ttl_secs(),
             journal_retention_days: default_journal_retention_days(),
             batch_size: default_sync_batch_size(),
+            home_timezone: default_home_timezone(),
         }
     }
 }

@@ -573,9 +573,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // MoA uses occurred_at (real-world time) as the primary sort key for
     // ontology actions. Clock drift between devices breaks timeline
     // consistency, so we check on startup and periodically thereafter.
-    if config.sync.enabled {
-        timesync::check_and_log().await;
-        timesync::spawn_periodic_check(None);
+    // Always run clock/timezone check — useful even without sync for
+    // accurate occurred_at timestamps in the ontology.
+    {
+        let home_tz = &config.sync.home_timezone;
+        timesync::check_and_log(home_tz).await;
+        if config.sync.enabled {
+            timesync::spawn_periodic_check(home_tz.clone(), None);
+        }
     }
 
     let runtime: Arc<dyn runtime::RuntimeAdapter> =

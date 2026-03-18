@@ -123,7 +123,7 @@ impl OntologyRepo {
 
     /// Record an action log delta in the sync engine (best-effort).
     ///
-    /// Uses `occurred_at` as the primary temporal anchor — this is the
+    /// Uses `occurred_at_utc` as the primary temporal anchor — this is the
     /// real-world time that matters for cross-device timeline ordering,
     /// not the DB insertion time.
     fn sync_action(
@@ -133,7 +133,11 @@ impl OntologyRepo {
         params: &serde_json::Value,
         result: Option<&serde_json::Value>,
         channel: Option<&str>,
-        occurred_at: Option<&str>,
+        occurred_at_utc: Option<&str>,
+        occurred_at_local: Option<&str>,
+        timezone: Option<&str>,
+        occurred_at_home: Option<&str>,
+        home_timezone: Option<&str>,
         location: Option<&str>,
         status: &str,
     ) {
@@ -146,7 +150,11 @@ impl OntologyRepo {
                 &params_json,
                 result_json.as_deref(),
                 channel,
-                occurred_at,
+                occurred_at_utc,
+                occurred_at_local,
+                timezone,
+                occurred_at_home,
+                home_timezone,
                 location,
                 status,
             );
@@ -596,6 +604,11 @@ impl OntologyRepo {
     /// (ISO-8601 or descriptive text). `location` records **where**.
     /// Both are optional but strongly encouraged — a great secretary always
     /// notes the time and place of every event.
+    ///
+    /// The `occurred_at` parameter accepts any ISO-8601 string (UTC, with
+    /// offset, or descriptive). The system normalizes it into a
+    /// `TimestampTriple` (UTC + device-local + home-timezone).
+    /// `home_timezone` is the IANA name for the user's primary timezone.
     pub fn insert_action_pending(
         &self,
         action_type_name: &str,
@@ -608,6 +621,7 @@ impl OntologyRepo {
         context_id: Option<i64>,
         occurred_at: Option<&str>,
         location: Option<&str>,
+        home_timezone: &str,
     ) -> anyhow::Result<i64> {
         let action_type_id = self.action_type_id(action_type_name)?;
         let now = now_millis();
@@ -618,21 +632,45 @@ impl OntologyRepo {
             Some(serde_json::to_string(related_object_ids)?)
         };
 
-        // Default occurred_at to current ISO-8601 UTC if not supplied.
-        let effective_occurred_at = occurred_at
-            .map(String::from)
-            .or_else(|| {
-                Some(Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
-            });
+        // Build the timestamp triple: UTC (sort key) + local + home (display).
+        use crate::gateway::timesync;
+        let triple = if let Some(ts) = occurred_at {
+            // Caller supplied a timestamp — normalize to UTC and convert.
+            if let Some(home_str) = timesync::to_home_timezone(ts, home_timezone) {
+                let device_tz = timesync::detect_device_timezone();
+                // Parse to UTC for the sort key.
+                let utc_str = if ts.ends_with('Z') || ts.ends_with("UTC") {
+                    ts.to_string()
+                } else if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+                    dt.with_timezone(&Utc).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+                } else {
+                    Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+                };
+                timesync::TimestampTriple {
+                    utc: utc_str,
+                    local: ts.to_string(),
+                    device_tz,
+                    home: home_str,
+                    home_tz: home_timezone.to_string(),
+                }
+            } else {
+                // Can't parse — fall back to now.
+                timesync::now_triple(home_timezone)
+            }
+        } else {
+            // No timestamp supplied — use current time.
+            timesync::now_triple(home_timezone)
+        };
 
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO ontology_actions
              (action_type_id, actor_user_id, actor_kind, primary_object_id,
               related_object_ids, params, channel, context_id,
-              occurred_at, location,
+              occurred_at_utc, occurred_at_local, timezone,
+              occurred_at_home, home_timezone, location,
               status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'pending', ?15, ?16)",
             params![
                 action_type_id,
                 actor_user_id,
@@ -642,7 +680,11 @@ impl OntologyRepo {
                 params_str,
                 channel,
                 context_id,
-                effective_occurred_at,
+                triple.utc,
+                triple.local,
+                triple.device_tz,
+                triple.home,
+                triple.home_tz,
                 location,
                 now,
                 now,
@@ -651,7 +693,7 @@ impl OntologyRepo {
         let id = conn.last_insert_rowid();
         drop(conn);
 
-        // Record pending action in sync journal — occurred_at is the
+        // Record pending action in sync journal — occurred_at_utc is the
         // primary temporal anchor for cross-device timeline ordering.
         self.sync_action(
             action_type_name,
@@ -659,7 +701,11 @@ impl OntologyRepo {
             params,
             None,
             channel,
-            effective_occurred_at.as_deref(),
+            Some(&triple.utc),
+            Some(&triple.local),
+            Some(&triple.device_tz),
+            Some(&triple.home),
+            Some(&triple.home_tz),
             location,
             "pending",
         );
@@ -685,8 +731,11 @@ impl OntologyRepo {
 
         // Re-read the action to get full context for sync delta.
         if self.sync.is_some() {
-            let action_opt = conn.query_row(
-                "SELECT at.name, a.actor_user_id, a.params, a.channel, a.occurred_at, a.location
+            #[allow(clippy::type_complexity)]
+            let action_opt: Option<(String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> = conn.query_row(
+                "SELECT at.name, a.actor_user_id, a.params, a.channel,
+                        a.occurred_at_utc, a.occurred_at_local, a.timezone,
+                        a.occurred_at_home, a.home_timezone, a.location
                  FROM ontology_actions a
                  JOIN ontology_action_types at ON at.id = a.action_type_id
                  WHERE a.id = ?1",
@@ -698,11 +747,16 @@ impl OntologyRepo {
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, Option<String>>(4)?,
                     r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, Option<String>>(8)?,
+                    r.get::<_, Option<String>>(9)?,
                 )),
             ).ok();
             drop(conn);
 
-            if let Some((type_name, actor, params_json, channel, occurred_at, location)) = action_opt {
+            if let Some((type_name, actor, params_json, channel,
+                         utc, local, tz, home, home_tz, location)) = action_opt {
                 let params_val: serde_json::Value =
                     serde_json::from_str(&params_json).unwrap_or_default();
                 self.sync_action(
@@ -711,7 +765,11 @@ impl OntologyRepo {
                     &params_val,
                     Some(result),
                     channel.as_deref(),
-                    occurred_at.as_deref(),
+                    utc.as_deref(),
+                    local.as_deref(),
+                    tz.as_deref(),
+                    home.as_deref(),
+                    home_tz.as_deref(),
                     location.as_deref(),
                     "success",
                 );
@@ -745,12 +803,14 @@ impl OntologyRepo {
             (
                 "SELECT id, action_type_id, actor_user_id, actor_kind,
                         primary_object_id, related_object_ids, params, result,
-                        channel, context_id, occurred_at, location,
+                        channel, context_id,
+                        occurred_at_utc, occurred_at_local, timezone,
+                        occurred_at_home, home_timezone, location,
                         status, error_message,
                         created_at, updated_at
                  FROM ontology_actions
                  WHERE actor_user_id = ?1 AND channel = ?3
-                 ORDER BY COALESCE(occurred_at, datetime(created_at/1000, 'unixepoch')) DESC LIMIT ?2"
+                 ORDER BY COALESCE(occurred_at_utc, datetime(created_at/1000, 'unixepoch')) DESC LIMIT ?2"
                     .to_string(),
                 limit as i64,
             )
@@ -758,12 +818,14 @@ impl OntologyRepo {
             (
                 "SELECT id, action_type_id, actor_user_id, actor_kind,
                         primary_object_id, related_object_ids, params, result,
-                        channel, context_id, occurred_at, location,
+                        channel, context_id,
+                        occurred_at_utc, occurred_at_local, timezone,
+                        occurred_at_home, home_timezone, location,
                         status, error_message,
                         created_at, updated_at
                  FROM ontology_actions
                  WHERE actor_user_id = ?1
-                 ORDER BY COALESCE(occurred_at, datetime(created_at/1000, 'unixepoch')) DESC LIMIT ?2"
+                 ORDER BY COALESCE(occurred_at_utc, datetime(created_at/1000, 'unixepoch')) DESC LIMIT ?2"
                     .to_string(),
                 limit as i64,
             )
@@ -797,12 +859,16 @@ impl OntologyRepo {
                 result: r.get::<_, Option<String>>(7)?.map(|s| parse_json_col(s)),
                 channel: r.get(8)?,
                 context_id: r.get(9)?,
-                occurred_at: r.get(10)?,
-                location: r.get(11)?,
-                status: ActionStatus::from_str_lossy(&r.get::<_, String>(12)?),
-                error_message: r.get(13)?,
-                created_at: r.get(14)?,
-                updated_at: r.get(15)?,
+                occurred_at_utc: r.get(10)?,
+                occurred_at_local: r.get(11)?,
+                timezone: r.get(12)?,
+                occurred_at_home: r.get(13)?,
+                home_timezone: r.get(14)?,
+                location: r.get(15)?,
+                status: ActionStatus::from_str_lossy(&r.get::<_, String>(16)?),
+                error_message: r.get(17)?,
+                created_at: r.get(18)?,
+                updated_at: r.get(19)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -942,6 +1008,7 @@ mod tests {
                 None,
                 Some("2026-03-18T14:30:00+09:00"),
                 Some("서울 서초구 사무실"),
+                "Asia/Seoul",
             )
             .unwrap();
 
@@ -952,10 +1019,11 @@ mod tests {
         let actions = repo.recent_actions("user-1", None, 10).unwrap();
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].status, ActionStatus::Success);
-        assert_eq!(
-            actions[0].occurred_at.as_deref(),
-            Some("2026-03-18T14:30:00+09:00")
-        );
+        // occurred_at_utc should be the UTC equivalent of 14:30 KST (=05:30Z)
+        assert!(actions[0].occurred_at_utc.as_deref().unwrap().contains("05:30:00"));
+        // occurred_at_home should be in Asia/Seoul (14:30 KST)
+        assert!(actions[0].occurred_at_home.as_deref().unwrap().contains("14:30:00"));
+        assert_eq!(actions[0].home_timezone.as_deref(), Some("Asia/Seoul"));
         assert_eq!(
             actions[0].location.as_deref(),
             Some("서울 서초구 사무실")

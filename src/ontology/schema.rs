@@ -92,13 +92,19 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
             result              TEXT,
             channel             TEXT,
             context_id          INTEGER REFERENCES ontology_objects(id),
-            -- When: real-world time the action occurred (ISO-8601 string).
-            -- Distinct from created_at (DB insertion time). Enables timeline
-            -- reconstruction sorted by actual occurrence, not record time.
-            occurred_at         TEXT,
-            -- Where: real-world location of the action (free-form text).
-            -- Enables location-based grouping and relationship inference
-            -- (e.g. same location → likely related events/people).
+            -- When (UTC): absolute UTC time (ISO-8601 ending in Z).
+            -- PRIMARY SORT KEY for cross-device timeline ordering.
+            occurred_at_utc     TEXT,
+            -- When (device-local): same instant in device timezone with offset.
+            occurred_at_local   TEXT,
+            -- IANA timezone of the recording device (e.g. America/New_York).
+            timezone            TEXT,
+            -- When (home): same instant converted to user home timezone.
+            -- DISPLAY TIME for consistent single-timeline view.
+            occurred_at_home    TEXT,
+            -- User home timezone IANA name (e.g. Asia/Seoul).
+            home_timezone       TEXT,
+            -- Where: real-world location (free-form text).
             location            TEXT,
             status              TEXT NOT NULL DEFAULT 'pending',
             error_message       TEXT,
@@ -120,26 +126,21 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
             ON ontology_actions(created_at);
         CREATE INDEX IF NOT EXISTS idx_onto_actions_status
             ON ontology_actions(status);
-        -- Index on occurred_at for timeline queries (sort by real-world time).
-        -- This is the PRIMARY sort key — in MoA the subject (who) is almost
-        -- always the user, so time is the most effective categorization axis.
-        CREATE INDEX IF NOT EXISTS idx_onto_actions_occurred
-            ON ontology_actions(occurred_at);
-        -- Index on location for location-based grouping queries.
-        -- Location-based grouping reveals implicit relationships (same place
-        -- at same time → likely related events/people).
+        -- UTC time is the PRIMARY sort key for cross-device timeline.
+        CREATE INDEX IF NOT EXISTS idx_onto_actions_utc
+            ON ontology_actions(occurred_at_utc);
+        -- Home timezone time for display-oriented queries.
+        CREATE INDEX IF NOT EXISTS idx_onto_actions_home
+            ON ontology_actions(occurred_at_home);
+        -- Location index for place-based grouping.
         CREATE INDEX IF NOT EXISTS idx_onto_actions_location
             ON ontology_actions(location);
-        -- Composite index: (occurred_at, location) for combined time+place
-        -- queries. This is the key categorization axis for MoA — events are
-        -- primarily identified and disambiguated by WHEN and WHERE, not by WHO
-        -- (since the subject is almost always the user).
+        -- Composite: UTC time + location (primary categorization axis).
         CREATE INDEX IF NOT EXISTS idx_onto_actions_when_where
-            ON ontology_actions(occurred_at, location);
-        -- Composite index: (location, occurred_at) for place-first queries
-        -- (e.g. all events at a specific court or golf course).
+            ON ontology_actions(occurred_at_utc, location);
+        -- Composite: location + UTC time (place-first queries).
         CREATE INDEX IF NOT EXISTS idx_onto_actions_where_when
-            ON ontology_actions(location, occurred_at);
+            ON ontology_actions(location, occurred_at_utc);
 
         -- ================================================================
         -- 4. FTS5 indexes for ontology search
@@ -175,11 +176,22 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
         ",
     )?;
 
-    // ── Migration: add occurred_at / location to existing ontology_actions ──
-    // ALTER TABLE ... ADD COLUMN is safe in SQLite (no-op concept check):
-    // we query pragma table_info to see if the columns already exist.
-    migrate_add_column(conn, "ontology_actions", "occurred_at", "TEXT")?;
+    // ── Migration: add time/timezone/location columns to existing tables ──
+    // Safe to call on every startup — skips if column already exists.
+    migrate_add_column(conn, "ontology_actions", "occurred_at_utc", "TEXT")?;
+    migrate_add_column(conn, "ontology_actions", "occurred_at_local", "TEXT")?;
+    migrate_add_column(conn, "ontology_actions", "timezone", "TEXT")?;
+    migrate_add_column(conn, "ontology_actions", "occurred_at_home", "TEXT")?;
+    migrate_add_column(conn, "ontology_actions", "home_timezone", "TEXT")?;
     migrate_add_column(conn, "ontology_actions", "location", "TEXT")?;
+    // Legacy migration: rename old occurred_at → occurred_at_utc if present.
+    migrate_add_column(conn, "ontology_actions", "occurred_at", "TEXT")?;
+    // Copy legacy occurred_at data to occurred_at_utc (best-effort).
+    let _ = conn.execute_batch(
+        "UPDATE ontology_actions
+         SET occurred_at_utc = occurred_at
+         WHERE occurred_at IS NOT NULL AND occurred_at_utc IS NULL",
+    );
 
     Ok(())
 }

@@ -727,10 +727,12 @@ pub fn all_tools_with_runtime(
             let ctx_builder = Arc::new(ContextBuilder::new(Arc::clone(&onto_repo)));
 
             // Give the dispatcher access to the current tool set for routing.
+            let home_timezone = root_config.sync.home_timezone.clone();
             let dispatcher = Arc::new(ActionDispatcher::new(
                 Arc::clone(&onto_repo),
                 rule_engine,
                 tool_arcs.clone(),
+                home_timezone,
             ));
 
             tool_arcs.push(Arc::new(OntologyGetContextTool::new(

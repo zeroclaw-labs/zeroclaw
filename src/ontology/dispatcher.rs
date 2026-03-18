@@ -38,6 +38,8 @@ pub struct ActionDispatcher {
     tools: HashMap<String, Arc<dyn Tool>>,
     /// Allowlisted base command names for RunCommand.
     runcommand_allowlist: HashSet<String>,
+    /// User's home timezone (IANA name, e.g. "Asia/Seoul") for timestamp normalization.
+    home_timezone: String,
 }
 
 impl ActionDispatcher {
@@ -45,6 +47,7 @@ impl ActionDispatcher {
         repo: Arc<OntologyRepo>,
         rule_engine: Arc<RuleEngine>,
         tool_list: Vec<Arc<dyn Tool>>,
+        home_timezone: String,
     ) -> Self {
         let mut tools = HashMap::new();
         for tool in tool_list {
@@ -59,6 +62,7 @@ impl ActionDispatcher {
             rule_engine,
             tools,
             runcommand_allowlist,
+            home_timezone,
         }
     }
 
@@ -81,6 +85,7 @@ impl ActionDispatcher {
             req.context_id,
             req.occurred_at.as_deref(),
             req.location.as_deref(),
+            &self.home_timezone,
         )?;
 
         // 2. Route to the appropriate handler.
