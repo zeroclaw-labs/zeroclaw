@@ -49,14 +49,111 @@ function renderMarkdown(content: string): string {
   }
 }
 
+/**
+ * Detect the BCP-47 language tag from text content using Unicode script
+ * analysis and common word/pattern heuristics. Returns a lang code suitable
+ * for Web Speech API (e.g. 'ko-KR', 'en-US', 'ja-JP').
+ */
+function detectLanguage(text: string): string {
+  // Strip markdown / code blocks so they don't skew detection
+  const clean = text
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/`[^`]+`/g, '')
+    .replace(/https?:\/\/\S+/g, '')
+    .replace(/[#*_~>\[\]()!|`]/g, '')
+    .trim();
+
+  if (!clean) return navigator.language || 'en-US';
+
+  // Count characters by Unicode script range
+  let ko = 0, ja = 0, zh = 0, cyrillic = 0, arabic = 0, thai = 0;
+  let devanagari = 0, greek = 0, latin = 0, vietnamese = 0;
+
+  for (const ch of clean) {
+    const cp = ch.codePointAt(0) ?? 0;
+    // Korean Hangul
+    if ((cp >= 0xAC00 && cp <= 0xD7AF) || (cp >= 0x1100 && cp <= 0x11FF) ||
+        (cp >= 0x3130 && cp <= 0x318F)) { ko++; continue; }
+    // Japanese Hiragana / Katakana
+    if ((cp >= 0x3040 && cp <= 0x309F) || (cp >= 0x30A0 && cp <= 0x30FF) ||
+        (cp >= 0x31F0 && cp <= 0x31FF)) { ja++; continue; }
+    // CJK Unified (shared by zh/ja/ko — counted separately below)
+    if (cp >= 0x4E00 && cp <= 0x9FFF) { zh++; continue; }
+    // Cyrillic
+    if (cp >= 0x0400 && cp <= 0x04FF) { cyrillic++; continue; }
+    // Arabic
+    if (cp >= 0x0600 && cp <= 0x06FF) { arabic++; continue; }
+    // Thai
+    if (cp >= 0x0E00 && cp <= 0x0E7F) { thai++; continue; }
+    // Devanagari (Hindi etc.)
+    if (cp >= 0x0900 && cp <= 0x097F) { devanagari++; continue; }
+    // Greek
+    if (cp >= 0x0370 && cp <= 0x03FF) { greek++; continue; }
+    // Vietnamese diacritics on Latin letters
+    if ('àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ'
+        .includes(ch.toLowerCase())) { vietnamese++; continue; }
+    // Basic Latin
+    if (cp >= 0x0041 && cp <= 0x007A) { latin++; continue; }
+  }
+
+  // If Japanese kana present, CJK chars are likely kanji → add to ja
+  if (ja > 0) ja += zh;
+  // If Korean present with CJK, likely hanja
+  else if (ko > 0 && zh > 0 && ja === 0) ko += zh;
+
+  // Build scored candidates
+  const scores: [string, number][] = [
+    ['ko-KR', ko],
+    ['ja-JP', ja],
+    ['zh-CN', (ja === 0 && ko === 0) ? zh : 0],
+    ['ru-RU', cyrillic],
+    ['ar-SA', arabic],
+    ['th-TH', thai],
+    ['hi-IN', devanagari],
+    ['el-GR', greek],
+    ['vi-VN', vietnamese],
+  ];
+
+  // Pick highest non-Latin script
+  scores.sort((a, b) => b[1] - a[1]);
+  if (scores[0][1] > 0) return scores[0][0];
+
+  // All Latin — use word-level heuristics for European languages
+  const lower = clean.toLowerCase();
+  // French
+  if (/\b(le|la|les|un|une|des|est|sont|avec|dans|pour|que|qui|nous|vous|ils|elles|ce|cette|je|tu|il|elle|ne|pas|mais|ou|et|donc|car)\b/.test(lower))
+    return 'fr-FR';
+  // Spanish
+  if (/\b(el|los|las|una|unos|unas|es|son|está|están|con|por|para|que|como|pero|más|este|esta|yo|tú|él|ella|nosotros)\b/.test(lower))
+    return 'es-ES';
+  // German
+  if (/\b(der|die|das|ein|eine|ist|sind|haben|mit|und|oder|aber|für|von|ich|du|er|sie|wir|ihr|nicht|auch|noch)\b/.test(lower))
+    return 'de-DE';
+  // Portuguese
+  if (/\b(o|os|as|um|uma|uns|umas|é|são|está|estão|com|por|para|que|como|mas|mais|este|esta|eu|tu|ele|ela|nós|vocês)\b/.test(lower))
+    return 'pt-BR';
+  // Italian
+  if (/\b(il|lo|la|gli|le|un|uno|una|è|sono|con|per|che|come|ma|più|questo|questa|io|tu|lui|lei|noi|voi|loro|anche|non)\b/.test(lower))
+    return 'it-IT';
+  // Indonesian / Malay
+  if (/\b(yang|dan|di|ini|itu|dengan|untuk|dari|pada|adalah|tidak|akan|sudah|bisa|kami|mereka|saya|anda)\b/.test(lower))
+    return 'id-ID';
+  // Turkish
+  if (/\b(bir|ve|bu|da|de|için|ile|ben|sen|biz|onlar|değil|var|yok|olan|gibi|ama|çok|daha)\b/.test(lower))
+    return 'tr-TR';
+
+  // Default: English
+  return 'en-US';
+}
+
 /** Create a SpeechRecognition instance (cross-browser) */
-function createSpeechRecognition() {
+function createSpeechRecognition(lang: string) {
   const SpeechRecognition =
     (window as unknown as { SpeechRecognition?: new () => SpeechRecognition }).SpeechRecognition ??
     (window as unknown as { webkitSpeechRecognition?: new () => SpeechRecognition }).webkitSpeechRecognition;
   if (!SpeechRecognition) return null;
   const recognition = new SpeechRecognition();
-  recognition.lang = 'ko-KR'; // Default Korean
+  recognition.lang = lang;
   recognition.interimResults = false;
   recognition.continuous = true;
   return recognition;
@@ -106,7 +203,7 @@ function exportToPdf(content: string) {
 }
 
 /** TTS: read content aloud using Web Speech API */
-function speakContent(content: string, onEnd?: () => void) {
+function speakContent(content: string, lang: string, onEnd?: () => void) {
   // Strip markdown syntax for cleaner speech
   const plain = content
     .replace(/```[\s\S]*?```/g, ' (code block) ')
@@ -122,7 +219,7 @@ function speakContent(content: string, onEnd?: () => void) {
   if (!plain) return;
   window.speechSynthesis.cancel();
   const utterance = new SpeechSynthesisUtterance(plain);
-  utterance.lang = 'ko-KR'; // Default Korean, browser will fallback
+  utterance.lang = lang;
   utterance.rate = 1.0;
   if (onEnd) utterance.onend = onEnd;
   if (onEnd) utterance.onerror = onEnd;
@@ -175,7 +272,7 @@ function CopyButton({ content }: { content: string }) {
 }
 
 /** Action buttons for agent messages: Copy, Doc export, PDF export, Listen */
-function MessageActions({ content }: { content: string }) {
+function MessageActions({ content, lang }: { content: string; lang: string }) {
   const [speaking, setSpeaking] = useState(false);
 
   const handleListen = useCallback(() => {
@@ -184,9 +281,9 @@ function MessageActions({ content }: { content: string }) {
       setSpeaking(false);
     } else {
       setSpeaking(true);
-      speakContent(content, () => setSpeaking(false));
+      speakContent(content, lang, () => setSpeaking(false));
     }
-  }, [content, speaking]);
+  }, [content, lang, speaking]);
 
   // Stop speech if component unmounts
   useEffect(() => {
@@ -246,6 +343,7 @@ export default function AgentChat() {
   const [error, setError] = useState<string | null>(null);
   const [listening, setListening] = useState(false);
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
+  const [chatLang, setChatLang] = useState(() => navigator.language || 'en-US');
 
   const wsRef = useRef<WebSocketClient | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -377,6 +475,10 @@ export default function AgentChat() {
     const trimmed = input.trim();
     if (!trimmed || !wsRef.current?.connected) return;
 
+    // Detect language from user's message and update session language
+    const detected = detectLanguage(trimmed);
+    setChatLang(detected);
+
     setMessages((prev) => [
       ...prev,
       {
@@ -424,7 +526,7 @@ export default function AgentChat() {
       return;
     }
 
-    const recognition = createSpeechRecognition();
+    const recognition = createSpeechRecognition(chatLang);
     if (!recognition) {
       setError('Speech recognition is not supported in this browser.');
       return;
@@ -449,7 +551,7 @@ export default function AgentChat() {
     recognitionRef.current = recognition;
     recognition.start();
     setListening(true);
-  }, [listening]);
+  }, [listening, chatLang]);
 
   // Cleanup STT on unmount
   useEffect(() => {
@@ -588,7 +690,7 @@ export default function AgentChat() {
                   {msg.timestamp.toLocaleTimeString()}
                 </p>
                 {msg.role === 'agent' && (
-                  <MessageActions content={msg.content} />
+                  <MessageActions content={msg.content} lang={chatLang} />
                 )}
               </div>
             </div>
