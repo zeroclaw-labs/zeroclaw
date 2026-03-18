@@ -875,19 +875,33 @@ run_docker_bootstrap() {
     onboard_cmd=(onboard --provider "$PROVIDER")
   fi
 
-  if [[ ${#onboard_cmd[@]} -gt 0 ]]; then
-    "$CONTAINER_CLI" run --rm -it \
-      "${container_run_namespace_args[@]+"${container_run_namespace_args[@]}"}" \
-      "${container_run_user_args[@]}" \
-      -e HOME=/zeroclaw-data \
-      -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
-      -v "$config_mount" \
-      -v "$workspace_mount" \
-      "$docker_image" \
-      "${onboard_cmd[@]}"
-  else
-    info "Docker image ready. Run zeroclaw onboard inside the container to configure."
-  fi
+   if [[ ${#onboard_cmd[@]} -gt 0 ]]; then
+     info "Running onboarding command inside container: ${onboard_cmd[*]}"
+     if ! "$CONTAINER_CLI" run --rm -it \
+       "${container_run_namespace_args[@]+"${container_run_namespace_args[@]}"}" \
+       "${container_run_user_args[@]}" \
+       -e HOME=/zeroclaw-data \
+       -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
+       -v "$config_mount" \
+       -v "$workspace_mount" \
+       "$docker_image" \
+       "${onboard_cmd[@]}"; then
+       error "Onboarding command failed inside container"
+       info "You can run 'zeroclaw onboard' manually after installation to configure your provider"
+     else
+       # Verify that config.toml was created in the host directory
+       if [[ ! -f "$docker_data_dir/.zeroclaw/config.toml" ]]; then
+         warn "Onboarding completed but config.toml was not found in $docker_data_dir/.zeroclaw"
+         info "This may indicate that the onboarding process did not complete successfully"
+         info "You can run 'zeroclaw onboard' manually to configure your provider"
+       else
+         info "Onboarding completed successfully"
+       fi
+     fi
+   else
+     info "Skipping onboarding in container (use --skip-onboard to suppress this message)"
+     info "Docker image ready. Run zeroclaw onboard inside the container to configure."
+   fi
 }
 
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
@@ -1000,6 +1014,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 OS_NAME="$(uname -s)"
+OS_ARCH="$(uname -m)"
 if [[ "$GUIDED_MODE" == "auto" ]]; then
   if [[ "$OS_NAME" == "Linux" && "$ORIGINAL_ARG_COUNT" -eq 0 && -t 0 && -t 1 ]]; then
     GUIDED_MODE="on"
