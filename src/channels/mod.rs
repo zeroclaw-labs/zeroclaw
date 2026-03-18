@@ -209,6 +209,9 @@ fn channel_message_timeout_budget_secs(
 struct ChannelRouteSelection {
     provider: String,
     model: String,
+    /// Optional route-specific API key override.
+    /// When set, provider creation uses this key instead of the global api_key.
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1918,6 +1921,7 @@ fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection
     ChannelRouteSelection {
         provider: defaults.default_provider,
         model: defaults.model,
+        api_key: None,
     }
 }
 
@@ -1954,6 +1958,7 @@ fn classify_message_route(
     Some(ChannelRouteSelection {
         provider: route.provider.clone(),
         model: route.model.clone(),
+        api_key: route.api_key.clone(),
     })
 }
 
@@ -2143,18 +2148,33 @@ fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<S
 async fn get_or_create_provider(
     ctx: &ChannelRuntimeContext,
     provider_name: &str,
+    route_api_key: Option<&str>,
 ) -> anyhow::Result<Arc<dyn Provider>> {
+    // Build cache key that includes api_key identity to prevent cache poisoning.
+    // Routes with different api_keys must not share cached provider instances.
+    let cache_key = match route_api_key {
+        Some(key) => {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            key.hash(&mut hasher);
+            format!("{}::{:x}", provider_name, hasher.finish())
+        }
+        None => provider_name.to_string(),
+    };
+
     if let Some(existing) = ctx
         .provider_cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(provider_name)
+        .get(&cache_key)
         .cloned()
     {
         return Ok(existing);
     }
 
-    if provider_name == ctx.default_provider.as_str() {
+    // Only return the default provider if no route-specific api_key is set
+    if provider_name == ctx.default_provider.as_str() && route_api_key.is_none() {
         return Ok(Arc::clone(&ctx.provider));
     }
 
@@ -2165,9 +2185,14 @@ async fn get_or_create_provider(
         None
     };
 
+    // Use route-specific api_key if provided, otherwise fall back to global
+    let effective_api_key = route_api_key
+        .map(ToString::to_string)
+        .or(defaults.api_key.clone());
+
     let provider = create_resilient_provider_nonblocking(
         provider_name,
-        defaults.api_key.clone(),
+        effective_api_key,
         api_url.map(ToString::to_string),
         defaults.reliability.clone(),
         ctx.provider_runtime_options.clone(),
@@ -2181,7 +2206,7 @@ async fn get_or_create_provider(
 
     let mut cache = ctx.provider_cache.lock().unwrap_or_else(|e| e.into_inner());
     let cached = cache
-        .entry(provider_name.to_string())
+        .entry(cache_key)
         .or_insert_with(|| Arc::clone(&provider));
     Ok(Arc::clone(cached))
 }
@@ -2506,26 +2531,29 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
             match resolve_provider_alias(&raw_provider) {
-                Some(provider_name) => match get_or_create_provider(ctx, &provider_name).await {
-                    Ok(_) => {
-                        if provider_name != current.provider {
-                            current.provider = provider_name.clone();
-                            set_route_selection(ctx, &sender_key, current.clone());
-                            clear_sender_history(ctx, &sender_key);
-                        }
+                Some(provider_name) => {
+                    match get_or_create_provider(ctx, &provider_name, None).await {
+                        Ok(_) => {
+                            if provider_name != current.provider {
+                                current.provider = provider_name.clone();
+                                current.api_key = None;
+                                set_route_selection(ctx, &sender_key, current.clone());
+                                clear_sender_history(ctx, &sender_key);
+                            }
 
-                        format!(
+                            format!(
                             "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
                             current.model
                         )
-                    }
-                    Err(err) => {
-                        let safe_err = providers::sanitize_api_error(&err.to_string());
-                        format!(
+                        }
+                        Err(err) => {
+                            let safe_err = providers::sanitize_api_error(&err.to_string());
+                            format!(
                             "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
                         )
+                        }
                     }
-                },
+                }
                 None => format!(
                     "Unknown provider `{raw_provider}`. Use `/models` to list valid providers."
                 ),
@@ -3795,14 +3823,20 @@ If this input is legitimate, rephrase the request and avoid instruction-override
         &msg.content,
     )
     .unwrap_or_else(|| get_route_selection(ctx.as_ref(), &history_key));
-    let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
+    let active_provider = match get_or_create_provider(
+        ctx.as_ref(),
+        &route.provider,
+        route.api_key.as_deref(),
+    )
+    .await
+    {
         Ok(provider) => provider,
         Err(err) => {
             let safe_err = providers::sanitize_api_error(&err.to_string());
             let message = format!(
-                "⚠️ Failed to initialize provider `{}`. Please run `/models` to choose another provider.\nDetails: {safe_err}",
-                route.provider
-            );
+                    "⚠️ Failed to initialize provider `{}`. Please run `/models` to choose another provider.\nDetails: {safe_err}",
+                    route.provider
+                );
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel
                     .send(
@@ -9745,6 +9779,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ChannelRouteSelection {
                 provider: "openrouter".to_string(),
                 model: "route-model".to_string(),
+                api_key: None,
             },
         );
 
