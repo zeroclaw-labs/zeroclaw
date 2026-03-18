@@ -258,6 +258,7 @@ temperature = 0.2
 | `max_images` | `4` | 每个请求接受的最大图像标记数 |
 | `max_image_size_mb` | `5` | base64 编码前的单图像大小限制 |
 | `allow_remote_fetch` | `false` | 允许从标记中获取 `http(s)` 图像 URL |
+| `vision_mcp_fallback` | `None` | 当提供商不支持视觉时用作回退的 MCP 服务器名称。图像标记将通过该服务器转换为文本描述。示例：`"zai-vision"` |
 
 注意事项：
 
@@ -267,7 +268,8 @@ temperature = 0.2
   - 数据 URI（例如 ``[IMAGE:data:image/png;base64,...]``）
   - 仅当 `allow_remote_fetch = true` 时支持远程 URL
 - 允许的 MIME 类型：`image/png`、`image/jpeg`、`image/webp`、`image/gif`、`image/bmp`。
-- 当活动提供商不支持视觉时，请求会失败并返回结构化能力错误（`capability=vision`），而不是静默丢弃图像。
+- 当提供商不支持视觉且未设置 `vision_mcp_fallback` 时，请求会失败并返回结构化能力错误（`capability=vision`），而不是静默丢弃图像。
+- 当设置了 `vision_mcp_fallback` 时，代理会自动从指定的 MCP 服务器发现视觉工具（匹配名称包含 "vision"、"describe" 或 "image" 的工具），并在发送给 LLM 之前将图像标记替换为文本描述。
 
 ## `[browser]`
 
@@ -531,7 +533,6 @@ WhatsApp Web 模式（原生客户端）：
 | `pair_phone` | 可选 | 配对码流程电话号码（仅数字） |
 | `pair_code` | 可选 | 自定义配对码（否则自动生成） |
 | `allowed_numbers` | 推荐 | 允许的入站号码（`[]` = 拒绝所有，`"*"` = 允许所有） |
-| `mention_only` | 可选 | 设为 `true` 时仅在群聊中被 @提及时回复，私聊不受影响。需要 `pair_phone`。默认：`false` |
 
 注意事项：
 

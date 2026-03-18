@@ -197,6 +197,7 @@ Lưu ý:
 | `max_images` | `4` | Số marker ảnh tối đa mỗi yêu cầu |
 | `max_image_size_mb` | `5` | Giới hạn kích thước ảnh trước khi mã hóa base64 |
 | `allow_remote_fetch` | `false` | Cho phép tải ảnh từ URL `http(s)` trong marker |
+| `vision_mcp_fallback` | `None` | Tên MCP server dùng làm fallback vision khi provider không hỗ trợ vision. Marker ảnh sẽ được chuyển thành mô tả văn bản qua server này. Ví dụ: `"zai-vision"` |
 
 Lưu ý:
 
@@ -206,7 +207,8 @@ Lưu ý:
 - Data URI (ví dụ ``[IMAGE:data:image/png;base64,...]``)
 - URL từ xa chỉ khi `allow_remote_fetch = true`
 - Kiểu MIME cho phép: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/bmp`.
-- Khi provider đang dùng không hỗ trợ vision, yêu cầu thất bại với lỗi capability có cấu trúc (`capability=vision`) thay vì bỏ qua ảnh.
+- Khi provider không hỗ trợ vision và `vision_mcp_fallback` chưa được đặt, yêu cầu thất bại với lỗi capability có cấu trúc (`capability=vision`) thay vì bỏ qua ảnh.
+- Khi `vision_mcp_fallback` được đặt, agent tự động tìm tool vision từ MCP server được chỉ định (khớp tên tool chứa "vision", "describe" hoặc "image") và thay thế marker ảnh bằng mô tả văn bản trước khi gửi cho LLM.
 
 ## `[browser]`
 
@@ -431,7 +433,6 @@ Chế độ WhatsApp Web (client gốc):
 | `pair_phone` | Tùy chọn | Số điện thoại cho luồng pair-code (chỉ chữ số) |
 | `pair_code` | Tùy chọn | Mã pair tùy chỉnh (nếu không sẽ tự tạo) |
 | `allowed_numbers` | Khuyến nghị | Số điện thoại cho phép gửi đến (`[]` = từ chối tất cả, `"*"` = cho phép tất cả) |
-| `mention_only` | Tùy chọn | Khi `true`, chỉ phản hồi trong nhóm khi được @nhắc đến. Tin nhắn riêng không bị ảnh hưởng. Cần `pair_phone`. Mặc định: `false` |
 
 Lưu ý:
 

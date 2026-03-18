@@ -289,6 +289,7 @@ Notes:
 | `max_images` | `4` | Maximum image markers accepted per request |
 | `max_image_size_mb` | `5` | Per-image size limit before base64 encoding |
 | `allow_remote_fetch` | `false` | Allow fetching `http(s)` image URLs from markers |
+| `vision_mcp_fallback` | `None` | MCP server name to use as a vision fallback when the provider does not support vision. Image markers are converted to text descriptions via this server. Example: `"zai-vision"` |
 
 Notes:
 
@@ -298,7 +299,8 @@ Notes:
 - Data URI (for example ``[IMAGE:data:image/png;base64,...]``)
 - Remote URL only when `allow_remote_fetch = true`
 - Allowed MIME types: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/bmp`.
-- When the active provider does not support vision, requests fail with a structured capability error (`capability=vision`) instead of silently dropping images.
+- When the active provider does not support vision and `vision_mcp_fallback` is not set, requests fail with a structured capability error (`capability=vision`) instead of silently dropping images.
+- When `vision_mcp_fallback` is set, the agent automatically discovers a vision tool from the named MCP server (matching tool names containing "vision", "describe", or "image") and replaces image markers with text descriptions before sending to the LLM.
 
 ## `[browser]`
 
@@ -562,7 +564,6 @@ WhatsApp Web mode (native client):
 | `pair_phone` | Optional | Pair-code flow phone number (digits only) |
 | `pair_code` | Optional | Custom pair code (otherwise auto-generated) |
 | `allowed_numbers` | Recommended | Allowed inbound numbers (`[]` = deny all, `"*"` = allow all) |
-| `mention_only` | Optional | When `true`, only respond in group chats when @mentioned. DMs unaffected. Requires `pair_phone`. Default: `false` |
 
 Notes:
 
