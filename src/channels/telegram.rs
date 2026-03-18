@@ -869,10 +869,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
     /// Download a file from the Telegram CDN.
     async fn download_file(&self, file_path: &str) -> anyhow::Result<Vec<u8>> {
-        let url = format!(
-            "{}/file/bot{}/{file_path}",
-            self.api_base, self.bot_token
-        );
+        let url = format!("{}/file/bot{}/{file_path}", self.api_base, self.bot_token);
         let resp = self
             .http_client()
             .get(&url)
@@ -1366,10 +1363,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .to_string();
 
         // Step 2: download the actual file
-        let download_url = format!(
-            "{}/file/bot{}/{}",
-            self.api_base, self.bot_token, file_path
-        );
+        let download_url = format!("{}/file/bot{}/{}", self.api_base, self.bot_token, file_path);
         let img_resp = self.http_client().get(&download_url).send().await?;
         let bytes = img_resp.bytes().await?;
 
