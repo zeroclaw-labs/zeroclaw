@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { Send, Bot, User, AlertCircle, Copy, Check } from 'lucide-react';
+import { Send, Bot, User, AlertCircle, Copy, Check, SquarePen } from 'lucide-react';
 import { marked } from 'marked';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
@@ -266,8 +266,34 @@ export default function AgentChat() {
     }
   };
 
+  const handleNewChat = () => {
+    if (!wsRef.current) return;
+    setMessages([]);
+    setTyping(false);
+    setError(null);
+    pendingContentRef.current = '';
+    wsRef.current.resetSession();
+    inputRef.current?.focus();
+  };
+
   return (
     <div className="flex flex-col h-[calc(100vh-3.5rem)]">
+      {/* Chat header with New Chat button */}
+      <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800 bg-gray-900/80">
+        <div className="flex items-center gap-2">
+          <Bot className="h-5 w-5 text-gray-400" />
+          <span className="text-sm font-medium text-gray-300">Agent Chat</span>
+        </div>
+        <button
+          onClick={handleNewChat}
+          className="inline-flex items-center gap-1.5 text-sm text-gray-400 hover:text-white px-3 py-1.5 rounded-lg hover:bg-gray-700/60 transition-colors"
+          title="New Chat"
+        >
+          <SquarePen className="h-4 w-4" />
+          <span>New Chat</span>
+        </button>
+      </div>
+
       {/* Connection status bar */}
       {error && (
         <div className="px-4 py-2 bg-red-900/30 border-b border-red-700 flex items-center gap-2 text-sm text-red-300">

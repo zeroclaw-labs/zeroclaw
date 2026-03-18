@@ -112,6 +112,17 @@ export class WebSocketClient {
     }
   }
 
+  /** Start a new chat session: generate a new session ID and reconnect. */
+  resetSession(): void {
+    this.disconnect();
+    const newId =
+      globalThis.crypto?.randomUUID?.().replace(/-/g, '_') ??
+      `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+    window.localStorage.setItem(WS_SESSION_STORAGE_KEY, newId);
+    (this as { sessionId: string }).sessionId = newId;
+    this.connect();
+  }
+
   /** Returns true if the socket is open. */
   get connected(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
