@@ -279,7 +279,13 @@ impl WhatsAppWebChannel {
         let save_dir = workspace.join("whatsapp_files");
         let safe_id: String = stanza_id
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         for ext in &["jpg", "png", "webp", "gif", "bmp"] {
             let path = save_dir.join(format!("img_{safe_id}.{ext}"));
@@ -339,7 +345,13 @@ impl WhatsAppWebChannel {
         // Sanitize message_id for filesystem safety
         let safe_id: String = message_id
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let filename = format!("img_{safe_id}.{ext}");
         let local_path = save_dir.join(&filename);
@@ -823,12 +835,10 @@ impl Channel for WhatsAppWebChannel {
                 extended_text_message: Some(Box::new(
                     wa_rs_proto::whatsapp::message::ExtendedTextMessage {
                         text: Some(message.content.clone()),
-                        context_info: Some(Box::new(
-                            wa_rs_proto::whatsapp::ContextInfo {
-                                mentioned_jid: mentioned_jids,
-                                ..Default::default()
-                            },
-                        )),
+                        context_info: Some(Box::new(wa_rs_proto::whatsapp::ContextInfo {
+                            mentioned_jid: mentioned_jids,
+                            ..Default::default()
+                        })),
                         ..Default::default()
                     },
                 )),

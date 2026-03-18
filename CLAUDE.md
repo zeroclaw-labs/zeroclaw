@@ -108,18 +108,23 @@ Branch/commit/PR rules:
 ## Architecture Notes
 
 ### Provider Resolution
+
 Providers are created in `src/providers/mod.rs` via `create_provider_with_url_and_options()`. The `ReliableProvider` wrapper (in `reliable.rs`) adds retry, fallback chain, and API key rotation. Provider names map to constructors — `custom:` prefix creates a generic OpenAI-compatible provider with `supports_vision: true`. Named providers (e.g. `zai`) use specific constructors that set correct capabilities.
 
 ### MCP Tool Pipeline
+
 MCP servers are configured in `[mcp]` config section. With `deferred_loading = true` (default), only tool names are loaded; full schemas are fetched on-demand via `tool_search`. With `deferred_loading = false`, all tools are eagerly loaded at startup. The vision fallback in `src/agent/loop_.rs` accesses MCP tools from the registry directly, bypassing LLM tool specs.
 
 ### WhatsApp Web Message Flow
+
 `src/channels/whatsapp_web.rs` uses `wa_rs` crate for WhatsApp Web protocol. Messages are wrapped in ephemeral/device-sent layers — use `msg.get_base_message()` to unwrap. Bot identity for mention detection uses `client.get_pn()` (Phone Number JID) and `client.get_lid()` (LID JID), not config values. JID formats: `user@s.whatsapp.net` (DM), `id@g.us` (group).
 
 ### i18n Docs
+
 Config and channel reference docs are maintained in 3 locales: EN (`docs/reference/`), zh-CN (`docs/i18n/zh-CN/reference/`), VI (`docs/vi/`). All three must be updated together when adding config fields or channel features.
 
 ### Pre-existing Clippy Warnings
+
 `src/channels/whatsapp_storage.rs` has pre-existing clippy errors (wildcard import, `as_ref.map`). `src/channels/whatsapp_web.rs` has a pre-existing `large_futures` warning. These are not from current work.
 
 ## Linked References
