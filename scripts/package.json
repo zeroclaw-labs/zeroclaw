@@ -1,0 +1,13 @@
+{
+  "name": "zeroclaw-browser-scripts",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser automation scripts for ZeroClaw (Playwright bridge)",
+  "scripts": {
+    "install-browser": "npx playwright install chromium",
+    "test-bridge": "node playwright-bridge.js eyJhY3Rpb24iOiJnZXRfdGl0bGUifQ=="
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}
