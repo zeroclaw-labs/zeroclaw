@@ -2393,14 +2393,151 @@ pub(crate) async fn run_tool_call_loop(
 
         let image_marker_count = multimodal::count_image_markers(history);
         if image_marker_count > 0 && !provider.supports_vision() {
-            return Err(ProviderCapabilityError {
-                provider: provider_name.to_string(),
-                capability: "vision".to_string(),
-                message: format!(
-                    "received {image_marker_count} image marker(s), but this provider does not support vision input"
-                ),
+            // Check for MCP vision fallback before rejecting outright.
+            if let Some(ref mcp_server) = multimodal_config.vision_mcp_fallback {
+                tracing::info!(
+                    mcp_server = %mcp_server,
+                    image_count = image_marker_count,
+                    "Provider does not support vision; attempting MCP vision fallback"
+                );
+                // Find a matching MCP vision tool in the tools registry.
+                // MCP tools are named `{server}__{tool}` (double-underscore).
+                // We look for any tool whose name starts with `{server}__`
+                // and contains "vision" (e.g. `zai-vision__vision`).
+                let prefix = format!("{mcp_server}__");
+                let is_vision_tool_name = |n: &str| -> bool {
+                    if let Some(tool_part) = n.strip_prefix(&prefix) {
+                        tool_part.contains("vision")
+                            || tool_part.contains("describe")
+                            || tool_part.contains("image")
+                            || tool_part.contains("analyze_image")
+                    } else {
+                        false
+                    }
+                };
+                // First check static tools registry, then activated (deferred) tools.
+                let static_match: Option<&dyn Tool> = tools_registry
+                    .iter()
+                    .find(|t| is_vision_tool_name(t.name()))
+                    .map(|t| t.as_ref());
+                let activated_arc: Option<Arc<dyn Tool>> = if static_match.is_none() {
+                    activated_tools.and_then(|at| {
+                        let guard = at.lock().unwrap();
+                        let name = guard
+                            .tool_names()
+                            .into_iter()
+                            .find(|n| is_vision_tool_name(n))
+                            .map(|s| s.to_string());
+                        name.and_then(|n| guard.get(&n))
+                    })
+                } else {
+                    None
+                };
+                let vision_tool: Option<&dyn Tool> = static_match
+                    .or_else(|| activated_arc.as_deref());
+                let vision_tool_name = vision_tool
+                    .map(|t| t.name().to_string())
+                    .unwrap_or_else(|| format!("{prefix}vision"));
+                if let Some(tool) = vision_tool {
+                    // Determine the correct image parameter name from the tool's
+                    // schema.  Z.AI vision tools use "image_source"; others may
+                    // use "image", "image_path", "image_url", etc.  We inspect
+                    // `properties` and pick the first key containing "image".
+                    let schema = tool.parameters_schema();
+                    let image_param = schema
+                        .get("properties")
+                        .and_then(|p| p.as_object())
+                        .and_then(|props| {
+                            // Prefer exact "image_source", then any key containing "image"
+                            if props.contains_key("image_source") {
+                                Some("image_source")
+                            } else if props.contains_key("image") {
+                                Some("image")
+                            } else {
+                                props.keys().find(|k| k.contains("image")).map(|k| k.as_str())
+                            }
+                        })
+                        .unwrap_or("image_source");
+
+                    // Replace each image marker with a description from the MCP
+                    // vision tool.
+                    for msg in history.iter_mut() {
+                        if msg.role != "user" {
+                            continue;
+                        }
+                        let (cleaned, refs) = multimodal::parse_image_markers(&msg.content);
+                        if refs.is_empty() {
+                            continue;
+                        }
+                        let mut descriptions = Vec::new();
+                        for image_ref in &refs {
+                            let args = serde_json::json!({
+                                image_param: image_ref,
+                                "prompt": "Briefly describe this image in 2-3 sentences. Mention key objects, text, and context."
+                            });
+                            match tool.execute(args).await {
+                                Ok(result) if result.success => {
+                                    let desc = result.output.trim();
+                                    let desc = truncate_with_ellipsis(desc, 800);
+                                    descriptions.push(format!(
+                                        "[Image description: {desc}]",
+                                    ));
+                                }
+                                Ok(result) => {
+                                    tracing::warn!(
+                                        image = %image_ref,
+                                        error = ?result.error,
+                                        "MCP vision fallback returned failure for image"
+                                    );
+                                    descriptions.push(format!(
+                                        "[Image: could not describe — {}]",
+                                        image_ref
+                                    ));
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        image = %image_ref,
+                                        error = %e,
+                                        "MCP vision fallback failed for image"
+                                    );
+                                    descriptions.push(format!(
+                                        "[Image: could not describe — {}]",
+                                        image_ref
+                                    ));
+                                }
+                            }
+                        }
+                        msg.content = if cleaned.is_empty() {
+                            descriptions.join("\n\n")
+                        } else {
+                            format!("{}\n\n{}", descriptions.join("\n\n"), cleaned)
+                        };
+                    }
+                } else {
+                    tracing::warn!(
+                        tool_name = %vision_tool_name,
+                        "MCP vision fallback configured but tool not found; rejecting"
+                    );
+                    return Err(ProviderCapabilityError {
+                        provider: provider_name.to_string(),
+                        capability: "vision".to_string(),
+                        message: format!(
+                            "received {image_marker_count} image marker(s), but this provider does not support vision input \
+                             (vision_mcp_fallback={mcp_server:?} configured but tool `{vision_tool_name}` not found)"
+                        ),
+                    }
+                    .into());
+                }
+            } else {
+                return Err(ProviderCapabilityError {
+                    provider: provider_name.to_string(),
+                    capability: "vision".to_string(),
+                    message: format!(
+                        "received {image_marker_count} image marker(s), but this provider does not support vision input"
+                    ),
+                }
+                .into());
             }
-            .into());
         }
 
         let prepared_messages =
@@ -4380,6 +4517,7 @@ mod tests {
             max_images: 4,
             max_image_size_mb: 1,
             allow_remote_fetch: false,
+            vision_mcp_fallback: None,
         };
 
         let err = run_tool_call_loop(

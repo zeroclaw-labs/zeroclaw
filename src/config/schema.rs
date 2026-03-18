@@ -1173,6 +1173,12 @@ pub struct MultimodalConfig {
     /// Allow fetching remote image URLs (http/https). Disabled by default.
     #[serde(default)]
     pub allow_remote_fetch: bool,
+    /// MCP server name to use as a vision fallback when the active provider
+    /// does not support vision input.  When set, image markers are converted
+    /// to text descriptions via this MCP server instead of rejecting the
+    /// request outright.  Example: `"zai-vision"`.
+    #[serde(default)]
+    pub vision_mcp_fallback: Option<String>,
 }
 
 fn default_multimodal_max_images() -> usize {
@@ -1198,6 +1204,7 @@ impl Default for MultimodalConfig {
             max_images: default_multimodal_max_images(),
             max_image_size_mb: default_multimodal_max_image_size_mb(),
             allow_remote_fetch: false,
+            vision_mcp_fallback: None,
         }
     }
 }
