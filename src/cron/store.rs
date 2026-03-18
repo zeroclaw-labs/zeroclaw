@@ -285,26 +285,41 @@ pub fn reschedule_after_run(
     output: &str,
 ) -> Result<()> {
     let now = Utc::now();
-    let next_run = next_run_for_schedule(&job.schedule, now)?;
     let status = if success { "ok" } else { "error" };
     let bounded_output = truncate_cron_output(output);
 
-    with_connection(config, |conn| {
-        conn.execute(
-            "UPDATE cron_jobs
-             SET next_run = ?1, last_run = ?2, last_status = ?3, last_output = ?4
-             WHERE id = ?5",
-            params![
-                next_run.to_rfc3339(),
-                now.to_rfc3339(),
-                status,
-                bounded_output,
-                job.id
-            ],
-        )
-        .context("Failed to update cron job run state")?;
-        Ok(())
-    })
+    // One-shot `At` schedules have no future occurrence — record the run
+    // result and disable the job so it won't be picked up again.
+    if matches!(job.schedule, Schedule::At { .. }) {
+        with_connection(config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs
+                 SET enabled = 0, last_run = ?1, last_status = ?2, last_output = ?3
+                 WHERE id = ?4",
+                params![now.to_rfc3339(), status, bounded_output, job.id],
+            )
+            .context("Failed to disable completed one-shot cron job")?;
+            Ok(())
+        })
+    } else {
+        let next_run = next_run_for_schedule(&job.schedule, now)?;
+        with_connection(config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs
+                 SET next_run = ?1, last_run = ?2, last_status = ?3, last_output = ?4
+                 WHERE id = ?5",
+                params![
+                    next_run.to_rfc3339(),
+                    now.to_rfc3339(),
+                    status,
+                    bounded_output,
+                    job.id
+                ],
+            )
+            .context("Failed to update cron job run state")?;
+            Ok(())
+        })
+    }
 }
 
 pub fn record_run(
@@ -850,6 +865,41 @@ mod tests {
         let stored = runs[0].output.as_deref().unwrap_or_default();
         assert!(stored.ends_with(TRUNCATED_OUTPUT_MARKER));
         assert!(stored.len() <= MAX_CRON_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn reschedule_after_run_disables_at_schedule_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = add_shell_job(&config, None, Schedule::At { at }, "echo once").unwrap();
+
+        reschedule_after_run(&config, &job, true, "done").unwrap();
+
+        let stored = get_job(&config, &job.id).unwrap();
+        assert!(
+            !stored.enabled,
+            "At schedule job should be disabled after reschedule"
+        );
+        assert_eq!(stored.last_status.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn reschedule_after_run_disables_at_schedule_job_on_failure() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = add_shell_job(&config, None, Schedule::At { at }, "echo once").unwrap();
+
+        reschedule_after_run(&config, &job, false, "failed").unwrap();
+
+        let stored = get_job(&config, &job.id).unwrap();
+        assert!(
+            !stored.enabled,
+            "At schedule job should be disabled after reschedule even on failure"
+        );
+        assert_eq!(stored.last_status.as_deref(), Some("error"));
+        assert_eq!(stored.last_output.as_deref(), Some("failed"));
     }
 
     #[test]

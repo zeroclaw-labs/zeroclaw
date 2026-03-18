@@ -4,7 +4,8 @@ use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
 use crate::providers::{
-    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
+    self, reliable::is_context_window_exceeded, ChatMessage, ChatRequest, Provider,
+    ProviderCapabilityError, ToolCall,
 };
 use crate::runtime;
 use crate::security::SecurityPolicy;
@@ -213,10 +214,60 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 /// Max characters retained in stored compaction summary.
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 
-/// Maximum characters kept per individual tool result when adding to history.
-/// Prevents a single oversized tool output (e.g. binary file read) from
-/// blowing up the context window beyond recovery.  ~25k tokens at 4 chars/tok.
-const MAX_TOOL_RESULT_CHARS: usize = 100_000;
+/// Absolute upper bound on per-tool-result characters regardless of context window.
+const HARD_MAX_TOOL_RESULT_CHARS: usize = 400_000;
+
+/// Conservative chars-per-token multiplier for tool output (tool results tend to
+/// have more overhead characters — JSON wrappers, special tokens, etc.).
+const TOOL_RESULT_CHARS_PER_TOKEN: usize = 3;
+
+/// Number of most-recent tool messages to keep verbatim when compacting old
+/// tool results into placeholders.
+const TOOL_RESULT_KEEP_RECENT: usize = 6;
+
+/// Placeholder that replaces compacted tool result content.
+const TOOL_RESULT_PLACEHOLDER: &str = "[tool result compacted]";
+
+/// Derive the per-tool-result character budget from the context-window token budget.
+fn max_tool_result_chars(max_context_tokens: usize) -> usize {
+    if max_context_tokens == 0 {
+        return HARD_MAX_TOOL_RESULT_CHARS;
+    }
+    // 30% of context window, converted to chars via TOOL_RESULT_CHARS_PER_TOKEN.
+    // Uses integer arithmetic to avoid f64-to-usize cast warnings.
+    let budget_tokens = max_context_tokens * 30 / 100;
+    (budget_tokens * TOOL_RESULT_CHARS_PER_TOKEN).min(HARD_MAX_TOOL_RESULT_CHARS)
+}
+
+/// Replace old tool-result message bodies with a short placeholder.
+///
+/// Walks history **backwards**, counts tool-role messages, and replaces the
+/// content of any beyond `keep_recent` with [`TOOL_RESULT_PLACEHOLDER`].
+/// Already-compacted messages (content == placeholder) are skipped from the
+/// recent count so they don't waste budget.
+///
+/// Returns `true` if at least one message was compacted.
+fn compact_old_tool_results(history: &mut [ChatMessage], keep_recent: usize) -> bool {
+    let mut seen_tool = 0usize;
+    let mut compacted_any = false;
+
+    for msg in history.iter_mut().rev() {
+        if msg.role != "tool" {
+            continue;
+        }
+        // Already compacted — skip (don't count toward recent budget).
+        if msg.content == TOOL_RESULT_PLACEHOLDER {
+            continue;
+        }
+        seen_tool += 1;
+        if seen_tool > keep_recent {
+            msg.content = TOOL_RESULT_PLACEHOLDER.to_string();
+            compacted_any = true;
+        }
+    }
+
+    compacted_any
+}
 
 /// Estimate token count for a message history using ~4 chars/token heuristic.
 /// Includes a small overhead per message for role/framing tokens.
@@ -2552,7 +2603,7 @@ pub(crate) async fn run_tool_call_loop(
             }
         }
 
-        // ── Pre-flight context guard: compact if over token budget ──
+        // ── Pre-flight context guard: layered compaction ──
         if max_context_tokens > 0 {
             let estimated = estimate_history_tokens(history);
             if estimated > max_context_tokens {
@@ -2562,6 +2613,8 @@ pub(crate) async fn run_tool_call_loop(
                     iteration,
                     "Pre-flight context guard: history exceeds token budget, compacting"
                 );
+
+                // Layer 1: LLM-based conversation summarization
                 let compacted = auto_compact_history(
                     history,
                     provider,
@@ -2573,18 +2626,31 @@ pub(crate) async fn run_tool_call_loop(
                 .unwrap_or(false);
                 if compacted {
                     tracing::info!("Pre-flight compaction complete within tool loop");
-                } else {
-                    // Compaction did not help — aggressively truncate large tool results
-                    // in older messages to stay within budget.
-                    let still_estimated = estimate_history_tokens(history);
-                    if still_estimated > max_context_tokens {
-                        trim_history(history, DEFAULT_MAX_HISTORY_MESSAGES);
-                        tracing::warn!(
+                }
+
+                // Layer 2: Replace old tool results with placeholders
+                let still_estimated = estimate_history_tokens(history);
+                if still_estimated > max_context_tokens {
+                    let tool_compacted =
+                        compact_old_tool_results(history, TOOL_RESULT_KEEP_RECENT);
+                    if tool_compacted {
+                        tracing::info!(
                             before = still_estimated,
                             after = estimate_history_tokens(history),
-                            "Fallback hard trim applied in tool loop"
+                            "Old tool results compacted to placeholders"
                         );
                     }
+                }
+
+                // Layer 3: Hard trim — remove oldest messages entirely
+                let still_estimated = estimate_history_tokens(history);
+                if still_estimated > max_context_tokens {
+                    trim_history(history, DEFAULT_MAX_HISTORY_MESSAGES);
+                    tracing::warn!(
+                        before = still_estimated,
+                        after = estimate_history_tokens(history),
+                        "Fallback hard trim applied in tool loop"
+                    );
                 }
             }
         }
@@ -2758,6 +2824,102 @@ pub(crate) async fn run_tool_call_loop(
                         assistant_history_content,
                         native_calls,
                     )
+                }
+                Err(e) if is_context_window_exceeded(&e) => {
+                    // ── Emergency compaction: context exceeded after pre-flight ──
+                    tracing::warn!(
+                        iteration,
+                        "Context window exceeded; attempting emergency compaction and retry"
+                    );
+
+                    // Aggressive tool result compaction — keep only 2 most recent
+                    compact_old_tool_results(history, 2);
+                    // Aggressive message trim
+                    trim_history(history, DEFAULT_MAX_HISTORY_MESSAGES / 2);
+
+                    let after_tokens = estimate_history_tokens(history);
+                    tracing::info!(
+                        after_tokens,
+                        budget = max_context_tokens,
+                        "Emergency compaction complete, retrying LLM call"
+                    );
+
+                    // Re-prepare messages after compaction
+                    let retry_prepared =
+                        multimodal::prepare_messages_for_provider(history, multimodal_config)
+                            .await?;
+                    let retry_tools = if use_native_tools {
+                        Some(tool_specs.as_slice())
+                    } else {
+                        None
+                    };
+
+                    let retry_result = provider
+                        .chat(
+                            ChatRequest {
+                                messages: &retry_prepared.messages,
+                                tools: retry_tools,
+                            },
+                            model,
+                            temperature,
+                        )
+                        .await;
+
+                    match retry_result {
+                        Ok(resp) => {
+                            let response_text = resp.text_or_empty().to_string();
+                            let mut calls = parse_structured_tool_calls(&resp.tool_calls);
+                            let mut parsed_text = String::new();
+                            if calls.is_empty() {
+                                let (ft, fc) = parse_tool_calls(&response_text);
+                                if !ft.is_empty() {
+                                    parsed_text = ft;
+                                }
+                                calls = fc;
+                            }
+                            let reasoning_content = resp.reasoning_content.clone();
+                            let assistant_history_content = if resp.tool_calls.is_empty() {
+                                if use_native_tools {
+                                    build_native_assistant_history_from_parsed_calls(
+                                        &response_text,
+                                        &calls,
+                                        reasoning_content.as_deref(),
+                                    )
+                                    .unwrap_or_else(|| response_text.clone())
+                                } else {
+                                    response_text.clone()
+                                }
+                            } else {
+                                build_native_assistant_history(
+                                    &response_text,
+                                    &resp.tool_calls,
+                                    reasoning_content.as_deref(),
+                                )
+                            };
+                            let native_calls = resp.tool_calls;
+                            (
+                                response_text,
+                                parsed_text,
+                                calls,
+                                assistant_history_content,
+                                native_calls,
+                            )
+                        }
+                        Err(retry_err) => {
+                            let safe_error =
+                                crate::providers::sanitize_api_error(&retry_err.to_string());
+                            observer.record_event(&ObserverEvent::LlmResponse {
+                                provider: provider_name.to_string(),
+                                model: model.to_string(),
+                                duration: llm_started_at.elapsed(),
+                                success: false,
+                                error_message: Some(safe_error.clone()),
+                                input_tokens: None,
+                                output_tokens: None,
+                            });
+                            return Err(retry_err);
+                        }
+                    }
                 }
                 Err(e) => {
                     let safe_error = crate::providers::sanitize_api_error(&e.to_string());
@@ -3125,15 +3287,16 @@ pub(crate) async fn run_tool_call_loop(
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
+        let tool_char_cap = max_tool_result_chars(max_context_tokens);
         for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
-            let output = if outcome.output.len() > MAX_TOOL_RESULT_CHARS {
+            let output = if outcome.output.len() > tool_char_cap {
                 tracing::warn!(
                     tool = %tool_name,
                     original_len = outcome.output.len(),
-                    cap = MAX_TOOL_RESULT_CHARS,
+                    cap = tool_char_cap,
                     "Truncating oversized tool output before adding to history"
                 );
-                truncate_with_ellipsis(&outcome.output, MAX_TOOL_RESULT_CHARS)
+                truncate_with_ellipsis(&outcome.output, tool_char_cap)
             } else {
                 outcome.output.clone()
             };

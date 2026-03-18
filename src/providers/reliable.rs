@@ -71,7 +71,7 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
             || msg_lower.contains("invalid"))
 }
 
-fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
+pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     let hints = [
         "exceeds the context window",
@@ -379,8 +379,11 @@ impl Provider for ReliableProvider {
                                 );
 
                                 if is_context_window_exceeded(&e) {
+                                    // Propagate with a recognisable prefix so
+                                    // the agent loop can catch it, compact
+                                    // history, and retry.
                                     anyhow::bail!(
-                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
+                                        "CONTEXT_WINDOW_EXCEEDED: Request exceeds model context window. Attempts:\n{}",
                                         failures.join("\n")
                                     );
                                 }
@@ -497,8 +500,11 @@ impl Provider for ReliableProvider {
                                 );
 
                                 if is_context_window_exceeded(&e) {
+                                    // Propagate with a recognisable prefix so
+                                    // the agent loop can catch it, compact
+                                    // history, and retry.
                                     anyhow::bail!(
-                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
+                                        "CONTEXT_WINDOW_EXCEEDED: Request exceeds model context window. Attempts:\n{}",
                                         failures.join("\n")
                                     );
                                 }
@@ -621,8 +627,11 @@ impl Provider for ReliableProvider {
                                 );
 
                                 if is_context_window_exceeded(&e) {
+                                    // Propagate with a recognisable prefix so
+                                    // the agent loop can catch it, compact
+                                    // history, and retry.
                                     anyhow::bail!(
-                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
+                                        "CONTEXT_WINDOW_EXCEEDED: Request exceeds model context window. Attempts:\n{}",
                                         failures.join("\n")
                                     );
                                 }
@@ -732,8 +741,11 @@ impl Provider for ReliableProvider {
                                 );
 
                                 if is_context_window_exceeded(&e) {
+                                    // Propagate with a recognisable prefix so
+                                    // the agent loop can catch it, compact
+                                    // history, and retry.
                                     anyhow::bail!(
-                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
+                                        "CONTEXT_WINDOW_EXCEEDED: Request exceeds model context window. Attempts:\n{}",
                                         failures.join("\n")
                                     );
                                 }
@@ -1107,8 +1119,8 @@ mod tests {
             .expect_err("context window overflow should fail fast");
         let msg = err.to_string();
 
+        assert!(msg.contains("CONTEXT_WINDOW_EXCEEDED"));
         assert!(msg.contains("context window"));
-        assert!(msg.contains("skipped"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 

@@ -1120,7 +1120,7 @@ fn default_agent_max_history_messages() -> usize {
 }
 
 fn default_agent_max_context_tokens() -> usize {
-    32_000
+    128_000
 }
 
 fn default_agent_tool_dispatcher() -> String {

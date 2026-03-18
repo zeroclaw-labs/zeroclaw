@@ -579,7 +579,7 @@ impl Provider for AnthropicProvider {
             base_url = %self.base_url,
             url = %url,
             model = %model,
-            has_credential = credential.len() > 0,
+            has_credential = !credential.is_empty(),
             credential_prefix = %&credential[..credential.len().min(10)],
             request_body_len = request_body.len(),
             "Anthropic chat_with_system: sending request"
@@ -645,7 +645,7 @@ impl Provider for AnthropicProvider {
             base_url = %self.base_url,
             url = %url,
             model = %model,
-            has_credential = credential.len() > 0,
+            has_credential = !credential.is_empty(),
             credential_prefix = %&credential[..credential.len().min(10)],
             "Anthropic provider: sending request"
         );

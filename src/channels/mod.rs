@@ -229,6 +229,10 @@ struct ChannelRouteSelection {
     model: String,
     /// Resolved context window budget (tokens) for the pre-flight context guard.
     max_context_tokens: usize,
+    /// Route-specific API key override. When set, this takes precedence over
+    /// the global `api_key` in [`ChannelRuntimeContext`] when creating the
+    /// provider for this route.
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -939,6 +943,7 @@ fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection
         provider: defaults.default_provider,
         model: defaults.model,
         max_context_tokens: ctx.max_context_tokens,
+        api_key: None,
     }
 }
 
@@ -1158,21 +1163,43 @@ fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<S
         .unwrap_or_default()
 }
 
+/// Build a cache key that includes the provider name and, when a
+/// route-specific API key is supplied, a hash of that key. This prevents
+/// cache poisoning when multiple routes target the same provider with
+/// different credentials.
+fn provider_cache_key(provider_name: &str, route_api_key: Option<&str>) -> String {
+    match route_api_key {
+        Some(key) => {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut hasher);
+            format!("{provider_name}@{:x}", hasher.finish())
+        }
+        None => provider_name.to_string(),
+    }
+}
+
 async fn get_or_create_provider(
     ctx: &ChannelRuntimeContext,
     provider_name: &str,
+    route_api_key: Option<&str>,
 ) -> anyhow::Result<Arc<dyn Provider>> {
+    let cache_key = provider_cache_key(provider_name, route_api_key);
+
     if let Some(existing) = ctx
         .provider_cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(provider_name)
+        .get(&cache_key)
         .cloned()
     {
         return Ok(existing);
     }
 
-    if provider_name == ctx.default_provider.as_str() {
+    // Only return the pre-built default provider when there is no
+    // route-specific credential override — otherwise the default was
+    // created with the global key and would be wrong.
+    if route_api_key.is_none() && provider_name == ctx.default_provider.as_str() {
         return Ok(Arc::clone(&ctx.provider));
     }
 
@@ -1183,9 +1210,14 @@ async fn get_or_create_provider(
         None
     };
 
+    // Prefer route-specific credential; fall back to the global key.
+    let effective_api_key = route_api_key
+        .map(ToString::to_string)
+        .or_else(|| ctx.api_key.clone());
+
     let provider = create_resilient_provider_nonblocking(
         provider_name,
-        ctx.api_key.clone(),
+        effective_api_key,
         api_url.map(ToString::to_string),
         ctx.reliability.as_ref().clone(),
         ctx.provider_runtime_options.clone(),
@@ -1199,7 +1231,7 @@ async fn get_or_create_provider(
 
     let mut cache = ctx.provider_cache.lock().unwrap_or_else(|e| e.into_inner());
     let cached = cache
-        .entry(provider_name.to_string())
+        .entry(cache_key)
         .or_insert_with(|| Arc::clone(&provider));
     Ok(Arc::clone(cached))
 }
@@ -1315,25 +1347,27 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
             match resolve_provider_alias(&raw_provider) {
-                Some(provider_name) => match get_or_create_provider(ctx, &provider_name).await {
-                    Ok(_) => {
-                        if provider_name != current.provider {
-                            current.provider = provider_name.clone();
-                            set_route_selection(ctx, &sender_key, current.clone());
-                        }
+                Some(provider_name) => {
+                    match get_or_create_provider(ctx, &provider_name, None).await {
+                        Ok(_) => {
+                            if provider_name != current.provider {
+                                current.provider = provider_name.clone();
+                                set_route_selection(ctx, &sender_key, current.clone());
+                            }
 
-                        format!(
+                            format!(
                             "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
                             current.model
                         )
-                    }
-                    Err(err) => {
-                        let safe_err = providers::sanitize_api_error(&err.to_string());
-                        format!(
+                        }
+                        Err(err) => {
+                            let safe_err = providers::sanitize_api_error(&err.to_string());
+                            format!(
                             "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
                         )
+                        }
                     }
-                },
+                }
                 None => format!(
                     "Unknown provider `{raw_provider}`. Use `/models` to list valid providers."
                 ),
@@ -1355,6 +1389,7 @@ async fn handle_runtime_command_if_needed(
                     current.model = route.model.clone();
                     current.max_context_tokens =
                         route.max_context_tokens.unwrap_or(ctx.max_context_tokens);
+                    current.api_key = route.api_key.clone();
                 } else {
                     current.model = model.clone();
                 }
@@ -1963,12 +1998,19 @@ async fn process_channel_message(
                 max_context_tokens: matched_route
                     .max_context_tokens
                     .unwrap_or(ctx.max_context_tokens),
+                api_key: matched_route.api_key.clone(),
             };
         }
     }
 
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
-    let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
+    let active_provider = match get_or_create_provider(
+        ctx.as_ref(),
+        &route.provider,
+        route.api_key.as_deref(),
+    )
+    .await
+    {
         Ok(provider) => provider,
         Err(err) => {
             let safe_err = providers::sanitize_api_error(&err.to_string());
@@ -5674,6 +5716,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 provider: "openrouter".to_string(),
                 model: "route-model".to_string(),
                 max_context_tokens: 32_000,
+                api_key: None,
             },
         );
 
