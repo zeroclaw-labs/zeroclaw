@@ -17,9 +17,6 @@
 //!
 //! # Limitations
 //!
-//! - **Conversation history**: Only the system prompt (if present) and the last
-//!   user message are forwarded. Full multi-turn history is not preserved because
-//!   the CLI accepts a single prompt per invocation.
 //! - **System prompt**: The system prompt is prepended to the user message with a
 //!   blank-line separator, as the CLI does not provide a dedicated system-prompt flag.
 //! - **Temperature**: The CLI does not expose a temperature parameter.
@@ -34,7 +31,7 @@
 //!
 //! - `CLAUDE_CODE_PATH` — override the path to the `claude` binary (default: `"claude"`)
 
-use crate::providers::traits::{ChatRequest, ChatResponse, Provider, TokenUsage};
+use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider, TokenUsage};
 use async_trait::async_trait;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
@@ -212,6 +209,54 @@ impl Provider for ClaudeCodeProvider {
         self.invoke_cli(&full_message, model).await
     }
 
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        Self::validate_temperature(temperature)?;
+
+        // Separate system prompt from conversation messages.
+        let system = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.as_str());
+
+        // Build conversation turns (skip system messages).
+        let turns: Vec<&ChatMessage> = messages.iter().filter(|m| m.role != "system").collect();
+
+        // If there's only one user message, use the simple path.
+        if turns.len() <= 1 {
+            let last_user = turns.first().map(|m| m.content.as_str()).unwrap_or("");
+            let full_message = match system {
+                Some(s) if !s.is_empty() => format!("{s}\n\n{last_user}"),
+                _ => last_user.to_string(),
+            };
+            return self.invoke_cli(&full_message, model).await;
+        }
+
+        // Format multi-turn conversation into a single prompt.
+        let mut parts = Vec::new();
+        if let Some(s) = system {
+            if !s.is_empty() {
+                parts.push(format!("[system]\n{s}"));
+            }
+        }
+        for msg in &turns {
+            let label = match msg.role.as_str() {
+                "user" => "[user]",
+                "assistant" => "[assistant]",
+                other => other,
+            };
+            parts.push(format!("{label}\n{}", msg.content));
+        }
+        parts.push("[assistant]".to_string());
+
+        let full_message = parts.join("\n\n");
+        self.invoke_cli(&full_message, model).await
+    }
+
     async fn chat(
         &self,
         request: ChatRequest<'_>,
@@ -326,5 +371,106 @@ mod tests {
             msg.contains("Failed to spawn Claude Code binary"),
             "unexpected error message: {msg}"
         );
+    }
+
+    /// Helper: create a provider that uses a shell script echoing stdin back.
+    /// The script ignores CLI flags (`--print`, `--model`, `-`) and just cats stdin.
+    ///
+    /// Uses `OnceLock` to write the script file exactly once, avoiding
+    /// "Text file busy" (ETXTBSY) races when parallel tests try to
+    /// overwrite a script that another test is currently executing.
+    fn echo_provider() -> ClaudeCodeProvider {
+        use std::sync::OnceLock;
+
+        static SCRIPT_PATH: OnceLock<PathBuf> = OnceLock::new();
+        let script = SCRIPT_PATH.get_or_init(|| {
+            use std::io::Write;
+            let dir = std::env::temp_dir().join("zeroclaw_test_claude_code");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("fake_claude.sh");
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "#!/bin/sh\ncat /dev/stdin").unwrap();
+            drop(f);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path
+        });
+        ClaudeCodeProvider {
+            binary_path: script.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_single_user_message() {
+        let provider = echo_provider();
+        let messages = vec![ChatMessage::user("hello")];
+        let result = provider
+            .chat_with_history(&messages, "default", 1.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "hello");
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_single_user_with_system() {
+        let provider = echo_provider();
+        let messages = vec![
+            ChatMessage::system("You are helpful."),
+            ChatMessage::user("hello"),
+        ];
+        let result = provider
+            .chat_with_history(&messages, "default", 1.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "You are helpful.\n\nhello");
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_multi_turn_includes_all_messages() {
+        let provider = echo_provider();
+        let messages = vec![
+            ChatMessage::system("Be concise."),
+            ChatMessage::user("What is 2+2?"),
+            ChatMessage::assistant("4"),
+            ChatMessage::user("And 3+3?"),
+        ];
+        let result = provider
+            .chat_with_history(&messages, "default", 1.0)
+            .await
+            .unwrap();
+        assert!(result.contains("[system]\nBe concise."));
+        assert!(result.contains("[user]\nWhat is 2+2?"));
+        assert!(result.contains("[assistant]\n4"));
+        assert!(result.contains("[user]\nAnd 3+3?"));
+        assert!(result.ends_with("[assistant]"));
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_multi_turn_without_system() {
+        let provider = echo_provider();
+        let messages = vec![
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let result = provider
+            .chat_with_history(&messages, "default", 1.0)
+            .await
+            .unwrap();
+        assert!(!result.contains("[system]"));
+        assert!(result.contains("[user]\nhi"));
+        assert!(result.contains("[assistant]\nhello"));
+        assert!(result.contains("[user]\nbye"));
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_rejects_bad_temperature() {
+        let provider = echo_provider();
+        let messages = vec![ChatMessage::user("test")];
+        let result = provider.chat_with_history(&messages, "default", 0.5).await;
+        assert!(result.is_err());
     }
 }
