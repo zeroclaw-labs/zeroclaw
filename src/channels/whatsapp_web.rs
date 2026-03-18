@@ -269,6 +269,51 @@ impl WhatsAppWebChannel {
         None
     }
 
+    /// Check if the message is a reply to a message sent by the bot itself.
+    /// Uses `context_info.participant` from any message sub-type.
+    #[cfg(feature = "whatsapp-web")]
+    fn is_reply_to_self(
+        msg: &wa_rs_proto::whatsapp::Message,
+        own_pn: Option<&str>,
+        own_lid: Option<&str>,
+    ) -> bool {
+        use wa_rs_core::proto_helpers::MessageExt;
+        let base = msg.get_base_message();
+
+        macro_rules! check_ctx {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    if let Some(ref m) = base.$field {
+                        if let Some(ref ctx) = m.context_info {
+                            if let Some(ref participant) = ctx.participant {
+                                let user_part = participant.split('@').next().unwrap_or("");
+                                if let Some(pn) = own_pn {
+                                    if user_part == pn { return true; }
+                                }
+                                if let Some(lid) = own_lid {
+                                    if user_part == lid { return true; }
+                                }
+                            }
+                        }
+                    }
+                )+
+            };
+        }
+
+        check_ctx!(
+            extended_text_message,
+            image_message,
+            video_message,
+            audio_message,
+            document_message,
+            sticker_message,
+            location_message,
+            contact_message,
+        );
+
+        false
+    }
+
     /// Look up a previously downloaded image by the quoted message's stanza ID.
     /// Checks for `img_{stanza_id}.*` in the whatsapp_files directory.
     fn find_image_by_stanza_id(
@@ -1121,7 +1166,14 @@ impl Channel for WhatsAppWebChannel {
                                             false
                                         });
 
-                                        if !is_mentioned {
+                                        // Also respond if replying to one of our own messages
+                                        let is_reply_to_bot = Self::is_reply_to_self(
+                                            &msg,
+                                            pn_user,
+                                            lid_user,
+                                        );
+
+                                        if !is_mentioned && !is_reply_to_bot {
                                             tracing::debug!(
                                                 "WhatsApp Web: mention_only — storing group message as observe_group (mentioned_jids={:?}, own_pn={:?}, own_lid={:?})",
                                                 mentioned,
