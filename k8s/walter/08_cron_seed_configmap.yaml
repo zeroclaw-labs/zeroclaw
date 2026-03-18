@@ -25,7 +25,9 @@ data:
         "unaddressed review comments. If ACTION NEEDED is reported, use the "
         "k8s-manifest-builder skill's 'Addressing PR Review Comments' section "
         "(Phase READ through Phase REPORT) to address each PR's feedback. "
-        "If all clear, no action needed."
+        "If all clear, no action needed — end the session immediately. "
+        "Do not search for files, check memories, or perform any other work "
+        "beyond what check-reviews reports."
     )
 
     def main():

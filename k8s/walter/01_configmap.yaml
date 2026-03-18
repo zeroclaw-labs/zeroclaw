@@ -57,9 +57,9 @@ data:
       provider_retries = 5
 
       [agent]
-      max_tool_iterations = 999
-      loop_detection_no_progress_threshold = 15
-      loop_detection_failure_streak = 10
+      max_tool_iterations = 50
+      loop_detection_no_progress_threshold = 8
+      loop_detection_failure_streak = 5
 
       [heartbeat]
       enabled = false
