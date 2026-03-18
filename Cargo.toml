@@ -92,7 +92,22 @@ prost = { version = "0.14", default-features = false }
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"] }
+memory-rvf = { path = "../zara/crates/memory-rvf", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+
+# Embedded brain (lifebook merge) — all optional, gated behind `embedded-brain` feature
+rvf-runtime  = { path = "../ruvector/crates/rvf/rvf-runtime", optional = true }
+rvf-types    = { path = "../ruvector/crates/rvf/rvf-types", optional = true }
+ruvector-onnx-embeddings = { path = "../lifebook-agent/ruvector-onnx-embeddings", optional = true }
+ruvector-sona = { path = "../ruvector/crates/sona", optional = true, features = ["serde-support"] }
+ruvector-gnn = { path = "../ruvector/crates/ruvector-gnn", optional = true, default-features = false, features = ["simd"] }
+ruvector-graph = { path = "../ruvector/crates/ruvector-graph", optional = true, default-features = false, features = ["storage"] }
+ruvector-nervous-system = { path = "../ruvector/crates/ruvector-nervous-system", optional = true }
+ruvllm = { path = "../ruvector/crates/ruvllm", optional = true, default-features = false, features = ["minimal"] }
+ort = { version = "=2.0.0-rc.9", optional = true }
+ort-sys = { version = "=2.0.0-rc.9", optional = true }
+notify = { version = "7", optional = true, default-features = false, features = ["macos_fsevent"] }
+dotenvy = { version = "0.15", optional = true }
 chrono-tz = "0.10"
 cron = "0.15"
 
@@ -179,6 +194,16 @@ probe = ["dep:probe-rs"]
 rag-pdf = ["dep:pdf-extract"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "serde-big-array"]
+# memory-rvf = RuVector Format cognitive vector memory (Zara)
+memory-rvf = ["dep:memory-rvf"]
+# embedded-brain = Full lifebook memory engine compiled into zeroclaw binary
+embedded-brain = [
+    "dep:rvf-runtime", "dep:rvf-types",
+    "dep:ruvector-onnx-embeddings", "dep:ruvector-sona",
+    "dep:ruvector-gnn", "dep:ruvector-graph",
+    "dep:ruvector-nervous-system", "dep:ruvllm",
+    "dep:ort", "dep:ort-sys", "dep:notify", "dep:dotenvy",
+]
 
 [profile.release]
 opt-level = "z"      # Optimize for size

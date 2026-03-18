@@ -79,6 +79,11 @@ pub trait Memory: Send + Sync {
 
     /// Health check
     async fn health_check(&self) -> bool;
+
+    /// Send quality feedback (0.0 = bad, 1.0 = perfect) to the backend's
+    /// learning system. Default is a no-op; the lifebook backend forwards
+    /// this to SONA so it adapts retrieval quality over time.
+    async fn send_feedback(&self, _quality: f32) {}
 }
 
 #[cfg(test)]

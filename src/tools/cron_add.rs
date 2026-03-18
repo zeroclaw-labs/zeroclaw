@@ -24,7 +24,14 @@ impl Tool for CronAddTool {
     }
 
     fn description(&self) -> &str {
-        "Create a scheduled cron job (shell or agent) with cron/at/every schedules"
+        "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
+         Use job_type='agent' with a prompt to run the AI agent on schedule. \
+         IMPORTANT: To actually deliver output to the user via Telegram/Discord/Slack/Mattermost, \
+         you MUST set delivery={\"mode\":\"announce\",\"channel\":\"telegram\",\"to\":\"<chat_id>\"}. \
+         Without delivery config, output is only logged — the user will never see it. \
+         Schedule kinds: cron={kind:'cron',expr:'30 9 * * *',tz:'Europe/Helsinki'}, \
+         at={kind:'at',at:'2026-02-25T07:30:00Z'}, every={kind:'every',every_ms:3600000}. \
+         For one-shot reminders use kind='at' and set delete_after_run=true."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

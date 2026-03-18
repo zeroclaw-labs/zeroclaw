@@ -2,11 +2,14 @@ pub mod backend;
 pub mod chunker;
 pub mod embeddings;
 pub mod hygiene;
+pub mod lifebook;
 pub mod lucid;
 pub mod markdown;
 pub mod none;
 pub mod postgres;
 pub mod response_cache;
+#[cfg(feature = "memory-rvf")]
+pub mod rvf;
 pub mod snapshot;
 pub mod sqlite;
 pub mod traits;
@@ -22,6 +25,9 @@ pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
 pub use postgres::PostgresMemory;
 pub use response_cache::ResponseCache;
+#[cfg(feature = "memory-rvf")]
+pub use rvf::RvfMemory;
+pub use lifebook::LifebookMemory;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
@@ -52,6 +58,43 @@ where
         MemoryBackendKind::Postgres => Ok(Box::new(postgres_builder()?)),
         MemoryBackendKind::Markdown => Ok(Box::new(MarkdownMemory::new(workspace_dir))),
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
+        #[cfg(feature = "memory-rvf")]
+        MemoryBackendKind::Rvf => Ok(Box::new(RvfMemory::new_sync(workspace_dir)?)),
+        #[cfg(not(feature = "memory-rvf"))]
+        MemoryBackendKind::Rvf => {
+            tracing::warn!(
+                "memory backend 'rvf' requested but feature 'memory-rvf' is not enabled; \
+                 falling back to markdown"
+            );
+            Ok(Box::new(MarkdownMemory::new(workspace_dir)))
+        }
+        MemoryBackendKind::Lifebook => Ok(Box::new(LifebookMemory::new())),
+        #[cfg(feature = "embedded-brain")]
+        MemoryBackendKind::Embedded => {
+            let rvf_path = "~/.zeroclaw/rvf/lifebook.rvf";
+            let db_path = "~/.zeroclaw/rvf/lifebook.db";
+            let vault_path = std::env::var("HOME").ok()
+                .map(|h| format!("{h}/zara/workspace/vault"));
+            let brain = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(
+                    crate::brain::EmbeddedBrainMemory::new(
+                        rvf_path,
+                        db_path,
+                        "base",
+                        vault_path.as_deref(),
+                    ),
+                )
+            })?;
+            Ok(Box::new(brain))
+        }
+        #[cfg(not(feature = "embedded-brain"))]
+        MemoryBackendKind::Embedded => {
+            tracing::warn!(
+                "memory backend 'embedded' requested but feature 'embedded-brain' is not enabled; \
+                 falling back to markdown"
+            );
+            Ok(Box::new(MarkdownMemory::new(workspace_dir)))
+        }
         MemoryBackendKind::Unknown => {
             tracing::warn!(
                 "Unknown memory backend '{backend_name}'{unknown_context}, falling back to markdown"

@@ -27,7 +27,12 @@ impl Tool for ScheduleTool {
     }
 
     fn description(&self) -> &str {
-        "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume"
+        "Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. \
+         WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. \
+         The user will NEVER see the result. \
+         To send a scheduled message or reminder to the user via Discord/Telegram/Slack, \
+         use the cron_add tool instead with job_type='agent', a prompt like 'Send Mike this reminder: ...', \
+         and delivery={\"mode\":\"announce\",\"channel\":\"telegram\",\"to\":\"<chat_id>\"}."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

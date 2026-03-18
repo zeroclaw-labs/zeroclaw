@@ -149,6 +149,10 @@ pub struct Config {
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
+
+    /// ACP provenance — inject trace metadata into prompts for audit/lineage.
+    #[serde(default)]
+    pub provenance: ProvenanceConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -261,6 +265,12 @@ pub struct AgentConfig {
     pub parallel_tools: bool,
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Minimum word count for auto-saved user messages. Messages shorter than this
+    /// are skipped (not stored to memory). Prevents noise like "ok", "yes", test
+    /// probes, and heartbeat replies from polluting the memory store.
+    /// Default: 8. Set to 0 to disable filtering.
+    #[serde(default = "default_agent_min_auto_save_words")]
+    pub min_auto_save_words: usize,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -275,6 +285,10 @@ fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
 
+fn default_agent_min_auto_save_words() -> usize {
+    8
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -283,6 +297,7 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            min_auto_save_words: default_agent_min_auto_save_words(),
         }
     }
 }
@@ -820,12 +835,15 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
+    /// Search provider: "duckduckgo" (free, no API key), "brave" (requires API key), or "exa" (requires API key)
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
     /// Brave Search API key (required if provider is "brave")
     #[serde(default)]
     pub brave_api_key: Option<String>,
+    /// Exa Search API key (required if provider is "exa")
+    #[serde(default)]
+    pub exa_api_key: Option<String>,
     /// Maximum results per search (1-10)
     #[serde(default = "default_web_search_max_results")]
     pub max_results: usize,
@@ -852,6 +870,7 @@ impl Default for WebSearchConfig {
             enabled: true,
             provider: default_web_search_provider(),
             brave_api_key: None,
+            exa_api_key: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
         }
@@ -1946,6 +1965,11 @@ pub struct ClassificationRule {
 pub struct HeartbeatConfig {
     pub enabled: bool,
     pub interval_minutes: u32,
+    /// Override provider for heartbeat tasks (e.g. "lifebook" for local models).
+    /// When None, uses the default provider.
+    pub provider: Option<String>,
+    /// Override model for heartbeat tasks (e.g. "auto" for lifebook router).
+    pub model: Option<String>,
 }
 
 impl Default for HeartbeatConfig {
@@ -1953,6 +1977,42 @@ impl Default for HeartbeatConfig {
         Self {
             enabled: false,
             interval_minutes: 30,
+            provider: None,
+            model: None,
+        }
+    }
+}
+
+// ── ACP Provenance ───────────────────────────────────────────────
+
+/// Controls what provenance metadata is injected into agent prompts.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceMode {
+    /// No provenance injection.
+    Off,
+    /// Inject trace_id, origin, user, timestamp (no receipt hash).
+    Meta,
+    /// Inject trace_id, origin, user, timestamp + SHA-256 receipt hash of prompt+tools.
+    MetaReceipt,
+}
+
+impl Default for ProvenanceMode {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProvenanceConfig {
+    #[serde(default)]
+    pub mode: ProvenanceMode,
+}
+
+impl Default for ProvenanceConfig {
+    fn default() -> Self {
+        Self {
+            mode: ProvenanceMode::Off,
         }
     }
 }
@@ -2133,6 +2193,56 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// Local speech-to-text settings for inbound Telegram voice/audio messages.
+    #[serde(default)]
+    pub speech_to_text: TelegramSpeechToTextConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TelegramSpeechToTextConfig {
+    /// Enable local speech-to-text for inbound Telegram voice/audio messages.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional explicit path to whisper.cpp / whisper-cli binary.
+    #[serde(default)]
+    pub whisper_cpp_path: Option<String>,
+    /// Optional explicit path to ffmpeg binary for audio normalization.
+    #[serde(default)]
+    pub ffmpeg_path: Option<String>,
+    /// Optional explicit path to the ggml Whisper model file.
+    #[serde(default)]
+    pub whisper_model_path: Option<String>,
+    /// Whisper model family name used when model path is not explicitly set.
+    #[serde(default = "default_telegram_stt_model")]
+    pub whisper_model: String,
+    /// Optional language hint passed to whisper.cpp.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Reject files larger than this size before downloading/transcribing.
+    #[serde(default = "default_telegram_stt_max_file_size_mb")]
+    pub max_file_size_mb: usize,
+}
+
+fn default_telegram_stt_model() -> String {
+    "base".to_string()
+}
+
+fn default_telegram_stt_max_file_size_mb() -> usize {
+    32
+}
+
+impl Default for TelegramSpeechToTextConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            whisper_cpp_path: None,
+            ffmpeg_path: None,
+            whisper_model_path: None,
+            whisper_model: default_telegram_stt_model(),
+            language: None,
+            max_file_size_mb: default_telegram_stt_max_file_size_mb(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2589,6 +2699,7 @@ impl Default for Config {
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            provenance: ProvenanceConfig::default(),
             query_classification: QueryClassificationConfig::default(),
         }
     }
@@ -2902,6 +3013,12 @@ impl Config {
 
             decrypt_optional_secret(
                 &store,
+                &mut config.web_search.exa_api_key,
+                "config.web_search.exa_api_key",
+            )?;
+
+            decrypt_optional_secret(
+                &store,
                 &mut config.storage.provider.config.db_url,
                 "config.storage.provider.config.db_url",
             )?;
@@ -3131,6 +3248,16 @@ impl Config {
             }
         }
 
+        // Exa API key: ZEROCLAW_EXA_API_KEY or EXA_API_KEY
+        if let Ok(api_key) =
+            std::env::var("ZEROCLAW_EXA_API_KEY").or_else(|_| std::env::var("EXA_API_KEY"))
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.web_search.exa_api_key = Some(api_key.to_string());
+            }
+        }
+
         // Web search max results: ZEROCLAW_WEB_SEARCH_MAX_RESULTS or WEB_SEARCH_MAX_RESULTS
         if let Ok(max_results) = std::env::var("ZEROCLAW_WEB_SEARCH_MAX_RESULTS")
             .or_else(|_| std::env::var("WEB_SEARCH_MAX_RESULTS"))
@@ -3245,6 +3372,16 @@ impl Config {
         }
 
         set_runtime_proxy_config(self.proxy.clone());
+
+        // Telegram bot token: TELEGRAM_BOT_TOKEN
+        if let Ok(token) = std::env::var("TELEGRAM_BOT_TOKEN") {
+            let token = token.trim().to_string();
+            if !token.is_empty() {
+                if let Some(ref mut tg) = self.channels_config.telegram {
+                    tg.bot_token = token;
+                }
+            }
+        }
     }
 
     pub async fn save(&self) -> Result<()> {
@@ -3273,6 +3410,12 @@ impl Config {
             &store,
             &mut config_to_save.web_search.brave_api_key,
             "config.web_search.brave_api_key",
+        )?;
+
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.web_search.exa_api_key,
+            "config.web_search.exa_api_key",
         )?;
 
         encrypt_optional_secret(
@@ -3572,6 +3715,8 @@ default_temperature = 0.7
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
+                provider: None,
+                model: None,
             },
             cron: CronConfig::default(),
             channels_config: ChannelsConfig {
@@ -3583,6 +3728,7 @@ default_temperature = 0.7
                     draft_update_interval_ms: default_draft_update_interval_ms(),
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    speech_to_text: TelegramSpeechToTextConfig::default(),
                 }),
                 discord: None,
                 slack: None,
@@ -3617,6 +3763,7 @@ default_temperature = 0.7
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            provenance: ProvenanceConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -3772,6 +3919,7 @@ tool_dispatcher = "xml"
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            provenance: ProvenanceConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -3916,6 +4064,7 @@ tool_dispatcher = "xml"
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
             mention_only: false,
+            speech_to_text: TelegramSpeechToTextConfig::default(),
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();

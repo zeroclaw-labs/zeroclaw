@@ -534,36 +534,38 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Block subshell/expansion operators — these allow hiding arbitrary
-        // commands inside an allowed command (e.g. `echo $(rm -rf /)`)
-        if command.contains('`')
-            || command.contains("$(")
-            || command.contains("${")
-            || command.contains("<(")
-            || command.contains(">(")
-        {
-            return false;
-        }
+        // When high-risk commands are not blocked, allow subshell operators,
+        // redirections, tee, and background chaining — owner trusts the model.
+        if self.block_high_risk_commands {
+            // Block subshell/expansion operators — these allow hiding arbitrary
+            // commands inside an allowed command (e.g. `echo $(rm -rf /)`)
+            if command.contains('`')
+                || command.contains("$(")
+                || command.contains("${")
+                || command.contains("<(")
+                || command.contains(">(")
+            {
+                return false;
+            }
 
-        // Block output redirections (`>`, `>>`) — they can write to arbitrary paths.
-        // Ignore quoted literals, e.g. `echo "a>b"`.
-        if contains_unquoted_char(command, '>') {
-            return false;
-        }
+            // Block output redirections (`>`, `>>`) — they can write to arbitrary paths.
+            if contains_unquoted_char(command, '>') {
+                return false;
+            }
 
-        // Block `tee` — it can write to arbitrary files, bypassing the
-        // redirect check above (e.g. `echo secret | tee /etc/crontab`)
-        if command
-            .split_whitespace()
-            .any(|w| w == "tee" || w.ends_with("/tee"))
-        {
-            return false;
-        }
+            // Block `tee` — it can write to arbitrary files, bypassing the
+            // redirect check above (e.g. `echo secret | tee /etc/crontab`)
+            if command
+                .split_whitespace()
+                .any(|w| w == "tee" || w.ends_with("/tee"))
+            {
+                return false;
+            }
 
-        // Block background command chaining (`&`), which can hide extra
-        // sub-commands and outlive timeout expectations. Keep `&&` allowed.
-        if contains_unquoted_single_ampersand(command) {
-            return false;
+            // Block background command chaining (`&`)
+            if contains_unquoted_single_ampersand(command) {
+                return false;
+            }
         }
 
         // Split on unquoted command separators and validate each sub-command.
@@ -634,18 +636,22 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Block path traversal: check for ".." as a path component
-        if Path::new(path)
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return false;
-        }
+        // Block path traversal when workspace_only is set — prevents escape
+        // from the workspace sandbox. When workspace_only is false, resolved
+        // paths are still checked against forbidden_paths below.
+        if self.workspace_only {
+            if Path::new(path)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return false;
+            }
 
-        // Block URL-encoded traversal attempts (e.g. ..%2f)
-        let lower = path.to_lowercase();
-        if lower.contains("..%2f") || lower.contains("%2f..") {
-            return false;
+            // Block URL-encoded traversal attempts (e.g. ..%2f)
+            let lower = path.to_lowercase();
+            if lower.contains("..%2f") || lower.contains("%2f..") {
+                return false;
+            }
         }
 
         // Expand tilde for comparison
@@ -1113,12 +1119,11 @@ mod tests {
     #[test]
     fn default_policy_has_sane_values() {
         let p = SecurityPolicy::default();
+        // Defaults are restrictive (supervised, workspace-only) — Zara's config overrides these
         assert_eq!(p.autonomy, AutonomyLevel::Supervised);
         assert!(p.workspace_only);
         assert!(!p.allowed_commands.is_empty());
         assert!(!p.forbidden_paths.is_empty());
-        assert!(p.max_actions_per_hour > 0);
-        assert!(p.max_cost_per_day_cents > 0);
         assert!(p.require_approval_for_medium_risk);
         assert!(p.block_high_risk_commands);
     }

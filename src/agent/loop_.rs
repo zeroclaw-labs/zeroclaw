@@ -1,10 +1,11 @@
+use crate::agent::provenance;
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{
-    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
+    self, ChatMessage, ChatRequest, Provider, ToolCall,
 };
 use crate::runtime;
 use crate::security::SecurityPolicy;
@@ -590,6 +591,47 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
     calls
 }
 
+/// Parse the GLM/ZhipuAI XML-arg format emitted by z-ai/glm-* models:
+/// ```text
+/// <tool_call>tool_name<arg_key>param</arg_key><arg_value>value</arg_value></tool_call>
+/// ```
+/// Returns a `ParsedToolCall` when the tool name and at least one arg can be extracted.
+fn parse_xml_arg_style_tool_call(inner: &str) -> Option<ParsedToolCall> {
+    static ARG_PAIR_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"<arg_key>\s*([^<]+?)\s*</arg_key>\s*<arg_value>\s*([^<]*?)\s*</arg_value>",
+        )
+        .unwrap()
+    });
+
+    // Tool name is everything before the first XML tag.
+    let name_end = inner.find('<').unwrap_or(inner.len());
+    let name = inner[..name_end].trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+
+    let mut map = serde_json::Map::new();
+    for cap in ARG_PAIR_RE.captures_iter(inner) {
+        let key = cap[1].to_string();
+        let val = cap[2].to_string();
+        map.insert(key, serde_json::Value::String(val));
+    }
+
+    if map.is_empty() {
+        return None;
+    }
+
+    Some(ParsedToolCall {
+        name: name.to_string(),
+        arguments: serde_json::Value::Object(map),
+    })
+}
+
 /// Parse tool calls from an LLM response that uses XML-style function calling.
 ///
 /// Expected format (common with system-prompt-guided tool use):
@@ -649,7 +691,15 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             }
 
             if !parsed_any {
-                tracing::warn!("Malformed <tool_call> JSON: expected tool-call object in tag body");
+                // Fallback: try the GLM XML-arg format used by z-ai/glm-* models:
+                // TOOLNAME<arg_key>K</arg_key><arg_value>V</arg_value>
+                if let Some(call) = parse_xml_arg_style_tool_call(inner) {
+                    calls.push(call);
+                } else {
+                    tracing::warn!(
+                        "Malformed <tool_call> JSON: expected tool-call object in tag body"
+                    );
+                }
             }
 
             remaining = &after_open[close_idx + close_tag.len()..];
@@ -893,11 +943,58 @@ pub(crate) async fn run_tool_call_loop(
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<String> {
+    Ok(run_tool_call_loop_with_stats(
+        provider,
+        history,
+        tools_registry,
+        observer,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        approval,
+        channel_name,
+        multimodal_config,
+        max_tool_iterations,
+        cancellation_token,
+        on_delta,
+    ).await?.response)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ToolLoopOutcome {
+    pub response: String,
+    pub tool_call_count: u32,
+    pub tool_error_count: u32,
+    /// Per-turn model attribution for provenance.
+    pub model_turns: Vec<provenance::ModelTurn>,
+}
+
+pub(crate) async fn run_tool_call_loop_with_stats(
+    provider: &dyn Provider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    provider_name: &str,
+    model: &str,
+    temperature: f64,
+    silent: bool,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
+    multimodal_config: &crate::config::MultimodalConfig,
+    max_tool_iterations: usize,
+    cancellation_token: Option<CancellationToken>,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+) -> Result<ToolLoopOutcome> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
         max_tool_iterations
     };
+    let mut tool_call_count: u32 = 0;
+    let mut tool_error_count: u32 = 0;
+    let mut model_turns: Vec<provenance::ModelTurn> = Vec::new();
+    let mut turn_counter: u32 = 0;
 
     let tool_specs: Vec<crate::tools::ToolSpec> =
         tools_registry.iter().map(|tool| tool.spec()).collect();
@@ -913,14 +1010,24 @@ pub(crate) async fn run_tool_call_loop(
 
         let image_marker_count = multimodal::count_image_markers(history);
         if image_marker_count > 0 && !provider.supports_vision() {
-            return Err(ProviderCapabilityError {
-                provider: provider_name.to_string(),
-                capability: "vision".to_string(),
-                message: format!(
-                    "received {image_marker_count} image marker(s), but this provider does not support vision input"
-                ),
+            // Provider doesn't support vision — strip [IMAGE:...] markers from all
+            // user messages so the conversation can continue as text-only instead
+            // of hard-failing.  The image content is lost but Telegram/Discord
+            // conversations degrade gracefully rather than returning an error.
+            tracing::warn!(
+                "provider '{}' does not support vision; stripping {} image marker(s) from history",
+                provider_name, image_marker_count
+            );
+            for msg in history.iter_mut() {
+                if msg.role == "user" {
+                    let (cleaned, _) = multimodal::parse_image_markers(&msg.content);
+                    msg.content = if cleaned.is_empty() {
+                        "[Image received but not supported by current model]".to_string()
+                    } else {
+                        cleaned
+                    };
+                }
             }
-            .into());
         }
 
         let prepared_messages =
@@ -1045,8 +1152,33 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(display_text);
+            turn_counter += 1;
+            model_turns.push(provenance::ModelTurn::new(
+                turn_counter,
+                provider_name,
+                model,
+                provenance::TurnAction::Inference,
+                0,
+                Some(&display_text),
+            ));
+            return Ok(ToolLoopOutcome {
+                response: display_text,
+                tool_call_count,
+                tool_error_count,
+                model_turns,
+            });
         }
+
+        tool_call_count += tool_calls.len() as u32;
+        turn_counter += 1;
+        model_turns.push(provenance::ModelTurn::new(
+            turn_counter,
+            provider_name,
+            model,
+            provenance::TurnAction::ToolDispatch,
+            tool_calls.len() as u32,
+            Some(&response_text),
+        ));
 
         // Print any text the LLM produced alongside tool calls (unless silent)
         if !silent && !display_text.is_empty() {
@@ -1079,6 +1211,7 @@ pub(crate) async fn run_tool_call_loop(
 
                     if decision == ApprovalResponse::No {
                         let denied = "Denied by user.".to_string();
+                        tool_error_count += 1;
                         individual_results.push(denied.clone());
                         let _ = writeln!(
                             tool_results,
@@ -1115,10 +1248,12 @@ pub(crate) async fn run_tool_call_loop(
                         if r.success {
                             scrub_credentials(&r.output)
                         } else {
+                            tool_error_count += 1;
                             format!("Error: {}", r.error.unwrap_or_else(|| r.output))
                         }
                     }
                     Err(e) => {
+                        tool_error_count += 1;
                         observer.record_event(&ObserverEvent::ToolCall {
                             tool: call.name.clone(),
                             duration: start.elapsed(),
@@ -1128,6 +1263,7 @@ pub(crate) async fn run_tool_call_loop(
                     }
                 }
             } else {
+                tool_error_count += 1;
                 format!("Unknown tool: {}", call.name)
             };
 
@@ -1248,6 +1384,7 @@ pub async fn run(
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        None,
     );
 
     let peripheral_tools: Vec<Box<dyn Tool>> =
@@ -1267,6 +1404,14 @@ pub async fn run(
         .as_deref()
         .or(config.default_model.as_deref())
         .unwrap_or("anthropic/claude-sonnet-4");
+
+    if providers::provider_runtime_profile(provider_name)
+        .is_some_and(|profile| !profile.agentic_tool_loop)
+    {
+        anyhow::bail!(
+            "provider '{provider_name}' is not compatible with Zeroclaw's tool-using agent loop"
+        );
+    }
 
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -1433,6 +1578,24 @@ pub async fn run(
     // Append structured tool-use instructions with schemas
     system_prompt.push_str(&build_tool_instructions(&tools_registry));
 
+    // ── ACP Provenance ───────────────────────────────────────────
+    let tool_names: Vec<&str> = tools_registry.iter().map(|t| t.name()).collect();
+    let mut prov = provenance::build_provenance(
+        &config.provenance.mode,
+        "cli",
+        "zeroclaw",
+    );
+    {
+        let prompt_snapshot = system_prompt.clone();
+        provenance::inject_provenance(
+            &mut system_prompt,
+            &mut prov,
+            &config.provenance.mode,
+            &prompt_snapshot,
+            &tool_names,
+        );
+    }
+
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = ApprovalManager::from_config(&config.autonomy);
 
@@ -1442,12 +1605,23 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
-        // Auto-save user message to memory
+        // Auto-save user message to memory — skip system-generated heartbeat
+        // prompts and short noise (same threshold as agent.rs).
         if config.memory.auto_save {
-            let user_key = autosave_memory_key("user_msg");
-            let _ = mem
-                .store(&user_key, &msg, MemoryCategory::Conversation, None)
-                .await;
+            let min_words = config.agent.min_auto_save_words;
+            let word_count = msg.split_whitespace().count();
+            let is_system_prompt = msg.starts_with("[Heartbeat Task]");
+            if !is_system_prompt && (min_words == 0 || word_count >= min_words) {
+                let user_key = autosave_memory_key("user_msg");
+                let source = if is_system_prompt {
+                    "source:heartbeat:user"
+                } else {
+                    "source:cli:user"
+                };
+                let _ = mem
+                    .store(&user_key, &msg, MemoryCategory::Conversation, Some(source))
+                    .await;
+            }
         }
 
         // Inject memory + hardware RAG context into user message
@@ -1470,7 +1644,7 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
-        let response = run_tool_call_loop(
+        let outcome = run_tool_call_loop_with_stats(
             provider.as_ref(),
             &mut history,
             &tools_registry,
@@ -1487,8 +1661,36 @@ pub async fn run(
             None,
         )
         .await?;
+        if let Some(ref mut p) = prov {
+            p.add_turns(outcome.model_turns);
+        }
+        let response = outcome.response;
         final_output = response.clone();
         println!("{response}");
+
+        // Save assistant response to memory (mirrors agent.rs behavior)
+        if config.memory.auto_save {
+            let trimmed = response.trim();
+            let source = if msg.starts_with("[Heartbeat Task]") {
+                "source:heartbeat:assistant"
+            } else {
+                "source:cli:assistant"
+            };
+            let is_noise = trimmed == "HEARTBEAT_OK"
+                || trimmed.split_whitespace().count() < 10;
+            if !trimmed.is_empty() && !is_noise {
+                let _ = mem
+                    .store(
+                        "assistant_msg",
+                        &response,
+                        MemoryCategory::Conversation,
+                        Some(source),
+                    )
+                    .await;
+                let _ = mem.send_feedback(0.85).await;
+            }
+        }
+
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
@@ -1564,12 +1766,21 @@ pub async fn run(
                 _ => {}
             }
 
-            // Auto-save conversation turns
+            // Auto-save conversation turns (with word count threshold)
             if config.memory.auto_save {
-                let user_key = autosave_memory_key("user_msg");
-                let _ = mem
-                    .store(&user_key, &user_input, MemoryCategory::Conversation, None)
-                    .await;
+                let min_words = config.agent.min_auto_save_words;
+                let word_count = user_input.split_whitespace().count();
+                if min_words == 0 || word_count >= min_words {
+                    let user_key = autosave_memory_key("user_msg");
+                    let _ = mem
+                        .store(
+                            &user_key,
+                            &user_input,
+                            MemoryCategory::Conversation,
+                            Some("source:cli:user"),
+                        )
+                        .await;
+                }
             }
 
             // Inject memory + hardware RAG context into user message
@@ -1589,7 +1800,7 @@ pub async fn run(
 
             history.push(ChatMessage::user(&enriched));
 
-            let response = match run_tool_call_loop(
+            let response = match run_tool_call_loop_with_stats(
                 provider.as_ref(),
                 &mut history,
                 &tools_registry,
@@ -1607,7 +1818,12 @@ pub async fn run(
             )
             .await
             {
-                Ok(resp) => resp,
+                Ok(outcome) => {
+                    if let Some(ref mut p) = prov {
+                        p.add_turns(outcome.model_turns);
+                    }
+                    outcome.response
+                }
                 Err(e) => {
                     eprintln!("\nError: {e}\n");
                     continue;
@@ -1622,6 +1838,25 @@ pub async fn run(
             {
                 eprintln!("\nError sending CLI response: {e}\n");
             }
+
+            // Save assistant response to memory (mirrors agent.rs behavior)
+            if config.memory.auto_save {
+                let trimmed = response.trim();
+                let is_noise = trimmed == "HEARTBEAT_OK"
+                    || trimmed.split_whitespace().count() < 10;
+                if !trimmed.is_empty() && !is_noise {
+                    let _ = mem
+                        .store(
+                            "assistant_msg",
+                            &response,
+                            MemoryCategory::Conversation,
+                            Some("source:cli:assistant"),
+                        )
+                        .await;
+                    let _ = mem.send_feedback(0.85).await;
+                }
+            }
+
             observer.record_event(&ObserverEvent::TurnComplete);
 
             // Auto-compaction before hard trimming to preserve long-context signal.
@@ -1641,6 +1876,19 @@ pub async fn run(
             // Hard cap as a safety net.
             trim_history(&mut history, config.agent.max_history_messages);
         }
+    }
+
+    // ── Persist provenance record ────────────────────────────────
+    if let Some(ref prov_record) = prov {
+        let prov_key = format!("prov:{}", prov_record.trace_id);
+        let _ = mem
+            .store(
+                &prov_key,
+                &prov_record.to_json().to_string(),
+                MemoryCategory::Custom("provenance".to_string()),
+                Some("source:provenance"),
+            )
+            .await;
     }
 
     let duration = start.elapsed();
@@ -1694,6 +1942,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        None,
     );
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;

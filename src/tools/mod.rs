@@ -8,6 +8,8 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+pub mod feedback_audit_report;
+pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
@@ -16,6 +18,7 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod learning_report;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
@@ -25,6 +28,7 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
+pub mod skill_read;
 pub mod traits;
 pub mod web_search_tool;
 
@@ -38,6 +42,8 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
+pub use feedback_audit_report::FeedbackAuditReportTool;
+pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
@@ -46,6 +52,7 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+pub use learning_report::LearningReportTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
@@ -56,6 +63,7 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
+pub use skill_read::SkillReadTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
@@ -67,6 +75,12 @@ use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Brain handle for embedded learning tools (feature-gated).
+#[cfg(feature = "embedded-brain")]
+pub type LearningBrainHandle = Arc<tokio::sync::Mutex<crate::brain::LearningBrain>>;
+#[cfg(not(feature = "embedded-brain"))]
+pub type LearningBrainHandle = ();
 
 /// Create the default tool registry
 pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
@@ -81,7 +95,8 @@ pub fn default_tools_with_runtime(
     vec![
         Box::new(ShellTool::new(security.clone(), runtime)),
         Box::new(FileReadTool::new(security.clone())),
-        Box::new(FileWriteTool::new(security)),
+        Box::new(FileWriteTool::new(security.clone())),
+        Box::new(FileEditTool::new(security)),
     ]
 }
 
@@ -99,6 +114,7 @@ pub fn all_tools(
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
+    learning_brain: Option<LearningBrainHandle>,
 ) -> Vec<Box<dyn Tool>> {
     all_tools_with_runtime(
         config,
@@ -113,6 +129,7 @@ pub fn all_tools(
         agents,
         fallback_api_key,
         root_config,
+        learning_brain,
     )
 }
 
@@ -131,11 +148,13 @@ pub fn all_tools_with_runtime(
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
+    learning_brain: Option<LearningBrainHandle>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(ShellTool::new(security.clone(), runtime)),
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security.clone())),
+        Box::new(FileEditTool::new(security.clone())),
         Box::new(CronAddTool::new(config.clone(), security.clone())),
         Box::new(CronListTool::new(config.clone())),
         Box::new(CronRemoveTool::new(config.clone())),
@@ -144,18 +163,31 @@ pub fn all_tools_with_runtime(
         Box::new(CronRunsTool::new(config.clone())),
         Box::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Box::new(MemoryRecallTool::new(memory.clone())),
-        Box::new(MemoryForgetTool::new(memory, security.clone())),
-        Box::new(ScheduleTool::new(security.clone(), root_config.clone())),
-        Box::new(ProxyConfigTool::new(config.clone(), security.clone())),
-        Box::new(GitOperationsTool::new(
-            security.clone(),
-            workspace_dir.to_path_buf(),
-        )),
-        Box::new(PushoverTool::new(
-            security.clone(),
-            workspace_dir.to_path_buf(),
-        )),
+        Box::new(FeedbackAuditReportTool::new(memory.clone())),
     ];
+
+    // LearningReportTool: uses embedded brain if available, otherwise HTTP
+    #[cfg(feature = "embedded-brain")]
+    if let Some(brain) = learning_brain {
+        tools.push(Box::new(LearningReportTool::new(brain)));
+    }
+    #[cfg(not(feature = "embedded-brain"))]
+    {
+        let _ = learning_brain; // suppress unused warning
+        tools.push(Box::new(LearningReportTool::new()));
+    }
+
+    tools.push(Box::new(MemoryForgetTool::new(memory.clone(), security.clone())));
+    tools.push(Box::new(ScheduleTool::new(security.clone(), root_config.clone())));
+    tools.push(Box::new(ProxyConfigTool::new(config.clone(), security.clone())));
+    tools.push(Box::new(GitOperationsTool::new(
+        security.clone(),
+        workspace_dir.to_path_buf(),
+    )));
+    tools.push(Box::new(PushoverTool::new(
+        security.clone(),
+        workspace_dir.to_path_buf(),
+    )));
 
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
@@ -198,6 +230,7 @@ pub fn all_tools_with_runtime(
         tools.push(Box::new(WebSearchTool::new(
             root_config.web_search.provider.clone(),
             root_config.web_search.brave_api_key.clone(),
+            root_config.web_search.exa_api_key.clone(),
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
         )));
@@ -206,6 +239,9 @@ pub fn all_tools_with_runtime(
     // Vision tools are always available
     tools.push(Box::new(ScreenshotTool::new(security.clone())));
     tools.push(Box::new(ImageInfoTool::new(security.clone())));
+
+    // On-demand skill reader
+    tools.push(Box::new(SkillReadTool::new(workspace_dir.to_path_buf())));
 
     if let Some(key) = composio_key {
         if !key.is_empty() {
@@ -231,6 +267,7 @@ pub fn all_tools_with_runtime(
             delegate_agents,
             delegate_fallback_credential,
             security.clone(),
+            memory.clone(),
             crate::providers::ProviderRuntimeOptions {
                 auth_profile_override: None,
                 zeroclaw_dir: root_config
@@ -299,6 +336,7 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
@@ -339,6 +377,7 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
@@ -480,6 +519,7 @@ mod tests {
             &agents,
             Some("delegate-test-credential"),
             &cfg,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
@@ -512,6 +552,7 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));

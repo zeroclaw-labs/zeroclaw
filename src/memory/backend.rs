@@ -5,6 +5,12 @@ pub enum MemoryBackendKind {
     Postgres,
     Markdown,
     None,
+    /// RuVector Format cognitive vector memory (Zara)
+    Rvf,
+    /// lifebook-agent: ONNX embeddings + knowledge graph + SONA + 4-tier routing
+    Lifebook,
+    /// Embedded brain: full lifebook engine compiled into zeroclaw (no HTTP)
+    Embedded,
     Unknown,
 }
 
@@ -55,6 +61,33 @@ const POSTGRES_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     optional_dependency: false,
 };
 
+const RVF_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
+    key: "rvf",
+    label: "RVF (RuVector Format) — cognitive vector memory for Zara agent",
+    auto_save_default: true,
+    uses_sqlite_hygiene: false,
+    sqlite_based: false,
+    optional_dependency: true,
+};
+
+const LIFEBOOK_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
+    key: "lifebook",
+    label: "Lifebook-agent — ONNX semantic memory + knowledge graph + SONA + 4-tier LLM routing",
+    auto_save_default: true,
+    uses_sqlite_hygiene: false,
+    sqlite_based: false,
+    optional_dependency: false,
+};
+
+const EMBEDDED_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
+    key: "embedded",
+    label: "Embedded brain — full cognitive engine in-process (RVF + SONA + KG + HDC)",
+    auto_save_default: true,
+    uses_sqlite_hygiene: false,
+    sqlite_based: false,
+    optional_dependency: true,
+};
+
 const NONE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "none",
     label: "None — disable persistent memory",
@@ -95,6 +128,9 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
         "postgres" => MemoryBackendKind::Postgres,
         "markdown" => MemoryBackendKind::Markdown,
         "none" => MemoryBackendKind::None,
+        "rvf" => MemoryBackendKind::Rvf,
+        "lifebook" => MemoryBackendKind::Lifebook,
+        "embedded" => MemoryBackendKind::Embedded,
         _ => MemoryBackendKind::Unknown,
     }
 }
@@ -106,6 +142,9 @@ pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
         MemoryBackendKind::Postgres => POSTGRES_PROFILE,
         MemoryBackendKind::Markdown => MARKDOWN_PROFILE,
         MemoryBackendKind::None => NONE_PROFILE,
+        MemoryBackendKind::Rvf => RVF_PROFILE,
+        MemoryBackendKind::Lifebook => LIFEBOOK_PROFILE,
+        MemoryBackendKind::Embedded => EMBEDDED_PROFILE,
         MemoryBackendKind::Unknown => CUSTOM_PROFILE,
     }
 }
@@ -127,6 +166,7 @@ mod tests {
             MemoryBackendKind::Markdown
         );
         assert_eq!(classify_memory_backend("none"), MemoryBackendKind::None);
+        assert_eq!(classify_memory_backend("rvf"), MemoryBackendKind::Rvf);
     }
 
     #[test]
@@ -158,5 +198,15 @@ mod tests {
         assert_eq!(profile.key, "custom");
         assert!(profile.auto_save_default);
         assert!(!profile.uses_sqlite_hygiene);
+    }
+
+    #[test]
+    fn rvf_profile_is_optional_vector_backend() {
+        let profile = memory_backend_profile("rvf");
+        assert_eq!(profile.key, "rvf");
+        assert!(!profile.sqlite_based);
+        assert!(!profile.uses_sqlite_hygiene);
+        assert!(profile.optional_dependency);
+        assert!(profile.auto_save_default);
     }
 }

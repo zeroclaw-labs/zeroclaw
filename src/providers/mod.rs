@@ -1277,6 +1277,113 @@ pub struct ProviderInfo {
     pub local: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderModelDiscovery {
+    Live,
+    Manual,
+    None,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderRuntimeProfile {
+    pub local: bool,
+    pub agentic_tool_loop: bool,
+    pub native_tool_calling: bool,
+    pub vision: bool,
+    pub model_discovery: ProviderModelDiscovery,
+    pub manual_models: &'static [&'static str],
+}
+
+const COPILOT_MANUAL_MODELS: &[&str] = &[
+    // GPT-5 family
+    "gpt-5.4",
+    "gpt-5.2",
+    "gpt-5.1",
+    "gpt-5-mini",
+    // GPT-4 family
+    "gpt-4.1",
+    "gpt-4o",
+    "gpt-4o-mini",
+    // Claude family
+    "claude-opus-4.6",
+    "claude-opus-4.6-fast",
+    "claude-opus-4.5",
+    "claude-sonnet-4.6",
+    "claude-sonnet-4.5",
+    "claude-sonnet-4",
+    "claude-haiku-4.5",
+    // Gemini family
+    "gemini-3.1-pro-preview",
+    "gemini-3-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    // Other
+    "grok-code-fast-1",
+];
+
+pub fn provider_runtime_profile(name: &str) -> Option<ProviderRuntimeProfile> {
+    let provider = list_providers().into_iter().find(|provider| {
+        provider.name.eq_ignore_ascii_case(name)
+            || provider
+                .aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(name))
+    })?;
+
+    let profile = match provider.name {
+        "copilot" => ProviderRuntimeProfile {
+            local: false,
+            agentic_tool_loop: true,
+            native_tool_calling: true,
+            vision: true,
+            model_discovery: ProviderModelDiscovery::Manual,
+            manual_models: COPILOT_MANUAL_MODELS,
+        },
+        "ollama" => ProviderRuntimeProfile {
+            local: true,
+            agentic_tool_loop: true,
+            native_tool_calling: true,
+            vision: true,
+            model_discovery: ProviderModelDiscovery::Live,
+            manual_models: &[],
+        },
+        "lmstudio" => ProviderRuntimeProfile {
+            local: true,
+            agentic_tool_loop: true,
+            native_tool_calling: true,
+            vision: true,
+            model_discovery: ProviderModelDiscovery::None,
+            manual_models: &[],
+        },
+        "openrouter" | "openai" | "openai-codex" | "anthropic" | "gemini" | "xai"
+        | "together" | "venice" | "nvidia" | "cloudflare" | "vercel" | "mistral"
+        | "deepseek" | "groq" | "qwen" | "bedrock" | "cohere" | "perplexity"
+        | "fireworks" | "moonshot" | "kimi-code" | "zai" | "glm" | "minimax"
+        | "qianfan" | "synthetic" | "opencode" | "ovhcloud" => ProviderRuntimeProfile {
+            local: provider.local,
+            agentic_tool_loop: true,
+            native_tool_calling: true,
+            vision: false,
+            model_discovery: match provider.name {
+                "openrouter" | "openai" | "anthropic" | "gemini" | "xai" | "together"
+                | "venice" | "nvidia" => ProviderModelDiscovery::Live,
+                _ => ProviderModelDiscovery::None,
+            },
+            manual_models: &[],
+        },
+        _ => ProviderRuntimeProfile {
+            local: provider.local,
+            agentic_tool_loop: true,
+            native_tool_calling: false,
+            vision: false,
+            model_discovery: ProviderModelDiscovery::None,
+            manual_models: &[],
+        },
+    };
+
+    Some(profile)
+}
+
 /// Return the list of all known providers for display in `zeroclaw providers list`.
 ///
 /// This is intentionally separate from the factory match in `create_provider`
@@ -1514,6 +1621,21 @@ mod tests {
             Self { key, original }
         }
     }
+
+    #[test]
+    fn copilot_runtime_profile_exposes_manual_catalog() {
+        let profile = provider_runtime_profile("copilot").expect("copilot profile");
+        assert!(profile.agentic_tool_loop);
+        assert!(profile.native_tool_calling);
+        assert!(profile.vision);
+        assert_eq!(profile.model_discovery, ProviderModelDiscovery::Manual);
+        assert!(profile.manual_models.contains(&"gpt-5.4"));
+        assert!(profile.manual_models.contains(&"claude-opus-4.6"));
+        assert!(profile.manual_models.contains(&"gpt-5-mini"));
+        assert!(profile.manual_models.contains(&"gemini-3.1-pro-preview"));
+        assert!(profile.manual_models.contains(&"grok-code-fast-1"));
+    }
+
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {

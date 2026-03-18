@@ -8,15 +8,28 @@ use crate::cron::{
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use futures_util::{stream, StreamExt};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::process::Stdio;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::{LazyLock, Mutex};
 use tokio::process::Command;
 use tokio::time::{self, Duration};
 
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
+const PROACTIVE_TZ: &str = "Europe/Helsinki";
+const PROACTIVE_MORNING_HOUR: u32 = 9;
+const PROACTIVE_EVENING_HOUR: u32 = 20;
+const PROACTIVE_DEDUP_COOLDOWN_SECS: i64 = 6 * 60 * 60;
+
+static DELIVERY_DEDUP_CACHE: LazyLock<Mutex<HashMap<String, DateTime<Utc>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static PROACTIVE_WINDOW_CACHE: LazyLock<Mutex<HashMap<String, DateTime<Utc>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub async fn run(config: Config) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
@@ -40,6 +53,10 @@ pub async fn run(config: Config) -> Result<()> {
             }
         };
 
+        // Refresh heartbeat on every tick so doctor doesn't flag it as stale
+        // when there are no due jobs.
+        crate::health::mark_component_ok("scheduler");
+
         process_due_jobs(&config, &security, jobs).await;
     }
 }
@@ -54,6 +71,22 @@ async fn execute_job_with_retry(
     security: &SecurityPolicy,
     job: &CronJob,
 ) -> (bool, String) {
+    if should_suppress_for_same_window(job) {
+        return (
+            true,
+            "suppressed duplicate proactive reminder for current window".to_string(),
+        );
+    }
+
+    if matches!(job.job_type, JobType::Agent)
+        && should_suppress_for_proactive_window(job).unwrap_or(false)
+    {
+        return (
+            true,
+            "suppressed proactive reminder outside 09:00/20:00 Helsinki windows".to_string(),
+        );
+    }
+
     let mut last_output = String::new();
     let retries = config.reliability.scheduler_retries;
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
@@ -118,7 +151,14 @@ async fn execute_and_persist_job(
 
 async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String) {
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
-    let prompt = job.prompt.clone().unwrap_or_default();
+    let mut prompt = job.prompt.clone().unwrap_or_default();
+
+    if is_proactive_reminder_job(job) {
+        prompt.push_str(
+            "\n\nPolicy: This is an autonomous proactive reminder. Keep it concise and respond in English only.",
+        );
+    }
+
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
@@ -243,6 +283,14 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         return Ok(());
     }
 
+    if should_suppress_for_proactive_window(job)? {
+        tracing::info!(
+            job_id = %job.id,
+            "Suppressing proactive reminder outside configured 09:00/20:00 Helsinki windows"
+        );
+        return Ok(());
+    }
+
     let channel = delivery
         .channel
         .as_deref()
@@ -251,6 +299,11 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         .to
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
+
+    if should_suppress_duplicate_delivery(channel, target, output) {
+        tracing::info!(job_id = %job.id, channel, target, "Suppressing near-duplicate cron delivery");
+        return Ok(());
+    }
 
     match channel.to_ascii_lowercase().as_str() {
         "telegram" => {
@@ -263,7 +316,8 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 tg.bot_token.clone(),
                 tg.allowed_users.clone(),
                 tg.mention_only,
-            );
+            )
+            .with_speech_to_text(tg.speech_to_text.clone());
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "discord" => {
@@ -314,6 +368,151 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
     }
 
     Ok(())
+}
+
+fn is_proactive_reminder_job(job: &CronJob) -> bool {
+    if !matches!(job.job_type, JobType::Agent) {
+        return false;
+    }
+    if !job.delivery.mode.eq_ignore_ascii_case("announce") {
+        return false;
+    }
+    if matches!(job.schedule, Schedule::At { .. }) {
+        // One-shot reminders are usually explicit user requests.
+        return false;
+    }
+
+    let text = format!(
+        "{} {}",
+        job.name.clone().unwrap_or_default(),
+        job.prompt.clone().unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+
+    [
+        "standup",
+        "focus",
+        "pulse",
+        "nudge",
+        "pomodoro",
+        "daily",
+        "idea",
+        "remind",
+        "calendar",
+        "task",
+        "heartbeat",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn should_suppress_for_proactive_window(job: &CronJob) -> Result<bool> {
+    if !is_proactive_reminder_job(job) {
+        return Ok(false);
+    }
+
+    let tz = proactive_timezone()?;
+    let now_local = Utc::now().with_timezone(&tz);
+    let hour = now_local.hour();
+    Ok(hour != PROACTIVE_MORNING_HOUR && hour != PROACTIVE_EVENING_HOUR)
+}
+
+fn proactive_timezone() -> Result<chrono_tz::Tz> {
+    chrono_tz::Tz::from_str(PROACTIVE_TZ)
+        .map_err(|e| anyhow::anyhow!("invalid proactive timezone '{}': {e}", PROACTIVE_TZ))
+}
+
+fn should_suppress_for_same_window(job: &CronJob) -> bool {
+    if !is_proactive_reminder_job(job) {
+        return false;
+    }
+
+    let delivery = &job.delivery;
+    if !delivery.mode.eq_ignore_ascii_case("announce") {
+        return false;
+    }
+
+    let channel = match delivery.channel.as_deref() {
+        Some(value) if !value.is_empty() => value.to_ascii_lowercase(),
+        _ => return false,
+    };
+    let target = match delivery.to.as_deref() {
+        Some(value) if !value.is_empty() => value,
+        _ => return false,
+    };
+
+    let tz = match proactive_timezone() {
+        Ok(tz) => tz,
+        Err(_) => return false,
+    };
+    let now_utc = Utc::now();
+    let now_local = now_utc.with_timezone(&tz);
+    let hour = now_local.hour();
+    if hour != PROACTIVE_MORNING_HOUR && hour != PROACTIVE_EVENING_HOUR {
+        return false;
+    }
+
+    let slot = format!(
+        "{}:{}:{}-{:02}-{:02}:{:02}",
+        channel,
+        target,
+        now_local.year(),
+        now_local.month(),
+        now_local.day(),
+        hour
+    );
+
+    let mut cache = match PROACTIVE_WINDOW_CACHE.lock() {
+        Ok(guard) => guard,
+        Err(_) => return false,
+    };
+    cache.retain(|_, seen_at| (now_utc - *seen_at).num_hours() <= 26);
+
+    if cache.contains_key(&slot) {
+        return true;
+    }
+    cache.insert(slot, now_utc);
+    false
+}
+
+fn should_suppress_duplicate_delivery(channel: &str, target: &str, output: &str) -> bool {
+    let normalized = normalize_delivery_text(output);
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    channel.to_ascii_lowercase().hash(&mut hasher);
+    target.hash(&mut hasher);
+    normalized.hash(&mut hasher);
+    let key = format!("{:x}", hasher.finish());
+
+    let now = Utc::now();
+    let mut cache = match DELIVERY_DEDUP_CACHE.lock() {
+        Ok(guard) => guard,
+        Err(_) => return false,
+    };
+
+    cache.retain(|_, seen_at| (now - *seen_at).num_seconds() <= PROACTIVE_DEDUP_COOLDOWN_SECS);
+
+    if let Some(seen_at) = cache.get(&key) {
+        if (now - *seen_at).num_seconds() < PROACTIVE_DEDUP_COOLDOWN_SECS {
+            return true;
+        }
+    }
+
+    cache.insert(key, now);
+    false
+}
+
+fn normalize_delivery_text(output: &str) -> String {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn is_env_assignment(word: &str) -> bool {

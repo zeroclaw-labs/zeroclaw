@@ -10,9 +10,10 @@ pub use schema::{
     HardwareConfig, HardwareTransport, HeartbeatConfig, HttpRequestConfig, IMessageConfig,
     IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig, ModelRouteConfig, MultimodalConfig,
     ObservabilityConfig, PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope,
-    QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig,
+    ProvenanceConfig, ProvenanceMode, QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig,
     SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig, SlackConfig,
     StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode, TelegramConfig,
+    TelegramSpeechToTextConfig,
     TunnelConfig, WebSearchConfig, WebhookConfig,
 };
 
@@ -38,6 +39,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            speech_to_text: TelegramSpeechToTextConfig::default(),
         };
 
         let discord = DiscordConfig {

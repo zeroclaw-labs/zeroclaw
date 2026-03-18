@@ -11,9 +11,15 @@ const SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Environment variables safe to pass to shell commands.
-/// Only functional variables are included — never API keys or secrets.
+/// Functional system variables plus explicitly allow-listed service keys.
+/// Keep this list minimal — only add keys that skills actively require.
 const SAFE_ENV_VARS: &[&str] = &[
+    // System / shell essentials
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+    // fal.ai — generation API (regular) and admin API keys.
+    // Both need to be passed so skill scripts can set FAL_KEY=$FAL_ADMIN_KEY
+    // when calling billing/usage endpoints that require admin privileges.
+    "FAL_KEY", "FAL_ADMIN_KEY",
 ];
 
 /// Shell command execution tool with sandboxing
@@ -386,11 +392,18 @@ mod tests {
 
     #[test]
     fn shell_safe_env_vars_excludes_secrets() {
+        // Explicitly allow-listed service keys that skills need at runtime.
+        // Any new entry here requires a code-review justification comment in SAFE_ENV_VARS.
+        const ALLOW_LISTED: &[&str] = &["FAL_KEY", "FAL_ADMIN_KEY"];
+
         for var in SAFE_ENV_VARS {
+            if ALLOW_LISTED.contains(var) {
+                continue; // intentionally allow-listed — see SAFE_ENV_VARS comment
+            }
             let lower = var.to_lowercase();
             assert!(
                 !lower.contains("key") && !lower.contains("secret") && !lower.contains("token"),
-                "SAFE_ENV_VARS must not include sensitive variable: {var}"
+                "SAFE_ENV_VARS must not include sensitive variable without allow-listing it: {var}"
             );
         }
     }

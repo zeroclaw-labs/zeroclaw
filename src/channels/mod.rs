@@ -40,7 +40,8 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
+use crate::agent::classifier;
+use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop_with_stats, ToolLoopOutcome};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -81,9 +82,11 @@ const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
-const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
+const TELEGRAM_FEEDBACK_CONTROL_PREFIX: &str = "[[telegram-feedback:";
+const MEMORY_CONTEXT_MAX_ENTRIES: usize = 10;
 const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
-const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
+const MEMORY_CONTEXT_MAX_CHARS: usize = 8_000;
+const MEMORY_CONTEXT_BACKGROUND_ENTRIES: usize = 6;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
 
@@ -102,10 +105,17 @@ struct ChannelRouteSelection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChannelRuntimeCommand {
+    ShowHelp,
+    ShowStatus,
     ShowProviders,
     SetProvider(String),
     ShowModel,
     SetModel(String),
+    ActivateCopilot(Option<String>),
+    ShowCopilotModels,
+    ResetDefaultRoute,
+    ClearHistory,
+    CompactHistory,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -144,6 +154,17 @@ struct ChannelRuntimeContext {
     message_timeout_secs: u64,
     interrupt_on_new_message: bool,
     multimodal: crate::config::MultimodalConfig,
+    classification_config: crate::config::QueryClassificationConfig,
+    available_hints: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ChannelFeedbackAction {
+    quality: f32,
+    acknowledgement: Option<&'static str>,
+    kind: &'static str,
+    target_message_id: Option<String>,
+    source: &'static str,
 }
 
 #[derive(Clone)]
@@ -256,7 +277,18 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         .to_ascii_lowercase();
 
     match base_command.as_str() {
+        "/help" => Some(ChannelRuntimeCommand::ShowHelp),
+        "/status" => Some(ChannelRuntimeCommand::ShowStatus),
         "/models" => {
+            if let Some(provider) = parts.next() {
+                Some(ChannelRuntimeCommand::SetProvider(
+                    provider.trim().to_string(),
+                ))
+            } else {
+                Some(ChannelRuntimeCommand::ShowProviders)
+            }
+        }
+        "/provider" => {
             if let Some(provider) = parts.next() {
                 Some(ChannelRuntimeCommand::SetProvider(
                     provider.trim().to_string(),
@@ -273,8 +305,123 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::SetModel(model))
             }
         }
+        "/copilot" | "/frontier" => {
+            let model = parts.collect::<Vec<_>>().join(" ").trim().to_string();
+            if model.is_empty() {
+                Some(ChannelRuntimeCommand::ActivateCopilot(None))
+            } else if model.eq_ignore_ascii_case("models") || model.eq_ignore_ascii_case("list") {
+                Some(ChannelRuntimeCommand::ShowCopilotModels)
+            } else {
+                Some(ChannelRuntimeCommand::ActivateCopilot(Some(model)))
+            }
+        }
+        "/zara" | "/default" => Some(ChannelRuntimeCommand::ResetDefaultRoute),
+        "/clear" => Some(ChannelRuntimeCommand::ClearHistory),
+        "/compact" => Some(ChannelRuntimeCommand::CompactHistory),
         _ => None,
     }
+}
+
+fn parse_channel_feedback_action(msg: &traits::ChannelMessage) -> Option<ChannelFeedbackAction> {
+    if msg.channel != "telegram" {
+        return None;
+    }
+
+    let trimmed = msg.content.trim();
+    let payload = trimmed
+        .strip_prefix(TELEGRAM_FEEDBACK_CONTROL_PREFIX)?
+        .strip_suffix("]]"
+        )?;
+    let mut parts = payload.split(':');
+    let kind = parts.next()?;
+    let target_message_id = parts.next()?.to_string();
+    let source = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    match kind {
+        "positive" => Some(ChannelFeedbackAction {
+            quality: 0.95,
+            acknowledgement: if source == "reply" {
+                Some("Logged. That answer helped.")
+            } else {
+                None
+            },
+            kind: "positive",
+            target_message_id: Some(target_message_id),
+            source: if source == "reaction" { "reaction" } else { "reply" },
+        }),
+        "negative" => Some(ChannelFeedbackAction {
+            quality: 0.15,
+            acknowledgement: if source == "reply" {
+                Some("Logged. That one missed. I'll steer differently.")
+            } else {
+                None
+            },
+            kind: "negative",
+            target_message_id: Some(target_message_id),
+            source: if source == "reaction" { "reaction" } else { "reply" },
+        }),
+        _ => None,
+    }
+}
+
+async fn handle_feedback_message_if_needed(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> bool {
+    let Some(action) = parse_channel_feedback_action(msg) else {
+        return false;
+    };
+
+    tracing::info!(
+        channel = %msg.channel,
+        sender = %msg.sender,
+        quality = action.quality,
+        "Recorded direct channel feedback"
+    );
+    ctx.memory.send_feedback(action.quality).await;
+
+    let audit_key = format!("telegram_feedback:{}", msg.id);
+    let audit_content = format!(
+        "telegram feedback kind={} source={} target_message_id={} sender={} reply_target={} quality={}",
+        action.kind,
+        action.source,
+        action
+            .target_message_id
+            .as_deref()
+            .unwrap_or("unknown"),
+        msg.sender,
+        msg.reply_target,
+        action.quality
+    );
+    let _ = ctx
+        .memory
+        .store(
+            &audit_key,
+            &audit_content,
+            crate::memory::MemoryCategory::Conversation,
+            Some("source:channel_feedback"),
+        )
+        .await;
+
+    if let Some(channel) = target_channel {
+        if let Some(acknowledgement) = action.acknowledgement {
+            if let Err(err) = channel
+                .send(
+                    &SendMessage::new(acknowledgement, &msg.reply_target)
+                        .in_thread(msg.thread_ts.clone()),
+                )
+                .await
+            {
+                tracing::debug!("Failed to send feedback acknowledgement on {}: {err}", channel.name());
+            }
+        }
+    }
+
+    true
 }
 
 fn resolve_provider_alias(name: &str) -> Option<String> {
@@ -296,6 +443,36 @@ fn resolve_provider_alias(name: &str) -> Option<String> {
     }
 
     None
+}
+
+fn provider_discovery_label(mode: providers::ProviderModelDiscovery) -> &'static str {
+    match mode {
+        providers::ProviderModelDiscovery::Live => "live",
+        providers::ProviderModelDiscovery::Manual => "manual",
+        providers::ProviderModelDiscovery::None => "none",
+    }
+}
+
+fn provider_capability_summary(provider_name: &str) -> Option<String> {
+    let profile = providers::provider_runtime_profile(provider_name)?;
+    let discovery_desc = match profile.model_discovery {
+        providers::ProviderModelDiscovery::Live => "live (API auto-discovery)".to_string(),
+        providers::ProviderModelDiscovery::Manual => "curated catalog (use /model to list)".to_string(),
+        providers::ProviderModelDiscovery::None => "none (enter model ID directly)".to_string(),
+    };
+    Some(format!(
+        "Capabilities:\n\
+         - Route kind: {}\n\
+         - Agent loop: {}\n\
+         - Tool calling: {}\n\
+         - Vision: {}\n\
+         - Model catalog: {}",
+        if profile.local { "local" } else { "cloud" },
+        if profile.agentic_tool_loop { "full (tools + memory + shell)" } else { "not supported" },
+        if profile.native_tool_calling { "yes" } else { "prompt-guided" },
+        if profile.vision { "supported" } else { "not available" },
+        discovery_desc,
+    ))
 }
 
 fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection {
@@ -483,15 +660,43 @@ fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &P
         "Current provider: `{}`\nCurrent model: `{}`",
         current.provider, current.model
     );
+    if let Some(summary) = provider_capability_summary(&current.provider) {
+        let _ = writeln!(response, "\n{summary}");
+    }
     response.push_str("\nSwitch model with `/model <model-id>`.\n");
 
     let cached_models = load_cached_model_preview(workspace_dir, &current.provider);
     if cached_models.is_empty() {
-        let _ = writeln!(
-            response,
-            "\nNo cached model list found for `{}`. Ask the operator to run `zeroclaw models refresh --provider {}`.",
-            current.provider, current.provider
-        );
+        if let Some(profile) = providers::provider_runtime_profile(&current.provider) {
+            if !profile.manual_models.is_empty() {
+                let _ = writeln!(
+                    response,
+                    "\n`{}` does not support live model discovery in Zeroclaw. Enter a model ID manually.",
+                    current.provider
+                );
+                response.push_str("Examples:\n");
+                for model in profile.manual_models {
+                    let _ = writeln!(response, "- `{model}`");
+                }
+                if current.provider == "copilot" {
+                    response.push_str(
+                        "\nUse `/provider copilot` to switch provider, or `/copilot <model>` to switch provider and model in one step.\n",
+                    );
+                }
+            } else {
+                let _ = writeln!(
+                    response,
+                    "\nNo cached model list found for `{}`. Ask the operator to run `zeroclaw models refresh --provider {}`.",
+                    current.provider, current.provider
+                );
+            }
+        } else {
+            let _ = writeln!(
+                response,
+                "\nNo cached model list found for `{}`. Ask the operator to run `zeroclaw models refresh --provider {}`.",
+                current.provider, current.provider
+            );
+        }
     } else {
         let _ = writeln!(
             response,
@@ -513,21 +718,75 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
         "Current provider: `{}`\nCurrent model: `{}`",
         current.provider, current.model
     );
+    if let Some(summary) = provider_capability_summary(&current.provider) {
+        let _ = writeln!(response, "\n{summary}");
+    }
     response.push_str("\nSwitch provider with `/models <provider>`.\n");
+    response.push_str("Alias: `/provider <provider>`.\n");
     response.push_str("Switch model with `/model <model-id>`.\n\n");
+    response.push_str("Quick frontier mode: `/copilot` or `/copilot <model>`.\n");
+    response.push_str("Return to Zara default: `/zara`.\n\n");
     response.push_str("Available providers:\n");
     for provider in providers::list_providers() {
+        let capability_suffix = providers::provider_runtime_profile(provider.name)
+            .map(|profile| {
+                format!(
+                    " [{} | agent:{} | discovery:{}]",
+                    if profile.local { "local" } else { "cloud" },
+                    if profile.agentic_tool_loop { "yes" } else { "no" },
+                    provider_discovery_label(profile.model_discovery),
+                )
+            })
+            .unwrap_or_default();
         if provider.aliases.is_empty() {
-            let _ = writeln!(response, "- {}", provider.name);
+            let _ = writeln!(response, "- {}{}", provider.name, capability_suffix);
         } else {
             let _ = writeln!(
                 response,
-                "- {} (aliases: {})",
+                "- {}{} (aliases: {})",
                 provider.name,
+                capability_suffix,
                 provider.aliases.join(", ")
             );
         }
     }
+    response
+}
+
+fn build_runtime_help_response(current: &ChannelRouteSelection, workspace_dir: &Path) -> String {
+    let mut response = String::new();
+    let _ = writeln!(
+        response,
+        "Current route:\nProvider: `{}`\nModel: `{}`",
+        current.provider, current.model
+    );
+    if let Some(summary) = provider_capability_summary(&current.provider) {
+        let _ = writeln!(response, "\n{summary}");
+    }
+    response.push_str("\nRuntime commands:\n");
+    response.push_str("- `/help` — this command summary\n");
+    response.push_str("- `/status` — current provider, model, and capabilities\n");
+    response.push_str("- `/models` — list providers; `/models <provider>` or `/provider <provider>` switches provider\n");
+    response.push_str("- `/model` — show current model + catalog; `/model <id>` switches model\n");
+    response.push_str("- `/copilot` or `/copilot <model>` — frontier mode (GPT-5.4, Claude Opus 4.6, etc.)\n");
+    response.push_str("- `/zara` or `/default` — restore default route\n");
+    response.push_str("- `/clear` — wipe conversation history for this session\n");
+    response.push_str("- `/compact` — compress conversation history (keep recent)\n");
+    response.push_str("\nAvailable tools: shell, file_read, file_write, file_edit, git_operations, memory_store, memory_recall, delegate, web_search, cron, pushover, screenshot\n\n");
+    response.push_str(&build_models_help_response(current, workspace_dir));
+    response
+}
+
+fn build_runtime_status_response(current: &ChannelRouteSelection) -> String {
+    let mut response = format!(
+        "Sender session status:\nProvider: `{}`\nModel: `{}`",
+        current.provider, current.model
+    );
+    if let Some(summary) = provider_capability_summary(&current.provider) {
+        response.push_str("\n\n");
+        response.push_str(&summary);
+    }
+    response.push_str("\n\nUse `/help` for available runtime commands.");
     response
 }
 
@@ -548,33 +807,91 @@ async fn handle_runtime_command_if_needed(
     let mut current = get_route_selection(ctx, &sender_key);
 
     let response = match command {
+        ChannelRuntimeCommand::ShowHelp => {
+            build_runtime_help_response(&current, ctx.workspace_dir.as_path())
+        }
+        ChannelRuntimeCommand::ShowStatus => build_runtime_status_response(&current),
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
             match resolve_provider_alias(&raw_provider) {
-                Some(provider_name) => match get_or_create_provider(ctx, &provider_name).await {
-                    Ok(_) => {
-                        if provider_name != current.provider {
-                            current.provider = provider_name.clone();
-                            set_route_selection(ctx, &sender_key, current.clone());
-                            clear_sender_history(ctx, &sender_key);
-                        }
+                Some(provider_name) => {
+                    if providers::provider_runtime_profile(&provider_name)
+                        .is_some_and(|profile| !profile.agentic_tool_loop)
+                    {
+                        format!(
+                            "Provider `{provider_name}` is not compatible with Zeroclaw's tool-using agent loop. Route unchanged.\nUse this provider through dedicated subsystems, not as the primary sender-session brain."
+                        )
+                    } else {
+                        match get_or_create_provider(ctx, &provider_name).await {
+                            Ok(_) => {
+                                if provider_name != current.provider {
+                                    current.provider = provider_name.clone();
+                                    set_route_selection(ctx, &sender_key, current.clone());
+                                    clear_sender_history(ctx, &sender_key);
+                                }
 
-                        format!(
-                            "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
-                            current.model
-                        )
+                                format!(
+                                    "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
+                                    current.model
+                                )
+                            }
+                            Err(err) => {
+                                let safe_err = providers::sanitize_api_error(&err.to_string());
+                                format!(
+                                    "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
+                                )
+                            }
+                        }
                     }
-                    Err(err) => {
-                        let safe_err = providers::sanitize_api_error(&err.to_string());
-                        format!(
-                            "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
-                        )
-                    }
-                },
+                }
                 None => format!(
                     "Unknown provider `{raw_provider}`. Use `/models` to list valid providers."
                 ),
             }
+        }
+        ChannelRuntimeCommand::ShowCopilotModels => {
+            let copilot_route = ChannelRouteSelection {
+                provider: "copilot".to_string(),
+                model: current.model.clone(),
+            };
+            build_models_help_response(&copilot_route, ctx.workspace_dir.as_path())
+        }
+        ChannelRuntimeCommand::ActivateCopilot(requested_model) => {
+            let provider_name = "copilot".to_string();
+            let model = requested_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("gpt-5")
+                .to_string();
+
+            match get_or_create_provider(ctx, &provider_name).await {
+                Ok(_) => {
+                    current.provider = provider_name.clone();
+                    current.model = model.clone();
+                    set_route_selection(ctx, &sender_key, current.clone());
+                    clear_sender_history(ctx, &sender_key);
+
+                    format!(
+                        "Frontier mode enabled for this sender session.\nProvider: `{provider_name}`\nModel: `{model}`\nTool loop and your current Zara permissions stay active. Use `/zara` to return to the default route."
+                    )
+                }
+                Err(err) => {
+                    let safe_err = providers::sanitize_api_error(&err.to_string());
+                    format!(
+                        "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
+                    )
+                }
+            }
+        }
+        ChannelRuntimeCommand::ResetDefaultRoute => {
+            let default_route = default_route_selection(ctx);
+            set_route_selection(ctx, &sender_key, default_route.clone());
+            clear_sender_history(ctx, &sender_key);
+            format!(
+                "Restored Zara default route for this sender session.\nProvider: `{}`\nModel: `{}`",
+                default_route.provider, default_route.model
+            )
         }
         ChannelRuntimeCommand::ShowModel => {
             build_models_help_response(&current, ctx.workspace_dir.as_path())
@@ -583,6 +900,27 @@ async fn handle_runtime_command_if_needed(
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
                 "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
+            } else if let Some(provider_name) = resolve_provider_alias(&model) {
+                if provider_name == current.provider {
+                    let mut response = format!(
+                        "`{model}` is the current provider, not a model ID. Provider remains `{}`.",
+                        current.provider
+                    );
+                    if provider_name == "copilot" {
+                        response.push_str(
+                            "\nUse `/model <copilot-model>` such as `gpt-5`, `gpt-5.4`, `claude-sonnet-4.6`, `claude-opus-4.6`, or `gpt-5-mini`."
+                        );
+                    } else {
+                        response.push_str("\nUse `/model <provider-specific-model-id>` to change models.");
+                    }
+                    response
+                } else if provider_name == "copilot" {
+                    "`copilot` is a provider, not a model ID. Use `/provider copilot`, `/models copilot`, or `/copilot <model>` to switch into GitHub Copilot mode.".to_string()
+                } else {
+                    format!(
+                        "`{model}` resolves to provider `{provider_name}`, not a model ID. Use `/provider {provider_name}` or `/models {provider_name}` to switch provider."
+                    )
+                }
             } else {
                 current.model = model.clone();
                 set_route_selection(ctx, &sender_key, current.clone());
@@ -592,6 +930,17 @@ async fn handle_runtime_command_if_needed(
                     "Model switched to `{model}` for provider `{}` in this sender session.",
                     current.provider
                 )
+            }
+        }
+        ChannelRuntimeCommand::ClearHistory => {
+            clear_sender_history(ctx, &sender_key);
+            "Conversation history cleared for this session.".to_string()
+        }
+        ChannelRuntimeCommand::CompactHistory => {
+            if compact_sender_history(ctx, &sender_key) {
+                "Conversation history compacted (older messages summarized, recent kept).".to_string()
+            } else {
+                "Nothing to compact — history is empty or already minimal.".to_string()
             }
         }
     };
@@ -616,18 +965,68 @@ async fn build_memory_context(
 ) -> String {
     let mut context = String::new();
 
-    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+    // ── Background profile recall ─────────────────────────────────────────────
+    // Always fetch Mike's persistent context (preferences, active projects,
+    // personality) regardless of message content.  Short messages like "ok" or
+    // "Hei Zara!" produce near-zero similarity hits on the next recall, so this
+    // ensures the agent always has foundational context about who it's talking to.
+    let background_queries: &[&str] = &[
+        "Mike preferences personality style communication",
+        "active project task goal status",
+    ];
+    let mut profile_entries: Vec<String> = Vec::new();
+    let mut profile_keys_seen = std::collections::HashSet::new();
+    for query in background_queries {
+        if let Ok(entries) = mem.recall(query, 5, None).await {
+            for entry in entries.iter().filter(|e| match e.score {
+                Some(score) => score >= min_relevance_score,
+                None => true,
+            }) {
+                if profile_keys_seen.contains(&entry.key) {
+                    continue;
+                }
+                if should_skip_memory_context_entry(&entry.key, &entry.content) {
+                    continue;
+                }
+                if profile_entries.len() >= MEMORY_CONTEXT_BACKGROUND_ENTRIES {
+                    break;
+                }
+                let content = if entry.content.chars().count() > MEMORY_CONTEXT_ENTRY_MAX_CHARS {
+                    truncate_with_ellipsis(&entry.content, MEMORY_CONTEXT_ENTRY_MAX_CHARS)
+                } else {
+                    entry.content.clone()
+                };
+                profile_entries.push(format!("- {}: {}", entry.key, content));
+                profile_keys_seen.insert(entry.key.clone());
+            }
+        }
+    }
+    if !profile_entries.is_empty() {
+        context.push_str("[Background context]\n");
+        for line in &profile_entries {
+            context.push_str(line);
+            context.push('\n');
+        }
+        context.push('\n');
+    }
+
+    // ── Message-specific recall ───────────────────────────────────────────────
+    // Top memories semantically relevant to THIS specific message.
+    if let Ok(entries) = mem.recall(user_msg, 15, None).await {
         let mut included = 0usize;
         let mut used_chars = 0usize;
 
         for entry in entries.iter().filter(|e| match e.score {
             Some(score) => score >= min_relevance_score,
-            None => true, // keep entries without a score (e.g. non-vector backends)
+            None => true,
         }) {
             if included >= MEMORY_CONTEXT_MAX_ENTRIES {
                 break;
             }
-
+            // Skip entries already shown in background section
+            if profile_keys_seen.contains(&entry.key) {
+                continue;
+            }
             if should_skip_memory_context_entry(&entry.key, &entry.content) {
                 continue;
             }
@@ -674,7 +1073,23 @@ fn spawn_supervised_listener(
 
         loop {
             crate::health::mark_component_ok(&component);
+
+            // Periodically refresh the health timestamp while the listener runs its
+            // own internal loop.  Without this, doctor flags long-lived healthy
+            // channels as stale after CHANNEL_STALE_SECONDS (300 s).
+            let tick_component = component.clone();
+            let health_tick = tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(60));
+                interval.tick().await; // consume the immediate first tick
+                loop {
+                    interval.tick().await;
+                    crate::health::mark_component_ok(&tick_component);
+                }
+            });
+
             let result = ch.listen(tx.clone()).await;
+            health_tick.abort();
 
             if tx.is_closed() {
                 break;
@@ -766,9 +1181,49 @@ async fn process_channel_message(
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
     }
+    if handle_feedback_message_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        return;
+    }
 
     let history_key = conversation_history_key(&msg);
     let route = get_route_selection(ctx.as_ref(), &history_key);
+
+    // Classify message and resolve to routed model when on default route.
+    // Only applies when the user hasn't manually overridden their route.
+    let is_default_route = route.provider == *ctx.default_provider && route.model == *ctx.model;
+    let effective_model = if is_default_route {
+        if let Some(hint) = classifier::classify(&ctx.classification_config, &msg.content) {
+            if ctx.available_hints.contains(&hint) {
+                tracing::info!(hint = hint.as_str(), channel = %msg.channel, "Auto-classified channel message");
+                format!("hint:{hint}")
+            } else {
+                route.model.clone()
+            }
+        } else {
+            route.model.clone()
+        }
+    } else {
+        route.model.clone()
+    };
+
+    if providers::provider_runtime_profile(&route.provider)
+        .is_some_and(|profile| !profile.agentic_tool_loop)
+    {
+        let message = format!(
+            "⚠️ Provider `{}` is not compatible with Zeroclaw's tool-using agent loop.\nUse `/models` to choose a provider with agent-loop support, or `/zara` to restore the default route.",
+            route.provider
+        );
+        if let Some(channel) = target_channel.as_ref() {
+            let _ = channel
+                .send(
+                    &SendMessage::new(message, &msg.reply_target)
+                        .in_thread(msg.thread_ts.clone()),
+                )
+                .await;
+        }
+        return;
+    }
+
     let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
         Ok(provider) => provider,
         Err(err) => {
@@ -794,13 +1249,14 @@ async fn process_channel_message(
 
     if ctx.auto_save_memory {
         let autosave_key = conversation_memory_key(&msg);
+        let source = format!("source:channel:{}:user", msg.channel);
         let _ = ctx
             .memory
             .store(
                 &autosave_key,
                 &msg.content,
                 crate::memory::MemoryCategory::Conversation,
-                None,
+                Some(&source),
             )
             .await;
     }
@@ -901,7 +1357,7 @@ async fn process_channel_message(
     };
 
     enum LlmExecutionResult {
-        Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
+        Completed(Result<Result<ToolLoopOutcome, anyhow::Error>, tokio::time::error::Elapsed>),
         Cancelled,
     }
 
@@ -909,13 +1365,13 @@ async fn process_channel_message(
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
             Duration::from_secs(ctx.message_timeout_secs),
-            run_tool_call_loop(
+            run_tool_call_loop_with_stats(
                 active_provider.as_ref(),
                 &mut history,
                 ctx.tools_registry.as_ref(),
                 ctx.observer.as_ref(),
                 route.provider.as_str(),
-                route.model.as_str(),
+                effective_model.as_str(),
                 ctx.temperature,
                 true,
                 None,
@@ -954,7 +1410,8 @@ async fn process_channel_message(
                 }
             }
         }
-        LlmExecutionResult::Completed(Ok(Ok(response))) => {
+        LlmExecutionResult::Completed(Ok(Ok(outcome))) => {
+            let response = outcome.response;
             append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
@@ -965,6 +1422,32 @@ async fn process_channel_message(
                 started_at.elapsed().as_millis(),
                 truncate_with_ellipsis(&response, 80)
             );
+            // Auto-save the assistant response + send SONA feedback.
+            // Channels previously never called send_feedback — SONA micro-LoRA
+            // only adapted from CLI turns.  Now every Telegram/Discord/etc.
+            // message contributes to learning, making the assistant improve
+            // its recall quality specifically for each user over time.
+            if ctx.auto_save_memory && !response.trim().is_empty() {
+                let save_key = format!("assistant:{}", msg.sender);
+                let source = format!("source:channel:{}:assistant", msg.channel);
+                let _ = ctx
+                    .memory
+                    .store(
+                        &save_key,
+                        &response,
+                        crate::memory::MemoryCategory::Conversation,
+                        Some(&source),
+                    )
+                    .await;
+                let quality = if outcome.tool_call_count == 0 || outcome.tool_error_count == 0 {
+                    0.85_f32
+                } else if outcome.tool_error_count >= outcome.tool_call_count {
+                    0.3_f32
+                } else {
+                    0.55_f32
+                };
+                let _ = ctx.memory.send_feedback(quality).await;
+            }
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
                     if let Err(e) = channel
@@ -1055,6 +1538,9 @@ async fn process_channel_message(
                         .await;
                 }
             }
+            // Signal SONA that this turn failed so micro-LoRA adapts away
+            // from query patterns that consistently produce errors.
+            let _ = ctx.memory.send_feedback(0.3).await;
         }
         LlmExecutionResult::Completed(Err(_)) => {
             let timeout_msg = format!("LLM response timed out after {}s", ctx.message_timeout_secs);
@@ -1341,10 +1827,7 @@ pub fn build_system_prompt(
 
     // ── 8. Channel Capabilities ─────────────────────────────────────
     prompt.push_str("## Channel Capabilities\n\n");
-    prompt.push_str(
-        "- You are running as a Discord bot. You CAN and do send messages to Discord channels.\n",
-    );
-    prompt.push_str("- When someone messages you on Discord, your response is automatically sent back to Discord.\n");
+    prompt.push_str("- Your responses are automatically delivered to the user on their messaging channel.\n");
     prompt.push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
     prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
     prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n\n");
@@ -1622,6 +2105,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                     tg.allowed_users.clone(),
                     tg.mention_only,
                 )
+                .with_speech_to_text(tg.speech_to_text.clone())
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
             ),
         ));
@@ -1842,7 +2326,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
-pub async fn start_channels(config: Config) -> Result<()> {
+pub async fn start_channels(config: Config, shared_mem: Option<Arc<dyn Memory>>, shared_observer: Option<Arc<dyn Observer>>) -> Result<()> {
     let provider_name = config
         .default_provider
         .clone()
@@ -1853,11 +2337,17 @@ pub async fn start_channels(config: Config) -> Result<()> {
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
     };
-    let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
+    let model = config
+        .default_model
+        .clone()
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+    let provider: Arc<dyn Provider> = Arc::from(providers::create_routed_provider_with_options(
         &provider_name,
         config.api_key.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
+        &config.model_routes,
+        &model,
         &provider_runtime_options,
     )?);
 
@@ -1867,25 +2357,24 @@ pub async fn start_channels(config: Config) -> Result<()> {
         tracing::warn!("Provider warmup failed (non-fatal): {e}");
     }
 
-    let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
+    let observer: Arc<dyn Observer> = shared_observer
+        .unwrap_or_else(|| Arc::from(observability::create_observer(&config.observability)));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
         &config.autonomy,
         &config.workspace_dir,
     ));
-    let model = config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
     let temperature = config.default_temperature;
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
-        &config.memory,
-        Some(&config.storage.provider.config),
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-    )?);
+    let mem: Arc<dyn Memory> = match shared_mem {
+        Some(m) => m,
+        None => Arc::from(memory::create_memory_with_storage(
+            &config.memory,
+            Some(&config.storage.provider.config),
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+        )?),
+    };
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),
@@ -1909,6 +2398,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        None,
     ));
 
     let skills = crate::skills::load_skills(&workspace);
@@ -1961,6 +2451,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         "pushover",
         "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",
     ));
+    tool_descs.push((
+        "skill_read",
+        "Load the full instructions for a skill by name. Use before executing a skill's workflow. See the skill catalog in the system prompt for available names.",
+    ));
     if !config.agents.is_empty() {
         tool_descs.push((
             "delegate",
@@ -2004,6 +2498,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 tg.allowed_users.clone(),
                 tg.mention_only,
             )
+            .with_speech_to_text(tg.speech_to_text.clone())
             .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
         ));
     }
@@ -2232,6 +2727,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .as_ref()
         .is_some_and(|tg| tg.interrupt_on_new_message);
 
+    let available_hints: Vec<String> = config.model_routes.iter().map(|r| r.hint.clone()).collect();
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
@@ -2256,6 +2753,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         message_timeout_secs,
         interrupt_on_new_message,
         multimodal: config.multimodal.clone(),
+        classification_config: config.query_classification.clone(),
+        available_hints,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -2340,6 +2839,43 @@ mod tests {
     }
 
     #[test]
+    fn runtime_status_includes_provider_capabilities() {
+        let current = ChannelRouteSelection {
+            provider: "copilot".to_string(),
+            model: "gpt-5.4".to_string(),
+        };
+
+        let response = build_runtime_status_response(&current);
+        assert!(response.contains("Capabilities:"));
+        assert!(response.contains("Agent loop: full (tools + memory + shell)"));
+        assert!(response.contains("Model catalog: curated catalog"));
+    }
+
+    #[test]
+    fn provider_alias_resolution_matches_copilot_and_ollama() {
+        assert_eq!(resolve_provider_alias("copilot").as_deref(), Some("copilot"));
+        assert_eq!(
+            resolve_provider_alias("github-copilot").as_deref(),
+            Some("copilot")
+        );
+        assert_eq!(resolve_provider_alias("ollama").as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn copilot_model_help_uses_manual_examples() {
+        let workspace = make_workspace();
+        let current = ChannelRouteSelection {
+            provider: "copilot".to_string(),
+            model: "gpt-5".to_string(),
+        };
+
+        let response = build_models_help_response(&current, workspace.path());
+        assert!(response.contains("does not support live model discovery"));
+        assert!(response.contains("gpt-5.4"));
+        assert!(response.contains("claude-opus-4.6"));
+    }
+
+    #[test]
     fn compact_sender_history_keeps_recent_truncated_messages() {
         let mut histories = HashMap::new();
         let sender = "telegram_u1".to_string();
@@ -2381,6 +2917,8 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            classification_config: crate::config::QueryClassificationConfig::default(),
+            available_hints: vec![],
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -2799,6 +3337,8 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            classification_config: crate::config::QueryClassificationConfig::default(),
+            available_hints: vec![],
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
         });
@@ -2856,6 +3396,8 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            classification_config: crate::config::QueryClassificationConfig::default(),
+            available_hints: vec![],
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
         });
@@ -2922,6 +3464,8 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            classification_config: crate::config::QueryClassificationConfig::default(),
+            available_hints: vec![],
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
         });
@@ -3009,6 +3553,8 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            classification_config: crate::config::QueryClassificationConfig::default(),
+            available_hints: vec![],
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
         });
@@ -3072,6 +3618,8 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            classification_config: crate::config::QueryClassificationConfig::default(),
+            available_hints: vec![],
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
         });
@@ -3130,6 +3678,8 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            classification_config: crate::config::QueryClassificationConfig::default(),
+            available_hints: vec![],
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
         });
@@ -3207,6 +3757,220 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FeedbackCaptureMemory {
+        feedbacks: std::sync::Mutex<Vec<f32>>,
+        stores: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Memory for FeedbackCaptureMemory {
+        fn name(&self) -> &str {
+            "feedback-capture"
+        }
+
+        async fn store(
+            &self,
+            key: &str,
+            content: &str,
+            _category: crate::memory::MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.stores
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((key.to_string(), content.to_string()));
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<crate::memory::MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&crate::memory::MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn send_feedback(&self, quality: f32) {
+            self.feedbacks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(quality);
+        }
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_telegram_feedback_without_llm_call() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let feedback_memory = Arc::new(FeedbackCaptureMemory::default());
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: feedback_memory.clone(),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            classification_config: crate::config::QueryClassificationConfig::default(),
+            available_hints: vec![],
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-feedback-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "[[telegram-feedback:positive:43:reply]]".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0], "chat-1:Logged. That answer helped.");
+        drop(sent);
+
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            feedback_memory
+                .feedbacks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &[0.95]
+        );
+        assert_eq!(
+            feedback_memory
+                .stores
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_reaction_feedback_without_ack_message() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let feedback_memory = Arc::new(FeedbackCaptureMemory::default());
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: feedback_memory.clone(),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            classification_config: crate::config::QueryClassificationConfig::default(),
+            available_hints: vec![],
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-feedback-2".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "[[telegram-feedback:negative:77:reaction]]".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 0);
+        drop(sent);
+
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            feedback_memory
+                .feedbacks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &[0.15]
+        );
+    }
+
     #[tokio::test]
     async fn message_dispatch_processes_messages_in_parallel() {
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -3239,6 +4003,8 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            classification_config: crate::config::QueryClassificationConfig::default(),
+            available_hints: vec![],
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
         });
@@ -3317,6 +4083,8 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            classification_config: crate::config::QueryClassificationConfig::default(),
+            available_hints: vec![],
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
         });
@@ -3407,6 +4175,8 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            classification_config: crate::config::QueryClassificationConfig::default(),
+            available_hints: vec![],
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
         });
@@ -3479,6 +4249,8 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            classification_config: crate::config::QueryClassificationConfig::default(),
+            available_hints: vec![],
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
         });
@@ -3642,7 +4414,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_skills_include_instructions_and_tools() {
+    fn prompt_skills_include_catalog_not_full_instructions() {
         let ws = make_workspace();
         let skills = vec![crate::skills::Skill {
             name: "code-review".into(),
@@ -3663,17 +4435,13 @@ mod tests {
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
 
-        assert!(prompt.contains("<available_skills>"), "missing skills XML");
+        assert!(prompt.contains("<skill_catalog>"), "missing skill catalog XML");
         assert!(prompt.contains("<name>code-review</name>"));
         assert!(prompt.contains("<description>Review code for bugs</description>"));
-        assert!(prompt.contains("SKILL.md</location>"));
-        assert!(prompt.contains("<instructions>"));
-        assert!(prompt
-            .contains("<instruction>Always run cargo test before final response.</instruction>"));
-        assert!(prompt.contains("<tools>"));
-        assert!(prompt.contains("<name>lint</name>"));
-        assert!(prompt.contains("<kind>shell</kind>"));
-        assert!(!prompt.contains("loaded on demand"));
+        // Full instructions should NOT be embedded (on-demand via skill_read tool)
+        assert!(!prompt.contains("<instructions>"));
+        assert!(!prompt.contains("cargo test before final response"));
+        assert!(prompt.contains("loaded on demand") || prompt.contains("skill_read"));
     }
 
     #[test]
@@ -3702,12 +4470,8 @@ mod tests {
         assert!(prompt.contains(
             "<description>Review &quot;unsafe&quot; and &apos;risky&apos; bits</description>"
         ));
-        assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
-        assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
-        assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
-        assert!(prompt.contains(
-            "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
-        ));
+        // Full tool details should NOT be in the catalog
+        assert!(!prompt.contains("<kind>"));
     }
 
     #[test]
@@ -3769,8 +4533,8 @@ mod tests {
             "missing Channel Capabilities section"
         );
         assert!(
-            prompt.contains("running as a Discord bot"),
-            "missing Discord context"
+            prompt.contains("automatically delivered to the user"),
+            "missing channel delivery context"
         );
         assert!(
             prompt.contains("NEVER repeat, describe, or echo credentials"),
@@ -3920,6 +4684,8 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            classification_config: crate::config::QueryClassificationConfig::default(),
+            available_hints: vec![],
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
         });
@@ -4013,6 +4779,8 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            classification_config: crate::config::QueryClassificationConfig::default(),
+            available_hints: vec![],
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
         });

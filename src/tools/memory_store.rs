@@ -78,7 +78,11 @@ impl Tool for MemoryStoreTool {
             });
         }
 
-        match self.memory.store(key, content, category, None).await {
+        match self
+            .memory
+            .store(key, content, category, Some("source:tool:memory_store"))
+            .await
+        {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("Stored memory: {key}"),

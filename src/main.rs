@@ -65,6 +65,8 @@ mod heartbeat;
 mod identity;
 mod integrations;
 mod memory;
+#[cfg(feature = "embedded-brain")]
+mod brain;
 mod migration;
 mod multimodal;
 mod observability;
@@ -681,7 +683,7 @@ async fn main() -> Result<()> {
         }?;
         // Auto-start channels if user said yes during wizard
         if std::env::var("ZEROCLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
-            channels::start_channels(config).await?;
+            channels::start_channels(config, None, None).await?;
         }
         return Ok(());
     }
@@ -689,6 +691,44 @@ async fn main() -> Result<()> {
     // All other commands need config loaded first
     let mut config = Config::load_or_init().await?;
     config.apply_env_overrides();
+
+    // Load workspace .env file so API keys (FAL_KEY, FAL_ADMIN_KEY, etc.) are
+    // available in the process environment.  We look for `.env` one level above
+    // the workspace_dir (e.g. ~/zara/.env when workspace is ~/zara/workspace/).
+    // Variables already present in the environment are NOT overwritten, so
+    // shell exports take precedence over the file.
+    {
+        let env_path = config.workspace_dir
+            .parent()
+            .map(|p| p.join(".env"))
+            .unwrap_or_else(|| config.workspace_dir.join(".env"));
+        if env_path.exists() {
+            match std::fs::read_to_string(&env_path) {
+                Ok(contents) => {
+                    let mut loaded = 0usize;
+                    for line in contents.lines() {
+                        let line = line.trim();
+                        if line.is_empty() || line.starts_with('#') {
+                            continue;
+                        }
+                        if let Some((key, val)) = line.split_once('=') {
+                            let key = key.trim();
+                            let val = val.trim().trim_matches('"').trim_matches('\'');
+                            // Only set if not already in environment
+                            if std::env::var(key).is_err() {
+                                std::env::set_var(key, val);
+                                loaded += 1;
+                            }
+                        }
+                    }
+                    info!("Loaded {} variable(s) from {}", loaded, env_path.display());
+                }
+                Err(e) => warn!("Could not read {}: {}", env_path.display(), e),
+            }
+        } else {
+            info!("No .env file found at {} — skipping", env_path.display());
+        }
+    }
 
     match cli.command {
         Commands::Onboard { .. } => unreachable!(),
@@ -711,7 +751,7 @@ async fn main() -> Result<()> {
             } else {
                 info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
             }
-            gateway::run_gateway(&host, port, config).await
+            gateway::run_gateway(&host, port, config, None, None).await
         }
 
         Commands::Daemon { port, host } => {
@@ -873,7 +913,7 @@ async fn main() -> Result<()> {
         },
 
         Commands::Channel { channel_command } => match channel_command {
-            ChannelCommands::Start => channels::start_channels(config).await,
+            ChannelCommands::Start => channels::start_channels(config, None, None).await,
             ChannelCommands::Doctor => channels::doctor_channels(config).await,
             other => channels::handle_command(other, &config).await,
         },

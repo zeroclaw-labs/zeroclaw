@@ -37,9 +37,11 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     .last_run
                     .map_or_else(|| "never".into(), |d| d.to_rfc3339());
                 let last_status = job.last_status.unwrap_or_else(|| "n/a".into());
+                let enabled_state = if job.enabled { "enabled" } else { "paused" };
                 println!(
-                    "- {} | {:?} | next={} | last={} ({})",
+                    "- {} | {} | {:?} | next={} | last={} ({})",
                     job.id,
+                    enabled_state,
                     job.schedule,
                     job.next_run.to_rfc3339(),
                     last_run,

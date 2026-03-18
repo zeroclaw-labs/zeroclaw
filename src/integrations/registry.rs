@@ -725,7 +725,9 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::{IMessageConfig, MatrixConfig, StreamMode, TelegramConfig};
+    use crate::config::schema::{
+        IMessageConfig, MatrixConfig, StreamMode, TelegramConfig, TelegramSpeechToTextConfig,
+    };
     use crate::config::Config;
 
     #[test]
@@ -792,6 +794,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            speech_to_text: TelegramSpeechToTextConfig::default(),
         });
         let entries = all_integrations();
         let tg = entries.iter().find(|e| e.name == "Telegram").unwrap();

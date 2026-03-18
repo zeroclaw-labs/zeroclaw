@@ -1,5 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::DelegateAgentConfig;
+use crate::memory::{Memory, MemoryCategory};
 use crate::providers::{self, Provider};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
@@ -16,9 +17,15 @@ const DELEGATE_TIMEOUT_SECS: u64 = 120;
 /// provider/model configuration. Enables multi-agent workflows where
 /// a primary agent can hand off specialized work (research, coding,
 /// summarization) to purpose-built sub-agents.
+///
+/// Memory is shared: relevant context is recalled before
+/// the sub-agent call, and the sub-agent's response is stored back so
+/// the full system learns from every delegation.
 pub struct DelegateTool {
     agents: Arc<HashMap<String, DelegateAgentConfig>>,
     security: Arc<SecurityPolicy>,
+    /// Shared memory backend — same instance as the primary agent.
+    memory: Arc<dyn Memory>,
     /// Global credential fallback (from config.api_key)
     fallback_credential: Option<String>,
     /// Provider runtime options inherited from root config.
@@ -32,11 +39,13 @@ impl DelegateTool {
         agents: HashMap<String, DelegateAgentConfig>,
         fallback_credential: Option<String>,
         security: Arc<SecurityPolicy>,
+        memory: Arc<dyn Memory>,
     ) -> Self {
         Self::new_with_options(
             agents,
             fallback_credential,
             security,
+            memory,
             providers::ProviderRuntimeOptions::default(),
         )
     }
@@ -45,11 +54,13 @@ impl DelegateTool {
         agents: HashMap<String, DelegateAgentConfig>,
         fallback_credential: Option<String>,
         security: Arc<SecurityPolicy>,
+        memory: Arc<dyn Memory>,
         provider_runtime_options: providers::ProviderRuntimeOptions,
     ) -> Self {
         Self {
             agents: Arc::new(agents),
             security,
+            memory,
             fallback_credential,
             provider_runtime_options,
             depth: 0,
@@ -63,12 +74,14 @@ impl DelegateTool {
         agents: HashMap<String, DelegateAgentConfig>,
         fallback_credential: Option<String>,
         security: Arc<SecurityPolicy>,
+        memory: Arc<dyn Memory>,
         depth: u32,
     ) -> Self {
         Self::with_depth_and_options(
             agents,
             fallback_credential,
             security,
+            memory,
             depth,
             providers::ProviderRuntimeOptions::default(),
         )
@@ -78,12 +91,14 @@ impl DelegateTool {
         agents: HashMap<String, DelegateAgentConfig>,
         fallback_credential: Option<String>,
         security: Arc<SecurityPolicy>,
+        memory: Arc<dyn Memory>,
         depth: u32,
         provider_runtime_options: providers::ProviderRuntimeOptions,
     ) -> Self {
         Self {
             agents: Arc::new(agents),
             security,
+            memory,
             fallback_credential,
             provider_runtime_options,
             depth,
@@ -242,11 +257,31 @@ impl Tool for DelegateTool {
             }
         };
 
-        // Build the message
-        let full_prompt = if context.is_empty() {
-            prompt.to_string()
-        } else {
-            format!("[Context]\n{context}\n\n[Task]\n{prompt}")
+        // Recall relevant memories to give the sub-agent the same context
+        // the primary agent has. Errors are non-fatal — the sub-agent still
+        // runs, just without injected context.
+        let mem_context: String = match self.memory.recall(prompt, 5, None).await {
+            Ok(entries) if !entries.is_empty() => {
+                let snippets: Vec<String> = entries
+                    .into_iter()
+                    .filter(|e| !e.content.trim().is_empty())
+                    .map(|e| format!("- {}", e.content.trim()))
+                    .collect();
+                if snippets.is_empty() {
+                    String::new()
+                } else {
+                    format!("[Memory context]\n{}\n\n", snippets.join("\n"))
+                }
+            }
+            _ => String::new(),
+        };
+
+        // Build the message — memory context + caller-supplied context + prompt
+        let full_prompt = match (mem_context.is_empty(), context.is_empty()) {
+            (true,  true)  => prompt.to_string(),
+            (true,  false) => format!("[Context]\n{context}\n\n[Task]\n{prompt}"),
+            (false, true)  => format!("{mem_context}[Task]\n{prompt}"),
+            (false, false) => format!("{mem_context}[Context]\n{context}\n\n[Task]\n{prompt}"),
         };
 
         let temperature = agent_config.temperature.unwrap_or(0.7);
@@ -283,6 +318,23 @@ impl Tool for DelegateTool {
                     rendered = "[Empty response]".to_string();
                 }
 
+                // Store the sub-agent's response back into the shared memory so
+                // the full system learns from every delegation.
+                if !rendered.trim().is_empty() && rendered != "[Empty response]" {
+                    let mem_key = format!("delegate_{agent_name}");
+                    let mem_content = format!("[{agent_name}] Q: {prompt}\nA: {rendered}");
+                    let source = format!("source:delegate:{agent_name}");
+                    let _ = self
+                        .memory
+                        .store(
+                            &mem_key,
+                            &mem_content,
+                            MemoryCategory::Conversation,
+                            Some(&source),
+                        )
+                        .await;
+                }
+
                 Ok(ToolResult {
                     success: true,
                     output: format!(
@@ -305,10 +357,15 @@ impl Tool for DelegateTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::NoneMemory;
     use crate::security::{AutonomyLevel, SecurityPolicy};
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
+    }
+
+    fn test_memory() -> Arc<dyn Memory> {
+        Arc::new(NoneMemory::new())
     }
 
     fn sample_agents() -> HashMap<String, DelegateAgentConfig> {
@@ -340,7 +397,7 @@ mod tests {
 
     #[test]
     fn name_and_schema() {
-        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let tool = DelegateTool::new(sample_agents(), None, test_security(), test_memory());
         assert_eq!(tool.name(), "delegate");
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["agent"].is_object());
@@ -356,13 +413,13 @@ mod tests {
 
     #[test]
     fn description_not_empty() {
-        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let tool = DelegateTool::new(sample_agents(), None, test_security(), test_memory());
         assert!(!tool.description().is_empty());
     }
 
     #[test]
     fn schema_lists_agent_names() {
-        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let tool = DelegateTool::new(sample_agents(), None, test_security(), test_memory());
         let schema = tool.parameters_schema();
         let desc = schema["properties"]["agent"]["description"]
             .as_str()
@@ -372,21 +429,21 @@ mod tests {
 
     #[tokio::test]
     async fn missing_agent_param() {
-        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let tool = DelegateTool::new(sample_agents(), None, test_security(), test_memory());
         let result = tool.execute(json!({"prompt": "test"})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn missing_prompt_param() {
-        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let tool = DelegateTool::new(sample_agents(), None, test_security(), test_memory());
         let result = tool.execute(json!({"agent": "researcher"})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn unknown_agent_returns_error() {
-        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let tool = DelegateTool::new(sample_agents(), None, test_security(), test_memory());
         let result = tool
             .execute(json!({"agent": "nonexistent", "prompt": "test"}))
             .await
@@ -397,7 +454,7 @@ mod tests {
 
     #[tokio::test]
     async fn depth_limit_enforced() {
-        let tool = DelegateTool::with_depth(sample_agents(), None, test_security(), 3);
+        let tool = DelegateTool::with_depth(sample_agents(), None, test_security(), test_memory(), 3);
         let result = tool
             .execute(json!({"agent": "researcher", "prompt": "test"}))
             .await
@@ -409,7 +466,7 @@ mod tests {
     #[tokio::test]
     async fn depth_limit_per_agent() {
         // coder has max_depth=2, so depth=2 should be blocked
-        let tool = DelegateTool::with_depth(sample_agents(), None, test_security(), 2);
+        let tool = DelegateTool::with_depth(sample_agents(), None, test_security(), test_memory(), 2);
         let result = tool
             .execute(json!({"agent": "coder", "prompt": "test"}))
             .await
@@ -420,7 +477,7 @@ mod tests {
 
     #[test]
     fn empty_agents_schema() {
-        let tool = DelegateTool::new(HashMap::new(), None, test_security());
+        let tool = DelegateTool::new(HashMap::new(), None, test_security(), test_memory());
         let schema = tool.parameters_schema();
         let desc = schema["properties"]["agent"]["description"]
             .as_str()
@@ -442,7 +499,7 @@ mod tests {
                 max_depth: 3,
             },
         );
-        let tool = DelegateTool::new(agents, None, test_security());
+        let tool = DelegateTool::new(agents, None, test_security(), test_memory());
         let result = tool
             .execute(json!({"agent": "broken", "prompt": "test"}))
             .await
@@ -453,7 +510,7 @@ mod tests {
 
     #[tokio::test]
     async fn blank_agent_rejected() {
-        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let tool = DelegateTool::new(sample_agents(), None, test_security(), test_memory());
         let result = tool
             .execute(json!({"agent": "  ", "prompt": "test"}))
             .await
@@ -464,7 +521,7 @@ mod tests {
 
     #[tokio::test]
     async fn blank_prompt_rejected() {
-        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let tool = DelegateTool::new(sample_agents(), None, test_security(), test_memory());
         let result = tool
             .execute(json!({"agent": "researcher", "prompt": "  \t  "}))
             .await
@@ -475,7 +532,7 @@ mod tests {
 
     #[tokio::test]
     async fn whitespace_agent_name_trimmed_and_found() {
-        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let tool = DelegateTool::new(sample_agents(), None, test_security(), test_memory());
         // " researcher " with surrounding whitespace — after trim becomes "researcher"
         let result = tool
             .execute(json!({"agent": " researcher ", "prompt": "test"}))
@@ -499,7 +556,7 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = DelegateTool::new(sample_agents(), None, readonly);
+        let tool = DelegateTool::new(sample_agents(), None, readonly, test_memory());
         let result = tool
             .execute(json!({"agent": "researcher", "prompt": "test"}))
             .await
@@ -518,7 +575,7 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = DelegateTool::new(sample_agents(), None, limited);
+        let tool = DelegateTool::new(sample_agents(), None, limited, test_memory());
         let result = tool
             .execute(json!({"agent": "researcher", "prompt": "test"}))
             .await
@@ -545,7 +602,7 @@ mod tests {
                 max_depth: 3,
             },
         );
-        let tool = DelegateTool::new(agents, None, test_security());
+        let tool = DelegateTool::new(agents, None, test_security(), test_memory());
         let result = tool
             .execute(json!({
                 "agent": "tester",
@@ -577,7 +634,7 @@ mod tests {
                 max_depth: 3,
             },
         );
-        let tool = DelegateTool::new(agents, None, test_security());
+        let tool = DelegateTool::new(agents, None, test_security(), test_memory());
         let result = tool
             .execute(json!({
                 "agent": "tester",
@@ -597,13 +654,13 @@ mod tests {
 
     #[test]
     fn delegate_depth_construction() {
-        let tool = DelegateTool::with_depth(sample_agents(), None, test_security(), 5);
+        let tool = DelegateTool::with_depth(sample_agents(), None, test_security(), test_memory(), 5);
         assert_eq!(tool.depth, 5);
     }
 
     #[tokio::test]
     async fn delegate_no_agents_configured() {
-        let tool = DelegateTool::new(HashMap::new(), None, test_security());
+        let tool = DelegateTool::new(HashMap::new(), None, test_security(), test_memory());
         let result = tool
             .execute(json!({"agent": "any", "prompt": "test"}))
             .await

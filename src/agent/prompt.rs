@@ -332,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn skills_section_includes_instructions_and_tools() {
+    fn skills_section_includes_catalog_not_full_instructions() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
@@ -361,11 +361,13 @@ mod tests {
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
-        assert!(output.contains("<available_skills>"));
+        assert!(output.contains("<skill_catalog>"));
         assert!(output.contains("<name>deploy</name>"));
-        assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
-        assert!(output.contains("<name>release_checklist</name>"));
-        assert!(output.contains("<kind>shell</kind>"));
+        assert!(output.contains("<description>Release safely</description>"));
+        // Full instructions and tool details should NOT be embedded
+        assert!(!output.contains("<instruction>"));
+        assert!(!output.contains("<kind>"));
+        assert!(output.contains("skill_read"));
     }
 
     #[test]
@@ -419,16 +421,13 @@ mod tests {
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
 
-        assert!(prompt.contains("<available_skills>"));
+        assert!(prompt.contains("<skill_catalog>"));
         assert!(prompt.contains("<name>code&lt;review&gt;&amp;</name>"));
         assert!(prompt.contains(
             "<description>Review &quot;unsafe&quot; and &apos;risky&apos; bits</description>"
         ));
-        assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
-        assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
-        assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
-        assert!(prompt.contains(
-            "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
-        ));
+        // Full tool/instruction details should NOT be in catalog
+        assert!(!prompt.contains("<kind>"));
+        assert!(!prompt.contains("<instruction>"));
     }
 }

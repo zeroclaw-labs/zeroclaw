@@ -260,6 +260,7 @@ impl Agent {
             &config.agents,
             config.api_key.as_deref(),
             config,
+            None,
         );
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
@@ -427,10 +428,16 @@ impl Agent {
         }
 
         if self.auto_save {
-            let _ = self
-                .memory
-                .store("user_msg", user_message, MemoryCategory::Conversation, None)
-                .await;
+            let word_count = user_message.split_whitespace().count();
+            let min_words = self.config.min_auto_save_words;
+            // Skip noise: single-word acks, test probes, heartbeat artifacts.
+            // Only save messages with enough substance to be worth recalling.
+            if min_words == 0 || word_count >= min_words {
+                let _ = self
+                    .memory
+                    .store("user_msg", user_message, MemoryCategory::Conversation, None)
+                    .await;
+            }
         }
 
         let context = self
@@ -449,6 +456,11 @@ impl Agent {
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
         let effective_model = self.classify_model(user_message);
+
+        // Track tool errors across all iterations so SONA receives accurate
+        // quality signals instead of a hardcoded constant.
+        let mut tool_error_count: u32 = 0;
+        let mut tool_call_count: u32 = 0;
 
         for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
@@ -486,6 +498,37 @@ impl Agent {
                     )));
                 self.trim_history();
 
+                // Persist assistant response so future recall finds what Zara
+                // actually concluded/built, not just that the topic came up.
+                // Skip trivial responses (HEARTBEAT_OK, short acks) to avoid
+                // polluting the memory store with non-informative entries.
+                let is_noise = final_text.trim() == "HEARTBEAT_OK"
+                    || final_text.split_whitespace().count() < 10;
+                if self.auto_save && !final_text.trim().is_empty() && !is_noise {
+                    let _ = self
+                        .memory
+                        .store("assistant_msg", &final_text, MemoryCategory::Conversation, None)
+                        .await;
+                    // Compute dynamic quality signal for SONA micro-LoRA adaptation:
+                    //   - All tools succeeded (or no tools called) → 0.85
+                    //   - Some tools errored → 0.55 (partial success)
+                    //   - All tools errored → 0.3
+                    let quality = if tool_call_count == 0 || tool_error_count == 0 {
+                        0.85_f32
+                    } else if tool_error_count >= tool_call_count {
+                        0.3_f32
+                    } else {
+                        0.55_f32
+                    };
+                    tracing::debug!(
+                        tool_calls = tool_call_count,
+                        tool_errors = tool_error_count,
+                        feedback_quality = quality,
+                        "Sending dynamic SONA feedback"
+                    );
+                    let _ = self.memory.send_feedback(quality).await;
+                }
+
                 return Ok(final_text);
             }
 
@@ -504,6 +547,9 @@ impl Agent {
             });
 
             let results = self.execute_tools(&calls).await;
+            // Accumulate tool outcome stats for dynamic SONA feedback quality.
+            tool_call_count += results.len() as u32;
+            tool_error_count += results.iter().filter(|r| !r.success).count() as u32;
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
             self.trim_history();

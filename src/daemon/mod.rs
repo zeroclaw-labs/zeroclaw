@@ -1,8 +1,10 @@
 use crate::config::Config;
+use crate::memory::{self, Memory};
 use anyhow::Result;
 use chrono::Utc;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
@@ -17,6 +19,22 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     crate::health::mark_component_ok("daemon");
 
+    // Create the memory backend once and share it between gateway and channels.
+    // This prevents LockHeld (0x0300) errors when both components independently
+    // try to open the same RVF store file simultaneously.
+    let shared_mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+        &config.memory,
+        Some(&config.storage.provider.config),
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+    )?);
+
+    // Create the observer once and share it between all components so that
+    // events recorded by the channels/heartbeat workers appear in the gateway's
+    // /metrics endpoint (they all share the same Prometheus registry).
+    let shared_observer: Arc<dyn crate::observability::Observer> =
+        Arc::from(crate::observability::create_observer(&config.observability));
+
     if config.heartbeat.enabled {
         let _ =
             crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.workspace_dir)
@@ -28,6 +46,8 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
+        let gateway_mem = Arc::clone(&shared_mem);
+        let gateway_obs = Arc::clone(&shared_observer);
         handles.push(spawn_component_supervisor(
             "gateway",
             initial_backoff,
@@ -35,7 +55,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             move || {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
-                async move { crate::gateway::run_gateway(&host, port, cfg).await }
+                let m = Arc::clone(&gateway_mem);
+                let obs = Arc::clone(&gateway_obs);
+                async move { crate::gateway::run_gateway(&host, port, cfg, Some(m), Some(obs)).await }
             },
         ));
     }
@@ -43,13 +65,17 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     {
         if has_supervised_channels(&config) {
             let channels_cfg = config.clone();
+            let channels_mem = Arc::clone(&shared_mem);
+            let channels_obs = Arc::clone(&shared_observer);
             handles.push(spawn_component_supervisor(
                 "channels",
                 initial_backoff,
                 max_backoff,
                 move || {
                     let cfg = channels_cfg.clone();
-                    async move { crate::channels::start_channels(cfg).await }
+                    let m = Arc::clone(&channels_mem);
+                    let obs = Arc::clone(&channels_obs);
+                    async move { crate::channels::start_channels(cfg, Some(m), Some(obs)).await }
                 },
             ));
         } else {
@@ -60,13 +86,15 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     if config.heartbeat.enabled {
         let heartbeat_cfg = config.clone();
+        let heartbeat_obs = Arc::clone(&shared_observer);
         handles.push(spawn_component_supervisor(
             "heartbeat",
             initial_backoff,
             max_backoff,
             move || {
                 let cfg = heartbeat_cfg.clone();
-                async move { run_heartbeat_worker(cfg).await }
+                let obs = Arc::clone(&heartbeat_obs);
+                async move { run_heartbeat_worker(cfg, obs).await }
             },
         ));
     }
@@ -173,9 +201,7 @@ where
     })
 }
 
-async fn run_heartbeat_worker(config: Config) -> Result<()> {
-    let observer: std::sync::Arc<dyn crate::observability::Observer> =
-        std::sync::Arc::from(crate::observability::create_observer(&config.observability));
+async fn run_heartbeat_worker(config: Config, observer: Arc<dyn crate::observability::Observer>) -> Result<()> {
     let engine = crate::heartbeat::engine::HeartbeatEngine::new(
         config.heartbeat.clone(),
         config.workspace_dir.clone(),
@@ -196,8 +222,22 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         for task in tasks {
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
+            let mut hb_provider = config.heartbeat.provider.clone();
+            let mut hb_model = config.heartbeat.model.clone();
+            if hb_provider
+                .as_deref()
+                .and_then(crate::providers::provider_runtime_profile)
+                .is_some_and(|profile| !profile.agentic_tool_loop)
+            {
+                tracing::warn!(
+                    provider = ?hb_provider,
+                    "Heartbeat provider is not agent-loop compatible; falling back to default route"
+                );
+                hb_provider = None;
+                hb_model = None;
+            }
             if let Err(e) =
-                crate::agent::run(config.clone(), Some(prompt), None, None, temp, vec![]).await
+                crate::agent::run(config.clone(), Some(prompt), hb_provider, hb_model, temp, vec![]).await
             {
                 crate::health::mark_component_error("heartbeat", e.to_string());
                 tracing::warn!("Heartbeat task failed: {e}");
@@ -323,6 +363,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            speech_to_text: crate::config::TelegramSpeechToTextConfig::default(),
         });
         assert!(has_supervised_channels(&config));
     }

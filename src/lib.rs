@@ -54,6 +54,8 @@ pub mod heartbeat;
 pub mod identity;
 pub mod integrations;
 pub mod memory;
+#[cfg(feature = "embedded-brain")]
+pub mod brain;
 pub mod migration;
 pub mod multimodal;
 pub mod observability;

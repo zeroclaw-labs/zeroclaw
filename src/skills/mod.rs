@@ -380,8 +380,11 @@ fn write_xml_text_element(out: &mut String, indent: usize, tag: &str, value: &st
     out.push_str(">\n");
 }
 
-/// Build the "Available Skills" system prompt section with full skill instructions.
-pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
+/// Build a lightweight "Available Skills" catalog for the system prompt.
+///
+/// Only includes name + description (no full instructions).
+/// The agent loads full skill details on-demand via the `skill_read` tool.
+pub fn skills_to_prompt(skills: &[Skill], _workspace_dir: &Path) -> String {
     use std::fmt::Write;
 
     if skills.is_empty() {
@@ -390,49 +393,99 @@ pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
 
     let mut prompt = String::from(
         "## Available Skills\n\n\
-         Skill instructions and tool metadata are preloaded below.\n\
-         Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
-         <available_skills>\n",
+         Skills are loaded on demand. Use the `skill_read` tool with the skill name to get full instructions before using a skill.\n\n\
+         <skill_catalog>\n",
     );
 
     for skill in skills {
         let _ = writeln!(prompt, "  <skill>");
         write_xml_text_element(&mut prompt, 4, "name", &skill.name);
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
-
-        let location = skill.location.clone().unwrap_or_else(|| {
-            workspace_dir
-                .join("skills")
-                .join(&skill.name)
-                .join("SKILL.md")
-        });
-        write_xml_text_element(&mut prompt, 4, "location", &location.display().to_string());
-
-        if !skill.prompts.is_empty() {
-            let _ = writeln!(prompt, "    <instructions>");
-            for instruction in &skill.prompts {
-                write_xml_text_element(&mut prompt, 6, "instruction", instruction);
-            }
-            let _ = writeln!(prompt, "    </instructions>");
-        }
-
-        if !skill.tools.is_empty() {
-            let _ = writeln!(prompt, "    <tools>");
-            for tool in &skill.tools {
-                let _ = writeln!(prompt, "      <tool>");
-                write_xml_text_element(&mut prompt, 8, "name", &tool.name);
-                write_xml_text_element(&mut prompt, 8, "description", &tool.description);
-                write_xml_text_element(&mut prompt, 8, "kind", &tool.kind);
-                let _ = writeln!(prompt, "      </tool>");
-            }
-            let _ = writeln!(prompt, "    </tools>");
-        }
-
         let _ = writeln!(prompt, "  </skill>");
     }
 
-    prompt.push_str("</available_skills>");
+    prompt.push_str("</skill_catalog>");
     prompt
+}
+
+/// Read the full content of a skill by name.
+///
+/// Searches workspace skills and open-skills directories. Returns the full
+/// SKILL.md / SKILL.toml content, or `None` if not found.
+pub fn read_skill_content(skill_name: &str, workspace_dir: &Path) -> Option<String> {
+    // Check workspace skills first
+    let ws_skill_dir = workspace_dir.join("skills").join(skill_name);
+    if let Some(content) = try_read_skill_dir(&ws_skill_dir) {
+        return Some(content);
+    }
+
+    // Check open-skills repo
+    if let Some(open_dir) = resolve_open_skills_dir() {
+        let open_skill_dir = open_dir.join("skills").join(skill_name);
+        if let Some(content) = try_read_skill_dir(&open_skill_dir) {
+            return Some(content);
+        }
+        // Open-skills may also have top-level .md files
+        let open_md = open_dir.join(format!("{skill_name}.md"));
+        if open_md.is_file() {
+            return std::fs::read_to_string(&open_md).ok();
+        }
+    }
+
+    None
+}
+
+/// Try to read skill content from a skill directory (SKILL.md or SKILL.toml).
+fn try_read_skill_dir(dir: &Path) -> Option<String> {
+    let md_path = dir.join("SKILL.md");
+    if md_path.is_file() {
+        return std::fs::read_to_string(&md_path).ok();
+    }
+    let toml_path = dir.join("SKILL.toml");
+    if toml_path.is_file() {
+        return std::fs::read_to_string(&toml_path).ok();
+    }
+    None
+}
+
+/// List all available skill names (lightweight — no content loading).
+pub fn list_skill_names(workspace_dir: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+
+    // Workspace skills
+    let ws_skills = workspace_dir.join("skills");
+    if let Ok(entries) = std::fs::read_dir(&ws_skills) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.join("SKILL.md").exists() || path.join("SKILL.toml").exists() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Open-skills
+    if let Some(open_dir) = resolve_open_skills_dir() {
+        let skills_subdir = open_dir.join("skills");
+        if let Ok(entries) = std::fs::read_dir(&skills_subdir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && path.join("SKILL.md").exists() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if !names.contains(&name.to_string()) {
+                            names.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    names.sort();
+    names
 }
 
 /// Get the skills directory path

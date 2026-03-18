@@ -3,6 +3,15 @@ use crate::config::schema::QueryClassificationConfig;
 /// Classify a user message against the configured rules and return the
 /// matching hint string, if any.
 ///
+/// Uses weighted Q-value scoring rather than first-match priority:
+/// - Each matching keyword contributes +1 to the rule's score
+/// - Each matching pattern contributes +2 (more specific signal)
+/// - Rule `priority` is added on top (acts as a bias / prior confidence)
+///
+/// All rules are evaluated; the hint with the highest composite score wins.
+/// This means a security rule with 3 keyword hits beats a coder rule with
+/// priority=10 but only 1 hit — which is the desired routing behaviour.
+///
 /// Returns `None` when classification is disabled, no rules are configured,
 /// or no rule matches the message.
 pub fn classify(config: &QueryClassificationConfig, message: &str) -> Option<String> {
@@ -13,11 +22,11 @@ pub fn classify(config: &QueryClassificationConfig, message: &str) -> Option<Str
     let lower = message.to_lowercase();
     let len = message.len();
 
-    let mut rules: Vec<_> = config.rules.iter().collect();
-    rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+    let mut best_hint: Option<String> = None;
+    let mut best_score: i64 = 0;
 
-    for rule in rules {
-        // Length constraints
+    for rule in &config.rules {
+        // Length constraints act as hard gates — skip the rule entirely
         if let Some(min) = rule.min_length {
             if len < min {
                 continue;
@@ -29,22 +38,35 @@ pub fn classify(config: &QueryClassificationConfig, message: &str) -> Option<Str
             }
         }
 
-        // Check keywords (case-insensitive) and patterns (case-sensitive)
-        let keyword_hit = rule
+        // Count how many keywords and patterns fire
+        let keyword_hits: i64 = rule
             .keywords
             .iter()
-            .any(|kw: &String| lower.contains(&kw.to_lowercase()));
-        let pattern_hit = rule
+            .filter(|kw| lower.contains(&kw.to_lowercase()))
+            .count() as i64;
+
+        let pattern_hits: i64 = rule
             .patterns
             .iter()
-            .any(|pat: &String| message.contains(pat.as_str()));
+            .filter(|pat| message.contains(pat.as_str()))
+            .count() as i64;
 
-        if keyword_hit || pattern_hit {
-            return Some(rule.hint.clone());
+        let total_hits = keyword_hits + pattern_hits;
+        if total_hits == 0 {
+            continue; // rule did not fire at all
+        }
+
+        // Q-value: weighted hits + priority bias
+        // patterns count double (more specific than keywords)
+        let score: i64 = keyword_hits + pattern_hits * 2 + rule.priority as i64;
+
+        if best_hint.is_none() || score > best_score {
+            best_score = score;
+            best_hint = Some(rule.hint.clone());
         }
     }
 
-    None
+    best_hint
 }
 
 #[cfg(test)]

@@ -4,7 +4,8 @@ use crate::config::schema::{
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
     HeartbeatConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
-    RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
+    ProvenanceConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig,
+    TelegramSpeechToTextConfig, WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
@@ -182,6 +183,7 @@ pub async fn run_wizard() -> Result<Config> {
         agents: std::collections::HashMap::new(),
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
+        provenance: ProvenanceConfig::default(),
     };
 
     println!(
@@ -401,6 +403,7 @@ pub async fn run_quick_setup(
         agents: std::collections::HashMap::new(),
         hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
+        provenance: ProvenanceConfig::default(),
     };
 
     config.save().await?;
@@ -555,7 +558,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "minimax" => "MiniMax-M2.5".into(),
         "qwen" => "qwen-plus".into(),
         "qwen-code" => "qwen3-coder-plus".into(),
-        "ollama" => "llama3.2".into(),
+        "ollama" => "qwen3.5:9b".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
@@ -883,12 +886,12 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "ollama" => vec![
             (
-                "llama3.2".to_string(),
-                "Llama 3.2 (recommended local)".to_string(),
+                "qwen3.5:9b".to_string(),
+                "Qwen 3.5 9B (recommended local)".to_string(),
             ),
+            ("qwen3.5:0.8b".to_string(), "Qwen 3.5 0.8B (small, fast)".to_string()),
+            ("qwen3.5:27b".to_string(), "Qwen 3.5 27B (best local code)".to_string()),
             ("mistral".to_string(), "Mistral 7B".to_string()),
-            ("codellama".to_string(), "Code Llama".to_string()),
-            ("phi3".to_string(), "Phi-3 (small, fast)".to_string()),
         ],
         "bedrock" => vec![
             (
@@ -2834,6 +2837,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     draft_update_interval_ms: 1000,
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    speech_to_text: TelegramSpeechToTextConfig::default(),
                 });
             }
             ChannelMenuChoice::Discord => {
@@ -5481,16 +5485,16 @@ mod tests {
     fn parse_ollama_model_ids_extracts_and_deduplicates_names() {
         let payload = json!({
             "models": [
-                {"name": "llama3.2:latest"},
+                {"name": "qwen3.5:9b"},
                 {"name": "mistral:latest"},
-                {"name": "llama3.2:latest"}
+                {"name": "qwen3.5:9b"}
             ]
         });
 
         let ids = parse_ollama_model_ids(&payload);
         assert_eq!(
             ids,
-            vec!["llama3.2:latest".to_string(), "mistral:latest".to_string()]
+            vec!["qwen3.5:9b".to_string(), "mistral:latest".to_string()]
         );
     }
 

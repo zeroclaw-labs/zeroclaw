@@ -20,7 +20,8 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::Stdio;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -201,6 +202,7 @@ impl CopilotProvider {
         Self {
             github_token: github_token
                 .filter(|token| !token.is_empty())
+                .filter(|token| !token.eq_ignore_ascii_case("YOUR_GITHUB_PAT"))
                 .map(String::from),
             refresh_lock: Arc::new(Mutex::new(None)),
             token_dir,
@@ -209,6 +211,203 @@ impl CopilotProvider {
 
     fn http_client(&self) -> Client {
         crate::config::build_runtime_proxy_client_with_timeouts("provider.copilot", 120, 10)
+    }
+
+    /// Check if the official Copilot CLI is installed.
+    ///
+    /// NOTE: The CLI path is disabled because it leaks session state to
+    /// VS Code Copilot Chat and doesn't support native tool calls.
+    /// We always use the direct HTTP API instead.
+    fn official_cli_available() -> bool {
+        false
+    }
+
+    fn truncate_for_cli(text: &str, max_chars: usize) -> String {
+        let char_count = text.chars().count();
+        if char_count <= max_chars {
+            return text.to_string();
+        }
+
+        let truncated: String = text.chars().take(max_chars).collect();
+        format!("{truncated}\n...[truncated]...")
+    }
+
+    fn build_cli_prompt(messages: &[ChatMessage]) -> String {
+        let mut prompt = String::from(
+            "You are acting as the language model backend inside another agent loop. \
+Do not use your own CLI tools, shell access, file editing, web fetches, or MCP integrations. \
+Respond only as the assistant for the conversation below. \
+If the system prompt contains tool-use instructions, follow them as plain-text response formatting instructions.\n\n",
+        );
+
+        let system_message = messages.iter().rev().find(|message| message.role == "system");
+        if let Some(system_message) = system_message {
+            let _ = std::fmt::Write::write_fmt(
+                &mut prompt,
+                format_args!(
+                    "[SYSTEM]\n{}\n\n",
+                    Self::truncate_for_cli(&system_message.content, 4000)
+                ),
+            );
+        }
+
+        let recent_messages: Vec<&ChatMessage> = messages
+            .iter()
+            .filter(|message| message.role != "system")
+            .rev()
+            .take(6)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        for message in recent_messages {
+            let role = message.role.to_ascii_uppercase();
+            let content_limit = if message.role == "user" { 3000 } else { 2000 };
+            let _ = std::fmt::Write::write_fmt(
+                &mut prompt,
+                format_args!(
+                    "[{role}]\n{}\n\n",
+                    Self::truncate_for_cli(&message.content, content_limit)
+                ),
+            );
+        }
+
+        prompt
+    }
+
+    fn build_compact_tool_instructions(tools: &[crate::tools::ToolSpec]) -> String {
+        let mut instructions = String::from(
+            "## Tool Use Protocol\n\n\
+To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n\
+<tool_call>\n\
+{\"name\":\"tool_name\",\"arguments\":{\"param\":\"value\"}}\n\
+</tool_call>\n\n\
+Output actual <tool_call> tags when you need a tool. After tool execution, results appear in <tool_result> tags. Continue until you can give a final answer.\n\n\
+### Available Tools\n\n",
+        );
+
+        for tool in tools {
+            let arg_names = tool
+                .parameters
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let args = if arg_names.is_empty() {
+                String::from("none")
+            } else {
+                arg_names.join(", ")
+            };
+            let _ = std::fmt::Write::write_fmt(
+                &mut instructions,
+                format_args!("- {}: {} | args: {}\n", tool.name, tool.description, args),
+            );
+        }
+
+        instructions
+    }
+
+    fn parse_cli_response(output: &str) -> anyhow::Result<ProviderChatResponse> {
+        let mut final_text: Option<String> = None;
+
+        for line in output.lines().filter(|line| !line.trim().is_empty()) {
+            let value: serde_json::Value = match serde_json::from_str(line) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            if value.get("type").and_then(serde_json::Value::as_str)
+                == Some("assistant.message")
+            {
+                final_text = value
+                    .get("data")
+                    .and_then(|data| data.get("content"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string);
+            }
+        }
+
+        match final_text {
+            Some(text) if !text.trim().is_empty() => Ok(ProviderChatResponse {
+                text: Some(text),
+                tool_calls: Vec::new(),
+            }),
+            _ => anyhow::bail!("Official Copilot CLI returned no assistant message"),
+        }
+    }
+
+    async fn send_official_cli_request(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let prompt = Self::build_cli_prompt(messages);
+        let mut command = tokio::process::Command::new("copilot");
+        command.args([
+                "--output-format",
+                "json",
+                "--model",
+                model,
+                "--disable-builtin-mcps",
+                "--no-custom-instructions",
+                "--no-ask-user",
+                "-p",
+                &prompt,
+            ]);
+        // Zara loads workspace .env into the parent process. If it contains a
+        // generic GitHub token, the official Copilot CLI will prefer that over
+        // its own persisted auth state and then reject it as unsupported.
+        // Scrub those vars for this subprocess so the CLI can use its native
+        // auth/session storage instead.
+        command.env_remove("GITHUB_TOKEN");
+        command.env_remove("GH_TOKEN");
+        command.env_remove("COPILOT_GITHUB_TOKEN");
+
+        let output = command.stdin(Stdio::inherit()).output().await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Official Copilot CLI failed: {}", stderr.trim());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Self::parse_cli_response(&stdout)
+    }
+
+    fn github_token_from_env() -> Option<String> {
+        for env_var in ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
+            if let Ok(value) = std::env::var(env_var) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("YOUR_GITHUB_PAT") {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+
+        None
+    }
+
+    async fn github_token_from_gh_cli() -> Option<String> {
+        let output = tokio::process::Command::new("gh")
+            .args(["auth", "token"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .await
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let token = String::from_utf8(output.stdout).ok()?;
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     }
 
     /// Required headers for Copilot API requests (editor identification).
@@ -420,12 +619,20 @@ impl CopilotProvider {
             return Ok(token.clone());
         }
 
+        if let Some(token) = Self::github_token_from_env() {
+            return Ok(token);
+        }
+
         let access_token_path = self.token_dir.join("access-token");
         if let Ok(cached) = tokio::fs::read_to_string(&access_token_path).await {
             let token = cached.trim();
             if !token.is_empty() {
                 return Ok(token.to_string());
             }
+        }
+
+        if let Some(token) = Self::github_token_from_gh_cli().await {
+            return Ok(token);
         }
 
         let token = self.device_code_login().await?;
@@ -589,6 +796,17 @@ impl Provider for CopilotProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
+        if Self::official_cli_available() {
+            let mut messages = Vec::new();
+            if let Some(system) = system_prompt {
+                messages.push(ChatMessage::system(system.to_string()));
+            }
+            messages.push(ChatMessage::user(message.to_string()));
+
+            let response = self.send_official_cli_request(&messages, model).await?;
+            return Ok(response.text.unwrap_or_default());
+        }
+
         let mut messages = Vec::new();
         if let Some(system) = system_prompt {
             messages.push(ApiMessage {
@@ -617,6 +835,11 @@ impl Provider for CopilotProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
+        if Self::official_cli_available() {
+            let response = self.send_official_cli_request(messages, model).await?;
+            return Ok(response.text.unwrap_or_default());
+        }
+
         let response = self
             .send_chat_request(Self::convert_messages(messages), None, model, temperature)
             .await?;
@@ -629,6 +852,28 @@ impl Provider for CopilotProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
+        if Self::official_cli_available() {
+            let mut modified_messages = request.messages.to_vec();
+
+            if let Some(tools) = request.tools {
+                if !tools.is_empty() {
+                    let tool_instructions = Self::build_compact_tool_instructions(tools);
+                    if let Some(system_message) =
+                        modified_messages.iter_mut().find(|message| message.role == "system")
+                    {
+                        if !system_message.content.is_empty() {
+                            system_message.content.push_str("\n\n");
+                        }
+                        system_message.content.push_str(&tool_instructions);
+                    } else {
+                        modified_messages.insert(0, ChatMessage::system(tool_instructions));
+                    }
+                }
+            }
+
+            return self.send_official_cli_request(&modified_messages, model).await;
+        }
+
         self.send_chat_request(
             Self::convert_messages(request.messages),
             request.tools,
@@ -639,10 +884,23 @@ impl Provider for CopilotProvider {
     }
 
     fn supports_native_tools(&self) -> bool {
-        true
+        // The Copilot HTTP API supports native OpenAI-style tool calls.
+        // The official CLI does not — it needs prompt-guided injection.
+        !Self::official_cli_available()
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
+        if Self::official_cli_available() {
+            tokio::process::Command::new("copilot")
+                .arg("version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .await?;
+            return Ok(());
+        }
+
         let _ = self.get_api_key().await?;
         Ok(())
     }
@@ -667,6 +925,15 @@ mod tests {
     #[test]
     fn empty_token_treated_as_none() {
         let provider = CopilotProvider::new(Some(""));
+        assert!(provider.github_token.is_none());
+    }
+
+    #[test]
+    fn placeholder_token_treated_as_none() {
+        let provider = CopilotProvider::new(Some("YOUR_GITHUB_PAT"));
+        assert!(provider.github_token.is_none());
+        // Case-insensitive
+        let provider = CopilotProvider::new(Some("your_github_pat"));
         assert!(provider.github_token.is_none());
     }
 
@@ -696,8 +963,13 @@ mod tests {
     }
 
     #[test]
-    fn supports_native_tools() {
+    fn supports_native_tools_when_no_cli() {
+        // When the official `copilot` CLI binary is not installed (typical
+        // on Linux servers), the provider uses the HTTP API path which
+        // supports native OpenAI-style tool calls.
         let provider = CopilotProvider::new(None);
-        assert!(provider.supports_native_tools());
+        if !CopilotProvider::official_cli_available() {
+            assert!(provider.supports_native_tools());
+        }
     }
 }
