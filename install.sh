@@ -1359,6 +1359,12 @@ if [[ -n "$TARGET_VERSION" ]]; then
   step_dot "Installing ZeroClaw v${TARGET_VERSION}"
 fi
 if [[ "$SKIP_BUILD" == false ]]; then
+  # Clean stale build artifacts on upgrade to prevent bindgen/build-script
+  # cache mismatches (e.g. libsqlite3-sys bindgen.rs not found).
+  if [[ "$INSTALL_MODE" == "upgrade" && -d "$WORK_DIR/target/release/build" ]]; then
+    step_dot "Cleaning stale build cache (upgrade detected)"
+    cargo clean --release 2>/dev/null || true
+  fi
   step_dot "Building release binary"
   cargo build --release --locked
   step_ok "Release binary built"

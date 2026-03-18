@@ -387,7 +387,7 @@ mod tests {
             use std::io::Write;
             let dir = std::env::temp_dir().join("zeroclaw_test_claude_code");
             std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("fake_claude.sh");
+            let path = dir.join(format!("fake_claude_{}.sh", std::process::id()));
             let mut f = std::fs::File::create(&path).unwrap();
             writeln!(f, "#!/bin/sh\ncat /dev/stdin").unwrap();
             drop(f);
