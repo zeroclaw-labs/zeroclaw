@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -32,6 +32,29 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+
+/// Callback type for checking if model has been switched during tool execution.
+/// Returns Some((provider, model)) if a switch was requested, None otherwise.
+pub type ModelSwitchCallback = Arc<Mutex<Option<(String, String)>>>;
+
+/// Global model switch request state - used for runtime model switching via model_switch tool.
+/// This is set by the model_switch tool and checked by the agent loop.
+#[allow(clippy::type_complexity)]
+static MODEL_SWITCH_REQUEST: LazyLock<Arc<Mutex<Option<(String, String)>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(None)));
+
+/// Get the global model switch request state
+pub fn get_model_switch_state() -> ModelSwitchCallback {
+    Arc::clone(&MODEL_SWITCH_REQUEST)
+}
+
+/// Clear any pending model switch request
+pub fn clear_model_switch_request() {
+    if let Ok(guard) = MODEL_SWITCH_REQUEST.lock() {
+        let mut guard = guard;
+        *guard = None;
+    }
+}
 
 fn glob_match(pattern: &str, name: &str) -> bool {
     match pattern.find('*') {
@@ -2118,6 +2141,31 @@ pub(crate) fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
+#[derive(Debug)]
+pub(crate) struct ModelSwitchRequested {
+    pub provider: String,
+    pub model: String,
+}
+
+impl std::fmt::Display for ModelSwitchRequested {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "model switch requested to {} {}",
+            self.provider, self.model
+        )
+    }
+}
+
+impl std::error::Error for ModelSwitchRequested {}
+
+pub(crate) fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)> {
+    err.chain()
+        .filter_map(|source| source.downcast_ref::<ModelSwitchRequested>())
+        .map(|e| (e.provider.clone(), e.model.clone()))
+        .next()
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
@@ -2137,6 +2185,7 @@ pub(crate) async fn agent_turn(
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    model_switch_callback: Option<ModelSwitchCallback>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -2157,6 +2206,7 @@ pub(crate) async fn agent_turn(
         excluded_tools,
         dedup_exempt_tools,
         activated_tools,
+        model_switch_callback,
     )
     .await
 }
@@ -2362,6 +2412,7 @@ pub(crate) async fn run_tool_call_loop(
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    model_switch_callback: Option<ModelSwitchCallback>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2378,6 +2429,28 @@ pub(crate) async fn run_tool_call_loop(
             .is_some_and(CancellationToken::is_cancelled)
         {
             return Err(ToolLoopCancelled.into());
+        }
+
+        // Check if model switch was requested via model_switch tool
+        if let Some(ref callback) = model_switch_callback {
+            if let Ok(guard) = callback.lock() {
+                if let Some((new_provider, new_model)) = guard.as_ref() {
+                    if new_provider != provider_name || new_model != model {
+                        tracing::info!(
+                            "Model switch detected: {} {} -> {} {}",
+                            provider_name,
+                            model,
+                            new_provider,
+                            new_model
+                        );
+                        return Err(ModelSwitchRequested {
+                            provider: new_provider.clone(),
+                            model: new_model.clone(),
+                        }
+                        .into());
+                    }
+                }
+            }
         }
 
         // Rebuild tool_specs each iteration so newly activated deferred tools appear.
@@ -3199,27 +3272,31 @@ pub async fn run(
     }
 
     // ── Resolve provider ─────────────────────────────────────────
-    let provider_name = provider_override
+    let mut provider_name = provider_override
         .as_deref()
         .or(config.default_provider.as_deref())
-        .unwrap_or("openrouter");
+        .unwrap_or("openrouter")
+        .to_string();
 
-    let model_name = model_override
+    let mut model_name = model_override
         .as_deref()
         .or(config.default_model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4");
+        .unwrap_or("anthropic/claude-sonnet-4")
+        .to_string();
 
     let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
 
-    let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
-        provider_name,
+    let mut provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
+        &provider_name,
         config.api_key.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
         &config.model_routes,
-        model_name,
+        &model_name,
         &provider_runtime_options,
     )?;
+
+    let model_switch_callback = get_model_switch_state();
 
     observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.to_string(),
@@ -3364,7 +3441,7 @@ pub async fn run(
     let native_tools = provider.supports_native_tools();
     let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
-        model_name,
+        &model_name,
         &tool_descs,
         &skills,
         Some(&config.identity),
@@ -3447,27 +3524,72 @@ pub async fn run(
         let excluded_tools =
             compute_excluded_mcp_tools(&tools_registry, &config.agent.tool_filter_groups, &msg);
 
-        let response = run_tool_call_loop(
-            provider.as_ref(),
-            &mut history,
-            &tools_registry,
-            observer.as_ref(),
-            provider_name,
-            model_name,
-            temperature,
-            false,
-            approval_manager.as_ref(),
-            channel_name,
-            &config.multimodal,
-            config.agent.max_tool_iterations,
-            None,
-            None,
-            None,
-            &excluded_tools,
-            &config.agent.tool_call_dedup_exempt,
-            activated_handle.as_ref(),
-        )
-        .await?;
+        #[allow(unused_assignments)]
+        let mut response = String::new();
+        loop {
+            match run_tool_call_loop(
+                provider.as_ref(),
+                &mut history,
+                &tools_registry,
+                observer.as_ref(),
+                &provider_name,
+                &model_name,
+                temperature,
+                false,
+                approval_manager.as_ref(),
+                channel_name,
+                &config.multimodal,
+                config.agent.max_tool_iterations,
+                None,
+                None,
+                None,
+                &excluded_tools,
+                &config.agent.tool_call_dedup_exempt,
+                activated_handle.as_ref(),
+                Some(model_switch_callback.clone()),
+            )
+            .await
+            {
+                Ok(resp) => {
+                    response = resp;
+                    break;
+                }
+                Err(e) => {
+                    if let Some((new_provider, new_model)) = is_model_switch_requested(&e) {
+                        tracing::info!(
+                            "Model switch requested, switching from {} {} to {} {}",
+                            provider_name,
+                            model_name,
+                            new_provider,
+                            new_model
+                        );
+
+                        provider = providers::create_routed_provider_with_options(
+                            &new_provider,
+                            config.api_key.as_deref(),
+                            config.api_url.as_deref(),
+                            &config.reliability,
+                            &config.model_routes,
+                            &new_model,
+                            &provider_runtime_options,
+                        )?;
+
+                        provider_name = new_provider;
+                        model_name = new_model;
+
+                        clear_model_switch_request();
+
+                        observer.record_event(&ObserverEvent::AgentStart {
+                            provider: provider_name.to_string(),
+                            model: model_name.to_string(),
+                        });
+
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
         final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
@@ -3609,32 +3731,66 @@ pub async fn run(
                 &user_input,
             );
 
-            let response = match run_tool_call_loop(
-                provider.as_ref(),
-                &mut history,
-                &tools_registry,
-                observer.as_ref(),
-                provider_name,
-                model_name,
-                temperature,
-                false,
-                approval_manager.as_ref(),
-                channel_name,
-                &config.multimodal,
-                config.agent.max_tool_iterations,
-                None,
-                None,
-                None,
-                &excluded_tools,
-                &config.agent.tool_call_dedup_exempt,
-                activated_handle.as_ref(),
-            )
-            .await
-            {
-                Ok(resp) => resp,
-                Err(e) => {
-                    eprintln!("\nError: {e}\n");
-                    continue;
+            let response = loop {
+                match run_tool_call_loop(
+                    provider.as_ref(),
+                    &mut history,
+                    &tools_registry,
+                    observer.as_ref(),
+                    &provider_name,
+                    &model_name,
+                    temperature,
+                    false,
+                    approval_manager.as_ref(),
+                    channel_name,
+                    &config.multimodal,
+                    config.agent.max_tool_iterations,
+                    None,
+                    None,
+                    None,
+                    &excluded_tools,
+                    &config.agent.tool_call_dedup_exempt,
+                    activated_handle.as_ref(),
+                    Some(model_switch_callback.clone()),
+                )
+                .await
+                {
+                    Ok(resp) => break resp,
+                    Err(e) => {
+                        if let Some((new_provider, new_model)) = is_model_switch_requested(&e) {
+                            tracing::info!(
+                                "Model switch requested, switching from {} {} to {} {}",
+                                provider_name,
+                                model_name,
+                                new_provider,
+                                new_model
+                            );
+
+                            provider = providers::create_routed_provider_with_options(
+                                &new_provider,
+                                config.api_key.as_deref(),
+                                config.api_url.as_deref(),
+                                &config.reliability,
+                                &config.model_routes,
+                                &new_model,
+                                &provider_runtime_options,
+                            )?;
+
+                            provider_name = new_provider;
+                            model_name = new_model;
+
+                            clear_model_switch_request();
+
+                            observer.record_event(&ObserverEvent::AgentStart {
+                                provider: provider_name.to_string(),
+                                model: model_name.to_string(),
+                            });
+
+                            continue;
+                        }
+                        eprintln!("\nError: {e}\n");
+                        break String::new();
+                    }
                 }
             };
             final_output = response.clone();
@@ -3652,7 +3808,7 @@ pub async fn run(
             if let Ok(compacted) = auto_compact_history(
                 &mut history,
                 provider.as_ref(),
-                model_name,
+                &model_name,
                 config.agent.max_history_messages,
                 config.agent.max_context_tokens,
             )
@@ -3946,6 +4102,7 @@ pub async fn process_message(
         &excluded_tools,
         &config.agent.tool_call_dedup_exempt,
         activated_handle_pm.as_ref(),
+        None,
     )
     .await
 }
@@ -4403,6 +4560,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -4451,6 +4609,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -4492,6 +4651,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
         )
         .await
@@ -4621,6 +4781,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -4692,6 +4853,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4759,6 +4921,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -4816,6 +4979,7 @@ mod tests {
             None,
             &[],
             &exempt,
+            None,
             None,
         )
         .await
@@ -4895,6 +5059,7 @@ mod tests {
             &[],
             &exempt,
             None,
+            None,
         )
         .await
         .expect("loop should complete");
@@ -4949,6 +5114,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
         )
         .await
@@ -5018,6 +5184,7 @@ mod tests {
                 &[],
                 &[],
                 Some(&activated),
+                None,
             )
             .await
             .expect("wrapper path should execute activated tools");
@@ -6908,6 +7075,7 @@ Let me check the result."#;
             None,
             &[],
             &[],
+            None,
             None,
         )
         .await
