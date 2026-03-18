@@ -4511,6 +4511,10 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// Whether to send acknowledgement reactions (👀, ✅, ⚠️).
+    /// If omitted, falls back to the top-level `channels_config.ack_reactions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_reactions: Option<bool>,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -8360,6 +8364,8 @@ default_temperature = 0.7
                     draft_update_interval_ms: default_draft_update_interval_ms(),
                     interrupt_on_new_message: false,
                     mention_only: false,
+
+                    ack_reactions: None,
                 }),
                 discord: None,
                 slack: None,
@@ -8942,6 +8948,8 @@ tool_dispatcher = "xml"
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
             mention_only: false,
+
+            ack_reactions: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -11256,6 +11264,8 @@ require_otp_to_resume = true
             draft_update_interval_ms: default_draft_update_interval_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
+
+            ack_reactions: None,
         });
 
         // Save (triggers encryption)
