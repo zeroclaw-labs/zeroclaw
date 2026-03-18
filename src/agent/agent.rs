@@ -33,10 +33,13 @@ pub struct Agent {
     skills: Vec<crate::skills::Skill>,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     auto_save: bool,
+    memory_session_id: Option<String>,
     history: Vec<ConversationMessage>,
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
     route_model_by_hint: HashMap<String, String>,
+    allowed_tools: Option<Vec<String>>,
+    response_cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
 }
 
 pub struct AgentBuilder {
@@ -55,9 +58,12 @@ pub struct AgentBuilder {
     skills: Option<Vec<crate::skills::Skill>>,
     skills_prompt_mode: Option<crate::config::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
+    memory_session_id: Option<String>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
     route_model_by_hint: Option<HashMap<String, String>>,
+    allowed_tools: Option<Vec<String>>,
+    response_cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
 }
 
 impl AgentBuilder {
@@ -78,9 +84,12 @@ impl AgentBuilder {
             skills: None,
             skills_prompt_mode: None,
             auto_save: None,
+            memory_session_id: None,
             classification_config: None,
             available_hints: None,
             route_model_by_hint: None,
+            allowed_tools: None,
+            response_cache: None,
         }
     }
 
@@ -162,6 +171,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn memory_session_id(mut self, memory_session_id: Option<String>) -> Self {
+        self.memory_session_id = memory_session_id;
+        self
+    }
+
     pub fn classification_config(
         mut self,
         classification_config: crate::config::QueryClassificationConfig,
@@ -180,10 +194,27 @@ impl AgentBuilder {
         self
     }
 
+    pub fn allowed_tools(mut self, allowed_tools: Option<Vec<String>>) -> Self {
+        self.allowed_tools = allowed_tools;
+        self
+    }
+
+    pub fn response_cache(
+        mut self,
+        cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
+    ) -> Self {
+        self.response_cache = cache;
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
-        let tools = self
+        let mut tools = self
             .tools
             .ok_or_else(|| anyhow::anyhow!("tools are required"))?;
+        let allowed = self.allowed_tools.clone();
+        if let Some(ref allow_list) = allowed {
+            tools.retain(|t| allow_list.iter().any(|name| name == t.name()));
+        }
         let tool_specs = tools.iter().map(|tool| tool.spec()).collect();
 
         Ok(Agent {
@@ -219,10 +250,13 @@ impl AgentBuilder {
             skills: self.skills.unwrap_or_default(),
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
+            memory_session_id: self.memory_session_id,
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
+            allowed_tools: allowed,
+            response_cache: self.response_cache,
         })
     }
 }
@@ -238,6 +272,29 @@ impl Agent {
 
     pub fn clear_history(&mut self) {
         self.history.clear();
+    }
+
+    pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
+        self.memory_session_id = session_id;
+    }
+
+    /// Hydrate the agent with prior chat messages (e.g. from a session backend).
+    ///
+    /// Ensures a system prompt is prepended if history is empty, then appends all
+    /// non-system messages from the seed. System messages in the seed are skipped
+    /// to avoid duplicating the system prompt.
+    pub fn seed_history(&mut self, messages: &[ChatMessage]) {
+        if self.history.is_empty() {
+            if let Ok(sys) = self.build_system_prompt() {
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::system(sys)));
+            }
+        }
+        for msg in messages {
+            if msg.role != "system" {
+                self.history.push(ConversationMessage::Chat(msg.clone()));
+            }
+        }
     }
 
     pub fn from_config(config: &Config) -> Result<Self> {
@@ -269,7 +326,7 @@ impl Agent {
             None
         };
 
-        let tools = tools::all_tools_with_runtime(
+        let (tools, _delegate_handle) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             runtime,
@@ -293,13 +350,16 @@ impl Agent {
             .unwrap_or("anthropic/claude-sonnet-4-20250514")
             .to_string();
 
-        let provider: Box<dyn Provider> = providers::create_routed_provider(
+        let provider_runtime_options = providers::provider_runtime_options_from_config(config);
+
+        let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
             provider_name,
             config.api_key.as_deref(),
             config.api_url.as_deref(),
             &config.reliability,
             &config.model_routes,
             &model_name,
+            &provider_runtime_options,
         )?;
 
         let dispatcher_choice = config.agent.tool_dispatcher.as_str();
@@ -317,11 +377,25 @@ impl Agent {
             .collect();
         let available_hints: Vec<String> = route_model_by_hint.keys().cloned().collect();
 
+        let response_cache = if config.memory.response_cache_enabled {
+            crate::memory::response_cache::ResponseCache::with_hot_cache(
+                &config.workspace_dir,
+                config.memory.response_cache_ttl_minutes,
+                config.memory.response_cache_max_entries,
+                config.memory.response_cache_hot_entries,
+            )
+            .ok()
+            .map(Arc::new)
+        } else {
+            None
+        };
+
         Agent::builder()
             .provider(provider)
             .tools(tools)
             .memory(memory)
             .observer(observer)
+            .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
             .memory_loader(Box::new(DefaultMemoryLoader::new(
                 5,
@@ -476,13 +550,22 @@ impl Agent {
         if self.auto_save {
             let _ = self
                 .memory
-                .store("user_msg", user_message, MemoryCategory::Conversation, None)
+                .store(
+                    "user_msg",
+                    user_message,
+                    MemoryCategory::Conversation,
+                    self.memory_session_id.as_deref(),
+                )
                 .await;
         }
 
         let context = self
             .memory_loader
-            .load_context(self.memory.as_ref(), user_message)
+            .load_context(
+                self.memory.as_ref(),
+                user_message,
+                self.memory_session_id.as_deref(),
+            )
             .await
             .unwrap_or_default();
 
@@ -500,6 +583,47 @@ impl Agent {
 
         for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+
+            // Response cache: check before LLM call (only for deterministic, text-only prompts)
+            let cache_key = if self.temperature == 0.0 {
+                self.response_cache.as_ref().map(|_| {
+                    let last_user = messages
+                        .iter()
+                        .rfind(|m| m.role == "user")
+                        .map(|m| m.content.as_str())
+                        .unwrap_or("");
+                    let system = messages
+                        .iter()
+                        .find(|m| m.role == "system")
+                        .map(|m| m.content.as_str());
+                    crate::memory::response_cache::ResponseCache::cache_key(
+                        &effective_model,
+                        system,
+                        last_user,
+                    )
+                })
+            } else {
+                None
+            };
+
+            if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                if let Ok(Some(cached)) = cache.get(key) {
+                    self.observer.record_event(&ObserverEvent::CacheHit {
+                        cache_type: "response".into(),
+                        tokens_saved: 0,
+                    });
+                    self.history
+                        .push(ConversationMessage::Chat(ChatMessage::assistant(
+                            cached.clone(),
+                        )));
+                    self.trim_history();
+                    return Ok(cached);
+                }
+                self.observer.record_event(&ObserverEvent::CacheMiss {
+                    cache_type: "response".into(),
+                });
+            }
+
             let response = match self
                 .provider
                 .chat(
@@ -527,6 +651,17 @@ impl Agent {
                 } else {
                     text
                 };
+
+                // Store in response cache (text-only, no tool calls)
+                if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                    let token_count = response
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.output_tokens)
+                        .unwrap_or(0);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let _ = cache.put(key, &effective_model, &final_text, token_count as u32);
+                }
 
                 self.history
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
@@ -891,5 +1026,201 @@ mod tests {
         assert_eq!(response, "classified");
         let seen = seen_models.lock();
         assert_eq!(seen.as_slice(), &["hint:fast".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn from_config_passes_extra_headers_to_custom_provider() {
+        use axum::{http::HeaderMap, routing::post, Json, Router};
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+
+        let captured_headers: Arc<std::sync::Mutex<Option<HashMap<String, String>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let captured_headers_clone = captured_headers.clone();
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(
+                move |headers: HeaderMap, Json(_body): Json<serde_json::Value>| {
+                    let captured_headers = captured_headers_clone.clone();
+                    async move {
+                        let collected = headers
+                            .iter()
+                            .filter_map(|(name, value)| {
+                                value
+                                    .to_str()
+                                    .ok()
+                                    .map(|value| (name.as_str().to_string(), value.to_string()))
+                            })
+                            .collect();
+                        *captured_headers.lock().unwrap() = Some(collected);
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "hello from mock"
+                                }
+                            }]
+                        }))
+                    }
+                },
+            ),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir;
+        config.config_path = tmp.path().join("config.toml");
+        config.api_key = Some("test-key".to_string());
+        config.default_provider = Some(format!("custom:http://{addr}"));
+        config.default_model = Some("test-model".to_string());
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.extra_headers.insert(
+            "User-Agent".to_string(),
+            "zeroclaw-web-test/1.0".to_string(),
+        );
+        config
+            .extra_headers
+            .insert("X-Title".to_string(), "zeroclaw-web".to_string());
+
+        let mut agent = Agent::from_config(&config).expect("agent from config");
+        let response = agent.turn("hello").await.expect("agent turn");
+
+        assert_eq!(response, "hello from mock");
+
+        let headers = captured_headers
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("captured headers");
+        assert_eq!(
+            headers.get("user-agent").map(String::as_str),
+            Some("zeroclaw-web-test/1.0")
+        );
+        assert_eq!(
+            headers.get("x-title").map(String::as_str),
+            Some("zeroclaw-web")
+        );
+
+        server_handle.abort();
+    }
+
+    #[test]
+    fn builder_allowed_tools_none_keeps_all_tools() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .allowed_tools(None)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        assert_eq!(agent.tool_specs.len(), 1);
+        assert_eq!(agent.tool_specs[0].name, "echo");
+    }
+
+    #[test]
+    fn builder_allowed_tools_some_filters_tools() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .allowed_tools(Some(vec!["nonexistent".to_string()]))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        assert!(
+            agent.tool_specs.is_empty(),
+            "No tools should match a non-existent allowlist entry"
+        );
+    }
+
+    #[test]
+    fn seed_history_prepends_system_and_skips_system_from_seed() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let seed = vec![
+            ChatMessage::system("old system prompt"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi there"),
+        ];
+        agent.seed_history(&seed);
+
+        let history = agent.history();
+        // First message should be a freshly built system prompt (not the seed one)
+        assert!(matches!(&history[0], ConversationMessage::Chat(m) if m.role == "system"));
+        // System message from seed should be skipped, so next is user
+        assert!(
+            matches!(&history[1], ConversationMessage::Chat(m) if m.role == "user" && m.content == "hello")
+        );
+        assert!(
+            matches!(&history[2], ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi there")
+        );
+        assert_eq!(history.len(), 3);
     }
 }

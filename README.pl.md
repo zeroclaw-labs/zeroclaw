@@ -17,7 +17,10 @@
   <a href="https://zeroclawlabs.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
   <a href="https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search"><img src="https://img.shields.io/badge/Xiaohongshu-Official-FF2442?style=flat" alt="Xiaohongshu: Official" /></a>
   <a href="https://t.me/zeroclawlabs"><img src="https://img.shields.io/badge/Telegram-%40zeroclawlabs-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @zeroclawlabs" /></a>
-  <a href="https://www.facebook.com/groups/zeroclaw"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
+  <a href="https://www.facebook.com/groups/zeroclawlabs"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
+  <a href="https://discord.com/invite/wDshRVqRjx"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
+  <a href="https://www.tiktok.com/@zeroclawlabs"><img src="https://img.shields.io/badge/TikTok-%40zeroclawlabs-000000?style=flat&logo=tiktok&logoColor=white" alt="TikTok: @zeroclawlabs" /></a>
+  <a href="https://www.rednote.com/user/profile/69b735e6000000002603927e"><img src="https://img.shields.io/badge/RedNote-Official-FF2442?style=flat" alt="RedNote" /></a>
   <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
 </p>
 <p align="center">
@@ -86,6 +89,16 @@ Zbudowany przez studentów i członków społeczności Harvard, MIT i Sundai.Clu
 
 <p align="center"><code>Architektura oparta na traitach · bezpieczny runtime domyślnie · wymienny dostawca/kanał/narzędzie · wszystko jest podłączalne</code></p>
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.3.1 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| ci | add Termux (aarch64-linux-android) release target |
+
+<!-- END:WHATS_NEW -->
+
 ### 📢 Ogłoszenia
 
 Użyj tej tabeli dla ważnych ogłoszeń (zmiany kompatybilności, powiadomienia bezpieczeństwa, okna serwisowe i blokady wersji).
@@ -93,7 +106,7 @@ Użyj tej tabeli dla ważnych ogłoszeń (zmiany kompatybilności, powiadomienia
 | Data (UTC) | Poziom      | Ogłoszenie                                                                                                                                                                                                                                                                                                                                                                                                              | Działanie                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ---------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 2026-02-19 | _Krytyczny_  | **Nie jesteśmy powiązani** z `openagen/zeroclaw` lub `zeroclaw.org`. Domena `zeroclaw.org` obecnie wskazuje na fork `openagen/zeroclaw`, i ta domena/repozytorium podszywa się pod naszą oficjalną stronę/projekt.                                                                                                                                                                                 | Nie ufaj informacjom, plikom binarnym, zbiórkom funduszy lub ogłoszeniom z tych źródeł. Używaj tylko [tego repozytorium](https://github.com/zeroclaw-labs/zeroclaw) i naszych zweryfikowanych kont społecznościowych.                                                                                                                                                                                                                                                                                                                                                          |
-| 2026-02-21 | _Ważne_ | Nasza oficjalna strona jest teraz online: [zeroclawlabs.ai](https://zeroclawlabs.ai). Dziękujemy za cierpliwość podczas oczekiwania. Nadal wykrywamy próby podszywania się: nie uczestnicz w żadnej działalności inwestycyjnej/finansowej w imieniu ZeroClaw jeśli nie jest opublikowana przez nasze oficjalne kanały.                                                                                                                   | Używaj [tego repozytorium](https://github.com/zeroclaw-labs/zeroclaw) jako jedynego źródła prawdy. Śledź [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Telegram (@zeroclawlabs)](https://t.me/zeroclawlabs), [Facebook (grupa)](https://www.facebook.com/groups/zeroclaw), [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/), i [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) dla oficjalnych aktualizacji. |
+| 2026-02-21 | _Ważne_ | Nasza oficjalna strona jest teraz online: [zeroclawlabs.ai](https://zeroclawlabs.ai). Dziękujemy za cierpliwość podczas oczekiwania. Nadal wykrywamy próby podszywania się: nie uczestnicz w żadnej działalności inwestycyjnej/finansowej w imieniu ZeroClaw jeśli nie jest opublikowana przez nasze oficjalne kanały.                                                                                                                   | Używaj [tego repozytorium](https://github.com/zeroclaw-labs/zeroclaw) jako jedynego źródła prawdy. Śledź [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Telegram (@zeroclawlabs)](https://t.me/zeroclawlabs), [Facebook (grupa)](https://www.facebook.com/groups/zeroclawlabs), [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/), i [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) dla oficjalnych aktualizacji. |
 | 2026-02-19 | _Ważne_ | Anthropic zaktualizował warunki używania uwierzytelniania i poświadczeń 2026-02-19. Uwierzytelnianie OAuth (Free, Pro, Max) jest wyłącznie dla Claude Code i Claude.ai; używanie tokenów OAuth Claude Free/Pro/Max w jakimkolwiek innym produkcie, narzędziu lub usłudze (w tym Agent SDK) nie jest dozwolone i może naruszać Warunki Użytkowania Konsumenta. | Prosimy tymczasowo unikać integracji OAuth Claude Code aby zapobiec potencjalnym stratom. Oryginalna klauzula: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).                                                                                                                                                                                                                                                                                                                      |
 
 ### ✨ Funkcje
@@ -363,443 +376,6 @@ zeroclaw version             # Pokazuje wersję i informacje o build
 
 Zobacz [Referencje Komend](docs/commands-reference.md) dla pełnych opcji i przykładów.
 
-## Architektura
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Kanały (trait)                           │
-│  Telegram │ Matrix │ Slack │ Discord │ Web │ CLI │ Custom       │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Orchestrator Agent                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │   Routing    │  │   Kontekst   │  │  Wykonanie   │          │
-│  │   Wiadomość  │  │   Pamięć     │  │   Narzędzie  │          │
-│  └──────────────┘  └──────────────┘  └──────────────┘          │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │
-          ┌───────────────┼───────────────┐
-          ▼               ▼               ▼
-┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│  Dostawcy    │  │   Pamięć     │  │  Narzędzia   │
-│   (trait)    │  │   (trait)    │  │   (trait)    │
-├──────────────┤  ├──────────────┤  ├──────────────┤
-│  Anthropic   │  │   Markdown   │  │  Filesystem  │
-│   OpenAI     │  │    SQLite    │  │     Bash     │
-│   Gemini     │  │     None     │  │   Web Fetch  │
-│   Ollama     │  │    Custom    │  │   Custom     │
-│   Custom     │  └──────────────┘  └──────────────┘
-└──────────────┘
-          │
-          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Runtime (trait)                               │
-│                  Native │ Docker                                │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**Kluczowe zasady:**
-
-- Wszystko jest **trait** — dostawcy, kanały, narzędzia, pamięć, tunele
-- Kanały wywołują orchestrator; orchestrator wywołuje dostawców + narzędzia
-- System pamięci zarządza kontekstem konwersacji (markdown, SQLite, lub brak)
-- Runtime abstrahuje wykonanie kodu (natywny lub Docker)
-- Brak blokady dostawcy — zamieniaj Anthropic ↔ OpenAI ↔ Gemini ↔ Ollama bez zmian kodu
-
-Zobacz [dokumentację architektury](docs/architecture.svg) dla szczegółowych diagramów i szczegółów implementacji.
-
-## Przykłady
-
-### Bot Telegram
-
-```toml
-[channels.telegram]
-enabled = true
-bot_token = "123456:ABC-DEF..."
-allowed_users = [987654321]  # Twój Telegram user ID
-```
-
-Uruchom daemon + agent, a następnie wyślij wiadomość do swojego bota na Telegram:
-
-```
-/start
-Cześć! Czy mógłbyś pomóc mi napisać skrypt Python?
-```
-
-Bot odpowiada kodem wygenerowanym przez AI, wykonuje narzędzia jeśli wymagane i utrzymuje kontekst konwersacji.
-
-### Matrix (szyfrowanie end-to-end)
-
-```toml
-[channels.matrix]
-enabled = true
-homeserver_url = "https://matrix.org"
-username = "@zeroclaw:matrix.org"
-password = "..."
-device_name = "zeroclaw-prod"
-e2ee_enabled = true
-```
-
-Zaproś `@zeroclaw:matrix.org` do zaszyfrowanego pokoju, a bot odpowie z pełnym szyfrowaniem. Zobacz [Przewodnik Matrix E2EE](docs/matrix-e2ee-guide.md) dla konfiguracji weryfikacji urządzenia.
-
-### Multi-Dostawca
-
-```toml
-[providers.anthropic]
-enabled = true
-api_key = "sk-ant-..."
-model = "claude-sonnet-4-20250514"
-
-[providers.openai]
-enabled = true
-api_key = "sk-..."
-model = "gpt-4o"
-
-[orchestrator]
-default_provider = "anthropic"
-fallback_providers = ["openai"]  # Failover przy błędzie dostawcy
-```
-
-Jeśli Anthropic zawiedzie lub ma rate-limit, orchestrator automatycznie przełącza się na OpenAI.
-
-### Własna Pamięć
-
-```toml
-[memory]
-kind = "sqlite"
-path = "~/.zeroclaw/workspace/memory/conversations.db"
-retention_days = 90  # Automatyczne czyszczenie po 90 dniach
-```
-
-Lub użyj Markdown dla przechowywania czytelnego dla ludzi:
-
-```toml
-[memory]
-kind = "markdown"
-path = "~/.zeroclaw/workspace/memory/"
-```
-
-Zobacz [Referencje Konfiguracji](docs/config-reference.md#memory) dla wszystkich opcji pamięci.
-
-## Wsparcie Dostawców
-
-| Dostawca       | Status      | API Key             | Przykładowe Modele                                      |
-| ----------------- | ----------- | ------------------- | ---------------------------------------------------- |
-| **Anthropic**     | ✅ Stabilny   | `ANTHROPIC_API_KEY` | `claude-sonnet-4-20250514`, `claude-opus-4-20250514` |
-| **OpenAI**        | ✅ Stabilny   | `OPENAI_API_KEY`    | `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini`             |
-| **Google Gemini** | ✅ Stabilny   | `GOOGLE_API_KEY`    | `gemini-2.0-flash-exp`, `gemini-exp-1206`            |
-| **Ollama**        | ✅ Stabilny   | N/A (lokalny)         | `llama3.3`, `qwen2.5`, `phi4`                        |
-| **Cerebras**      | ✅ Stabilny   | `CEREBRAS_API_KEY`  | `llama-3.3-70b`                                      |
-| **Groq**          | ✅ Stabilny   | `GROQ_API_KEY`      | `llama-3.3-70b-versatile`                            |
-| **Mistral**       | 🚧 Planowany | `MISTRAL_API_KEY`   | TBD                                                  |
-| **Cohere**        | 🚧 Planowany | `COHERE_API_KEY`    | TBD                                                  |
-
-### Własne Endpointy
-
-ZeroClaw wspiera endpointy kompatybilne z OpenAI:
-
-```toml
-[providers.custom]
-enabled = true
-api_key = "..."
-base_url = "https://api.your-llm-provider.com/v1"
-model = "your-model-name"
-```
-
-Przykład: użyj [LiteLLM](https://github.com/BerriAI/litellm) jako proxy aby uzyskać dostęp do każdego LLM przez interfejs OpenAI.
-
-Zobacz [Referencje Dostawców](docs/providers-reference.md) dla pełnych szczegółów konfiguracji.
-
-## Wsparcie Kanałów
-
-| Kanał        | Status      | Uwierzytelnianie         | Uwagi                                                     |
-| ------------ | ----------- | ------------------------ | --------------------------------------------------------- |
-| **Telegram** | ✅ Stabilny   | Bot Token                | Pełne wsparcie w tym pliki, obrazy, przyciski inline |
-| **Matrix**   | ✅ Stabilny   | Hasło lub Token    | Wsparcie E2EE z weryfikacją urządzenia              |
-| **Slack**    | 🚧 Planowany | OAuth lub Bot Token       | Wymaga dostępu do workspace                                    |
-| **Discord**  | 🚧 Planowany | Bot Token                | Wymaga uprawnień guild                                |
-| **WhatsApp** | 🚧 Planowany | Twilio lub oficjalne API | Wymaga konta business                                    |
-| **CLI**      | ✅ Stabilny   | Brak                    | Bezpośredni interfejs konwersacyjny                       |
-| **Web**      | 🚧 Planowany | API Key lub OAuth         | Interfejs czatu oparty na przeglądarce                        |
-
-Zobacz [Referencje Kanałów](docs/channels-reference.md) dla pełnych instrukcji konfiguracji.
-
-## Wsparcie Narzędzi
-
-ZeroClaw dostarcza wbudowane narzędzia do wykonania kodu, dostępu do systemu plików i pobierania web:
-
-| Narzędzie                | Opis                 | Wymagany Runtime                |
-| -------------------- | --------------------------- | ----------------------------- |
-| **bash**             | Wykonuje komendy shell | Natywny lub Docker              |
-| **python**           | Wykonuje skrypty Python  | Python 3.8+ (natywny) lub Docker |
-| **javascript**       | Wykonuje kod Node.js     | Node.js 18+ (natywny) lub Docker |
-| **filesystem_read**  | Odczytuje pliki            | Natywny lub Docker              |
-| **filesystem_write** | Zapisuje pliki          | Natywny lub Docker              |
-| **web_fetch**        | Pobiera treści web     | Natywny lub Docker              |
-
-### Bezpieczeństwo Wykonania
-
-- **Natywny Runtime** — działa jako proces użytkownika daemon, pełny dostęp do systemu plików
-- **Docker Runtime** — pełna izolacja kontenera, oddzielne systemy plików i sieci
-
-Skonfiguruj politykę wykonania w `config.toml`:
-
-```toml
-[runtime]
-kind = "docker"
-allowed_tools = ["bash", "python", "filesystem_read"]  # Jawna lista dozwolona
-```
-
-Zobacz [Referencje Konfiguracji](docs/config-reference.md#runtime) dla pełnych opcji bezpieczeństwa.
-
-## Wdrażanie
-
-### Lokalne Wdrażanie (Rozwój)
-
-```bash
-zeroclaw daemon start
-zeroclaw agent start
-```
-
-### Serwerowe Wdrażanie (Produkcja)
-
-Użyj systemd do zarządzania daemon i agent jako usługi:
-
-```bash
-# Zainstaluj binarium
-cargo install --path . --locked
-
-# Skonfiguruj workspace
-zeroclaw init
-
-# Utwórz pliki usług systemd
-sudo cp deployment/systemd/zeroclaw-daemon.service /etc/systemd/system/
-sudo cp deployment/systemd/zeroclaw-agent.service /etc/systemd/system/
-
-# Włącz i uruchom usługi
-sudo systemctl enable zeroclaw-daemon zeroclaw-agent
-sudo systemctl start zeroclaw-daemon zeroclaw-agent
-
-# Zweryfikuj status
-sudo systemctl status zeroclaw-daemon
-sudo systemctl status zeroclaw-agent
-```
-
-Zobacz [Przewodnik Wdrażania Sieciowego](docs/network-deployment.md) dla pełnych instrukcji wdrażania produkcyjnego.
-
-### Docker
-
-```bash
-# Zbuduj obraz
-docker build -t zeroclaw:latest .
-
-# Uruchom kontener
-docker run -d \
-  --name zeroclaw \
-  -v ~/.zeroclaw/workspace:/workspace \
-  -e ANTHROPIC_API_KEY=sk-ant-... \
-  zeroclaw:latest
-```
-
-Zobacz [`Dockerfile`](Dockerfile) dla szczegółów budowania i opcji konfiguracji.
-
-### Sprzęt Edge
-
-ZeroClaw jest zaprojektowany do działania na sprzęcie niskiego poboru mocy:
-
-- **Raspberry Pi Zero 2 W** — ~512 MB RAM, pojedynczy rdzeń ARMv8, < $5 koszt sprzętu
-- **Raspberry Pi 4/5** — 1 GB+ RAM, wielordzeniowy, idealny dla równoczesnych obciążeń
-- **Orange Pi Zero 2** — ~512 MB RAM, czterordzeniowy ARMv8, ultra-niski koszt
-- **SBC x86 (Intel N100)** — 4-8 GB RAM, szybkie buildy, natywne wsparcie Docker
-
-Zobacz [Przewodnik Sprzętowy](docs/hardware/README.md) dla instrukcji konfiguracji specyficznych dla urządzenia.
-
-## Tunneling (Publiczna Ekspozycja)
-
-Exponuj swoj lokalny daemon ZeroClaw do sieci publicznej przez bezpieczne tunele:
-
-```bash
-zeroclaw tunnel start --provider cloudflare
-```
-
-Wspierani dostawcy tunnel:
-
-- **Cloudflare Tunnel** — darmowy HTTPS, brak ekspozycji portów, wsparcie multi-domenowe
-- **Ngrok** — szybka konfiguracja, własne domeny (plan płatny)
-- **Tailscale** — prywatna sieć mesh, brak publicznego portu
-
-Zobacz [Referencje Konfiguracji](docs/config-reference.md#tunnel) dla pełnych opcji konfiguracji.
-
-## Bezpieczeństwo
-
-ZeroClaw implementuje wiele warstw bezpieczeństwa:
-
-### Parowanie
-
-Daemon generuje sekret parowania przy pierwszym uruchomieniu przechowywany w `~/.zeroclaw/workspace/.pairing`. Klienci (agent, CLI) muszą przedstawić ten sekret aby się połączyć.
-
-```bash
-zeroclaw pairing rotate  # Generuje nowy sekret i unieważnia stary
-```
-
-### Sandbox
-
-- **Docker Runtime** — pełna izolacja kontenera z oddzielnymi systemami plików i sieciami
-- **Natywny Runtime** — działa jako proces użytkownika, domyślnie ograniczony do workspace
-
-### Listy Dozwolone
-
-Kanały mogą ograniczać dostęp po ID użytkownika:
-
-```toml
-[channels.telegram]
-enabled = true
-allowed_users = [123456789, 987654321]  # Jawna lista dozwolona
-```
-
-### Szyfrowanie
-
-- **Matrix E2EE** — pełne szyfrowanie end-to-end z weryfikacją urządzenia
-- **Transport TLS** — cały ruch API i tunnel używa HTTPS/TLS
-
-Zobacz [Dokumentację Bezpieczeństwa](docs/security/README.md) dla pełnych polityk i praktyk.
-
-## Obserwowalność
-
-ZeroClaw loguje do `~/.zeroclaw/workspace/logs/` domyślnie. Logi są przechowywane po komponentach:
-
-```
-~/.zeroclaw/workspace/logs/
-├── daemon.log           # Logi daemon (startup, żądania API, błędy)
-├── agent.log            # Logi agent (routing wiadomości, wykonanie narzędzi)
-├── telegram.log         # Logi specyficzne dla kanału (jeśli włączone)
-└── matrix.log           # Logi specyficzne dla kanału (jeśli włączone)
-```
-
-### Konfiguracja Logowania
-
-```toml
-[logging]
-level = "info"                           # debug, info, warn, error
-path = "~/.zeroclaw/workspace/logs/"
-rotation = "daily"                       # daily, hourly, size
-max_size_mb = 100                        # Dla rotacji opartej na rozmiarze
-retention_days = 30                      # Automatyczne czyszczenie po N dniach
-```
-
-Zobacz [Referencje Konfiguracji](docs/config-reference.md#logging) dla wszystkich opcji logowania.
-
-### Metryki (Planowane)
-
-Wsparcie metryk Prometheus dla monitoringu produkcyjnego wkrótce. Śledzenie w [#234](https://github.com/zeroclaw-labs/zeroclaw/issues/234).
-
-## Umiejętności
-
-ZeroClaw wspiera własne umiejętności — wielokrotnego użytku moduły rozszerzające możliwości systemu.
-
-### Definicja Umiejętności
-
-Umiejętności są przechowywane w `~/.zeroclaw/workspace/skills/<skill-name>/` z tą strukturą:
-
-```
-skills/
-└── my-skill/
-    ├── skill.toml       # Metadane umiejętności (nazwa, opis, zależności)
-    ├── prompt.md        # Prompt systemowy dla AI
-    └── tools/           # Opcjonalne własne narzędzia
-        └── my_tool.py
-```
-
-### Przykład Umiejętności
-
-```toml
-# skills/web-research/skill.toml
-[skill]
-name = "web-research"
-description = "Szuka w web i podsumowuje wyniki"
-version = "1.0.0"
-
-[dependencies]
-tools = ["web_fetch", "bash"]
-```
-
-```markdown
-<!-- skills/web-research/prompt.md -->
-
-Jesteś asystentem badawczym. Kiedy proszą o zbadanie czegoś:
-
-1. Użyj web_fetch aby pobrać treść
-2. Podsumuj wyniki w łatwym do czytania formacie
-3. Zacytuj źródła z URL-ami
-```
-
-### Użycie Umiejętności
-
-Umiejętności są automatycznie ładowane przy starcie agenta. Odwołuj się do nich po nazwie w konwersacjach:
-
-```
-Użytkownik: Użyj umiejętności web-research aby znaleźć najnowsze wiadomości AI
-Bot: [ładuje umiejętność web-research, wykonuje web_fetch, podsumowuje wyniki]
-```
-
-Zobacz sekcję [Umiejętności](#umiejętności) dla pełnych instrukcji tworzenia umiejętności.
-
-## Open Skills
-
-ZeroClaw wspiera [Open Skills](https://github.com/openagents-com/open-skills) — modułowy i agnostyczny względem dostawcy system do rozszerzania możliwości agentów AI.
-
-### Włącz Open Skills
-
-```toml
-[skills]
-open_skills_enabled = true
-# open_skills_dir = "/path/to/open-skills"  # opcjonalne
-```
-
-Możesz też nadpisać w runtime używając `ZEROCLAW_OPEN_SKILLS_ENABLED` i `ZEROCLAW_OPEN_SKILLS_DIR`.
-
-## Rozwój
-
-```bash
-cargo build              # Build deweloperski
-cargo build --release    # Build release (codegen-units=1, działa na wszystkich urządzeniach w tym Raspberry Pi)
-cargo build --profile release-fast    # Szybszy build (codegen-units=8, wymaga 16 GB+ RAM)
-cargo test               # Uruchom pełny zestaw testów
-cargo clippy --locked --all-targets -- -D clippy::correctness
-cargo fmt                # Formatowanie
-
-# Uruchom benchmark porównawczy SQLite vs Markdown
-cargo test --test memory_comparison -- --nocapture
-```
-
-### Hook pre-push
-
-Hook git uruchamia `cargo fmt --check`, `cargo clippy -- -D warnings`, i `cargo test` przed każdym push. Włącz go raz:
-
-```bash
-git config core.hooksPath .githooks
-```
-
-### Rozwiązywanie Problemów Build (błędy OpenSSL na Linux)
-
-Jeśli napotkasz błąd build `openssl-sys`, zsynchronizuj zależności i przekompiluj z lockfile repozytorium:
-
-```bash
-git pull
-cargo build --release --locked
-cargo install --path . --force --locked
-```
-
-ZeroClaw jest skonfigurowany do używania `rustls` dla zależności HTTP/TLS; `--locked` utrzymuje graf przechodni deterministyczny w czystych środowiskach.
-
-Aby pominąć hook gdy potrzebujesz szybkiego push podczas rozwoju:
-
-```bash
-git push --no-verify
-```
-
 ## Współpraca i Docs
 
 Zacznij od centrum dokumentacji dla mapy opartej na zadaniach:
@@ -849,6 +425,20 @@ Serdeczne podziękowania dla społeczności i instytucji które inspirują i zas
 - **Świat i Dalej** 🌍✨ — dla każdego kontrybutora, marzyciela, i budowniczego tam na zewnątrz który czyni open source siłą dla dobra. To dla ciebie.
 
 Budujemy w open source ponieważ najlepsze pomysły przychodzą zewsząd. Jeśli to czytasz, jesteś tego częścią. Witamy. 🦀❤️
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.3.1)
+
+3 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+- **argenis de la rosa**
+- **Claude Opus 4.6**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ Oficjalne Repozytorium i Ostrzeżenie o Podszywaniu Się
 

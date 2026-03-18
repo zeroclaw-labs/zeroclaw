@@ -23,6 +23,8 @@ Release automation lives in:
 
 - `.github/workflows/pub-release.yml`
 - `.github/workflows/pub-homebrew-core.yml` (manual Homebrew formula PR, bot-owned)
+- `.github/workflows/pub-scoop.yml` (manual Scoop bucket manifest update)
+- `.github/workflows/pub-aur.yml` (manual AUR PKGBUILD push)
 
 Modes:
 
@@ -114,6 +116,41 @@ Workflow guardrails:
 - formula source URL and SHA256 are updated from the tagged tarball
 - formula license is normalized to `Apache-2.0 OR MIT`
 - PR is opened from the bot fork into `Homebrew/homebrew-core:master`
+
+### 7) Publish Scoop manifest (Windows)
+
+Run `Pub Scoop Manifest` manually:
+
+- `release_tag`: `vX.Y.Z`
+- `dry_run`: `true` first, then `false`
+
+Required repository settings for non-dry-run:
+
+- secret: `SCOOP_BUCKET_TOKEN` (PAT with push access to the bucket repo)
+- variable: `SCOOP_BUCKET_REPO` (for example `zeroclaw-labs/scoop-zeroclaw`)
+
+Workflow guardrails:
+
+- release tag must be `vX.Y.Z` format
+- Windows binary SHA256 extracted from `SHA256SUMS` release asset
+- manifest pushed to `bucket/zeroclaw.json` in the Scoop bucket repo
+
+### 8) Publish AUR package (Arch Linux)
+
+Run `Pub AUR Package` manually:
+
+- `release_tag`: `vX.Y.Z`
+- `dry_run`: `true` first, then `false`
+
+Required repository settings for non-dry-run:
+
+- secret: `AUR_SSH_KEY` (SSH private key registered with AUR)
+
+Workflow guardrails:
+
+- release tag must be `vX.Y.Z` format
+- source tarball SHA256 computed from the tagged release
+- PKGBUILD and .SRCINFO pushed to AUR `zeroclaw` package
 
 ## Emergency / Recovery Path
 

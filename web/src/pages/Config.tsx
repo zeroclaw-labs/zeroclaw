@@ -7,6 +7,7 @@ import {
   ShieldAlert,
 } from 'lucide-react';
 import { getConfig, putConfig } from '@/lib/api';
+import { t } from '@/lib/i18n';
 
 export default function Config() {
   const [config, setConfig] = useState('');
@@ -18,7 +19,6 @@ export default function Config() {
   useEffect(() => {
     getConfig()
       .then((data) => {
-        // The API may return either a raw string or a JSON string
         setConfig(typeof data === 'string' ? data : JSON.stringify(data, null, 2));
       })
       .catch((err) => setError(err.message))
@@ -31,9 +31,9 @@ export default function Config() {
     setSuccess(null);
     try {
       await putConfig(config);
-      setSuccess('Configuration saved successfully.');
+      setSuccess(t('config.save_success'));
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to save configuration');
+      setError(err instanceof Error ? err.message : t('config.save_error'));
     } finally {
       setSaving(false);
     }
@@ -49,75 +49,74 @@ export default function Config() {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="animate-spin rounded-full h-8 w-8 border-2 border-blue-500 border-t-transparent" />
+        <div className="h-8 w-8 border-2 border-[#0080ff30] border-t-[#0080ff] rounded-full animate-spin" />
       </div>
     );
   }
 
   return (
-    <div className="p-6 space-y-6">
+    <div className="p-6 space-y-6 animate-fade-in">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <Settings className="h-5 w-5 text-blue-400" />
-          <h2 className="text-base font-semibold text-white">Configuration</h2>
+          <Settings className="h-5 w-5 text-[#0080ff]" />
+          <h2 className="text-sm font-semibold text-white uppercase tracking-wider">{t('config.configuration_title')}</h2>
         </div>
         <button
           onClick={handleSave}
           disabled={saving}
-          className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors disabled:opacity-50"
+          className="btn-electric flex items-center gap-2 text-sm px-4 py-2"
         >
           <Save className="h-4 w-4" />
-          {saving ? 'Saving...' : 'Save'}
+          {saving ? t('config.saving') : t('config.save')}
         </button>
       </div>
 
       {/* Sensitive fields note */}
-      <div className="flex items-start gap-3 bg-yellow-900/20 border border-yellow-700/40 rounded-lg p-4">
-        <ShieldAlert className="h-5 w-5 text-yellow-400 flex-shrink-0 mt-0.5" />
+      <div className="flex items-start gap-3 rounded-xl p-4 border border-[#ffaa0020]" style={{ background: 'rgba(255,170,0,0.05)' }}>
+        <ShieldAlert className="h-5 w-5 text-[#ffaa00] flex-shrink-0 mt-0.5" />
         <div>
-          <p className="text-sm text-yellow-300 font-medium">
-            Sensitive fields are masked
+          <p className="text-sm text-[#ffaa00] font-medium">
+            {t('config.sensitive_title')}
           </p>
-          <p className="text-sm text-yellow-400/70 mt-0.5">
-            API keys, tokens, and passwords are hidden for security. To update a
-            masked field, replace the entire masked value with your new value.
+          <p className="text-sm text-[#ffaa0080] mt-0.5">
+            {t('config.sensitive_hint')}
           </p>
         </div>
       </div>
 
       {/* Success message */}
       {success && (
-        <div className="flex items-center gap-2 bg-green-900/30 border border-green-700 rounded-lg p-3">
-          <CheckCircle className="h-4 w-4 text-green-400 flex-shrink-0" />
-          <span className="text-sm text-green-300">{success}</span>
+        <div className="flex items-center gap-2 rounded-xl p-3 border border-[#00e68a30] animate-fade-in" style={{ background: 'rgba(0,230,138,0.06)' }}>
+          <CheckCircle className="h-4 w-4 text-[#00e68a] flex-shrink-0" />
+          <span className="text-sm text-[#00e68a]">{success}</span>
         </div>
       )}
 
       {/* Error message */}
       {error && (
-        <div className="flex items-center gap-2 bg-red-900/30 border border-red-700 rounded-lg p-3">
-          <AlertTriangle className="h-4 w-4 text-red-400 flex-shrink-0" />
-          <span className="text-sm text-red-300">{error}</span>
+        <div className="flex items-center gap-2 rounded-xl p-3 border border-[#ff446630] animate-fade-in" style={{ background: 'rgba(255,68,102,0.06)' }}>
+          <AlertTriangle className="h-4 w-4 text-[#ff4466] flex-shrink-0" />
+          <span className="text-sm text-[#ff6680]">{error}</span>
         </div>
       )}
 
       {/* Config Editor */}
-      <div className="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
-        <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800 bg-gray-800/50">
-          <span className="text-xs text-gray-400 font-medium uppercase tracking-wider">
-            TOML Configuration
+      <div className="glass-card overflow-hidden">
+        <div className="flex items-center justify-between px-4 py-2.5 border-b border-[#1a1a3e]" style={{ background: 'rgba(0,128,255,0.03)' }}>
+          <span className="text-[10px] text-[#334060] font-semibold uppercase tracking-wider">
+            {t('config.toml_label')}
           </span>
-          <span className="text-xs text-gray-500">
-            {config.split('\n').length} lines
+          <span className="text-[10px] text-[#334060]">
+            {config.split('\n').length} {t('config.lines')}
           </span>
         </div>
         <textarea
           value={config}
           onChange={(e) => setConfig(e.target.value)}
           spellCheck={false}
-          className="w-full min-h-[500px] bg-gray-950 text-gray-200 font-mono text-sm p-4 resize-y focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-inset"
-          style={{ tabSize: 4 }}
+          className="w-full min-h-[500px] text-[#8892a8] font-mono text-sm p-4 resize-y focus:outline-none focus:ring-2 focus:ring-[#0080ff40] focus:ring-inset"
+          style={{ background: 'rgba(5,5,16,0.8)', tabSize: 4 }}
         />
       </div>
     </div>

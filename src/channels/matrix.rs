@@ -4,10 +4,12 @@ use matrix_sdk::{
     authentication::matrix::MatrixSession,
     config::SyncSettings,
     ruma::{
+        api::client::receipt::create_receipt,
         events::reaction::ReactionEventContent,
-        events::relation::{Annotation, InReplyTo, Thread},
+        events::receipt::ReceiptThread,
+        events::relation::{Annotation, Thread},
         events::room::message::{
-            MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+            MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
         },
         events::room::MediaSource,
         OwnedEventId, OwnedRoomId, OwnedUserId,
@@ -540,12 +542,7 @@ impl Channel for MatrixChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let client = self.matrix_client().await?;
         let target_room_id = if message.recipient.contains("||") {
-            message
-                .recipient
-                .splitn(2, "||")
-                .nth(1)
-                .unwrap()
-                .to_string()
+            message.recipient.split_once("||").unwrap().1.to_string()
         } else {
             self.target_room_id().await?
         };
@@ -563,6 +560,11 @@ impl Channel for MatrixChannel {
 
         if room.state() != RoomState::Joined {
             anyhow::bail!("Matrix room '{}' is not in joined state", target_room_id);
+        }
+
+        // Stop typing notification before sending the response
+        if let Err(error) = room.typing_notice(false).await {
+            tracing::warn!("Matrix failed to stop typing notification: {error}");
         }
 
         let mut content = RoomMessageEventContent::text_markdown(&message.content);
@@ -589,8 +591,7 @@ impl Channel for MatrixChannel {
             let tts_text = message
                 .content
                 .replace("**", "")
-                .replace("*", "")
-                .replace("`", "")
+                .replace(['*', '`'], "")
                 .replace("# ", "");
 
             let tts_ok = tokio::process::Command::new("edge-tts")
@@ -703,7 +704,7 @@ impl Channel for MatrixChannel {
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
-            let target_room = target_room_for_handler.clone();
+            let _target_room = target_room_for_handler.clone();
             let my_user_id = my_user_id_for_handler.clone();
             let allowed_users = allowed_users_for_handler.clone();
             let dedupe = Arc::clone(&dedupe_for_handler);
@@ -736,7 +737,7 @@ impl Channel for MatrixChannel {
                                 format!("{}/_matrix/client/v1/media/download/{}", homeserver, rest);
                             Some((url, name.to_string()))
                         }
-                        _ => None,
+                        MediaSource::Encrypted(_) => None,
                     }
                 };
 
@@ -745,7 +746,7 @@ impl Channel for MatrixChannel {
                     MessageType::Notice(content) => (content.body.clone(), None),
                     MessageType::Image(content) => {
                         let dl = media_info(&content.source, &content.body);
-                        (format!("[image: {}]", content.body), dl)
+                        (format!("[IMAGE:{}]", content.body), dl)
                     }
                     MessageType::File(content) => {
                         let dl = media_info(&content.source, &content.body);
@@ -765,8 +766,11 @@ impl Channel for MatrixChannel {
                 // Download media to workspace if present
                 let body = if let Some((url, filename)) = media_download {
                     let workspace = std::path::PathBuf::from(
-                        std::env::var("ZEROCLAW_WORKSPACE")
-                            .unwrap_or_else(|_| "/tmp/zeroclaw-uploads".to_string()),
+                        shellexpand::tilde(
+                            &std::env::var("ZEROCLAW_WORKSPACE")
+                                .unwrap_or_else(|_| "/tmp/zeroclaw-uploads".to_string()),
+                        )
+                        .as_ref(),
                     );
                     let _ = tokio::fs::create_dir_all(&workspace).await;
                     let dest = workspace.join(&filename);
@@ -779,7 +783,7 @@ impl Channel for MatrixChannel {
                     {
                         Ok(resp) if resp.status().is_success() => match resp.bytes().await {
                             Ok(bytes) => match tokio::fs::write(&dest, &bytes).await {
-                                Ok(_) => format!("{} — saved to {}", body, dest.display()),
+                                Ok(()) => format!("{} — saved to {}", body, dest.display()),
                                 Err(_) => format!("{} — failed to write to disk", body),
                             },
                             Err(_) => format!("{} — download failed", body),
@@ -858,6 +862,23 @@ impl Channel for MatrixChannel {
                     }
                 }
 
+                // Send a read receipt for the incoming event
+                if let Err(error) = room
+                    .send_single_receipt(
+                        create_receipt::v3::ReceiptType::Read,
+                        ReceiptThread::Unthreaded,
+                        event.event_id.clone(),
+                    )
+                    .await
+                {
+                    tracing::warn!("Matrix failed to send read receipt: {error}");
+                }
+
+                // Start typing notification while processing begins
+                if let Err(error) = room.typing_notice(true).await {
+                    tracing::warn!("Matrix failed to start typing notification: {error}");
+                }
+
                 let thread_ts = match &event.content.relates_to {
                     Some(Relation::Thread(thread)) => Some(thread.event_id.to_string()),
                     _ => None,
@@ -867,7 +888,7 @@ impl Channel for MatrixChannel {
                     sender: sender.clone(),
                     reply_target: format!("{}||{}", sender, room.room_id()),
                     content: body,
-                    channel: format!("matrix:{}", room.room_id()),
+                    channel: "matrix".to_string(),
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()

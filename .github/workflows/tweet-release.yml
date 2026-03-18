@@ -1,0 +1,308 @@
+name: Tweet Release
+
+on:
+  # Called by release workflows AFTER all publish steps (docker, crates, website) complete.
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Stable release tag (e.g. v0.3.0)"
+        required: true
+        type: string
+      release_url:
+        description: "GitHub Release URL"
+        required: true
+        type: string
+    secrets:
+      TWITTER_CONSUMER_API_KEY:
+        required: false
+      TWITTER_CONSUMER_API_SECRET_KEY:
+        required: false
+      TWITTER_ACCESS_TOKEN:
+        required: false
+      TWITTER_ACCESS_TOKEN_SECRET:
+        required: false
+  workflow_dispatch:
+    inputs:
+      tweet_text:
+        description: "Custom tweet text (include emojis, keep it punchy)"
+        required: true
+        type: string
+      image_url:
+        description: "Optional image URL to attach (png/jpg)"
+        required: false
+        type: string
+
+jobs:
+  tweet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for new features
+        id: check
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || '' }}
+          MANUAL_TEXT: ${{ inputs.tweet_text || '' }}
+        run: |
+          # Manual dispatch always proceeds
+          if [ -n "$MANUAL_TEXT" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Stable releases (no -beta suffix) always tweet — they represent
+          # the full release cycle, so skipping them loses visibility.
+          if [[ ! "$RELEASE_TAG" =~ -beta\. ]]; then
+            echo "Stable release ${RELEASE_TAG} — always tweet"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Find the previous STABLE release tag (exclude betas) to check for new features
+          PREV_TAG=$(git tag --sort=-creatordate \
+            | grep -v "^${RELEASE_TAG}$" \
+            | grep -vE '\-beta\.' \
+            | head -1 || echo "")
+
+          if [ -z "$PREV_TAG" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Count new feat() OR fix() commits since the previous release
+          NEW_CHANGES=$(git log "${PREV_TAG}..${RELEASE_TAG}" --pretty=format:"%s" --no-merges \
+            | grep -ciE '^(feat|fix)(\(|:)' || echo "0")
+
+          if [ "$NEW_CHANGES" -eq 0 ]; then
+            echo "No new features or fixes since ${PREV_TAG} — skipping tweet"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "${NEW_CHANGES} new change(s) since ${PREV_TAG} — tweeting"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build tweet text
+        id: tweet
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || '' }}
+          RELEASE_URL: ${{ inputs.release_url || '' }}
+          MANUAL_TEXT: ${{ inputs.tweet_text || '' }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$MANUAL_TEXT" ]; then
+            TWEET="$MANUAL_TEXT"
+          else
+            # Diff against the last STABLE release (exclude betas) to capture
+            # ALL features accumulated across the full beta cycle
+            PREV_STABLE=$(git tag --sort=-creatordate \
+              | grep -v "^${RELEASE_TAG}$" \
+              | grep -vE '\-beta\.' \
+              | head -1 || echo "")
+
+            RANGE="${PREV_STABLE:+${PREV_STABLE}..}${RELEASE_TAG}"
+
+            # Extract ALL features since the last stable release
+            FEATURES=$(git log "$RANGE" --pretty=format:"%s" --no-merges \
+              | grep -iE '^feat(\(|:)' \
+              | sed 's/^feat(\([^)]*\)): /\1: /' \
+              | sed 's/^feat: //' \
+              | sed 's/ (#[0-9]*)$//' \
+              | sort -uf || true)
+
+            FEAT_COUNT=$(echo "$FEATURES" | grep -c . || echo "0")
+
+            # Format top features with rocket emoji (limit to 6 for tweet space)
+            FEAT_LIST=$(echo "$FEATURES" \
+              | head -6 \
+              | while IFS= read -r line; do echo "🚀 ${line}"; done || true)
+
+            if [ -z "$FEAT_LIST" ]; then
+              FEAT_LIST="🚀 Incremental improvements and polish"
+            fi
+
+            # Build tweet — feature-focused style
+            TWEET=$(printf "🦀 ZeroClaw %s\n\n%s\n\nZero overhead. Zero compromise. 100%% Rust.\n\n#zeroclaw #rust #ai #opensource" \
+              "$RELEASE_TAG" "$FEAT_LIST")
+          fi
+
+          # X/Twitter counts any URL as 23 chars (t.co shortening).
+          # Extract the URL (if present), truncate the BODY to fit, then
+          # re-append the URL so it is never chopped.
+          URL=""
+          BODY="$TWEET"
+
+          # Pull URL out of existing tweet text or use RELEASE_URL
+          FOUND_URL=$(echo "$TWEET" | grep -oE 'https?://[^ ]+' | tail -1 || true)
+          if [ -n "$FOUND_URL" ]; then
+            URL="$FOUND_URL"
+            BODY=$(echo "$TWEET" | sed "s|${URL}||" | sed -e 's/[[:space:]]*$//')
+          elif [ -n "$RELEASE_URL" ]; then
+            URL="$RELEASE_URL"
+          fi
+
+          if [ -n "$URL" ]; then
+            # URL counts as 23 chars on X + 2 chars for \n\n separator = 25
+            MAX_BODY=$((280 - 25))
+            if [ ${#BODY} -gt $MAX_BODY ]; then
+              BODY="${BODY:0:$((MAX_BODY - 3))}..."
+            fi
+            TWEET=$(printf "%s\n\n%s" "$BODY" "$URL")
+          else
+            if [ ${#TWEET} -gt 280 ]; then
+              TWEET="${TWEET:0:277}..."
+            fi
+          fi
+
+          echo "--- Tweet preview ---"
+          echo "$TWEET"
+          echo "--- ${#TWEET} chars ---"
+
+          {
+            echo "text<<TWEET_EOF"
+            echo "$TWEET"
+            echo "TWEET_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check for duplicate tweet
+        id: dedup
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        env:
+          TWEET_TEXT: ${{ steps.tweet.outputs.text }}
+        run: |
+          # Hash the tweet content (ignore whitespace differences)
+          TWEET_HASH=$(echo "$TWEET_TEXT" | tr -s '[:space:]' | sha256sum | cut -d' ' -f1)
+          echo "hash=${TWEET_HASH}" >> "$GITHUB_OUTPUT"
+
+          # Check if we already have a cache hit for this exact tweet
+          MARKER_FILE="/tmp/tweet-dedup-${TWEET_HASH}"
+          echo "$TWEET_HASH" > "$MARKER_FILE"
+
+      - uses: actions/cache@v4
+        if: steps.check.outputs.skip != 'true'
+        id: tweet-cache
+        with:
+          path: /tmp/tweet-dedup-${{ steps.dedup.outputs.hash }}
+          key: tweet-${{ steps.dedup.outputs.hash }}
+
+      - name: Skip duplicate tweet
+        if: steps.check.outputs.skip != 'true' && steps.tweet-cache.outputs.cache-hit == 'true'
+        run: |
+          echo "::warning::Duplicate tweet detected (hash=${{ steps.dedup.outputs.hash }}) — skipping"
+          echo "This exact tweet was already posted in a previous run."
+
+      - name: Post to X
+        if: steps.check.outputs.skip != 'true' && steps.tweet-cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          TWITTER_CONSUMER_KEY: ${{ secrets.TWITTER_CONSUMER_API_KEY }}
+          TWITTER_CONSUMER_SECRET: ${{ secrets.TWITTER_CONSUMER_API_SECRET_KEY }}
+          TWITTER_ACCESS_TOKEN: ${{ secrets.TWITTER_ACCESS_TOKEN }}
+          TWITTER_ACCESS_TOKEN_SECRET: ${{ secrets.TWITTER_ACCESS_TOKEN_SECRET }}
+          TWEET_TEXT: ${{ steps.tweet.outputs.text }}
+          IMAGE_URL: ${{ inputs.image_url || '' }}
+        run: |
+          set -euo pipefail
+
+          # Skip if Twitter secrets are not configured
+          if [ -z "$TWITTER_CONSUMER_KEY" ] || [ -z "$TWITTER_ACCESS_TOKEN" ]; then
+            echo "::warning::Twitter secrets not configured — skipping tweet"
+            exit 0
+          fi
+
+          pip install requests requests-oauthlib --quiet
+
+          python3 - <<'PYEOF'
+          import os, sys, time
+          from requests_oauthlib import OAuth1Session
+
+          consumer_key = os.environ["TWITTER_CONSUMER_KEY"]
+          consumer_secret = os.environ["TWITTER_CONSUMER_SECRET"]
+          access_token = os.environ["TWITTER_ACCESS_TOKEN"]
+          access_token_secret = os.environ["TWITTER_ACCESS_TOKEN_SECRET"]
+          tweet_text = os.environ["TWEET_TEXT"]
+          image_url = os.environ.get("IMAGE_URL", "")
+
+          oauth = OAuth1Session(
+              consumer_key,
+              client_secret=consumer_secret,
+              resource_owner_key=access_token,
+              resource_owner_secret=access_token_secret,
+          )
+
+          media_id = None
+
+          # Upload image if provided
+          if image_url:
+              import requests
+              print(f"Downloading image: {image_url}")
+              img_resp = requests.get(image_url, timeout=30)
+              img_resp.raise_for_status()
+
+              content_type = img_resp.headers.get("content-type", "image/png")
+              init_resp = oauth.post(
+                  "https://upload.twitter.com/1.1/media/upload.json",
+                  data={
+                      "command": "INIT",
+                      "total_bytes": len(img_resp.content),
+                      "media_type": content_type,
+                  },
+              )
+              if init_resp.status_code != 202:
+                  print(f"Media INIT failed: {init_resp.status_code} {init_resp.text}", file=sys.stderr)
+                  sys.exit(1)
+
+              media_id = init_resp.json()["media_id_string"]
+
+              append_resp = oauth.post(
+                  "https://upload.twitter.com/1.1/media/upload.json",
+                  data={"command": "APPEND", "media_id": media_id, "segment_index": 0},
+                  files={"media_data": img_resp.content},
+              )
+              if append_resp.status_code not in (200, 204):
+                  print(f"Media APPEND failed: {append_resp.status_code} {append_resp.text}", file=sys.stderr)
+                  sys.exit(1)
+
+              fin_resp = oauth.post(
+                  "https://upload.twitter.com/1.1/media/upload.json",
+                  data={"command": "FINALIZE", "media_id": media_id},
+              )
+              if fin_resp.status_code not in (200, 201):
+                  print(f"Media FINALIZE failed: {fin_resp.status_code} {fin_resp.text}", file=sys.stderr)
+                  sys.exit(1)
+
+              state = fin_resp.json().get("processing_info", {}).get("state")
+              while state == "pending" or state == "in_progress":
+                  wait = fin_resp.json().get("processing_info", {}).get("check_after_secs", 2)
+                  time.sleep(wait)
+                  status_resp = oauth.get(
+                      "https://upload.twitter.com/1.1/media/upload.json",
+                      params={"command": "STATUS", "media_id": media_id},
+                  )
+                  state = status_resp.json().get("processing_info", {}).get("state")
+                  fin_resp = status_resp
+
+              print(f"Image uploaded: media_id={media_id}")
+
+          # Post tweet
+          payload = {"text": tweet_text}
+          if media_id:
+              payload["media"] = {"media_ids": [media_id]}
+
+          resp = oauth.post("https://api.x.com/2/tweets", json=payload)
+
+          if resp.status_code == 201:
+              data = resp.json()
+              tweet_id = data["data"]["id"]
+              print(f"Tweet posted: https://x.com/zeroclawlabs/status/{tweet_id}")
+          else:
+              print(f"Failed to post tweet: {resp.status_code}", file=sys.stderr)
+              print(resp.text, file=sys.stderr)
+              sys.exit(1)
+          PYEOF

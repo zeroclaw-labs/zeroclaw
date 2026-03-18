@@ -22,6 +22,64 @@ For first-time installation, start from [one-click-bootstrap.md](../setup-guides
 | Foreground runtime | `zeroclaw daemon` | local debugging, short-lived sessions |
 | Foreground gateway only | `zeroclaw gateway` | webhook endpoint testing |
 | User service | `zeroclaw service install && zeroclaw service start` | persistent operator-managed runtime |
+| Docker / Podman | `docker compose up -d` | containerized deployment |
+
+## Docker / Podman Runtime
+
+If you installed via `./install.sh --docker`, the container exits after onboarding. To run
+ZeroClaw as a long-lived container, use the repository `docker-compose.yml` or start a
+container manually against the persisted data directory.
+
+### Recommended: docker-compose
+
+```bash
+# Start (detached, auto-restarts on reboot)
+docker compose up -d
+
+# Stop
+docker compose down
+
+# Restart
+docker compose up -d
+```
+
+Replace `docker` with `podman` if using Podman.
+
+### Manual container lifecycle
+
+```bash
+# Start a new container from the bootstrap image
+docker run -d --name zeroclaw \
+  --restart unless-stopped \
+  -v "$PWD/.zeroclaw-docker/.zeroclaw:/zeroclaw-data/.zeroclaw" \
+  -v "$PWD/.zeroclaw-docker/workspace:/zeroclaw-data/workspace" \
+  -e HOME=/zeroclaw-data \
+  -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
+  -p 42617:42617 \
+  zeroclaw-bootstrap:local \
+  gateway
+
+# Stop (preserves config and workspace)
+docker stop zeroclaw
+
+# Restart a stopped container
+docker start zeroclaw
+
+# View logs
+docker logs -f zeroclaw
+
+# Health check
+docker exec zeroclaw zeroclaw status
+```
+
+For Podman, add `--userns keep-id --user "$(id -u):$(id -g)"` and append `:Z` to volume mounts.
+
+### Key detail: do not re-run install.sh to restart
+
+Re-running `install.sh --docker` rebuilds the image and re-runs onboarding. To simply
+restart, use `docker start`, `docker compose up -d`, or `podman start`.
+
+For full setup instructions, see [one-click-bootstrap.md](../setup-guides/one-click-bootstrap.md#stopping-and-restarting-a-dockerpodman-container).
 
 ## Baseline Operator Checklist
 

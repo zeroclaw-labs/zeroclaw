@@ -1,5 +1,6 @@
 import type { WsMessage } from '../types/api';
 import { getToken } from './auth';
+import { generateUUID } from './uuid';
 
 export type WsMessageHandler = (msg: WsMessage) => void;
 export type WsOpenHandler = () => void;
@@ -26,7 +27,7 @@ const SESSION_STORAGE_KEY = 'zeroclaw_session_id';
 function getOrCreateSessionId(): string {
   let id = sessionStorage.getItem(SESSION_STORAGE_KEY);
   if (!id) {
-    id = crypto.randomUUID();
+    id = generateUUID();
     sessionStorage.setItem(SESSION_STORAGE_KEY, id);
   }
   return id;
@@ -70,7 +71,9 @@ export class WebSocketClient {
     params.set('session_id', sessionId);
     const url = `${this.baseUrl}/ws/chat?${params.toString()}`;
 
-    this.ws = new WebSocket(url, ['zeroclaw.v1']);
+    const protocols: string[] = ['zeroclaw.v1'];
+    if (token) protocols.push(`bearer.${token}`);
+    this.ws = new WebSocket(url, protocols);
 
     this.ws.onopen = () => {
       this.currentDelay = this.reconnectDelay;
