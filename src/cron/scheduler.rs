@@ -337,11 +337,14 @@ pub(crate) async fn deliver_announcement(
                 .telegram
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("telegram channel not configured"))?;
-            let channel = TelegramChannel::new(
+            let mut channel = TelegramChannel::new(
                 tg.bot_token.clone(),
                 tg.allowed_users.clone(),
                 tg.mention_only,
             );
+            if let Some(base) = &tg.api_base {
+                channel = channel.with_api_base(base.clone());
+            }
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "discord" => {

@@ -3186,16 +3186,18 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .telegram
                 .as_ref()
                 .context("Telegram channel is not configured")?;
-            Ok(Arc::new(
-                TelegramChannel::new(
-                    tg.bot_token.clone(),
-                    tg.allowed_users.clone(),
-                    tg.mention_only,
-                )
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                .with_transcription(config.transcription.clone())
-                .with_workspace_dir(config.workspace_dir.clone()),
-            ))
+            let mut channel = TelegramChannel::new(
+                tg.bot_token.clone(),
+                tg.allowed_users.clone(),
+                tg.mention_only,
+            )
+            .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+            .with_transcription(config.transcription.clone())
+            .with_workspace_dir(config.workspace_dir.clone());
+            if let Some(base) = &tg.api_base {
+                channel = channel.with_api_base(base.clone());
+            }
+            Ok(Arc::new(channel))
         }
         "discord" => {
             let dc = config
@@ -8624,6 +8626,7 @@ This is an example JSON object for profile settings."#;
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            api_base: None,
         });
         match build_channel_by_id(&config, "telegram") {
             Ok(channel) => assert_eq!(channel.name(), "telegram"),

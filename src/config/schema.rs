@@ -4511,6 +4511,11 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// Custom base URL for the Telegram Bot API.
+    /// When set, all API calls use this URL instead of `https://api.telegram.org/bot<token>`.
+    /// Useful for proxy gateways that inject credentials at the network boundary.
+    #[serde(default)]
+    pub api_base: Option<String>,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -8360,6 +8365,7 @@ default_temperature = 0.7
                     draft_update_interval_ms: default_draft_update_interval_ms(),
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    api_base: None,
                 }),
                 discord: None,
                 slack: None,
@@ -8942,6 +8948,7 @@ tool_dispatcher = "xml"
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
             mention_only: false,
+            api_base: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -11256,6 +11263,7 @@ require_otp_to_resume = true
             draft_update_interval_ms: default_draft_update_interval_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
+            api_base: None,
         });
 
         // Save (triggers encryption)
