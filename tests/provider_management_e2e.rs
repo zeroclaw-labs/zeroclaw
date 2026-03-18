@@ -367,18 +367,18 @@ async fn pm_11_multi_turn_add_test_default() {
     let snapshot = snapshot_config().await;
     let (mut tx, mut rx) = connect().await;
 
-    // Step 1: add minimax
-    let r1 = send_and_wait(&mut tx, &mut rx, "добавь minimax в фоллбэк").await;
+    // Step 1: add groq (keys are plentiful and fast)
+    let r1 = send_and_wait(&mut tx, &mut rx, "добавь ещё один groq профиль в фоллбэк").await;
     assert!(!r1.starts_with("ERROR"), "Step 1 error: {r1}");
 
-    // Step 2: test MiniMax-M1
+    // Step 2: test llama model
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let r2 = send_and_wait(&mut tx, &mut rx, "протестируй MiniMax-M1").await;
+    let r2 = send_and_wait(&mut tx, &mut rx, "протестируй llama-3.3-70b-versatile").await;
     assert!(!r2.starts_with("ERROR"), "Step 2 error: {r2}");
 
     // Step 3: set as default
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let r3 = send_and_wait(&mut tx, &mut rx, "сделай основным").await;
+    let r3 = send_and_wait(&mut tx, &mut rx, "сделай groq основным").await;
     assert!(!r3.starts_with("ERROR"), "Step 3 error: {r3}");
 
     restore_config(&snapshot).await;
