@@ -3608,6 +3608,27 @@ pub async fn run(
                 }
             }
         }
+
+        // After successful multi-step execution, attempt autonomous skill creation.
+        #[cfg(feature = "skill-creation")]
+        if config.skills.skill_creation.enabled {
+            let tool_calls = crate::skills::creator::extract_tool_calls_from_history(&history);
+            if tool_calls.len() >= 2 {
+                let creator = crate::skills::creator::SkillCreator::new(
+                    config.workspace_dir.clone(),
+                    config.skills.skill_creation.clone(),
+                );
+                match creator.create_from_execution(&msg, &tool_calls, None).await {
+                    Ok(Some(slug)) => {
+                        tracing::info!(slug, "Auto-created skill from execution");
+                    }
+                    Ok(None) => {
+                        tracing::debug!("Skill creation skipped (duplicate or disabled)");
+                    }
+                    Err(e) => tracing::warn!("Skill creation failed: {e}"),
+                }
+            }
+        }
         final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);

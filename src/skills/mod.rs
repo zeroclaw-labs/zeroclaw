@@ -7,6 +7,8 @@ use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 mod audit;
+#[cfg(feature = "skill-creation")]
+pub mod creator;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
