@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { getAdminPairCode } from '../lib/api';
 
 interface Device {
   id: string;
@@ -32,6 +33,19 @@ export default function Pairing() {
       setLoading(false);
     }
   }, [token]);
+
+  // Fetch the current pairing code on mount (if one is active)
+  useEffect(() => {
+    getAdminPairCode()
+      .then((data) => {
+        if (data.pairing_code) {
+          setPairingCode(data.pairing_code);
+        }
+      })
+      .catch(() => {
+        // Admin endpoint not reachable — code will show after clicking "Pair New Device"
+      });
+  }, []);
 
   useEffect(() => {
     fetchDevices();
