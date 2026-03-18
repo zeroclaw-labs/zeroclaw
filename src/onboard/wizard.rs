@@ -3782,6 +3782,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     guild_id: if guild.is_empty() { None } else { Some(guild) },
                     allowed_users,
                     listen_to_bots: false,
+                    interrupt_on_new_message: false,
                     mention_only: false,
                 });
             }

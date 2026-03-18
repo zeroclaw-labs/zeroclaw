@@ -4541,6 +4541,10 @@ pub struct DiscordConfig {
     /// The bot still ignores its own messages to prevent feedback loops.
     #[serde(default)]
     pub listen_to_bots: bool,
+    /// When true, a newer Discord message from the same sender in the same channel
+    /// cancels the in-flight request and starts a fresh response with preserved history.
+    #[serde(default)]
+    pub interrupt_on_new_message: bool,
     /// When true, only respond to messages that @-mention the bot.
     /// Other messages in the guild are silently ignored.
     #[serde(default)]
@@ -8975,6 +8979,7 @@ tool_dispatcher = "xml"
             guild_id: Some("12345".into()),
             allowed_users: vec![],
             listen_to_bots: false,
+            interrupt_on_new_message: false,
             mention_only: false,
         };
         let json = serde_json::to_string(&dc).unwrap();
@@ -8990,6 +8995,7 @@ tool_dispatcher = "xml"
             guild_id: None,
             allowed_users: vec![],
             listen_to_bots: false,
+            interrupt_on_new_message: false,
             mention_only: false,
         };
         let json = serde_json::to_string(&dc).unwrap();
@@ -9238,6 +9244,20 @@ allowed_users = ["@ops:matrix.org"]
         let parsed: SlackConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.interrupt_on_new_message);
         assert!(!parsed.mention_only);
+    }
+
+    #[test]
+    async fn discord_config_default_interrupt_on_new_message_is_false() {
+        let json = r#"{"bot_token":"tok"}"#;
+        let parsed: DiscordConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.interrupt_on_new_message);
+    }
+
+    #[test]
+    async fn discord_config_deserializes_interrupt_on_new_message_true() {
+        let json = r#"{"bot_token":"tok","interrupt_on_new_message":true}"#;
+        let parsed: DiscordConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.interrupt_on_new_message);
     }
 
     #[test]
