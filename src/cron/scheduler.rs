@@ -242,6 +242,15 @@ async fn persist_job_result(
         if success {
             if let Err(e) = remove_job(config, &job.id) {
                 tracing::warn!("Failed to remove one-shot cron job after success: {e}");
+                // Fall back to disabling the job so it won't re-trigger.
+                let _ = update_job(
+                    config,
+                    &job.id,
+                    CronJobPatch {
+                        enabled: Some(false),
+                        ..CronJobPatch::default()
+                    },
+                );
             }
         } else {
             let _ = record_last_run(config, &job.id, finished_at, false, output);
@@ -1038,7 +1047,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_job_result_at_schedule_without_delete_after_run_is_not_deleted() {
+    async fn persist_job_result_at_schedule_without_delete_after_run_is_disabled() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
@@ -1060,8 +1069,13 @@ mod tests {
         let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
         assert!(success);
 
+        // After reschedule_after_run, At schedule jobs should be disabled
+        // to prevent re-execution with a past next_run timestamp.
         let updated = cron::get_job(&config, &job.id).unwrap();
-        assert!(updated.enabled);
+        assert!(
+            !updated.enabled,
+            "At schedule job should be disabled after execution via reschedule"
+        );
         assert_eq!(updated.last_status.as_deref(), Some("ok"));
     }
 
