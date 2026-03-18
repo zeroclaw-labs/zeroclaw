@@ -260,7 +260,7 @@ fn is_known_image_magic(bytes: &[u8]) -> bool {
         return true;
     }
     // JPEG (FFD8FF)
-    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+    if bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
         return true;
     }
     // GIF87a / GIF89a
@@ -840,7 +840,9 @@ mod tests {
             result.output
         );
         assert!(
-            result.output.contains("PDF file detected but text extraction failed"),
+            result
+                .output
+                .contains("PDF file detected but text extraction failed"),
             "output must explain PDF extraction failure, got: {:?}",
             result.output
         );

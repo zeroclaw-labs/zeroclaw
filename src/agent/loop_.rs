@@ -2631,8 +2631,7 @@ pub(crate) async fn run_tool_call_loop(
                 // Layer 2: Replace old tool results with placeholders
                 let still_estimated = estimate_history_tokens(history);
                 if still_estimated > max_context_tokens {
-                    let tool_compacted =
-                        compact_old_tool_results(history, TOOL_RESULT_KEEP_RECENT);
+                    let tool_compacted = compact_old_tool_results(history, TOOL_RESULT_KEEP_RECENT);
                     if tool_compacted {
                         tracing::info!(
                             before = still_estimated,
@@ -2867,6 +2866,39 @@ pub(crate) async fn run_tool_call_loop(
 
                     match retry_result {
                         Ok(resp) => {
+                            let (resp_input_tokens, resp_output_tokens) = resp
+                                .usage
+                                .as_ref()
+                                .map(|u| (u.input_tokens, u.output_tokens))
+                                .unwrap_or((None, None));
+
+                            observer.record_event(&ObserverEvent::LlmResponse {
+                                provider: provider_name.to_string(),
+                                model: model.to_string(),
+                                duration: llm_started_at.elapsed(),
+                                success: true,
+                                error_message: None,
+                                input_tokens: resp_input_tokens,
+                                output_tokens: resp_output_tokens,
+                            });
+
+                            runtime_trace::record_event(
+                                "llm_response",
+                                Some(channel_name),
+                                Some(provider_name),
+                                Some(model),
+                                Some(&turn_id),
+                                Some(true),
+                                None,
+                                serde_json::json!({
+                                    "iteration": iteration + 1,
+                                    "duration_ms": llm_started_at.elapsed().as_millis(),
+                                    "input_tokens": resp_input_tokens,
+                                    "output_tokens": resp_output_tokens,
+                                    "emergency_retry": true,
+                                }),
+                            );
+
                             let response_text = resp.text_or_empty().to_string();
                             let mut calls = parse_structured_tool_calls(&resp.tool_calls);
                             let mut parsed_text = String::new();

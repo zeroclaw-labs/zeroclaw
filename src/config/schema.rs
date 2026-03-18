@@ -1090,7 +1090,7 @@ pub struct AgentConfig {
     pub max_history_messages: usize,
     /// Maximum estimated tokens for conversation history before compaction triggers.
     /// Uses ~4 chars/token heuristic. When this threshold is exceeded, older messages
-    /// are summarized to preserve context while staying within budget. Default: `32000`.
+    /// are summarized to preserve context while staying within budget. Default: `128000`.
     #[serde(default = "default_agent_max_context_tokens")]
     pub max_context_tokens: usize,
     /// Enable parallel tool execution within a single iteration. Default: `false`.
