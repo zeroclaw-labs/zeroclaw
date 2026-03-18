@@ -13,13 +13,20 @@
 //
 
 const { chromium } = require("playwright");
+const fs = require("fs");
+const path = require("path");
 
 let browser = null;
 let context = null;
 let page = null;
+let downloadDir = null;
 
-async function ensureBrowser(headless) {
+async function ensureBrowser(headless, downloadsPath) {
   if (!browser || !browser.isConnected()) {
+    downloadDir = downloadsPath || path.join(process.cwd(), "downloads");
+    if (!fs.existsSync(downloadDir)) {
+      fs.mkdirSync(downloadDir, { recursive: true });
+    }
     browser = await chromium.launch({
       headless: headless !== false,
       args: [
@@ -32,6 +39,7 @@ async function ensureBrowser(headless) {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       viewport: { width: 1280, height: 720 },
       locale: "ko-KR",
+      acceptDownloads: true,
     });
     page = await context.newPage();
   }
@@ -44,7 +52,7 @@ async function ensureBrowser(headless) {
 async function executeAction(cmd) {
   const action = cmd.action;
   const headless = cmd.headless !== false;
-  const p = await ensureBrowser(headless);
+  const p = await ensureBrowser(headless, cmd.downloads_path);
 
   switch (action) {
     case "open": {
@@ -319,6 +327,214 @@ async function executeAction(cmd) {
     case "uncheck": {
       await p.uncheck(cmd.selector, { timeout: cmd.timeout_ms || 5000 });
       return { unchecked: cmd.selector };
+    }
+
+    // ── File download: click a link/button and save the downloaded file ──
+    case "download": {
+      const [download] = await Promise.all([
+        p.waitForEvent("download", { timeout: cmd.timeout_ms || 30000 }),
+        cmd.selector
+          ? p.click(cmd.selector, { timeout: cmd.timeout_ms || 5000 })
+          : Promise.resolve(),
+      ]);
+      const suggestedName = download.suggestedFilename();
+      const savePath = path.join(
+        cmd.save_dir || downloadDir || "downloads",
+        cmd.filename || suggestedName
+      );
+      const saveDir = path.dirname(savePath);
+      if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
+      await download.saveAs(savePath);
+      const stats = fs.statSync(savePath);
+      return {
+        downloaded: true,
+        path: savePath,
+        filename: path.basename(savePath),
+        size_bytes: stats.size,
+        suggested_name: suggestedName,
+      };
+    }
+
+    // ── Download file from URL directly (HTTP download via browser) ──
+    case "download_url": {
+      const url = cmd.url;
+      const response = await p.goto(url, {
+        waitUntil: "commit",
+        timeout: cmd.timeout_ms || 60000,
+      });
+      const body = await response.body();
+      const filename =
+        cmd.filename ||
+        url.split("/").pop().split("?")[0] ||
+        "downloaded_file";
+      const savePath = path.join(
+        cmd.save_dir || downloadDir || "downloads",
+        filename
+      );
+      const saveDir = path.dirname(savePath);
+      if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
+      fs.writeFileSync(savePath, body);
+      return {
+        downloaded: true,
+        path: savePath,
+        filename: path.basename(savePath),
+        size_bytes: body.length,
+        content_type: response.headers()["content-type"] || "unknown",
+      };
+    }
+
+    // ── Scrape all links from current page ──
+    case "scrape_links": {
+      const links = await p.evaluate((opts) => {
+        const anchors = document.querySelectorAll("a[href]");
+        const results = [];
+        for (const a of anchors) {
+          const href = a.href;
+          const text = a.textContent?.trim().slice(0, 200) || "";
+          if (href && !href.startsWith("javascript:")) {
+            if (!opts.filter || text.toLowerCase().includes(opts.filter.toLowerCase()) ||
+                href.toLowerCase().includes(opts.filter.toLowerCase())) {
+              results.push({ href, text });
+            }
+          }
+        }
+        return results.slice(0, opts.max || 100);
+      }, { filter: cmd.filter || null, max: cmd.max_results || 100 });
+      return { links, count: links.length };
+    }
+
+    // ── Scrape table data from current page ──
+    case "scrape_table": {
+      const tableData = await p.evaluate((opts) => {
+        const table = opts.selector
+          ? document.querySelector(opts.selector)
+          : document.querySelector("table");
+        if (!table) return { error: "No table found" };
+
+        const headers = [];
+        const rows = [];
+        const ths = table.querySelectorAll("thead th, tr:first-child th");
+        for (const th of ths) {
+          headers.push(th.textContent?.trim() || "");
+        }
+
+        const trs = table.querySelectorAll("tbody tr, tr");
+        const startRow = headers.length > 0 ? 0 : 0;
+        for (const tr of trs) {
+          const tds = tr.querySelectorAll("td");
+          if (tds.length === 0) continue;
+          const row = [];
+          for (const td of tds) row.push(td.textContent?.trim() || "");
+          rows.push(row);
+        }
+
+        return { headers, rows: rows.slice(0, opts.max_rows || 200) };
+      }, { selector: cmd.selector || null, max_rows: cmd.max_rows || 200 });
+      return tableData;
+    }
+
+    // ── Extract structured page data (text, metadata, forms) ──
+    case "extract_page_data": {
+      const data = await p.evaluate(() => {
+        const meta = {};
+        document.querySelectorAll("meta").forEach((m) => {
+          const name = m.getAttribute("name") || m.getAttribute("property");
+          const content = m.getAttribute("content");
+          if (name && content) meta[name] = content;
+        });
+
+        const forms = [];
+        document.querySelectorAll("form").forEach((f) => {
+          const fields = [];
+          f.querySelectorAll("input, select, textarea").forEach((el) => {
+            fields.push({
+              tag: el.tagName.toLowerCase(),
+              type: el.type || null,
+              name: el.name || null,
+              id: el.id || null,
+              placeholder: el.placeholder || null,
+              value: el.value || null,
+              required: el.required || false,
+            });
+          });
+          forms.push({
+            action: f.action || null,
+            method: f.method || "get",
+            fields,
+          });
+        });
+
+        const textContent = document.body?.innerText?.slice(0, 10000) || "";
+
+        return {
+          title: document.title,
+          url: location.href,
+          meta,
+          forms,
+          text_length: textContent.length,
+          text_preview: textContent.slice(0, 3000),
+        };
+      });
+      return data;
+    }
+
+    // ── Fill and submit a form ──
+    case "fill_form": {
+      const fields = cmd.fields || {};
+      for (const [selector, value] of Object.entries(fields)) {
+        const el = await p.$(selector);
+        if (!el) continue;
+        const tag = await el.evaluate((e) => e.tagName.toLowerCase());
+        if (tag === "select") {
+          await p.selectOption(selector, value, { timeout: cmd.timeout_ms || 5000 });
+        } else {
+          await p.fill(selector, value, { timeout: cmd.timeout_ms || 5000 });
+        }
+      }
+      if (cmd.submit_selector) {
+        await p.click(cmd.submit_selector, { timeout: cmd.timeout_ms || 5000 });
+      } else if (cmd.submit !== false) {
+        await p.press("body", "Enter");
+      }
+      await p.waitForTimeout(cmd.wait_after_ms || 1000);
+      return {
+        filled: Object.keys(fields).length,
+        url: p.url(),
+        title: await p.title(),
+      };
+    }
+
+    // ── Multi-page navigation (next/prev pages for pagination) ──
+    case "paginate": {
+      const results = [];
+      const maxPages = cmd.max_pages || 5;
+      for (let i = 0; i < maxPages; i++) {
+        const pageData = await p.evaluate((opts) => {
+          const items = document.querySelectorAll(opts.item_selector || "li, .item, article, .product");
+          const extracted = [];
+          for (const item of items) {
+            extracted.push({
+              text: item.textContent?.trim().slice(0, 500) || "",
+              html: item.innerHTML?.slice(0, 200) || "",
+            });
+          }
+          return extracted.slice(0, 50);
+        }, { item_selector: cmd.item_selector });
+        results.push(...pageData);
+        if (cmd.next_selector) {
+          const nextBtn = await p.$(cmd.next_selector);
+          if (!nextBtn) break;
+          const isDisabled = await nextBtn.evaluate((e) =>
+            e.disabled || e.classList.contains("disabled") || e.getAttribute("aria-disabled") === "true"
+          );
+          if (isDisabled) break;
+          await nextBtn.click();
+          await p.waitForTimeout(cmd.wait_between_ms || 2000);
+        } else {
+          break;
+        }
+      }
+      return { items: results, total: results.length };
     }
 
     default:
