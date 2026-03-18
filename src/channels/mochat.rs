@@ -199,6 +199,7 @@ impl Channel for MochatChannel {
                                     .as_secs(),
                                 thread_ts: None,
                                 interruption_scope_id: None,
+                                observe_group: false,
                             };
 
                             if tx.send(channel_msg).await.is_err() {

@@ -17,6 +17,27 @@ pub struct ChannelMessage {
     /// is genuinely inside a reply thread and should be isolated from other threads.
     /// `None` means top-level — scope is sender+channel only.
     pub interruption_scope_id: Option<String>,
+    /// When true, the message is stored in session history for context
+    /// but the agent does not generate a response.  Used by channels with
+    /// `mention_only` to passively observe group conversation.
+    #[cfg_attr(test, allow(dead_code))]
+    pub observe_group: bool,
+}
+
+impl Default for ChannelMessage {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            sender: String::new(),
+            reply_target: String::new(),
+            content: String::new(),
+            channel: String::new(),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            observe_group: false,
+        }
+    }
 }
 
 /// Message to send through a channel
