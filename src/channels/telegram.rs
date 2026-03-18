@@ -544,7 +544,13 @@ impl TelegramChannel {
     }
 
     fn api_url(&self, method: &str) -> String {
-        format!("{}/bot{}/{method}", self.api_base, self.bot_token)
+        if self.api_base == "https://api.telegram.org" {
+            // Standard Telegram API: include bot token in path
+            format!("{}/bot{}/{method}", self.api_base, self.bot_token)
+        } else {
+            // Custom api_base (proxy gateway): send directly, no bot token in path
+            format!("{}/{method}", self.api_base)
+        }
     }
 
     async fn classify_edit_message_response(resp: reqwest::Response) -> EditMessageResult {
@@ -869,7 +875,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
     /// Download a file from the Telegram CDN.
     async fn download_file(&self, file_path: &str) -> anyhow::Result<Vec<u8>> {
-        let url = format!("{}/file/bot{}/{file_path}", self.api_base, self.bot_token);
+        let url = if self.api_base == "https://api.telegram.org" {
+            format!("{}/file/bot{}/{file_path}", self.api_base, self.bot_token)
+        } else {
+            format!("{}/file/{file_path}", self.api_base)
+        };
         let resp = self
             .http_client()
             .get(&url)
@@ -1363,7 +1373,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .to_string();
 
         // Step 2: download the actual file
-        let download_url = format!("{}/file/bot{}/{}", self.api_base, self.bot_token, file_path);
+        let download_url = if self.api_base == "https://api.telegram.org" {
+            format!("{}/file/bot{}/{}", self.api_base, self.bot_token, file_path)
+        } else {
+            format!("{}/file/{}", self.api_base, file_path)
+        };
         let img_resp = self.http_client().get(&download_url).send().await?;
         let bytes = img_resp.bytes().await?;
 

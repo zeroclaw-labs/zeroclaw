@@ -4494,6 +4494,8 @@ fn default_draft_update_interval_ms() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TelegramConfig {
     /// Telegram Bot API token (from @BotFather).
+    /// Optional when `api_base` is set (proxy injects credentials).
+    #[serde(default)]
     pub bot_token: String,
     /// Allowed Telegram user IDs or usernames. Empty = deny all.
     pub allowed_users: Vec<String>,
