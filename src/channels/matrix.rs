@@ -893,7 +893,8 @@ impl Channel for MatrixChannel {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs(),
-                    thread_ts,
+                    thread_ts: thread_ts.clone(),
+                    interruption_scope_id: thread_ts,
                 };
 
                 let _ = tx.send(msg).await;
