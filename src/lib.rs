@@ -54,6 +54,7 @@ pub(crate) mod hardware;
 pub(crate) mod health;
 pub(crate) mod heartbeat;
 pub mod hooks;
+pub mod i18n;
 pub(crate) mod identity;
 pub(crate) mod integrations;
 pub mod memory;

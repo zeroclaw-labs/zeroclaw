@@ -3939,6 +3939,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
 
+    // ── Load locale-aware tool descriptions ────────────────────────
+    let i18n_locale = config
+        .locale
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(crate::i18n::detect_locale);
+    let i18n_search_dirs = crate::i18n::default_search_dirs(&workspace);
+    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (
@@ -4018,7 +4028,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         config.skills.prompt_injection_mode,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
+        system_prompt.push_str(&build_tool_instructions(
+            tools_registry.as_ref(),
+            Some(&i18n_descs),
+        ));
     }
 
     // Append deferred MCP tool names so the LLM knows what is available
@@ -6768,7 +6781,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "build_system_prompt should not emit protocol block directly"
         );
 
-        prompt.push_str(&build_tool_instructions(&[]));
+        prompt.push_str(&build_tool_instructions(&[], None));
 
         assert_eq!(
             prompt.matches("## Tool Use Protocol").count(),
