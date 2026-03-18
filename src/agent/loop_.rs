@@ -2179,8 +2179,12 @@ pub(crate) async fn agent_turn(
     model: &str,
     temperature: f64,
     silent: bool,
+    channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    excluded_tools: &[String],
+    dedup_exempt_tools: &[String],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
 ) -> Result<String> {
     run_tool_call_loop(
@@ -2193,15 +2197,15 @@ pub(crate) async fn agent_turn(
         temperature,
         silent,
         None,
-        "channel",
+        channel_name,
         multimodal_config,
         max_tool_iterations,
         None,
         None,
         None,
-        &[],
-        &[],
-        None,
+        excluded_tools,
+        dedup_exempt_tools,
+        activated_tools,
         model_switch_callback,
     )
     .await
@@ -2224,7 +2228,7 @@ async fn execute_one_tool(
 
     let static_tool = find_tool(tools_registry, call_name);
     let activated_arc = if static_tool.is_none() {
-        activated_tools.and_then(|at| at.lock().unwrap().get(call_name))
+        activated_tools.and_then(|at| at.lock().unwrap().get_resolved(call_name))
     } else {
         None
     };
@@ -3280,16 +3284,7 @@ pub async fn run(
         .unwrap_or("anthropic/claude-sonnet-4")
         .to_string();
 
-    let provider_runtime_options = providers::ProviderRuntimeOptions {
-        auth_profile_override: None,
-        provider_api_url: config.api_url.clone(),
-        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
-        secrets_encrypt: config.secrets.encrypt,
-        reasoning_enabled: config.runtime.reasoning_enabled,
-        provider_timeout_secs: Some(config.provider_timeout_secs),
-        extra_headers: config.extra_headers.clone(),
-        api_path: config.api_path.clone(),
-    };
+    let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
 
     let mut provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         &provider_name,
@@ -3899,6 +3894,10 @@ pub async fn process_message(
     // NOTE: Same ordering contract as the CLI path above — MCP tools must be
     // injected after filter_primary_agent_tools_or_fail (or equivalent built-in
     // tool allow/deny filtering) to avoid MCP tools being silently dropped.
+    let mut deferred_section = String::new();
+    let mut activated_handle_pm: Option<
+        std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
+    > = None;
     if config.mcp.enabled && !config.mcp.servers.is_empty() {
         tracing::info!(
             "Initializing MCP client — {} server(s) configured",
@@ -3907,28 +3906,50 @@ pub async fn process_message(
         match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
             Ok(registry) => {
                 let registry = std::sync::Arc::new(registry);
-                let names = registry.tool_names();
-                let mut registered = 0usize;
-                for name in names {
-                    if let Some(def) = registry.get_tool_def(&name).await {
-                        let wrapper: std::sync::Arc<dyn Tool> =
-                            std::sync::Arc::new(crate::tools::McpToolWrapper::new(
-                                name,
-                                def,
-                                std::sync::Arc::clone(&registry),
-                            ));
-                        if let Some(ref handle) = delegate_handle_pm {
-                            handle.write().push(std::sync::Arc::clone(&wrapper));
+                if config.mcp.deferred_loading {
+                    let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
+                        std::sync::Arc::clone(&registry),
+                    )
+                    .await;
+                    tracing::info!(
+                        "MCP deferred: {} tool stub(s) from {} server(s)",
+                        deferred_set.len(),
+                        registry.server_count()
+                    );
+                    deferred_section =
+                        crate::tools::mcp_deferred::build_deferred_tools_section(&deferred_set);
+                    let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::tools::ActivatedToolSet::new(),
+                    ));
+                    activated_handle_pm = Some(std::sync::Arc::clone(&activated));
+                    tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
+                        deferred_set,
+                        activated,
+                    )));
+                } else {
+                    let names = registry.tool_names();
+                    let mut registered = 0usize;
+                    for name in names {
+                        if let Some(def) = registry.get_tool_def(&name).await {
+                            let wrapper: std::sync::Arc<dyn Tool> =
+                                std::sync::Arc::new(crate::tools::McpToolWrapper::new(
+                                    name,
+                                    def,
+                                    std::sync::Arc::clone(&registry),
+                                ));
+                            if let Some(ref handle) = delegate_handle_pm {
+                                handle.write().push(std::sync::Arc::clone(&wrapper));
+                            }
+                            tools_registry.push(Box::new(crate::tools::ArcToolRef(wrapper)));
+                            registered += 1;
                         }
-                        tools_registry.push(Box::new(crate::tools::ArcToolRef(wrapper)));
-                        registered += 1;
                     }
+                    tracing::info!(
+                        "MCP: {} tool(s) registered from {} server(s)",
+                        registered,
+                        registry.server_count()
+                    );
                 }
-                tracing::info!(
-                    "MCP: {} tool(s) registered from {} server(s)",
-                    registered,
-                    registry.server_count()
-                );
             }
             Err(e) => {
                 tracing::error!("MCP registry failed to initialize: {e:#}");
@@ -3941,16 +3962,7 @@ pub async fn process_message(
         .default_model
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
-    let provider_runtime_options = providers::ProviderRuntimeOptions {
-        auth_profile_override: None,
-        provider_api_url: config.api_url.clone(),
-        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
-        secrets_encrypt: config.secrets.encrypt,
-        reasoning_enabled: config.runtime.reasoning_enabled,
-        provider_timeout_secs: Some(config.provider_timeout_secs),
-        extra_headers: config.extra_headers.clone(),
-        api_path: config.api_path.clone(),
-    };
+    let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,
         config.api_key.as_deref(),
@@ -4043,6 +4055,10 @@ pub async fn process_message(
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
+    if !deferred_section.is_empty() {
+        system_prompt.push('\n');
+        system_prompt.push_str(&deferred_section);
+    }
 
     let mem_context = build_context(
         mem.as_ref(),
@@ -4068,6 +4084,8 @@ pub async fn process_message(
         ChatMessage::system(&system_prompt),
         ChatMessage::user(&enriched),
     ];
+    let excluded_tools =
+        compute_excluded_mcp_tools(&tools_registry, &config.agent.tool_filter_groups, message);
 
     agent_turn(
         provider.as_ref(),
@@ -4078,8 +4096,12 @@ pub async fn process_message(
         &model_name,
         config.default_temperature,
         true,
+        "daemon",
         &config.multimodal,
         config.agent.max_tool_iterations,
+        &excluded_tools,
+        &config.agent.tool_call_dedup_exempt,
+        activated_handle_pm.as_ref(),
         None,
     )
     .await
@@ -4176,6 +4198,36 @@ mod tests {
         let outcome = result.unwrap();
         assert!(!outcome.success);
         assert!(outcome.output.contains("Unknown tool: unknown_tool"));
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_resolves_unique_activated_tool_suffix() {
+        let observer = NoopObserver;
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let activated = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+        let activated_tool: Arc<dyn Tool> = Arc::new(CountingTool::new(
+            "docker-mcp__extract_text",
+            Arc::clone(&invocations),
+        ));
+        activated
+            .lock()
+            .unwrap()
+            .activate("docker-mcp__extract_text".into(), activated_tool);
+
+        let outcome = execute_one_tool(
+            "extract_text",
+            serde_json::json!({ "value": "ok" }),
+            &[],
+            Some(&activated),
+            &observer,
+            None,
+        )
+        .await
+        .expect("suffix alias should execute the unique activated tool");
+
+        assert!(outcome.success);
+        assert_eq!(outcome.output, "counted:ok");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
 
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
@@ -4822,6 +4874,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_allows_low_risk_shell_in_non_interactive_mode() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"echo hello"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let tmp = TempDir::new().expect("temp dir");
+        let security = Arc::new(crate::security::SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Supervised,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..crate::security::SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn crate::runtime::RuntimeAdapter> =
+            Arc::new(crate::runtime::NativeRuntime::new());
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(
+            crate::tools::shell::ShellTool::new(security, runtime),
+        )];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run shell"),
+        ];
+        let observer = NoopObserver;
+        let approval_mgr =
+            ApprovalManager::for_non_interactive(&crate::config::AutonomyConfig::default());
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(&approval_mgr),
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+        )
+        .await
+        .expect("non-interactive shell should succeed for low-risk command");
+
+        assert_eq!(result, "done");
+
+        let tool_results = history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("tool results message should be present");
+        assert!(tool_results.content.contains("hello"));
+        assert!(!tool_results.content.contains("Denied by user."));
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_dedup_exempt_allows_repeated_calls() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>
@@ -5019,6 +5134,64 @@ mod tests {
                 .all(|msg| !(msg.role == "user" && msg.content.starts_with("[Tool results]"))),
             "native mode should use role=tool history instead of prompt fallback wrapper"
         );
+    }
+
+    #[test]
+    fn agent_turn_executes_activated_tool_from_wrapper() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should initialize");
+
+        runtime.block_on(async {
+            let provider = ScriptedProvider::from_text_responses(vec![
+                r#"<tool_call>
+{"name":"pixel__get_api_health","arguments":{"value":"ok"}}
+</tool_call>"#,
+                "done",
+            ]);
+
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let activated = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+            let activated_tool: Arc<dyn Tool> = Arc::new(CountingTool::new(
+                "pixel__get_api_health",
+                Arc::clone(&invocations),
+            ));
+            activated
+                .lock()
+                .unwrap()
+                .activate("pixel__get_api_health".into(), activated_tool);
+
+            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let mut history = vec![
+                ChatMessage::system("test-system"),
+                ChatMessage::user("use the activated MCP tool"),
+            ];
+            let observer = NoopObserver;
+
+            let result = agent_turn(
+                &provider,
+                &mut history,
+                &tools_registry,
+                &observer,
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                "daemon",
+                &crate::config::MultimodalConfig::default(),
+                4,
+                &[],
+                &[],
+                Some(&activated),
+                None,
+            )
+            .await
+            .expect("wrapper path should execute activated tools");
+
+            assert_eq!(result, "done");
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        });
     }
 
     #[test]

@@ -12,9 +12,11 @@ import Config from './pages/Config';
 import Cost from './pages/Cost';
 import Logs from './pages/Logs';
 import Doctor from './pages/Doctor';
+import Pairing from './pages/Pairing';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { DraftContext, useDraftStore } from './hooks/useDraft';
 import { setLocale, type Locale } from './lib/i18n';
+import { getAdminPairCode } from './lib/api';
 
 // Locale context
 interface LocaleContextType {
@@ -23,7 +25,7 @@ interface LocaleContextType {
 }
 
 export const LocaleContext = createContext<LocaleContextType>({
-  locale: 'tr',
+  locale: 'en',
   setAppLocale: () => {},
 });
 
@@ -88,6 +90,26 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
   const [code, setCode] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [displayCode, setDisplayCode] = useState<string | null>(null);
+  const [codeLoading, setCodeLoading] = useState(true);
+
+  // Fetch the current pairing code from the admin endpoint (localhost only)
+  useEffect(() => {
+    let cancelled = false;
+    getAdminPairCode()
+      .then((data) => {
+        if (!cancelled && data.pairing_code) {
+          setDisplayCode(data.pairing_code);
+        }
+      })
+      .catch(() => {
+        // Admin endpoint not reachable (non-localhost) — user must check terminal
+      })
+      .finally(() => {
+        if (!cancelled) setCodeLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -119,8 +141,23 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
             style={{ boxShadow: '0 0 30px rgba(0,128,255,0.3)' }}
           />
           <h1 className="text-2xl font-bold text-gradient-blue mb-2">ZeroClaw</h1>
-          <p className="text-[#556080] text-sm">Enter the pairing code from your terminal</p>
+          {displayCode ? (
+            <p className="text-[#556080] text-sm">Your pairing code</p>
+          ) : (
+            <p className="text-[#556080] text-sm">Enter the pairing code from your terminal</p>
+          )}
         </div>
+
+        {/* Show the pairing code if available (localhost) */}
+        {!codeLoading && displayCode && (
+          <div className="mb-6 p-4 rounded-xl text-center" style={{ background: 'rgba(0,128,255,0.08)', border: '1px solid rgba(0,128,255,0.2)' }}>
+            <div className="text-4xl font-mono font-bold tracking-[0.4em] text-white py-2">
+              {displayCode}
+            </div>
+            <p className="text-[#556080] text-xs mt-2">Enter this code below or on another device</p>
+          </div>
+        )}
+
         <form onSubmit={handleSubmit}>
           <input
             type="text"
@@ -154,7 +191,7 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 
 function AppContent() {
   const { isAuthenticated, requiresPairing, loading, pair, logout } = useAuth();
-  const [locale, setLocaleState] = useState('tr');
+  const [locale, setLocaleState] = useState('en');
   const draftStore = useDraftStore();
 
   const setAppLocale = (newLocale: string) => {
@@ -201,6 +238,7 @@ function AppContent() {
             <Route path="/cost" element={<Cost />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/doctor" element={<Doctor />} />
+            <Route path="/pairing" element={<Pairing />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>

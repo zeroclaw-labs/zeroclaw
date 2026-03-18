@@ -579,6 +579,7 @@ pub fn all_tools_with_runtime(
             .map(std::path::PathBuf::from),
         secrets_encrypt: root_config.secrets.encrypt,
         reasoning_enabled: root_config.runtime.reasoning_enabled,
+        reasoning_effort: root_config.runtime.reasoning_effort.clone(),
         provider_timeout_secs: Some(root_config.provider_timeout_secs),
         extra_headers: root_config.extra_headers.clone(),
         api_path: root_config.api_path.clone(),
@@ -634,6 +635,53 @@ pub fn all_tools_with_runtime(
             Arc::new(tokio::sync::RwLock::new(ws_manager)),
             security.clone(),
         )));
+    }
+
+    // ── WASM plugin tools (requires plugins-wasm feature) ──
+    #[cfg(feature = "plugins-wasm")]
+    {
+        let plugin_dir = config.plugins.plugins_dir.clone();
+        let plugin_path = if plugin_dir.starts_with("~/") {
+            let home = directories::UserDirs::new()
+                .map(|u| u.home_dir().to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            home.join(&plugin_dir[2..])
+        } else {
+            std::path::PathBuf::from(&plugin_dir)
+        };
+
+        if plugin_path.exists() && config.plugins.enabled {
+            match crate::plugins::host::PluginHost::new(
+                plugin_path.parent().unwrap_or(&plugin_path),
+            ) {
+                Ok(host) => {
+                    let tool_manifests = host.tool_plugins();
+                    let count = tool_manifests.len();
+                    for manifest in tool_manifests {
+                        tool_arcs.push(Arc::new(crate::plugins::wasm_tool::WasmTool::new(
+                            manifest.name.clone(),
+                            manifest.description.clone().unwrap_or_default(),
+                            manifest.name.clone(),
+                            "call".to_string(),
+                            serde_json::json!({
+                                "type": "object",
+                                "properties": {
+                                    "input": {
+                                        "type": "string",
+                                        "description": "Input for the plugin"
+                                    }
+                                },
+                                "required": ["input"]
+                            }),
+                        )));
+                    }
+                    tracing::info!("Loaded {count} WASM plugin tools");
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load WASM plugins: {e}");
+                }
+            }
+        }
     }
 
     (boxed_registry_from_arcs(tool_arcs), delegate_handle)

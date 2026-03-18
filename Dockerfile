@@ -1,9 +1,18 @@
 # syntax=docker/dockerfile:1.7
 
+# ── Stage 0: Frontend build ─────────────────────────────────────
+FROM node:22-alpine AS web-builder
+WORKDIR /web
+COPY web/package.json web/package-lock.json* ./
+RUN npm ci --ignore-scripts 2>/dev/null || npm install --ignore-scripts
+COPY web/ .
+RUN npm run build
+
 # ── Stage 1: Build ────────────────────────────────────────────
-FROM rust:1.94-slim@sha256:7d3701660d2aa7101811ba0c54920021452aa60e5bae073b79c2b137a432b2f4 AS builder
+FROM rust:1.94-slim@sha256:da9dab7a6b8dd428e71718402e97207bb3e54167d37b5708616050b1e8f60ed6 AS builder
 
 WORKDIR /app
+ARG ZEROCLAW_CARGO_FEATURES=""
 
 # Install build dependencies
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -24,7 +33,11 @@ RUN mkdir -p src benches crates/robot-kit/src \
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    cargo build --release --locked
+    if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
+      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
+    else \
+      cargo build --release --locked; \
+    fi
 RUN rm -rf src benches crates/robot-kit/src
 
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
@@ -32,25 +45,8 @@ COPY src/ src/
 COPY benches/ benches/
 COPY crates/ crates/
 COPY firmware/ firmware/
-COPY web/ web/
+COPY --from=web-builder /web/dist web/dist
 COPY *.rs .
-# Keep release builds resilient when frontend dist assets are not prebuilt in Git.
-RUN mkdir -p web/dist && \
-    if [ ! -f web/dist/index.html ]; then \
-      printf '%s\n' \
-        '<!doctype html>' \
-        '<html lang="en">' \
-        '  <head>' \
-        '    <meta charset="utf-8" />' \
-        '    <meta name="viewport" content="width=device-width,initial-scale=1" />' \
-        '    <title>ZeroClaw Dashboard</title>' \
-        '  </head>' \
-        '  <body>' \
-        '    <h1>ZeroClaw Dashboard Unavailable</h1>' \
-        '    <p>Frontend assets are not bundled in this build. Build the web UI to populate <code>web/dist</code>.</p>' \
-        '  </body>' \
-        '</html>' > web/dist/index.html; \
-    fi
 RUN touch src/main.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
@@ -58,7 +54,11 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     rm -rf target/release/.fingerprint/zeroclawlabs-* \
            target/release/deps/zeroclawlabs-* \
            target/release/incremental/zeroclawlabs-* && \
-    cargo build --release --locked && \
+    if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
+      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
+    else \
+      cargo build --release --locked; \
+    fi && \
     cp target/release/zeroclaw /app/zeroclaw && \
     strip /app/zeroclaw
 RUN size=$(stat -c%s /app/zeroclaw 2>/dev/null || stat -f%z /app/zeroclaw) && \
@@ -114,6 +114,8 @@ ENV ZEROCLAW_GATEWAY_PORT=42617
 WORKDIR /zeroclaw-data
 USER 65534:65534
 EXPOSE 42617
+HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
+    CMD ["zeroclaw", "status", "--format=exit-code"]
 ENTRYPOINT ["zeroclaw"]
 CMD ["gateway"]
 
@@ -138,5 +140,7 @@ ENV ZEROCLAW_GATEWAY_PORT=42617
 WORKDIR /zeroclaw-data
 USER 65534:65534
 EXPOSE 42617
+HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
+    CMD ["zeroclaw", "status", "--format=exit-code"]
 ENTRYPOINT ["zeroclaw"]
 CMD ["gateway"]

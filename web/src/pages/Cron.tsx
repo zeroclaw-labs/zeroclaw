@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import type { CronJob, CronRun } from '@/types/api';
 import { getCronJobs, addCronJob, deleteCronJob, getCronRuns } from '@/lib/api';
+import { t } from '@/lib/i18n';
 
 function formatDate(iso: string | null): string {
   if (!iso) return '-';
@@ -60,7 +61,7 @@ function RunHistoryPanel({ jobId }: { jobId: string }) {
       <div className="px-4 py-3">
         <div className="flex items-center justify-between">
           <span className="text-xs text-[#ff6680]">
-            Failed to load run history: {error}
+            {t('cron.load_run_history_error')}: {error}
           </span>
           <button
             onClick={fetchRuns}
@@ -76,7 +77,7 @@ function RunHistoryPanel({ jobId }: { jobId: string }) {
   if (runs.length === 0) {
     return (
       <div className="px-4 py-3 flex items-center justify-between">
-        <span className="text-xs text-[#334060]">No runs recorded yet.</span>
+        <span className="text-xs text-[#334060]">{t('cron.no_runs')}</span>
         <button
           onClick={fetchRuns}
           className="text-[#556080] hover:text-white transition-colors duration-300"
@@ -91,7 +92,7 @@ function RunHistoryPanel({ jobId }: { jobId: string }) {
     <div className="px-4 py-3">
       <div className="flex items-center justify-between mb-2">
         <span className="text-xs font-medium text-[#8892a8]">
-          Recent Runs ({runs.length})
+          {t('cron.recent_runs')} ({runs.length})
         </span>
         <button
           onClick={fetchRuns}
@@ -164,7 +165,7 @@ export default function Cron() {
 
   const handleAdd = async () => {
     if (!formSchedule.trim() || !formCommand.trim()) {
-      setFormError('Schedule and command are required.');
+      setFormError(t('cron.validation_error'));
       return;
     }
     setSubmitting(true);
@@ -181,7 +182,7 @@ export default function Cron() {
       setFormSchedule('');
       setFormCommand('');
     } catch (err: unknown) {
-      setFormError(err instanceof Error ? err.message : 'Failed to add job');
+      setFormError(err instanceof Error ? err.message : t('cron.add_error'));
     } finally {
       setSubmitting(false);
     }
@@ -192,7 +193,7 @@ export default function Cron() {
       await deleteCronJob(id);
       setJobs((prev) => prev.filter((j) => j.id !== id));
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to delete job');
+      setError(err instanceof Error ? err.message : t('cron.delete_error'));
     } finally {
       setConfirmDelete(null);
     }
@@ -216,7 +217,7 @@ export default function Cron() {
     return (
       <div className="p-6 animate-fade-in">
         <div className="rounded-xl bg-[#ff446615] border border-[#ff446630] p-4 text-[#ff6680]">
-          Failed to load cron jobs: {error}
+          {t('cron.load_error')}: {error}
         </div>
       </div>
     );
@@ -237,7 +238,7 @@ export default function Cron() {
         <div className="flex items-center gap-2">
           <Clock className="h-5 w-5 text-[#0080ff]" />
           <h2 className="text-sm font-semibold text-white uppercase tracking-wider">
-            Scheduled Tasks ({jobs.length})
+            {t('cron.scheduled_tasks')} ({jobs.length})
           </h2>
         </div>
         <button
@@ -245,7 +246,7 @@ export default function Cron() {
           className="btn-electric flex items-center gap-2 text-sm px-4 py-2"
         >
           <Plus className="h-4 w-4" />
-          Add Job
+          {t('cron.add_job')}
         </button>
       </div>
 
@@ -254,7 +255,7 @@ export default function Cron() {
         <div className="fixed inset-0 modal-backdrop flex items-center justify-center z-50">
           <div className="glass-card p-6 w-full max-w-md mx-4 animate-fade-in-scale">
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-semibold text-white">Add Cron Job</h3>
+              <h3 className="text-lg font-semibold text-white">{t('cron.add_modal_title')}</h3>
               <button
                 onClick={() => {
                   setShowForm(false);
@@ -275,7 +276,7 @@ export default function Cron() {
             <div className="space-y-4">
               <div>
                 <label className="block text-xs font-semibold text-[#8892a8] mb-1.5 uppercase tracking-wider">
-                  Name (optional)
+                  {t('cron.name_optional')}
                 </label>
                 <input
                   type="text"
@@ -287,7 +288,7 @@ export default function Cron() {
               </div>
               <div>
                 <label className="block text-xs font-semibold text-[#8892a8] mb-1.5 uppercase tracking-wider">
-                  Schedule <span className="text-[#ff4466]">*</span>
+                  {t('cron.schedule_required')} <span className="text-[#ff4466]">*</span>
                 </label>
                 <input
                   type="text"
@@ -299,7 +300,7 @@ export default function Cron() {
               </div>
               <div>
                 <label className="block text-xs font-semibold text-[#8892a8] mb-1.5 uppercase tracking-wider">
-                  Command <span className="text-[#ff4466]">*</span>
+                  {t('cron.command_required')} <span className="text-[#ff4466]">*</span>
                 </label>
                 <input
                   type="text"
@@ -319,14 +320,14 @@ export default function Cron() {
                 }}
                 className="px-4 py-2 text-sm font-medium text-[#8892a8] hover:text-white border border-[#1a1a3e] rounded-xl hover:bg-[#0080ff08] transition-all duration-300"
               >
-                Cancel
+                {t('cron.cancel')}
               </button>
               <button
                 onClick={handleAdd}
                 disabled={submitting}
                 className="btn-electric px-4 py-2 text-sm font-medium"
               >
-                {submitting ? 'Adding...' : 'Add Job'}
+                {submitting ? t('cron.adding') : t('cron.add_job')}
               </button>
             </div>
           </div>
@@ -337,20 +338,20 @@ export default function Cron() {
       {jobs.length === 0 ? (
         <div className="glass-card p-8 text-center">
           <Clock className="h-10 w-10 text-[#1a1a3e] mx-auto mb-3" />
-          <p className="text-[#556080]">No scheduled tasks configured.</p>
+          <p className="text-[#556080]">{t('cron.empty')}</p>
         </div>
       ) : (
         <div className="glass-card overflow-x-auto">
           <table className="table-electric">
             <thead>
               <tr>
-                <th className="text-left">ID</th>
-                <th className="text-left">Name</th>
-                <th className="text-left">Command</th>
-                <th className="text-left">Next Run</th>
-                <th className="text-left">Last Status</th>
-                <th className="text-left">Enabled</th>
-                <th className="text-right">Actions</th>
+                <th className="text-left">{t('cron.id')}</th>
+                <th className="text-left">{t('cron.name')}</th>
+                <th className="text-left">{t('cron.command')}</th>
+                <th className="text-left">{t('cron.next_run')}</th>
+                <th className="text-left">{t('cron.last_status')}</th>
+                <th className="text-left">{t('cron.enabled')}</th>
+                <th className="text-right">{t('cron.actions')}</th>
               </tr>
             </thead>
             <tbody>
@@ -401,24 +402,24 @@ export default function Cron() {
                         }`}
                         style={{ background: job.enabled ? 'rgba(0,230,138,0.06)' : 'rgba(26,26,62,0.3)' }}
                       >
-                        {job.enabled ? 'Enabled' : 'Disabled'}
+                        {job.enabled ? t('cron.enabled_status') : t('cron.disabled_status')}
                       </span>
                     </td>
                     <td className="px-4 py-3 text-right">
                       {confirmDelete === job.id ? (
                         <div className="flex items-center justify-end gap-2 animate-fade-in">
-                          <span className="text-xs text-[#ff4466]">Delete?</span>
+                          <span className="text-xs text-[#ff4466]">{t('cron.confirm_delete')}</span>
                           <button
                             onClick={() => handleDelete(job.id)}
                             className="text-[#ff4466] hover:text-[#ff6680] text-xs font-medium"
                           >
-                            Yes
+                            {t('cron.yes')}
                           </button>
                           <button
                             onClick={() => setConfirmDelete(null)}
                             className="text-[#556080] hover:text-white text-xs font-medium"
                           >
-                            No
+                            {t('cron.no')}
                           </button>
                         </div>
                       ) : (

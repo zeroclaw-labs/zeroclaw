@@ -127,6 +127,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
     println!("   Components: gateway, channels, heartbeat, scheduler");
+    if config.gateway.require_pairing {
+        println!("   Pairing:    enabled (code appears in gateway output above)");
+    }
     println!("   Ctrl+C or SIGTERM to stop");
 
     // Wait for shutdown signal (SIGINT or SIGTERM)

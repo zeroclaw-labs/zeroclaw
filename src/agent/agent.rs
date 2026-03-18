@@ -278,6 +278,25 @@ impl Agent {
         self.memory_session_id = session_id;
     }
 
+    /// Hydrate the agent with prior chat messages (e.g. from a session backend).
+    ///
+    /// Ensures a system prompt is prepended if history is empty, then appends all
+    /// non-system messages from the seed. System messages in the seed are skipped
+    /// to avoid duplicating the system prompt.
+    pub fn seed_history(&mut self, messages: &[ChatMessage]) {
+        if self.history.is_empty() {
+            if let Ok(sys) = self.build_system_prompt() {
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::system(sys)));
+            }
+        }
+        for msg in messages {
+            if msg.role != "system" {
+                self.history.push(ConversationMessage::Chat(msg.clone()));
+            }
+        }
+    }
+
     pub fn from_config(config: &Config) -> Result<Self> {
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
@@ -331,13 +350,16 @@ impl Agent {
             .unwrap_or("anthropic/claude-sonnet-4-20250514")
             .to_string();
 
-        let provider: Box<dyn Provider> = providers::create_routed_provider(
+        let provider_runtime_options = providers::provider_runtime_options_from_config(config);
+
+        let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
             provider_name,
             config.api_key.as_deref(),
             config.api_url.as_deref(),
             &config.reliability,
             &config.model_routes,
             &model_name,
+            &provider_runtime_options,
         )?;
 
         let dispatcher_choice = config.agent.tool_dispatcher.as_str();
@@ -1006,6 +1028,92 @@ mod tests {
         assert_eq!(seen.as_slice(), &["hint:fast".to_string()]);
     }
 
+    #[tokio::test]
+    async fn from_config_passes_extra_headers_to_custom_provider() {
+        use axum::{http::HeaderMap, routing::post, Json, Router};
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+
+        let captured_headers: Arc<std::sync::Mutex<Option<HashMap<String, String>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let captured_headers_clone = captured_headers.clone();
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(
+                move |headers: HeaderMap, Json(_body): Json<serde_json::Value>| {
+                    let captured_headers = captured_headers_clone.clone();
+                    async move {
+                        let collected = headers
+                            .iter()
+                            .filter_map(|(name, value)| {
+                                value
+                                    .to_str()
+                                    .ok()
+                                    .map(|value| (name.as_str().to_string(), value.to_string()))
+                            })
+                            .collect();
+                        *captured_headers.lock().unwrap() = Some(collected);
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "hello from mock"
+                                }
+                            }]
+                        }))
+                    }
+                },
+            ),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir;
+        config.config_path = tmp.path().join("config.toml");
+        config.api_key = Some("test-key".to_string());
+        config.default_provider = Some(format!("custom:http://{addr}"));
+        config.default_model = Some("test-model".to_string());
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.extra_headers.insert(
+            "User-Agent".to_string(),
+            "zeroclaw-web-test/1.0".to_string(),
+        );
+        config
+            .extra_headers
+            .insert("X-Title".to_string(), "zeroclaw-web".to_string());
+
+        let mut agent = Agent::from_config(&config).expect("agent from config");
+        let response = agent.turn("hello").await.expect("agent turn");
+
+        assert_eq!(response, "hello from mock");
+
+        let headers = captured_headers
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("captured headers");
+        assert_eq!(
+            headers.get("user-agent").map(String::as_str),
+            Some("zeroclaw-web-test/1.0")
+        );
+        assert_eq!(
+            headers.get("x-title").map(String::as_str),
+            Some("zeroclaw-web")
+        );
+
+        server_handle.abort();
+    }
+
     #[test]
     fn builder_allowed_tools_none_keeps_all_tools() {
         let provider = Box::new(MockProvider {
@@ -1068,5 +1176,51 @@ mod tests {
             agent.tool_specs.is_empty(),
             "No tools should match a non-existent allowlist entry"
         );
+    }
+
+    #[test]
+    fn seed_history_prepends_system_and_skips_system_from_seed() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let seed = vec![
+            ChatMessage::system("old system prompt"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi there"),
+        ];
+        agent.seed_history(&seed);
+
+        let history = agent.history();
+        // First message should be a freshly built system prompt (not the seed one)
+        assert!(matches!(&history[0], ConversationMessage::Chat(m) if m.role == "system"));
+        // System message from seed should be skipped, so next is user
+        assert!(
+            matches!(&history[1], ConversationMessage::Chat(m) if m.role == "user" && m.content == "hello")
+        );
+        assert!(
+            matches!(&history[2], ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi there")
+        );
+        assert_eq!(history.len(), 3);
     }
 }

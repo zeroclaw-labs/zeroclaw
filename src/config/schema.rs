@@ -335,6 +335,10 @@ pub struct Config {
     /// LinkedIn integration configuration (`[linkedin]`).
     #[serde(default)]
     pub linkedin: LinkedInConfig,
+
+    /// Plugin system configuration (`[plugins]`).
+    #[serde(default)]
+    pub plugins: PluginsConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -522,6 +526,28 @@ where
 {
     let value: f64 = serde::Deserialize::deserialize(deserializer)?;
     validate_temperature(value).map_err(serde::de::Error::custom)
+}
+
+fn normalize_reasoning_effort(value: &str) -> std::result::Result<String, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "minimal" | "low" | "medium" | "high" | "xhigh" => Ok(normalized),
+        _ => Err(format!(
+            "reasoning_effort {value:?} is invalid (expected one of: minimal, low, medium, high, xhigh)"
+        )),
+    }
+}
+
+fn deserialize_reasoning_effort_opt<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<String> = Option::deserialize(deserializer)?;
+    value
+        .map(|raw| normalize_reasoning_effort(&raw).map_err(serde::de::Error::custom))
+        .transpose()
 }
 
 fn default_max_depth() -> u32 {
@@ -1415,6 +1441,7 @@ impl Default for PeripheralBoardConfig {
 ///
 /// Controls the HTTP gateway for webhook and pairing endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct GatewayConfig {
     /// Gateway port (default: 42617)
     #[serde(default = "default_gateway_port")]
@@ -1456,6 +1483,18 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
+
+    /// Persist gateway WebSocket chat sessions to SQLite. Default: true.
+    #[serde(default = "default_true")]
+    pub session_persistence: bool,
+
+    /// Auto-archive stale gateway sessions older than N hours. 0 = disabled. Default: 0.
+    #[serde(default)]
+    pub session_ttl_hours: u32,
+
+    /// Pairing dashboard configuration
+    #[serde(default)]
+    pub pairing_dashboard: PairingDashboardConfig,
 }
 
 fn default_gateway_port() -> u16 {
@@ -1490,6 +1529,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_false() -> bool {
+    false
+}
+
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
@@ -1504,6 +1547,57 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+            session_persistence: true,
+            session_ttl_hours: 0,
+            pairing_dashboard: PairingDashboardConfig::default(),
+        }
+    }
+}
+
+/// Pairing dashboard configuration (`[gateway.pairing_dashboard]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PairingDashboardConfig {
+    /// Length of pairing codes (default: 8)
+    #[serde(default = "default_pairing_code_length")]
+    pub code_length: usize,
+    /// Time-to-live for pending pairing codes in seconds (default: 3600)
+    #[serde(default = "default_pairing_ttl")]
+    pub code_ttl_secs: u64,
+    /// Maximum concurrent pending pairing codes (default: 3)
+    #[serde(default = "default_max_pending_codes")]
+    pub max_pending_codes: usize,
+    /// Maximum failed pairing attempts before lockout (default: 5)
+    #[serde(default = "default_max_failed_attempts")]
+    pub max_failed_attempts: u32,
+    /// Lockout duration in seconds after max attempts (default: 300)
+    #[serde(default = "default_pairing_lockout_secs")]
+    pub lockout_secs: u64,
+}
+
+fn default_pairing_code_length() -> usize {
+    8
+}
+fn default_pairing_ttl() -> u64 {
+    3600
+}
+fn default_max_pending_codes() -> usize {
+    3
+}
+fn default_max_failed_attempts() -> u32 {
+    5
+}
+fn default_pairing_lockout_secs() -> u64 {
+    300
+}
+
+impl Default for PairingDashboardConfig {
+    fn default() -> Self {
+        Self {
+            code_length: default_pairing_code_length(),
+            code_ttl_secs: default_pairing_ttl(),
+            max_pending_codes: default_max_pending_codes(),
+            max_failed_attempts: default_max_failed_attempts(),
+            lockout_secs: default_pairing_lockout_secs(),
         }
     }
 }
@@ -2265,6 +2359,42 @@ impl Default for LinkedInConfig {
 
 fn default_linkedin_api_version() -> String {
     "202602".to_string()
+}
+
+/// Plugin system configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PluginsConfig {
+    /// Enable the plugin system (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory where plugins are stored
+    #[serde(default = "default_plugins_dir")]
+    pub plugins_dir: String,
+    /// Auto-discover and load plugins on startup
+    #[serde(default)]
+    pub auto_discover: bool,
+    /// Maximum number of plugins that can be loaded
+    #[serde(default = "default_max_plugins")]
+    pub max_plugins: usize,
+}
+
+fn default_plugins_dir() -> String {
+    "~/.zeroclaw/plugins".to_string()
+}
+
+fn default_max_plugins() -> usize {
+    50
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            plugins_dir: default_plugins_dir(),
+            auto_discover: false,
+            max_plugins: default_max_plugins(),
+        }
+    }
 }
 
 /// Content strategy configuration for LinkedIn auto-posting (`[linkedin.content]`).
@@ -3425,6 +3555,7 @@ impl Default for WebhookAuditConfig {
 /// Controls what the agent is allowed to do: shell commands, filesystem access,
 /// risk approval gates, and per-policy budgets.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
 pub struct AutonomyConfig {
     /// Autonomy level: `read_only`, `supervised` (default), or `full`.
     pub level: AutonomyLevel,
@@ -3566,6 +3697,9 @@ pub struct RuntimeConfig {
     /// - `Some(false)`: disable reasoning/thinking when supported
     #[serde(default)]
     pub reasoning_enabled: Option<bool>,
+    /// Optional reasoning effort for providers that expose a level control.
+    #[serde(default, deserialize_with = "deserialize_reasoning_effort_opt")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Docker runtime configuration (`[runtime.docker]` section).
@@ -3640,6 +3774,7 @@ impl Default for RuntimeConfig {
             kind: default_runtime_kind(),
             docker: DockerRuntimeConfig::default(),
             reasoning_enabled: None,
+            reasoning_effort: None,
         }
     }
 }
@@ -4169,8 +4304,8 @@ pub struct ChannelsConfig {
     pub ack_reactions: bool,
     /// Whether to send tool-call notification messages (e.g. `🔧 web_search_tool: …`)
     /// to channel users. When `false`, tool calls are still logged server-side but
-    /// not forwarded as individual channel messages. Default: `true`.
-    #[serde(default = "default_true")]
+    /// not forwarded as individual channel messages. Default: `false`.
+    #[serde(default = "default_false")]
     pub show_tool_calls: bool,
     /// Persist channel conversation history to JSONL files so sessions survive
     /// daemon restarts. Files are stored in `{workspace}/sessions/`. Default: `true`.
@@ -4332,7 +4467,7 @@ impl Default for ChannelsConfig {
             bluesky: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
-            show_tool_calls: true,
+            show_tool_calls: false,
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
@@ -5855,6 +5990,7 @@ impl Default for Config {
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
+            plugins: PluginsConfig::default(),
         }
     }
 }
@@ -7310,6 +7446,16 @@ impl Config {
             }
         }
 
+        if let Ok(raw) = std::env::var("ZEROCLAW_REASONING_EFFORT")
+            .or_else(|_| std::env::var("REASONING_EFFORT"))
+            .or_else(|_| std::env::var("ZEROCLAW_CODEX_REASONING_EFFORT"))
+        {
+            match normalize_reasoning_effort(&raw) {
+                Ok(effort) => self.runtime.reasoning_effort = Some(effort),
+                Err(message) => tracing::warn!("Ignoring reasoning effort env override: {message}"),
+            }
+        }
+
         // Web search enabled: ZEROCLAW_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
         if let Ok(enabled) = std::env::var("ZEROCLAW_WEB_SEARCH_ENABLED")
             .or_else(|_| std::env::var("WEB_SEARCH_ENABLED"))
@@ -8141,6 +8287,7 @@ default_temperature = 0.7
         assert!(c.cli);
         assert!(c.telegram.is_none());
         assert!(c.discord.is_none());
+        assert!(!c.show_tool_calls);
     }
 
     // ── Serde round-trip ─────────────────────────────────────
@@ -8279,6 +8426,7 @@ default_temperature = 0.7
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
+            plugins: PluginsConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -8474,6 +8622,32 @@ reasoning_enabled = false
     }
 
     #[test]
+    async fn runtime_reasoning_effort_deserializes() {
+        let raw = r#"
+default_temperature = 0.7
+
+[runtime]
+reasoning_effort = "HIGH"
+"#;
+
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.runtime.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    async fn runtime_reasoning_effort_rejects_invalid_values() {
+        let raw = r#"
+default_temperature = 0.7
+
+[runtime]
+reasoning_effort = "turbo"
+"#;
+
+        let error = toml::from_str::<Config>(raw).expect_err("invalid value should fail");
+        assert!(error.to_string().contains("reasoning_effort"));
+    }
+
+    #[test]
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
@@ -8585,6 +8759,7 @@ tool_dispatcher = "xml"
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
+            plugins: PluginsConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -9321,10 +9496,15 @@ channel_id = "C123"
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
+            session_persistence: true,
+            session_ttl_hours: 0,
+            pairing_dashboard: PairingDashboardConfig::default(),
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
         assert!(parsed.require_pairing);
+        assert!(parsed.session_persistence);
+        assert_eq!(parsed.session_ttl_hours, 0);
         assert!(!parsed.allow_public_bind);
         assert_eq!(parsed.paired_tokens, vec!["zc_test_token"]);
         assert_eq!(parsed.pair_rate_limit_per_minute, 12);
@@ -10452,6 +10632,31 @@ default_model = "legacy-model"
         assert_eq!(config.runtime.reasoning_enabled, Some(false));
 
         std::env::remove_var("ZEROCLAW_REASONING_ENABLED");
+    }
+
+    #[test]
+    async fn env_override_reasoning_effort() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        assert_eq!(config.runtime.reasoning_effort, None);
+
+        std::env::set_var("ZEROCLAW_REASONING_EFFORT", "HIGH");
+        config.apply_env_overrides();
+        assert_eq!(config.runtime.reasoning_effort.as_deref(), Some("high"));
+
+        std::env::remove_var("ZEROCLAW_REASONING_EFFORT");
+    }
+
+    #[test]
+    async fn env_override_reasoning_effort_legacy_codex_env() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+
+        std::env::set_var("ZEROCLAW_CODEX_REASONING_EFFORT", "minimal");
+        config.apply_env_overrides();
+        assert_eq!(config.runtime.reasoning_effort.as_deref(), Some("minimal"));
+
+        std::env::remove_var("ZEROCLAW_CODEX_REASONING_EFFORT");
     }
 
     #[test]

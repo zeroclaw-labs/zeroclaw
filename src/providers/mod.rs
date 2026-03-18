@@ -680,6 +680,7 @@ pub struct ProviderRuntimeOptions {
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
+    pub reasoning_effort: Option<String>,
     /// HTTP request timeout in seconds for LLM provider API calls.
     /// `None` uses the provider's built-in default (120s for compatible providers).
     pub provider_timeout_secs: Option<u64>,
@@ -699,10 +700,27 @@ impl Default for ProviderRuntimeOptions {
             zeroclaw_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: None,
+            reasoning_effort: None,
             provider_timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
         }
+    }
+}
+
+pub fn provider_runtime_options_from_config(
+    config: &crate::config::Config,
+) -> ProviderRuntimeOptions {
+    ProviderRuntimeOptions {
+        auth_profile_override: None,
+        provider_api_url: config.api_url.clone(),
+        zeroclaw_dir: config.config_path.parent().map(PathBuf::from),
+        secrets_encrypt: config.secrets.encrypt,
+        reasoning_enabled: config.runtime.reasoning_enabled,
+        reasoning_effort: config.runtime.reasoning_effort.clone(),
+        provider_timeout_secs: Some(config.provider_timeout_secs),
+        extra_headers: config.extra_headers.clone(),
+        api_path: config.api_path.clone(),
     }
 }
 
@@ -1036,12 +1054,16 @@ fn create_provider_with_url_and_options(
     // headers to OpenAI-compatible providers before boxing them as trait objects.
     let compat = {
         let timeout = options.provider_timeout_secs;
+        let reasoning_effort = options.reasoning_effort.clone();
         let extra_headers = options.extra_headers.clone();
         let api_path = options.api_path.clone();
         move |p: OpenAiCompatibleProvider| -> Box<dyn Provider> {
             let mut p = p;
             if let Some(t) = timeout {
                 p = p.with_timeout_secs(t);
+            }
+            if let Some(ref effort) = reasoning_effort {
+                p = p.with_reasoning_effort(Some(effort.clone()));
             }
             if !extra_headers.is_empty() {
                 p = p.with_extra_headers(extra_headers.clone());
