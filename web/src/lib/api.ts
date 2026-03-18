@@ -93,6 +93,14 @@ export async function pair(code: string): Promise<{ token: string }> {
   return data;
 }
 
+export async function getAdminPairCode(): Promise<{ pairing_code: string | null; pairing_required: boolean }> {
+  const response = await fetch('/admin/paircode');
+  if (!response.ok) {
+    throw new Error(`Failed to fetch pairing code (${response.status})`);
+  }
+  return response.json() as Promise<{ pairing_code: string | null; pairing_required: boolean }>;
+}
+
 // ---------------------------------------------------------------------------
 // Public health (no auth required)
 // ---------------------------------------------------------------------------

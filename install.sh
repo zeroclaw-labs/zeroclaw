@@ -177,10 +177,28 @@ get_available_disk_mb() {
   fi
 }
 
+is_musl_linux() {
+  [[ "$(uname -s)" == "Linux" ]] || return 1
+
+  if [[ -f /etc/alpine-release ]]; then
+    return 0
+  fi
+
+  if have_cmd ldd && ldd --version 2>&1 | grep -qi 'musl'; then
+    return 0
+  fi
+
+  return 1
+}
+
 detect_release_target() {
   local os arch
   os="$(uname -s)"
   arch="$(uname -m)"
+
+  if is_musl_linux; then
+    return 1
+  fi
 
   case "$os:$arch" in
     Linux:x86_64)
@@ -280,6 +298,12 @@ install_prebuilt_binary() {
   fi
   if ! have_cmd tar; then
     warn "tar is required for pre-built binary installation."
+    return 1
+  fi
+
+  if is_musl_linux; then
+    warn "Pre-built release binaries are not published for musl/Alpine yet."
+    warn "Falling back to source build."
     return 1
   fi
 
@@ -1145,7 +1169,11 @@ if [[ "$FORCE_SOURCE_BUILD" == false ]]; then
       SKIP_BUILD=true
       SKIP_INSTALL=true
     elif [[ "$PREBUILT_ONLY" == true ]]; then
-      error "Pre-built-only mode requested, but no compatible release asset is available."
+      if is_musl_linux; then
+        error "Pre-built-only mode is not supported on musl/Alpine because releases do not include musl assets yet."
+      else
+        error "Pre-built-only mode requested, but no compatible release asset is available."
+      fi
       error "Try again later, or run with --force-source-build on a machine with enough RAM/disk."
       exit 1
     else
@@ -1290,8 +1318,14 @@ if [[ -n "$ZEROCLAW_BIN" ]]; then
       step_ok "Gateway service restarted"
 
       # Fetch and display pairing code from running gateway
-      sleep 1  # brief wait for service to start
-      if PAIR_CODE=$("$ZEROCLAW_BIN" gateway get-paircode 2>/dev/null | grep -oE '[0-9]{6}'); then
+      PAIR_CODE=""
+      for i in 1 2 3 4 5; do
+        sleep 2
+        if PAIR_CODE=$("$ZEROCLAW_BIN" gateway get-paircode 2>/dev/null | grep -oE '[0-9]{6}'); then
+          break
+        fi
+      done
+      if [[ -n "$PAIR_CODE" ]]; then
         echo
         echo -e "  ${BOLD_BLUE}🔐 Gateway Pairing Code${RESET}"
         echo
@@ -1300,6 +1334,7 @@ if [[ -n "$ZEROCLAW_BIN" ]]; then
         echo -e "  ${BOLD_BLUE}└──────────────┘${RESET}"
         echo
         echo -e "  ${DIM}Enter this code in the dashboard to pair your device.${RESET}"
+        echo -e "  ${DIM}Run 'zeroclaw gateway get-paircode --new' anytime to generate a fresh code.${RESET}"
       fi
     else
       step_fail "Gateway service restart failed — re-run with zeroclaw service start"
@@ -1329,6 +1364,13 @@ if [[ -n "$INSTALLED_VERSION" ]]; then
   echo -e "${BOLD_BLUE}${CRAB} ZeroClaw installed successfully (ZeroClaw ${INSTALLED_VERSION})!${RESET}"
 else
   echo -e "${BOLD_BLUE}${CRAB} ZeroClaw installed successfully!${RESET}"
+fi
+
+if [[ -x "$HOME/.cargo/bin/zeroclaw" ]] && ! have_cmd zeroclaw; then
+  echo
+  warn "zeroclaw is installed in $HOME/.cargo/bin, but that directory is not in PATH for this shell."
+  warn 'Run: export PATH="$HOME/.cargo/bin:$PATH"'
+  step_dot "To persist it, add that export line to ~/.bashrc, ~/.zshrc, or your shell profile, then open a new shell."
 fi
 
 if [[ "$INSTALL_MODE" == "upgrade" ]]; then

@@ -75,6 +75,7 @@ mod agent;
 mod approval;
 mod auth;
 mod channels;
+mod commands;
 mod rag {
     pub use zeroclaw::rag::*;
 }
@@ -96,6 +97,8 @@ mod multimodal;
 mod observability;
 mod onboard;
 mod peripherals;
+#[cfg(feature = "plugins-wasm")]
+mod plugins;
 mod providers;
 mod runtime;
 mod security;
@@ -282,7 +285,11 @@ Examples:
     },
 
     /// Show system status (full details)
-    Status,
+    Status {
+        /// Output format: "exit-code" exits 0 if healthy, 1 otherwise (for Docker HEALTHCHECK)
+        #[arg(long)]
+        format: Option<String>,
+    },
 
     /// Engage, inspect, and resume emergency-stop states.
     ///
@@ -462,6 +469,52 @@ Examples:
         config_command: ConfigCommands,
     },
 
+    /// Check for and apply updates
+    #[command(long_about = "\
+Check for and apply ZeroClaw updates.
+
+By default, downloads and installs the latest release with a \
+6-phase pipeline: preflight, download, backup, validate, swap, \
+and smoke test. Automatic rollback on failure.
+
+Use --check to only check for updates without installing.
+Use --force to skip the confirmation prompt.
+Use --version to target a specific release instead of latest.
+
+Examples:
+  zeroclaw update                      # download and install latest
+  zeroclaw update --check              # check only, don't install
+  zeroclaw update --force              # install without confirmation
+  zeroclaw update --version 0.6.0      # install specific version")]
+    Update {
+        /// Only check for updates, don't install
+        #[arg(long)]
+        check: bool,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+        /// Target version (default: latest)
+        #[arg(long)]
+        version: Option<String>,
+    },
+
+    /// Run diagnostic self-tests
+    #[command(long_about = "\
+Run diagnostic self-tests to verify the ZeroClaw installation.
+
+By default, runs the full test suite including network checks \
+(gateway health, memory round-trip). Use --quick to skip network \
+checks for faster offline validation.
+
+Examples:
+  zeroclaw self-test             # full suite
+  zeroclaw self-test --quick     # quick checks only (no network)")]
+    SelfTest {
+        /// Run quick checks only (no network)
+        #[arg(long)]
+        quick: bool,
+    },
+
     /// Generate shell completion script to stdout
     #[command(long_about = "\
 Generate shell completion scripts for `zeroclaw`.
@@ -476,6 +529,35 @@ Examples:
         /// Target shell
         #[arg(value_enum)]
         shell: CompletionShell,
+    },
+
+    /// Manage WASM plugins
+    #[cfg(feature = "plugins-wasm")]
+    Plugin {
+        #[command(subcommand)]
+        plugin_command: PluginCommands,
+    },
+}
+
+#[cfg(feature = "plugins-wasm")]
+#[derive(Subcommand, Debug)]
+enum PluginCommands {
+    /// List installed plugins
+    List,
+    /// Install a plugin from a directory or URL
+    Install {
+        /// Path to plugin directory or manifest
+        source: String,
+    },
+    /// Remove an installed plugin
+    Remove {
+        /// Plugin name
+        name: String,
+    },
+    /// Show information about a plugin
+    Info {
+        /// Plugin name
+        name: String,
     },
 }
 
@@ -816,30 +898,12 @@ async fn main() -> Result<()> {
             .await
         }?;
 
-        // Display pairing code — user enters it in the dashboard to pair securely.
-        // The code is one-time use and brute-force protected (5 attempts → lockout).
-        // No auth material is placed in URLs to prevent leakage via browser history,
-        // Referer headers, clipboard, or proxy logs.
         if config.gateway.require_pairing {
-            let pairing = security::PairingGuard::new(true, &config.gateway.paired_tokens);
-            if let Some(code) = pairing.pairing_code() {
-                println!();
-                println!("  \x1b[1;34m🦀 Gateway Pairing Code\x1b[0m");
-                println!();
-                println!("  \x1b[1;34m┌──────────────┐\x1b[0m");
-                println!("  \x1b[1;34m│\x1b[0m  \x1b[1m{code}\x1b[0m  \x1b[1;34m│\x1b[0m");
-                println!("  \x1b[1;34m└──────────────┘\x1b[0m");
-                println!();
-                println!("  Enter this code in the dashboard to pair your device.");
-                println!("  The code is single-use and expires after pairing.");
-                println!();
-                println!(
-                    "  \x1b[2mDashboard: http://127.0.0.1:{}\x1b[0m",
-                    config.gateway.port
-                );
-                println!("  \x1b[2mDocs: https://www.zeroclawlabs.ai/docs\x1b[0m");
-                println!();
-            }
+            println!();
+            println!("  Pairing is enabled. A one-time pairing code will be");
+            println!("  displayed when the gateway starts.");
+            println!("  Dashboard: http://127.0.0.1:{}", config.gateway.port);
+            println!();
         }
 
         // Auto-start channels if user said yes during wizard
@@ -1002,7 +1066,30 @@ async fn main() -> Result<()> {
             Box::pin(daemon::run(config, host, port)).await
         }
 
-        Commands::Status => {
+        Commands::Status { format } => {
+            if format.as_deref() == Some("exit-code") {
+                // Lightweight health probe for Docker HEALTHCHECK
+                let port = config.gateway.port;
+                let host = if config.gateway.host == "[::]" || config.gateway.host == "0.0.0.0" {
+                    "127.0.0.1"
+                } else {
+                    &config.gateway.host
+                };
+                let url = format!("http://{}:{}/health", host, port);
+                match reqwest::Client::new()
+                    .get(&url)
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        std::process::exit(0);
+                    }
+                    _ => {
+                        std::process::exit(1);
+                    }
+                }
+            }
             println!("🦀 ZeroClaw Status");
             println!();
             println!("Version:     {}", env!("CARGO_PKG_VERSION"));
@@ -1224,6 +1311,41 @@ async fn main() -> Result<()> {
             .await
         }
 
+        Commands::Update {
+            check,
+            force: _force,
+            version,
+        } => {
+            if check {
+                let info = commands::update::check(version.as_deref()).await?;
+                if info.is_newer {
+                    println!(
+                        "Update available: v{} -> v{}",
+                        info.current_version, info.latest_version
+                    );
+                } else {
+                    println!("Already up to date (v{}).", info.current_version);
+                }
+                Ok(())
+            } else {
+                commands::update::run(version.as_deref()).await
+            }
+        }
+
+        Commands::SelfTest { quick } => {
+            let results = if quick {
+                commands::self_test::run_quick(&config).await?
+            } else {
+                commands::self_test::run_full(&config).await?
+            };
+            commands::self_test::print_results(&results);
+            let failed = results.iter().filter(|r| !r.passed).count();
+            if failed > 0 {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+
         Commands::Config { config_command } => match config_command {
             ConfigCommands::Schema => {
                 let schema = schemars::schema_for!(config::Config);
@@ -1231,6 +1353,56 @@ async fn main() -> Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&schema).expect("failed to serialize JSON Schema")
                 );
+                Ok(())
+            }
+        },
+
+        #[cfg(feature = "plugins-wasm")]
+        Commands::Plugin { plugin_command } => match plugin_command {
+            PluginCommands::List => {
+                let host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
+                let plugins = host.list_plugins();
+                if plugins.is_empty() {
+                    println!("No plugins installed.");
+                } else {
+                    println!("Installed plugins:");
+                    for p in &plugins {
+                        println!(
+                            "  {} v{} — {}",
+                            p.name,
+                            p.version,
+                            p.description.as_deref().unwrap_or("(no description)")
+                        );
+                    }
+                }
+                Ok(())
+            }
+            PluginCommands::Install { source } => {
+                let mut host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
+                host.install(&source)?;
+                println!("Plugin installed from {source}");
+                Ok(())
+            }
+            PluginCommands::Remove { name } => {
+                let mut host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
+                host.remove(&name)?;
+                println!("Plugin '{name}' removed.");
+                Ok(())
+            }
+            PluginCommands::Info { name } => {
+                let host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
+                match host.get_plugin(&name) {
+                    Some(info) => {
+                        println!("Plugin: {} v{}", info.name, info.version);
+                        if let Some(desc) = &info.description {
+                            println!("Description: {desc}");
+                        }
+                        println!("Capabilities: {:?}", info.capabilities);
+                        println!("Permissions: {:?}", info.permissions);
+                        println!("WASM: {}", info.wasm_path.display());
+                    }
+                    None => println!("Plugin '{name}' not found."),
+                }
                 Ok(())
             }
         },

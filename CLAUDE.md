@@ -1,4 +1,6 @@
-# CLAUDE.md — ZeroClaw
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Commands
 
@@ -6,6 +8,22 @@
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+```
+
+Feature-gated builds (WhatsApp Web requires its feature flag):
+
+```bash
+cargo clippy --features whatsapp-web --all-targets -- -D warnings
+cargo test --features whatsapp-web
+cargo build --release --features whatsapp-web
+```
+
+Cross-compile for Linux (Synology/NAS deployment):
+
+```bash
+CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc \
+cargo build --release --target x86_64-unknown-linux-musl --features whatsapp-web
 ```
 
 Full pre-PR validation (recommended):
@@ -43,9 +61,13 @@ Key extension points:
 - `src/memory/` — markdown/sqlite memory backends + embeddings/vector merge
 - `src/providers/` — model providers and resilient wrapper
 - `src/channels/` — Telegram/Discord/Slack/etc channels
-- `src/tools/` — tool execution surface (shell, file, memory, browser)
+- `src/tools/` — tool execution surface (shell, file, memory, browser, MCP client)
+- `src/tools/mcp_client.rs` — MCP server lifecycle, stdio/HTTP/SSE transports
+- `src/tools/mcp_tool.rs` — MCP tool wrapper implementing `Tool` trait
+- `src/tools/mcp_deferred.rs` — deferred (lazy) MCP tool loading via `tool_search`
 - `src/peripherals/` — hardware peripherals (STM32, RPi GPIO)
 - `src/runtime/` — runtime adapters (currently native)
+- `src/multimodal.rs` — image marker parsing, base64 encoding, provider vision checks
 - `docs/` — topic-based documentation (setup-guides, reference, ops, security, hardware, contributing, maintainers)
 - `.github/` — CI, templates, automation workflows
 
@@ -82,6 +104,23 @@ Branch/commit/PR rules:
 - Do not bypass failing checks without explicit explanation.
 - Do not hide behavior-changing side effects in refactor commits.
 - Do not include personal identity or sensitive information in test data, examples, docs, or commits.
+
+## Architecture Notes
+
+### Provider Resolution
+Providers are created in `src/providers/mod.rs` via `create_provider_with_url_and_options()`. The `ReliableProvider` wrapper (in `reliable.rs`) adds retry, fallback chain, and API key rotation. Provider names map to constructors — `custom:` prefix creates a generic OpenAI-compatible provider with `supports_vision: true`. Named providers (e.g. `zai`) use specific constructors that set correct capabilities.
+
+### MCP Tool Pipeline
+MCP servers are configured in `[mcp]` config section. With `deferred_loading = true` (default), only tool names are loaded; full schemas are fetched on-demand via `tool_search`. With `deferred_loading = false`, all tools are eagerly loaded at startup. The vision fallback in `src/agent/loop_.rs` accesses MCP tools from the registry directly, bypassing LLM tool specs.
+
+### WhatsApp Web Message Flow
+`src/channels/whatsapp_web.rs` uses `wa_rs` crate for WhatsApp Web protocol. Messages are wrapped in ephemeral/device-sent layers — use `msg.get_base_message()` to unwrap. Bot identity for mention detection uses `client.get_pn()` (Phone Number JID) and `client.get_lid()` (LID JID), not config values. JID formats: `user@s.whatsapp.net` (DM), `id@g.us` (group).
+
+### i18n Docs
+Config and channel reference docs are maintained in 3 locales: EN (`docs/reference/`), zh-CN (`docs/i18n/zh-CN/reference/`), VI (`docs/vi/`). All three must be updated together when adding config fields or channel features.
+
+### Pre-existing Clippy Warnings
+`src/channels/whatsapp_storage.rs` has pre-existing clippy errors (wildcard import, `as_ref.map`). `src/channels/whatsapp_web.rs` has a pre-existing `large_futures` warning. These are not from current work.
 
 ## Linked References
 

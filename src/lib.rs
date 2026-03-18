@@ -42,6 +42,7 @@ pub mod agent;
 pub(crate) mod approval;
 pub(crate) mod auth;
 pub mod channels;
+pub mod commands;
 pub mod config;
 pub(crate) mod cost;
 pub(crate) mod cron;
@@ -71,6 +72,9 @@ pub(crate) mod skills;
 pub mod tools;
 pub(crate) mod tunnel;
 pub(crate) mod util;
+
+#[cfg(feature = "plugins-wasm")]
+pub mod plugins;
 
 pub use config::Config;
 

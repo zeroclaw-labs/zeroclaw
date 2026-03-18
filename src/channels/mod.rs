@@ -227,6 +227,8 @@ fn channel_message_timeout_budget_secs(
 struct ChannelRouteSelection {
     provider: String,
     model: String,
+    /// Resolved context window budget (tokens) for the pre-flight context guard.
+    max_context_tokens: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,6 +338,8 @@ struct ChannelRuntimeContext {
     /// approval since no operator is present on channel runs.
     approval_manager: Arc<ApprovalManager>,
     activated_tools: Option<std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    /// Global default context window budget from `[agent] max_context_tokens`.
+    max_context_tokens: usize,
 }
 
 #[derive(Clone)]
@@ -917,6 +921,7 @@ fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection
     ChannelRouteSelection {
         provider: defaults.default_provider,
         model: defaults.model,
+        max_context_tokens: ctx.max_context_tokens,
     }
 }
 
@@ -1331,6 +1336,9 @@ async fn handle_runtime_command_if_needed(
                 }) {
                     current.provider = route.provider.clone();
                     current.model = route.model.clone();
+                    current.max_context_tokens = route
+                        .max_context_tokens
+                        .unwrap_or(ctx.max_context_tokens);
                 } else {
                     current.model = model.clone();
                 }
@@ -1936,6 +1944,9 @@ async fn process_channel_message(
             route = ChannelRouteSelection {
                 provider: matched_route.provider.clone(),
                 model: matched_route.model.clone(),
+                max_context_tokens: matched_route
+                    .max_context_tokens
+                    .unwrap_or(ctx.max_context_tokens),
             };
         }
     }
@@ -2235,8 +2246,7 @@ async fn process_channel_message(
                 },
                 ctx.tool_call_dedup_exempt.as_ref(),
                 ctx.activated_tools.as_ref(),
-                // Pre-flight context guard: use char-budget / 4 as token estimate
-                PROACTIVE_CONTEXT_BUDGET_CHARS / 4,
+                route.max_context_tokens,
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -4173,6 +4183,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         },
         approval_manager: Arc::new(ApprovalManager::for_non_interactive(&config.autonomy)),
         activated_tools: ch_activated_handle,
+        max_context_tokens: config.agent.max_context_tokens,
     });
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.

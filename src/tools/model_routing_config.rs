@@ -534,6 +534,7 @@ impl ModelRoutingConfigTool {
             provider: provider.clone(),
             model: model.clone(),
             api_key: None,
+            max_context_tokens: None,
         });
 
         next_route.hint = hint.clone();

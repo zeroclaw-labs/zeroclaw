@@ -232,7 +232,6 @@ session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
 pair_phone = "15551234567"         # tùy chọn; bỏ qua để dùng QR flow
 pair_code = ""                     # tùy chọn pair code tùy chỉnh
 allowed_numbers = ["*"]
-mention_only = false               # tùy chọn; khi true, chỉ phản hồi trong nhóm khi được @nhắc đến
 ```
 
 Lưu ý:
@@ -240,7 +239,6 @@ Lưu ý:
 - Build với `cargo build --features whatsapp-web` (hoặc lệnh run tương đương).
 - Giữ `session_path` trên bộ nhớ lưu trữ bền vững để tránh phải liên kết lại sau khi khởi động lại.
 - Định tuyến trả lời sử dụng JID của chat nguồn, vì vậy cả trả lời trực tiếp và nhóm đều hoạt động đúng.
-- `mention_only`: khi bật, bot bỏ qua tin nhắn nhóm trừ khi được @nhắc đến trực tiếp. Tin nhắn riêng không bị ảnh hưởng. Cần đặt `pair_phone` để bot có thể nhận diện JID của mình trong danh sách mention.
 
 ### 4.8 Cấu hình Webhook Channel (Gateway)
 
