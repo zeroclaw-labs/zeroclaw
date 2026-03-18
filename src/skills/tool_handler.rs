@@ -367,7 +367,11 @@ impl Tool for SkillToolHandler {
         let command = match self.render_command(&args) {
             Ok(cmd) => cmd,
             Err(e) => {
-                anyhow::bail!("Failed to render skill tool command. args={} error={}", args, e);
+                anyhow::bail!(
+                    "Failed to render skill tool command. args={} error={}",
+                    args,
+                    e
+                );
             }
         };
 
@@ -424,8 +428,8 @@ impl Tool for SkillToolHandler {
 
         // Inject reply-to message ID from channel context so skill scripts
         // can reply to the user's original message.
-        if let Ok(Some(reply_to)) = crate::agent::loop_::TOOL_LOOP_REPLY_TO_MESSAGE_ID
-            .try_with(|v| v.clone())
+        if let Ok(Some(reply_to)) =
+            crate::agent::loop_::TOOL_LOOP_REPLY_TO_MESSAGE_ID.try_with(|v| v.clone())
         {
             cmd.env("ZC_REPLY_TO_MESSAGE_ID", reply_to);
         }

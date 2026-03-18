@@ -31,7 +31,7 @@ Build with `--features hardware` to include Uno Q support.
 
 ### 1.1 Configure Uno Q via App Lab
 
-1. Download [Arduino App Lab](https://docs.arduino.cc/software/app-lab/) (AppImage on Linux).
+1. Download [Arduino App Lab](https://docs.arduino.cc/software/app-lab/) (tar.gz on Linux).
 2. Connect Uno Q via USB, power it on.
 3. Open App Lab, connect to the board.
 4. Follow the setup wizard:

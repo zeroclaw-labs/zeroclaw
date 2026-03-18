@@ -161,8 +161,7 @@ impl DeferredMcpToolSet {
 /// The agent loop consults this each iteration to decide which tool_specs
 /// to include in the LLM request.
 pub struct ActivatedToolSet {
-    /// name -> activated Tool
-    tools: HashMap<String, Box<dyn Tool>>,
+    tools: HashMap<String, Arc<dyn Tool>>,
 }
 
 impl ActivatedToolSet {
@@ -172,27 +171,53 @@ impl ActivatedToolSet {
         }
     }
 
-    /// Mark a tool as activated, storing its live wrapper.
-    pub fn activate(&mut self, name: String, tool: Box<dyn Tool>) {
+    pub fn activate(&mut self, name: String, tool: Arc<dyn Tool>) {
         self.tools.insert(name, tool);
     }
 
-    /// Whether a tool has been activated.
     pub fn is_activated(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }
 
-    /// Get an activated tool for execution.
-    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.get(name).map(|t| t.as_ref())
+    /// Clone the Arc so the caller can drop the mutex guard before awaiting.
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools.get(name).cloned()
     }
 
-    /// All currently activated tool specs (to include in LLM requests).
+    /// Resolve an activated tool by exact name first, then by unique MCP suffix.
+    ///
+    /// Some providers occasionally strip the `<server>__` prefix when calling a
+    /// deferred MCP tool after `tool_search` activation. When the suffix maps to
+    /// exactly one activated tool, allow that call to proceed.
+    pub fn get_resolved(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        if let Some(tool) = self.get(name) {
+            return Some(tool);
+        }
+        if name.contains("__") {
+            return None;
+        }
+
+        let mut resolved = None;
+        for (tool_name, tool) in &self.tools {
+            let Some((_, suffix)) = tool_name.split_once("__") else {
+                continue;
+            };
+            if suffix != name {
+                continue;
+            }
+            if resolved.is_some() {
+                return None;
+            }
+            resolved = Some(Arc::clone(tool));
+        }
+
+        resolved
+    }
+
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         self.tools.values().map(|t| t.spec()).collect()
     }
 
-    /// All activated tools for execution dispatch.
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.keys().map(|s| s.as_str()).collect()
     }
@@ -280,10 +305,79 @@ mod tests {
 
         let mut set = ActivatedToolSet::new();
         assert!(!set.is_activated("fake"));
-        set.activate("fake".into(), Box::new(FakeTool));
+        set.activate("fake".into(), Arc::new(FakeTool));
         assert!(set.is_activated("fake"));
         assert!(set.get("fake").is_some());
         assert_eq!(set.tool_specs().len(), 1);
+    }
+
+    #[test]
+    fn activated_set_resolves_unique_suffix() {
+        use crate::tools::traits::ToolResult;
+        use async_trait::async_trait;
+
+        struct FakeTool;
+        #[async_trait]
+        impl Tool for FakeTool {
+            fn name(&self) -> &str {
+                "docker-mcp__extract_text"
+            }
+            fn description(&self) -> &str {
+                "fake tool"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: String::new(),
+                    error: None,
+                })
+            }
+        }
+
+        let mut set = ActivatedToolSet::new();
+        set.activate("docker-mcp__extract_text".into(), Arc::new(FakeTool));
+        assert!(set.get_resolved("extract_text").is_some());
+    }
+
+    #[test]
+    fn activated_set_rejects_ambiguous_suffix() {
+        use crate::tools::traits::ToolResult;
+        use async_trait::async_trait;
+
+        struct FakeTool(&'static str);
+        #[async_trait]
+        impl Tool for FakeTool {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "fake tool"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: String::new(),
+                    error: None,
+                })
+            }
+        }
+
+        let mut set = ActivatedToolSet::new();
+        set.activate(
+            "docker-mcp__extract_text".into(),
+            Arc::new(FakeTool("docker-mcp__extract_text")),
+        );
+        set.activate(
+            "ocr-mcp__extract_text".into(),
+            Arc::new(FakeTool("ocr-mcp__extract_text")),
+        );
+        assert!(set.get_resolved("extract_text").is_none());
     }
 
     #[test]

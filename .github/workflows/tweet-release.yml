@@ -5,7 +5,7 @@ on:
   workflow_call:
     inputs:
       release_tag:
-        description: "Release tag (e.g. v0.3.0 or v0.3.0-beta.42)"
+        description: "Stable release tag (e.g. v0.3.0)"
         required: true
         type: string
       release_url:
@@ -53,9 +53,18 @@ jobs:
             exit 0
           fi
 
-          # Find the PREVIOUS release tag (including betas) to check for new features
+          # Stable releases (no -beta suffix) always tweet — they represent
+          # the full release cycle, so skipping them loses visibility.
+          if [[ ! "$RELEASE_TAG" =~ -beta\. ]]; then
+            echo "Stable release ${RELEASE_TAG} — always tweet"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Find the previous STABLE release tag (exclude betas) to check for new features
           PREV_TAG=$(git tag --sort=-creatordate \
             | grep -v "^${RELEASE_TAG}$" \
+            | grep -vE '\-beta\.' \
             | head -1 || echo "")
 
           if [ -z "$PREV_TAG" ]; then
@@ -63,15 +72,15 @@ jobs:
             exit 0
           fi
 
-          # Count new feat() commits since the previous release
-          NEW_FEATS=$(git log "${PREV_TAG}..${RELEASE_TAG}" --pretty=format:"%s" --no-merges \
-            | grep -ciE '^feat(\(|:)' || echo "0")
+          # Count new feat() OR fix() commits since the previous release
+          NEW_CHANGES=$(git log "${PREV_TAG}..${RELEASE_TAG}" --pretty=format:"%s" --no-merges \
+            | grep -ciE '^(feat|fix)(\(|:)' || echo "0")
 
-          if [ "$NEW_FEATS" -eq 0 ]; then
-            echo "No new features since ${PREV_TAG} — skipping tweet"
+          if [ "$NEW_CHANGES" -eq 0 ]; then
+            echo "No new features or fixes since ${PREV_TAG} — skipping tweet"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            echo "${NEW_FEATS} new feature(s) since ${PREV_TAG} — tweeting"
+            echo "${NEW_CHANGES} new change(s) since ${PREV_TAG} — tweeting"
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -89,53 +98,37 @@ jobs:
           if [ -n "$MANUAL_TEXT" ]; then
             TWEET="$MANUAL_TEXT"
           else
-            # For features: diff against the PREVIOUS release (including betas)
-            # This prevents duplicate feature lists across consecutive betas
-            PREV_RELEASE=$(git tag --sort=-creatordate \
-              | grep -v "^${RELEASE_TAG}$" \
-              | head -1 || echo "")
-
-            # For contributors: diff against the last STABLE release
-            # This captures everyone across the full release cycle
+            # Diff against the last STABLE release (exclude betas) to capture
+            # ALL features accumulated across the full beta cycle
             PREV_STABLE=$(git tag --sort=-creatordate \
               | grep -v "^${RELEASE_TAG}$" \
               | grep -vE '\-beta\.' \
               | head -1 || echo "")
 
-            FEAT_RANGE="${PREV_RELEASE:+${PREV_RELEASE}..}${RELEASE_TAG}"
-            CONTRIB_RANGE="${PREV_STABLE:+${PREV_STABLE}..}${RELEASE_TAG}"
+            RANGE="${PREV_STABLE:+${PREV_STABLE}..}${RELEASE_TAG}"
 
-            # Extract NEW features only since the last release
-            FEATURES=$(git log "$FEAT_RANGE" --pretty=format:"%s" --no-merges \
+            # Extract ALL features since the last stable release
+            FEATURES=$(git log "$RANGE" --pretty=format:"%s" --no-merges \
               | grep -iE '^feat(\(|:)' \
               | sed 's/^feat(\([^)]*\)): /\1: /' \
               | sed 's/^feat: //' \
               | sed 's/ (#[0-9]*)$//' \
-              | sort -uf \
-              | head -4 \
-              | while IFS= read -r line; do echo "🚀 ${line}"; done || true)
-
-            if [ -z "$FEATURES" ]; then
-              FEATURES="🚀 Incremental improvements and polish"
-            fi
-
-            # Count ALL contributors across the full release cycle
-            GIT_AUTHORS=$(git log "$CONTRIB_RANGE" --pretty=format:"%an" --no-merges | sort -uf || true)
-            CO_AUTHORS=$(git log "$CONTRIB_RANGE" --pretty=format:"%b" --no-merges \
-              | grep -ioE 'Co-Authored-By: *[^<]+' \
-              | sed 's/Co-Authored-By: *//i' \
-              | sed 's/ *$//' \
               | sort -uf || true)
 
-            TOTAL_COUNT=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
-              | sort -uf \
-              | grep -v '^$' \
-              | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^ZeroClaw Bot|^ZeroClaw Runner|^ZeroClaw Agent|^blacksmith' \
-              | grep -c . || echo "0")
+            FEAT_COUNT=$(echo "$FEATURES" | grep -c . || echo "0")
 
-            # Build tweet — new features, contributor count, hashtags
-            TWEET=$(printf "🦀 ZeroClaw %s\n\n%s\n\n🙌 %s contributors\n\n%s\n\n#zeroclaw #rust #ai #opensource" \
-              "$RELEASE_TAG" "$FEATURES" "$TOTAL_COUNT" "$RELEASE_URL")
+            # Format top features with rocket emoji (limit to 6 for tweet space)
+            FEAT_LIST=$(echo "$FEATURES" \
+              | head -6 \
+              | while IFS= read -r line; do echo "🚀 ${line}"; done || true)
+
+            if [ -z "$FEAT_LIST" ]; then
+              FEAT_LIST="🚀 Incremental improvements and polish"
+            fi
+
+            # Build tweet — feature-focused style
+            TWEET=$(printf "🦀 ZeroClaw %s\n\n%s\n\nZero overhead. Zero compromise. 100%% Rust.\n\n#zeroclaw #rust #ai #opensource" \
+              "$RELEASE_TAG" "$FEAT_LIST")
           fi
 
           # X/Twitter counts any URL as 23 chars (t.co shortening).

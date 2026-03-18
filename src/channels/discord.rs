@@ -711,8 +711,13 @@ impl Channel for DiscordChannel {
                     }
 
                     let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    // DMs carry no guild_id in the Discord gateway payload. They are
+                    // inherently private and implicitly addressed to the bot, so bypass
+                    // the mention gate — requiring a @mention in a DM is never correct.
+                    let is_dm = d.get("guild_id").is_none();
+                    let effective_mention_only = self.mention_only && !is_dm;
                     let Some(clean_content) =
-                        normalize_incoming_content(content, self.mention_only, &bot_user_id)
+                        normalize_incoming_content(content, effective_mention_only, &bot_user_id)
                     else {
                         continue;
                     };
@@ -1026,6 +1031,41 @@ mod tests {
     fn normalize_incoming_content_rejects_empty_after_strip() {
         let cleaned = normalize_incoming_content("<@12345>", true, "12345");
         assert!(cleaned.is_none());
+    }
+
+    // mention_only DM-bypass tests
+
+    #[test]
+    fn mention_only_dm_bypasses_mention_gate() {
+        // DMs (no guild_id) must pass through even when mention_only is true
+        // and the message contains no @mention. Mirrors the listen call-site logic.
+        let mention_only = true;
+        let is_dm = true;
+        let effective = mention_only && !is_dm;
+        let cleaned = normalize_incoming_content("hello without mention", effective, "12345");
+        assert_eq!(cleaned.as_deref(), Some("hello without mention"));
+    }
+
+    #[test]
+    fn mention_only_guild_message_without_mention_is_rejected() {
+        // Guild messages (has guild_id, so is_dm = false) must still be rejected
+        // when mention_only is true and the message contains no @mention.
+        let mention_only = true;
+        let is_dm = false;
+        let effective = mention_only && !is_dm;
+        let cleaned = normalize_incoming_content("hello without mention", effective, "12345");
+        assert!(cleaned.is_none());
+    }
+
+    #[test]
+    fn mention_only_guild_message_with_mention_passes_and_strips() {
+        // Guild messages that do carry a @mention pass through and have the
+        // mention tag stripped, consistent with pre-existing behaviour.
+        let mention_only = true;
+        let is_dm = false;
+        let effective = mention_only && !is_dm;
+        let cleaned = normalize_incoming_content("<@12345> run status", effective, "12345");
+        assert_eq!(cleaned.as_deref(), Some("run status"));
     }
 
     // Message splitting tests

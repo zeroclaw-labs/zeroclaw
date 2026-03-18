@@ -632,6 +632,7 @@ impl Provider for OllamaProvider {
         ProviderCapabilities {
             native_tool_calling: true,
             vision: true,
+            prompt_caching: false,
         }
     }
 
@@ -764,6 +765,7 @@ impl Provider for OllamaProvider {
             Some(TokenUsage {
                 input_tokens: response.prompt_eval_count,
                 output_tokens: response.eval_count,
+                cached_input_tokens: None,
             })
         } else {
             None

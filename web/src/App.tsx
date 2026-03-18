@@ -1,5 +1,6 @@
 import { Routes, Route, Navigate } from 'react-router-dom';
-import { useState, useEffect, createContext, useContext } from 'react';
+import { useState, useEffect, createContext, useContext, Component } from 'react';
+import type { ReactNode, ErrorInfo } from 'react';
 import Layout from './components/layout/Layout';
 import Dashboard from './pages/Dashboard';
 import AgentChat from './pages/AgentChat';
@@ -11,9 +12,11 @@ import Config from './pages/Config';
 import Cost from './pages/Cost';
 import Logs from './pages/Logs';
 import Doctor from './pages/Doctor';
+import Pairing from './pages/Pairing';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { DraftContext, useDraftStore } from './hooks/useDraft';
 import { setLocale, type Locale } from './lib/i18n';
+import { getAdminPairCode } from './lib/api';
 
 // Locale context
 interface LocaleContextType {
@@ -22,17 +25,91 @@ interface LocaleContextType {
 }
 
 export const LocaleContext = createContext<LocaleContextType>({
-  locale: 'tr',
+  locale: 'en',
   setAppLocale: () => {},
 });
 
 export const useLocaleContext = () => useContext(LocaleContext);
+
+// ---------------------------------------------------------------------------
+// Error boundary — catches render crashes and shows a recoverable message
+// instead of a black screen
+// ---------------------------------------------------------------------------
+
+interface ErrorBoundaryState {
+  error: Error | null;
+}
+
+export class ErrorBoundary extends Component<
+  { children: ReactNode },
+  ErrorBoundaryState
+> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('[ZeroClaw] Render error:', error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="p-6">
+          <div className="bg-gray-900 border border-red-700 rounded-xl p-6 w-full max-w-lg">
+            <h2 className="text-lg font-semibold text-red-400 mb-2">
+              Something went wrong
+            </h2>
+            <p className="text-gray-400 text-sm mb-4">
+              A render error occurred. Check the browser console for details.
+            </p>
+            <pre className="text-xs text-red-300 bg-gray-800 rounded p-3 overflow-x-auto whitespace-pre-wrap break-all">
+              {this.state.error.message}
+            </pre>
+            <button
+              onClick={() => this.setState({ error: null })}
+              className="mt-6 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg transition-colors"
+            >
+              Try again
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // Pairing dialog component
 function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) {
   const [code, setCode] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [displayCode, setDisplayCode] = useState<string | null>(null);
+  const [codeLoading, setCodeLoading] = useState(true);
+
+  // Fetch the current pairing code from the admin endpoint (localhost only)
+  useEffect(() => {
+    let cancelled = false;
+    getAdminPairCode()
+      .then((data) => {
+        if (!cancelled && data.pairing_code) {
+          setDisplayCode(data.pairing_code);
+        }
+      })
+      .catch(() => {
+        // Admin endpoint not reachable (non-localhost) — user must check terminal
+      })
+      .finally(() => {
+        if (!cancelled) setCodeLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -64,8 +141,23 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
             style={{ boxShadow: '0 0 30px rgba(0,128,255,0.3)' }}
           />
           <h1 className="text-2xl font-bold text-gradient-blue mb-2">ZeroClaw</h1>
-          <p className="text-[#556080] text-sm">Enter the pairing code from your terminal</p>
+          {displayCode ? (
+            <p className="text-[#556080] text-sm">Your pairing code</p>
+          ) : (
+            <p className="text-[#556080] text-sm">Enter the pairing code from your terminal</p>
+          )}
         </div>
+
+        {/* Show the pairing code if available (localhost) */}
+        {!codeLoading && displayCode && (
+          <div className="mb-6 p-4 rounded-xl text-center" style={{ background: 'rgba(0,128,255,0.08)', border: '1px solid rgba(0,128,255,0.2)' }}>
+            <div className="text-4xl font-mono font-bold tracking-[0.4em] text-white py-2">
+              {displayCode}
+            </div>
+            <p className="text-[#556080] text-xs mt-2">Enter this code below or on another device</p>
+          </div>
+        )}
+
         <form onSubmit={handleSubmit}>
           <input
             type="text"
@@ -77,7 +169,7 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
             autoFocus
           />
           {error && (
-            <p className="text-[#ff4466] text-sm mb-4 text-center animate-fade-in">{error}</p>
+            <p className="text-[#ff4466] text-sm mb-4 text-center animate-fade-in" aria-live="polite">{error}</p>
           )}
           <button
             type="submit"
@@ -99,7 +191,7 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 
 function AppContent() {
   const { isAuthenticated, requiresPairing, loading, pair, logout } = useAuth();
-  const [locale, setLocaleState] = useState('tr');
+  const [locale, setLocaleState] = useState('en');
   const draftStore = useDraftStore();
 
   const setAppLocale = (newLocale: string) => {
@@ -146,6 +238,7 @@ function AppContent() {
             <Route path="/cost" element={<Cost />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/doctor" element={<Doctor />} />
+            <Route path="/pairing" element={<Pairing />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>

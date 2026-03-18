@@ -64,3 +64,12 @@ LICENSE
 *.profdata
 coverage
 lcov.info
+
+# Firmware and hardware crates (not needed for Docker runtime)
+firmware/
+crates/robot-kit/
+
+# Application and script directories (not needed for Docker runtime)
+apps/
+python/
+scripts/

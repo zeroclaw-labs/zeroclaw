@@ -484,6 +484,7 @@ impl DelegateTool {
                 agent_config.iteration_cooldown_ms.unwrap_or(0),
                 None,
                 false,
+                None,
             ),
         )
         .await;

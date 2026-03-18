@@ -156,11 +156,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Use ubuntu-22.04 for Linux builds to link against glibc 2.35,
+          # ensuring compatibility with Ubuntu 22.04+ (#3573).
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: zeroclaw
             ext: tar.gz
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             artifact: zeroclaw
             ext: tar.gz
@@ -188,6 +190,8 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         if: runner.os != 'Windows'
+        with:
+          prefix-key: ${{ matrix.os }}-${{ matrix.target }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -210,7 +214,7 @@ jobs:
           if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
           fi
-          cargo build --release --locked --target ${{ matrix.target }}
+          cargo build --release --locked --features channel-matrix --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -303,13 +307,16 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           VERSION: ${{ inputs.version }}
         run: |
-          # Skip if this version is already on crates.io (auto-sync may have published it)
+          # Publish to crates.io; treat "already exists" as success
+          # (auto-publish workflow may have already published this version)
           CRATE_NAME=$(sed -n 's/^name = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
-          if curl -sfL "https://crates.io/api/v1/crates/${CRATE_NAME}/${VERSION}" | grep -q '"version"'; then
-            echo "::notice::${CRATE_NAME}@${VERSION} already published on crates.io — skipping"
-          else
-            cargo publish --locked --allow-dirty --no-verify
+          OUTPUT=$(cargo publish --locked --allow-dirty --no-verify 2>&1) && exit 0
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -q 'already exists'; then
+            echo "::notice::${CRATE_NAME}@${VERSION} already on crates.io — skipping"
+            exit 0
           fi
+          exit 1
 
   redeploy-website:
     name: Trigger Website Redeploy
@@ -330,9 +337,43 @@ jobs:
     name: Push Docker Image
     needs: [validate, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zeroclaw-x86_64-unknown-linux-gnu
+          path: artifacts/
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zeroclaw-aarch64-unknown-linux-gnu
+          path: artifacts/
+
+      - name: Prepare Docker context with pre-built binaries
+        run: |
+          mkdir -p docker-ctx/bin/amd64 docker-ctx/bin/arm64
+          tar xzf artifacts/zeroclaw-x86_64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/amd64
+          tar xzf artifacts/zeroclaw-aarch64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/arm64
+
+          mkdir -p docker-ctx/zeroclaw-data/.zeroclaw docker-ctx/zeroclaw-data/workspace
+          printf '%s\n' \
+            'workspace_dir = "/zeroclaw-data/workspace"' \
+            'config_path = "/zeroclaw-data/.zeroclaw/config.toml"' \
+            'api_key = ""' \
+            'default_provider = "openrouter"' \
+            'default_model = "anthropic/claude-sonnet-4-20250514"' \
+            'default_temperature = 0.7' \
+            '' \
+            '[gateway]' \
+            'port = 42617' \
+            'host = "[::]"' \
+            'allow_public_bind = true' \
+            > docker-ctx/zeroclaw-data/.zeroclaw/config.toml
+
+          cp Dockerfile.ci docker-ctx/Dockerfile
+          cp Dockerfile.debian.ci docker-ctx/Dockerfile.debian
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
@@ -345,19 +386,53 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
-          context: .
+          context: docker-ctx
           push: true
+          build-args: |
+            ZEROCLAW_CARGO_FEATURES=channel-matrix
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           platforms: linux/amd64,linux/arm64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
-  # ── Post-publish: only run after ALL artifacts are live ──────────────
+      - name: Build and push Debian compatibility image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: docker-ctx
+          file: docker-ctx/Dockerfile.debian
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate.outputs.tag }}-debian
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:debian
+          platforms: linux/amd64,linux/arm64
+
+  # ── Post-publish: package manager auto-sync ─────────────────────────
+  scoop:
+    name: Update Scoop Manifest
+    needs: [validate, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    uses: ./.github/workflows/pub-scoop.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+      dry_run: false
+    secrets: inherit
+
+  aur:
+    name: Update AUR Package
+    needs: [validate, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    uses: ./.github/workflows/pub-aur.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+      dry_run: false
+    secrets: inherit
+
+  # ── Post-publish: tweet after release + website are live ──────────────
+  # Docker push can be slow; don't let it block the tweet.
   tweet:
     name: Tweet Release
-    needs: [validate, publish, docker, crates-io, redeploy-website]
+    needs: [validate, publish, redeploy-website]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
     uses: ./.github/workflows/tweet-release.yml
     with:
       release_tag: ${{ needs.validate.outputs.tag }}

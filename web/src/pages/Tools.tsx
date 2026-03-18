@@ -9,6 +9,7 @@ import {
 } from 'lucide-react';
 import type { ToolSpec, CliTool } from '@/types/api';
 import { getTools, getCliTools } from '@/lib/api';
+import { t } from '@/lib/i18n';
 
 export default function Tools() {
   const [tools, setTools] = useState<ToolSpec[]>([]);
@@ -44,7 +45,7 @@ export default function Tools() {
     return (
       <div className="p-6 animate-fade-in">
         <div className="rounded-xl bg-[#ff446615] border border-[#ff446630] p-4 text-[#ff6680]">
-          Failed to load tools: {error}
+          {t('tools.load_error')}: {error}
         </div>
       </div>
     );
@@ -67,7 +68,7 @@ export default function Tools() {
           type="text"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          placeholder="Search tools..."
+          placeholder={t('tools.search')}
           className="input-electric w-full pl-10 pr-4 py-2.5 text-sm"
         />
       </div>
@@ -77,12 +78,12 @@ export default function Tools() {
         <div className="flex items-center gap-2 mb-4">
           <Wrench className="h-5 w-5 text-[#0080ff]" />
           <h2 className="text-sm font-semibold text-white uppercase tracking-wider">
-            Agent Tools ({filtered.length})
+            {t('tools.agent_tools')} ({filtered.length})
           </h2>
         </div>
 
         {filtered.length === 0 ? (
-          <p className="text-sm text-[#334060]">No tools match your search.</p>
+          <p className="text-sm text-[#334060]">{t('tools.empty')}</p>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 stagger-children">
             {filtered.map((tool) => {
@@ -119,7 +120,7 @@ export default function Tools() {
                   {isExpanded && tool.parameters && (
                     <div className="border-t border-[#1a1a3e] p-4 animate-fade-in">
                       <p className="text-[10px] text-[#334060] mb-2 font-semibold uppercase tracking-wider">
-                        Parameter Schema
+                        {t('tools.parameter_schema')}
                       </p>
                       <pre className="text-xs text-[#8892a8] rounded-xl p-3 overflow-x-auto max-h-64 overflow-y-auto" style={{ background: 'rgba(5,5,16,0.8)' }}>
                         {JSON.stringify(tool.parameters, null, 2)}
@@ -139,7 +140,7 @@ export default function Tools() {
           <div className="flex items-center gap-2 mb-4">
             <Terminal className="h-5 w-5 text-[#00e68a]" />
             <h2 className="text-sm font-semibold text-white uppercase tracking-wider">
-              CLI Tools ({filteredCli.length})
+              {t('tools.cli_tools')} ({filteredCli.length})
             </h2>
           </div>
 
@@ -147,10 +148,10 @@ export default function Tools() {
             <table className="table-electric">
               <thead>
                 <tr>
-                  <th className="text-left">Name</th>
-                  <th className="text-left">Path</th>
-                  <th className="text-left">Version</th>
-                  <th className="text-left">Category</th>
+                  <th className="text-left">{t('tools.name')}</th>
+                  <th className="text-left">{t('tools.path')}</th>
+                  <th className="text-left">{t('tools.version')}</th>
+                  <th className="text-left">{t('tools.category')}</th>
                 </tr>
               </thead>
               <tbody>

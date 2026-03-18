@@ -103,9 +103,20 @@ jobs:
         run: rm -rf web/node_modules web/src web/package.json web/package-lock.json web/tsconfig*.json web/vite.config.ts web/index.html
 
       - name: Publish to crates.io
-        run: cargo publish --locked --allow-dirty --no-verify
+        shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.detect-version-change.outputs.version }}
+        run: |
+          # Publish to crates.io; treat "already exists" as success
+          # (manual publish or stable workflow may have already published)
+          OUTPUT=$(cargo publish --locked --allow-dirty --no-verify 2>&1) && exit 0
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -q 'already exists'; then
+            echo "::notice::zeroclawlabs@${VERSION} already on crates.io — skipping"
+            exit 0
+          fi
+          exit 1
 
       - name: Verify published
         shell: bash

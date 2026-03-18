@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 // immediately — avoiding wasted latency on errors that cannot self-heal.
 
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
-fn is_non_retryable(err: &anyhow::Error) -> bool {
+pub fn is_non_retryable(err: &anyhow::Error) -> bool {
     if is_context_window_exceeded(err) {
         return true;
     }
@@ -335,13 +335,20 @@ impl ReliableProvider {
 
     /// Check if provider is in rate-limit cooldown. Returns true if should skip.
     fn is_in_cooldown(&self, provider_idx: usize) -> bool {
-        let lock = self.rate_limit_cooldowns.lock().unwrap_or_else(|e| e.into_inner());
-        lock.get(&provider_idx).is_some_and(|&deadline| Instant::now() < deadline)
+        let lock = self
+            .rate_limit_cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        lock.get(&provider_idx)
+            .is_some_and(|&deadline| Instant::now() < deadline)
     }
 
     /// Mark provider as rate-limited for the given duration.
     fn set_cooldown(&self, provider_idx: usize, cooldown: Duration) {
-        let mut lock = self.rate_limit_cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+        let mut lock = self
+            .rate_limit_cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         lock.insert(provider_idx, Instant::now() + cooldown);
     }
 
@@ -2112,7 +2119,10 @@ mod tests {
     fn model_compatibility_gemini_accepts_gemini_models() {
         assert!(is_model_compatible("gemini", "gemini-3-flash-preview"));
         assert!(is_model_compatible("gemini", "gemini-2.5-flash"));
-        assert!(is_model_compatible("gemini:gemini-api-1", "gemini-3-flash-preview"));
+        assert!(is_model_compatible(
+            "gemini:gemini-api-1",
+            "gemini-3-flash-preview"
+        ));
         assert!(!is_model_compatible("gemini", "gpt-5.1"));
         assert!(!is_model_compatible("gemini", "claude-sonnet"));
     }
@@ -2122,7 +2132,10 @@ mod tests {
         assert!(is_model_compatible("openai-codex", "gpt-5.1"));
         assert!(is_model_compatible("openai-codex", "gpt-5.1-codex-mini"));
         assert!(is_model_compatible("openai-codex:codex-1", "o4-mini"));
-        assert!(!is_model_compatible("openai-codex", "gemini-3-flash-preview"));
+        assert!(!is_model_compatible(
+            "openai-codex",
+            "gemini-3-flash-preview"
+        ));
         assert!(!is_model_compatible("openai-codex", "claude-sonnet"));
     }
 

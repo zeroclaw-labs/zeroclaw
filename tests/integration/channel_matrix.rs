@@ -124,7 +124,7 @@ impl Channel for MatrixTestChannel {
             channel: self.channel_name.clone(),
             timestamp: 1700000000,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
         })
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -565,7 +565,7 @@ fn channel_message_thread_ts_preserved_on_clone() {
         channel: "slack".into(),
         timestamp: 1700000000,
         thread_ts: Some("1700000000.000001".into()),
-                reply_to_message_id: None,
+        reply_to_message_id: None,
     };
 
     let cloned = msg.clone();
@@ -582,7 +582,7 @@ fn channel_message_none_thread_ts_preserved() {
         channel: "telegram".into(),
         timestamp: 1700000000,
         thread_ts: None,
-                reply_to_message_id: None,
+        reply_to_message_id: None,
     };
 
     assert!(msg.clone().thread_ts.is_none());
@@ -636,7 +636,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             channel: "telegram".into(),
             timestamp: 1700000000,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
         },
         "discord" => ChannelMessage {
             id: "dc_1".into(),
@@ -646,7 +646,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             channel: "discord".into(),
             timestamp: 1700000000,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
         },
         "slack" => ChannelMessage {
             id: "sl_1".into(),
@@ -656,7 +656,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             channel: "slack".into(),
             timestamp: 1700000000,
             thread_ts: Some("1700000000.000001".into()),
-                reply_to_message_id: None,
+            reply_to_message_id: None,
         },
         "imessage" => ChannelMessage {
             id: "im_1".into(),
@@ -666,7 +666,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             channel: "imessage".into(),
             timestamp: 1700000000,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
         },
         "irc" => ChannelMessage {
             id: "irc_1".into(),
@@ -676,7 +676,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             channel: "irc".into(),
             timestamp: 1700000000,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
         },
         "email" => ChannelMessage {
             id: "email_1".into(),
@@ -686,7 +686,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             channel: "email".into(),
             timestamp: 1700000000,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
         },
         "signal" => ChannelMessage {
             id: "sig_1".into(),
@@ -696,7 +696,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             channel: "signal".into(),
             timestamp: 1700000000,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
         },
         "mattermost" => ChannelMessage {
             id: "mm_1".into(),
@@ -706,7 +706,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             channel: "mattermost".into(),
             timestamp: 1700000000,
             thread_ts: Some("root_msg_id".into()),
-                reply_to_message_id: None,
+            reply_to_message_id: None,
         },
         "whatsapp" => ChannelMessage {
             id: "wa_1".into(),
@@ -716,7 +716,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             channel: "whatsapp".into(),
             timestamp: 1700000000,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
         },
         "nextcloud_talk" => ChannelMessage {
             id: "nc_1".into(),
@@ -726,7 +726,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             channel: "nextcloud_talk".into(),
             timestamp: 1700000000,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
         },
         "wecom" => ChannelMessage {
             id: "wc_1".into(),
@@ -736,7 +736,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             channel: "wecom".into(),
             timestamp: 1700000000,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
         },
         "dingtalk" => ChannelMessage {
             id: "dt_1".into(),
@@ -746,7 +746,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             channel: "dingtalk".into(),
             timestamp: 1700000000,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
         },
         "qq" => ChannelMessage {
             id: "qq_1".into(),
@@ -756,7 +756,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             channel: "qq".into(),
             timestamp: 1700000000,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
         },
         "linq" => ChannelMessage {
             id: "lq_1".into(),
@@ -766,7 +766,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             channel: "linq".into(),
             timestamp: 1700000000,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
         },
         "wati" => ChannelMessage {
             id: "wt_1".into(),
@@ -776,7 +776,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             channel: "wati".into(),
             timestamp: 1700000000,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
         },
         "cli" => ChannelMessage {
             id: "cli_1".into(),
@@ -786,7 +786,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             channel: "cli".into(),
             timestamp: 1700000000,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
         },
         _ => panic!("Unknown platform: {platform}"),
     }
@@ -1087,7 +1087,7 @@ fn channel_message_zero_timestamp() {
         channel: "ch".into(),
         timestamp: 0,
         thread_ts: None,
-                reply_to_message_id: None,
+        reply_to_message_id: None,
     };
     assert_eq!(msg.timestamp, 0);
 }
@@ -1102,7 +1102,7 @@ fn channel_message_max_timestamp() {
         channel: "ch".into(),
         timestamp: u64::MAX,
         thread_ts: None,
-                reply_to_message_id: None,
+        reply_to_message_id: None,
     };
     assert_eq!(msg.timestamp, u64::MAX);
 }
