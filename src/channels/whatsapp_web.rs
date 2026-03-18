@@ -70,6 +70,8 @@ pub struct WhatsAppWebChannel {
     transcription: Option<crate::config::TranscriptionConfig>,
     /// Text-to-speech config for voice replies
     tts_config: Option<crate::config::TtsConfig>,
+    /// Workspace directory for saving downloaded media (images, docs)
+    workspace_dir: Option<std::path::PathBuf>,
     /// Chats awaiting a voice reply — maps chat JID to the latest substantive
     /// reply text. A background task debounces and sends the voice note after
     /// the agent finishes its turn (no new send() for 3 seconds).
@@ -106,6 +108,7 @@ impl WhatsAppWebChannel {
             tx: Arc::new(Mutex::new(None)),
             transcription: None,
             tts_config: None,
+            workspace_dir: None,
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
@@ -160,6 +163,185 @@ impl WhatsAppWebChannel {
         );
 
         jids
+    }
+
+    /// Extract reply/quote context from a WhatsApp message.
+    ///
+    /// When a user replies to a previous message, the protobuf carries the
+    /// original text inside `context_info.quoted_message`. This helper returns
+    /// a human-readable prefix like `[Replying to: "original text"]` so the
+    /// agent can see what message the user is responding to.
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_reply_context(msg: &wa_rs_proto::whatsapp::Message) -> Option<String> {
+        use wa_rs_core::proto_helpers::MessageExt;
+
+        let base = msg.get_base_message();
+
+        /// Try to extract a displayable preview from a quoted message.
+        /// Checks text content first, then falls back to image/video caption,
+        /// and finally to a media-type placeholder.
+        fn quoted_preview(quoted: &wa_rs_proto::whatsapp::Message) -> Option<String> {
+            use wa_rs_core::proto_helpers::MessageExt as _;
+            // 1. Text content (conversation or extended_text_message)
+            if let Some(text) = quoted.text_content() {
+                if !text.is_empty() {
+                    return Some(truncate_reply_preview(text, 200));
+                }
+            }
+            // 2. Image caption
+            if let Some(ref img) = quoted.image_message {
+                return Some(
+                    img.caption
+                        .as_deref()
+                        .filter(|c| !c.trim().is_empty())
+                        .map(|c| format!("[Photo] {}", truncate_reply_preview(c, 180)))
+                        .unwrap_or_else(|| "[Photo]".to_string()),
+                );
+            }
+            // 3. Video caption
+            if let Some(ref vid) = quoted.video_message {
+                return Some(
+                    vid.caption
+                        .as_deref()
+                        .filter(|c| !c.trim().is_empty())
+                        .map(|c| format!("[Video] {}", truncate_reply_preview(c, 180)))
+                        .unwrap_or_else(|| "[Video]".to_string()),
+                );
+            }
+            // 4. Document filename
+            if let Some(ref doc) = quoted.document_message {
+                return Some(
+                    doc.file_name
+                        .as_deref()
+                        .map(|f| format!("[Document: {f}]"))
+                        .unwrap_or_else(|| "[Document]".to_string()),
+                );
+            }
+            // 5. Audio / voice note
+            if quoted.audio_message.is_some() {
+                return Some("[Voice message]".to_string());
+            }
+            // 6. Sticker
+            if quoted.sticker_message.is_some() {
+                return Some("[Sticker]".to_string());
+            }
+            // 7. Location
+            if quoted.location_message.is_some() {
+                return Some("[Location]".to_string());
+            }
+            // 8. Contact
+            if quoted.contact_message.is_some() {
+                return Some("[Contact]".to_string());
+            }
+            None
+        }
+
+        macro_rules! try_ctx {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    if let Some(ref m) = base.$field {
+                        if let Some(ref ctx) = m.context_info {
+                            if let Some(ref quoted) = ctx.quoted_message {
+                                if let Some(preview) = quoted_preview(quoted) {
+                                    return Some(format!(
+                                        "[Replying to: \"{preview}\"]",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                )+
+            };
+        }
+
+        try_ctx!(
+            extended_text_message,
+            image_message,
+            video_message,
+            audio_message,
+            document_message,
+            sticker_message,
+            location_message,
+            contact_message,
+        );
+
+        // Plain `conversation` messages don't carry context_info in the proto;
+        // they cannot be quote-replies.
+        None
+    }
+
+    /// Attempt to download a WhatsApp image and save it locally.
+    ///
+    /// Returns the local path on success, or `None` if workspace is not
+    /// configured, download fails, or the image is empty.
+    #[cfg(feature = "whatsapp-web")]
+    async fn try_download_image(
+        client: &wa_rs::Client,
+        image: &wa_rs_proto::whatsapp::message::ImageMessage,
+        workspace_dir: Option<&std::path::Path>,
+    ) -> Option<std::path::PathBuf> {
+        let workspace = workspace_dir.or_else(|| {
+            tracing::warn!("WhatsApp Web: cannot save image — workspace_dir not configured");
+            None
+        })?;
+
+        let save_dir = workspace.join("whatsapp_files");
+        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
+            tracing::warn!("WhatsApp Web: failed to create whatsapp_files dir: {e}");
+            return None;
+        }
+
+        // Download and decrypt the image
+        use wa_rs::download::Downloadable;
+        let data = match client.download(image as &dyn Downloadable).await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("WhatsApp Web: failed to download image: {e}");
+                return None;
+            }
+        };
+
+        if data.is_empty() {
+            tracing::warn!("WhatsApp Web: downloaded image is empty");
+            return None;
+        }
+
+        // Determine extension from mimetype
+        let ext = match image.mimetype.as_deref() {
+            Some(m) if m.contains("png") => "png",
+            Some(m) if m.contains("webp") => "webp",
+            Some(m) if m.contains("gif") => "gif",
+            Some(m) if m.contains("bmp") => "bmp",
+            _ => "jpg", // WhatsApp default
+        };
+
+        let filename = format!(
+            "img_{}.{ext}",
+            chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f")
+        );
+        let local_path = save_dir.join(&filename);
+
+        if let Err(e) = tokio::fs::write(&local_path, &data).await {
+            tracing::warn!(
+                "WhatsApp Web: failed to save image to {}: {e}",
+                local_path.display()
+            );
+            return None;
+        }
+
+        tracing::info!(
+            "WhatsApp Web: saved image ({} bytes) to {}",
+            data.len(),
+            local_path.display()
+        );
+        Some(local_path)
+    }
+
+    /// Set the workspace directory for saving downloaded media files.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_workspace_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
     }
 
     /// Configure voice transcription (STT) for incoming voice notes.
@@ -654,7 +836,7 @@ impl Channel for WhatsAppWebChannel {
                 tracing::info!(
                     "WhatsApp Web: no existing session, new device will be created during pairing"
                 );
-            };
+            }
 
             // Create transport factory
             let mut transport_factory = TokioWebSocketTransportFactory::new();
@@ -679,9 +861,8 @@ impl Channel for WhatsAppWebChannel {
             let retry_count_clone = retry_count.clone();
             let session_revoked_clone = session_revoked.clone();
             let transcription_config = self.transcription.clone();
-
-            let transcription_config = self.transcription.clone();
             let voice_chats = self.voice_chats.clone();
+            let workspace_dir = self.workspace_dir.clone();
 
             let mut builder = Bot::builder()
                 .with_backend(backend)
@@ -695,6 +876,7 @@ impl Channel for WhatsAppWebChannel {
                     let session_revoked = session_revoked_clone.clone();
                     let transcription_config = transcription_config.clone();
                     let voice_chats = voice_chats.clone();
+                    let workspace_dir = workspace_dir.clone();
                     async move {
                         match event {
                             Event::Message(msg, info) => {
@@ -751,14 +933,43 @@ impl Channel for WhatsAppWebChannel {
                                     None
                                 };
 
-                                // Use transcribed voice text, or fall back to text content.
+                                // Use transcribed voice text, image, or fall back to text content.
                                 // Track whether this chat used a voice note so we reply in kind.
                                 // We store the chat JID (reply_target) since that's what send() receives.
-                                let content = if let Some(ref vt) = voice_text {
+                                let mut content = if let Some(ref vt) = voice_text {
                                     if let Ok(mut vs) = voice_chats.lock() {
                                         vs.insert(chat.clone());
                                     }
                                     format!("[Voice] {vt}")
+                                } else if let Some(ref image) = msg.get_base_message().image_message {
+                                    if let Ok(mut vs) = voice_chats.lock() {
+                                        vs.remove(&chat);
+                                    }
+                                    // Download image and produce [IMAGE:] marker
+                                    if let Some(local_path) = Self::try_download_image(
+                                        &client,
+                                        image,
+                                        workspace_dir.as_deref(),
+                                    )
+                                    .await
+                                    {
+                                        let marker = format!("[IMAGE:{}]", local_path.display());
+                                        // Append caption if present
+                                        match image.caption.as_deref() {
+                                            Some(cap) if !cap.trim().is_empty() => {
+                                                format!("{marker}\n\n{}", cap.trim())
+                                            }
+                                            _ => marker,
+                                        }
+                                    } else {
+                                        // Download failed; fall back to caption-only or skip
+                                        image
+                                            .caption
+                                            .as_deref()
+                                            .filter(|c| !c.trim().is_empty())
+                                            .map(|c| c.trim().to_string())
+                                            .unwrap_or_default()
+                                    }
                                 } else {
                                     if let Ok(mut vs) = voice_chats.lock() {
                                         vs.remove(&chat);
@@ -766,6 +977,16 @@ impl Channel for WhatsAppWebChannel {
                                     let text = msg.text_content().unwrap_or("");
                                     text.trim().to_string()
                                 };
+
+                                // Prepend reply/quote context so the agent knows
+                                // what message the user is responding to.
+                                if let Some(quote) = Self::extract_reply_context(&msg) {
+                                    if content.is_empty() {
+                                        content = quote;
+                                    } else {
+                                        content = format!("{quote}\n\n{content}");
+                                    }
+                                }
 
                                 tracing::info!(
                                     "WhatsApp Web message received (sender_len={}, chat_len={}, content_len={})",
@@ -805,16 +1026,14 @@ impl Channel for WhatsAppWebChannel {
 
                                         let is_mentioned = mentioned.iter().any(|jid| {
                                             if let Some(pn) = pn_user {
-                                                if jid.starts_with(pn) {
-                                                    let rest = &jid[pn.len()..];
+                                                if let Some(rest) = jid.strip_prefix(pn) {
                                                     if rest.starts_with('@') || rest.starts_with(':') {
                                                         return true;
                                                     }
                                                 }
                                             }
                                             if let Some(lid) = lid_user {
-                                                if jid.starts_with(lid) {
-                                                    let rest = &jid[lid.len()..];
+                                                if let Some(rest) = jid.strip_prefix(lid) {
                                                     if rest.starts_with('@') || rest.starts_with(':') {
                                                         return true;
                                                     }
@@ -843,7 +1062,7 @@ impl Channel for WhatsAppWebChannel {
                                         // Reply to the originating chat JID (DM or group).
                                         reply_target: chat,
                                         content,
-                                        timestamp: chrono::Utc::now().timestamp() as u64,
+                                        timestamp: chrono::Utc::now().timestamp().cast_unsigned(),
                                         thread_ts: None,
                                     })
                                     .await
@@ -1069,6 +1288,20 @@ impl Channel for WhatsAppWebChannel {
     }
 }
 
+/// Truncate a quoted-message preview to at most `max_chars` characters,
+/// appending "…" when the text is shortened.
+#[cfg(feature = "whatsapp-web")]
+fn truncate_reply_preview(text: &str, max_chars: usize) -> String {
+    // Normalise whitespace so multi-line quotes become a single line.
+    let normalised: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalised.chars().count() <= max_chars {
+        normalised
+    } else {
+        let truncated: String = normalised.chars().take(max_chars).collect();
+        format!("{truncated}…")
+    }
+}
+
 // Stub implementation when feature is not enabled
 #[cfg(not(feature = "whatsapp-web"))]
 pub struct WhatsAppWebChannel {
@@ -1091,6 +1324,14 @@ impl WhatsAppWebChannel {
     }
 
     pub fn with_tts(self, _config: crate::config::TtsConfig) -> Self {
+        self
+    }
+
+    pub fn with_workspace_dir(self, _dir: std::path::PathBuf) -> Self {
+        self
+    }
+
+    pub fn with_mention_only(self, _mention_only: bool) -> Self {
         self
     }
 }
