@@ -6405,6 +6405,45 @@ fn read_codex_openai_api_key() -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// Ensure that essential bootstrap files exist in the workspace directory.
+///
+/// When the workspace is created outside of `zeroclaw onboard` (e.g., non-tty
+/// daemon/cron sessions), these files would otherwise be missing. This function
+/// creates sensible defaults that allow the agent to operate with a basic identity.
+async fn ensure_bootstrap_files(workspace_dir: &Path) -> Result<()> {
+    let defaults: &[(&str, &str)] = &[
+        (
+            "IDENTITY.md",
+            "# IDENTITY.md — Who Am I?\n\n\
+             I am ZeroClaw, an autonomous AI agent.\n\n\
+             ## Traits\n\
+             - Helpful, precise, and safety-conscious\n\
+             - I prioritize clarity and correctness\n",
+        ),
+        (
+            "SOUL.md",
+            "# SOUL.md — Who You Are\n\n\
+             You are ZeroClaw, an autonomous AI agent.\n\n\
+             ## Core Principles\n\
+             - Be helpful and accurate\n\
+             - Respect user intent and boundaries\n\
+             - Ask before taking destructive actions\n\
+             - Prefer safe, reversible operations\n",
+        ),
+    ];
+
+    for (filename, content) in defaults {
+        let path = workspace_dir.join(filename);
+        if !path.exists() {
+            fs::write(&path, content)
+                .await
+                .with_context(|| format!("Failed to create default {filename} in workspace"))?;
+        }
+    }
+
+    Ok(())
+}
+
 impl Config {
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
@@ -6420,6 +6459,8 @@ impl Config {
         fs::create_dir_all(&workspace_dir)
             .await
             .context("Failed to create workspace directory")?;
+
+        ensure_bootstrap_files(&workspace_dir).await?;
 
         if config_path.exists() {
             // Warn if config file is world-readable (may contain API keys)
@@ -11881,5 +11922,47 @@ require_otp_to_resume = true
             !effective,
             "must fall back to top-level false when channel omits field"
         );
+    }
+
+    // ── Bootstrap files ─────────────────────────────────────
+
+    #[test]
+    async fn ensure_bootstrap_files_creates_missing_files() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("workspace");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+
+        ensure_bootstrap_files(&ws).await.unwrap();
+
+        let soul = tokio::fs::read_to_string(ws.join("SOUL.md")).await.unwrap();
+        let identity = tokio::fs::read_to_string(ws.join("IDENTITY.md"))
+            .await
+            .unwrap();
+        assert!(soul.contains("SOUL.md"));
+        assert!(identity.contains("IDENTITY.md"));
+    }
+
+    #[test]
+    async fn ensure_bootstrap_files_does_not_overwrite_existing() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("workspace");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+
+        let custom = "# My custom SOUL";
+        tokio::fs::write(ws.join("SOUL.md"), custom).await.unwrap();
+
+        ensure_bootstrap_files(&ws).await.unwrap();
+
+        let soul = tokio::fs::read_to_string(ws.join("SOUL.md")).await.unwrap();
+        assert_eq!(
+            soul, custom,
+            "ensure_bootstrap_files must not overwrite existing files"
+        );
+
+        // IDENTITY.md should still be created since it was missing
+        let identity = tokio::fs::read_to_string(ws.join("IDENTITY.md"))
+            .await
+            .unwrap();
+        assert!(identity.contains("IDENTITY.md"));
     }
 }
