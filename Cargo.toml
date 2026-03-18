@@ -84,7 +84,7 @@ nanohtml2text = "0.2"
 fantoccini = { version = "0.22.1", optional = true, default-features = false, features = ["rustls-tls"] }
 
 # Progress bars (update pipeline)
-indicatif = "0.17"
+indicatif = "0.18"
 
 # Temp files (update pipeline rollback)
 tempfile = "3.26"
