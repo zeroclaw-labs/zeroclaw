@@ -101,7 +101,7 @@ curl -fsSL https://ollama.ai/install.sh | sh
 
 # Pull models (choose based on RAM)
 # 8GB Pi: Use smaller models
-ollama pull llama3.2:3b      # 3B params, fast
+ollama pull qwen3.5:0.8b     # 0.8B params, fast
 ollama pull moondream        # Vision model, small
 
 # 4GB Pi: Use tiny models
@@ -295,7 +295,7 @@ aplay test.wav
 echo "Testing speaker" | piper --model ~/.zeroclaw/models/piper/en_US-lessac-medium.onnx --output_file - | aplay -D plughw:0,0
 
 # Test Ollama
-curl http://localhost:11434/api/generate -d '{"model":"llama3.2:3b","prompt":"Say hello"}'
+curl http://localhost:11434/api/generate -d '{"model":"qwen3.5:0.8b","prompt":"Say hello"}'
 
 # Test motors (careful!)
 # Write a simple test script for your motor controller
@@ -361,7 +361,7 @@ nohup python3 ~/sensor_loop.py &
 cat > ~/.zeroclaw/config.toml << 'EOF'
 api_key = ""  # Not needed for local Ollama
 default_provider = "ollama"
-default_model = "llama3.2:3b"
+default_model = "qwen3.5:0.8b"
 
 [memory]
 backend = "sqlite"
@@ -475,7 +475,7 @@ aplay -D plughw:0,0 /tmp/test.wav
 free -h
 
 # Use smaller model
-ollama rm llama3.2:3b
+ollama rm qwen3.5:0.8b
 ollama pull phi3:mini
 
 # Set memory limit
@@ -499,9 +499,9 @@ sudo usermod -aG dialout $USER
 
 1. **Use NVMe** - SD cards are slow for model loading
 2. **Active cooling** - Pi 5 throttles without it
-3. **Smaller models** - llama3.2:3b or phi3:mini
+3. **Smaller models** - qwen3.5:0.8b or phi3:mini
 4. **Disable GPU** - Pi doesn't have one, saves confusion
-5. **Preload models** - `ollama run llama3.2:3b "warmup"` before use
+5. **Preload models** - `ollama run qwen3.5:0.8b "warmup"` before use
 
 ## Safety Checklist Before First Run
 

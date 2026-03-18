@@ -2,7 +2,7 @@
 
 This runbook is for operators who maintain availability, security posture, and incident response.
 
-Last verified: **February 18, 2026**.
+Last verified: **March 12, 2026**.
 
 ## Scope
 
@@ -22,6 +22,18 @@ For first-time installation, start from [one-click-bootstrap.md](one-click-boots
 | Foreground runtime | `zeroclaw daemon` | local debugging, short-lived sessions |
 | Foreground gateway only | `zeroclaw gateway` | webhook endpoint testing |
 | User service | `zeroclaw service install && zeroclaw service start` | persistent operator-managed runtime |
+
+## Zara Workspace Deployment Boundary
+
+If ZeroClaw is being used as Zara's live brain on this machine, keep the runtime boundary explicit:
+
+- `zara-agent.service` runs `~/.local/bin/zeroclaw` with `WorkingDirectory=~/zara`
+- the authoritative ZeroClaw source and build root is `~/zeroclaw`
+- `~/zara/zeroclaw` is a workspace mirror/symlink, not the deploy source of truth
+- `lifebook-agent.service` is a separate memory/learning service running `~/.local/bin/lifebook-agent` built from `~/lifebook-agent`
+
+For that layout, build from `~/zeroclaw`, deploy the resulting binary to `~/.local/bin/zeroclaw`, and restart `zara-agent.service`.
+Do not treat edits under `~/zara/zeroclaw` as live until the real binary has been rebuilt and deployed.
 
 ## Baseline Operator Checklist
 
@@ -110,6 +122,15 @@ Before applying config changes:
 3. run `zeroclaw doctor`
 4. restart daemon/service
 5. verify with `status` + `channel doctor`
+
+If you are operating the Zara deployment layout:
+
+1. edit ZeroClaw code in `~/zeroclaw`
+2. rebuild from `~/zeroclaw`
+3. stop `zara-agent.service`
+4. copy `~/zeroclaw/target/release/zeroclaw` to `~/.local/bin/zeroclaw`
+5. restart `zara-agent.service`
+6. if Lifebook changed, rebuild from `~/lifebook-agent`, deploy `~/.local/bin/lifebook-agent`, then restart `lifebook-agent.service`
 
 ## Rollback Procedure
 

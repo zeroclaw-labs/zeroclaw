@@ -21,104 +21,31 @@ Key extension points:
 - `src/providers/traits.rs` (`Provider`)
 - `src/channels/traits.rs` (`Channel`)
 - `src/tools/traits.rs` (`Tool`)
-- `src/memory/traits.rs` (`Memory`)
-- `src/observability/traits.rs` (`Observer`)
-- `src/runtime/traits.rs` (`RuntimeAdapter`)
-- `src/peripherals/traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
+## GitNexus — Code Intelligence
 
-## 2) Deep Architecture Observations (Why This Protocol Exists)
+This repository is indexed by GitNexus as **zeroclaw**. Use the installed `gitnexus` CLI from the repo root unless real GitNexus MCP tools are explicitly available in the current runtime.
 
-These codebase realities should drive every design decision:
+## Always Do
 
-1. **Trait + factory architecture is the stability backbone**
-    - Extension points are intentionally explicit and swappable.
-    - Most features should be added via trait implementation + factory registration, not cross-cutting rewrites.
-2. **Security-critical surfaces are first-class and internet-adjacent**
-    - `src/gateway/`, `src/security/`, `src/tools/`, `src/runtime/` carry high blast radius.
-    - Defaults already lean secure-by-default (pairing, bind safety, limits, secret handling); keep it that way.
-3. **Performance and binary size are product goals, not nice-to-have**
-    - `Cargo.toml` release profile and dependency choices optimize for size and determinism.
-    - Convenience dependencies and broad abstractions can silently regress these goals.
-4. **Config and runtime contracts are user-facing API**
-    - `src/config/schema.rs` and CLI commands are effectively public interfaces.
-    - Backward compatibility and explicit migration matter.
-5. **The project now runs in high-concurrency collaboration mode**
-    - CI + docs governance + label routing are part of the product delivery system.
-    - PR throughput is a design constraint; not just a maintainer inconvenience.
+- Before editing an unfamiliar symbol, run `gitnexus impact -r zeroclaw <symbol>` from `~/zeroclaw` and inspect the blast radius.
+- When exploring architecture or execution flow, prefer `gitnexus query -r zeroclaw "concept"` or `gitnexus context -r zeroclaw <symbol>` before broad grep sweeps.
+- If `gitnexus status` says the index is stale, refresh it with `gitnexus analyze .` from the repo root.
 
-## 3) Engineering Principles (Normative)
+## Never Do
 
-These principles are mandatory by default. They are not slogans; they are implementation constraints.
+- Never invent MCP-only GitNexus tool calls when only the CLI is available.
+- Never assume `detect_changes` or `rename` exist unless `gitnexus --help` shows them in the installed version.
 
-### 3.1 KISS (Keep It Simple, Stupid)
+## Quick Commands
 
-**Why here:** Runtime + security behavior must stay auditable under pressure.
-
-Required:
-
-- Prefer straightforward control flow over clever meta-programming.
-- Prefer explicit match branches and typed structs over hidden dynamic behavior.
-- Keep error paths obvious and localized.
-
-### 3.2 YAGNI (You Aren't Gonna Need It)
-
-**Why here:** Premature features increase attack surface and maintenance burden.
-
-Required:
-
-- Do not add new config keys, trait methods, feature flags, or workflow branches without a concrete accepted use case.
-- Do not introduce speculative “future-proof” abstractions without at least one current caller.
-- Keep unsupported paths explicit (error out) rather than adding partial fake support.
-
-### 3.3 DRY + Rule of Three
-
-**Why here:** Naive DRY can create brittle shared abstractions across providers/channels/tools.
-
-Required:
-
-- Duplicate small, local logic when it preserves clarity.
-- Extract shared utilities only after repeated, stable patterns (rule-of-three).
-- When extracting, preserve module boundaries and avoid hidden coupling.
-
-### 3.4 SRP + ISP (Single Responsibility + Interface Segregation)
-
-**Why here:** Trait-driven architecture already encodes subsystem boundaries.
-
-Required:
-
-- Keep each module focused on one concern.
-- Extend behavior by implementing existing narrow traits whenever possible.
-- Avoid fat interfaces and “god modules” that mix policy + transport + storage.
-
-### 3.5 Fail Fast + Explicit Errors
-
-**Why here:** Silent fallback in agent runtimes can create unsafe or costly behavior.
-
-Required:
-
-- Prefer explicit `bail!`/errors for unsupported or unsafe states.
-- Never silently broaden permissions/capabilities.
-- Document fallback behavior when fallback is intentional and safe.
-
-### 3.6 Secure by Default + Least Privilege
-
-**Why here:** Gateway/tools/runtime can execute actions with real-world side effects.
-
-Required:
-
-- Deny-by-default for access and exposure boundaries.
-- Never log secrets, raw tokens, or sensitive payloads.
-- Keep network/filesystem/shell scope as narrow as possible unless explicitly justified.
-
-### 3.7 Determinism + Reproducibility
-
-**Why here:** Reliable CI and low-latency triage depend on deterministic behavior.
-
-Required:
-
-- Prefer reproducible commands and locked dependency behavior in CI-sensitive paths.
-- Keep tests deterministic (no flaky timing/network dependence without guardrails).
-- Ensure local validation commands map to CI expectations.
+```bash
+cd ~/zeroclaw
+gitnexus status
+gitnexus query -r zeroclaw "telegram feedback"
+gitnexus context -r zeroclaw process_channel_message
+gitnexus impact -r zeroclaw process_channel_message
+gitnexus analyze .
+```
 
 ### 3.8 Reversibility + Rollback-First Thinking
 
@@ -472,3 +399,105 @@ When working in fast iterative mode:
 - Prefer deterministic behavior over clever shortcuts.
 - Do not “ship and hope” on security-sensitive paths.
 - If uncertain, leave a concrete TODO with verification context, not a hidden guess.
+
+<!-- gitnexus:start -->
+# GitNexus — Code Intelligence
+
+This project is indexed by GitNexus as **zeroclaw** (8045 symbols, 20446 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+
+> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
+
+## Always Do
+
+- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
+- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
+- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
+- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
+
+## When Debugging
+
+1. `gitnexus_query({query: "<error or symptom>"})` — find execution flows related to the issue
+2. `gitnexus_context({name: "<suspect function>"})` — see all callers, callees, and process participation
+3. `READ gitnexus://repo/zeroclaw/process/{processName}` — trace the full execution flow step by step
+4. For regressions: `gitnexus_detect_changes({scope: "compare", base_ref: "main"})` — see what your branch changed
+
+## When Refactoring
+
+- **Renaming**: MUST use `gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})` first. Review the preview — graph edits are safe, text_search edits need manual review. Then run with `dry_run: false`.
+- **Extracting/Splitting**: MUST run `gitnexus_context({name: "target"})` to see all incoming/outgoing refs, then `gitnexus_impact({target: "target", direction: "upstream"})` to find all external callers before moving code.
+- After any refactor: run `gitnexus_detect_changes({scope: "all"})` to verify only expected files changed.
+
+## Never Do
+
+- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
+- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
+- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
+- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
+
+## Tools Quick Reference
+
+| Tool | When to use | Command |
+|------|-------------|---------|
+| `query` | Find code by concept | `gitnexus_query({query: "auth validation"})` |
+| `context` | 360-degree view of one symbol | `gitnexus_context({name: "validateUser"})` |
+| `impact` | Blast radius before editing | `gitnexus_impact({target: "X", direction: "upstream"})` |
+| `detect_changes` | Pre-commit scope check | `gitnexus_detect_changes({scope: "staged"})` |
+| `rename` | Safe multi-file rename | `gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})` |
+| `cypher` | Custom graph queries | `gitnexus_cypher({query: "MATCH ..."})` |
+
+## Impact Risk Levels
+
+| Depth | Meaning | Action |
+|-------|---------|--------|
+| d=1 | WILL BREAK — direct callers/importers | MUST update these |
+| d=2 | LIKELY AFFECTED — indirect deps | Should test |
+| d=3 | MAY NEED TESTING — transitive | Test if critical path |
+
+## Resources
+
+| Resource | Use for |
+|----------|---------|
+| `gitnexus://repo/zeroclaw/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/zeroclaw/clusters` | All functional areas |
+| `gitnexus://repo/zeroclaw/processes` | All execution flows |
+| `gitnexus://repo/zeroclaw/process/{name}` | Step-by-step execution trace |
+
+## Self-Check Before Finishing
+
+Before completing any code modification task, verify:
+1. `gitnexus_impact` was run for all modified symbols
+2. No HIGH/CRITICAL risk warnings were ignored
+3. `gitnexus_detect_changes()` confirms changes match expected scope
+4. All d=1 (WILL BREAK) dependents were updated
+
+## Keeping the Index Fresh
+
+After committing code changes, the GitNexus index becomes stale. Re-run analyze to update it:
+
+```bash
+npx gitnexus analyze
+```
+
+If the index previously included embeddings, preserve them by adding `--embeddings`:
+
+```bash
+npx gitnexus analyze --embeddings
+```
+
+To check whether embeddings exist, inspect `.gitnexus/meta.json` — the `stats.embeddings` field shows the count (0 means no embeddings). **Running analyze without `--embeddings` will delete any previously generated embeddings.**
+
+> Claude Code users: A PostToolUse hook handles this automatically after `git commit` and `git merge`.
+
+## CLI
+
+| Task | Read this skill file |
+|------|---------------------|
+| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
+| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
+| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
+| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
+| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
+| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
+
+<!-- gitnexus:end -->

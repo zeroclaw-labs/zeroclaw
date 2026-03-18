@@ -152,7 +152,7 @@ agent = create_agent(
 
 ```python
 agent = create_agent(
-    model="llama3.2",
+    model="qwen3.5:9b",
     base_url="http://localhost:11434/v1"
 )
 ```

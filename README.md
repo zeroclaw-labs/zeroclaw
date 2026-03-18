@@ -184,6 +184,17 @@ curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts
 
 ## Quick Start
 
+### Zara Deployment Note
+
+If you run ZeroClaw as Zara's live agent on this machine, keep the source and runtime paths separate:
+
+- live runtime: `zara-agent.service` -> `~/.local/bin/zeroclaw` with config in `~/zara/config.toml`
+- authoritative ZeroClaw source/build root: `~/zeroclaw`
+- Zara workspace path `~/zara/zeroclaw` is a mirror/symlink for workspace context, not the deploy source of truth
+- Lifebook memory/learning service is separate: build from `~/lifebook-agent`, deploy `~/.local/bin/lifebook-agent`, run `lifebook-agent.service`
+
+That means live ZeroClaw changes are only real after rebuilding from `~/zeroclaw`, copying the binary to `~/.local/bin/zeroclaw`, and restarting `zara-agent.service`.
+
 ### Homebrew (macOS/Linuxbrew)
 
 ```bash
@@ -626,7 +637,7 @@ format = "openclaw"            # "openclaw" (default, markdown files) or "aieos"
 
 ZeroClaw uses one provider key (`ollama`) for both local and remote Ollama deployments:
 
-- Local Ollama: keep `api_url` unset, run `ollama serve`, and use models like `llama3.2`.
+- Local Ollama: keep `api_url` unset, run `ollama serve`, and use models like `qwen3.5:9b`.
 - Remote Ollama endpoint (including Ollama Cloud): set `api_url` to the remote endpoint and set `api_key` (or `OLLAMA_API_KEY`) when required.
 - Optional `:cloud` suffix: model IDs like `qwen3:cloud` are normalized to `qwen3` before the request.
 

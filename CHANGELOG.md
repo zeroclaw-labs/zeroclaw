@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Telegram feedback ingestion now supports native `message_reaction` updates for thumbs up/down.
+- Reply-based Telegram feedback is now intercepted before the LLM loop and converted into direct learning signals.
+- Direct Telegram feedback stores an audit memory entry alongside the SONA quality signal.
+- `feedback_audit_report` tool now exposes recent Telegram feedback audit entries to the agent/tool layer.
+
+### Changed
+- Telegram polling now requests both `message` and `message_reaction` updates.
+- Channel feedback handling distinguishes reply feedback from silent reaction feedback.
+- Zara observability now includes lifebook metrics alongside ZeroClaw runtime metrics in Prometheus/Grafana.
+
+### Fixed
+- Channel feedback tests and runtime docs now align with the control-message format used by Telegram feedback handling.
+
 ### Security
 - **Legacy XOR cipher migration**: The `enc:` prefix (XOR cipher) is now deprecated. 
   Secrets using this format will be automatically migrated to `enc2:` (ChaCha20-Poly1305 AEAD)
