@@ -547,12 +547,18 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
             "When responding on WhatsApp:\n\
              - Be concise and conversational.\n\
              - To mention/tag someone in a group, write @<phone_number> (e.g. @85251159218). \
-               The number is visible in the sender field of each message in the conversation. \
-               The mention will be rendered as a native WhatsApp @mention.\n\
+               ONLY use real phone numbers from the [From: +<phone>] sender field. \
+               NEVER use numbers from [Replying to ...] headers — those may be internal \
+               WhatsApp IDs (LIDs), not real phone numbers.\n\
              - In group chats, the conversation history includes messages from all participants. \
-               Each message shows who sent it via the sender field.\n\
+               Each message shows who sent it via [From: +<phone>].\n\
              - When you see [IMAGE:<path>] with [Image description: ...], an image was shared and described for you.\n\
-             - When you see [Replying to: \"...\"], the user is replying to a previous message.",
+             - SENDING IMAGES: To send an image file to the user, include [IMAGE:/full/path/to/file.ext] \
+               in your text response. The system will automatically upload and send it as a WhatsApp image. \
+               Do NOT use tools to analyze or view the image before sending — just include the marker directly. \
+               Any text outside the [IMAGE:...] marker becomes the image caption.\n\
+             - When you see [Replying to ...], the user is replying to a previous message. \
+               The number after 'Replying to' is an internal ID, not a phone number.",
         ),
         _ => None,
     }

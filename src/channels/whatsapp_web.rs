@@ -861,6 +861,98 @@ impl Channel for WhatsAppWebChannel {
             // Fall through to send text normally (voice chat gets BOTH)
         }
 
+        // Check for outbound [IMAGE:path] markers — send as WhatsApp media.
+        let image_marker_re = regex::Regex::new(r"\[IMAGE:([^\]]+)\]").unwrap();
+        if let Some(caps) = image_marker_re.captures(&message.content) {
+            let image_path_str = caps[1].trim();
+            let image_path = std::path::Path::new(image_path_str);
+
+            if image_path.exists() {
+                // Read image bytes from disk.
+                let image_bytes = tokio::fs::read(image_path).await.map_err(|e| {
+                    anyhow!("Failed to read image file {}: {e}", image_path.display())
+                })?;
+
+                if image_bytes.is_empty() {
+                    tracing::warn!(
+                        "WhatsApp Web: image file is empty: {}",
+                        image_path.display()
+                    );
+                } else {
+                    // Detect MIME type from extension.
+                    let mimetype = match image_path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_lowercase())
+                        .as_deref()
+                    {
+                        Some("png") => "image/png",
+                        Some("gif") => "image/gif",
+                        Some("webp") => "image/webp",
+                        _ => "image/jpeg",
+                    };
+
+                    // Upload to WhatsApp servers.
+                    use wa_rs_core::download::MediaType;
+                    let upload = client
+                        .upload(image_bytes, MediaType::Image)
+                        .await
+                        .map_err(|e| anyhow!("Failed to upload image: {e}"))?;
+
+                    tracing::info!(
+                        "WhatsApp Web: uploaded image (url_len={}, file_length={})",
+                        upload.url.len(),
+                        upload.file_length
+                    );
+
+                    // Extract caption: everything outside the [IMAGE:...] marker.
+                    let caption = image_marker_re
+                        .replace(&message.content, "")
+                        .trim()
+                        .to_string();
+                    let caption = if caption.is_empty() {
+                        None
+                    } else {
+                        Some(caption)
+                    };
+
+                    let image_msg = wa_rs_proto::whatsapp::Message {
+                        image_message: Some(Box::new(
+                            wa_rs_proto::whatsapp::message::ImageMessage {
+                                url: Some(upload.url),
+                                direct_path: Some(upload.direct_path),
+                                media_key: Some(upload.media_key),
+                                file_enc_sha256: Some(upload.file_enc_sha256),
+                                file_sha256: Some(upload.file_sha256),
+                                file_length: Some(upload.file_length),
+                                mimetype: Some(mimetype.to_string()),
+                                caption,
+                                ..Default::default()
+                            },
+                        )),
+                        ..Default::default()
+                    };
+
+                    Box::pin(client.send_message(to, image_msg))
+                        .await
+                        .map_err(|e| anyhow!("Failed to send image: {e}"))?;
+
+                    tracing::info!(
+                        "WhatsApp Web: sent image {} to {}",
+                        image_path.display(),
+                        message.recipient
+                    );
+                    return Ok(());
+                }
+            } else {
+                tracing::warn!(
+                    "WhatsApp Web: image file not found for outbound: {}",
+                    image_path.display()
+                );
+            }
+            // Fall through to send as text if image processing failed.
+        }
+
         // Extract @phone mentions from the message content.
         let mention_re = regex::Regex::new(r"@(\d{8,15})").unwrap();
         let mentioned_jids: Vec<String> = mention_re
