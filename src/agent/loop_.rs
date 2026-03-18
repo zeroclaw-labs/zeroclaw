@@ -2489,7 +2489,7 @@ pub(crate) async fn run_tool_call_loop(
                                     let desc = result.output.trim();
                                     let desc = truncate_with_ellipsis(desc, 800);
                                     descriptions.push(format!(
-                                        "[IMAGE:{image_ref}]\n[Image description: {desc}]",
+                                        "[Image file: {image_ref}]\n[Image description: {desc}]",
                                     ));
                                 }
                                 Ok(result) => {
@@ -2499,7 +2499,7 @@ pub(crate) async fn run_tool_call_loop(
                                         "MCP vision fallback returned failure for image"
                                     );
                                     descriptions.push(format!(
-                                        "[IMAGE:{image_ref}]\n[Image: could not describe]",
+                                        "[Image file: {image_ref}]\n[Image: could not describe]",
                                     ));
                                 }
                                 Err(e) => {
@@ -2509,7 +2509,7 @@ pub(crate) async fn run_tool_call_loop(
                                         "MCP vision fallback failed for image"
                                     );
                                     descriptions.push(format!(
-                                        "[IMAGE:{image_ref}]\n[Image: could not describe]",
+                                        "[Image file: {image_ref}]\n[Image: could not describe]",
                                     ));
                                 }
                             }
