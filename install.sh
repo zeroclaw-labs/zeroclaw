@@ -683,6 +683,14 @@ run_docker_bootstrap() {
 
   mkdir -p "$docker_data_dir/.zeroclaw" "$docker_data_dir/workspace"
 
+  # Create config.toml from template if it doesn't exist
+  if [[ ! -f "$docker_data_dir/.zeroclaw/config.toml" ]]; then
+    if [[ -f "$WORK_DIR/dev/config.template.toml" ]]; then
+      cp "$WORK_DIR/dev/config.template.toml" "$docker_data_dir/.zeroclaw/config.toml"
+      info "Created config.toml from template at $docker_data_dir/.zeroclaw/config.toml"
+    fi
+  fi
+
   if [[ "$SKIP_INSTALL" == true ]]; then
     warn "--skip-install has no effect with --docker."
   fi
@@ -1083,6 +1091,16 @@ MSG
       ONBOARD_CMD+=(--model "$MODEL")
     fi
     "${ONBOARD_CMD[@]}"
+  fi
+fi
+
+# Create config.toml from template if it doesn't exist (non-Docker mode)
+ZEROCLAW_CONFIG_DIR="$HOME/.zeroclaw"
+if [[ "$DOCKER_MODE" == false && ! -f "$ZEROCLAW_CONFIG_DIR/config.toml" ]]; then
+  mkdir -p "$ZEROCLAW_CONFIG_DIR"
+  if [[ -f "$WORK_DIR/dev/config.template.toml" ]]; then
+    cp "$WORK_DIR/dev/config.template.toml" "$ZEROCLAW_CONFIG_DIR/config.toml"
+    echo "✅ Created config.toml from template at $ZEROCLAW_CONFIG_DIR/config.toml"
   fi
 fi
 
