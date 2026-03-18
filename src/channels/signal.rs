@@ -273,14 +273,36 @@ impl SignalChannel {
             return None;
         }
 
-        if self.mention_only
-            && Self::is_group_message(data_msg)
-            && !self.is_account_mentioned(data_msg)
-        {
-            return None;
-        }
+        let is_group = Self::is_group_message(data_msg);
+        let is_mentioned = self.is_account_mentioned(data_msg);
 
         let target = self.reply_target(data_msg, &sender);
+
+        if self.mention_only && is_group && !is_mentioned {
+            let timestamp = data_msg
+                .timestamp
+                .or(envelope.timestamp)
+                .unwrap_or_else(|| {
+                    u64::try_from(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis(),
+                    )
+                    .unwrap_or(u64::MAX)
+                });
+
+            return Some(ChannelMessage {
+                id: format!("sig_{timestamp}"),
+                sender: sender.clone(),
+                reply_target: target,
+                content: text.to_string(),
+                channel: "signal".to_string(),
+                timestamp: timestamp / 1000,
+                thread_ts: None,
+                observe_group: true,
+            });
+        }
 
         let timestamp = data_msg
             .timestamp
@@ -913,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn mention_only_group_without_mention_is_rejected() {
+    fn mention_only_group_without_mention_is_observed_only() {
         let ch = SignalChannel::new(
             "http://127.0.0.1:8686".to_string(),
             "+1234567890".to_string(),
@@ -938,7 +960,9 @@ mod tests {
             story_message: None,
             timestamp: Some(1_700_000_000_000),
         };
-        assert!(ch.process_envelope(&env).is_none());
+        let msg = ch.process_envelope(&env).expect("group msg should be observed");
+        assert_eq!(msg.reply_target, "group:group123");
+        assert!(msg.observe_group);
     }
 
     #[test]
@@ -970,7 +994,8 @@ mod tests {
             story_message: None,
             timestamp: Some(1_700_000_000_000),
         };
-        assert!(ch.process_envelope(&env).is_some());
+        let msg = ch.process_envelope(&env).expect("mentioned msg should pass");
+        assert!(!msg.observe_group);
     }
 
     #[test]
@@ -997,7 +1022,8 @@ mod tests {
             story_message: None,
             timestamp: Some(1_700_000_000_000),
         };
-        assert!(ch.process_envelope(&env).is_some());
+        let msg = ch.process_envelope(&env).expect("dm should pass");
+        assert!(!msg.observe_group);
     }
 
     #[test]
