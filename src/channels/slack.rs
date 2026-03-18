@@ -2220,6 +2220,7 @@ impl SlackChannel {
                     },
                     interruption_scope_id: Self::inbound_interruption_scope_id(event, ts),
                     attachments: vec![],
+                    observe_group: false,
                 };
 
                 // Track thread context so start_typing can set assistant status.
@@ -2912,6 +2913,7 @@ impl Channel for SlackChannel {
                             },
                             interruption_scope_id: Self::inbound_interruption_scope_id(msg, ts),
                             attachments: vec![],
+                            observe_group: false,
                         };
 
                         if tx.send(channel_msg).await.is_err() {
@@ -2998,6 +3000,7 @@ impl Channel for SlackChannel {
                         thread_ts: Some(thread_ts.clone()),
                         interruption_scope_id: Some(thread_ts.clone()),
                         attachments: vec![],
+                        observe_group: false,
                     };
 
                     if tx.send(channel_msg).await.is_err() {
