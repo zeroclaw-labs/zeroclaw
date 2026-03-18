@@ -298,6 +298,7 @@ impl Agent {
             &config.agents,
             config.api_key.as_deref(),
             config,
+            None,
         );
 
         // ── Provider access mode resolution ──────────────────────────

@@ -121,11 +121,25 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_onto_actions_status
             ON ontology_actions(status);
         -- Index on occurred_at for timeline queries (sort by real-world time).
+        -- This is the PRIMARY sort key — in MoA the subject (who) is almost
+        -- always the user, so time is the most effective categorization axis.
         CREATE INDEX IF NOT EXISTS idx_onto_actions_occurred
             ON ontology_actions(occurred_at);
         -- Index on location for location-based grouping queries.
+        -- Location-based grouping reveals implicit relationships (same place
+        -- at same time → likely related events/people).
         CREATE INDEX IF NOT EXISTS idx_onto_actions_location
             ON ontology_actions(location);
+        -- Composite index: (occurred_at, location) for combined time+place
+        -- queries. This is the key categorization axis for MoA — events are
+        -- primarily identified and disambiguated by WHEN and WHERE, not by WHO
+        -- (since the subject is almost always the user).
+        CREATE INDEX IF NOT EXISTS idx_onto_actions_when_where
+            ON ontology_actions(occurred_at, location);
+        -- Composite index: (location, occurred_at) for place-first queries
+        -- (e.g. all events at a specific court or golf course).
+        CREATE INDEX IF NOT EXISTS idx_onto_actions_where_when
+            ON ontology_actions(location, occurred_at);
 
         -- ================================================================
         -- 4. FTS5 indexes for ontology search

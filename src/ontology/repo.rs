@@ -12,10 +12,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Repository providing structured access to ontology tables.
+///
+/// Optionally holds a reference to a [`SyncEngine`] so that every
+/// create/update/delete operation automatically records a sync delta.
+/// When `sync` is `None`, the repo operates in local-only mode.
 pub struct OntologyRepo {
     conn: Arc<Mutex<Connection>>,
     #[allow(dead_code)]
     db_path: PathBuf,
+    /// Optional sync engine for cross-device replication.
+    sync: Option<Arc<parking_lot::Mutex<crate::memory::sync::SyncEngine>>>,
 }
 
 impl OntologyRepo {
@@ -45,6 +51,7 @@ impl OntologyRepo {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             db_path,
+            sync: None,
         })
     }
 
@@ -58,7 +65,92 @@ impl OntologyRepo {
         Ok(Self {
             conn,
             db_path: PathBuf::new(),
+            sync: None,
         })
+    }
+
+    /// Attach a sync engine for cross-device replication.
+    ///
+    /// After this call, every CUD operation (create/update object, create
+    /// link, insert action) will automatically record a delta in the sync
+    /// journal keyed by `occurred_at` (real-world time).
+    pub fn set_sync(
+        &mut self,
+        sync: Arc<parking_lot::Mutex<crate::memory::sync::SyncEngine>>,
+    ) {
+        self.sync = Some(sync);
+    }
+
+    /// Record an object upsert delta in the sync engine (best-effort).
+    fn sync_object(
+        &self,
+        object_id: i64,
+        type_name: &str,
+        title: Option<&str>,
+        properties: &serde_json::Value,
+        owner_user_id: &str,
+    ) {
+        if let Some(ref sync) = self.sync {
+            let props_json = serde_json::to_string(properties).unwrap_or_default();
+            sync.lock().record_ontology_object(
+                object_id,
+                type_name,
+                title,
+                &props_json,
+                owner_user_id,
+            );
+        }
+    }
+
+    /// Record a link creation delta in the sync engine (best-effort).
+    fn sync_link(
+        &self,
+        link_type_name: &str,
+        from_object_id: i64,
+        to_object_id: i64,
+        properties: Option<&serde_json::Value>,
+    ) {
+        if let Some(ref sync) = self.sync {
+            let props_json = properties.map(|p| serde_json::to_string(p).unwrap_or_default());
+            sync.lock().record_ontology_link(
+                link_type_name,
+                from_object_id,
+                to_object_id,
+                props_json.as_deref(),
+            );
+        }
+    }
+
+    /// Record an action log delta in the sync engine (best-effort).
+    ///
+    /// Uses `occurred_at` as the primary temporal anchor — this is the
+    /// real-world time that matters for cross-device timeline ordering,
+    /// not the DB insertion time.
+    fn sync_action(
+        &self,
+        action_type_name: &str,
+        actor_user_id: &str,
+        params: &serde_json::Value,
+        result: Option<&serde_json::Value>,
+        channel: Option<&str>,
+        occurred_at: Option<&str>,
+        location: Option<&str>,
+        status: &str,
+    ) {
+        if let Some(ref sync) = self.sync {
+            let params_json = serde_json::to_string(params).unwrap_or_default();
+            let result_json = result.map(|r| serde_json::to_string(r).unwrap_or_default());
+            sync.lock().record_ontology_action(
+                action_type_name,
+                actor_user_id,
+                &params_json,
+                result_json.as_deref(),
+                channel,
+                occurred_at,
+                location,
+                status,
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -72,6 +164,15 @@ impl OntologyRepo {
         let id = stmt.query_row(params![name], |r| r.get(0))
             .map_err(|e| anyhow::anyhow!("unknown object type '{}': {}", name, e))?;
         Ok(id)
+    }
+
+    /// Resolve an object type ID to its name.
+    pub fn object_type_name(&self, id: i64) -> anyhow::Result<String> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached("SELECT name FROM ontology_object_types WHERE id = ?1")?;
+        let name = stmt.query_row(params![id], |r| r.get(0))
+            .map_err(|e| anyhow::anyhow!("unknown object type id {}: {}", id, e))?;
+        Ok(name)
     }
 
     /// Resolve a link type name to its ID.
@@ -106,6 +207,8 @@ impl OntologyRepo {
     // -----------------------------------------------------------------------
 
     /// Create a new object and return its ID.
+    ///
+    /// Automatically records a sync delta if a SyncEngine is attached.
     pub fn create_object(
         &self,
         type_name: &str,
@@ -122,7 +225,10 @@ impl OntologyRepo {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![type_id, title, props_str, owner_user_id, now, now],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = conn.last_insert_rowid();
+        drop(conn); // Release DB lock before sync
+        self.sync_object(id, type_name, title, properties, owner_user_id);
+        Ok(id)
     }
 
     /// Get an object by ID (internal use only — no owner filter).
@@ -242,6 +348,24 @@ impl OntologyRepo {
                 id,
                 owner_user_id,
             );
+        }
+        // Sync the updated state. We need to read back the object to get
+        // the full state including type_name. Best-effort — if read fails
+        // we skip sync rather than fail the update.
+        if self.sync.is_some() {
+            if let Ok(Some(obj)) = self.get_object_for_owner(id, owner_user_id) {
+                // Resolve type name for the sync delta.
+                let type_name = self
+                    .object_type_name(obj.type_id)
+                    .unwrap_or_else(|_| format!("type_{}", obj.type_id));
+                self.sync_object(
+                    id,
+                    &type_name,
+                    obj.title.as_deref(),
+                    &obj.properties,
+                    owner_user_id,
+                );
+            }
         }
         Ok(())
     }
@@ -391,18 +515,22 @@ impl OntologyRepo {
             params![link_type_id, from_object_id, to_object_id, props_str, now],
         )?;
 
-        if affected > 0 {
-            // Row was inserted — last_insert_rowid is valid.
-            Ok(conn.last_insert_rowid())
+        let id = if affected > 0 {
+            conn.last_insert_rowid()
         } else {
-            // Duplicate was ignored — look up the existing link.
             conn.query_row(
                 "SELECT id FROM ontology_links WHERE link_type_id = ?1 AND from_object_id = ?2 AND to_object_id = ?3",
                 params![link_type_id, from_object_id, to_object_id],
                 |r| r.get(0),
-            )
-            .map_err(Into::into)
+            )?
+        };
+        drop(conn);
+
+        // Only sync newly created links (not duplicates).
+        if affected > 0 {
+            self.sync_link(link_type_name, from_object_id, to_object_id, properties);
         }
+        Ok(id)
     }
 
     /// Get all links originating from an object, scoped to the object's owner.
@@ -520,10 +648,28 @@ impl OntologyRepo {
                 now,
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = conn.last_insert_rowid();
+        drop(conn);
+
+        // Record pending action in sync journal — occurred_at is the
+        // primary temporal anchor for cross-device timeline ordering.
+        self.sync_action(
+            action_type_name,
+            actor_user_id,
+            params,
+            None,
+            channel,
+            effective_occurred_at.as_deref(),
+            location,
+            "pending",
+        );
+        Ok(id)
     }
 
     /// Mark an action as succeeded with a result payload.
+    ///
+    /// Also records a sync delta with the final result so remote devices
+    /// see the completed action with its outcome.
     pub fn complete_action(
         &self,
         action_id: i64,
@@ -536,6 +682,41 @@ impl OntologyRepo {
             "UPDATE ontology_actions SET result = ?2, status = 'success', updated_at = ?3 WHERE id = ?1",
             params![action_id, result_str, now],
         )?;
+
+        // Re-read the action to get full context for sync delta.
+        if self.sync.is_some() {
+            let action_opt = conn.query_row(
+                "SELECT at.name, a.actor_user_id, a.params, a.channel, a.occurred_at, a.location
+                 FROM ontology_actions a
+                 JOIN ontology_action_types at ON at.id = a.action_type_id
+                 WHERE a.id = ?1",
+                params![action_id],
+                |r| Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                )),
+            ).ok();
+            drop(conn);
+
+            if let Some((type_name, actor, params_json, channel, occurred_at, location)) = action_opt {
+                let params_val: serde_json::Value =
+                    serde_json::from_str(&params_json).unwrap_or_default();
+                self.sync_action(
+                    &type_name,
+                    &actor,
+                    &params_val,
+                    Some(result),
+                    channel.as_deref(),
+                    occurred_at.as_deref(),
+                    location.as_deref(),
+                    "success",
+                );
+            }
+        }
         Ok(())
     }
 

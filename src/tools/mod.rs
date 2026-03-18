@@ -302,6 +302,7 @@ pub fn all_tools(
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
+    sync_engine: Option<Arc<parking_lot::Mutex<crate::memory::sync::SyncEngine>>>,
 ) -> Vec<Box<dyn Tool>> {
     all_tools_with_runtime(
         config,
@@ -317,6 +318,7 @@ pub fn all_tools(
         agents,
         fallback_api_key,
         root_config,
+        sync_engine,
     )
 }
 
@@ -336,6 +338,7 @@ pub fn all_tools_with_runtime(
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
+    sync_engine: Option<Arc<parking_lot::Mutex<crate::memory::sync::SyncEngine>>>,
 ) -> Vec<Box<dyn Tool>> {
     let has_shell_access = runtime.has_shell_access();
     let has_filesystem_access = runtime.has_filesystem_access();
@@ -712,7 +715,13 @@ pub fn all_tools_with_runtime(
             })
             .unwrap_or_else(|| "default_user".to_string());
 
-        if let Ok(onto_repo) = OntologyRepo::open(&workspace_dir) {
+        if let Ok(mut onto_repo) = OntologyRepo::open(&workspace_dir) {
+            // Wire sync engine into OntologyRepo so every CUD operation
+            // automatically records a delta for cross-device replication.
+            // occurred_at is the primary temporal anchor for sync ordering.
+            if let Some(ref se) = sync_engine {
+                onto_repo.set_sync(Arc::clone(se));
+            }
             let onto_repo = Arc::new(onto_repo);
             let rule_engine = Arc::new(RuleEngine::new(Arc::clone(&onto_repo)));
             let ctx_builder = Arc::new(ContextBuilder::new(Arc::clone(&onto_repo)));
@@ -831,6 +840,7 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
@@ -876,6 +886,7 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
@@ -919,6 +930,7 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"docx_read"));
@@ -956,6 +968,7 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"wasm_module"));
@@ -997,6 +1010,7 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None,
         );
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -1145,6 +1159,7 @@ mod tests {
             &agents,
             Some("delegate-test-credential"),
             &cfg,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
@@ -1179,6 +1194,7 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
@@ -1230,6 +1246,7 @@ mod tests {
             &agents,
             Some("delegate-test-credential"),
             &cfg,
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));

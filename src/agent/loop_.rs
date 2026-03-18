@@ -2461,6 +2461,7 @@ pub async fn run(
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        None,
     );
 
     let peripheral_tools: Vec<Box<dyn Tool>> =
@@ -3144,6 +3145,7 @@ pub async fn process_message_with_session(
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        None,
     );
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;

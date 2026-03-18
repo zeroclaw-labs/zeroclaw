@@ -16,6 +16,7 @@ pub mod pair;
 pub mod remote;
 pub mod sse;
 pub mod static_files;
+pub mod timesync;
 pub mod ws;
 
 use crate::billing::PaymentManager;
@@ -480,8 +481,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
     let temperature = config.default_temperature;
     // Create memory backend, optionally with cross-device sync support.
-    let (mem, sync_coordinator): (Arc<dyn Memory>, Option<Arc<crate::sync::SyncCoordinator>>) =
-        if config.sync.enabled {
+    // `sync_engine_for_ontology` is kept alive so the OntologyRepo can
+    // record deltas for cross-device replication of the knowledge graph.
+    let (mem, sync_coordinator, sync_engine_for_ontology): (
+        Arc<dyn Memory>,
+        Option<Arc<crate::sync::SyncCoordinator>>,
+        Option<Arc<parking_lot::Mutex<crate::memory::sync::SyncEngine>>>,
+    ) = if config.sync.enabled {
             // Build base memory, then wrap with SyncedMemory for the coordinator
             let base = memory::create_memory_with_storage(
                 &config.memory,
@@ -491,6 +497,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             )?;
             let engine = crate::memory::sync::SyncEngine::new(&config.workspace_dir, true)?;
             let engine = Arc::new(parking_lot::Mutex::new(engine));
+            let engine_for_ontology = Arc::clone(&engine);
             let synced = Arc::new(crate::memory::synced::SyncedMemory::new(
                 Arc::from(base),
                 engine,
@@ -551,7 +558,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                     "Gateway memory initialized with sync enabled (no relay)"
                 );
             }
-            (synced as Arc<dyn Memory>, Some(coordinator))
+            (synced as Arc<dyn Memory>, Some(coordinator), Some(engine_for_ontology))
         } else {
             let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
                 &config.memory,
@@ -559,8 +566,18 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 &config.workspace_dir,
                 config.api_key.as_deref(),
             )?);
-            (mem, None)
+            (mem, None, None)
         };
+
+    // ── Clock drift check ─────────────────────────────────────────────
+    // MoA uses occurred_at (real-world time) as the primary sort key for
+    // ontology actions. Clock drift between devices breaks timeline
+    // consistency, so we check on startup and periodically thereafter.
+    if config.sync.enabled {
+        timesync::check_and_log().await;
+        timesync::spawn_periodic_check(None);
+    }
+
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -591,6 +608,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        sync_engine_for_ontology,
     ));
     let tools_registry: Arc<Vec<ToolSpec>> =
         Arc::new(tools_registry_exec.iter().map(|t| t.spec()).collect());
