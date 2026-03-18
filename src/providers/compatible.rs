@@ -1720,10 +1720,11 @@ impl OpenAiCompatibleProvider {
 
                     native_messages.push(NativeMessage {
                         role: "user".to_string(),
-                        content: Some(MessageContent::Text(format!(
-                            "[Tool result]\n{}",
-                            content_text
-                        ))),
+                        content: Some(Self::to_message_content(
+                            "user",
+                            &format!("[Tool result]\n{}", content_text),
+                            allow_user_image_parts,
+                        )),
                         tool_call_id: None,
                         tool_calls: None,
                         reasoning_content: None,
@@ -4720,6 +4721,68 @@ mod tests {
             "reasoning_content should be present when Some"
         );
         assert!(json.contains("thinking..."));
+    }
+
+    #[test]
+    fn tool_message_with_image_marker_in_fallback_path_extracts_image() {
+        use crate::providers::ChatMessage;
+
+        // Tool result with [IMAGE:] marker falls through to generic handler
+        // because tool_call_id doesn't match any assistant tool_call
+        let tool_content = serde_json::json!({
+            "tool_call_id": "orphan_call_id",
+            "content": "Screenshot captured\n[IMAGE:data:image/jpeg;base64,/9j/4AAQ]"
+        });
+
+        let messages = vec![
+            ChatMessage::user("take a screenshot".to_string()),
+            ChatMessage::tool(tool_content.to_string()),
+        ];
+
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+
+        let has_raw_marker = native.iter().any(|msg| match &msg.content {
+            Some(MessageContent::Text(t)) => t.contains("[IMAGE:"),
+            Some(MessageContent::Parts(parts)) => parts.iter().any(|p| {
+                if let MessagePart::Text { text } = p {
+                    text.contains("[IMAGE:")
+                } else {
+                    false
+                }
+            }),
+            None => false,
+        });
+
+        assert!(
+            !has_raw_marker,
+            "image should be extracted as image_url part, not left as raw [IMAGE:] text"
+        );
+    }
+
+    #[test]
+    fn tool_message_with_unparseable_json_extracts_image() {
+        use crate::providers::ChatMessage;
+
+        let raw_content = "Screenshot result\n[IMAGE:data:image/jpeg;base64,/9j/4AAQ]";
+        let messages = vec![
+            ChatMessage::user("test".to_string()),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: raw_content.to_string(),
+            },
+        ];
+
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+
+        let has_raw_marker = native.iter().any(|msg| match &msg.content {
+            Some(MessageContent::Text(t)) => t.contains("[IMAGE:"),
+            _ => false,
+        });
+
+        assert!(
+            !has_raw_marker,
+            "image should be extracted even when tool content is not valid JSON"
+        );
     }
 
     #[test]
