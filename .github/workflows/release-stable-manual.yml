@@ -262,6 +262,31 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+
+      - name: Create Homebrew source archive
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          version="${TAG#v}"
+          workdir="$(mktemp -d)"
+          pkgdir="${workdir}/zeroclaw-${version}"
+          archive_name="zeroclaw-source-${version}.tar.gz"
+
+          mkdir -p "$pkgdir"
+          git archive --format=tar HEAD | tar -xf - -C "$pkgdir"
+          mkdir -p "$pkgdir/web/dist"
+          cp -R web/dist/. "$pkgdir/web/dist/"
+
+          mkdir -p artifacts/zeroclaw-source
+          tar -C "$workdir" -czf "artifacts/zeroclaw-source/${archive_name}" "zeroclaw-${version}"
+          ls -lh "artifacts/zeroclaw-source/${archive_name}"
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: zeroclaw-*
