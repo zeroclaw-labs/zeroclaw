@@ -370,6 +370,10 @@ zeroclaw pairing rotate      # Roteert het bestaande pairing geheim
 zeroclaw tunnel start        # Start een tunnel naar de lokale daemon
 zeroclaw tunnel stop         # Stopt de actieve tunnel
 
+# Migrate from OpenClaw
+zeroclaw migrate openclaw --dry-run
+zeroclaw migrate openclaw
+
 # Diagnostiek
 zeroclaw doctor              # Voert systeem gezondheidscontroles uit
 zeroclaw version             # Toont versie en build informatie

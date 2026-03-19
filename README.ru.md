@@ -185,6 +185,10 @@ zeroclaw agent -m "Hello, ZeroClaw!"
 zeroclaw gateway
 
 zeroclaw daemon
+
+# Migrate from OpenClaw
+zeroclaw migrate openclaw --dry-run
+zeroclaw migrate openclaw
 ```
 
 ## Subscription Auth (OpenAI Codex / Claude Code)

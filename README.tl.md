@@ -370,6 +370,10 @@ zeroclaw pairing rotate      # Nag-rotate ng existing pairing secret
 zeroclaw tunnel start        # Nagse-start ng tunnel sa local daemon
 zeroclaw tunnel stop         # Naghihinto sa active tunnel
 
+# Migrate from OpenClaw
+zeroclaw migrate openclaw --dry-run
+zeroclaw migrate openclaw
+
 # Diagnostics
 zeroclaw doctor              # Nagpapatakbo ng system health checks
 zeroclaw version             # Nagpapakita ng version at build info
