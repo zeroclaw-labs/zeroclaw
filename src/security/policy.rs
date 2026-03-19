@@ -234,6 +234,26 @@ fn expand_user_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn rootless_path(path: &Path) -> Option<PathBuf> {
+    let mut relative = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => return None,
+            std::path::Component::Normal(part) => relative.push(part),
+        }
+    }
+
+    if relative.as_os_str().is_empty() {
+        None
+    } else {
+        Some(relative)
+    }
+}
+
 // ── Shell Command Parsing Utilities ───────────────────────────────────────
 // These helpers implement a minimal quote-aware shell lexer. They exist
 // because security validation must reason about the *structure* of a
@@ -1173,6 +1193,44 @@ impl SecurityPolicy {
         false
     }
 
+    fn runtime_config_dir(&self) -> Option<PathBuf> {
+        let parent = self.workspace_dir.parent()?;
+        Some(
+            parent
+                .canonicalize()
+                .unwrap_or_else(|_| parent.to_path_buf()),
+        )
+    }
+
+    pub fn is_runtime_config_path(&self, resolved: &Path) -> bool {
+        let Some(config_dir) = self.runtime_config_dir() else {
+            return false;
+        };
+        if !resolved.starts_with(&config_dir) {
+            return false;
+        }
+        if resolved.parent() != Some(config_dir.as_path()) {
+            return false;
+        }
+
+        let Some(file_name) = resolved.file_name().and_then(|value| value.to_str()) else {
+            return false;
+        };
+
+        file_name == "config.toml"
+            || file_name == "config.toml.bak"
+            || file_name == "active_workspace.toml"
+            || file_name.starts_with(".config.toml.tmp-")
+            || file_name.starts_with(".active_workspace.toml.tmp-")
+    }
+
+    pub fn runtime_config_violation_message(&self, resolved: &Path) -> String {
+        format!(
+            "Refusing to modify ZeroClaw runtime config/state file: {}. Use dedicated config tools or edit it manually outside the agent loop.",
+            resolved.display()
+        )
+    }
+
     pub fn resolved_path_violation_message(&self, resolved: &Path) -> String {
         let guidance = if self.allowed_roots.is_empty() {
             "Add the directory to [autonomy].allowed_roots (for example: allowed_roots = [\"/absolute/path\"]), or move the file into the workspace."
@@ -1245,6 +1303,16 @@ impl SecurityPolicy {
         let expanded = expand_user_path(path);
         if expanded.is_absolute() {
             expanded
+        } else if let Some(workspace_hint) = rootless_path(&self.workspace_dir) {
+            if let Ok(stripped) = expanded.strip_prefix(&workspace_hint) {
+                if stripped.as_os_str().is_empty() {
+                    self.workspace_dir.clone()
+                } else {
+                    self.workspace_dir.join(stripped)
+                }
+            } else {
+                self.workspace_dir.join(expanded)
+            }
         } else {
             self.workspace_dir.join(expanded)
         }
@@ -2721,6 +2789,19 @@ mod tests {
     }
 
     #[test]
+    fn resolve_tool_path_normalizes_workspace_prefixed_relative_paths() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/zeroclaw-data/workspace"),
+            ..SecurityPolicy::default()
+        };
+        let resolved = p.resolve_tool_path("zeroclaw-data/workspace/scripts/daily.py");
+        assert_eq!(
+            resolved,
+            PathBuf::from("/zeroclaw-data/workspace/scripts/daily.py")
+        );
+    }
+
+    #[test]
     fn is_under_allowed_root_matches_allowed_roots() {
         let p = SecurityPolicy {
             workspace_dir: PathBuf::from("/workspace"),
@@ -2743,5 +2824,34 @@ mod tests {
             ..SecurityPolicy::default()
         };
         assert!(!p.is_under_allowed_root("/any/path"));
+    }
+
+    #[test]
+    fn runtime_config_paths_are_protected() {
+        let workspace = PathBuf::from("/tmp/zeroclaw-profile/workspace");
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        let config_dir = workspace.parent().unwrap();
+
+        assert!(policy.is_runtime_config_path(&config_dir.join("config.toml")));
+        assert!(policy.is_runtime_config_path(&config_dir.join("config.toml.bak")));
+        assert!(policy.is_runtime_config_path(&config_dir.join(".config.toml.tmp-1234")));
+        assert!(policy.is_runtime_config_path(&config_dir.join("active_workspace.toml")));
+        assert!(policy.is_runtime_config_path(&config_dir.join(".active_workspace.toml.tmp-1234")));
+    }
+
+    #[test]
+    fn workspace_files_are_not_runtime_config_paths() {
+        let workspace = PathBuf::from("/tmp/zeroclaw-profile/workspace");
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        let nested_dir = workspace.join("notes");
+
+        assert!(!policy.is_runtime_config_path(&workspace.join("notes.txt")));
+        assert!(!policy.is_runtime_config_path(&nested_dir.join("config.toml")));
     }
 }

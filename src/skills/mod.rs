@@ -97,6 +97,15 @@ pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Con
     )
 }
 
+/// Load skills using explicit open-skills settings.
+pub fn load_skills_with_open_skills_settings(
+    workspace_dir: &Path,
+    open_skills_enabled: bool,
+    open_skills_dir: Option<&str>,
+) -> Vec<Skill> {
+    load_skills_with_open_skills_config(workspace_dir, Some(open_skills_enabled), open_skills_dir)
+}
+
 fn load_skills_with_open_skills_config(
     workspace_dir: &Path,
     config_open_skills_enabled: Option<bool>,
@@ -674,7 +683,8 @@ pub fn skills_to_prompt_with_mode(
         crate::config::SkillsPromptInjectionMode::Compact => String::from(
             "## Available Skills\n\n\
              Skill summaries are preloaded below to keep context compact.\n\
-             Skill instructions are loaded on demand: read the skill file in `location` only when needed.\n\n\
+             Skill instructions are loaded on demand: call `read_skill(name)` with the skill's `<name>` when you need the full skill file.\n\
+             The `location` field is included for reference.\n\n\
              <available_skills>\n",
         ),
     };
@@ -1267,6 +1277,7 @@ command = "echo hello"
         assert!(prompt.contains("<name>test</name>"));
         assert!(prompt.contains("<location>skills/test/SKILL.md</location>"));
         assert!(prompt.contains("loaded on demand"));
+        assert!(prompt.contains("read_skill(name)"));
         assert!(!prompt.contains("<instructions>"));
         assert!(!prompt.contains("<instruction>Do the thing.</instruction>"));
         assert!(!prompt.contains("<tools>"));
