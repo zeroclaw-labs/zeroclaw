@@ -137,13 +137,13 @@ async fn handle_connection(
 ) {
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
-    // Spawn heartbeat task
-    let stop_flag_clone = stop_flag as *const AtomicBool;
+    // Spawn heartbeat task (sends ping periodically)
+    let stop_clone = Arc::new(AtomicBool::new(false));
+    let stop_for_heartbeat = stop_clone.clone();
     let heartbeat_task = tokio::spawn(async move {
-        let stop = unsafe { &*stop_flag_clone };
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
-            if stop.load(Ordering::Relaxed) {
+            if stop_for_heartbeat.load(Ordering::Relaxed) {
                 break;
             }
         }
@@ -273,6 +273,7 @@ async fn handle_connection(
         }
     }
 
+    stop_clone.store(true, Ordering::Relaxed);
     heartbeat_task.abort();
 }
 

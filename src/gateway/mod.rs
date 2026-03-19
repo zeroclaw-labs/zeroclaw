@@ -1534,7 +1534,7 @@ fn try_consume_pairing_code(
     }
 
     // Check if the message looks like a pairing code.
-    // Accept: UUID tokens (36 chars) or short codes (4-8 alphanumeric).
+    // Accept: UUID tokens (36 chars) or short codes (4-64 alphanumeric + dash).
     let trimmed = content.trim();
     let looks_like_code = (trimmed.len() >= 4 && trimmed.len() <= 64)
         && trimmed
@@ -1776,8 +1776,8 @@ pub(super) async fn process_channel_message(
     session_id: Option<&str>,
 ) -> anyhow::Result<String> {
     // ── Step 0: Check for pairing code ──
-    // If the user sends a message that looks like a pairing code (6-char
-    // alphanumeric, or a UUID token), try to consume it and pair.
+    // If the user sends a message that looks like a pairing code (4-64 char
+    // alphanumeric/dash, including UUID tokens), try to consume it and pair.
     // This enables one-click channel pairing: user sends the code in the
     // channel chat, and we automatically link their channel identity to
     // their MoA account.
