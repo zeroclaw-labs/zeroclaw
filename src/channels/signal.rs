@@ -24,6 +24,7 @@ enum RecipientTarget {
 /// Listens via SSE at `/api/v1/events` and sends via JSON-RPC at
 /// `/api/v1/rpc`.
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SignalChannel {
     http_url: String,
     account: String,
@@ -135,6 +136,7 @@ impl ProcessedEnvelope {
 }
 
 impl SignalChannel {
+    #[allow(clippy::fn_params_excessive_bools)]
     pub fn new(
         http_url: String,
         account: String,
@@ -567,10 +569,8 @@ impl SignalChannel {
         let has_attachments = data_msg.attachments.as_ref().is_some_and(|a| !a.is_empty());
 
         // Skip attachment-only messages when configured
-        if self.ignore_attachments {
-            if has_attachments && data_msg.message.is_none() {
-                return None;
-            }
+        if self.ignore_attachments && has_attachments && data_msg.message.is_none() {
+            return None;
         }
 
         let text = data_msg.message.as_deref().filter(|t| !t.is_empty());
