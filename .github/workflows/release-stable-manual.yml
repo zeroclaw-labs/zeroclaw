@@ -389,8 +389,6 @@ jobs:
         with:
           context: docker-ctx
           push: true
-          build-args: |
-            ZEROCLAW_CARGO_FEATURES=channel-matrix,channel-lark,memory-postgres
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
