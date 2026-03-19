@@ -321,7 +321,7 @@ temperature = 0.2
 | `enabled` | `false` | 启用 `google_workspace` 工具 |
 | `credentials_path` | 未设置 | Google 服务账号或 OAuth 凭据 JSON 的路径 |
 | `default_account` | 未设置 | 传递给 `gws` 的 `--account` 默认 Google 账号 |
-| `allowed_services` | （内置列表） | 代理可访问的服务：`drive`、`gmail`、`calendar`、`sheets`、`docs`、`slides`、`tasks`、`people`、`chat`、`forms`、`keep`、`meet` |
+| `allowed_services` | （内置列表） | 代理可访问的服务：`drive`、`gmail`、`calendar`、`sheets`、`docs`、`slides`、`tasks`、`people`、`chat`、`classroom`、`forms`、`keep`、`meet`、`events` |
 | `rate_limit_per_minute` | `60` | 每分钟最大 `gws` 调用次数 |
 | `timeout_secs` | `30` | 每次调用超时时间（秒） |
 | `audit_log` | `false` | 为每次 `gws` 调用记录 `INFO` 日志 |

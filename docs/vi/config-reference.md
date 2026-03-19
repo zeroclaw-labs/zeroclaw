@@ -259,7 +259,7 @@ Lưu ý:
 | `enabled` | `false` | Enable the `google_workspace` tool |
 | `credentials_path` | unset | Path to Google service account or OAuth credentials JSON |
 | `default_account` | unset | Default Google account passed as `--account` to `gws` |
-| `allowed_services` | (built-in list) | Services the agent may access: `drive`, `gmail`, `calendar`, `sheets`, `docs`, `slides`, `tasks`, `people`, `chat`, `forms`, `keep`, `meet` |
+| `allowed_services` | (built-in list) | Services the agent may access: `drive`, `gmail`, `calendar`, `sheets`, `docs`, `slides`, `tasks`, `people`, `chat`, `classroom`, `forms`, `keep`, `meet`, `events` |
 | `rate_limit_per_minute` | `60` | Maximum `gws` calls per minute |
 | `timeout_secs` | `30` | Per-call execution timeout before kill |
 | `audit_log` | `false` | Emit an `INFO` log line for every `gws` call |
