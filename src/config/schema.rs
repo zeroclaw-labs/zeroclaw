@@ -10878,6 +10878,7 @@ default_model = "legacy-model"
     }
 
     #[test]
+    #[allow(clippy::large_futures)]
     async fn load_or_init_logs_existing_config_as_initialized() {
         let _env_guard = env_override_lock().await;
         let temp_home =
