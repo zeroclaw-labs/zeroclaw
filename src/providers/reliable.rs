@@ -22,6 +22,13 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
         return false;
     }
 
+    // Tool schema validation errors are NOT non-retryable — the provider's
+    // built-in fallback in compatible.rs can recover by switching to
+    // prompt-guided tool instructions.
+    if is_tool_schema_error(err) {
+        return false;
+    }
+
     // 4xx errors are generally non-retryable (bad request, auth failure, etc.),
     // except 429 (rate-limit — transient) and 408 (timeout — worth retrying).
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
@@ -71,6 +78,22 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
             || msg_lower.contains("unsupported")
             || msg_lower.contains("does not exist")
             || msg_lower.contains("invalid"))
+}
+
+/// Check if an error is a tool schema validation failure (e.g. Groq returning
+/// "tool call validation failed: attempted to call tool '...' which was not in request").
+/// These errors should NOT be classified as non-retryable because the provider's
+/// built-in fallback logic (`compatible.rs::is_native_tool_schema_unsupported`)
+/// can recover by switching to prompt-guided tool instructions.
+pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_lowercase();
+    let hints = [
+        "tool call validation failed",
+        "was not in request",
+        "not found in tool list",
+        "invalid_tool_call",
+    ];
+    hints.iter().any(|hint| lower.contains(hint))
 }
 
 fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
