@@ -43,6 +43,7 @@ impl SystemPromptBuilder {
         Self {
             sections: vec![
                 Box::new(IdentitySection),
+                Box::new(ToolHonestySection),
                 Box::new(ToolsSection),
                 Box::new(SafetySection),
                 Box::new(SkillsSection),
@@ -74,6 +75,7 @@ impl SystemPromptBuilder {
 }
 
 pub struct IdentitySection;
+pub struct ToolHonestySection;
 pub struct ToolsSection;
 pub struct SafetySection;
 pub struct SkillsSection;
@@ -122,6 +124,22 @@ impl PromptSection for IdentitySection {
         }
 
         Ok(prompt)
+    }
+}
+
+impl PromptSection for ToolHonestySection {
+    fn name(&self) -> &str {
+        "tool_honesty"
+    }
+
+    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
+        Ok(
+            "## CRITICAL: Tool Honesty\n\n\
+             - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
+             - If a tool call fails, report the error — never make up data to fill the gap.\n\
+             - When unsure whether a tool call succeeded, ask the user rather than guessing."
+                .into(),
+        )
     }
 }
 
