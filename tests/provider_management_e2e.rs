@@ -161,6 +161,82 @@ async fn restore_config(toml: &str) {
         .await;
 }
 
+/// Switch daemon to a different provider/model via config API.
+async fn switch_provider_config(provider: &str, model: &str) {
+    let snapshot = snapshot_config().await;
+    let mut modified = snapshot.clone();
+    if let Some(start) = modified.find("default_provider = \"") {
+        if let Some(end) = modified[start..].find('\n') {
+            modified.replace_range(
+                start..start + end,
+                &format!("default_provider = \"{provider}\""),
+            );
+        }
+    }
+    if let Some(start) = modified.find("default_model = \"") {
+        if let Some(end) = modified[start..].find('\n') {
+            modified.replace_range(start..start + end, &format!("default_model = \"{model}\""));
+        }
+    }
+    restore_config(&modified).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+}
+
+/// File to persist original provider config across test suite.
+fn original_config_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/.e2e_original_config.toml")
+}
+
+/// Switch to OpenAI gpt-4o-mini if E2E_PROVIDER=openai is set.
+///
+/// Usage: E2E_PROVIDER=openai cargo test --test provider_management_e2e -- --ignored --test-threads=1
+///
+/// Falls back to default provider (gemini) when env var is not set.
+#[tokio::test]
+#[ignore = "requires running ZeroClaw daemon"]
+async fn pm_00_setup_provider() {
+    let original = snapshot_config().await;
+    std::fs::write(original_config_path(), &original).expect("save original config");
+
+    if let Ok(provider) = std::env::var("E2E_PROVIDER") {
+        let (prov, model) = match provider.as_str() {
+            "openai" | "codex" => ("openai", "gpt-4o-mini"),
+            "groq" => ("groq", "meta-llama/llama-4-scout-17b-16e-instruct"),
+            other => {
+                eprintln!("pm_00: unknown E2E_PROVIDER={other}, keeping default");
+                return;
+            }
+        };
+        switch_provider_config(prov, model).await;
+        // Verify the switch works
+        let (mut tx, mut rx) = connect().await;
+        let resp = send_and_wait(&mut tx, &mut rx, "скажи одно слово: привет").await;
+        if resp.starts_with("ERROR") {
+            eprintln!("pm_00: {prov}/{model} failed: {resp}");
+            eprintln!("pm_00: restoring default provider");
+            restore_config(&original).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        } else {
+            eprintln!("pm_00: switched to {prov}/{model}");
+        }
+    } else {
+        eprintln!("pm_00: E2E_PROVIDER not set, using default");
+    }
+}
+
+/// Restore original provider config (runs last, alphabetically).
+#[tokio::test]
+#[ignore = "requires running ZeroClaw daemon"]
+async fn pm_99_restore_provider() {
+    let path = original_config_path();
+    if path.exists() {
+        let original = std::fs::read_to_string(&path).expect("read original config");
+        restore_config(&original).await;
+        let _ = std::fs::remove_file(&path);
+        eprintln!("pm_99: restored original provider config");
+    }
+}
+
 // ──────────────────────────────────────────────────────────
 // Single-turn tests
 // ──────────────────────────────────────────────────────────
