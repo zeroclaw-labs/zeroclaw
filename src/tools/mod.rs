@@ -19,6 +19,7 @@ pub mod backup_tool;
 pub mod browser;
 pub mod browser_delegate;
 pub mod browser_open;
+pub mod calculator;
 pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
@@ -86,6 +87,7 @@ pub use browser::{BrowserTool, ComputerUseConfig};
 #[allow(unused_imports)]
 pub use browser_delegate::{BrowserDelegateConfig, BrowserDelegateTool};
 pub use browser_open::BrowserOpenTool;
+pub use calculator::CalculatorTool;
 pub use cloud_ops::CloudOpsTool;
 pub use cloud_patterns::CloudPatternsTool;
 pub use composio::ComposioTool;
@@ -323,6 +325,7 @@ pub fn all_tools_with_runtime(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
+        Arc::new(CalculatorTool::new()),
     ];
 
     if matches!(
