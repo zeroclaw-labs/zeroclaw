@@ -91,10 +91,7 @@ impl JiraTool {
                 ("fields", "created"),
                 ("fields", "updated"),
             ],
-            LevelOfDetails::Full => vec![
-                ("expand", "renderedFields"),
-                ("expand", "names"),
-            ],
+            LevelOfDetails::Full => vec![("expand", "renderedFields"), ("expand", "names")],
             LevelOfDetails::Changelog => vec![("expand", "changelog")],
         };
 
@@ -131,8 +128,7 @@ impl JiraTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&shaped)
-                .unwrap_or_else(|_| shaped.to_string()),
+            output: serde_json::to_string_pretty(&shaped).unwrap_or_else(|_| shaped.to_string()),
             error: None,
         })
     }
@@ -204,8 +200,7 @@ impl JiraTool {
         let output = json!(issues);
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&output)
-                .unwrap_or_else(|_| output.to_string()),
+            output: serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
             error: None,
         })
     }
@@ -255,8 +250,7 @@ impl JiraTool {
         let shaped = shape_comment_response(&response);
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&shaped)
-                .unwrap_or_else(|_| shaped.to_string()),
+            output: serde_json::to_string_pretty(&shaped).unwrap_or_else(|_| shaped.to_string()),
             error: None,
         })
     }
@@ -464,24 +458,21 @@ impl Tool for JiraTool {
 
 // ── Input validation ──────────────────────────────────────────────────────────
 
-/// Validates that `issue_key` matches the Jira key format `PROJ-123`.
+/// Validates that `issue_key` matches the Jira key format `PROJ-123` or `proj-123`.
 /// Prevents path traversal if a crafted key like `../../other` were interpolated
 /// directly into the URL.
 fn validate_issue_key(key: &str) -> anyhow::Result<()> {
-    let valid = key
-        .split_once('-')
-        .is_some_and(|(project, number)| {
-            !project.is_empty()
-                && project.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-                && project.starts_with(|c: char| c.is_ascii_uppercase())
-                && !number.is_empty()
-                && number.chars().all(|c| c.is_ascii_digit())
-        });
+    let valid = key.split_once('-').is_some_and(|(project, number)| {
+        !project.is_empty()
+            && project.chars().all(|c| c.is_ascii_alphanumeric())
+            && !number.is_empty()
+            && number.chars().all(|c| c.is_ascii_digit())
+    });
     if valid {
         Ok(())
     } else {
         anyhow::bail!(
-            "Invalid issue key '{key}'. Expected format: PROJECT-123 (e.g. PROJ-42)"
+            "Invalid issue key '{key}'. Expected format: PROJECT-123 (e.g. PROJ-42, proj-42)"
         )
     }
 }
@@ -657,8 +648,7 @@ fn parse_inline(text: &str, mentions: &HashMap<String, (String, String)>) -> Vec
             // Compute the end position of `email` within `raw` via pointer
             // arithmetic so the suffix is correct even when leading chars were
             // stripped by clean_email.
-            let email_end =
-                (email.as_ptr() as usize - raw.as_ptr() as usize) + email.len();
+            let email_end = (email.as_ptr() as usize - raw.as_ptr() as usize) + email.len();
             let suffix = &raw[email_end..];
             if email.contains('@') {
                 if let Some((account_id, display_name)) = mentions.get(email) {
@@ -901,6 +891,8 @@ mod tests {
         assert!(validate_issue_key("PROJ-123").is_ok());
         assert!(validate_issue_key("AB-99").is_ok());
         assert!(validate_issue_key("MYPROJECT-1000").is_ok());
+        assert!(validate_issue_key("proj-1").is_ok());
+        assert!(validate_issue_key("proj-123").is_ok());
     }
 
     #[test]
@@ -911,12 +903,10 @@ mod tests {
 
     #[test]
     fn validate_issue_key_rejects_malformed() {
-        assert!(validate_issue_key("proj-1").is_err()); // lowercase
         assert!(validate_issue_key("PROJ").is_err()); // no number
         assert!(validate_issue_key("PROJ-").is_err()); // empty number
         assert!(validate_issue_key("-123").is_err()); // no project
         assert!(validate_issue_key("PROJ-12x").is_err()); // non-digit in number
-        assert!(validate_issue_key("1PROJ-12").is_err()); // starts with digit
     }
 
     // ── ADF builder unit tests ────────────────────────────────────────────────
