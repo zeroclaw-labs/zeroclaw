@@ -130,6 +130,11 @@ impl Tool for CronAddTool {
                     "type": "string",
                     "description": "Optional model override for agent jobs, e.g. 'x-ai/grok-4-1-fast'"
                 },
+                "allowed_tools": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional allowlist of tool names for agent jobs. When omitted, all tools remain available."
+                },
                 "delivery": {
                     "type": "object",
                     "description": "Optional delivery config to send job output to a channel after each run. When provided, all three of mode, channel, and to are expected.",
@@ -288,6 +293,19 @@ impl Tool for CronAddTool {
                     .get("model")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string);
+                let allowed_tools = match args.get("allowed_tools") {
+                    Some(v) => match serde_json::from_value::<Vec<String>>(v.clone()) {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!("Invalid allowed_tools: {e}")),
+                            });
+                        }
+                    },
+                    None => None,
+                };
 
                 let delivery = match args.get("delivery") {
                     Some(v) => match serde_json::from_value::<DeliveryConfig>(v.clone()) {
@@ -316,6 +334,7 @@ impl Tool for CronAddTool {
                     model,
                     delivery,
                     delete_after_run,
+                    allowed_tools,
                 )
             }
         };
@@ -329,7 +348,8 @@ impl Tool for CronAddTool {
                     "job_type": job.job_type,
                     "schedule": job.schedule,
                     "next_run": job.next_run,
-                    "enabled": job.enabled
+                    "enabled": job.enabled,
+                    "allowed_tools": job.allowed_tools
                 }))?,
                 error: None,
             }),
@@ -610,6 +630,32 @@ mod tests {
             .error
             .unwrap_or_default()
             .contains("Missing 'prompt'"));
+    }
+
+    #[tokio::test]
+    async fn agent_job_persists_allowed_tools() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "agent",
+                "prompt": "check status",
+                "allowed_tools": ["file_read", "web_search"]
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+
+        let jobs = cron::list_jobs(&cfg).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].allowed_tools,
+            Some(vec!["file_read".into(), "web_search".into()])
+        );
     }
 
     #[tokio::test]

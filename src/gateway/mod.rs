@@ -633,6 +633,21 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  🌐 Public URL: {url}");
     }
     println!("  🌐 Web Dashboard: http://{display_addr}/");
+    if let Some(code) = pairing.pairing_code() {
+        println!();
+        println!("  🔐 PAIRING REQUIRED — use this one-time code:");
+        println!("     ┌──────────────┐");
+        println!("     │  {code}  │");
+        println!("     └──────────────┘");
+        println!();
+    } else if pairing.require_pairing() {
+        println!("  🔒 Pairing: ACTIVE (bearer token required)");
+        println!("     To pair a new device: zeroclaw gateway get-paircode --new");
+        println!();
+    } else {
+        println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
+        println!();
+    }
     println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
     if whatsapp_channel.is_some() {
@@ -656,19 +671,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     }
     println!("  GET  /health    — health check");
     println!("  GET  /metrics   — Prometheus metrics");
-    if let Some(code) = pairing.pairing_code() {
-        println!();
-        println!("  🔐 PAIRING REQUIRED — use this one-time code:");
-        println!("     ┌──────────────┐");
-        println!("     │  {code}  │");
-        println!("     └──────────────┘");
-        println!("     Send: POST /pair with header X-Pairing-Code: {code}");
-    } else if pairing.require_pairing() {
-        println!("  🔒 Pairing: ACTIVE (bearer token required)");
-        println!("     To pair a new device: zeroclaw gateway get-paircode --new");
-    } else {
-        println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
-    }
     println!("  Press Ctrl+C to stop.\n");
 
     crate::health::mark_component_ok("gateway");
@@ -764,6 +766,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/tools", get(api::handle_api_tools))
         .route("/api/cron", get(api::handle_api_cron_list))
         .route("/api/cron", post(api::handle_api_cron_add))
+        .route(
+            "/api/cron/settings",
+            get(api::handle_api_cron_settings_get).patch(api::handle_api_cron_settings_patch),
+        )
         .route("/api/cron/{id}", delete(api::handle_api_cron_delete))
         .route("/api/cron/{id}/runs", get(api::handle_api_cron_runs))
         .route("/api/integrations", get(api::handle_api_integrations))

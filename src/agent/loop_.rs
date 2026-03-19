@@ -1,5 +1,6 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
+use crate::i18n::ToolDescriptions;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
@@ -7,7 +8,7 @@ use crate::providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
 };
 use crate::runtime;
-use crate::security::SecurityPolicy;
+use crate::security::{AutonomyLevel, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -2107,9 +2108,20 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
     parts.join("\n")
 }
 
-fn resolve_display_text(response_text: &str, parsed_text: &str, has_tool_calls: bool) -> String {
+fn resolve_display_text(
+    response_text: &str,
+    parsed_text: &str,
+    has_tool_calls: bool,
+    has_native_tool_calls: bool,
+) -> String {
     if has_tool_calls {
-        return parsed_text.to_string();
+        if !parsed_text.is_empty() {
+            return parsed_text.to_string();
+        }
+        if has_native_tool_calls {
+            return response_text.to_string();
+        }
+        return String::new();
     }
 
     if parsed_text.is_empty() {
@@ -2180,8 +2192,10 @@ pub(crate) async fn agent_turn(
     temperature: f64,
     silent: bool,
     channel_name: &str,
+    channel_reply_target: Option<&str>,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    approval: Option<&ApprovalManager>,
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
@@ -2196,8 +2210,9 @@ pub(crate) async fn agent_turn(
         model,
         temperature,
         silent,
-        None,
+        approval,
         channel_name,
+        channel_reply_target,
         multimodal_config,
         max_tool_iterations,
         None,
@@ -2209,6 +2224,100 @@ pub(crate) async fn agent_turn(
         model_switch_callback,
     )
     .await
+}
+
+fn maybe_inject_channel_delivery_defaults(
+    tool_name: &str,
+    tool_args: &mut serde_json::Value,
+    channel_name: &str,
+    channel_reply_target: Option<&str>,
+) {
+    if tool_name != "cron_add" {
+        return;
+    }
+
+    if !matches!(
+        channel_name,
+        "telegram" | "discord" | "slack" | "mattermost" | "matrix"
+    ) {
+        return;
+    }
+
+    let Some(reply_target) = channel_reply_target
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+
+    let Some(args) = tool_args.as_object_mut() else {
+        return;
+    };
+
+    let is_agent_job = args
+        .get("job_type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|job_type| job_type.eq_ignore_ascii_case("agent"))
+        || args
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|prompt| !prompt.trim().is_empty());
+    if !is_agent_job {
+        return;
+    }
+
+    let default_delivery = || {
+        serde_json::json!({
+            "mode": "announce",
+            "channel": channel_name,
+            "to": reply_target,
+        })
+    };
+
+    match args.get_mut("delivery") {
+        None => {
+            args.insert("delivery".to_string(), default_delivery());
+        }
+        Some(serde_json::Value::Null) => {
+            *args.get_mut("delivery").expect("delivery key exists") = default_delivery();
+        }
+        Some(serde_json::Value::Object(delivery)) => {
+            if delivery
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|mode| mode.eq_ignore_ascii_case("none"))
+            {
+                return;
+            }
+
+            delivery
+                .entry("mode".to_string())
+                .or_insert_with(|| serde_json::Value::String("announce".to_string()));
+
+            let needs_channel = delivery
+                .get("channel")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|value| value.trim().is_empty());
+            if needs_channel {
+                delivery.insert(
+                    "channel".to_string(),
+                    serde_json::Value::String(channel_name.to_string()),
+                );
+            }
+
+            let needs_target = delivery
+                .get("to")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|value| value.trim().is_empty());
+            if needs_target {
+                delivery.insert(
+                    "to".to_string(),
+                    serde_json::Value::String(reply_target.to_string()),
+                );
+            }
+        }
+        Some(_) => {}
+    }
 }
 
 async fn execute_one_tool(
@@ -2404,6 +2513,7 @@ pub(crate) async fn run_tool_call_loop(
     silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    channel_reply_target: Option<&str>,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
@@ -2679,8 +2789,12 @@ pub(crate) async fn run_tool_call_loop(
                 }
             };
 
-        let display_text =
-            resolve_display_text(&response_text, &parsed_text, !tool_calls.is_empty());
+        let display_text = resolve_display_text(
+            &response_text,
+            &parsed_text,
+            !tool_calls.is_empty(),
+            !native_tool_calls.is_empty(),
+        );
         let display_text = strip_tool_result_blocks(&display_text);
 
         // ── Progress: LLM responded ─────────────────────────────
@@ -2741,10 +2855,18 @@ pub(crate) async fn run_tool_call_loop(
             return Ok(display_text);
         }
 
-        // Print any text the LLM produced alongside tool calls (unless silent)
-        if !silent && !display_text.is_empty() {
-            print!("{display_text}");
-            let _ = std::io::stdout().flush();
+        // Native tool-call providers can return assistant text separately from
+        // the structured call payload; relay it to draft-capable channels.
+        if !display_text.is_empty() {
+            if !native_tool_calls.is_empty() {
+                if let Some(ref tx) = on_delta {
+                    let _ = tx.send(display_text.clone()).await;
+                }
+            }
+            if !silent {
+                print!("{display_text}");
+                let _ = std::io::stdout().flush();
+            }
         }
 
         // Execute tool calls and build results. `individual_results` tracks per-call output so
@@ -2813,6 +2935,13 @@ pub(crate) async fn run_tool_call_loop(
                     }
                 }
             }
+
+            maybe_inject_channel_delivery_defaults(
+                &tool_name,
+                &mut tool_args,
+                channel_name,
+                channel_reply_target,
+            );
 
             // ── Approval hook ────────────────────────────────
             if let Some(mgr) = approval {
@@ -3078,7 +3207,10 @@ pub(crate) async fn run_tool_call_loop(
 
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
-pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
+pub(crate) fn build_tool_instructions(
+    tools_registry: &[Box<dyn Tool>],
+    tool_descriptions: Option<&ToolDescriptions>,
+) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
@@ -3094,11 +3226,14 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools_registry {
+        let desc = tool_descriptions
+            .and_then(|td| td.get(tool.name()))
+            .unwrap_or_else(|| tool.description());
         let _ = writeln!(
             instructions,
             "**{}**: {}\nParameters: `{}`\n",
             tool.name(),
-            tool.description(),
+            desc,
             tool.parameters_schema()
         );
     }
@@ -3324,6 +3459,16 @@ pub async fn run(
         .map(|b| b.board.clone())
         .collect();
 
+    // ── Load locale-aware tool descriptions ────────────────────────
+    let i18n_locale = config
+        .locale
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(crate::i18n::detect_locale);
+    let i18n_search_dirs = crate::i18n::default_search_dirs(&config.workspace_dir);
+    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
     let mut tool_descs: Vec<(&str, &str)> = vec![
@@ -3352,6 +3497,15 @@ pub async fn run(
             "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
         ),
     ];
+    if matches!(
+        config.skills.prompt_injection_mode,
+        crate::config::SkillsPromptInjectionMode::Compact
+    ) {
+        tool_descs.push((
+            "read_skill",
+            "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
+        ));
+    }
     tool_descs.push((
         "cron_add",
         "Create a cron job. Supports schedule kinds: cron, at, every; and job types: shell or agent.",
@@ -3440,20 +3594,21 @@ pub async fn run(
         None
     };
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+    let mut system_prompt = crate::channels::build_system_prompt_with_mode_and_autonomy(
         &config.workspace_dir,
         &model_name,
         &tool_descs,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
+        Some(&config.autonomy),
         native_tools,
         config.skills.prompt_injection_mode,
     );
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+        system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
     }
 
     // Append deferred MCP tool names so the LLM knows what is available
@@ -3539,6 +3694,7 @@ pub async fn run(
                 false,
                 approval_manager.as_ref(),
                 channel_name,
+                None,
                 &config.multimodal,
                 config.agent.max_tool_iterations,
                 None,
@@ -3588,6 +3744,27 @@ pub async fn run(
                         continue;
                     }
                     return Err(e);
+                }
+            }
+        }
+
+        // After successful multi-step execution, attempt autonomous skill creation.
+        #[cfg(feature = "skill-creation")]
+        if config.skills.skill_creation.enabled {
+            let tool_calls = crate::skills::creator::extract_tool_calls_from_history(&history);
+            if tool_calls.len() >= 2 {
+                let creator = crate::skills::creator::SkillCreator::new(
+                    config.workspace_dir.clone(),
+                    config.skills.skill_creation.clone(),
+                );
+                match creator.create_from_execution(&msg, &tool_calls, None).await {
+                    Ok(Some(slug)) => {
+                        tracing::info!(slug, "Auto-created skill from execution");
+                    }
+                    Ok(None) => {
+                        tracing::debug!("Skill creation skipped (duplicate or disabled)");
+                    }
+                    Err(e) => tracing::warn!("Skill creation failed: {e}"),
                 }
             }
         }
@@ -3744,6 +3921,7 @@ pub async fn run(
                     false,
                     approval_manager.as_ref(),
                     channel_name,
+                    None,
                     &config.multimodal,
                     config.agent.max_tool_iterations,
                     None,
@@ -3856,6 +4034,7 @@ pub async fn process_message(
         &config.autonomy,
         &config.workspace_dir,
     ));
+    let approval_manager = ApprovalManager::for_non_interactive(&config.autonomy);
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
         &config.memory,
         &config.embedding_routes,
@@ -3989,6 +4168,16 @@ pub async fn process_message(
         .map(|b| b.board.clone())
         .collect();
 
+    // ── Load locale-aware tool descriptions ────────────────────────
+    let i18n_locale = config
+        .locale
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(crate::i18n::detect_locale);
+    let i18n_search_dirs = crate::i18n::default_search_dirs(&config.workspace_dir);
+    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
     let mut tool_descs: Vec<(&str, &str)> = vec![
         ("shell", "Execute terminal commands."),
@@ -4004,6 +4193,15 @@ pub async fn process_message(
         ("screenshot", "Capture a screenshot."),
         ("image_info", "Read image metadata."),
     ];
+    if matches!(
+        config.skills.prompt_injection_mode,
+        crate::config::SkillsPromptInjectionMode::Compact
+    ) {
+        tool_descs.push((
+            "read_skill",
+            "Load the full source for an available skill by name.",
+        ));
+    }
     if config.browser.enabled {
         tool_descs.push(("browser_open", "Open approved URLs in browser."));
     }
@@ -4037,24 +4235,35 @@ pub async fn process_message(
             "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
         ));
     }
+
+    // Filter out tools excluded for non-CLI channels (gateway counts as non-CLI).
+    // Skip when autonomy is `Full` — full-autonomy agents keep all tools.
+    if config.autonomy.level != AutonomyLevel::Full {
+        let excluded = &config.autonomy.non_cli_excluded_tools;
+        if !excluded.is_empty() {
+            tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+        }
+    }
+
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
         None
     };
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+    let mut system_prompt = crate::channels::build_system_prompt_with_mode_and_autonomy(
         &config.workspace_dir,
         &model_name,
         &tool_descs,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
+        Some(&config.autonomy),
         native_tools,
         config.skills.prompt_injection_mode,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+        system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
     }
     if !deferred_section.is_empty() {
         system_prompt.push('\n');
@@ -4085,8 +4294,11 @@ pub async fn process_message(
         ChatMessage::system(&system_prompt),
         ChatMessage::user(&enriched),
     ];
-    let excluded_tools =
+    let mut excluded_tools =
         compute_excluded_mcp_tools(&tools_registry, &config.agent.tool_filter_groups, message);
+    if config.autonomy.level != AutonomyLevel::Full {
+        excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
+    }
 
     agent_turn(
         provider.as_ref(),
@@ -4098,8 +4310,10 @@ pub async fn process_message(
         config.default_temperature,
         true,
         "daemon",
+        None,
         &config.multimodal,
         config.agent.max_tool_iterations,
+        Some(&approval_manager),
         &excluded_tools,
         &config.agent.tool_call_dedup_exempt,
         activated_handle_pm.as_ref(),
@@ -4415,6 +4629,57 @@ mod tests {
         }
     }
 
+    struct RecordingArgsTool {
+        name: String,
+        recorded_args: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl RecordingArgsTool {
+        fn new(name: &str, recorded_args: Arc<Mutex<Vec<serde_json::Value>>>) -> Self {
+            Self {
+                name: name.to_string(),
+                recorded_args,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for RecordingArgsTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "Records tool arguments for regression tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string" },
+                    "schedule": { "type": "object" },
+                    "delivery": { "type": "object" }
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.recorded_args
+                .lock()
+                .expect("recorded args lock should be valid")
+                .push(args.clone());
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: args.to_string(),
+                error: None,
+            })
+        }
+    }
+
     struct DelayTool {
         name: String,
         delay_ms: u64,
@@ -4553,6 +4818,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &crate::config::MultimodalConfig::default(),
             3,
             None,
@@ -4602,6 +4868,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &multimodal,
             3,
             None,
@@ -4645,6 +4912,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &crate::config::MultimodalConfig::default(),
             3,
             None,
@@ -4774,6 +5042,7 @@ mod tests {
             true,
             Some(&approval_mgr),
             "telegram",
+            None,
             &crate::config::MultimodalConfig::default(),
             4,
             None,
@@ -4812,6 +5081,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_injects_channel_delivery_defaults_for_cron_add() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"cron_add","arguments":{"job_type":"agent","prompt":"remind me later","schedule":{"kind":"every","every_ms":60000}}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+            "cron_add",
+            Arc::clone(&recorded_args),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("schedule a reminder"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            Some("chat-42"),
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+        )
+        .await
+        .expect("cron_add delivery defaults should be injected");
+
+        assert_eq!(result, "done");
+
+        let recorded = recorded_args
+            .lock()
+            .expect("recorded args lock should be valid");
+        let delivery = recorded[0]["delivery"].clone();
+        assert_eq!(
+            delivery,
+            serde_json::json!({
+                "mode": "announce",
+                "channel": "telegram",
+                "to": "chat-42",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_preserves_explicit_cron_delivery_none() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"cron_add","arguments":{"job_type":"agent","prompt":"run silently","schedule":{"kind":"every","every_ms":60000},"delivery":{"mode":"none"}}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+            "cron_add",
+            Arc::clone(&recorded_args),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("schedule a quiet cron job"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            Some("chat-42"),
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+        )
+        .await
+        .expect("explicit delivery mode should be preserved");
+
+        assert_eq!(result, "done");
+
+        let recorded = recorded_args
+            .lock()
+            .expect("recorded args lock should be valid");
+        assert_eq!(recorded[0]["delivery"], serde_json::json!({"mode": "none"}));
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_deduplicates_repeated_tool_calls() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>
@@ -4846,6 +5231,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &crate::config::MultimodalConfig::default(),
             4,
             None,
@@ -4914,6 +5300,7 @@ mod tests {
             true,
             Some(&approval_mgr),
             "telegram",
+            None,
             &crate::config::MultimodalConfig::default(),
             4,
             None,
@@ -4973,6 +5360,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &crate::config::MultimodalConfig::default(),
             4,
             None,
@@ -5052,6 +5440,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &crate::config::MultimodalConfig::default(),
             4,
             None,
@@ -5108,6 +5497,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &crate::config::MultimodalConfig::default(),
             4,
             None,
@@ -5135,6 +5525,99 @@ mod tests {
                 .all(|msg| !(msg.role == "user" && msg.content.starts_with("[Tool results]"))),
             "native mode should use role=tool history instead of prompt fallback wrapper"
         );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_relays_native_tool_call_text_via_on_delta() {
+        let provider = ScriptedProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from(vec![
+                ChatResponse {
+                    text: Some("Task started. Waiting 30 seconds before checking status.".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "call_wait".into(),
+                        name: "count_tool".into(),
+                        arguments: r#"{"value":"A"}"#.into(),
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("Final answer".into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]))),
+            capabilities: ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            },
+        };
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+        )
+        .await
+        .expect("native tool-call text should be relayed through on_delta");
+
+        let mut deltas: Vec<String> = Vec::new();
+        while let Some(delta) = rx.recv().await {
+            deltas.push(delta);
+        }
+
+        let explanation_idx = deltas
+            .iter()
+            .position(|delta| delta == "Task started. Waiting 30 seconds before checking status.")
+            .expect("native assistant text should be relayed to on_delta");
+        let clear_idx = deltas
+            .iter()
+            .position(|delta| delta == DRAFT_CLEAR_SENTINEL)
+            .expect("final answer streaming should clear prior draft state");
+
+        assert!(
+            deltas
+                .iter()
+                .any(|delta| delta.starts_with("\u{1f4ac} Got 1 tool call(s)")),
+            "tool-call progress line should still be relayed"
+        );
+        assert!(
+            explanation_idx < clear_idx,
+            "native assistant text should arrive before final-answer draft clearing"
+        );
+        assert_eq!(result, "Final answer");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -5180,8 +5663,10 @@ mod tests {
                 0.0,
                 true,
                 "daemon",
+                None,
                 &crate::config::MultimodalConfig::default(),
                 4,
+                None,
                 &[],
                 &[],
                 Some(&activated),
@@ -5201,6 +5686,7 @@ mod tests {
             "<tool_call>{\"name\":\"memory_store\"}</tool_call>",
             "",
             true,
+            false,
         );
         assert!(display.is_empty());
     }
@@ -5211,13 +5697,20 @@ mod tests {
             "<tool_call>{\"name\":\"shell\"}</tool_call>",
             "Let me check that.",
             true,
+            false,
         );
         assert_eq!(display, "Let me check that.");
     }
 
     #[test]
+    fn resolve_display_text_uses_response_text_for_native_tool_turns() {
+        let display = resolve_display_text("Task started.", "", true, true);
+        assert_eq!(display, "Task started.");
+    }
+
+    #[test]
     fn resolve_display_text_uses_response_text_for_final_turns() {
-        let display = resolve_display_text("Final answer", "", false);
+        let display = resolve_display_text("Final answer", "", false, false);
         assert_eq!(display, "Final answer");
     }
 
@@ -5764,7 +6257,7 @@ Tail"#;
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
-        let instructions = build_tool_instructions(&tools);
+        let instructions = build_tool_instructions(&tools, None);
 
         assert!(instructions.contains("## Tool Use Protocol"));
         assert!(instructions.contains("<tool_call>"));
@@ -6624,6 +7117,7 @@ Let me check the result."#;
             None, // no bootstrap_max_chars
             true, // native_tools
             crate::config::SkillsPromptInjectionMode::Full,
+            crate::security::AutonomyLevel::default(),
         );
 
         // Must contain zero XML protocol artifacts
@@ -7069,6 +7563,7 @@ Let me check the result."#;
             true,
             None,
             "telegram",
+            None,
             &crate::config::MultimodalConfig::default(),
             4,
             None,
