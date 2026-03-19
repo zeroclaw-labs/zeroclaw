@@ -10,17 +10,13 @@ const JIRA_SEARCH_PAGE_SIZE: u32 = 100;
 const MAX_ERROR_BODY_CHARS: usize = 500;
 
 /// Controls how much data is returned by `get_ticket`.
+#[derive(Default)]
 enum LevelOfDetails {
     Basic,
+    #[default]
     BasicSearch,
     Full,
     Changelog,
-}
-
-impl Default for LevelOfDetails {
-    fn default() -> Self {
-        LevelOfDetails::Basic
-    }
 }
 
 /// Tool for interacting with the Jira REST API v3.
@@ -133,6 +129,7 @@ impl JiraTool {
         })
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     async fn search_tickets(
         &self,
         jql: &str,
@@ -145,7 +142,8 @@ impl JiraTool {
         let mut next_page_token: Option<String> = None;
 
         loop {
-            let remaining = max_results - issues.len() as u32;
+            let remaining = max_results.saturating_sub(issues.len() as u32);
+
             let page_size = remaining.min(JIRA_SEARCH_PAGE_SIZE);
 
             let mut body = json!({
@@ -414,7 +412,7 @@ impl Tool for JiraTool {
                 let max_results = args
                     .get("max_results")
                     .and_then(|v| v.as_u64())
-                    .map(|n| n as u32);
+                    .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
                 self.search_tickets(jql, max_results).await
             }
             "comment_ticket" => {
@@ -582,8 +580,8 @@ fn shape_comment_response(raw: &Value) -> Value {
 /// (e.g. `@john@co.com,` or `@john@co.com)`). Also strips leading bracket-like
 /// punctuation so `@(john@co.com)` resolves correctly.
 fn clean_email(s: &str) -> &str {
-    s.trim_start_matches(|c: char| matches!(c, '(' | '['))
-        .trim_end_matches(|c: char| matches!(c, ',' | '!' | '?' | ':' | ';' | ')' | ']'))
+    s.trim_start_matches(['(', '['])
+        .trim_end_matches([',', '!', '?', ':', ';', ')', ']'])
 }
 
 fn extract_emails(text: &str) -> Vec<String> {
@@ -672,7 +670,7 @@ fn parse_inline(text: &str, mentions: &HashMap<String, (String, String)>) -> Vec
                 }
             } else {
                 current.push('@');
-                current.push_str(&email);
+                current.push_str(email);
             }
         } else {
             current.push(ch);
