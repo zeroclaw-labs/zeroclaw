@@ -534,7 +534,7 @@ impl Tool for GitOperationsTool {
                         error: Some("Action blocked: read-only mode".into()),
                     });
                 }
-                AutonomyLevel::Supervised | AutonomyLevel::Full => {}
+                AutonomyLevel::Supervised | AutonomyLevel::Full | AutonomyLevel::Unrestricted => {}
             }
         }
 

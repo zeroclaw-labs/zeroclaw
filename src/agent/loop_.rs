@@ -4141,8 +4141,24 @@ pub async fn process_message(
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
+    // Apply per-user autonomy overrides based on session_id (e.g. "telegram_zverozabr").
+    let autonomy_for_session = {
+        let mut ac = config.autonomy.clone();
+        if let Some(sid) = session_id {
+            let username = sid.splitn(2, '_').nth(1).unwrap_or("");
+            if let Some(&override_level) = ac.user_overrides.get(username) {
+                tracing::info!(
+                    username = username,
+                    level = ?override_level,
+                    "Applying per-user autonomy override"
+                );
+                ac.level = override_level;
+            }
+        }
+        ac
+    };
     let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
+        &autonomy_for_session,
         &config.workspace_dir,
     ));
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(

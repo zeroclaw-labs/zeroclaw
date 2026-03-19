@@ -111,8 +111,10 @@ impl ApprovalManager {
     ///
     /// Returns `true` if the call needs a prompt, `false` if it can proceed.
     pub fn needs_approval(&self, tool_name: &str) -> bool {
-        // Full autonomy never prompts.
-        if self.autonomy_level == AutonomyLevel::Full {
+        // Full/Unrestricted autonomy never prompts.
+        if self.autonomy_level == AutonomyLevel::Full
+            || self.autonomy_level == AutonomyLevel::Unrestricted
+        {
             return false;
         }
 

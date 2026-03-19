@@ -15,6 +15,9 @@ pub enum AutonomyLevel {
     Supervised,
     /// Full: autonomous execution within policy bounds
     Full,
+    /// Unrestricted: no command filtering, no path restrictions, no operator blocking.
+    /// The agent can execute any shell command without validation.
+    Unrestricted,
 }
 
 /// Risk score for shell command execution.
@@ -805,6 +808,10 @@ impl SecurityPolicy {
         command: &str,
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
+        // Unrestricted mode: skip all validation gates.
+        if self.autonomy == AutonomyLevel::Unrestricted {
+            return Ok(CommandRiskLevel::Low);
+        }
         if !self.is_command_allowed(command) {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
@@ -893,6 +900,9 @@ impl SecurityPolicy {
     /// - Blocks shell redirections (`<`, `>`, `>>`) that can bypass path policy
     /// - Blocks dangerous arguments (e.g. `find -exec`, `git config`)
     pub fn is_command_allowed(&self, command: &str) -> bool {
+        if self.autonomy == AutonomyLevel::Unrestricted {
+            return true;
+        }
         if self.autonomy == AutonomyLevel::ReadOnly {
             return false;
         }
@@ -999,6 +1009,9 @@ impl SecurityPolicy {
     /// This is best-effort token parsing for shell commands and is intended
     /// as a safety gate before command execution.
     pub fn forbidden_path_argument(&self, command: &str) -> Option<String> {
+        if self.autonomy == AutonomyLevel::Unrestricted {
+            return None;
+        }
         let forbidden_candidate = |raw: &str| {
             let candidate = strip_wrapping_quotes(raw).trim();
             if candidate.is_empty() || candidate.contains("://") {

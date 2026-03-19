@@ -3667,6 +3667,19 @@ pub struct AutonomyConfig {
     /// model in tool specs.
     #[serde(default)]
     pub non_cli_excluded_tools: Vec<String>,
+
+    /// Per-user autonomy level overrides.
+    ///
+    /// Keys are usernames (e.g. Telegram `@handle` without `@`).
+    /// Values are autonomy levels that override the global `level` for that user.
+    ///
+    /// ```toml
+    /// [autonomy.user_overrides]
+    /// zverozabr = "unrestricted"
+    /// someone_else = "supervised"
+    /// ```
+    #[serde(default)]
+    pub user_overrides: HashMap<String, AutonomyLevel>,
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -3735,6 +3748,7 @@ impl Default for AutonomyConfig {
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
             non_cli_excluded_tools: Vec::new(),
+            user_overrides: HashMap::new(),
         }
     }
 }
