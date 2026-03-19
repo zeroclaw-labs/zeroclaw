@@ -20,6 +20,7 @@ env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  RELEASE_CARGO_FEATURES: channel-matrix,memory-postgres
 
 jobs:
   validate:
@@ -214,7 +215,7 @@ jobs:
           if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
           fi
-          cargo build --release --locked --features channel-matrix,channel-lark,memory-postgres --target ${{ matrix.target }}
+          cargo build --release --locked --features "${{ env.RELEASE_CARGO_FEATURES }}" --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
