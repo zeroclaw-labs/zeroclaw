@@ -199,8 +199,17 @@ system automatically routes to the most appropriate model per task type:
 │                                                                     │
 │  Important: Railway relay is ALWAYS used for:                       │
 │  ├─ Memory sync (E2E encrypted delta exchange) — regardless of key  │
-│  └─ Remote channel routing (KakaoTalk, Telegram, etc.)              │
-│  These are NOT LLM calls and do not consume credits.                │
+│  ├─ Remote channel routing (KakaoTalk, Telegram, etc.)              │
+│  └─ Web chat from mymoa.app (browser-based access)                  │
+│  Memory sync and channel routing are NOT LLM calls and do not       │
+│  consume credits. LLM calls via Railway do consume credits (2.2×).  │
+│                                                                     │
+│  Railway's role is MINIMAL:                                         │
+│  ├─ Hosts webhook endpoints for channel messages                    │
+│  ├─ Stores operator's ADMIN_*_API_KEY env vars (never exposed)      │
+│  ├─ Proxies LLM calls when user has no local API key                │
+│  ├─ Holds E2E encrypted sync deltas (5-min TTL, auto-deleted)       │
+│  └─ Does NOT persistently store any user data or conversation       │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -235,13 +244,123 @@ Users send messages through these channels to their remote MoA device,
 which processes the request and sends back the response through the same
 channel.
 
-### Web Chat Access
+### Web Chat Access (웹채팅)
 
 A web-based chat interface on the MoA homepage allows users to:
 - Send commands to their remote MoA app instance
 - Receive responses in real-time
 - No MoA app installation required on the browsing device
 - Authenticated connection to the user's registered MoA devices
+
+### Three Chat Modes (3가지 채팅 방식)
+
+MoA provides three distinct ways to interact with the AI agent, each
+designed for different user scenarios:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Three Chat Modes Overview                                               │
+│                                                                         │
+│  ① App Chat (앱채팅) — Local GUI                                        │
+│     User: MoA app installed on their device                              │
+│     Interface: Desktop/Mobile Tauri app with rich GUI                    │
+│     API Key: Local key preferred → Operator key fallback                 │
+│     Route: Device → LLM Provider directly (local key)                    │
+│            Device → Railway → LLM Provider (operator key fallback)       │
+│     Features: Full GUI, markdown rendering, STT/TTS, voice mode,         │
+│               120+ language auto-detection, document editor,             │
+│               export (PDF/DOC/HTML/MD), file upload, all tools           │
+│                                                                         │
+│  ② Channel Chat (채널채팅) — Remote via Messaging Platforms              │
+│     User: No MoA app needed on the chatting device                       │
+│     Interface: KakaoTalk, Telegram, Discord, Slack, LINE messages        │
+│     API Key: Operator key on Railway server                              │
+│     Route: Channel → Railway webhook → MoA gateway → LLM Provider       │
+│     Setup: Operator pre-configures channel bot tokens/secrets on         │
+│            Railway. Users just message the bot — zero setup required.     │
+│     Credits: Deducted at 2.2× per usage (operator key)                   │
+│                                                                         │
+│  ③ Web Chat (웹채팅) — Browser-based, no app install                     │
+│     User: Public PC, library, internet café — MoA not installed          │
+│     Interface: mymoa.app website → web chat widget                       │
+│     API Key: Own key if provided → Operator key fallback                 │
+│     Route: Browser → Railway WebSocket → MoA gateway → LLM Provider     │
+│     Use case: Access MoA from any computer by logging into mymoa.app     │
+│     Credits: Only deducted when operator key is used                     │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### App Chat (앱채팅) — Local GUI
+
+The primary and richest chat experience. Users interact through the
+desktop/mobile MoA app installed on their device.
+
+- **API key resolution order**: Local key (in `~/.zeroclaw/config.toml`
+  or per-provider keys) → Operator key on Railway (fallback)
+- **When local key is used**: LLM calls go directly from the device to
+  the provider API. No Railway involvement. No credit deduction.
+- **When operator key is used**: LLM calls are proxied through Railway
+  server using the operator's `ADMIN_*_API_KEY` env vars. Credits are
+  deducted at 2.2× the actual API cost.
+- **Features**: Full rich GUI (markdown rendering in chat, 120+ language
+  auto-detection with dialects for China/India, STT voice input,
+  TTS voice output, document viewer/editor, export to PDF/DOC/HTML/MD,
+  file upload, all tool categories)
+
+#### Channel Chat (채널채팅) — Remote via Messaging Platforms
+
+Designed for non-technical users who want to interact with MoA through
+familiar messaging apps **without any setup on their end**.
+
+- **Zero user setup**: The operator (admin) pre-configures all channel
+  bot tokens, webhook secrets, and API keys as Railway environment
+  variables. Users simply message the bot in their messaging app.
+- **Railway's role (minimal)**: Railway only hosts the webhook endpoints
+  and channel configuration. The actual AI processing uses the operator's
+  API keys stored as `ADMIN_*_API_KEY` env vars on Railway.
+- **Supported channels**: KakaoTalk, Telegram, Discord, Slack, LINE
+- **Credits**: Always deducted at 2.2× (operator key used)
+
+##### KakaoTalk Direct Connection (카카오톡 직접 연결)
+
+KakaoTalk has a unique architecture compared to other channels:
+
+- **Webhook-based**: KakaoTalk uses a callback URL pattern where Kakao
+  servers send user messages to a registered webhook endpoint.
+- **Railway requirement**: Because KakaoTalk requires a publicly
+  accessible HTTPS endpoint for webhooks, Railway (or any public server)
+  is needed to receive the webhook callbacks.
+- **However**: If the user's local device has a public IP or uses a
+  tunnel (e.g., ngrok, Cloudflare Tunnel), KakaoTalk can connect
+  directly to the local MoA app without Railway, by registering the
+  local webhook URL in the Kakao Developer Console.
+- **Practical recommendation**: For most users, Railway hosting is
+  simpler and more reliable than maintaining a local tunnel.
+
+##### Channel Setup Simplification Strategy
+
+The goal is to make channel access as simple as possible for end users:
+
+| Channel | Operator Setup (one-time) | User Setup | User Experience |
+|---------|--------------------------|------------|-----------------|
+| **KakaoTalk** | Register Kakao Channel, set webhook URL on Railway, add `KAKAO_*` env vars | Add KakaoTalk Channel as friend | Send message → Get AI response |
+| **Telegram** | Create bot via @BotFather, add `TELEGRAM_BOT_TOKEN` to Railway | Search bot name, click Start | Send message → Get AI response |
+| **Discord** | Create Discord App/Bot, add `DISCORD_TOKEN` to Railway | Join server with bot or DM the bot | Send message → Get AI response |
+| **Slack** | Create Slack App, add `SLACK_*` tokens to Railway | Add app to workspace | Send message → Get AI response |
+| **LINE** | Create LINE Official Account, add `LINE_*` tokens to Railway | Add LINE friend | Send message → Get AI response |
+
+#### Web Chat (웹채팅) — Browser-based Access
+
+For situations where users cannot install MoA on the device they are
+using (public PCs, library computers, internet cafés, borrowed devices).
+
+- **How it works**: User visits `mymoa.app`, logs in with their MoA
+  account, and chats through the web interface.
+- **Route**: Browser → Railway server (WebSocket) → MoA gateway → LLM
+- **API key**: Can use own key if entered in web settings, otherwise
+  uses operator key with credit deduction at 2.2×.
+- **Limitations**: No local file access, no local tool execution —
+  tools run on the Railway-hosted gateway instance.
 
 ### Unified App Experience (MoA + ZeroClaw = One App)
 
@@ -855,7 +974,15 @@ communication.
 web/
 ├── src/
 │   ├── pages/
-│   │   ├── AgentChat.tsx      # Primary chat interface
+│   │   ├── AgentChat.tsx      # Primary chat interface with:
+│   │   │                      #   - Markdown rendering (marked library)
+│   │   │                      #   - 120+ language auto-detection (Unicode + heuristics)
+│   │   │                      #   - Language preference persistence (memory + localStorage)
+│   │   │                      #   - STT voice input (Web Speech API, cross-browser)
+│   │   │                      #   - TTS voice output (speechSynthesis, auto voice selection)
+│   │   │                      #   - Export to DOC/MD/TXT
+│   │   │                      #   - Voice mode with language indicator
+│   │   │                      #   - Connection status indicator
 │   │   ├── Config.tsx         # Agent configuration
 │   │   ├── Cost.tsx           # Usage & billing dashboard
 │   │   ├── Cron.tsx           # Scheduled tasks
@@ -863,10 +990,27 @@ web/
 │   │   ├── Devices.tsx        # Multi-device management & sync status
 │   │   └── ...
 │   ├── components/            # Shared React components
+│   ├── lib/
+│   │   ├── api.ts             # API client with Bearer token auth
+│   │   ├── auth.ts            # Token management (session/localStorage)
+│   │   └── ws.ts              # WebSocket client with session management
 │   └── App.tsx                # Route definitions
-├── vite.config.ts
-└── package.json
+├── dist/                      # Built frontend assets (tracked in git for rust-embed)
+│   ├── index.html             # SPA entry point with CSP headers
+│   └── assets/                # Vite-bundled JS/CSS with content hashes
+├── vite.config.ts             # base: "/_app/", proxy to localhost:8080
+└── package.json               # Build: tsc -b && vite build
 ```
+
+#### Frontend Build Pipeline
+
+The web frontend is embedded into the ZeroClaw Rust binary via
+`rust-embed` at compile time. Both Dockerfiles include a
+`node:22-alpine` web-builder stage that runs `npm ci && npm run build`
+automatically, ensuring frontend assets are always current in
+production builds. The built assets in `web/dist/` are also tracked
+in git (excluded from the generic `dist/` gitignore rule) so that
+local `cargo build` picks them up without requiring Node.js.
 
 ### Main Website (`site/`)
 
@@ -924,6 +1068,12 @@ the native app — the gateway handles WebSocket connections from any
 authenticated browser session. Memory, ontology state, and sync all work
 identically regardless of whether the client is the Tauri app or a web
 browser.
+
+**Primary use case**: Public PCs, library computers, internet cafés,
+or any device where the user cannot install MoA. Users visit
+`mymoa.app`, log in with their account, and chat through the web
+interface. The web chat connects to the Railway-hosted gateway instance
+via WebSocket.
 
 ---
 
@@ -1510,6 +1660,25 @@ These are **mandatory constraints**, not guidelines:
 - [x] Image/Video/Music generation tool integrations — `src/tools/media_gen.rs` ImageGenTool (DALL-E), VideoGenTool (Runway), MusicGenTool (Suno)
 - [x] iOS native bridge (Swift-Rust FFI) — Tauri 2 manages Rust↔Swift bridge transparently, `MoAApp.swift` entry point with WKWebView
 - [x] Android NDK sidecar build — Gradle multi-ABI (arm64-v8a, armeabi-v7a, x86, x86_64), ProGuard config, SDK 34
+
+### Recently Completed (2026-03-19)
+
+- [x] Markdown rendering in chat messages — `marked` library for real-time markdown-to-HTML conversion in `AgentChat.tsx`
+- [x] 120+ language auto-detection with China/India dialect support — Unicode script analysis + word-level heuristics in `detectLanguage()`
+  - China: Cantonese (yue-HK), Traditional Chinese (zh-TW), Wu/Shanghainese (wuu), Min Nan/Hokkien (nan-TW), Yi (ii-CN), Tai Lü (khb-CN), Uyghur (ug-CN), Tibetan (bo-CN)
+  - India: Hindi/Marathi/Nepali/Sanskrit/Konkani/Dogri/Maithili/Bodo disambiguation within Devanagari; Bengali vs Assamese; 12+ unique-script Indian languages including Manipuri, Santali, Lepcha, Limbu, Chakma
+  - Arabic script: Arabic/Urdu/Persian/Pashto/Kurdish Sorani/Sindhi/Uyghur
+  - Cyrillic additions: Tajik, Kyrgyz, Mongolian Cyrillic
+  - Additional scripts: Thaana, N'Ko, Javanese, Balinese, Sundanese, Cherokee
+- [x] Language preference persistence — auto-save to memory + localStorage, auto-restore on session start (`persistLangToMemory()` / `loadLangFromMemory()`)
+- [x] STT (Speech-to-Text) voice input — Web Speech API with cross-browser support, real-time transcription, language-aware recognition
+- [x] TTS (Text-to-Speech) voice output — `speechSynthesis` API with auto voice selection per detected language, voice mode toggle
+- [x] Chat export functionality — Export conversations to `.doc` (MS Word compatible), `.md` (Markdown), and `.txt` formats via `exportToDoc()`, `exportToMarkdown()`, `exportToText()`
+- [x] Chat UI enhancements — Voice mode indicator, connection status, new chat button, message copy, format toggle, bottom toolbar with STT/TTS/export controls
+- [x] Dockerfile npm build step — Both `Dockerfile` and `deploy/railway/Dockerfile` now include a `node:22-alpine` web-builder stage that runs `npm ci && npm run build` automatically, ensuring frontend assets are always fresh in Docker builds
+- [x] `.gitignore` updated to track `web/dist/` — Required for `rust-embed` to bundle frontend assets into the Rust binary
+- [x] TypeScript error fixes — Fixed type safety issues in `ws.ts` (sessionId cast), `AgentChat.tsx` (SpeechRecognition types, null checks, unused variables)
+- [x] Three Chat Modes documented in ARCHITECTURE.md — App Chat (앱채팅), Channel Chat (채널채팅), Web Chat (웹채팅) with clear API key routing and Railway role
 
 ---
 
