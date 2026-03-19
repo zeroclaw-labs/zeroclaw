@@ -438,6 +438,8 @@ pub fn all_tools_with_runtime(
             );
         } else if root_config.jira.base_url.trim().is_empty() {
             tracing::warn!("Jira tool enabled but jira.base_url is empty — skipping registration");
+        } else if root_config.jira.email.trim().is_empty() {
+            tracing::warn!("Jira tool enabled but jira.email is empty — skipping registration");
         } else {
             tool_arcs.push(Arc::new(JiraTool::new(
                 root_config.jira.base_url.trim().to_string(),

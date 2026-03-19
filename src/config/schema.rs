@@ -7466,6 +7466,16 @@ impl Config {
             if self.jira.email.trim().is_empty() {
                 anyhow::bail!("jira.email must not be empty when jira.enabled = true");
             }
+            if self.jira.api_token.trim().is_empty()
+                && std::env::var("JIRA_API_TOKEN")
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+            {
+                anyhow::bail!(
+                    "jira.api_token must be set (or JIRA_API_TOKEN env var) when jira.enabled = true"
+                );
+            }
             let valid_actions = ["get_ticket", "search_tickets", "comment_ticket"];
             for action in &self.jira.allowed_actions {
                 if !valid_actions.contains(&action.as_str()) {
