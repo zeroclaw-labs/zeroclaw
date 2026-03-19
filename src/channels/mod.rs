@@ -2896,6 +2896,10 @@ pub fn build_system_prompt_with_mode(
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     autonomy_level: AutonomyLevel,
 ) -> String {
+    let autonomy_cfg = crate::config::AutonomyConfig {
+        level: autonomy_level,
+        ..Default::default()
+    };
     build_system_prompt_with_mode_and_autonomy(
         workspace_dir,
         model_name,
@@ -2903,7 +2907,7 @@ pub fn build_system_prompt_with_mode(
         skills,
         identity_config,
         bootstrap_max_chars,
-        None,
+        Some(&autonomy_cfg),
         native_tools,
         skills_prompt_mode,
     )
