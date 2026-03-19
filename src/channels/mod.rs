@@ -167,6 +167,8 @@ impl Observer for ChannelNotifyObserver {
 
 /// Per-sender conversation history for channel messages.
 type ConversationHistoryMap = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
+/// Senders that requested `/new` and must force a fresh prompt on their next message.
+type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
 /// Maximum history messages to keep per sender.
 const MAX_CHANNEL_HISTORY: usize = 50;
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -306,6 +308,7 @@ struct ChannelRuntimeContext {
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
     provider: Arc<dyn Provider>,
     default_provider: Arc<String>,
+    prompt_config: Arc<crate::config::Config>,
     memory: Arc<dyn Memory>,
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
     observer: Arc<dyn Observer>,
@@ -316,6 +319,7 @@ struct ChannelRuntimeContext {
     max_tool_iterations: usize,
     min_relevance_score: f64,
     conversation_histories: ConversationHistoryMap,
+    pending_new_sessions: PendingNewSessionSet,
     provider_cache: ProviderCacheMap,
     route_overrides: RouteSelectionMap,
     api_key: Option<String>,
@@ -942,6 +946,75 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
         .remove(sender_key);
 }
 
+fn mark_sender_for_new_session(ctx: &ChannelRuntimeContext, sender_key: &str) {
+    ctx.pending_new_sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(sender_key.to_string());
+}
+
+fn take_pending_new_session(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
+    ctx.pending_new_sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(sender_key)
+}
+
+fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -> String {
+    const SKILLS_HEADER: &str = "## Available Skills\n\n";
+    const SKILLS_END: &str = "</available_skills>";
+    const WORKSPACE_HEADER: &str = "## Workspace\n\n";
+
+    if let Some(start) = base_prompt.find(SKILLS_HEADER) {
+        if let Some(rel_end) = base_prompt[start..].find(SKILLS_END) {
+            let end = start + rel_end + SKILLS_END.len();
+            let tail = base_prompt[end..]
+                .strip_prefix("\n\n")
+                .unwrap_or(&base_prompt[end..]);
+
+            let mut refreshed = String::with_capacity(
+                base_prompt.len().saturating_sub(end.saturating_sub(start))
+                    + refreshed_skills.len()
+                    + 2,
+            );
+            refreshed.push_str(&base_prompt[..start]);
+            if !refreshed_skills.is_empty() {
+                refreshed.push_str(refreshed_skills);
+                refreshed.push_str("\n\n");
+            }
+            refreshed.push_str(tail);
+            return refreshed;
+        }
+    }
+
+    if refreshed_skills.is_empty() {
+        return base_prompt.to_string();
+    }
+
+    if let Some(workspace_start) = base_prompt.find(WORKSPACE_HEADER) {
+        let mut refreshed = String::with_capacity(base_prompt.len() + refreshed_skills.len() + 2);
+        refreshed.push_str(&base_prompt[..workspace_start]);
+        refreshed.push_str(refreshed_skills);
+        refreshed.push_str("\n\n");
+        refreshed.push_str(&base_prompt[workspace_start..]);
+        return refreshed;
+    }
+
+    format!("{base_prompt}\n\n{refreshed_skills}")
+}
+
+fn refreshed_new_session_system_prompt(ctx: &ChannelRuntimeContext) -> String {
+    let refreshed_skills = crate::skills::skills_to_prompt_with_mode(
+        &crate::skills::load_skills_with_config(
+            ctx.workspace_dir.as_ref(),
+            ctx.prompt_config.as_ref(),
+        ),
+        ctx.workspace_dir.as_ref(),
+        ctx.prompt_config.skills.prompt_injection_mode,
+    );
+    replace_available_skills_section(ctx.system_prompt.as_str(), &refreshed_skills)
+}
+
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
     let mut histories = ctx
         .conversation_histories
@@ -1366,6 +1439,7 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::NewSession => {
             clear_sender_history(ctx, &sender_key);
+            mark_sender_for_new_session(ctx, &sender_key);
             "Conversation history cleared. Starting fresh.".to_string()
         }
     };
@@ -2008,24 +2082,37 @@ async fn process_channel_message(
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
-    let had_prior_history = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&history_key)
-        .is_some_and(|turns| !turns.is_empty());
+    let force_fresh_session = take_pending_new_session(ctx.as_ref(), &history_key);
+    if force_fresh_session {
+        // `/new` should make the next user turn completely fresh even if
+        // older cached turns reappear before this message starts.
+        clear_sender_history(ctx.as_ref(), &history_key);
+    }
+
+    let had_prior_history = if force_fresh_session {
+        false
+    } else {
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&history_key)
+            .is_some_and(|turns| !turns.is_empty())
+    };
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
     append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
 
     // Build history from per-sender conversation cache.
-    let prior_turns_raw = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&history_key)
-        .cloned()
-        .unwrap_or_default();
+    let prior_turns_raw = if force_fresh_session {
+        vec![ChatMessage::user(&msg.content)]
+    } else {
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&history_key)
+            .cloned()
+            .unwrap_or_default()
+    };
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
     // Strip stale tool_result blocks from cached turns so the LLM never
@@ -2090,8 +2177,13 @@ async fn process_channel_message(
         }
     }
 
+    let base_system_prompt = if had_prior_history {
+        ctx.system_prompt.as_str().to_string()
+    } else {
+        refreshed_new_session_system_prompt(ctx.as_ref())
+    };
     let system_prompt =
-        build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
+        build_channel_system_prompt(&base_system_prompt, &msg.channel, &msg.reply_target);
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let use_streaming = target_channel
@@ -4163,6 +4255,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         channels_by_name,
         provider: Arc::clone(&provider),
         default_provider: Arc::new(provider_name),
+        prompt_config: Arc::new(config.clone()),
         memory: Arc::clone(&mem),
         tools_registry: Arc::clone(&tools_registry),
         observer,
@@ -4173,6 +4266,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         max_tool_iterations: config.agent.max_tool_iterations,
         min_relevance_score: config.memory.min_relevance_score,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         api_key: config.api_key.clone(),
@@ -4491,6 +4585,7 @@ mod tests {
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -4504,6 +4599,7 @@ mod tests {
             hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -4601,6 +4697,7 @@ mod tests {
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -4614,6 +4711,7 @@ mod tests {
             hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -4667,6 +4765,7 @@ mod tests {
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -4680,6 +4779,7 @@ mod tests {
             hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -4752,6 +4852,7 @@ mod tests {
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -4765,6 +4866,7 @@ mod tests {
             hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -5287,6 +5389,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5294,6 +5397,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -5361,6 +5465,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5368,6 +5473,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -5449,6 +5555,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5456,6 +5563,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -5522,6 +5630,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5529,6 +5638,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -5605,6 +5715,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5612,6 +5723,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -5709,6 +5821,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(route_overrides)),
             api_key: None,
@@ -5716,6 +5829,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -5794,6 +5908,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5801,6 +5916,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -5891,6 +6007,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5901,6 +6018,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..providers::ProviderRuntimeOptions::default()
             },
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -5979,6 +6097,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 12,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5986,6 +6105,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -6054,6 +6174,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 3,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6061,6 +6182,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -6240,6 +6362,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6247,6 +6370,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -6334,6 +6458,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6341,6 +6466,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
@@ -6443,6 +6569,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6450,6 +6577,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -6549,6 +6677,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6556,6 +6685,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
@@ -6637,6 +6767,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6644,6 +6775,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -6710,6 +6842,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6717,6 +6850,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -7401,6 +7535,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7408,6 +7543,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -7478,6 +7614,188 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn process_channel_message_refreshes_available_skills_after_new_session() {
+        let workspace = make_workspace();
+        let mut config = Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        config.skills.open_skills_enabled = false;
+
+        let initial_skills = crate::skills::load_skills_with_config(workspace.path(), &config);
+        assert!(initial_skills.is_empty());
+
+        let initial_system_prompt = build_system_prompt_with_mode(
+            workspace.path(),
+            "test-model",
+            &[],
+            &initial_skills,
+            Some(&config.identity),
+            None,
+            false,
+            config.skills.prompt_injection_mode,
+        );
+        assert!(
+            !initial_system_prompt.contains("refresh-test"),
+            "initial prompt should not contain the new skill before it exists"
+        );
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureProvider::default());
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new(initial_system_prompt),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(config.workspace_dir.clone()),
+            prompt_config: Arc::new(config.clone()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-before-new".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-refresh".to_string(),
+                content: "hello".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let skill_dir = workspace.path().join("skills").join("refresh-test");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: refresh-test\ndescription: Refresh the available skills section\n---\n# Refresh Test\nExpose this skill after /new.\n",
+        )
+        .unwrap();
+        let refreshed_skills = crate::skills::load_skills_with_config(workspace.path(), &config);
+        assert_eq!(refreshed_skills.len(), 1);
+        assert_eq!(refreshed_skills[0].name, "refresh-test");
+        assert!(
+            refreshed_new_session_system_prompt(runtime_ctx.as_ref())
+                .contains("<name>refresh-test</name>"),
+            "fresh-session prompt should pick up skills added after startup"
+        );
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-new-session".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-refresh".to_string(),
+                content: "/new".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !histories.contains_key("telegram_alice"),
+            "/new should clear the cached sender history before the next message"
+        );
+        drop(histories);
+
+        let pending_new_sessions = runtime_ctx
+            .pending_new_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            pending_new_sessions.contains("telegram_alice"),
+            "/new should mark the sender for a fresh next-message prompt rebuild"
+        );
+        drop(pending_new_sessions);
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-after-new".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-refresh".to_string(),
+                content: "hello again".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 3,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0][0].0, "system");
+        assert_eq!(calls[1][0].0, "system");
+        assert!(
+            !calls[0][0].1.contains("<name>refresh-test</name>"),
+            "pre-/new prompt should not advertise a skill that did not exist yet"
+        );
+        assert!(
+            calls[1][0].1.contains("<available_skills>"),
+            "post-/new prompt should contain the refreshed skills block"
+        );
+        assert!(
+            calls[1][0].1.contains("<name>refresh-test</name>"),
+            "post-/new prompt should include skills discovered after the reset"
+        );
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(sent_messages
+            .iter()
+            .any(|message| { message.contains("Conversation history cleared. Starting fresh.") }));
+    }
+
+    #[tokio::test]
     async fn process_channel_message_enriches_current_turn_without_persisting_context() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -7500,6 +7818,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7507,6 +7826,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -7599,6 +7919,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7606,6 +7927,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -8162,6 +8484,7 @@ This is an example JSON object for profile settings."#;
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -8169,6 +8492,7 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -8242,6 +8566,7 @@ This is an example JSON object for profile settings."#;
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -8249,6 +8574,7 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -8396,6 +8722,7 @@ This is an example JSON object for profile settings."#;
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -8403,6 +8730,7 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -8500,6 +8828,7 @@ This is an example JSON object for profile settings."#;
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -8507,6 +8836,7 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -8596,6 +8926,7 @@ This is an example JSON object for profile settings."#;
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -8603,6 +8934,7 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -8712,6 +9044,7 @@ This is an example JSON object for profile settings."#;
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -8719,6 +9052,7 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
