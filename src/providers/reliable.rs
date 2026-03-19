@@ -2212,4 +2212,57 @@ mod tests {
         // Should have been called twice: once with full messages, once with truncated
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
+
+    // ── Tool schema error detection tests ───────────────────────────────
+
+    #[test]
+    fn tool_schema_error_detects_groq_validation_failure() {
+        let err = anyhow::anyhow!(
+            r#"Groq API error (400 Bad Request): {"error":{"message":"tool call validation failed: attempted to call tool 'memory_recall' which was not in request"}}"#
+        );
+        assert!(is_tool_schema_error(&err));
+    }
+
+    #[test]
+    fn tool_schema_error_detects_not_in_request() {
+        let err = anyhow::anyhow!("tool 'search' was not in request");
+        assert!(is_tool_schema_error(&err));
+    }
+
+    #[test]
+    fn tool_schema_error_detects_not_found_in_tool_list() {
+        let err = anyhow::anyhow!("function 'foo' not found in tool list");
+        assert!(is_tool_schema_error(&err));
+    }
+
+    #[test]
+    fn tool_schema_error_detects_invalid_tool_call() {
+        let err = anyhow::anyhow!("invalid_tool_call: no matching function");
+        assert!(is_tool_schema_error(&err));
+    }
+
+    #[test]
+    fn tool_schema_error_ignores_unrelated_errors() {
+        let err = anyhow::anyhow!("invalid api key");
+        assert!(!is_tool_schema_error(&err));
+
+        let err = anyhow::anyhow!("model not found");
+        assert!(!is_tool_schema_error(&err));
+    }
+
+    #[test]
+    fn non_retryable_returns_false_for_tool_schema_400() {
+        // A 400 error with tool schema validation text should NOT be non-retryable.
+        let err = anyhow::anyhow!(
+            r#"400 Bad Request: tool call validation failed: attempted to call tool 'x' which was not in request"#
+        );
+        assert!(!is_non_retryable(&err));
+    }
+
+    #[test]
+    fn non_retryable_returns_true_for_other_400_errors() {
+        // A regular 400 error (e.g. invalid API key) should still be non-retryable.
+        let err = anyhow::anyhow!("400 Bad Request: invalid api key provided");
+        assert!(is_non_retryable(&err));
+    }
 }
