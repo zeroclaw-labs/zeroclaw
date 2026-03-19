@@ -510,10 +510,13 @@ fn sanitize_provider_errors(message: &str) -> Option<String> {
         .map(|s| s.trim_start())
         .unwrap_or(message);
 
+    // Detect actual ReliableProvider error dumps, not bot reasoning about providers.
+    // Real dumps have the structured format: "provider=X model=Y attempt N/M: error_type"
     let is_error_dump = text.contains("provider=")
-        && (text.contains("attempt ")
-            || text.contains("non_retryable")
-            || text.contains("rate_limited"));
+        && text.contains("model=")
+        && (text.contains("non_retryable;")
+            || text.contains("rate_limited;")
+            || text.contains("All providers/models failed"));
 
     if !is_error_dump {
         return None;

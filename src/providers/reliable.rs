@@ -222,7 +222,7 @@ fn accepted_model_prefixes(provider_name: &str) -> Option<&[&str]> {
     // Strip profile suffix: "gemini:gemini-api-1" → "gemini"
     let base = provider_name.split(':').next().unwrap_or(provider_name);
     match base {
-        "gemini" => Some(&["gemini-"]),
+        "gemini" | "google" => Some(&["gemini-"]),
         "openai-codex" => Some(&["gpt-", "o1-", "o3-", "o4-"]),
         "openai" => Some(&["gpt-", "o1-", "o3-", "o4-", "chatgpt-"]),
         "anthropic" => Some(&["claude-"]),
@@ -2125,6 +2125,9 @@ mod tests {
         ));
         assert!(!is_model_compatible("gemini", "gpt-5.1"));
         assert!(!is_model_compatible("gemini", "claude-sonnet"));
+        // "google" is an alias used in config — should behave the same
+        assert!(is_model_compatible("google", "gemini-3-flash-preview"));
+        assert!(!is_model_compatible("google", "gpt-4o"));
     }
 
     #[test]

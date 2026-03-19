@@ -290,6 +290,20 @@ fn client_key_from_request(
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Write a service token to a file with mode 0600.
+fn write_service_token_file(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    use std::io::Write;
+    f.write_all(token.as_bytes())?;
+    Ok(())
+}
+
 fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
     if configured == 0 {
         fallback.max(1)
@@ -592,6 +606,32 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.gateway.require_pairing,
         &config.gateway.paired_tokens,
     ));
+
+    // ── Service token for trusted skills ─────────────────
+    {
+        let service_token = pairing.generate_service_token();
+
+        // Write token file for external tools (E2E tests, scripts)
+        let token_path = config
+            .workspace_dir
+            .parent()
+            .map(|p| p.join("gateway_token"))
+            .unwrap_or_else(|| std::path::PathBuf::from("gateway_token"));
+        if let Err(e) = write_service_token_file(&token_path, &service_token) {
+            tracing::warn!(error = %e, "Failed to write gateway_token file");
+        } else {
+            tracing::info!(path = %token_path.display(), "Wrote gateway_token file");
+        }
+
+        // Set process-global context for skill execution
+        let gateway_url = format!("http://{}:{}", host, actual_port);
+        crate::skills::set_service_token_context(crate::skills::ServiceTokenContext {
+            token: service_token,
+            gateway_url,
+            trusted_skills: config.skills.trusted.iter().cloned().collect(),
+        });
+    }
+
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,

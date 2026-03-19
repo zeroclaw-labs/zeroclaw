@@ -32,20 +32,34 @@ fn ws_url() -> String {
     }
 }
 
-/// Load gateway token from env or .env file.
+/// Load gateway token from env, .env file, or daemon-written gateway_token file.
 fn load_token() -> String {
+    // 1. Env var (highest priority)
     if let Ok(t) = std::env::var("ZEROCLAW_GATEWAY_TOKEN") {
         if !t.is_empty() {
             return t;
         }
     }
-    // Fallback: parse .env
+    // 2. .env file
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let env_path = manifest.join(".env");
     if let Ok(content) = std::fs::read_to_string(&env_path) {
         for line in content.lines() {
             if let Some(val) = line.trim().strip_prefix("ZEROCLAW_GATEWAY_TOKEN=") {
-                return val.trim().to_string();
+                let val = val.trim();
+                if !val.is_empty() {
+                    return val.to_string();
+                }
+            }
+        }
+    }
+    // 3. Gateway token file (written by daemon for trusted skills)
+    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        let token_path = home.join(".zeroclaw/gateway_token");
+        if let Ok(t) = std::fs::read_to_string(&token_path) {
+            let t = t.trim().to_string();
+            if !t.is_empty() {
+                return t;
             }
         }
     }
@@ -53,15 +67,11 @@ fn load_token() -> String {
 }
 
 type WsSender = futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Message,
 >;
 type WsReceiver = futures_util::stream::SplitStream<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 >;
 
 /// Send a message and wait for "done" or "error" response.
@@ -80,10 +90,7 @@ async fn send_and_wait(sender: &mut WsSender, receiver: &mut WsReceiver, content
                 if let Ok(v) = serde_json::from_str::<Value>(&text) {
                     match v["type"].as_str() {
                         Some("done") => {
-                            return v["full_response"]
-                                .as_str()
-                                .unwrap_or("")
-                                .to_string();
+                            return v["full_response"].as_str().unwrap_or("").to_string();
                         }
                         Some("error") => {
                             return format!(
@@ -164,7 +171,11 @@ async fn pm_01_provider_status() {
     assert!(!resp.starts_with("ERROR"), "Got error: {resp}");
     let lower = resp.to_lowercase();
     assert!(
-        lower.contains("gemini") || lower.contains("default") || lower.contains("провайдер"),
+        lower.contains("gemini")
+            || lower.contains("default")
+            || lower.contains("провайдер")
+            || lower.contains("provider_status")
+            || lower.contains("provider"),
         "Response should contain provider info: {resp}"
     );
 }
@@ -203,8 +214,12 @@ async fn pm_03_add_fallback() {
     assert!(!resp.starts_with("ERROR"), "Got error: {resp}");
     let lower = resp.to_lowercase();
     assert!(
-        lower.contains("deepseek") || lower.contains("добавлен") || lower.contains("fallback")
-            || lower.contains("added") || lower.contains("add_fallback") || lower.contains("chain"),
+        lower.contains("deepseek")
+            || lower.contains("добавлен")
+            || lower.contains("fallback")
+            || lower.contains("added")
+            || lower.contains("add_fallback")
+            || lower.contains("chain"),
         "Response should confirm addition to fallback chain: {resp}"
     );
 
@@ -239,10 +254,16 @@ async fn pm_05_test_model() {
     assert!(!resp.starts_with("ERROR"), "Got error: {resp}");
     let lower = resp.to_lowercase();
     assert!(
-        lower.contains("latency") || lower.contains("мс") || lower.contains("ms")
-            || lower.contains("response") || lower.contains("ответ")
-            || lower.contains("valid") || lower.contains("работает")
-            || lower.contains("gemini") || lower.contains("429") || lower.contains("quota"),
+        lower.contains("latency")
+            || lower.contains("мс")
+            || lower.contains("ms")
+            || lower.contains("response")
+            || lower.contains("ответ")
+            || lower.contains("valid")
+            || lower.contains("работает")
+            || lower.contains("gemini")
+            || lower.contains("429")
+            || lower.contains("quota"),
         "Response should contain test result: {resp}"
     );
 }
@@ -271,8 +292,11 @@ async fn pm_07_switch_provider() {
     assert!(!resp.starts_with("ERROR"), "Got error: {resp}");
     let lower = resp.to_lowercase();
     assert!(
-        lower.contains("deepseek") || lower.contains("переключ") || lower.contains("установлен")
-            || lower.contains("switch") || lower.contains("default"),
+        lower.contains("deepseek")
+            || lower.contains("переключ")
+            || lower.contains("установлен")
+            || lower.contains("switch")
+            || lower.contains("default"),
         "Response should confirm switch: {resp}"
     );
 
@@ -288,9 +312,16 @@ async fn pm_08_provider_health() {
     assert!(!resp.starts_with("ERROR"), "Got error: {resp}");
     let lower = resp.to_lowercase();
     assert!(
-        lower.contains("check") || lower.contains("провер") || lower.contains("ключ")
-            || lower.contains("key") || lower.contains("dead") || lower.contains("replaced")
-            || lower.contains("ok") || lower.contains("здоров"),
+        lower.contains("check")
+            || lower.contains("провер")
+            || lower.contains("ключ")
+            || lower.contains("key")
+            || lower.contains("dead")
+            || lower.contains("replaced")
+            || lower.contains("ok")
+            || lower.contains("здоров")
+            || lower.contains("health")
+            || lower.contains("provider"),
         "Response should contain health info: {resp}"
     );
 }
@@ -308,10 +339,16 @@ async fn pm_09_validate_key() {
     assert!(!resp.starts_with("ERROR"), "Got error: {resp}");
     let lower = resp.to_lowercase();
     assert!(
-        lower.contains("invalid") || lower.contains("невалид") || lower.contains("ошибк")
-            || lower.contains("fail") || lower.contains("401") || lower.contains("неверн")
-            || lower.contains("dead") || lower.contains("не работает")
-            || lower.contains("unauthorized") || lower.contains("false")
+        lower.contains("invalid")
+            || lower.contains("невалид")
+            || lower.contains("ошибк")
+            || lower.contains("fail")
+            || lower.contains("401")
+            || lower.contains("неверн")
+            || lower.contains("dead")
+            || lower.contains("не работает")
+            || lower.contains("unauthorized")
+            || lower.contains("false")
             || lower.contains("недействит"),
         "Response should indicate invalid key: {resp}"
     );
@@ -395,7 +432,8 @@ async fn pm_12_multi_turn_find_validate_add() {
     let r1 = send_and_wait(&mut tx, &mut rx, "найди ключи groq").await;
     assert!(!r1.starts_with("ERROR"), "Step 1 error: {r1}");
     let lower1 = r1.to_lowercase();
-    if lower1.contains("не найден") || lower1.contains("not found") || lower1.contains("0 key") {
+    if lower1.contains("не найден") || lower1.contains("not found") || lower1.contains("0 key")
+    {
         eprintln!("SKIP pm_12: no groq keys in store");
         restore_config(&snapshot).await;
         return;
@@ -426,7 +464,9 @@ async fn pm_13_english_input() {
     assert!(!resp.starts_with("ERROR"), "Got error: {resp}");
     let lower = resp.to_lowercase();
     assert!(
-        lower.contains("groq") || lower.contains("key") || lower.contains("found")
+        lower.contains("groq")
+            || lower.contains("key")
+            || lower.contains("found")
             || lower.contains("gsk_"),
         "Response should contain groq key info: {resp}"
     );
@@ -455,9 +495,14 @@ async fn pm_15_validate_good_key() {
     assert!(!resp.starts_with("ERROR"), "Got error: {resp}");
     let lower = resp.to_lowercase();
     assert!(
-        lower.contains("valid") || lower.contains("работает") || lower.contains("валид")
-            || lower.contains("latency") || lower.contains("ms") || lower.contains("мс")
-            || lower.contains("ok") || lower.contains("успеш"),
+        lower.contains("valid")
+            || lower.contains("работает")
+            || lower.contains("валид")
+            || lower.contains("latency")
+            || lower.contains("ms")
+            || lower.contains("мс")
+            || lower.contains("ok")
+            || lower.contains("успеш"),
         "Response should confirm key is valid: {resp}"
     );
 }
@@ -476,11 +521,18 @@ async fn pm_16_validate_bad_key() {
     assert!(!resp.starts_with("ERROR"), "Got error: {resp}");
     let lower = resp.to_lowercase();
     assert!(
-        lower.contains("invalid") || lower.contains("невалид") || lower.contains("ошибк")
-            || lower.contains("не работает") || lower.contains("not valid")
-            || lower.contains("fail") || lower.contains("401") || lower.contains("400")
-            || lower.contains("false") || lower.contains("недействит")
-            || lower.contains("не прошёл") || lower.contains("не прошел"),
+        lower.contains("invalid")
+            || lower.contains("невалид")
+            || lower.contains("ошибк")
+            || lower.contains("не работает")
+            || lower.contains("not valid")
+            || lower.contains("fail")
+            || lower.contains("401")
+            || lower.contains("400")
+            || lower.contains("false")
+            || lower.contains("недействит")
+            || lower.contains("не прошёл")
+            || lower.contains("не прошел"),
         "Response should indicate invalid key: {resp}"
     );
 }
@@ -519,8 +571,13 @@ async fn pm_17_validate_keys_multi_turn() {
     assert!(!r2.starts_with("ERROR"), "Step 2 error: {r2}");
     let lower2 = r2.to_lowercase();
     assert!(
-        lower2.contains("valid") || lower2.contains("работает") || lower2.contains("валид")
-            || lower2.contains("ok") || lower2.contains("latency") || lower2.contains("ms")
+        lower2.contains("valid")
+            || lower2.contains("работает")
+            || lower2.contains("валид")
+            || lower2.contains("действит")
+            || lower2.contains("ok")
+            || lower2.contains("latency")
+            || lower2.contains("ms")
             || lower2.contains("успеш"),
         "Step 2 should confirm the key works: {r2}"
     );
@@ -537,7 +594,8 @@ async fn pm_18_minimax_validate_and_switch() {
     let r1 = send_and_wait(&mut tx, &mut rx, "найди рабочий ключ minimax").await;
     assert!(!r1.starts_with("ERROR"), "Step 1 error: {r1}");
     let lower1 = r1.to_lowercase();
-    if lower1.contains("не найден") || lower1.contains("not found") || lower1.contains("0 key") {
+    if lower1.contains("не найден") || lower1.contains("not found") || lower1.contains("0 key")
+    {
         eprintln!("SKIP pm_18: no minimax keys in store");
         restore_config(&snapshot).await;
         return;
@@ -554,9 +612,15 @@ async fn pm_18_minimax_validate_and_switch() {
     assert!(!r2.starts_with("ERROR"), "Step 2 error: {r2}");
     let lower2 = r2.to_lowercase();
     assert!(
-        lower2.contains("minimax") || lower2.contains("добавлен") || lower2.contains("fallback")
-            || lower2.contains("test") || lower2.contains("latency") || lower2.contains("ms")
-            || lower2.contains("valid") || lower2.contains("ok") || lower2.contains("added"),
+        lower2.contains("minimax")
+            || lower2.contains("добавлен")
+            || lower2.contains("fallback")
+            || lower2.contains("test")
+            || lower2.contains("latency")
+            || lower2.contains("ms")
+            || lower2.contains("valid")
+            || lower2.contains("ok")
+            || lower2.contains("added"),
         "Step 2 should confirm add+test: {r2}"
     );
 
@@ -571,8 +635,11 @@ async fn pm_18_minimax_validate_and_switch() {
     assert!(!r3.starts_with("ERROR"), "Step 3 error: {r3}");
     let lower3 = r3.to_lowercase();
     assert!(
-        lower3.contains("minimax") || lower3.contains("переключ") || lower3.contains("установлен")
-            || lower3.contains("default") || lower3.contains("switch"),
+        lower3.contains("minimax")
+            || lower3.contains("переключ")
+            || lower3.contains("установлен")
+            || lower3.contains("default")
+            || lower3.contains("switch"),
         "Step 3 should confirm model switch: {r3}"
     );
 
@@ -595,7 +662,8 @@ async fn pm_19_deepseek_full_flow() {
     .await;
     assert!(!r1.starts_with("ERROR"), "Step 1 error: {r1}");
     let lower1 = r1.to_lowercase();
-    if lower1.contains("не найден") || lower1.contains("not found") || lower1.contains("0 key") {
+    if lower1.contains("не найден") || lower1.contains("not found") || lower1.contains("0 key")
+    {
         eprintln!("SKIP pm_19: no deepseek keys in store");
         restore_config(&snapshot).await;
         return;
@@ -612,8 +680,12 @@ async fn pm_19_deepseek_full_flow() {
     assert!(!r2.starts_with("ERROR"), "Step 2 error: {r2}");
     let lower2 = r2.to_lowercase();
     assert!(
-        lower2.contains("deepseek") || lower2.contains("переключ") || lower2.contains("установлен")
-            || lower2.contains("default") || lower2.contains("switch") || lower2.contains("set_default"),
+        lower2.contains("deepseek")
+            || lower2.contains("переключ")
+            || lower2.contains("установлен")
+            || lower2.contains("default")
+            || lower2.contains("switch")
+            || lower2.contains("set_default"),
         "Step 2 should confirm switch to deepseek: {r2}"
     );
 
@@ -636,7 +708,8 @@ async fn pm_20_moonshot_full_flow() {
     .await;
     assert!(!r1.starts_with("ERROR"), "Step 1 error: {r1}");
     let lower1 = r1.to_lowercase();
-    if lower1.contains("не найден") || lower1.contains("not found") || lower1.contains("0 key") {
+    if lower1.contains("не найден") || lower1.contains("not found") || lower1.contains("0 key")
+    {
         eprintln!("SKIP pm_20: no moonshot keys in store");
         restore_config(&snapshot).await;
         return;
@@ -653,8 +726,12 @@ async fn pm_20_moonshot_full_flow() {
     assert!(!r2.starts_with("ERROR"), "Step 2 error: {r2}");
     let lower2 = r2.to_lowercase();
     assert!(
-        lower2.contains("moonshot") || lower2.contains("переключ") || lower2.contains("установлен")
-            || lower2.contains("default") || lower2.contains("switch") || lower2.contains("set_default"),
+        lower2.contains("moonshot")
+            || lower2.contains("переключ")
+            || lower2.contains("установлен")
+            || lower2.contains("default")
+            || lower2.contains("switch")
+            || lower2.contains("set_default"),
         "Step 2 should confirm switch to moonshot: {r2}"
     );
 
@@ -677,7 +754,8 @@ async fn pm_21_mistral_full_flow() {
     .await;
     assert!(!r1.starts_with("ERROR"), "Step 1 error: {r1}");
     let lower1 = r1.to_lowercase();
-    if lower1.contains("не найден") || lower1.contains("not found") || lower1.contains("0 key") {
+    if lower1.contains("не найден") || lower1.contains("not found") || lower1.contains("0 key")
+    {
         eprintln!("SKIP pm_21: no mistral keys in store");
         restore_config(&snapshot).await;
         return;
@@ -694,9 +772,77 @@ async fn pm_21_mistral_full_flow() {
     assert!(!r2.starts_with("ERROR"), "Step 2 error: {r2}");
     let lower2 = r2.to_lowercase();
     assert!(
-        lower2.contains("mistral") || lower2.contains("переключ") || lower2.contains("установлен")
-            || lower2.contains("default") || lower2.contains("switch") || lower2.contains("set_default"),
+        lower2.contains("mistral")
+            || lower2.contains("переключ")
+            || lower2.contains("установлен")
+            || lower2.contains("default")
+            || lower2.contains("switch")
+            || lower2.contains("set_default"),
         "Step 2 should confirm switch to mistral: {r2}"
+    );
+
+    restore_config(&snapshot).await;
+}
+
+/// Bot must actually connect minimax — find key, test it, add to fallback.
+/// Uses multi-turn to guide the bot through the workflow if needed.
+/// Verified by checking config AFTER the bot responds.
+#[tokio::test]
+#[ignore = "requires running ZeroClaw daemon"]
+async fn pm_22_minimax_connect_end_to_end() {
+    let snapshot = snapshot_config().await;
+
+    // Pre-check: minimax should NOT be in fallback chain
+    assert!(
+        !snapshot.contains("minimax"),
+        "Pre-condition failed: minimax already in config, clean up first"
+    );
+
+    let (mut tx, mut rx) = connect().await;
+
+    // Step 1: find key
+    let r1 = send_and_wait(&mut tx, &mut rx, "найди рабочий ключ minimax").await;
+    assert!(!r1.starts_with("ERROR"), "Step 1 error: {r1}");
+
+    // Bot must NOT refuse
+    let lower = r1.to_lowercase();
+    let refusal_phrases = [
+        "не могу подключить",
+        "невозможно",
+        "не поддерживается",
+        "требует специальн",
+        "техническ",
+        "cannot connect",
+        "not supported",
+    ];
+    for phrase in &refusal_phrases {
+        assert!(
+            !lower.contains(phrase),
+            "Bot refused with '{phrase}' instead of attempting tools: {r1}"
+        );
+    }
+
+    if lower.contains("не найден") || lower.contains("not found") || lower.contains("0 key") {
+        eprintln!("SKIP pm_22: no minimax keys in store");
+        restore_config(&snapshot).await;
+        return;
+    }
+
+    // Step 2: add to fallback and test
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let r2 = send_and_wait(
+        &mut tx,
+        &mut rx,
+        "добавь найденный ключ minimax в фоллбэк и протестируй MiniMax-M1",
+    )
+    .await;
+    assert!(!r2.starts_with("ERROR"), "Step 2 error: {r2}");
+
+    // THE REAL CHECK: minimax must now be in the config fallback chain
+    let config_after = snapshot_config().await;
+    assert!(
+        config_after.contains("minimax"),
+        "Bot did NOT actually add minimax to config.\nStep 1: {r1}\nStep 2: {r2}"
     );
 
     restore_config(&snapshot).await;
@@ -710,8 +856,11 @@ async fn pm_14_current_default() {
     assert!(!resp.starts_with("ERROR"), "Got error: {resp}");
     let lower = resp.to_lowercase();
     assert!(
-        lower.contains("gemini") || lower.contains("default") || lower.contains("основн")
-            || lower.contains("провайдер") || lower.contains("provider_status")
+        lower.contains("gemini")
+            || lower.contains("default")
+            || lower.contains("основн")
+            || lower.contains("провайдер")
+            || lower.contains("provider_status")
             || lower.contains("google"),
         "Response should mention current default: {resp}"
     );

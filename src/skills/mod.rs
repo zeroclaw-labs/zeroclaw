@@ -11,7 +11,32 @@ pub mod tool_handler;
 
 use crate::security::SecurityPolicy;
 use crate::tools::traits::Tool;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+
+/// Runtime context for injecting gateway credentials into trusted skills.
+pub struct ServiceTokenContext {
+    pub token: String,
+    pub gateway_url: String,
+    pub trusted_skills: HashSet<String>,
+}
+
+static SERVICE_TOKEN_CTX: RwLock<Option<ServiceTokenContext>> = RwLock::new(None);
+
+/// Set the process-global service token context (called once at gateway startup).
+pub fn set_service_token_context(ctx: ServiceTokenContext) {
+    *SERVICE_TOKEN_CTX.write().unwrap() = Some(ctx);
+}
+
+/// Get gateway credentials for a skill if it is trusted.
+fn get_gateway_creds_for_skill(skill_name: &str) -> Option<(String, String)> {
+    let guard = SERVICE_TOKEN_CTX.read().unwrap();
+    let ctx = guard.as_ref()?;
+    if ctx.trusted_skills.contains(skill_name) {
+        Some((ctx.token.clone(), ctx.gateway_url.clone()))
+    } else {
+        None
+    }
+}
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
@@ -140,6 +165,7 @@ pub fn create_skill_tools(
             .location
             .as_ref()
             .and_then(|p| p.parent().map(PathBuf::from));
+        let gateway_creds = get_gateway_creds_for_skill(&skill_name);
 
         for tool_def in skill.tools {
             let tool_name = tool_def.name.clone();
@@ -148,6 +174,7 @@ pub fn create_skill_tools(
                 tool_def,
                 security.clone(),
                 skill_dir.clone(),
+                gateway_creds.clone(),
             ) {
                 Ok(handler) => {
                     tracing::info!(
@@ -1796,6 +1823,26 @@ command = "echo hello"
         assert!(skills[0].tags.iter().any(|tag| tag == "open-skills"));
         assert!(skills[0].prompts[0].contains("# PDF Guide"));
         assert!(!skills[0].prompts[0].contains("description: Use this skill"));
+    }
+
+    #[test]
+    fn service_token_context_trusted_and_untrusted() {
+        // Single test to avoid race conditions on the global RwLock.
+        set_service_token_context(ServiceTokenContext {
+            token: "zc_test_token".to_string(),
+            gateway_url: "http://127.0.0.1:42617".to_string(),
+            trusted_skills: ["my-skill".to_string()].into_iter().collect(),
+        });
+
+        // Trusted skill gets credentials
+        let creds = get_gateway_creds_for_skill("my-skill");
+        assert!(creds.is_some());
+        let (token, url) = creds.unwrap();
+        assert_eq!(token, "zc_test_token");
+        assert_eq!(url, "http://127.0.0.1:42617");
+
+        // Untrusted skill gets None
+        assert!(get_gateway_creds_for_skill("untrusted-skill").is_none());
     }
 }
 

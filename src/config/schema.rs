@@ -1197,6 +1197,11 @@ pub struct SkillsConfig {
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
+    /// List of skill names trusted for gateway API access.
+    /// Trusted skills receive ZEROCLAW_GATEWAY_TOKEN and ZEROCLAW_GATEWAY_URL
+    /// as environment variables at execution time.
+    #[serde(default)]
+    pub trusted: Vec<String>,
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
@@ -11878,5 +11883,32 @@ require_otp_to_resume = true
             debug_output.contains("[REDACTED]"),
             "Debug output must show [REDACTED] for client_secret"
         );
+    }
+
+    #[test]
+    async fn skills_config_trusted_deserializes() {
+        let toml_str = r#"
+            [skills]
+            trusted = ["provider-manager", "erp-analyst"]
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            skills: SkillsConfig,
+        }
+        let w: Wrapper = toml::from_str(toml_str).unwrap();
+        assert_eq!(w.skills.trusted, vec!["provider-manager", "erp-analyst"]);
+    }
+
+    #[test]
+    async fn skills_config_trusted_defaults_to_empty() {
+        let toml_str = r#"
+            [skills]
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            skills: SkillsConfig,
+        }
+        let w: Wrapper = toml::from_str(toml_str).unwrap();
+        assert!(w.skills.trusted.is_empty());
     }
 }

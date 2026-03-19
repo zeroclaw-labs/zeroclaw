@@ -47,15 +47,22 @@ pub struct SkillToolHandler {
     skill_dir: Option<PathBuf>,
     /// Per-tool concurrency limiter. None = unlimited.
     concurrency_limit: Option<Arc<tokio::sync::Semaphore>>,
+    /// Gateway credentials for trusted skills (None for untrusted).
+    gateway_token: Option<String>,
+    gateway_url: Option<String>,
 }
 
 impl SkillToolHandler {
     /// Create a new skill tool handler from a skill tool definition.
+    ///
+    /// `gateway_creds` is `Some((token, url))` for trusted skills that should
+    /// receive gateway credentials as environment variables.
     pub fn new(
         skill_name: String,
         tool_def: SkillTool,
         security: Arc<SecurityPolicy>,
         skill_dir: Option<PathBuf>,
+        gateway_creds: Option<(String, String)>,
     ) -> Result<Self> {
         if !tool_def.kind.eq_ignore_ascii_case("shell") {
             bail!(
@@ -67,6 +74,10 @@ impl SkillToolHandler {
         let concurrency_limit = tool_def
             .max_parallel
             .map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
+        let (gateway_token, gateway_url) = match gateway_creds {
+            Some((t, u)) => (Some(t), Some(u)),
+            None => (None, None),
+        };
         Ok(Self {
             skill_name,
             tool_def,
@@ -74,6 +85,8 @@ impl SkillToolHandler {
             security,
             skill_dir,
             concurrency_limit,
+            gateway_token,
+            gateway_url,
         })
     }
 
@@ -426,6 +439,14 @@ impl Tool for SkillToolHandler {
             cmd.env(key, val);
         }
 
+        // Inject gateway credentials for trusted skills.
+        if let Some(ref token) = self.gateway_token {
+            cmd.env("ZEROCLAW_GATEWAY_TOKEN", token);
+        }
+        if let Some(ref url) = self.gateway_url {
+            cmd.env("ZEROCLAW_GATEWAY_URL", url);
+        }
+
         // Inject reply-to message ID from channel context so skill scripts
         // can reply to the user's original message.
         if let Ok(Some(reply_to)) =
@@ -503,7 +524,8 @@ mod tests {
     fn test_skill_tool_handler_name() {
         let tool_def = test_tool_def("echo hello", HashMap::new());
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test-skill".into(), tool_def, security, None).unwrap();
+        let handler =
+            SkillToolHandler::new("test-skill".into(), tool_def, security, None, None).unwrap();
         assert_eq!(handler.name(), "test_tool");
     }
 
@@ -511,7 +533,8 @@ mod tests {
     fn test_skill_tool_handler_description() {
         let tool_def = test_tool_def("echo hello", HashMap::new());
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test-skill".into(), tool_def, security, None).unwrap();
+        let handler =
+            SkillToolHandler::new("test-skill".into(), tool_def, security, None, None).unwrap();
         assert_eq!(handler.description(), "Test tool");
     }
 
@@ -519,7 +542,8 @@ mod tests {
     fn test_skill_tool_handler_tags() {
         let tool_def = test_tool_def("echo hello", HashMap::new());
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test-skill".into(), tool_def, security, None).unwrap();
+        let handler =
+            SkillToolHandler::new("test-skill".into(), tool_def, security, None, None).unwrap();
         assert_eq!(handler.tags(), &["test-tag".to_string()]);
     }
 
@@ -527,7 +551,8 @@ mod tests {
     fn test_skill_tool_handler_terminal() {
         let tool_def = test_tool_def("echo hello", HashMap::new());
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test-skill".into(), tool_def, security, None).unwrap();
+        let handler =
+            SkillToolHandler::new("test-skill".into(), tool_def, security, None, None).unwrap();
         assert!(handler.is_terminal());
     }
 
@@ -541,7 +566,8 @@ mod tests {
         .collect();
         let tool_def = test_tool_def("echo {message} --count {count}", args);
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test-skill".into(), tool_def, security, None).unwrap();
+        let handler =
+            SkillToolHandler::new("test-skill".into(), tool_def, security, None, None).unwrap();
         let schema = handler.parameters_schema();
 
         assert_eq!(schema["type"], "object");
@@ -626,7 +652,7 @@ mod tests {
         .collect();
         let tool_def = test_tool_def("python3 script.py --limit {limit} --name {name}", args_map);
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".into(), tool_def, security, None).unwrap();
+        let handler = SkillToolHandler::new("test".into(), tool_def, security, None, None).unwrap();
 
         let args = serde_json::json!({"limit": 100, "name": "alice"});
         let command = handler.render_command(&args).unwrap();
@@ -647,7 +673,7 @@ mod tests {
             args_map,
         );
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".into(), tool_def, security, None).unwrap();
+        let handler = SkillToolHandler::new("test".into(), tool_def, security, None, None).unwrap();
 
         let args = serde_json::json!({"required": "value"});
         let command = handler.render_command(&args).unwrap();
@@ -662,7 +688,7 @@ mod tests {
             .collect();
         let tool_def = test_tool_def("echo {message}", args_map);
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".into(), tool_def, security, None).unwrap();
+        let handler = SkillToolHandler::new("test".into(), tool_def, security, None, None).unwrap();
 
         let args = serde_json::json!({"message": "hello; rm -rf /"});
         let command = handler.render_command(&args).unwrap();
@@ -687,7 +713,7 @@ mod tests {
             args_map,
         );
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".into(), tool_def, security, None).unwrap();
+        let handler = SkillToolHandler::new("test".into(), tool_def, security, None, None).unwrap();
 
         let args = serde_json::json!({"query": "test search", "channel_filter": null, "limit": 50});
         let command = handler.render_command(&args).unwrap();
@@ -709,7 +735,7 @@ mod tests {
             args_map,
         );
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".into(), tool_def, security, None).unwrap();
+        let handler = SkillToolHandler::new("test".into(), tool_def, security, None, None).unwrap();
 
         let args = serde_json::json!({"query": "test", "date_from": ""});
         let command = handler.render_command(&args).unwrap();
@@ -733,7 +759,7 @@ mod tests {
             args_map,
         );
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".into(), tool_def, security, None).unwrap();
+        let handler = SkillToolHandler::new("test".into(), tool_def, security, None, None).unwrap();
 
         let args = serde_json::json!({"contact_name": 5_084_292_206_i64, "limit": 100});
         let command = handler.render_command(&args).unwrap();
@@ -758,7 +784,7 @@ mod tests {
             env: HashMap::new(),
         };
         let security = Arc::new(SecurityPolicy::default());
-        let result = SkillToolHandler::new("test".into(), tool_def, security, None);
+        let result = SkillToolHandler::new("test".into(), tool_def, security, None, None);
         assert!(result.is_err());
     }
 
@@ -780,7 +806,7 @@ mod tests {
             env: HashMap::new(),
         };
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".into(), tool_def, security, None).unwrap();
+        let handler = SkillToolHandler::new("test".into(), tool_def, security, None, None).unwrap();
 
         let result = handler
             .execute(serde_json::json!({"message": "hello world"}))
@@ -810,7 +836,7 @@ mod tests {
         let mut policy = SecurityPolicy::default();
         policy.allowed_commands.push("env".into());
         let security = Arc::new(policy);
-        let handler = SkillToolHandler::new("test".into(), tool_def, security, None).unwrap();
+        let handler = SkillToolHandler::new("test".into(), tool_def, security, None, None).unwrap();
 
         let result = handler.execute(serde_json::json!({})).await.unwrap();
         assert!(
@@ -821,6 +847,75 @@ mod tests {
         assert!(
             result.output.contains("SKILL_MY_VAR=hello_from_env"),
             "Expected env var in output, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_injects_gateway_creds_for_trusted_skill() {
+        let tool_def = SkillTool {
+            name: "env_tool".into(),
+            description: "Print env".into(),
+            kind: "shell".into(),
+            command: "env".into(),
+            args: HashMap::new(),
+            tags: Vec::new(),
+            terminal: false,
+            max_parallel: None,
+            max_result_chars: None,
+            max_calls_per_turn: None,
+            env: HashMap::new(),
+        };
+        let mut policy = SecurityPolicy::default();
+        policy.allowed_commands.push("env".into());
+        let security = Arc::new(policy);
+        let creds = Some(("zc_trusted_token".to_string(), "http://gw:1234".to_string()));
+        let handler =
+            SkillToolHandler::new("trusted-skill".into(), tool_def, security, None, creds).unwrap();
+
+        let result = handler.execute(serde_json::json!({})).await.unwrap();
+        assert!(result.success, "Command should succeed: {}", result.output);
+        assert!(
+            result.output.contains("ZEROCLAW_GATEWAY_TOKEN="),
+            "Should contain gateway token env var: {}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("ZEROCLAW_GATEWAY_URL=http://gw:1234"),
+            "Should contain gateway URL env var: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_no_gateway_creds_for_untrusted_skill() {
+        let tool_def = SkillTool {
+            name: "env_tool".into(),
+            description: "Print env".into(),
+            kind: "shell".into(),
+            command: "env".into(),
+            args: HashMap::new(),
+            tags: Vec::new(),
+            terminal: false,
+            max_parallel: None,
+            max_result_chars: None,
+            max_calls_per_turn: None,
+            env: HashMap::new(),
+        };
+        let mut policy = SecurityPolicy::default();
+        policy.allowed_commands.push("env".into());
+        let security = Arc::new(policy);
+        let handler =
+            SkillToolHandler::new("untrusted-skill".into(), tool_def, security, None, None)
+                .unwrap();
+
+        let result = handler.execute(serde_json::json!({})).await.unwrap();
+        assert!(result.success, "Command should succeed: {}", result.output);
+        assert!(
+            !result.output.contains("ZEROCLAW_GATEWAY_TOKEN="),
+            "Should NOT contain gateway token: {}",
             result.output
         );
     }

@@ -238,6 +238,15 @@ impl PairingGuard {
         hex::encode(Sha256::digest(token.as_bytes()))
     }
 
+    /// Generate a service token for trusted skills.
+    /// Stores the hash in paired_tokens, returns plaintext.
+    pub fn generate_service_token(&self) -> String {
+        let token = generate_token();
+        let hash = hash_token(&token);
+        self.paired_tokens.lock().insert(hash);
+        token
+    }
+
     /// Check if a token is paired and return its hash.
     pub fn authenticate_and_hash(&self, token: &str) -> Option<String> {
         if self.is_authenticated(token) {
@@ -727,6 +736,20 @@ mod tests {
         assert!(
             state.0.contains_key("fresh_client"),
             "Fresh client should still be tracked"
+        );
+    }
+
+    #[test]
+    async fn generate_service_token_returns_valid_token() {
+        let guard = PairingGuard::new(true, &[]);
+        let token = guard.generate_service_token();
+        assert!(
+            token.starts_with("zc_"),
+            "Service token should have zc_ prefix"
+        );
+        assert!(
+            guard.is_authenticated(&token),
+            "Service token should pass authentication"
         );
     }
 
