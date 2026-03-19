@@ -3271,6 +3271,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     sl.channel_id.clone(),
                     Vec::new(),
                     sl.allowed_users.clone(),
+                    sl.thread_replies.unwrap_or(true),
                 )
                 .with_workspace_dir(config.workspace_dir.clone()),
             ))
@@ -3368,6 +3369,7 @@ fn collect_configured_channels(
                     sl.channel_id.clone(),
                     Vec::new(),
                     sl.allowed_users.clone(),
+                    sl.thread_replies.unwrap_or(true),
                 )
                 .with_group_reply_policy(sl.mention_only, Vec::new())
                 .with_workspace_dir(config.workspace_dir.clone()),

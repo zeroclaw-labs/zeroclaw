@@ -4624,6 +4624,10 @@ pub struct SlackConfig {
     /// Direct messages remain allowed.
     #[serde(default)]
     pub mention_only: bool,
+    /// When true (default), replies thread on the original post.
+    /// When false, replies go to the channel root.
+    #[serde(default)]
+    pub thread_replies: Option<bool>,
 }
 
 impl ChannelConfig for SlackConfig {
