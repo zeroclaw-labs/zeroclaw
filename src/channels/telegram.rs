@@ -332,6 +332,11 @@ pub struct TelegramChannel {
     transcription: Option<crate::config::TranscriptionConfig>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
+    ack_reactions: bool,
+    tts_config: Option<crate::config::TtsConfig>,
+    voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    pending_voice:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,7 +375,17 @@ impl TelegramChannel {
             transcription: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
+            ack_reactions: true,
+            tts_config: None,
+            voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Configure whether Telegram-native acknowledgement reactions are sent.
+    pub fn with_ack_reactions(mut self, enabled: bool) -> Self {
+        self.ack_reactions = enabled;
+        self
     }
 
     /// Configure workspace directory for saving downloaded attachments.
@@ -401,6 +416,14 @@ impl TelegramChannel {
     pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
         if config.enabled {
             self.transcription = Some(config);
+        }
+        self
+    }
+
+    /// Configure text-to-speech for outgoing voice replies.
+    pub fn with_tts(mut self, config: crate::config::TtsConfig) -> Self {
+        if config.enabled {
+            self.tts_config = Some(config);
         }
         self
     }
@@ -545,6 +568,51 @@ impl TelegramChannel {
 
     fn api_url(&self, method: &str) -> String {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
+    }
+
+    /// Synthesize text to speech and send as a Telegram voice note (static version for spawned tasks).
+    async fn synthesize_and_send_voice(
+        api_base: &str,
+        bot_token: &str,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        text: &str,
+        tts_config: &crate::config::TtsConfig,
+    ) -> anyhow::Result<()> {
+        let tts_manager = super::tts::TtsManager::new(tts_config)?;
+        let audio_bytes = tts_manager.synthesize(text).await?;
+        let audio_len = audio_bytes.len();
+        tracing::info!("Telegram TTS: synthesized {audio_len} bytes of audio");
+
+        if audio_bytes.is_empty() {
+            anyhow::bail!("TTS returned empty audio");
+        }
+
+        let url = format!("{api_base}/bot{bot_token}/sendVoice");
+        let client = crate::config::build_runtime_proxy_client("channel.telegram");
+
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part(
+                "voice",
+                reqwest::multipart::Part::bytes(audio_bytes)
+                    .file_name("voice.ogg")
+                    .mime_str("audio/ogg")?,
+            );
+
+        if let Some(tid) = thread_id {
+            form = form.text("message_thread_id", tid.to_string());
+        }
+
+        let resp = client.post(&url).multipart(form).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("sendVoice failed: status={status}, body={body}");
+        }
+
+        tracing::info!("Telegram TTS: sent voice note ({audio_len} bytes)");
+        Ok(())
     }
 
     async fn classify_edit_message_response(resp: reqwest::Response) -> EditMessageResult {
@@ -1165,6 +1233,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return None;
         }
 
+        // Enter voice-chat mode so outgoing replies get a TTS voice note
+        if let Ok(mut vc) = self.voice_chats.lock() {
+            vc.insert(reply_target.clone());
+        }
+
         // Cache transcription for reply-context lookups
         {
             let mut cache = self.voice_transcriptions.lock();
@@ -1335,6 +1408,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         } else {
             content
         };
+
+        // Exit voice-chat mode when user switches back to typing
+        if let Ok(mut vc) = self.voice_chats.lock() {
+            vc.remove(&reply_target);
+        }
 
         Some(ChannelMessage {
             id: format!("telegram_{chat_id}_{message_id}"),
@@ -2501,6 +2579,84 @@ impl Channel for TelegramChannel {
             None => (message.recipient.as_str(), None),
         };
 
+        // Voice chat mode: send text normally AND queue a voice note of the
+        // final answer. Text in → text out. Voice in → text + voice out.
+        let is_voice_chat = self
+            .voice_chats
+            .lock()
+            .map(|vs| vs.contains(&message.recipient))
+            .unwrap_or(false);
+
+        if is_voice_chat && self.tts_config.is_some() {
+            // Only queue substantive natural-language replies for voice.
+            // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
+            let is_substantive = content.len() > 40
+                && !content.starts_with("http")
+                && !content.starts_with('{')
+                && !content.starts_with('[')
+                && !content.starts_with("Error")
+                && !content.contains("```")
+                && !content.contains("tool_call")
+                && !content.contains("wttr.in");
+
+            if is_substantive {
+                if let Ok(mut pv) = self.pending_voice.lock() {
+                    pv.insert(
+                        message.recipient.clone(),
+                        (content.clone(), std::time::Instant::now()),
+                    );
+                }
+
+                let pending = self.pending_voice.clone();
+                let voice_chats = self.voice_chats.clone();
+                let api_base = self.api_base.clone();
+                let bot_token = self.bot_token.clone();
+                let chat_id_owned = chat_id.to_string();
+                let thread_id_owned = thread_id.map(str::to_string);
+                let recipient = message.recipient.clone();
+                let tts_config = self.tts_config.clone().unwrap();
+                tokio::spawn(async move {
+                    // Wait 10 seconds — long enough for the agent to finish its
+                    // full tool chain and send the final answer.
+                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+                    // Atomic check-and-remove: only one task gets the value
+                    let to_voice = pending.lock().ok().and_then(|mut pv| {
+                        if let Some((_, ts)) = pv.get(&recipient) {
+                            if ts.elapsed().as_secs() >= 8 {
+                                return pv.remove(&recipient).map(|(text, _)| text);
+                            }
+                        }
+                        None
+                    });
+
+                    if let Some(text) = to_voice {
+                        if let Ok(mut vc) = voice_chats.lock() {
+                            vc.remove(&recipient);
+                        }
+                        match Self::synthesize_and_send_voice(
+                            &api_base,
+                            &bot_token,
+                            &chat_id_owned,
+                            thread_id_owned.as_deref(),
+                            &text,
+                            &tts_config,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                tracing::info!("Telegram: voice reply sent ({} chars)", text.len());
+                            }
+                            Err(e) => {
+                                tracing::warn!("Telegram: TTS voice reply failed: {e}");
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        // Always send text reply (voice chat gets both text and voice)
         let (text_without_markers, attachments) = parse_attachment_markers(&content);
 
         if !attachments.is_empty() {
@@ -2689,13 +2845,15 @@ Ensure only one `zeroclaw` process is using this bot token."
                         continue;
                     };
 
-                    if let Some((reaction_chat_id, reaction_message_id)) =
-                        Self::extract_update_message_target(update)
-                    {
-                        self.try_add_ack_reaction_nonblocking(
-                            reaction_chat_id,
-                            reaction_message_id,
-                        );
+                    if self.ack_reactions {
+                        if let Some((reaction_chat_id, reaction_message_id)) =
+                            Self::extract_update_message_target(update)
+                        {
+                            self.try_add_ack_reaction_nonblocking(
+                                reaction_chat_id,
+                                reaction_message_id,
+                            );
+                        }
                     }
 
                     // Send "typing" indicator immediately when we receive a message
@@ -4680,5 +4838,25 @@ mod tests {
         // The combination of marker_count > 0 && !supports_vision() means
         // the agent loop will return ProviderCapabilityError before calling
         // the provider, and the channel will send "⚠️ Error: ..." to the user.
+    }
+
+    #[test]
+    fn ack_reactions_defaults_to_true() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        assert!(ch.ack_reactions);
+    }
+
+    #[test]
+    fn with_ack_reactions_false_disables_reactions() {
+        let ch =
+            TelegramChannel::new("token".into(), vec!["*".into()], false).with_ack_reactions(false);
+        assert!(!ch.ack_reactions);
+    }
+
+    #[test]
+    fn with_ack_reactions_true_keeps_reactions() {
+        let ch =
+            TelegramChannel::new("token".into(), vec!["*".into()], false).with_ack_reactions(true);
+        assert!(ch.ack_reactions);
     }
 }

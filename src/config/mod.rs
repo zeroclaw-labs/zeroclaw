@@ -14,19 +14,19 @@ pub use schema::{
     FeishuConfig, GatewayConfig, GoogleSttConfig, GoogleTtsConfig, GoogleWorkspaceConfig,
     HardwareConfig, HardwareTransport, HeartbeatConfig, HooksConfig, HttpRequestConfig,
     IMessageConfig, IdentityConfig, ImageProviderDalleConfig, ImageProviderFluxConfig,
-    ImageProviderImagenConfig, ImageProviderStabilityConfig, KnowledgeConfig, LarkConfig,
-    LinkedInConfig, LinkedInContentConfig, LinkedInImageConfig, MatrixConfig, McpConfig,
-    McpServerConfig, McpTransport, MemoryConfig, Microsoft365Config, ModelRouteConfig,
+    ImageProviderImagenConfig, ImageProviderStabilityConfig, JiraConfig, KnowledgeConfig,
+    LarkConfig, LinkedInConfig, LinkedInContentConfig, LinkedInImageConfig, MatrixConfig,
+    McpConfig, McpServerConfig, McpTransport, MemoryConfig, Microsoft365Config, ModelRouteConfig,
     MultimodalConfig, NextcloudTalkConfig, NodeTransportConfig, NodesConfig, NotionConfig,
     ObservabilityConfig, OpenAiSttConfig, OpenAiTtsConfig, OpenVpnTunnelConfig, OtpConfig,
     OtpMethod, PeripheralBoardConfig, PeripheralsConfig, PluginsConfig, ProjectIntelConfig,
     ProxyConfig, ProxyScope, QdrantConfig, QueryClassificationConfig, ReliabilityConfig,
     ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig,
-    SecretsConfig, SecurityConfig, SecurityOpsConfig, SkillsConfig, SkillsPromptInjectionMode,
-    SlackConfig, StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode,
-    SwarmConfig, SwarmStrategy, TelegramConfig, ToolFilterGroup, ToolFilterGroupMode,
-    TranscriptionConfig, TtsConfig, TunnelConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
-    WorkspaceConfig,
+    SecretsConfig, SecurityConfig, SecurityOpsConfig, SkillCreationConfig, SkillsConfig,
+    SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
+    StorageProviderSection, StreamMode, SwarmConfig, SwarmStrategy, TelegramConfig,
+    ToolFilterGroup, ToolFilterGroupMode, TranscriptionConfig, TtsConfig, TunnelConfig,
+    WebFetchConfig, WebSearchConfig, WebhookConfig, WorkspaceConfig,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
@@ -55,6 +55,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            ack_reactions: None,
         };
 
         let discord = DiscordConfig {

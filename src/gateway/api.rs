@@ -357,6 +357,65 @@ pub async fn handle_api_cron_delete(
     }
 }
 
+/// GET /api/cron/settings — return cron subsystem settings
+pub async fn handle_api_cron_settings_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    Json(serde_json::json!({
+        "enabled": config.cron.enabled,
+        "catch_up_on_startup": config.cron.catch_up_on_startup,
+        "max_run_history": config.cron.max_run_history,
+    }))
+    .into_response()
+}
+
+/// PATCH /api/cron/settings — update cron subsystem settings
+pub async fn handle_api_cron_settings_patch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let mut config = state.config.lock().clone();
+
+    if let Some(v) = body.get("enabled").and_then(|v| v.as_bool()) {
+        config.cron.enabled = v;
+    }
+    if let Some(v) = body.get("catch_up_on_startup").and_then(|v| v.as_bool()) {
+        config.cron.catch_up_on_startup = v;
+    }
+    if let Some(v) = body.get("max_run_history").and_then(|v| v.as_u64()) {
+        config.cron.max_run_history = u32::try_from(v).unwrap_or(u32::MAX);
+    }
+
+    if let Err(e) = config.save().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
+        )
+            .into_response();
+    }
+
+    *state.config.lock() = config.clone();
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "enabled": config.cron.enabled,
+        "catch_up_on_startup": config.cron.catch_up_on_startup,
+        "max_run_history": config.cron.max_run_history,
+    }))
+    .into_response()
+}
+
 /// GET /api/integrations — list all integrations with status
 pub async fn handle_api_integrations(
     State(state): State<AppState>,

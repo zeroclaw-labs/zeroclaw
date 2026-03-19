@@ -25,6 +25,7 @@ pub struct SlackChannel {
     channel_id: Option<String>,
     channel_ids: Vec<String>,
     allowed_users: Vec<String>,
+    thread_replies: bool,
     mention_only: bool,
     group_reply_allowed_sender_ids: Vec<String>,
     user_display_name_cache: Mutex<HashMap<String, CachedSlackDisplayName>>,
@@ -75,6 +76,7 @@ impl SlackChannel {
             channel_id,
             channel_ids,
             allowed_users,
+            thread_replies: true,
             mention_only: false,
             group_reply_allowed_sender_ids: Vec::new(),
             user_display_name_cache: Mutex::new(HashMap::new()),
@@ -91,6 +93,12 @@ impl SlackChannel {
         self.mention_only = mention_only;
         self.group_reply_allowed_sender_ids =
             Self::normalize_group_reply_allowed_sender_ids(allowed_sender_ids);
+        self
+    }
+
+    /// Configure whether outbound replies stay in the originating Slack thread.
+    pub fn with_thread_replies(mut self, thread_replies: bool) -> Self {
+        self.thread_replies = thread_replies;
         self
     }
 
@@ -120,6 +128,14 @@ impl SlackChannel {
         self.group_reply_allowed_sender_ids
             .iter()
             .any(|entry| entry == "*" || entry == user_id)
+    }
+
+    fn outbound_thread_ts<'a>(&self, message: &'a SendMessage) -> Option<&'a str> {
+        if self.thread_replies {
+            message.thread_ts.as_deref()
+        } else {
+            None
+        }
     }
 
     /// Get the bot's own user ID so we can ignore our own messages
@@ -2149,7 +2165,7 @@ impl Channel for SlackChannel {
             "text": message.content
         });
 
-        if let Some(ref ts) = message.thread_ts {
+        if let Some(ts) = self.outbound_thread_ts(message) {
             body["thread_ts"] = serde_json::json!(ts);
         }
 
@@ -2484,8 +2500,28 @@ mod tests {
     #[test]
     fn slack_group_reply_policy_defaults_to_all_messages() {
         let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()]);
+        assert!(ch.thread_replies);
         assert!(!ch.mention_only);
         assert!(ch.group_reply_allowed_sender_ids.is_empty());
+    }
+
+    #[test]
+    fn with_thread_replies_sets_flag() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![])
+            .with_thread_replies(false);
+        assert!(!ch.thread_replies);
+    }
+
+    #[test]
+    fn outbound_thread_ts_respects_thread_replies_setting() {
+        let msg = SendMessage::new("hello", "C123").in_thread(Some("1741234567.100001".into()));
+
+        let threaded = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
+        assert_eq!(threaded.outbound_thread_ts(&msg), Some("1741234567.100001"));
+
+        let channel_root = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![])
+            .with_thread_replies(false);
+        assert_eq!(channel_root.outbound_thread_ts(&msg), None);
     }
 
     #[test]

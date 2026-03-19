@@ -133,6 +133,29 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
+  check-all-features:
+    name: Check (all features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.92.0
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Install system dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev
+
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+
+      - name: Check all features
+        run: cargo check --all-features --locked
+
   docs-quality:
     name: Docs Quality
     runs-on: ubuntu-latest
@@ -157,7 +180,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [lint, lint-strict-delta, test, build, docs-quality]
+    needs: [lint, lint-strict-delta, test, build, docs-quality, check-all-features]
     runs-on: ubuntu-latest
     steps:
       - name: Check upstream job results
