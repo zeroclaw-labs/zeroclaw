@@ -103,7 +103,7 @@ impl Tool for FileEditTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        let full_path = self.security.resolve_tool_path(path);
 
         // ── 5. Canonicalize parent ─────────────────────────────────
         let Some(parent) = full_path.parent() else {
@@ -662,6 +662,46 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("Failed to read file"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_absolute_path_in_workspace() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_abs_path");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Canonicalize so the workspace dir matches resolved paths on macOS (/private/var/…)
+        let dir = tokio::fs::canonicalize(&dir).await.unwrap();
+
+        tokio::fs::write(dir.join("target.txt"), "old content")
+            .await
+            .unwrap();
+
+        let tool = FileEditTool::new(test_security(dir.clone()));
+
+        // Pass an absolute path that is within the workspace
+        let abs_path = dir.join("target.txt");
+        let result = tool
+            .execute(json!({
+                "path": abs_path.to_string_lossy().to_string(),
+                "old_string": "old content",
+                "new_string": "new content"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "editing via absolute workspace path should succeed, error: {:?}",
+            result.error
+        );
+
+        let content = tokio::fs::read_to_string(dir.join("target.txt"))
+            .await
+            .unwrap();
+        assert_eq!(content, "new content");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
