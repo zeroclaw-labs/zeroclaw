@@ -447,17 +447,13 @@ impl AnthropicProvider {
             }
         }
 
-        // Convert system text to SystemPrompt with cache control if large
+        // Always use Blocks format with cache_control for system prompts
         let system_prompt = system_text.map(|text| {
-            if Self::should_cache_system(&text) {
-                SystemPrompt::Blocks(vec![SystemBlock {
-                    block_type: "text".to_string(),
-                    text,
-                    cache_control: Some(CacheControl::ephemeral()),
-                }])
-            } else {
-                SystemPrompt::String(text)
-            }
+            SystemPrompt::Blocks(vec![SystemBlock {
+                block_type: "text".to_string(),
+                text,
+                cache_control: Some(CacheControl::ephemeral()),
+            }])
         });
 
         (system_prompt, native_messages)
