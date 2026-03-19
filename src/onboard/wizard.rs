@@ -3975,6 +3975,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     },
                     allowed_users,
                     interrupt_on_new_message: false,
+                    thread_replies: None,
                     mention_only: false,
                 });
             }
