@@ -3369,6 +3369,7 @@ fn collect_configured_channels(
                     Vec::new(),
                     sl.allowed_users.clone(),
                 )
+                .with_thread_replies(sl.thread_replies.unwrap_or(true))
                 .with_group_reply_policy(sl.mention_only, Vec::new())
                 .with_workspace_dir(config.workspace_dir.clone()),
             ),

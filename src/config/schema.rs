@@ -4620,6 +4620,10 @@ pub struct SlackConfig {
     /// cancels the in-flight request and starts a fresh response with preserved history.
     #[serde(default)]
     pub interrupt_on_new_message: bool,
+    /// When true (default), replies stay in the originating Slack thread.
+    /// When false, replies go to the channel root instead.
+    #[serde(default)]
+    pub thread_replies: Option<bool>,
     /// When true, only respond to messages that @-mention the bot in groups.
     /// Direct messages remain allowed.
     #[serde(default)]
@@ -9330,6 +9334,7 @@ allowed_users = ["@ops:matrix.org"]
         let parsed: SlackConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.allowed_users.is_empty());
         assert!(!parsed.interrupt_on_new_message);
+        assert_eq!(parsed.thread_replies, None);
         assert!(!parsed.mention_only);
     }
 
@@ -9339,6 +9344,7 @@ allowed_users = ["@ops:matrix.org"]
         let parsed: SlackConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.allowed_users, vec!["U111"]);
         assert!(!parsed.interrupt_on_new_message);
+        assert_eq!(parsed.thread_replies, None);
         assert!(!parsed.mention_only);
     }
 
@@ -9348,6 +9354,7 @@ allowed_users = ["@ops:matrix.org"]
         let parsed: SlackConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.mention_only);
         assert!(!parsed.interrupt_on_new_message);
+        assert_eq!(parsed.thread_replies, None);
     }
 
     #[test]
@@ -9355,6 +9362,16 @@ allowed_users = ["@ops:matrix.org"]
         let json = r#"{"bot_token":"xoxb-tok","interrupt_on_new_message":true}"#;
         let parsed: SlackConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.interrupt_on_new_message);
+        assert_eq!(parsed.thread_replies, None);
+        assert!(!parsed.mention_only);
+    }
+
+    #[test]
+    async fn slack_config_deserializes_thread_replies() {
+        let json = r#"{"bot_token":"xoxb-tok","thread_replies":false}"#;
+        let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.thread_replies, Some(false));
+        assert!(!parsed.interrupt_on_new_message);
         assert!(!parsed.mention_only);
     }
 
@@ -9378,6 +9395,7 @@ channel_id = "C123"
         let parsed: SlackConfig = toml::from_str(toml_str).unwrap();
         assert!(parsed.allowed_users.is_empty());
         assert!(!parsed.interrupt_on_new_message);
+        assert_eq!(parsed.thread_replies, None);
         assert!(!parsed.mention_only);
         assert_eq!(parsed.channel_id.as_deref(), Some("C123"));
     }
