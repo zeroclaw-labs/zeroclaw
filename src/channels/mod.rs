@@ -7734,25 +7734,27 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .await;
 
-        let histories = runtime_ctx
-            .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert!(
-            !histories.contains_key("telegram_alice"),
-            "/new should clear the cached sender history before the next message"
-        );
-        drop(histories);
+        {
+            let histories = runtime_ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(
+                !histories.contains_key("telegram_alice"),
+                "/new should clear the cached sender history before the next message"
+            );
+        }
 
-        let pending_new_sessions = runtime_ctx
-            .pending_new_sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert!(
-            pending_new_sessions.contains("telegram_alice"),
-            "/new should mark the sender for a fresh next-message prompt rebuild"
-        );
-        drop(pending_new_sessions);
+        {
+            let pending_new_sessions = runtime_ctx
+                .pending_new_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(
+                pending_new_sessions.contains("telegram_alice"),
+                "/new should mark the sender for a fresh next-message prompt rebuild"
+            );
+        }
 
         process_channel_message(
             runtime_ctx,
@@ -7769,25 +7771,27 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .await;
 
-        let calls = provider_impl
-            .calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0][0].0, "system");
-        assert_eq!(calls[1][0].0, "system");
-        assert!(
-            !calls[0][0].1.contains("<name>refresh-test</name>"),
-            "pre-/new prompt should not advertise a skill that did not exist yet"
-        );
-        assert!(
-            calls[1][0].1.contains("<available_skills>"),
-            "post-/new prompt should contain the refreshed skills block"
-        );
-        assert!(
-            calls[1][0].1.contains("<name>refresh-test</name>"),
-            "post-/new prompt should include skills discovered after the reset"
-        );
+        {
+            let calls = provider_impl
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0][0].0, "system");
+            assert_eq!(calls[1][0].0, "system");
+            assert!(
+                !calls[0][0].1.contains("<name>refresh-test</name>"),
+                "pre-/new prompt should not advertise a skill that did not exist yet"
+            );
+            assert!(
+                calls[1][0].1.contains("<available_skills>"),
+                "post-/new prompt should contain the refreshed skills block"
+            );
+            assert!(
+                calls[1][0].1.contains("<name>refresh-test</name>"),
+                "post-/new prompt should include skills discovered after the reset"
+            );
+        }
 
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert!(sent_messages
