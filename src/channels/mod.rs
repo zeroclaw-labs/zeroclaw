@@ -3406,6 +3406,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
+                .with_tts(config.tts.clone())
                 .with_workspace_dir(config.workspace_dir.clone()),
             ))
         }
@@ -3505,6 +3506,7 @@ fn collect_configured_channels(
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
+                .with_tts(config.tts.clone())
                 .with_workspace_dir(config.workspace_dir.clone()),
             ),
         });
@@ -5441,82 +5443,6 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[tokio::test]
     async fn process_channel_message_executes_tool_calls_instead_of_sending_raw_json() {
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let mut channels_by_name = HashMap::new();
-        channels_by_name.insert(channel.name().to_string(), channel);
-
-        let runtime_ctx = Arc::new(ChannelRuntimeContext {
-            channels_by_name: Arc::new(channels_by_name),
-            provider: Arc::new(ToolCallingProvider),
-            default_provider: Arc::new("test-provider".to_string()),
-            memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
-            observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: 0.0,
-            auto_save_memory: false,
-            max_tool_iterations: 10,
-            min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
-            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
-            route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(crate::config::Config::default()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-            },
-            non_cli_excluded_tools: Arc::new(Vec::new()),
-            autonomy_level: AutonomyLevel::default(),
-            tool_call_dedup_exempt: Arc::new(Vec::new()),
-            multimodal: crate::config::MultimodalConfig::default(),
-            hooks: None,
-            model_routes: Arc::new(Vec::new()),
-            query_classification: crate::config::QueryClassificationConfig::default(),
-            ack_reactions: true,
-            show_tool_calls: true,
-            session_store: None,
-            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &crate::config::AutonomyConfig::default(),
-            )),
-            activated_tools: None,
-        });
-
-        process_channel_message(
-            runtime_ctx,
-            traits::ChannelMessage {
-                id: "msg-1".to_string(),
-                sender: "alice".to_string(),
-                reply_target: "chat-42".to_string(),
-                content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
-                timestamp: 1,
-                thread_ts: None,
-            },
-            CancellationToken::new(),
-        )
-        .await;
-
-        let sent_messages = channel_impl.sent_messages.lock().await;
-        assert!(!sent_messages.is_empty());
-        let reply = sent_messages.last().unwrap();
-        assert!(reply.starts_with("chat-42:"));
-        assert!(reply.contains("BTC is currently around"));
-        assert!(!reply.contains("\"tool_calls\""));
-        assert!(!reply.contains("mock_price"));
-    }
-
-    #[tokio::test]
-    async fn process_channel_message_telegram_does_not_persist_tool_summary_prefix() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 

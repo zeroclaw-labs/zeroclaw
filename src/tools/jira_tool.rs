@@ -10,17 +10,13 @@ const JIRA_SEARCH_PAGE_SIZE: u32 = 100;
 const MAX_ERROR_BODY_CHARS: usize = 500;
 
 /// Controls how much data is returned by `get_ticket`.
+#[derive(Default)]
 enum LevelOfDetails {
     Basic,
+    #[default]
     BasicSearch,
     Full,
     Changelog,
-}
-
-impl Default for LevelOfDetails {
-    fn default() -> Self {
-        LevelOfDetails::Basic
-    }
 }
 
 /// Tool for interacting with the Jira REST API v3.
@@ -49,7 +45,7 @@ impl JiraTool {
         timeout_secs: u64,
     ) -> Self {
         Self {
-            base_url,
+            base_url: base_url.trim_end_matches('/').to_string(),
             email,
             api_token,
             allowed_actions,
@@ -133,6 +129,7 @@ impl JiraTool {
         })
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     async fn search_tickets(
         &self,
         jql: &str,
@@ -145,7 +142,8 @@ impl JiraTool {
         let mut next_page_token: Option<String> = None;
 
         loop {
-            let remaining = max_results - issues.len() as u32;
+            let remaining = max_results.saturating_sub(issues.len() as u32);
+
             let page_size = remaining.min(JIRA_SEARCH_PAGE_SIZE);
 
             let mut body = json!({
@@ -414,7 +412,7 @@ impl Tool for JiraTool {
                 let max_results = args
                     .get("max_results")
                     .and_then(|v| v.as_u64())
-                    .map(|n| n as u32);
+                    .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
                 self.search_tickets(jql, max_results).await
             }
             "comment_ticket" => {
@@ -479,6 +477,13 @@ fn validate_issue_key(key: &str) -> anyhow::Result<()> {
 
 // ── Response shaping ──────────────────────────────────────────────────────────
 
+/// Safely extracts the first 10 characters (date prefix) from a string.
+/// Returns the full string if it is shorter than 10 characters instead of
+/// panicking on out-of-bounds slice indexing.
+fn date_prefix(s: &str) -> &str {
+    s.get(..10).unwrap_or(s)
+}
+
 fn shape_basic(raw: &Value) -> Value {
     let f = &raw["fields"];
     let rf = &raw["renderedFields"];
@@ -502,7 +507,7 @@ fn shape_basic(raw: &Value) -> Value {
                     let id = c["id"].as_str().unwrap_or("");
                     json!({
                         "author": c["author"]["displayName"],
-                        "created": &c["created"].as_str().unwrap_or("")[ ..10],
+                        "created": date_prefix(c["created"].as_str().unwrap_or("")),
                         "body": rendered_by_id.get(id).copied().unwrap_or("")
                     })
                 })
@@ -516,8 +521,8 @@ fn shape_basic(raw: &Value) -> Value {
         "status":      f["status"]["name"],
         "priority":    f["priority"]["name"],
         "assignee":    f["assignee"]["displayName"],
-        "created":     &f["created"].as_str().unwrap_or("")[ ..10],
-        "updated":     &f["updated"].as_str().unwrap_or("")[ ..10],
+        "created":     date_prefix(f["created"].as_str().unwrap_or("")),
+        "updated":     date_prefix(f["updated"].as_str().unwrap_or("")),
         "description": rf["description"].as_str().unwrap_or(""),
         "comments":    comments,
     })
@@ -531,8 +536,8 @@ fn shape_basic_search(raw: &Value) -> Value {
         "status":   f["status"]["name"],
         "priority": f["priority"]["name"],
         "assignee": f["assignee"]["displayName"],
-        "created":  &f["created"].as_str().unwrap_or("")[ ..10],
-        "updated":  &f["updated"].as_str().unwrap_or("")[ ..10],
+        "created":  date_prefix(f["created"].as_str().unwrap_or("")),
+        "updated":  date_prefix(f["updated"].as_str().unwrap_or("")),
     })
 }
 
@@ -572,7 +577,7 @@ fn shape_comment_response(raw: &Value) -> Value {
     json!({
         "id":      raw["id"],
         "author":  raw["author"]["displayName"],
-        "created": &raw["created"].as_str().unwrap_or("")[ ..10],
+        "created": date_prefix(raw["created"].as_str().unwrap_or("")),
     })
 }
 
@@ -582,8 +587,8 @@ fn shape_comment_response(raw: &Value) -> Value {
 /// (e.g. `@john@co.com,` or `@john@co.com)`). Also strips leading bracket-like
 /// punctuation so `@(john@co.com)` resolves correctly.
 fn clean_email(s: &str) -> &str {
-    s.trim_start_matches(|c: char| matches!(c, '(' | '['))
-        .trim_end_matches(|c: char| matches!(c, ',' | '!' | '?' | ':' | ';' | ')' | ']'))
+    s.trim_start_matches(['(', '['])
+        .trim_end_matches([',', '!', '?', ':', ';', ')', ']'])
 }
 
 fn extract_emails(text: &str) -> Vec<String> {
@@ -596,7 +601,8 @@ fn extract_emails(text: &str) -> Vec<String> {
             }
         }
     }
-    emails.dedup();
+    let mut seen = std::collections::HashSet::new();
+    emails.retain(|e| seen.insert(e.clone()));
     emails
 }
 
@@ -672,7 +678,7 @@ fn parse_inline(text: &str, mentions: &HashMap<String, (String, String)>) -> Vec
                 }
             } else {
                 current.push('@');
-                current.push_str(&email);
+                current.push_str(email);
             }
         } else {
             current.push(ch);
@@ -984,6 +990,12 @@ mod tests {
     }
 
     #[test]
+    fn extract_emails_deduplicates_non_adjacent() {
+        let emails = extract_emails("@a@b.com @c@d.com @a@b.com");
+        assert_eq!(emails, vec!["a@b.com", "c@d.com"]);
+    }
+
+    #[test]
     fn extract_emails_strips_trailing_punctuation() {
         let emails = extract_emails("@john@company.com,");
         assert_eq!(emails, vec!["john@company.com"]);
@@ -1046,6 +1058,28 @@ mod tests {
         assert_eq!(shaped["created"], "2024-06-01");
         assert!(shaped.get("body").is_none());
         assert!(shaped.get("self").is_none());
+    }
+
+    // ── date_prefix helper ─────────────────────────────────────────────────
+
+    #[test]
+    fn date_prefix_normal_date_string() {
+        assert_eq!(date_prefix("2024-01-15T10:00:00.000Z"), "2024-01-15");
+    }
+
+    #[test]
+    fn date_prefix_empty_string() {
+        assert_eq!(date_prefix(""), "");
+    }
+
+    #[test]
+    fn date_prefix_short_string() {
+        assert_eq!(date_prefix("2024"), "2024");
+    }
+
+    #[test]
+    fn date_prefix_exactly_ten_chars() {
+        assert_eq!(date_prefix("2024-01-15"), "2024-01-15");
     }
 
     #[test]
