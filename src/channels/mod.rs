@@ -2452,10 +2452,7 @@ async fn process_channel_message(
             // of what it did on subsequent turns.
             let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
             let history_response = if tool_summary.is_empty()
-                || matches!(
-                    msg.channel.as_str(),
-                    "telegram" | "whatsapp" | "signal"
-                )
+                || matches!(msg.channel.as_str(), "telegram" | "whatsapp" | "signal")
             {
                 delivered_response.clone()
             } else {
