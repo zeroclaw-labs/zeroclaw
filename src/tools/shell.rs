@@ -187,6 +187,14 @@ impl Tool for ShellTool {
                 });
             }
         };
+
+        // Apply sandbox wrapping before execution.
+        // The Sandbox trait operates on std::process::Command, so use as_std_mut()
+        // to get a mutable reference to the underlying command.
+        self.sandbox
+            .wrap_command(cmd.as_std_mut())
+            .map_err(|e| anyhow::anyhow!("Sandbox error: {}", e))?;
+
         cmd.env_clear();
 
         for var in collect_allowed_shell_env_vars(&self.security) {
