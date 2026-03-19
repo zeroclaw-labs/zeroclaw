@@ -698,13 +698,13 @@ impl Tool for DocumentPipelineTool {
                     false,
                     0u32,
                 ),
-                DocumentType::OfficeDocument(ext) => (
+                DocumentType::OfficeDocument(_ext) => (
                     "office_document",
                     "hancom_docs_converter",
                     false,
                     0u32,
                 ),
-                DocumentType::Unsupported(ext) => (
+                DocumentType::Unsupported(_ext) => (
                     "unsupported",
                     "none",
                     false,
