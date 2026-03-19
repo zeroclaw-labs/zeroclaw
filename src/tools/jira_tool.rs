@@ -68,6 +68,7 @@ impl JiraTool {
         issue_key: &str,
         level: LevelOfDetails,
     ) -> anyhow::Result<ToolResult> {
+        validate_issue_key(issue_key)?;
         let url = format!("{}/rest/api/3/issue/{}", self.base_url, issue_key);
 
         let query: Vec<(&str, &str)> = match &level {
@@ -214,6 +215,8 @@ impl JiraTool {
         issue_key: &str,
         comment_text: &str,
     ) -> anyhow::Result<ToolResult> {
+        validate_issue_key(issue_key)?;
+
         let emails = extract_emails(comment_text);
         let mut mentions: HashMap<String, (String, String)> = HashMap::new();
         for email in emails {
@@ -249,10 +252,11 @@ impl JiraTool {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to parse Jira comment response: {e}"))?;
 
+        let shaped = shape_comment_response(&response);
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&response)
-                .unwrap_or_else(|_| response.to_string()),
+            output: serde_json::to_string_pretty(&shaped)
+                .unwrap_or_else(|_| shaped.to_string()),
             error: None,
         })
     }
@@ -325,7 +329,7 @@ impl Tool for JiraTool {
                 },
                 "comment": {
                     "type": "string",
-                    "description": "Comment body for comment_ticket. Supports a limited markdown-like syntax that is converted to Atlassian Document Format (ADF): mention a user with @user@domain.com (the email is resolved to their Jira account and rendered as a proper mention); bold text with **text**; bullet list items with a leading '- '; newlines become line breaks. Everything else is rendered as plain text. Example: 'Hi @john@company.com, this is **important**.\n- Check the logs\n- Rerun the pipeline'"
+                    "description": "Comment body for comment_ticket. Supports a limited markdown-like syntax converted to Atlassian Document Format (ADF). Mention a user with @user@domain.com — the leading @ is required (a bare email without @ prefix is treated as plain text). Bold with **text**. Bullet list items with a leading '- '. Newlines become line breaks. Everything else is plain text. Example: 'Hi @john@company.com, this is **important**.\n- Check the logs\n- Rerun the pipeline'"
                 }
             },
             "required": ["action"]
@@ -458,25 +462,57 @@ impl Tool for JiraTool {
     }
 }
 
+// ── Input validation ──────────────────────────────────────────────────────────
+
+/// Validates that `issue_key` matches the Jira key format `PROJ-123`.
+/// Prevents path traversal if a crafted key like `../../other` were interpolated
+/// directly into the URL.
+fn validate_issue_key(key: &str) -> anyhow::Result<()> {
+    let valid = key
+        .split_once('-')
+        .is_some_and(|(project, number)| {
+            !project.is_empty()
+                && project.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                && project.starts_with(|c: char| c.is_ascii_uppercase())
+                && !number.is_empty()
+                && number.chars().all(|c| c.is_ascii_digit())
+        });
+    if valid {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Invalid issue key '{key}'. Expected format: PROJECT-123 (e.g. PROJ-42)"
+        )
+    }
+}
+
 // ── Response shaping ──────────────────────────────────────────────────────────
 
 fn shape_basic(raw: &Value) -> Value {
     let f = &raw["fields"];
     let rf = &raw["renderedFields"];
 
+    // Build a lookup map from comment ID → rendered body for O(1) access
+    // instead of scanning the rendered array for each comment (O(n²)).
+    let rendered_by_id: HashMap<&str, &str> = rf["comment"]["comments"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|rc| Some((rc["id"].as_str()?, rc["body"].as_str()?)))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let comments: Vec<Value> = f["comment"]["comments"]
         .as_array()
         .map(|arr| {
             arr.iter()
                 .map(|c| {
+                    let id = c["id"].as_str().unwrap_or("");
                     json!({
                         "author": c["author"]["displayName"],
                         "created": &c["created"].as_str().unwrap_or("")[ ..10],
-                        "body": rf["comment"]["comments"]
-                            .as_array()
-                            .and_then(|rc| rc.iter().find(|rc| rc["id"] == c["id"]))
-                            .and_then(|rc| rc["body"].as_str())
-                            .unwrap_or("")
+                        "body": rendered_by_id.get(id).copied().unwrap_or("")
                     })
                 })
                 .collect()
@@ -496,7 +532,7 @@ fn shape_basic(raw: &Value) -> Value {
     })
 }
 
-pub fn shape_basic_search(raw: &Value) -> Value {
+fn shape_basic_search(raw: &Value) -> Value {
     let f = &raw["fields"];
     json!({
         "key":      raw["key"],
@@ -539,10 +575,24 @@ fn shape_changelog(raw: &Value) -> Value {
     })
 }
 
+/// Returns only the comment ID, author, and creation date — avoids
+/// exposing internal Jira metadata back to the AI.
+fn shape_comment_response(raw: &Value) -> Value {
+    json!({
+        "id":      raw["id"],
+        "author":  raw["author"]["displayName"],
+        "created": &raw["created"].as_str().unwrap_or("")[ ..10],
+    })
+}
+
 // ── Comment / ADF builder ─────────────────────────────────────────────────────
 
+/// Strips trailing punctuation that commonly appears after an email address
+/// (e.g. `@john@co.com,` or `@john@co.com)`). Also strips leading bracket-like
+/// punctuation so `@(john@co.com)` resolves correctly.
 fn clean_email(s: &str) -> &str {
-    s.trim_end_matches(|c: char| matches!(c, ',' | '!' | '?' | ':' | ';' | ')' | ']'))
+    s.trim_start_matches(|c: char| matches!(c, '(' | '['))
+        .trim_end_matches(|c: char| matches!(c, ',' | '!' | '?' | ':' | ';' | ')' | ']'))
 }
 
 fn extract_emails(text: &str) -> Vec<String> {
@@ -566,28 +616,34 @@ fn parse_inline(text: &str, mentions: &HashMap<String, (String, String)>) -> Vec
 
     while let Some(ch) = chars.next() {
         if ch == '*' && chars.peek() == Some(&'*') {
-            chars.next();
+            chars.next(); // consume second *
             if !current.is_empty() {
                 nodes.push(json!({ "type": "text", "text": current.clone() }));
                 current.clear();
             }
             let mut bold = String::new();
+            let mut closed = false;
             loop {
                 match chars.next() {
                     Some('*') if chars.peek() == Some(&'*') => {
-                        chars.next();
+                        chars.next(); // consume second *
+                        closed = true;
                         break;
                     }
                     Some(c) => bold.push(c),
                     None => break,
                 }
             }
-            if !bold.is_empty() {
+            if closed && !bold.is_empty() {
                 nodes.push(json!({
                     "type": "text",
                     "text": bold,
                     "marks": [{ "type": "strong" }]
                 }));
+            } else if !bold.is_empty() {
+                // Unmatched ** — emit as literal text
+                current.push_str("**");
+                current.push_str(&bold);
             }
         } else if ch == '@' {
             let mut raw = String::new();
@@ -598,7 +654,12 @@ fn parse_inline(text: &str, mentions: &HashMap<String, (String, String)>) -> Vec
                 raw.push(chars.next().unwrap());
             }
             let email = clean_email(&raw);
-            let suffix = &raw[email.len()..];
+            // Compute the end position of `email` within `raw` via pointer
+            // arithmetic so the suffix is correct even when leading chars were
+            // stripped by clean_email.
+            let email_end =
+                (email.as_ptr() as usize - raw.as_ptr() as usize) + email.len();
+            let suffix = &raw[email_end..];
             if email.contains('@') {
                 if let Some((account_id, display_name)) = mentions.get(email) {
                     if !current.is_empty() {
@@ -832,6 +893,32 @@ mod tests {
         assert!(result.error.as_deref().unwrap().contains("read-only"));
     }
 
+    // ── Issue key validation ──────────────────────────────────────────────────
+
+    #[test]
+    fn validate_issue_key_accepts_valid_keys() {
+        assert!(validate_issue_key("PROJ-1").is_ok());
+        assert!(validate_issue_key("PROJ-123").is_ok());
+        assert!(validate_issue_key("AB-99").is_ok());
+        assert!(validate_issue_key("MYPROJECT-1000").is_ok());
+    }
+
+    #[test]
+    fn validate_issue_key_rejects_path_traversal() {
+        assert!(validate_issue_key("../../etc/passwd").is_err());
+        assert!(validate_issue_key("../other").is_err());
+    }
+
+    #[test]
+    fn validate_issue_key_rejects_malformed() {
+        assert!(validate_issue_key("proj-1").is_err()); // lowercase
+        assert!(validate_issue_key("PROJ").is_err()); // no number
+        assert!(validate_issue_key("PROJ-").is_err()); // empty number
+        assert!(validate_issue_key("-123").is_err()); // no project
+        assert!(validate_issue_key("PROJ-12x").is_err()); // non-digit in number
+        assert!(validate_issue_key("1PROJ-12").is_err()); // starts with digit
+    }
+
     // ── ADF builder unit tests ────────────────────────────────────────────────
 
     #[test]
@@ -850,6 +937,13 @@ mod tests {
         let text_node = &adf["content"][0]["content"][0];
         assert_eq!(text_node["text"], "bold");
         assert_eq!(text_node["marks"][0]["type"], "strong");
+    }
+
+    #[test]
+    fn build_adf_unmatched_bold_is_literal() {
+        let adf = build_adf("**no closing", &HashMap::new());
+        let text = &adf["content"][0]["content"][0]["text"];
+        assert!(text.as_str().unwrap().contains("**no closing"));
     }
 
     #[test]
@@ -906,6 +1000,12 @@ mod tests {
     }
 
     #[test]
+    fn extract_emails_strips_leading_punctuation() {
+        let emails = extract_emails("@(john@company.com)");
+        assert_eq!(emails, vec!["john@company.com"]);
+    }
+
+    #[test]
     fn shape_basic_search_extracts_expected_fields() {
         let raw = json!({
             "key": "PROJ-1",
@@ -939,5 +1039,57 @@ mod tests {
         assert_eq!(shaped["key"], "PROJ-42");
         assert!(shaped.get("changelog").is_some());
         assert!(shaped.get("fields").is_none());
+    }
+
+    #[test]
+    fn shape_comment_response_extracts_id_author_created() {
+        let raw = json!({
+            "id": "12345",
+            "author": { "displayName": "Alice", "accountId": "abc" },
+            "created": "2024-06-01T09:00:00.000Z",
+            "body": { "type": "doc" },
+            "self": "https://internal.url"
+        });
+        let shaped = shape_comment_response(&raw);
+        assert_eq!(shaped["id"], "12345");
+        assert_eq!(shaped["author"], "Alice");
+        assert_eq!(shaped["created"], "2024-06-01");
+        assert!(shaped.get("body").is_none());
+        assert!(shaped.get("self").is_none());
+    }
+
+    #[test]
+    fn shape_basic_uses_o1_comment_lookup() {
+        // Verify that comments are matched by ID, not by position.
+        let raw = json!({
+            "key": "PROJ-1",
+            "fields": {
+                "summary": "s", "priority": {"name":"P"}, "status": {"name":"S"},
+                "assignee": {"displayName":"A"},
+                "created": "2024-01-01T00:00:00.000Z",
+                "updated": "2024-01-01T00:00:00.000Z",
+                "comment": {
+                    "comments": [
+                        { "id": "2", "author": {"displayName":"Bob"}, "created": "2024-01-02T00:00:00.000Z" },
+                        { "id": "1", "author": {"displayName":"Alice"}, "created": "2024-01-01T00:00:00.000Z" }
+                    ]
+                }
+            },
+            "renderedFields": {
+                "description": "",
+                "comment": {
+                    "comments": [
+                        { "id": "1", "body": "Alice's body" },
+                        { "id": "2", "body": "Bob's body" }
+                    ]
+                }
+            }
+        });
+        let shaped = shape_basic(&raw);
+        // Comment with id "2" (Bob) should get Bob's rendered body, not Alice's
+        assert_eq!(shaped["comments"][0]["author"], "Bob");
+        assert_eq!(shaped["comments"][0]["body"], "Bob's body");
+        assert_eq!(shaped["comments"][1]["author"], "Alice");
+        assert_eq!(shaped["comments"][1]["body"], "Alice's body");
     }
 }

@@ -42,7 +42,7 @@ get_ticket: requires issue_key. Use level_of_details to control response depth:
 search_tickets: requires jql. Optional max_results (default 25, max 999). Response always uses the basic_search shape regardless of level_of_details. Example JQL: 'project = PROJ AND status = "In Progress" ORDER BY updated DESC'
 
 comment_ticket: requires issue_key and comment. The comment supports a limited syntax converted to Atlassian Document Format:
-  - Mention a user: @user@domain.com — the email is resolved to their Jira account and rendered as a proper @mention. If the email cannot be resolved the text is left as-is.
+  - Mention a user: @user@domain.com — the leading @ is required. A bare email without the @ prefix (e.g. just user@domain.com) is treated as plain text and will NOT be resolved to a Jira mention. If the email cannot be resolved, the text is left as-is.
   - Bold: **text**
   - Bullet list: lines starting with '- '
   - Newlines become line breaks within a paragraph; a blank line starts a new paragraph.
