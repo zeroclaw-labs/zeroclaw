@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/zeroclaw-banner.png" alt="ZeroClaw" width="600" />
+  <img src="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/docs/assets/zeroclaw-banner.png" alt="ZeroClaw" width="600" />
 </p>
 
 <h1 align="center">ZeroClaw 🦀（Русский）</h1>
