@@ -7,7 +7,7 @@ export default function Layout() {
   const { pathname } = useLocation();
 
   return (
-    <div className="min-h-screen text-white" style={{ background: 'linear-gradient(135deg, #050510 0%, #080818 50%, #050510 100%)' }}>
+    <div className="min-h-screen text-white" style={{ background: 'var(--pc-bg-base)' }}>
       {/* Fixed sidebar */}
       <Sidebar />
 
@@ -15,8 +15,7 @@ export default function Layout() {
       <div className="ml-60 flex flex-col min-h-screen">
         <Header />
 
-        {/* Page content — ErrorBoundary keyed by pathname so the nav shell
-            survives a page crash and the boundary resets on route change */}
+        {/* Page content */}
         <main className="flex-1 overflow-y-auto">
           <ErrorBoundary key={pathname}>
             <Outlet />

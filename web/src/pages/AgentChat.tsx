@@ -29,7 +29,6 @@ export default function AgentChat() {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const pendingContentRef = useRef('');
 
-  // Persist draft to in-memory store so it survives route changes
   useEffect(() => {
     saveDraft(input);
   }, [input, saveDraft]);
@@ -178,11 +177,20 @@ export default function AgentChat() {
     });
   }, []);
 
+  const isUser = (role: string) => role === 'user';
+
   return (
     <div className="flex flex-col h-[calc(100vh-3.5rem)]">
-      {/* Connection status bar */}
+      {/* Connection error banner */}
       {error && (
-        <div className="px-4 py-2 bg-[#ff446615] border-b border-[#ff446630] flex items-center gap-2 text-sm text-[#ff6680] animate-fade-in">
+        <div
+          className="px-4 py-2 border-b flex items-center gap-2 text-sm animate-fade-in"
+          style={{
+            background: 'rgba(239, 68, 68, 0.08)',
+            borderColor: 'rgba(239, 68, 68, 0.2)',
+            color: '#f87171',
+          }}
+        >
           <AlertCircle className="h-4 w-4 flex-shrink-0" />
           {error}
         </div>
@@ -191,12 +199,22 @@ export default function AgentChat() {
       {/* Messages area */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {messages.length === 0 && (
-          <div className="flex flex-col items-center justify-center h-full text-[#334060] animate-fade-in">
-            <div className="h-16 w-16 rounded-2xl flex items-center justify-center mb-4 animate-float" style={{ background: 'linear-gradient(135deg, #0080ff15, #0080ff08)' }}>
-              <Bot className="h-8 w-8 text-[#0080ff]" />
+          <div
+            className="flex flex-col items-center justify-center h-full text-center animate-fade-in"
+            style={{ color: 'var(--pc-text-muted)' }}
+          >
+            <div
+              className="h-16 w-16 rounded-3xl flex items-center justify-center mb-4 animate-float"
+              style={{ background: 'var(--pc-accent-glow)' }}
+            >
+              <Bot className="h-8 w-8" style={{ color: 'var(--pc-accent)' }} />
             </div>
-            <p className="text-lg font-semibold text-white mb-1">ZeroClaw Agent</p>
-            <p className="text-sm text-[#556080]">{t('agent.start_conversation')}</p>
+            <p className="text-lg font-semibold mb-1" style={{ color: 'var(--pc-text-primary)' }}>
+              ZeroClaw Agent
+            </p>
+            <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
+              {t('agent.start_conversation')}
+            </p>
           </div>
         )}
 
@@ -204,57 +222,69 @@ export default function AgentChat() {
           <div
             key={msg.id}
             className={`group flex items-start gap-3 ${
-              msg.role === 'user' ? 'flex-row-reverse animate-slide-in-right' : 'animate-slide-in-left'
+              isUser(msg.role) ? 'flex-row-reverse animate-slide-in-right' : 'animate-slide-in-left'
             }`}
             style={{ animationDelay: `${Math.min(idx * 30, 200)}ms` }}
           >
+            {/* Avatar */}
             <div
-              className={`flex-shrink-0 w-8 h-8 rounded-xl flex items-center justify-center ${
-                msg.role === 'user'
-                  ? ''
-                  : ''
-              }`}
+              className="flex-shrink-0 w-9 h-9 rounded-2xl flex items-center justify-center border"
               style={{
-                background: msg.role === 'user'
-                  ? 'linear-gradient(135deg, #0080ff, #0060cc)'
-                  : 'linear-gradient(135deg, #1a1a3e, #12122a)'
+                background: isUser(msg.role) ? 'var(--pc-accent)' : 'var(--pc-bg-elevated)',
+                borderColor: isUser(msg.role) ? 'var(--pc-accent)' : 'var(--pc-border)',
               }}
             >
-              {msg.role === 'user' ? (
+              {isUser(msg.role) ? (
                 <User className="h-4 w-4 text-white" />
               ) : (
-                <Bot className="h-4 w-4 text-[#0080ff]" />
+                <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
               )}
             </div>
+
+            {/* Bubble */}
             <div className="relative max-w-[75%]">
               <div
-                className={`rounded-2xl px-4 py-3 ${
-                  msg.role === 'user'
-                    ? 'text-white'
-                    : 'text-[#e8edf5] border border-[#1a1a3e]'
-                }`}
-                style={{
-                  background: msg.role === 'user'
-                    ? 'linear-gradient(135deg, #0080ff, #0066cc)'
-                    : 'linear-gradient(135deg, rgba(13,13,32,0.8), rgba(10,10,26,0.6))'
-                }}
+                className="rounded-2xl px-4 py-3 border"
+                style={
+                  isUser(msg.role)
+                    ? {
+                        background: 'var(--pc-accent-glow)',
+                        borderColor: 'var(--pc-accent-dim)',
+                        color: 'var(--pc-text-primary)',
+                      }
+                    : {
+                        background: 'var(--pc-bg-elevated)',
+                        borderColor: 'var(--pc-border)',
+                        color: 'var(--pc-text-primary)',
+                      }
+                }
               >
-                <p className="text-sm whitespace-pre-wrap break-words">{msg.content}</p>
+                <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">
+                  {msg.content}
+                </p>
                 <p
-                  className={`text-[10px] mt-1.5 ${
-                    msg.role === 'user' ? 'text-white/50' : 'text-[#334060]'
-                  }`}
+                  className="text-[10px] mt-1.5"
+                  style={{ color: isUser(msg.role) ? 'var(--pc-accent-light)' : 'var(--pc-text-faint)' }}
                 >
                   {msg.timestamp.toLocaleTimeString()}
                 </p>
               </div>
+
+              {/* Copy button — hover reveal */}
               <button
                 onClick={() => handleCopy(msg.id, msg.content)}
                 aria-label={t('agent.copy_message')}
-                className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-all duration-300 p-1.5 rounded-lg bg-[#0a0a18] border border-[#1a1a3e] text-[#556080] hover:text-white hover:border-[#0080ff40]"
+                className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-all p-1.5 rounded-xl"
+                style={{
+                  background: 'var(--pc-bg-elevated)',
+                  border: '1px solid var(--pc-border)',
+                  color: 'var(--pc-text-muted)',
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--pc-text-primary)'; e.currentTarget.style.borderColor = 'var(--pc-accent-dim)'; }}
+                onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; e.currentTarget.style.borderColor = 'var(--pc-border)'; }}
               >
                 {copiedId === msg.id ? (
-                  <Check className="h-3 w-3 text-[#00e68a]" />
+                  <Check className="h-3 w-3" style={{ color: '#34d399' }} />
                 ) : (
                   <Copy className="h-3 w-3" />
                 )}
@@ -263,17 +293,22 @@ export default function AgentChat() {
           </div>
         ))}
 
+        {/* Typing indicator */}
         {typing && (
           <div className="flex items-start gap-3 animate-fade-in">
-            <div className="flex-shrink-0 w-8 h-8 rounded-xl flex items-center justify-center" style={{ background: 'linear-gradient(135deg, #1a1a3e, #12122a)' }}>
-              <Bot className="h-4 w-4 text-[#0080ff]" />
+            <div
+              className="flex-shrink-0 w-9 h-9 rounded-2xl flex items-center justify-center border"
+              style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}
+            >
+              <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
             </div>
-            <div className="rounded-2xl px-4 py-3 border border-[#1a1a3e]" style={{ background: 'linear-gradient(135deg, rgba(13,13,32,0.8), rgba(10,10,26,0.6))' }}>
-              <div className="flex items-center gap-1.5">
-                <span className="w-1.5 h-1.5 bg-[#0080ff] rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                <span className="w-1.5 h-1.5 bg-[#0080ff] rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-                <span className="w-1.5 h-1.5 bg-[#0080ff] rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
-              </div>
+            <div
+              className="rounded-2xl px-4 py-3 border flex items-center gap-1.5"
+              style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}
+            >
+              <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
+              <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
+              <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
             </div>
           </div>
         )}
@@ -282,36 +317,46 @@ export default function AgentChat() {
       </div>
 
       {/* Input area */}
-      <div className="border-t border-[#1a1a3e]/40 p-4" style={{ background: 'linear-gradient(180deg, rgba(8,8,24,0.9), rgba(5,5,16,0.95))' }}>
-        <div className="flex items-end gap-3 max-w-4xl mx-auto">
-          <div className="flex-1">
-            <textarea
-              ref={inputRef}
-              rows={1}
-              value={input}
-              onChange={handleTextareaChange}
-              onKeyDown={handleKeyDown}
-              placeholder={connected ? t('agent.type_message') : t('agent.connecting')}
-              disabled={!connected}
-              className="input-electric w-full px-4 py-3 text-sm resize-none overflow-y-auto disabled:opacity-40"
-              style={{ minHeight: '44px', maxHeight: '200px' }}
-            />
-          </div>
+      <div
+        className="border-t p-4"
+        style={{
+          borderColor: 'var(--pc-border)',
+          background: 'var(--pc-bg-surface)',
+        }}
+      >
+        <div className="flex items-center gap-3 max-w-4xl mx-auto">
+          <textarea
+            ref={inputRef}
+            rows={1}
+            value={input}
+            onChange={handleTextareaChange}
+            onKeyDown={handleKeyDown}
+            placeholder={connected ? t('agent.type_message') : t('agent.connecting')}
+            disabled={!connected}
+            className="input-electric flex-1 px-4 text-sm resize-none disabled:opacity-40"
+            style={{ minHeight: '44px', maxHeight: '200px', paddingTop: '10px', paddingBottom: '10px' }}
+          />
           <button
+            type='button'
             onClick={handleSend}
             disabled={!connected || !input.trim()}
-            className="btn-electric flex-shrink-0 p-3 rounded-xl"
+            className="btn-electric flex-shrink-0 rounded-2xl flex items-center justify-center"
+            style={{ color: 'white', width: '40px', height: '40px' }}
           >
             <Send className="h-5 w-5" />
           </button>
         </div>
+
+        {/* Connection status */}
         <div className="flex items-center justify-center mt-2 gap-2">
           <span
-            className={`inline-block h-1.5 w-1.5 rounded-full glow-dot ${
-              connected ? 'text-[#00e68a] bg-[#00e68a]' : 'text-[#ff4466] bg-[#ff4466]'
-            }`}
+            className="status-dot"
+            style={connected
+              ? { background: 'var(--color-status-success)', boxShadow: '0 0 6px var(--color-status-success)' }
+              : { background: 'var(--color-status-error)', boxShadow: '0 0 6px var(--color-status-error)' }
+            }
           />
-          <span className="text-[10px] text-[#334060]">
+          <span className="text-[10px]" style={{ color: 'var(--pc-text-faint)' }}>
             {connected ? t('agent.connected_status') : t('agent.disconnected_status')}
           </span>
         </div>

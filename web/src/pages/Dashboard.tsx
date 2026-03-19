@@ -29,13 +29,13 @@ function healthColor(status: string): string {
   switch (status.toLowerCase()) {
     case 'ok':
     case 'healthy':
-      return 'bg-[#00e68a]';
+      return 'var(--color-status-success)';
     case 'warn':
     case 'warning':
     case 'degraded':
-      return 'bg-[#ffaa00]';
+      return 'var(--color-status-warning)';
     default:
-      return 'bg-[#ff4466]';
+      return 'var(--color-status-error)';
   }
 }
 
@@ -43,15 +43,36 @@ function healthBorder(status: string): string {
   switch (status.toLowerCase()) {
     case 'ok':
     case 'healthy':
-      return 'border-[#00e68a30]';
+      return 'rgba(0, 230, 138, 0.2)';
     case 'warn':
     case 'warning':
     case 'degraded':
-      return 'border-[#ffaa0030]';
+      return 'rgba(255, 170, 0, 0.2)';
     default:
-      return 'border-[#ff446630]';
+      return 'rgba(255, 68, 102, 0.2)';
   }
 }
+
+function healthBg(status: string): string {
+  switch (status.toLowerCase()) {
+    case 'ok':
+    case 'healthy':
+      return 'rgba(0, 230, 138, 0.05)';
+    case 'warn':
+    case 'warning':
+    case 'degraded':
+      return 'rgba(255, 170, 0, 0.05)';
+    default:
+      return 'rgba(255, 68, 102, 0.05)';
+  }
+}
+
+const STATUS_CARDS = [
+  { icon: Cpu, accent: 'var(--pc-accent)', labelKey: 'dashboard.provider_model', getValue: (s: StatusResponse) => s.provider ?? 'Unknown', getSub: (s: StatusResponse) => s.model ?? '' },
+  { icon: Clock, accent: '#34d399', labelKey: 'dashboard.uptime', getValue: (s: StatusResponse) => formatUptime(s.uptime_seconds), getSub: () => t('dashboard.since_last_restart') },
+  { icon: Globe, accent: '#a78bfa', labelKey: 'dashboard.gateway_port', getValue: (s: StatusResponse) => `:${s.gateway_port}`, getSub: () => '' },
+  { icon: Database, accent: '#fbbf24', labelKey: 'dashboard.memory_backend', getValue: (s: StatusResponse) => s.memory_backend, getSub: (s: StatusResponse) => `${t('dashboard.paired')}: ${s.paired ? t('dashboard.paired_yes') : t('dashboard.paired_no')}` },
+];
 
 export default function Dashboard() {
   const [status, setStatus] = useState<StatusResponse | null>(null);
@@ -70,7 +91,14 @@ export default function Dashboard() {
   if (error) {
     return (
       <div className="p-6 animate-fade-in">
-        <div className="rounded-xl bg-[#ff446615] border border-[#ff446630] p-4 text-[#ff6680]">
+        <div
+          className="rounded-2xl border p-4"
+          style={{
+            background: 'rgba(239, 68, 68, 0.08)',
+            borderColor: 'rgba(239, 68, 68, 0.2)',
+            color: '#f87171',
+          }}
+        >
           {t('dashboard.load_error')}: {error}
         </div>
       </div>
@@ -80,7 +108,10 @@ export default function Dashboard() {
   if (!status || !cost) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="h-8 w-8 border-2 border-[#0080ff30] border-t-[#0080ff] rounded-full animate-spin" />
+        <div
+          className="h-8 w-8 border-2 rounded-full animate-spin"
+          style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}
+        />
       </div>
     );
   }
@@ -91,44 +122,66 @@ export default function Dashboard() {
     <div className="p-6 space-y-6 animate-fade-in">
       {/* Status Cards Grid */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 stagger-children">
-        {[
-          { icon: Cpu, color: '#0080ff', bg: '#0080ff15', label: t('dashboard.provider_model'), value: status.provider ?? 'Unknown', sub: status.model },
-          { icon: Clock, color: '#00e68a', bg: '#00e68a15', label: t('dashboard.uptime'), value: formatUptime(status.uptime_seconds), sub: t('dashboard.since_last_restart') },
-          { icon: Globe, color: '#a855f7', bg: '#a855f715', label: t('dashboard.gateway_port'), value: `:${status.gateway_port}`, sub: '' },
-          { icon: Database, color: '#ff8800', bg: '#ff880015', label: t('dashboard.memory_backend'), value: status.memory_backend, sub: `${t('dashboard.paired')}: ${status.paired ? t('dashboard.paired_yes') : t('dashboard.paired_no')}` },
-        ].map(({ icon: Icon, color, bg, label, value, sub }) => (
-          <div key={label} className="glass-card p-5 animate-slide-in-up">
-            <div className="flex items-center gap-3 mb-3">
-              <div className="p-2 rounded-xl" style={{ background: bg }}>
-                <Icon className="h-5 w-5" style={{ color }} />
+        {STATUS_CARDS.map(({ icon: Icon, accent, labelKey, getValue, getSub }) => {
+          return (
+            <div key={labelKey} className="card p-5 animate-slide-in-up">
+              <div className="flex items-center gap-3 mb-3">
+                <div
+                  className="p-2 rounded-2xl"
+                  style={{ background: `rgba(var(--pc-accent-rgb), 0.08)`, color: accent }}
+                >
+                  <Icon className="h-5 w-5" />
+                </div>
+                <span
+                  className="text-xs uppercase tracking-wider font-medium"
+                  style={{ color: 'var(--pc-text-muted)' }}
+                >
+                  {t(labelKey)}
+                </span>
               </div>
-              <span className="text-xs text-[#556080] uppercase tracking-wider font-medium">{label}</span>
+              <p className="text-lg font-semibold truncate capitalize" style={{ color: 'var(--pc-text-primary)' }}>
+                {getValue(status)}
+              </p>
+              <p className="text-sm truncate" style={{ color: 'var(--pc-text-muted)' }}>
+                {getSub(status)}
+              </p>
             </div>
-            <p className="text-lg font-semibold text-white truncate capitalize">{value}</p>
-            <p className="text-sm text-[#556080] truncate">{sub}</p>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 stagger-children">
         {/* Cost Widget */}
-        <div className="glass-card p-5 animate-slide-in-up">
+        <div className="card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
-            <DollarSign className="h-5 w-5 text-[#0080ff]" />
-            <h2 className="text-sm font-semibold text-white uppercase tracking-wider">{t('dashboard.cost_overview')}</h2>
+            <DollarSign className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
+            <h2
+              className="text-sm font-semibold uppercase tracking-wider"
+              style={{ color: 'var(--pc-text-primary)' }}
+            >
+              {t('dashboard.cost_overview')}
+            </h2>
           </div>
           <div className="space-y-4">
             {[
-              { label: t('dashboard.session_label'), value: cost.session_cost_usd, color: '#0080ff' },
-              { label: t('dashboard.daily_label'), value: cost.daily_cost_usd, color: '#00e68a' },
-              { label: t('dashboard.monthly_label'), value: cost.monthly_cost_usd, color: '#a855f7' },
+              { label: t('dashboard.session_label'), value: cost.session_cost_usd, color: 'var(--pc-accent)' },
+              { label: t('dashboard.daily_label'), value: cost.daily_cost_usd, color: '#34d399' },
+              { label: t('dashboard.monthly_label'), value: cost.monthly_cost_usd, color: '#a78bfa' },
             ].map(({ label, value, color }) => (
               <div key={label}>
                 <div className="flex justify-between text-sm mb-1.5">
-                  <span className="text-[#556080]">{label}</span>
-                  <span className="text-white font-medium font-mono">{formatUSD(value)}</span>
+                  <span style={{ color: 'var(--pc-text-muted)' }}>{label}</span>
+                  <span
+                    className="font-medium font-mono"
+                    style={{ color: 'var(--pc-text-primary)' }}
+                  >
+                    {formatUSD(value)}
+                  </span>
                 </div>
-                <div className="w-full h-1.5 bg-[#0a0a18] rounded-full overflow-hidden">
+                <div
+                  className="w-full h-1.5 rounded-full overflow-hidden"
+                  style={{ background: 'var(--pc-hover)' }}
+                >
                   <div
                     className="h-full rounded-full progress-bar-animated transition-all duration-700 ease-out"
                     style={{ width: `${Math.max((value / maxCost) * 100, 2)}%`, background: color }}
@@ -137,40 +190,57 @@ export default function Dashboard() {
               </div>
             ))}
           </div>
-          <div className="mt-5 pt-4 border-t border-[#1a1a3e]/50 flex justify-between text-sm">
-            <span className="text-[#556080]">{t('dashboard.total_tokens_label')}</span>
-            <span className="text-white font-mono">{cost.total_tokens.toLocaleString()}</span>
+          <div className="mt-5 pt-4 border-t flex justify-between text-sm" style={{ borderColor: 'var(--pc-border)' }}>
+            <span style={{ color: 'var(--pc-text-muted)' }}>{t('dashboard.total_tokens_label')}</span>
+            <span className="font-mono" style={{ color: 'var(--pc-text-primary)' }}>
+              {cost.total_tokens.toLocaleString()}
+            </span>
           </div>
           <div className="flex justify-between text-sm mt-1">
-            <span className="text-[#556080]">{t('dashboard.requests_label')}</span>
-            <span className="text-white font-mono">{cost.request_count.toLocaleString()}</span>
+            <span style={{ color: 'var(--pc-text-muted)' }}>{t('dashboard.requests_label')}</span>
+            <span className="font-mono" style={{ color: 'var(--pc-text-primary)' }}>
+              {cost.request_count.toLocaleString()}
+            </span>
           </div>
         </div>
 
         {/* Active Channels */}
-        <div className="glass-card p-5 animate-slide-in-up">
+        <div className="card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
-            <Radio className="h-5 w-5 text-[#0080ff]" />
-            <h2 className="text-sm font-semibold text-white uppercase tracking-wider">{t('dashboard.active_channels')}</h2>
+            <Radio className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
+            <h2
+              className="text-sm font-semibold uppercase tracking-wider"
+              style={{ color: 'var(--pc-text-primary)' }}
+            >
+              {t('dashboard.active_channels')}
+            </h2>
           </div>
           <div className="space-y-2">
             {Object.entries(status.channels).length === 0 ? (
-              <p className="text-sm text-[#334060]">{t('dashboard.no_channels')}</p>
+              <p className="text-sm" style={{ color: 'var(--pc-text-faint)' }}>
+                {t('dashboard.no_channels')}
+              </p>
             ) : (
               Object.entries(status.channels).map(([name, active]) => (
                 <div
                   key={name}
-                  className="flex items-center justify-between py-2.5 px-3 rounded-xl transition-all duration-300 hover:bg-[#0080ff08]"
-                  style={{ background: 'rgba(10, 10, 26, 0.5)' }}
+                  className="flex items-center justify-between py-2.5 px-3 rounded-xl transition-all"
+                  style={{ background: 'var(--pc-bg-elevated)' }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--pc-hover)'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = 'var(--pc-bg-elevated)'; }}
                 >
-                  <span className="text-sm text-white capitalize font-medium">{name}</span>
+                  <span className="text-sm font-medium capitalize" style={{ color: 'var(--pc-text-primary)' }}>
+                    {name}
+                  </span>
                   <div className="flex items-center gap-2">
                     <span
-                      className={`inline-block h-2 w-2 rounded-full glow-dot ${
-                        active ? 'text-[#00e68a] bg-[#00e68a]' : 'text-[#334060] bg-[#334060]'
-                      }`}
+                      className="status-dot"
+                      style={active
+                        ? { background: 'var(--color-status-success)', boxShadow: '0 0 6px var(--color-status-success)' }
+                        : { background: 'var(--pc-text-faint)' }
+                      }
                     />
-                    <span className="text-xs text-[#556080]">
+                    <span className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
                       {active ? t('dashboard.active') : t('dashboard.inactive')}
                     </span>
                   </div>
@@ -181,30 +251,53 @@ export default function Dashboard() {
         </div>
 
         {/* Health Grid */}
-        <div className="glass-card p-5 animate-slide-in-up">
+        <div className="card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
-            <Activity className="h-5 w-5 text-[#0080ff]" />
-            <h2 className="text-sm font-semibold text-white uppercase tracking-wider">{t('dashboard.component_health')}</h2>
+            <Activity className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
+            <h2
+              className="text-sm font-semibold uppercase tracking-wider"
+              style={{ color: 'var(--pc-text-primary)' }}
+            >
+              {t('dashboard.component_health')}
+            </h2>
           </div>
           <div className="grid grid-cols-2 gap-3">
             {Object.entries(status.health.components).length === 0 ? (
-              <p className="text-sm text-[#334060] col-span-2">{t('dashboard.no_components')}</p>
+              <p className="text-sm col-span-2" style={{ color: 'var(--pc-text-faint)' }}>
+                {t('dashboard.no_components')}
+              </p>
             ) : (
               Object.entries(status.health.components).map(([name, comp]) => (
                 <div
                   key={name}
-                  className={`rounded-xl p-3 border ${healthBorder(comp.status)} transition-all duration-300 hover:scale-[1.02]`}
-                  style={{ background: 'rgba(10, 10, 26, 0.5)' }}
+                  className="rounded-2xl p-3 transition-all"
+                  style={{
+                    border: `1px solid ${healthBorder(comp.status)}`,
+                    background: healthBg(comp.status),
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.transform = 'scale(1.02)'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.transform = 'scale(1)'; }}
                 >
                   <div className="flex items-center gap-2 mb-1">
-                    <span className={`inline-block h-2 w-2 rounded-full ${healthColor(comp.status)} glow-dot`} />
-                    <span className="text-sm font-medium text-white capitalize truncate">
+                    <span
+                      className="status-dot"
+                      style={{
+                        background: healthColor(comp.status),
+                        boxShadow: `0 0 6px ${healthColor(comp.status)}`,
+                      }}
+                    />
+                    <span
+                      className="text-sm font-medium truncate capitalize"
+                      style={{ color: 'var(--pc-text-primary)' }}
+                    >
                       {name}
                     </span>
                   </div>
-                  <p className="text-xs text-[#556080] capitalize">{comp.status}</p>
+                  <p className="text-xs capitalize" style={{ color: 'var(--pc-text-muted)' }}>
+                    {comp.status}
+                  </p>
                   {comp.restart_count > 0 && (
-                    <p className="text-xs text-[#ffaa00] mt-1">
+                    <p className="text-xs mt-1" style={{ color: 'var(--color-status-warning)' }}>
                       {t('dashboard.restarts')}: {comp.restart_count}
                     </p>
                   )}

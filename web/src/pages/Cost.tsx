@@ -1,10 +1,5 @@
 import { useState, useEffect } from 'react';
-import {
-  DollarSign,
-  TrendingUp,
-  Hash,
-  Layers,
-} from 'lucide-react';
+import { DollarSign, TrendingUp, Hash, Layers } from 'lucide-react';
 import type { CostSummary } from '@/types/api';
 import { getCost } from '@/lib/api';
 import { t } from '@/lib/i18n';
@@ -19,29 +14,22 @@ export default function Cost() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    getCost()
-      .then(setCost)
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false));
+    getCost().then(setCost).catch((err) => setError(err.message)).finally(() => setLoading(false));
   }, []);
 
-  if (error) {
-    return (
-      <div className="p-6 animate-fade-in">
-        <div className="rounded-xl bg-[#ff446615] border border-[#ff446630] p-4 text-[#ff6680]">
-          {t('cost.load_error')}: {error}
-        </div>
+  if (error) return (
+    <div className="p-6 animate-fade-in">
+      <div className="rounded-2xl border p-4" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
+        {t('cost.load_error')}: {error}
       </div>
-    );
-  }
+    </div>
+  );
 
-  if (loading || !cost) {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <div className="h-8 w-8 border-2 border-[#0080ff30] border-t-[#0080ff] rounded-full animate-spin" />
-      </div>
-    );
-  }
+  if (loading || !cost) return (
+    <div className="flex items-center justify-center h-64">
+      <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
+    </div>
+  );
 
   const models = Object.values(cost.by_model);
 
@@ -50,26 +38,26 @@ export default function Cost() {
       {/* Summary Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 stagger-children">
         {[
-          { icon: DollarSign, color: '#0080ff', bg: '#0080ff15', label: t('cost.session_cost'), value: formatUSD(cost.session_cost_usd) },
-          { icon: TrendingUp, color: '#00e68a', bg: '#00e68a15', label: t('cost.daily_cost'), value: formatUSD(cost.daily_cost_usd) },
-          { icon: Layers, color: '#a855f7', bg: '#a855f715', label: t('cost.monthly_cost'), value: formatUSD(cost.monthly_cost_usd) },
-          { icon: Hash, color: '#ff8800', bg: '#ff880015', label: t('cost.total_requests'), value: cost.request_count.toLocaleString() },
-        ].map(({ icon: Icon, color, bg, label, value }) => (
-          <div key={label} className="glass-card p-5 animate-slide-in-up">
+          { icon: DollarSign, accent: 'var(--pc-accent)', bg: 'rgba(var(--pc-accent-rgb), 0.08)', label: t('cost.session_cost'), value: formatUSD(cost.session_cost_usd) },
+          { icon: TrendingUp, accent: 'var(--color-status-success)', bg: 'rgba(0, 230, 138, 0.08)', label: t('cost.daily_cost'), value: formatUSD(cost.daily_cost_usd) },
+          { icon: Layers, accent: '#a78bfa', bg: 'rgba(167, 139, 250, 0.08)', label: t('cost.monthly_cost'), value: formatUSD(cost.monthly_cost_usd) },
+          { icon: Hash, accent: 'var(--color-status-warning)', bg: 'rgba(255, 170, 0, 0.08)', label: t('cost.total_requests'), value: cost.request_count.toLocaleString() },
+        ].map(({ icon: Icon, accent, bg, label, value }) => (
+          <div key={label} className="card p-5 animate-slide-in-up">
             <div className="flex items-center gap-3 mb-3">
-              <div className="p-2 rounded-xl" style={{ background: bg }}>
-                <Icon className="h-5 w-5" style={{ color }} />
+              <div className="p-2 rounded-2xl" style={{ background: bg, color: accent }}>
+                <Icon className="h-5 w-5" />
               </div>
-              <span className="text-xs text-[#556080] uppercase tracking-wider font-medium">{label}</span>
+              <span className="text-xs uppercase tracking-wider font-medium" style={{ color: 'var(--pc-text-muted)' }}>{label}</span>
             </div>
-            <p className="text-2xl font-bold text-white font-mono">{value}</p>
+            <p className="text-2xl font-bold font-mono" style={{ color: 'var(--pc-text-primary)' }}>{value}</p>
           </div>
         ))}
       </div>
 
       {/* Token Statistics */}
-      <div className="glass-card p-5 animate-slide-in-up" style={{ animationDelay: '200ms' }}>
-        <h3 className="text-sm font-semibold text-white mb-4 uppercase tracking-wider">
+      <div className="card p-5 animate-slide-in-up" style={{ animationDelay: '200ms' }}>
+        <h3 className="text-sm font-semibold mb-4 uppercase tracking-wider" style={{ color: 'var(--pc-text-primary)' }}>
           {t('cost.token_statistics')}
         </h3>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -78,75 +66,53 @@ export default function Cost() {
             { label: t('cost.avg_tokens_per_request'), value: cost.request_count > 0 ? Math.round(cost.total_tokens / cost.request_count).toLocaleString() : '0' },
             { label: t('cost.cost_per_1k_tokens'), value: cost.total_tokens > 0 ? formatUSD((cost.monthly_cost_usd / cost.total_tokens) * 1000) : '$0.0000' },
           ].map(({ label, value }) => (
-            <div key={label} className="rounded-xl p-4" style={{ background: 'rgba(0,128,255,0.04)', border: '1px solid rgba(0,128,255,0.08)' }}>
-              <p className="text-xs text-[#556080] uppercase tracking-wider">{label}</p>
-              <p className="text-xl font-bold text-white mt-1 font-mono">{value}</p>
+            <div key={label} className="rounded-2xl p-4 border" style={{ background: 'var(--pc-accent-glow)', borderColor: 'var(--pc-border)' }}>
+              <p className="text-xs uppercase tracking-wider" style={{ color: 'var(--pc-text-muted)' }}>{label}</p>
+              <p className="text-xl font-bold mt-1 font-mono" style={{ color: 'var(--pc-text-primary)' }}>{value}</p>
             </div>
           ))}
         </div>
       </div>
 
-      {/* Model Breakdown Table */}
-      <div className="glass-card overflow-hidden animate-slide-in-up" style={{ animationDelay: '300ms' }}>
-        <div className="px-5 py-4 border-b border-[#1a1a3e]">
-          <h3 className="text-sm font-semibold text-white uppercase tracking-wider">
-            {t('cost.model_breakdown')}
-          </h3>
+      {/* Model Breakdown */}
+      <div className="card overflow-hidden animate-slide-in-up rounded-2xl" style={{ animationDelay: '300ms' }}>
+        <div className="px-5 py-4 border-b" style={{ borderColor: 'var(--pc-border)' }}>
+          <h3 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-primary)' }}>{t('cost.model_breakdown')}</h3>
         </div>
         {models.length === 0 ? (
-          <div className="p-8 text-center text-[#334060]">
-            {t('cost.no_model_data')}
-          </div>
+          <div className="p-8 text-center" style={{ color: 'var(--pc-text-faint)' }}>{t('cost.no_model_data')}</div>
         ) : (
           <div className="overflow-x-auto">
             <table className="table-electric">
               <thead>
                 <tr>
-                  <th className="text-left">{t('cost.model')}</th>
+                  <th>{t('cost.model')}</th>
                   <th className="text-right">{t('cost.cost')}</th>
                   <th className="text-right">{t('cost.tokens')}</th>
                   <th className="text-right">{t('cost.requests')}</th>
-                  <th className="text-left">{t('cost.share')}</th>
+                  <th>{t('cost.share')}</th>
                 </tr>
               </thead>
               <tbody>
-                {models
-                  .sort((a, b) => b.cost_usd - a.cost_usd)
-                  .map((m) => {
-                    const share =
-                      cost.monthly_cost_usd > 0
-                        ? (m.cost_usd / cost.monthly_cost_usd) * 100
-                        : 0;
-                    return (
-                      <tr key={m.model}>
-                        <td className="px-5 py-3 text-white font-medium text-sm">
-                          {m.model}
-                        </td>
-                        <td className="px-5 py-3 text-[#8892a8] text-right font-mono text-sm">
-                          {formatUSD(m.cost_usd)}
-                        </td>
-                        <td className="px-5 py-3 text-[#8892a8] text-right text-sm">
-                          {m.total_tokens.toLocaleString()}
-                        </td>
-                        <td className="px-5 py-3 text-[#8892a8] text-right text-sm">
-                          {m.request_count.toLocaleString()}
-                        </td>
-                        <td className="px-5 py-3">
-                          <div className="flex items-center gap-2">
-                            <div className="w-20 h-1.5 bg-[#0a0a18] rounded-full overflow-hidden">
-                              <div
-                                className="h-full rounded-full progress-bar-animated transition-all duration-700"
-                                style={{ width: `${Math.max(share, 2)}%`, background: '#0080ff' }}
-                              />
-                            </div>
-                            <span className="text-xs text-[#556080] w-10 text-right font-mono">
-                              {share.toFixed(1)}%
-                            </span>
+                {models.sort((a, b) => b.cost_usd - a.cost_usd).map((m) => {
+                  const share = cost.monthly_cost_usd > 0 ? (m.cost_usd / cost.monthly_cost_usd) * 100 : 0;
+                  return (
+                    <tr key={m.model}>
+                      <td className="font-medium text-sm" style={{ color: 'var(--pc-text-primary)' }}>{m.model}</td>
+                      <td className="text-right font-mono text-sm" style={{ color: 'var(--pc-text-secondary)' }}>{formatUSD(m.cost_usd)}</td>
+                      <td className="text-right text-sm" style={{ color: 'var(--pc-text-secondary)' }}>{m.total_tokens.toLocaleString()}</td>
+                      <td className="text-right text-sm" style={{ color: 'var(--pc-text-secondary)' }}>{m.request_count.toLocaleString()}</td>
+                      <td>
+                        <div className="flex items-center gap-2">
+                          <div className="w-20 h-1.5 rounded-full overflow-hidden" style={{ background: 'var(--pc-hover)' }}>
+                            <div className="h-full rounded-full progress-bar-animated transition-all duration-700" style={{ width: `${Math.max(share, 2)}%`, background: 'var(--pc-accent)' }} />
                           </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
+                          <span className="text-xs font-mono w-10 text-right" style={{ color: 'var(--pc-text-muted)' }}>{share.toFixed(1)}%</span>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
