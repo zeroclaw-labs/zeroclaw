@@ -7,6 +7,8 @@ pub mod hygiene;
 pub mod knowledge_graph;
 pub mod lucid;
 pub mod markdown;
+#[cfg(feature = "memory-mem0")]
+pub mod mem0;
 pub mod none;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
@@ -24,6 +26,8 @@ pub use backend::{
 };
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
+#[cfg(feature = "memory-mem0")]
+pub use mem0::Mem0Memory;
 pub use none::NoneMemory;
 #[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
@@ -32,7 +36,7 @@ pub use response_cache::ResponseCache;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
-pub use traits::{MemoryCategory, MemoryEntry};
+pub use traits::{MemoryCategory, MemoryEntry, ProceduralMessage};
 
 use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
 use anyhow::Context;
@@ -57,7 +61,7 @@ where
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
         MemoryBackendKind::Postgres => postgres_builder(),
-        MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
+        MemoryBackendKind::Qdrant | MemoryBackendKind::Mem0 | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
         }
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
@@ -333,6 +337,30 @@ pub fn create_memory_with_storage_and_routes(
         anyhow::bail!(
             "memory backend 'postgres' requested but this build was compiled without `memory-postgres`; rebuild with `--features memory-postgres`"
         );
+    }
+
+    #[cfg(feature = "memory-mem0")]
+    fn build_mem0_memory(config: &crate::config::MemoryConfig) -> anyhow::Result<Box<dyn Memory>> {
+        let mem = Mem0Memory::new(&config.mem0)?;
+        tracing::info!(
+            "📦 Mem0 memory backend configured (url: {}, user: {})",
+            config.mem0.url,
+            config.mem0.user_id
+        );
+        Ok(Box::new(mem))
+    }
+
+    #[cfg(not(feature = "memory-mem0"))]
+    fn build_mem0_memory(
+        _config: &crate::config::MemoryConfig,
+    ) -> anyhow::Result<Box<dyn Memory>> {
+        anyhow::bail!(
+            "memory backend 'mem0' requested but this build was compiled without `memory-mem0`; rebuild with `--features memory-mem0`"
+        );
+    }
+
+    if matches!(backend_kind, MemoryBackendKind::Mem0) {
+        return build_mem0_memory(config);
     }
 
     if matches!(backend_kind, MemoryBackendKind::Qdrant) {
