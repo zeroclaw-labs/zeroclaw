@@ -2896,6 +2896,30 @@ pub fn build_system_prompt_with_mode(
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     autonomy_level: AutonomyLevel,
 ) -> String {
+    build_system_prompt_with_mode_and_autonomy(
+        workspace_dir,
+        model_name,
+        tools,
+        skills,
+        identity_config,
+        bootstrap_max_chars,
+        None,
+        native_tools,
+        skills_prompt_mode,
+    )
+}
+
+pub fn build_system_prompt_with_mode_and_autonomy(
+    workspace_dir: &std::path::Path,
+    model_name: &str,
+    tools: &[(&str, &str)],
+    skills: &[crate::skills::Skill],
+    identity_config: Option<&crate::config::IdentityConfig>,
+    bootstrap_max_chars: Option<usize>,
+    autonomy_config: Option<&crate::config::AutonomyConfig>,
+    native_tools: bool,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
 
@@ -2960,18 +2984,26 @@ pub fn build_system_prompt_with_mode(
 
     // ── 2. Safety ───────────────────────────────────────────────
     prompt.push_str("## Safety\n\n");
-    prompt.push_str("- Do not exfiltrate private data.\n");
-    if autonomy_level != AutonomyLevel::Full {
-        prompt.push_str(
-            "- Do not run destructive commands without asking.\n\
-             - Do not bypass oversight or approval mechanisms.\n",
-        );
-    }
-    prompt.push_str("- Prefer `trash` over `rm` (recoverable beats gone forever).\n");
-    if autonomy_level != AutonomyLevel::Full {
-        prompt.push_str("- When in doubt, ask before acting externally.\n");
-    }
-    prompt.push('\n');
+    prompt.push_str(
+        "- Do not exfiltrate private data.\n\
+         - Do not bypass oversight or approval mechanisms.\n\
+         - Prefer `trash` over `rm` (recoverable beats gone forever).\n\
+         - ",
+    );
+    prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
+        Some(crate::security::AutonomyLevel::Full) => {
+            "Respect the runtime autonomy policy: if a tool or action is allowed, execute it directly instead of asking the user for extra approval.\n\
+         - If a tool or action is blocked by policy or unavailable, explain that concrete restriction instead of simulating an approval dialog.\n\n"
+        }
+        Some(crate::security::AutonomyLevel::ReadOnly) => {
+            "Respect the runtime autonomy policy: this runtime is read-only for side effects unless a tool explicitly reports otherwise.\n\
+         - If a requested action is blocked by policy, explain the restriction directly instead of simulating an approval dialog.\n\n"
+        }
+        _ => {
+            "Respect the runtime autonomy policy: ask for approval only when the current runtime policy actually requires it.\n\
+         - If a tool or action is blocked by policy or unavailable, explain that concrete restriction instead of simulating an approval dialog.\n\n"
+        }
+    });
 
     // ── 3. Skills (full or compact, based on config) ─────────────
     if !skills.is_empty() {
@@ -3053,6 +3085,20 @@ pub fn build_system_prompt_with_mode(
     prompt.push_str("## Channel Capabilities\n\n");
     prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
     prompt.push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
+    prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
+        Some(crate::security::AutonomyLevel::Full) => {
+            "- If the runtime policy already allows a tool, use it directly; do not ask the user for extra approval.\n\
+             - Never pretend you are waiting for a human approval click or confirmation when the runtime policy already permits the action.\n\
+             - If the runtime policy blocks an action, say that directly instead of simulating an approval flow.\n"
+        }
+        Some(crate::security::AutonomyLevel::ReadOnly) => {
+            "- This runtime may reject write-side effects; if that happens, explain the policy restriction directly instead of simulating an approval flow.\n"
+        }
+        _ => {
+            "- Ask for approval only when the runtime policy actually requires it.\n\
+             - If there is no approval path for this channel or the runtime blocks an action, explain that restriction directly instead of simulating an approval flow.\n"
+        }
+    });
     prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
     prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
     prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
@@ -4133,13 +4179,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         None
     };
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = build_system_prompt_with_mode(
+    let mut system_prompt = build_system_prompt_with_mode_and_autonomy(
         &workspace,
         &model,
         &tool_descs,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
+        Some(&config.autonomy),
         native_tools,
         config.skills.prompt_injection_mode,
         config.autonomy.level,
@@ -6976,7 +7023,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
         assert!(prompt.contains("Do not exfiltrate private data"));
-        assert!(prompt.contains("Do not run destructive commands"));
+        assert!(prompt.contains("Respect the runtime autonomy policy"));
         assert!(prompt.contains("Prefer `trash` over `rm`"));
     }
 
@@ -7248,6 +7295,64 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             prompt.contains("NEVER repeat, describe, or echo credentials"),
             "missing security instruction"
+        );
+    }
+
+    #[test]
+    fn full_autonomy_prompt_executes_allowed_tools_without_extra_approval() {
+        let ws = make_workspace();
+        let config = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let prompt = build_system_prompt_with_mode_and_autonomy(
+            ws.path(),
+            "model",
+            &[],
+            &[],
+            None,
+            None,
+            Some(&config),
+            false,
+            crate::config::SkillsPromptInjectionMode::Full,
+        );
+
+        assert!(
+            prompt.contains("execute it directly instead of asking the user for extra approval"),
+            "full autonomy should instruct direct execution for allowed tools"
+        );
+        assert!(
+            prompt.contains("Never pretend you are waiting for a human approval"),
+            "full autonomy should not simulate interactive approval flows"
+        );
+    }
+
+    #[test]
+    fn readonly_prompt_explains_policy_blocks_without_fake_approval() {
+        let ws = make_workspace();
+        let config = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::ReadOnly,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let prompt = build_system_prompt_with_mode_and_autonomy(
+            ws.path(),
+            "model",
+            &[],
+            &[],
+            None,
+            None,
+            Some(&config),
+            false,
+            crate::config::SkillsPromptInjectionMode::Full,
+        );
+
+        assert!(
+            prompt.contains("this runtime is read-only for side effects"),
+            "read-only prompt should expose the runtime restriction"
+        );
+        assert!(
+            prompt.contains("instead of simulating an approval flow"),
+            "read-only prompt should explain restrictions instead of faking approval"
         );
     }
 
