@@ -5135,6 +5135,10 @@ pub struct OtpConfig {
     /// Domain-category presets expanded into `gated_domains`.
     #[serde(default)]
     pub gated_domain_categories: Vec<String>,
+
+    /// Maximum number of OTP challenge attempts before lockout.
+    #[serde(default = "default_otp_challenge_max_attempts")]
+    pub challenge_max_attempts: u32,
 }
 
 fn default_otp_token_ttl_secs() -> u64 {
@@ -5143,6 +5147,10 @@ fn default_otp_token_ttl_secs() -> u64 {
 
 fn default_otp_cache_valid_secs() -> u64 {
     300
+}
+
+fn default_otp_challenge_max_attempts() -> u32 {
+    3
 }
 
 fn default_otp_gated_actions() -> Vec<String> {
@@ -5165,6 +5173,7 @@ impl Default for OtpConfig {
             gated_actions: default_otp_gated_actions(),
             gated_domains: Vec::new(),
             gated_domain_categories: Vec::new(),
+            challenge_max_attempts: default_otp_challenge_max_attempts(),
         }
     }
 }
@@ -7036,6 +7045,9 @@ impl Config {
         }
 
         // Security OTP / estop
+        if self.security.otp.challenge_max_attempts == 0 {
+            anyhow::bail!("security.otp.challenge_max_attempts must be greater than 0");
+        }
         if self.security.otp.token_ttl_secs == 0 {
             anyhow::bail!("security.otp.token_ttl_secs must be greater than 0");
         }
