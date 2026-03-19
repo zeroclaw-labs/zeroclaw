@@ -16057,7 +16057,7 @@ pub struct SyncConfig {
     #[serde(default)]
     pub enabled: bool,
     /// WebSocket URL of the Railway relay server for cross-device sync.
-    /// Example: "wss://moanew-production.up.railway.app/sync"
+    /// Example: "wss://api.mymoa.app/sync"
     /// When empty, only in-memory relay is used (single-process mode).
     #[serde(default)]
     pub relay_url: Option<String>,

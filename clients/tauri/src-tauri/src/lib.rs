@@ -1997,7 +1997,7 @@ pub fn run() {
             // Railway relay server (memory sync + operator key fallback only)
             relay_url: std::sync::Mutex::new(
                 std::env::var("MOA_RELAY_URL")
-                    .unwrap_or_else(|_| "https://moanew-production.up.railway.app".to_string()),
+                    .unwrap_or_else(|_| "https://api.mymoa.app".to_string()),
             ),
             token: std::sync::Mutex::new(None),
             sync_connected: AtomicBool::new(false),

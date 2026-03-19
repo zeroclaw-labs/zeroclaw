@@ -21,7 +21,7 @@ const STORAGE_KEY_DEVICE_ID = "zeroclaw_device_id";
 const DEFAULT_LOCAL_GATEWAY_URL =
   import.meta.env.VITE_LOCAL_GATEWAY_URL || "http://127.0.0.1:3000";
 const DEFAULT_RELAY_SERVER_URL =
-  import.meta.env.VITE_RELAY_SERVER_URL || "https://moanew-production.up.railway.app";
+  import.meta.env.VITE_RELAY_SERVER_URL || "https://api.mymoa.app";
 
 // ── Types ────────────────────────────────────────────────────────
 
