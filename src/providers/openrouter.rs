@@ -4,6 +4,7 @@ use crate::providers::traits::{
     Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
+use anyhow::Context as _;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -376,7 +377,9 @@ impl Provider for OpenRouterProvider {
             return Err(super::api_error("OpenRouter", response).await);
         }
 
-        let chat_response: ApiChatResponse = response.json().await?;
+        let text = response.text().await?;
+        let chat_response: ApiChatResponse = serde_json::from_str(&text)
+            .with_context(|| format!("OpenRouter: failed to decode response body: {}", &text[..text.len().min(500)]))?;
 
         chat_response
             .choices
@@ -423,7 +426,9 @@ impl Provider for OpenRouterProvider {
             return Err(super::api_error("OpenRouter", response).await);
         }
 
-        let chat_response: ApiChatResponse = response.json().await?;
+        let text = response.text().await?;
+        let chat_response: ApiChatResponse = serde_json::from_str(&text)
+            .with_context(|| format!("OpenRouter: failed to decode response body: {}", &text[..text.len().min(500)]))?;
 
         chat_response
             .choices
@@ -468,7 +473,9 @@ impl Provider for OpenRouterProvider {
             return Err(super::api_error("OpenRouter", response).await);
         }
 
-        let native_response: NativeChatResponse = response.json().await?;
+        let text = response.text().await?;
+        let native_response: NativeChatResponse = serde_json::from_str(&text)
+            .with_context(|| format!("OpenRouter: failed to decode response body: {}", &text[..text.len().min(500)]))?;
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
@@ -560,7 +567,9 @@ impl Provider for OpenRouterProvider {
             return Err(super::api_error("OpenRouter", response).await);
         }
 
-        let native_response: NativeChatResponse = response.json().await?;
+        let text = response.text().await?;
+        let native_response: NativeChatResponse = serde_json::from_str(&text)
+            .with_context(|| format!("OpenRouter: failed to decode response body: {}", &text[..text.len().min(500)]))?;
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
