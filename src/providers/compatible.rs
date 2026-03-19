@@ -1628,9 +1628,8 @@ impl Provider for OpenAiCompatibleProvider {
             temperature,
             stream: Some(false),
             reasoning_effort: self.reasoning_effort_for_model(model),
-            tool_stream: self.tool_stream_for_tools(
-                tools.as_ref().is_some_and(|tools| !tools.is_empty()),
-            ),
+            tool_stream: self
+                .tool_stream_for_tools(tools.as_ref().is_some_and(|tools| !tools.is_empty())),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
