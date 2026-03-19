@@ -46,6 +46,7 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod jira_tool;
 pub mod knowledge_tool;
 pub mod linkedin;
 pub mod linkedin_client;
@@ -111,6 +112,7 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+pub use jira_tool::JiraTool;
 pub use knowledge_tool::KnowledgeTool;
 pub use linkedin::LinkedInTool;
 pub use mcp_client::McpRegistry;
@@ -420,6 +422,31 @@ pub fn all_tools_with_runtime(
             );
         } else {
             tool_arcs.push(Arc::new(NotionTool::new(notion_api_key, security.clone())));
+        }
+    }
+
+    // Jira integration (config-gated)
+    if root_config.jira.enabled {
+        let api_token = if root_config.jira.api_token.trim().is_empty() {
+            std::env::var("JIRA_API_TOKEN").unwrap_or_default()
+        } else {
+            root_config.jira.api_token.trim().to_string()
+        };
+        if api_token.trim().is_empty() {
+            tracing::warn!(
+                "Jira tool enabled but no API token found (set jira.api_token or JIRA_API_TOKEN env var)"
+            );
+        } else if root_config.jira.base_url.trim().is_empty() {
+            tracing::warn!("Jira tool enabled but jira.base_url is empty — skipping registration");
+        } else {
+            tool_arcs.push(Arc::new(JiraTool::new(
+                root_config.jira.base_url.trim().to_string(),
+                root_config.jira.email.trim().to_string(),
+                api_token,
+                root_config.jira.allowed_actions.clone(),
+                security.clone(),
+                root_config.jira.timeout_secs,
+            )));
         }
     }
 

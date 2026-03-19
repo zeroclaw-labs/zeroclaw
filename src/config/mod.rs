@@ -13,6 +13,7 @@ pub use schema::{
     DockerRuntimeConfig, EdgeTtsConfig, ElevenLabsTtsConfig, EmbeddingRouteConfig, EstopConfig,
     FeishuConfig, GatewayConfig, GoogleSttConfig, GoogleTtsConfig, GoogleWorkspaceConfig,
     HardwareConfig, HardwareTransport, HeartbeatConfig, HooksConfig, HttpRequestConfig,
+    JiraConfig,
     IMessageConfig, IdentityConfig, ImageProviderDalleConfig, ImageProviderFluxConfig,
     ImageProviderImagenConfig, ImageProviderStabilityConfig, KnowledgeConfig, LarkConfig,
     LinkedInConfig, LinkedInContentConfig, LinkedInImageConfig, MatrixConfig, McpConfig,
