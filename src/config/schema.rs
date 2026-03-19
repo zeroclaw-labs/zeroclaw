@@ -449,6 +449,22 @@ pub struct DelegateAgentConfig {
     /// Maximum tool-call iterations in agentic mode.
     #[serde(default = "default_max_tool_iterations")]
     pub max_iterations: usize,
+    /// Timeout in seconds for non-agentic sub-agent provider calls.
+    /// Default: 120 seconds.
+    #[serde(default = "default_delegate_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Timeout in seconds for agentic sub-agent runs.
+    /// Default: 300 seconds.
+    #[serde(default = "default_delegate_agentic_timeout_secs")]
+    pub agentic_timeout_secs: u64,
+}
+
+fn default_delegate_timeout_secs() -> u64 {
+    120
+}
+
+fn default_delegate_agentic_timeout_secs() -> u64 {
+    300
 }
 
 // ── Swarms ──────────────────────────────────────────────────────

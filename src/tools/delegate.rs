@@ -296,8 +296,9 @@ impl Tool for DelegateTool {
         }
 
         // Wrap the provider call in a timeout to prevent indefinite blocking
+        let timeout_secs = agent_config.timeout_secs;
         let result = tokio::time::timeout(
-            Duration::from_secs(DELEGATE_TIMEOUT_SECS),
+            Duration::from_secs(timeout_secs),
             provider.chat_with_system(
                 agent_config.system_prompt.as_deref(),
                 &full_prompt,
@@ -314,7 +315,7 @@ impl Tool for DelegateTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!(
-                        "Agent '{agent_name}' timed out after {DELEGATE_TIMEOUT_SECS}s"
+                        "Agent '{agent_name}' timed out after {timeout_secs}s"
                     )),
                 });
             }
@@ -401,8 +402,9 @@ impl DelegateTool {
 
         let noop_observer = NoopObserver;
 
+        let agentic_timeout_secs = agent_config.agentic_timeout_secs;
         let result = tokio::time::timeout(
-            Duration::from_secs(DELEGATE_AGENTIC_TIMEOUT_SECS),
+            Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(
                 provider,
                 &mut history,
@@ -454,7 +456,7 @@ impl DelegateTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Agent '{agent_name}' timed out after {DELEGATE_AGENTIC_TIMEOUT_SECS}s"
+                    "Agent '{agent_name}' timed out after {agentic_timeout_secs}s"
                 )),
             }),
         }
@@ -531,6 +533,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: 120,
+                agentic_timeout_secs: 300,
             },
         );
         agents.insert(
@@ -545,6 +549,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: 120,
+                agentic_timeout_secs: 300,
             },
         );
         agents
@@ -698,6 +704,8 @@ mod tests {
             agentic: true,
             allowed_tools,
             max_iterations,
+            timeout_secs: 120,
+            agentic_timeout_secs: 300,
         }
     }
 
@@ -806,6 +814,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: 120,
+                agentic_timeout_secs: 300,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
