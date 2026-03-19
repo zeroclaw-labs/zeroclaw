@@ -448,46 +448,32 @@ bool_to_word() {
   fi
 }
 
-guided_input_stream() {
-  # Some constrained containers report interactive stdin (-t 0) but deny
-  # opening /dev/stdin directly. Probe readability before selecting it.
-  if [[ -t 0 ]] && (: </dev/stdin) 2>/dev/null; then
-    echo "/dev/stdin"
+guided_open_input() {
+  # Use stdin directly when it is an interactive terminal (e.g. SSH into LXC).
+  # Subshell probing of /dev/stdin fails in some constrained containers even
+  # when FD 0 is perfectly usable, so skip the probe and trust -t 0.
+  if [[ -t 0 ]]; then
+    GUIDED_FD=0
     return 0
   fi
 
-  if [[ -t 0 ]] && (: </proc/self/fd/0) 2>/dev/null; then
-    echo "/proc/self/fd/0"
-    return 0
-  fi
-
-  if (: </dev/tty) 2>/dev/null; then
-    echo "/dev/tty"
-    return 0
-  fi
-
-  return 1
+  # Non-interactive stdin: try to open /dev/tty as an explicit fd.
+  exec {GUIDED_FD}</dev/tty 2>/dev/null || return 1
 }
 
 guided_read() {
   local __target_var="$1"
   local __prompt="$2"
   local __silent="${3:-false}"
-  local __input_source=""
   local __value=""
 
-  if ! __input_source="$(guided_input_stream)"; then
-    return 1
-  fi
+  [[ -n "${GUIDED_FD:-}" ]] || guided_open_input || return 1
 
   if [[ "$__silent" == true ]]; then
-    if ! read -r -s -p "$__prompt" __value <"$__input_source"; then
-      return 1
-    fi
+    read -r -s -u "$GUIDED_FD" -p "$__prompt" __value || return 1
+    echo
   else
-    if ! read -r -p "$__prompt" __value <"$__input_source"; then
-      return 1
-    fi
+    read -r -u "$GUIDED_FD" -p "$__prompt" __value || return 1
   fi
 
   printf -v "$__target_var" '%s' "$__value"
@@ -708,7 +694,7 @@ prompt_model() {
 run_guided_installer() {
   local os_name="$1"
 
-  if ! guided_input_stream >/dev/null; then
+  if ! guided_open_input >/dev/null; then
     error "guided installer requires an interactive terminal."
     error "Run from a terminal, or pass --no-guided with explicit flags."
     exit 1
