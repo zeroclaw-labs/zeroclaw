@@ -5578,6 +5578,7 @@ mod tests {
             true,
             None,
             "telegram",
+            None,
             &crate::config::MultimodalConfig::default(),
             4,
             None,
@@ -5591,7 +5592,7 @@ mod tests {
         .await
         .expect("native tool-call text should be relayed through on_delta");
 
-        let mut deltas = Vec::new();
+        let mut deltas: Vec<String> = Vec::new();
         while let Some(delta) = rx.recv().await {
             deltas.push(delta);
         }
