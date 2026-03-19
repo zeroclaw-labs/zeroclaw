@@ -188,6 +188,34 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     })
 }
 
+/// Return **all** enabled overdue jobs without the `max_tasks` limit.
+///
+/// Used by the scheduler startup catch-up to ensure every missed job is
+/// executed at least once after a period of downtime (late boot, daemon
+/// restart, etc.).
+pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
+    with_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output
+             FROM cron_jobs
+             WHERE enabled = 1 AND next_run <= ?1
+             ORDER BY next_run ASC",
+        )?;
+
+        let rows = stmt.query_map(params![now.to_rfc3339()], map_cron_job_row)?;
+
+        let mut jobs = Vec::new();
+        for row in rows {
+            match row {
+                Ok(job) => jobs.push(job),
+                Err(e) => tracing::warn!("Skipping cron job with unparseable row data: {e}"),
+            }
+        }
+        Ok(jobs)
+    })
+}
+
 pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
     let mut job = get_job(config, job_id)?;
     let mut schedule_changed = false;
@@ -702,6 +730,46 @@ mod tests {
         let far_future = Utc::now() + ChronoDuration::days(365);
         let due = due_jobs(&config, far_future).unwrap();
         assert_eq!(due.len(), 2);
+    }
+
+    #[test]
+    fn all_overdue_jobs_ignores_max_tasks_limit() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.scheduler.max_tasks = 2;
+
+        let _ = add_job(&config, "* * * * *", "echo ov-1").unwrap();
+        let _ = add_job(&config, "* * * * *", "echo ov-2").unwrap();
+        let _ = add_job(&config, "* * * * *", "echo ov-3").unwrap();
+
+        let far_future = Utc::now() + ChronoDuration::days(365);
+        // due_jobs respects the limit
+        let due = due_jobs(&config, far_future).unwrap();
+        assert_eq!(due.len(), 2);
+        // all_overdue_jobs returns everything
+        let overdue = all_overdue_jobs(&config, far_future).unwrap();
+        assert_eq!(overdue.len(), 3);
+    }
+
+    #[test]
+    fn all_overdue_jobs_excludes_disabled_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_job(&config, "* * * * *", "echo disabled").unwrap();
+        let _ = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+
+        let far_future = Utc::now() + ChronoDuration::days(365);
+        let overdue = all_overdue_jobs(&config, far_future).unwrap();
+        assert!(overdue.is_empty());
     }
 
     #[test]
