@@ -352,6 +352,17 @@ pub struct Config {
     /// Plugin system configuration (`[plugins]`).
     #[serde(default)]
     pub plugins: PluginsConfig,
+
+    /// Locale for tool descriptions (e.g. `"en"`, `"zh-CN"`).
+    ///
+    /// When set, tool descriptions shown in system prompts are loaded from
+    /// `tool_descriptions/<locale>.toml`. Falls back to English, then to
+    /// hardcoded descriptions.
+    ///
+    /// If omitted or empty, the locale is auto-detected from `ZEROCLAW_LOCALE`,
+    /// `LANG`, or `LC_ALL` environment variables (defaulting to `"en"`).
+    #[serde(default)]
+    pub locale: Option<String>,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -462,6 +473,14 @@ pub struct DelegateAgentConfig {
     /// Maximum tool-call iterations in agentic mode.
     #[serde(default = "default_max_tool_iterations")]
     pub max_iterations: usize,
+    /// Timeout in seconds for non-agentic provider calls.
+    /// Defaults to 120 when unset. Must be between 1 and 3600.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Timeout in seconds for agentic sub-agent loops.
+    /// Defaults to 300 when unset. Must be between 1 and 3600.
+    #[serde(default)]
+    pub agentic_timeout_secs: Option<u64>,
 }
 
 // ── Swarms ──────────────────────────────────────────────────────
@@ -1176,6 +1195,34 @@ pub struct SkillsConfig {
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
+    /// Autonomous skill creation from successful multi-step task executions.
+    #[serde(default)]
+    pub skill_creation: SkillCreationConfig,
+}
+
+/// Autonomous skill creation configuration (`[skills.skill_creation]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct SkillCreationConfig {
+    /// Enable automatic skill creation after successful multi-step tasks.
+    /// Default: `false`.
+    pub enabled: bool,
+    /// Maximum number of auto-generated skills to keep.
+    /// When exceeded, the oldest auto-generated skill is removed (LRU eviction).
+    pub max_skills: usize,
+    /// Embedding similarity threshold for deduplication.
+    /// Skills with descriptions more similar than this value are skipped.
+    pub similarity_threshold: f64,
+}
+
+impl Default for SkillCreationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_skills: 500,
+            similarity_threshold: 0.85,
+        }
+    }
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
@@ -4536,6 +4583,11 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// Override for the top-level `ack_reactions` setting. When `None`, the
+    /// channel falls back to `[channels_config].ack_reactions`. When set
+    /// explicitly, it takes precedence.
+    #[serde(default)]
+    pub ack_reactions: Option<bool>,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -5116,6 +5168,10 @@ pub struct OtpConfig {
     /// Domain-category presets expanded into `gated_domains`.
     #[serde(default)]
     pub gated_domain_categories: Vec<String>,
+
+    /// Maximum number of OTP challenge attempts before lockout.
+    #[serde(default = "default_otp_challenge_max_attempts")]
+    pub challenge_max_attempts: u32,
 }
 
 fn default_otp_token_ttl_secs() -> u64 {
@@ -5124,6 +5180,10 @@ fn default_otp_token_ttl_secs() -> u64 {
 
 fn default_otp_cache_valid_secs() -> u64 {
     300
+}
+
+fn default_otp_challenge_max_attempts() -> u32 {
+    3
 }
 
 fn default_otp_gated_actions() -> Vec<String> {
@@ -5146,6 +5206,7 @@ impl Default for OtpConfig {
             gated_actions: default_otp_gated_actions(),
             gated_domains: Vec::new(),
             gated_domain_categories: Vec::new(),
+            challenge_max_attempts: default_otp_challenge_max_attempts(),
         }
     }
 }
@@ -6025,6 +6086,7 @@ impl Default for Config {
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             plugins: PluginsConfig::default(),
+            locale: None,
         }
     }
 }
@@ -6434,6 +6496,45 @@ fn read_codex_openai_api_key() -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// Ensure that essential bootstrap files exist in the workspace directory.
+///
+/// When the workspace is created outside of `zeroclaw onboard` (e.g., non-tty
+/// daemon/cron sessions), these files would otherwise be missing. This function
+/// creates sensible defaults that allow the agent to operate with a basic identity.
+async fn ensure_bootstrap_files(workspace_dir: &Path) -> Result<()> {
+    let defaults: &[(&str, &str)] = &[
+        (
+            "IDENTITY.md",
+            "# IDENTITY.md — Who Am I?\n\n\
+             I am ZeroClaw, an autonomous AI agent.\n\n\
+             ## Traits\n\
+             - Helpful, precise, and safety-conscious\n\
+             - I prioritize clarity and correctness\n",
+        ),
+        (
+            "SOUL.md",
+            "# SOUL.md — Who You Are\n\n\
+             You are ZeroClaw, an autonomous AI agent.\n\n\
+             ## Core Principles\n\
+             - Be helpful and accurate\n\
+             - Respect user intent and boundaries\n\
+             - Ask before taking destructive actions\n\
+             - Prefer safe, reversible operations\n",
+        ),
+    ];
+
+    for (filename, content) in defaults {
+        let path = workspace_dir.join(filename);
+        if !path.exists() {
+            fs::write(&path, content)
+                .await
+                .with_context(|| format!("Failed to create default {filename} in workspace"))?;
+        }
+    }
+
+    Ok(())
+}
+
 impl Config {
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
@@ -6449,6 +6550,8 @@ impl Config {
         fs::create_dir_all(&workspace_dir)
             .await
             .context("Failed to create workspace directory")?;
+
+        ensure_bootstrap_files(&workspace_dir).await?;
 
         if config_path.exists() {
             // Warn if config file is world-readable (may contain API keys)
@@ -6986,6 +7089,9 @@ impl Config {
         }
 
         // Security OTP / estop
+        if self.security.otp.challenge_max_attempts == 0 {
+            anyhow::bail!("security.otp.challenge_max_attempts must be greater than 0");
+        }
         if self.security.otp.token_ttl_secs == 0 {
             anyhow::bail!("security.otp.token_ttl_secs must be greater than 0");
         }
@@ -7294,6 +7400,31 @@ impl Config {
         // Nevis IAM — delegate to NevisConfig::validate() for field-level checks
         if let Err(msg) = self.security.nevis.validate() {
             anyhow::bail!("security.nevis: {msg}");
+        }
+
+        // Delegate agent timeouts
+        const MAX_DELEGATE_TIMEOUT_SECS: u64 = 3600;
+        for (name, agent) in &self.agents {
+            if let Some(timeout) = agent.timeout_secs {
+                if timeout == 0 {
+                    anyhow::bail!("agents.{name}.timeout_secs must be greater than 0");
+                }
+                if timeout > MAX_DELEGATE_TIMEOUT_SECS {
+                    anyhow::bail!(
+                        "agents.{name}.timeout_secs exceeds max {MAX_DELEGATE_TIMEOUT_SECS}"
+                    );
+                }
+            }
+            if let Some(timeout) = agent.agentic_timeout_secs {
+                if timeout == 0 {
+                    anyhow::bail!("agents.{name}.agentic_timeout_secs must be greater than 0");
+                }
+                if timeout > MAX_DELEGATE_TIMEOUT_SECS {
+                    anyhow::bail!(
+                        "agents.{name}.agentic_timeout_secs exceeds max {MAX_DELEGATE_TIMEOUT_SECS}"
+                    );
+                }
+            }
         }
 
         // Transcription
@@ -8405,6 +8536,7 @@ default_temperature = 0.7
                     draft_update_interval_ms: default_draft_update_interval_ms(),
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    ack_reactions: None,
                 }),
                 discord: None,
                 slack: None,
@@ -8472,6 +8604,7 @@ default_temperature = 0.7
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             plugins: PluginsConfig::default(),
+            locale: None,
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -8806,6 +8939,7 @@ tool_dispatcher = "xml"
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             plugins: PluginsConfig::default(),
+            locale: None,
         };
 
         config.save().await.unwrap();
@@ -8864,6 +8998,8 @@ tool_dispatcher = "xml"
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
 
@@ -8988,6 +9124,7 @@ tool_dispatcher = "xml"
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
             mention_only: false,
+            ack_reactions: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -11312,6 +11449,7 @@ require_otp_to_resume = true
             draft_update_interval_ms: default_draft_update_interval_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
+            ack_reactions: None,
         });
 
         // Save (triggers encryption)
@@ -11866,5 +12004,110 @@ require_otp_to_resume = true
             debug_output.contains("[REDACTED]"),
             "Debug output must show [REDACTED] for client_secret"
         );
+    }
+
+    #[test]
+    async fn telegram_config_ack_reactions_false_deserializes() {
+        let toml_str = r#"
+            bot_token = "123:ABC"
+            allowed_users = ["alice"]
+            ack_reactions = false
+        "#;
+        let cfg: TelegramConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.ack_reactions, Some(false));
+    }
+
+    #[test]
+    async fn telegram_config_ack_reactions_true_deserializes() {
+        let toml_str = r#"
+            bot_token = "123:ABC"
+            allowed_users = ["alice"]
+            ack_reactions = true
+        "#;
+        let cfg: TelegramConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.ack_reactions, Some(true));
+    }
+
+    #[test]
+    async fn telegram_config_ack_reactions_missing_defaults_to_none() {
+        let toml_str = r#"
+            bot_token = "123:ABC"
+            allowed_users = ["alice"]
+        "#;
+        let cfg: TelegramConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.ack_reactions, None);
+    }
+
+    #[test]
+    async fn telegram_config_ack_reactions_channel_overrides_top_level() {
+        let tg_toml = r#"
+            bot_token = "123:ABC"
+            allowed_users = ["alice"]
+            ack_reactions = false
+        "#;
+        let tg: TelegramConfig = toml::from_str(tg_toml).unwrap();
+        let top_level_ack = true;
+        let effective = tg.ack_reactions.unwrap_or(top_level_ack);
+        assert!(
+            !effective,
+            "channel-level false must override top-level true"
+        );
+    }
+
+    #[test]
+    async fn telegram_config_ack_reactions_falls_back_to_top_level() {
+        let tg_toml = r#"
+            bot_token = "123:ABC"
+            allowed_users = ["alice"]
+        "#;
+        let tg: TelegramConfig = toml::from_str(tg_toml).unwrap();
+        let top_level_ack = false;
+        let effective = tg.ack_reactions.unwrap_or(top_level_ack);
+        assert!(
+            !effective,
+            "must fall back to top-level false when channel omits field"
+        );
+    }
+
+    // ── Bootstrap files ─────────────────────────────────────
+
+    #[test]
+    async fn ensure_bootstrap_files_creates_missing_files() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("workspace");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+
+        ensure_bootstrap_files(&ws).await.unwrap();
+
+        let soul = tokio::fs::read_to_string(ws.join("SOUL.md")).await.unwrap();
+        let identity = tokio::fs::read_to_string(ws.join("IDENTITY.md"))
+            .await
+            .unwrap();
+        assert!(soul.contains("SOUL.md"));
+        assert!(identity.contains("IDENTITY.md"));
+    }
+
+    #[test]
+    async fn ensure_bootstrap_files_does_not_overwrite_existing() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("workspace");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+
+        let custom = "# My custom SOUL";
+        tokio::fs::write(ws.join("SOUL.md"), custom).await.unwrap();
+
+        ensure_bootstrap_files(&ws).await.unwrap();
+
+        let soul = tokio::fs::read_to_string(ws.join("SOUL.md")).await.unwrap();
+        assert_eq!(
+            soul, custom,
+            "ensure_bootstrap_files must not overwrite existing files"
+        );
+
+        // IDENTITY.md should still be created since it was missing
+        let identity = tokio::fs::read_to_string(ws.join("IDENTITY.md"))
+            .await
+            .unwrap();
+        assert!(identity.contains("IDENTITY.md"));
     }
 }

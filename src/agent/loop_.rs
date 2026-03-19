@@ -1,11 +1,11 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
+use crate::i18n::ToolDescriptions;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
 use crate::providers::{
-    self, reliable::is_context_window_exceeded, ChatMessage, ChatRequest, Provider,
-    ProviderCapabilityError, ToolCall,
+    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
 };
 use crate::runtime;
 use crate::security::SecurityPolicy;
@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -33,6 +33,29 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+
+/// Callback type for checking if model has been switched during tool execution.
+/// Returns Some((provider, model)) if a switch was requested, None otherwise.
+pub type ModelSwitchCallback = Arc<Mutex<Option<(String, String)>>>;
+
+/// Global model switch request state - used for runtime model switching via model_switch tool.
+/// This is set by the model_switch tool and checked by the agent loop.
+#[allow(clippy::type_complexity)]
+static MODEL_SWITCH_REQUEST: LazyLock<Arc<Mutex<Option<(String, String)>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(None)));
+
+/// Get the global model switch request state
+pub fn get_model_switch_state() -> ModelSwitchCallback {
+    Arc::clone(&MODEL_SWITCH_REQUEST)
+}
+
+/// Clear any pending model switch request
+pub fn clear_model_switch_request() {
+    if let Ok(guard) = MODEL_SWITCH_REQUEST.lock() {
+        let mut guard = guard;
+        *guard = None;
+    }
+}
 
 fn glob_match(pattern: &str, name: &str) -> bool {
     match pattern.find('*') {
@@ -214,60 +237,10 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 /// Max characters retained in stored compaction summary.
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 
-/// Absolute upper bound on per-tool-result characters regardless of context window.
-const HARD_MAX_TOOL_RESULT_CHARS: usize = 400_000;
-
-/// Conservative chars-per-token multiplier for tool output (tool results tend to
-/// have more overhead characters — JSON wrappers, special tokens, etc.).
-const TOOL_RESULT_CHARS_PER_TOKEN: usize = 3;
-
-/// Number of most-recent tool messages to keep verbatim when compacting old
-/// tool results into placeholders.
-const TOOL_RESULT_KEEP_RECENT: usize = 6;
-
-/// Placeholder that replaces compacted tool result content.
-const TOOL_RESULT_PLACEHOLDER: &str = "[tool result compacted]";
-
-/// Derive the per-tool-result character budget from the context-window token budget.
-fn max_tool_result_chars(max_context_tokens: usize) -> usize {
-    if max_context_tokens == 0 {
-        return HARD_MAX_TOOL_RESULT_CHARS;
-    }
-    // 30% of context window, converted to chars via TOOL_RESULT_CHARS_PER_TOKEN.
-    // Uses integer arithmetic to avoid f64-to-usize cast warnings.
-    let budget_tokens = max_context_tokens * 30 / 100;
-    (budget_tokens * TOOL_RESULT_CHARS_PER_TOKEN).min(HARD_MAX_TOOL_RESULT_CHARS)
-}
-
-/// Replace old tool-result message bodies with a short placeholder.
-///
-/// Walks history **backwards**, counts tool-role messages, and replaces the
-/// content of any beyond `keep_recent` with [`TOOL_RESULT_PLACEHOLDER`].
-/// Already-compacted messages (content == placeholder) are skipped from the
-/// recent count so they don't waste budget.
-///
-/// Returns `true` if at least one message was compacted.
-fn compact_old_tool_results(history: &mut [ChatMessage], keep_recent: usize) -> bool {
-    let mut seen_tool = 0usize;
-    let mut compacted_any = false;
-
-    for msg in history.iter_mut().rev() {
-        if msg.role != "tool" {
-            continue;
-        }
-        // Already compacted — skip (don't count toward recent budget).
-        if msg.content == TOOL_RESULT_PLACEHOLDER {
-            continue;
-        }
-        seen_tool += 1;
-        if seen_tool > keep_recent {
-            msg.content = TOOL_RESULT_PLACEHOLDER.to_string();
-            compacted_any = true;
-        }
-    }
-
-    compacted_any
-}
+/// Maximum characters kept per individual tool result when adding to history.
+/// Prevents a single oversized tool output (e.g. binary file read) from
+/// blowing up the context window beyond recovery.  ~25k tokens at 4 chars/tok.
+const MAX_TOOL_RESULT_CHARS: usize = 100_000;
 
 /// Estimate token count for a message history using ~4 chars/token heuristic.
 /// Includes a small overhead per message for role/framing tokens.
@@ -279,53 +252,6 @@ fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
             m.content.len().div_ceil(4) + 4
         })
         .sum()
-}
-
-/// Budget-based selective trim: remove messages from oldest to newest until
-/// estimated tokens fit within `token_budget`.
-///
-/// Two passes, following the OpenClaw pattern:
-///   1. Remove **tool** messages first (they are usually the largest).
-///   2. If still over budget, remove non-system messages (user/assistant) oldest-first.
-///
-/// The system prompt (first message with role "system") is always preserved.
-/// Returns the number of messages removed.
-fn budget_based_trim(history: &mut Vec<ChatMessage>, token_budget: usize) -> usize {
-    if token_budget == 0 || estimate_history_tokens(history) <= token_budget {
-        return 0;
-    }
-
-    let has_system = history.first().map_or(false, |m| m.role == "system");
-    let start = if has_system { 1 } else { 0 };
-    let mut removed = 0usize;
-
-    // Pass 1: remove tool messages oldest-first
-    let mut i = start;
-    while i < history.len() {
-        if estimate_history_tokens(history) <= token_budget {
-            break;
-        }
-        if history[i].role == "tool" {
-            history.remove(i);
-            removed += 1;
-            // don't increment i — next element shifted into position
-        } else {
-            i += 1;
-        }
-    }
-
-    // Pass 2: remove remaining non-system messages oldest-first
-    let i = start;
-    while i < history.len() {
-        if estimate_history_tokens(history) <= token_budget {
-            break;
-        }
-        history.remove(i);
-        removed += 1;
-        // don't increment — next element shifted into position
-    }
-
-    removed
 }
 
 /// Minimum interval between progress sends to avoid flooding the draft channel.
@@ -2221,6 +2147,31 @@ pub(crate) fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
+#[derive(Debug)]
+pub(crate) struct ModelSwitchRequested {
+    pub provider: String,
+    pub model: String,
+}
+
+impl std::fmt::Display for ModelSwitchRequested {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "model switch requested to {} {}",
+            self.provider, self.model
+        )
+    }
+}
+
+impl std::error::Error for ModelSwitchRequested {}
+
+pub(crate) fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)> {
+    err.chain()
+        .filter_map(|source| source.downcast_ref::<ModelSwitchRequested>())
+        .map(|e| (e.provider.clone(), e.model.clone()))
+        .next()
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
@@ -2240,6 +2191,7 @@ pub(crate) async fn agent_turn(
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    model_switch_callback: Option<ModelSwitchCallback>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -2260,7 +2212,7 @@ pub(crate) async fn agent_turn(
         excluded_tools,
         dedup_exempt_tools,
         activated_tools,
-        0, // no pre-flight compaction in simple agent_turn
+        model_switch_callback,
     )
     .await
 }
@@ -2466,7 +2418,7 @@ pub(crate) async fn run_tool_call_loop(
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-    max_context_tokens: usize,
+    model_switch_callback: Option<ModelSwitchCallback>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2475,14 +2427,127 @@ pub(crate) async fn run_tool_call_loop(
     };
 
     let turn_id = Uuid::new_v4().to_string();
-    let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
+
+    // ── MCP vision fallback ─────────────────────────────────────────
+    // When the active provider does not support vision input AND the
+    // config specifies `vision_mcp_fallback`, describe images in the
+    // *latest* user message via the named MCP server so the LLM
+    // receives text descriptions instead of raw [IMAGE:] markers.
+    // Only the last user message is processed — older history entries
+    // keep their [IMAGE:path] markers so the agent can reference them.
+    let image_marker_count = crate::multimodal::count_image_markers(history);
+    if image_marker_count > 0 && !provider.supports_vision() {
+        if let Some(ref server_name) = multimodal_config.vision_mcp_fallback {
+            let prefix = format!("{server_name}__");
+            let is_vision_tool_name = |n: &str| -> bool {
+                if let Some(tool_part) = n.strip_prefix(&prefix) {
+                    tool_part.contains("vision")
+                        || tool_part.contains("describe")
+                        || tool_part.contains("image")
+                } else {
+                    false
+                }
+            };
+
+            // Find a suitable vision tool from the registry.
+            let vision_tool: Option<&dyn Tool> = tools_registry
+                .iter()
+                .find(|t| is_vision_tool_name(t.name()))
+                .map(|t| t.as_ref());
+
+            if let Some(tool) = vision_tool {
+                // Only process the LAST user message — keep old [IMAGE:path]
+                // markers in history so the agent can reference them later.
+                if let Some(msg) = history.iter_mut().rev().find(|m| m.role == "user") {
+                    let (cleaned, refs) = crate::multimodal::parse_image_markers(&msg.content);
+                    if !refs.is_empty() {
+                        let schema = tool.parameters_schema();
+                        let image_param = schema
+                            .get("properties")
+                            .and_then(|p| p.as_object())
+                            .and_then(|props| {
+                                if props.contains_key("image_source") {
+                                    Some("image_source")
+                                } else if props.contains_key("image") {
+                                    Some("image")
+                                } else {
+                                    props
+                                        .keys()
+                                        .find(|k| k.contains("image"))
+                                        .map(|k| k.as_str())
+                                }
+                            })
+                            .unwrap_or("image_source");
+
+                        let mut descriptions = Vec::new();
+                        for image_ref in &refs {
+                            let args = serde_json::json!({
+                                image_param: image_ref,
+                                "prompt": "Briefly describe this image in 2-3 sentences."
+                            });
+                            match tool.execute(args).await {
+                                Ok(result) => {
+                                    let truncated: String =
+                                        result.output.chars().take(800).collect();
+                                    descriptions.push(format!(
+                                        "[Image file: {image_ref} — Description: {truncated}]"
+                                    ));
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Vision MCP fallback failed for {}: {e}",
+                                        image_ref
+                                    );
+                                    descriptions
+                                        .push(format!("[Image: could not describe — {image_ref}]"));
+                                }
+                            }
+                        }
+                        msg.content = if cleaned.is_empty() {
+                            descriptions.join("\n\n")
+                        } else {
+                            format!("{}\n\n{}", descriptions.join("\n\n"), cleaned)
+                        };
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "vision_mcp_fallback=\"{server_name}\" configured but no matching tool found"
+                );
+            }
+        }
+    }
 
     for iteration in 0..max_iterations {
+        let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
+
         if cancellation_token
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
         {
             return Err(ToolLoopCancelled.into());
+        }
+
+        // Check if model switch was requested via model_switch tool
+        if let Some(ref callback) = model_switch_callback {
+            if let Ok(guard) = callback.lock() {
+                if let Some((new_provider, new_model)) = guard.as_ref() {
+                    if new_provider != provider_name || new_model != model {
+                        tracing::info!(
+                            "Model switch detected: {} {} -> {} {}",
+                            provider_name,
+                            model,
+                            new_provider,
+                            new_model
+                        );
+                        return Err(ModelSwitchRequested {
+                            provider: new_provider.clone(),
+                            model: new_model.clone(),
+                        }
+                        .into());
+                    }
+                }
+            }
         }
 
         // Rebuild tool_specs each iteration so newly activated deferred tools appear.
@@ -2502,204 +2567,14 @@ pub(crate) async fn run_tool_call_loop(
 
         let image_marker_count = multimodal::count_image_markers(history);
         if image_marker_count > 0 && !provider.supports_vision() {
-            // Check for MCP vision fallback before rejecting outright.
-            if let Some(ref mcp_server) = multimodal_config.vision_mcp_fallback {
-                tracing::info!(
-                    mcp_server = %mcp_server,
-                    image_count = image_marker_count,
-                    "Provider does not support vision; attempting MCP vision fallback"
-                );
-                // Find a matching MCP vision tool in the tools registry.
-                // MCP tools are named `{server}__{tool}` (double-underscore).
-                // We look for any tool whose name starts with `{server}__`
-                // and contains "vision" (e.g. `zai-vision__vision`).
-                let prefix = format!("{mcp_server}__");
-                let is_vision_tool_name = |n: &str| -> bool {
-                    if let Some(tool_part) = n.strip_prefix(&prefix) {
-                        tool_part.contains("vision")
-                            || tool_part.contains("describe")
-                            || tool_part.contains("image")
-                            || tool_part.contains("analyze_image")
-                    } else {
-                        false
-                    }
-                };
-                // First check static tools registry, then activated (deferred) tools.
-                let static_match: Option<&dyn Tool> = tools_registry
-                    .iter()
-                    .find(|t| is_vision_tool_name(t.name()))
-                    .map(|t| t.as_ref());
-                let activated_arc: Option<Arc<dyn Tool>> = if static_match.is_none() {
-                    activated_tools.and_then(|at| {
-                        let guard = at.lock().unwrap();
-                        let name = guard
-                            .tool_names()
-                            .into_iter()
-                            .find(|n| is_vision_tool_name(n))
-                            .map(|s| s.to_string());
-                        name.and_then(|n| guard.get(&n))
-                    })
-                } else {
-                    None
-                };
-                let vision_tool: Option<&dyn Tool> =
-                    static_match.or_else(|| activated_arc.as_deref());
-                let vision_tool_name = vision_tool
-                    .map(|t| t.name().to_string())
-                    .unwrap_or_else(|| format!("{prefix}vision"));
-                if let Some(tool) = vision_tool {
-                    // Determine the correct image parameter name from the tool's
-                    // schema.  Z.AI vision tools use "image_source"; others may
-                    // use "image", "image_path", "image_url", etc.  We inspect
-                    // `properties` and pick the first key containing "image".
-                    let schema = tool.parameters_schema();
-                    let image_param = schema
-                        .get("properties")
-                        .and_then(|p| p.as_object())
-                        .and_then(|props| {
-                            // Prefer exact "image_source", then any key containing "image"
-                            if props.contains_key("image_source") {
-                                Some("image_source")
-                            } else if props.contains_key("image") {
-                                Some("image")
-                            } else {
-                                props
-                                    .keys()
-                                    .find(|k| k.contains("image"))
-                                    .map(|k| k.as_str())
-                            }
-                        })
-                        .unwrap_or("image_source");
-
-                    // Only describe images in the LATEST user message.
-                    // Older messages keep raw [IMAGE:path] so the agent can
-                    // see the file path and use tools if needed (avoids slow
-                    // MCP calls for every historical image).
-                    if let Some(msg) = history.iter_mut().rev().find(|m| m.role == "user") {
-                        let (cleaned, refs) = multimodal::parse_image_markers(&msg.content);
-                        if !refs.is_empty() {
-                            let mut descriptions = Vec::new();
-                            for image_ref in &refs {
-                                let args = serde_json::json!({
-                                    image_param: image_ref,
-                                    "prompt": "Briefly describe this image in 2-3 sentences. Mention key objects, text, and context."
-                                });
-                                match tool.execute(args).await {
-                                    Ok(result) if result.success => {
-                                        let desc = result.output.trim();
-                                        let desc = truncate_with_ellipsis(desc, 800);
-                                        descriptions.push(format!(
-                                            "[Image file: {image_ref}]\n[Image description: {desc}]",
-                                        ));
-                                    }
-                                    Ok(result) => {
-                                        tracing::warn!(
-                                            image = %image_ref,
-                                            error = ?result.error,
-                                            "MCP vision fallback returned failure for image"
-                                        );
-                                        descriptions.push(format!(
-                                            "[Image file: {image_ref}]\n[Image: could not describe]",
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            image = %image_ref,
-                                            error = %e,
-                                            "MCP vision fallback failed for image"
-                                        );
-                                        descriptions.push(format!(
-                                            "[Image file: {image_ref}]\n[Image: could not describe]",
-                                        ));
-                                    }
-                                }
-                            }
-                            msg.content = if cleaned.is_empty() {
-                                descriptions.join("\n\n")
-                            } else {
-                                format!("{}\n\n{}", descriptions.join("\n\n"), cleaned)
-                            };
-                        }
-                    }
-                } else {
-                    tracing::warn!(
-                        tool_name = %vision_tool_name,
-                        "MCP vision fallback configured but tool not found; rejecting"
-                    );
-                    return Err(ProviderCapabilityError {
-                        provider: provider_name.to_string(),
-                        capability: "vision".to_string(),
-                        message: format!(
-                            "received {image_marker_count} image marker(s), but this provider does not support vision input \
-                             (vision_mcp_fallback={mcp_server:?} configured but tool `{vision_tool_name}` not found)"
-                        ),
-                    }
-                    .into());
-                }
-            } else {
-                return Err(ProviderCapabilityError {
-                    provider: provider_name.to_string(),
-                    capability: "vision".to_string(),
-                    message: format!(
-                        "received {image_marker_count} image marker(s), but this provider does not support vision input"
-                    ),
-                }
-                .into());
+            return Err(ProviderCapabilityError {
+                provider: provider_name.to_string(),
+                capability: "vision".to_string(),
+                message: format!(
+                    "received {image_marker_count} image marker(s), but this provider does not support vision input"
+                ),
             }
-        }
-
-        // ── Pre-flight context guard: layered compaction ──
-        if max_context_tokens > 0 {
-            let estimated = estimate_history_tokens(history);
-            if estimated > max_context_tokens {
-                tracing::info!(
-                    estimated_tokens = estimated,
-                    budget = max_context_tokens,
-                    iteration,
-                    "Pre-flight context guard: history exceeds token budget, compacting"
-                );
-
-                // Layer 1: LLM-based conversation summarization
-                let compacted = auto_compact_history(
-                    history,
-                    provider,
-                    model,
-                    DEFAULT_MAX_HISTORY_MESSAGES,
-                    max_context_tokens,
-                )
-                .await
-                .unwrap_or(false);
-                if compacted {
-                    tracing::info!("Pre-flight compaction complete within tool loop");
-                }
-
-                // Layer 2: Replace old tool results with placeholders
-                let still_estimated = estimate_history_tokens(history);
-                if still_estimated > max_context_tokens {
-                    let tool_compacted = compact_old_tool_results(history, TOOL_RESULT_KEEP_RECENT);
-                    if tool_compacted {
-                        tracing::info!(
-                            before = still_estimated,
-                            after = estimate_history_tokens(history),
-                            "Old tool results compacted to placeholders"
-                        );
-                    }
-                }
-
-                // Layer 3: Budget-based selective trim — remove tool msgs
-                // first, then oldest non-system messages, stopping once
-                // within budget.
-                let still_estimated = estimate_history_tokens(history);
-                if still_estimated > max_context_tokens {
-                    let trimmed = budget_based_trim(history, max_context_tokens);
-                    tracing::warn!(
-                        before = still_estimated,
-                        after = estimate_history_tokens(history),
-                        trimmed,
-                        "Budget-based selective trim applied in tool loop"
-                    );
-                }
-            }
+            .into());
         }
 
         let prepared_messages =
@@ -2871,146 +2746,6 @@ pub(crate) async fn run_tool_call_loop(
                         assistant_history_content,
                         native_calls,
                     )
-                }
-                Err(e) if is_context_window_exceeded(&e) => {
-                    // ── Emergency compaction: context exceeded after pre-flight ──
-                    tracing::warn!(
-                        iteration,
-                        "Context window exceeded; attempting emergency compaction and retry"
-                    );
-
-                    // Aggressive tool result compaction — keep only 2 most recent
-                    compact_old_tool_results(history, 2);
-                    // Budget-based selective trim: remove tool msgs first, then
-                    // oldest non-system messages, stopping as soon as we fit.
-                    // When max_context_tokens is 0 (unlimited), fall back to
-                    // halving the current estimated token count as the budget.
-                    let emergency_budget = if max_context_tokens > 0 {
-                        max_context_tokens
-                    } else {
-                        estimate_history_tokens(history) / 2
-                    };
-                    let trimmed = budget_based_trim(history, emergency_budget);
-                    if trimmed > 0 {
-                        tracing::info!(trimmed, "Budget-based selective trim removed messages");
-                    }
-
-                    let after_tokens = estimate_history_tokens(history);
-                    tracing::info!(
-                        after_tokens,
-                        budget = max_context_tokens,
-                        "Emergency compaction complete, retrying LLM call"
-                    );
-
-                    // Re-prepare messages after compaction
-                    let retry_prepared =
-                        multimodal::prepare_messages_for_provider(history, multimodal_config)
-                            .await?;
-                    let retry_tools = if use_native_tools {
-                        Some(tool_specs.as_slice())
-                    } else {
-                        None
-                    };
-
-                    let retry_result = provider
-                        .chat(
-                            ChatRequest {
-                                messages: &retry_prepared.messages,
-                                tools: retry_tools,
-                            },
-                            model,
-                            temperature,
-                        )
-                        .await;
-
-                    match retry_result {
-                        Ok(resp) => {
-                            let (resp_input_tokens, resp_output_tokens) = resp
-                                .usage
-                                .as_ref()
-                                .map(|u| (u.input_tokens, u.output_tokens))
-                                .unwrap_or((None, None));
-
-                            observer.record_event(&ObserverEvent::LlmResponse {
-                                provider: provider_name.to_string(),
-                                model: model.to_string(),
-                                duration: llm_started_at.elapsed(),
-                                success: true,
-                                error_message: None,
-                                input_tokens: resp_input_tokens,
-                                output_tokens: resp_output_tokens,
-                            });
-
-                            runtime_trace::record_event(
-                                "llm_response",
-                                Some(channel_name),
-                                Some(provider_name),
-                                Some(model),
-                                Some(&turn_id),
-                                Some(true),
-                                None,
-                                serde_json::json!({
-                                    "iteration": iteration + 1,
-                                    "duration_ms": llm_started_at.elapsed().as_millis(),
-                                    "input_tokens": resp_input_tokens,
-                                    "output_tokens": resp_output_tokens,
-                                    "emergency_retry": true,
-                                }),
-                            );
-
-                            let response_text = resp.text_or_empty().to_string();
-                            let mut calls = parse_structured_tool_calls(&resp.tool_calls);
-                            let mut parsed_text = String::new();
-                            if calls.is_empty() {
-                                let (ft, fc) = parse_tool_calls(&response_text);
-                                if !ft.is_empty() {
-                                    parsed_text = ft;
-                                }
-                                calls = fc;
-                            }
-                            let reasoning_content = resp.reasoning_content.clone();
-                            let assistant_history_content = if resp.tool_calls.is_empty() {
-                                if use_native_tools {
-                                    build_native_assistant_history_from_parsed_calls(
-                                        &response_text,
-                                        &calls,
-                                        reasoning_content.as_deref(),
-                                    )
-                                    .unwrap_or_else(|| response_text.clone())
-                                } else {
-                                    response_text.clone()
-                                }
-                            } else {
-                                build_native_assistant_history(
-                                    &response_text,
-                                    &resp.tool_calls,
-                                    reasoning_content.as_deref(),
-                                )
-                            };
-                            let native_calls = resp.tool_calls;
-                            (
-                                response_text,
-                                parsed_text,
-                                calls,
-                                assistant_history_content,
-                                native_calls,
-                            )
-                        }
-                        Err(retry_err) => {
-                            let safe_error =
-                                crate::providers::sanitize_api_error(&retry_err.to_string());
-                            observer.record_event(&ObserverEvent::LlmResponse {
-                                provider: provider_name.to_string(),
-                                model: model.to_string(),
-                                duration: llm_started_at.elapsed(),
-                                success: false,
-                                error_message: Some(safe_error.clone()),
-                                input_tokens: None,
-                                output_tokens: None,
-                            });
-                            return Err(retry_err);
-                        }
-                    }
                 }
                 Err(e) => {
                     let safe_error = crate::providers::sanitize_api_error(&e.to_string());
@@ -3378,16 +3113,15 @@ pub(crate) async fn run_tool_call_loop(
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
-        let tool_char_cap = max_tool_result_chars(max_context_tokens);
         for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
-            let output = if outcome.output.len() > tool_char_cap {
+            let output = if outcome.output.len() > MAX_TOOL_RESULT_CHARS {
                 tracing::warn!(
                     tool = %tool_name,
                     original_len = outcome.output.len(),
-                    cap = tool_char_cap,
+                    cap = MAX_TOOL_RESULT_CHARS,
                     "Truncating oversized tool output before adding to history"
                 );
-                truncate_with_ellipsis(&outcome.output, tool_char_cap)
+                truncate_with_ellipsis(&outcome.output, MAX_TOOL_RESULT_CHARS)
             } else {
                 outcome.output.clone()
             };
@@ -3451,7 +3185,10 @@ pub(crate) async fn run_tool_call_loop(
 
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
-pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
+pub(crate) fn build_tool_instructions(
+    tools_registry: &[Box<dyn Tool>],
+    tool_descriptions: Option<&ToolDescriptions>,
+) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
@@ -3467,11 +3204,14 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools_registry {
+        let desc = tool_descriptions
+            .and_then(|td| td.get(tool.name()))
+            .unwrap_or_else(|| tool.description());
         let _ = writeln!(
             instructions,
             "**{}**: {}\nParameters: `{}`\n",
             tool.name(),
-            tool.description(),
+            desc,
             tool.parameters_schema()
         );
     }
@@ -3646,27 +3386,31 @@ pub async fn run(
     }
 
     // ── Resolve provider ─────────────────────────────────────────
-    let provider_name = provider_override
+    let mut provider_name = provider_override
         .as_deref()
         .or(config.default_provider.as_deref())
-        .unwrap_or("openrouter");
+        .unwrap_or("openrouter")
+        .to_string();
 
-    let model_name = model_override
+    let mut model_name = model_override
         .as_deref()
         .or(config.default_model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4");
+        .unwrap_or("anthropic/claude-sonnet-4")
+        .to_string();
 
     let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
 
-    let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
-        provider_name,
+    let mut provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
+        &provider_name,
         config.api_key.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
         &config.model_routes,
-        model_name,
+        &model_name,
         &provider_runtime_options,
     )?;
+
+    let model_switch_callback = get_model_switch_state();
 
     observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.to_string(),
@@ -3692,6 +3436,16 @@ pub async fn run(
         .iter()
         .map(|b| b.board.clone())
         .collect();
+
+    // ── Load locale-aware tool descriptions ────────────────────────
+    let i18n_locale = config
+        .locale
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(crate::i18n::detect_locale);
+    let i18n_search_dirs = crate::i18n::default_search_dirs(&config.workspace_dir);
+    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
@@ -3811,7 +3565,7 @@ pub async fn run(
     let native_tools = provider.supports_native_tools();
     let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
-        model_name,
+        &model_name,
         &tool_descs,
         &skills,
         Some(&config.identity),
@@ -3822,7 +3576,7 @@ pub async fn run(
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+        system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
     }
 
     // Append deferred MCP tool names so the LLM knows what is available
@@ -3894,28 +3648,93 @@ pub async fn run(
         let excluded_tools =
             compute_excluded_mcp_tools(&tools_registry, &config.agent.tool_filter_groups, &msg);
 
-        let response = run_tool_call_loop(
-            provider.as_ref(),
-            &mut history,
-            &tools_registry,
-            observer.as_ref(),
-            provider_name,
-            model_name,
-            temperature,
-            false,
-            approval_manager.as_ref(),
-            channel_name,
-            &config.multimodal,
-            config.agent.max_tool_iterations,
-            None,
-            None,
-            None,
-            &excluded_tools,
-            &config.agent.tool_call_dedup_exempt,
-            activated_handle.as_ref(),
-            config.agent.max_context_tokens,
-        )
-        .await?;
+        #[allow(unused_assignments)]
+        let mut response = String::new();
+        loop {
+            match run_tool_call_loop(
+                provider.as_ref(),
+                &mut history,
+                &tools_registry,
+                observer.as_ref(),
+                &provider_name,
+                &model_name,
+                temperature,
+                false,
+                approval_manager.as_ref(),
+                channel_name,
+                &config.multimodal,
+                config.agent.max_tool_iterations,
+                None,
+                None,
+                None,
+                &excluded_tools,
+                &config.agent.tool_call_dedup_exempt,
+                activated_handle.as_ref(),
+                Some(model_switch_callback.clone()),
+            )
+            .await
+            {
+                Ok(resp) => {
+                    response = resp;
+                    break;
+                }
+                Err(e) => {
+                    if let Some((new_provider, new_model)) = is_model_switch_requested(&e) {
+                        tracing::info!(
+                            "Model switch requested, switching from {} {} to {} {}",
+                            provider_name,
+                            model_name,
+                            new_provider,
+                            new_model
+                        );
+
+                        provider = providers::create_routed_provider_with_options(
+                            &new_provider,
+                            config.api_key.as_deref(),
+                            config.api_url.as_deref(),
+                            &config.reliability,
+                            &config.model_routes,
+                            &new_model,
+                            &provider_runtime_options,
+                        )?;
+
+                        provider_name = new_provider;
+                        model_name = new_model;
+
+                        clear_model_switch_request();
+
+                        observer.record_event(&ObserverEvent::AgentStart {
+                            provider: provider_name.to_string(),
+                            model: model_name.to_string(),
+                        });
+
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        // After successful multi-step execution, attempt autonomous skill creation.
+        #[cfg(feature = "skill-creation")]
+        if config.skills.skill_creation.enabled {
+            let tool_calls = crate::skills::creator::extract_tool_calls_from_history(&history);
+            if tool_calls.len() >= 2 {
+                let creator = crate::skills::creator::SkillCreator::new(
+                    config.workspace_dir.clone(),
+                    config.skills.skill_creation.clone(),
+                );
+                match creator.create_from_execution(&msg, &tool_calls, None).await {
+                    Ok(Some(slug)) => {
+                        tracing::info!(slug, "Auto-created skill from execution");
+                    }
+                    Ok(None) => {
+                        tracing::debug!("Skill creation skipped (duplicate or disabled)");
+                    }
+                    Err(e) => tracing::warn!("Skill creation failed: {e}"),
+                }
+            }
+        }
         final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
@@ -4057,33 +3876,66 @@ pub async fn run(
                 &user_input,
             );
 
-            let response = match run_tool_call_loop(
-                provider.as_ref(),
-                &mut history,
-                &tools_registry,
-                observer.as_ref(),
-                provider_name,
-                model_name,
-                temperature,
-                false,
-                approval_manager.as_ref(),
-                channel_name,
-                &config.multimodal,
-                config.agent.max_tool_iterations,
-                None,
-                None,
-                None,
-                &excluded_tools,
-                &config.agent.tool_call_dedup_exempt,
-                activated_handle.as_ref(),
-                config.agent.max_context_tokens,
-            )
-            .await
-            {
-                Ok(resp) => resp,
-                Err(e) => {
-                    eprintln!("\nError: {e}\n");
-                    continue;
+            let response = loop {
+                match run_tool_call_loop(
+                    provider.as_ref(),
+                    &mut history,
+                    &tools_registry,
+                    observer.as_ref(),
+                    &provider_name,
+                    &model_name,
+                    temperature,
+                    false,
+                    approval_manager.as_ref(),
+                    channel_name,
+                    &config.multimodal,
+                    config.agent.max_tool_iterations,
+                    None,
+                    None,
+                    None,
+                    &excluded_tools,
+                    &config.agent.tool_call_dedup_exempt,
+                    activated_handle.as_ref(),
+                    Some(model_switch_callback.clone()),
+                )
+                .await
+                {
+                    Ok(resp) => break resp,
+                    Err(e) => {
+                        if let Some((new_provider, new_model)) = is_model_switch_requested(&e) {
+                            tracing::info!(
+                                "Model switch requested, switching from {} {} to {} {}",
+                                provider_name,
+                                model_name,
+                                new_provider,
+                                new_model
+                            );
+
+                            provider = providers::create_routed_provider_with_options(
+                                &new_provider,
+                                config.api_key.as_deref(),
+                                config.api_url.as_deref(),
+                                &config.reliability,
+                                &config.model_routes,
+                                &new_model,
+                                &provider_runtime_options,
+                            )?;
+
+                            provider_name = new_provider;
+                            model_name = new_model;
+
+                            clear_model_switch_request();
+
+                            observer.record_event(&ObserverEvent::AgentStart {
+                                provider: provider_name.to_string(),
+                                model: model_name.to_string(),
+                            });
+
+                            continue;
+                        }
+                        eprintln!("\nError: {e}\n");
+                        break String::new();
+                    }
                 }
             };
             final_output = response.clone();
@@ -4101,7 +3953,7 @@ pub async fn run(
             if let Ok(compacted) = auto_compact_history(
                 &mut history,
                 provider.as_ref(),
-                model_name,
+                &model_name,
                 config.agent.max_history_messages,
                 config.agent.max_context_tokens,
             )
@@ -4281,6 +4133,16 @@ pub async fn process_message(
         .map(|b| b.board.clone())
         .collect();
 
+    // ── Load locale-aware tool descriptions ────────────────────────
+    let i18n_locale = config
+        .locale
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(crate::i18n::detect_locale);
+    let i18n_search_dirs = crate::i18n::default_search_dirs(&config.workspace_dir);
+    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
     let mut tool_descs: Vec<(&str, &str)> = vec![
         ("shell", "Execute terminal commands."),
@@ -4346,7 +4208,7 @@ pub async fn process_message(
         config.skills.prompt_injection_mode,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+        system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
     }
     if !deferred_section.is_empty() {
         system_prompt.push('\n');
@@ -4395,6 +4257,7 @@ pub async fn process_message(
         &excluded_tools,
         &config.agent.tool_call_dedup_exempt,
         activated_handle_pm.as_ref(),
+        None,
     )
     .await
 }
@@ -4852,7 +4715,7 @@ mod tests {
             &[],
             &[],
             None,
-            0,
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -4902,7 +4765,7 @@ mod tests {
             &[],
             &[],
             None,
-            0,
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -4945,7 +4808,7 @@ mod tests {
             &[],
             &[],
             None,
-            0,
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -5074,7 +4937,7 @@ mod tests {
             &[],
             &[],
             None,
-            0,
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -5146,7 +5009,7 @@ mod tests {
             &[],
             &[],
             None,
-            0,
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -5214,7 +5077,7 @@ mod tests {
             &[],
             &[],
             None,
-            0,
+            None,
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -5273,7 +5136,7 @@ mod tests {
             &[],
             &exempt,
             None,
-            0,
+            None,
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -5352,7 +5215,7 @@ mod tests {
             &[],
             &exempt,
             None,
-            0,
+            None,
         )
         .await
         .expect("loop should complete");
@@ -5408,7 +5271,7 @@ mod tests {
             &[],
             &[],
             None,
-            0,
+            None,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -5477,6 +5340,7 @@ mod tests {
                 &[],
                 &[],
                 Some(&activated),
+                None,
             )
             .await
             .expect("wrapper path should execute activated tools");
@@ -6055,7 +5919,7 @@ Tail"#;
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
-        let instructions = build_tool_instructions(&tools);
+        let instructions = build_tool_instructions(&tools, None);
 
         assert!(instructions.contains("## Tool Use Protocol"));
         assert!(instructions.contains("<tool_call>"));
@@ -7368,7 +7232,7 @@ Let me check the result."#;
             &[],
             &[],
             None,
-            0,
+            None,
         )
         .await
         .expect("tool loop should complete");
@@ -7445,205 +7309,5 @@ Let me check the result."#;
         let allowed: Vec<String> = vec![];
         let result = filter_by_allowed_tools(specs, Some(&allowed));
         assert!(result.is_empty());
-    }
-
-    // ── budget_based_trim tests ─────────────────────────────────────
-
-    fn make_msg(role: &str, content: &str) -> ChatMessage {
-        match role {
-            "system" => ChatMessage::system(content),
-            "assistant" => ChatMessage::assistant(content),
-            "tool" => ChatMessage::tool(content.to_string()),
-            // "user" and any unknown role default to user message
-            _ => ChatMessage::user(content),
-        }
-    }
-
-    #[test]
-    fn budget_trim_noop_when_within_budget() {
-        let mut history = vec![
-            make_msg("system", "sys"),
-            make_msg("user", "hi"),
-            make_msg("assistant", "hello"),
-        ];
-        let removed = super::budget_based_trim(&mut history, 999_999);
-        assert_eq!(removed, 0);
-        assert_eq!(history.len(), 3);
-    }
-
-    #[test]
-    fn budget_trim_noop_when_budget_zero() {
-        let mut history = vec![make_msg("system", "sys"), make_msg("user", "hi")];
-        let removed = super::budget_based_trim(&mut history, 0);
-        assert_eq!(removed, 0);
-        assert_eq!(history.len(), 2);
-    }
-
-    #[test]
-    fn budget_trim_removes_tool_messages_first() {
-        // Build history: system + user + tool(big) + assistant + tool(big) + user
-        let big = "x".repeat(4000); // ~1000 tokens each
-        let mut history = vec![
-            make_msg("system", "sys"),
-            make_msg("user", "q1"),
-            make_msg("tool", &big),
-            make_msg("assistant", "a1"),
-            make_msg("tool", &big),
-            make_msg("user", "q2"),
-        ];
-        // Budget that fits everything minus the 2 big tool msgs
-        // system(~5) + user(~5) + assistant(~5) + user(~5) = ~20 tokens
-        // Each tool msg = ~1004 tokens. Total = ~2028 tokens.
-        // Set budget to 100 tokens — should remove both tool msgs.
-        let removed = super::budget_based_trim(&mut history, 100);
-        assert!(
-            removed >= 2,
-            "should remove at least 2 tool messages, removed {removed}"
-        );
-        // Verify no tool messages remain
-        assert!(
-            history.iter().all(|m| m.role != "tool"),
-            "all tool messages should be removed, remaining roles: {:?}",
-            history.iter().map(|m| &m.role).collect::<Vec<_>>()
-        );
-        // System prompt must survive
-        assert_eq!(history[0].role, "system");
-    }
-
-    #[test]
-    fn budget_trim_removes_user_assistant_after_tools() {
-        let big = "x".repeat(4000);
-        let mut history = vec![
-            make_msg("system", "sys"),
-            make_msg("user", &big),
-            make_msg("assistant", &big),
-        ];
-        // Budget tiny — must remove user + assistant, keep only system
-        let removed = super::budget_based_trim(&mut history, 10);
-        assert_eq!(removed, 2);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].role, "system");
-    }
-
-    #[test]
-    fn budget_trim_stops_early_when_budget_met() {
-        let big = "x".repeat(4000);
-        let small = "ok";
-        let mut history = vec![
-            make_msg("system", "sys"),
-            make_msg("tool", &big),       // ~1004 tokens
-            make_msg("user", small),      // ~5 tokens
-            make_msg("tool", &big),       // ~1004 tokens
-            make_msg("assistant", small), // ~5 tokens
-        ];
-        // Budget: 1020 tokens — removing just the first tool msg should be enough
-        let removed = super::budget_based_trim(&mut history, 1020);
-        assert_eq!(
-            removed, 1,
-            "should only remove 1 tool message to fit budget"
-        );
-        assert_eq!(history.len(), 4);
-    }
-
-    #[test]
-    fn budget_trim_preserves_system_prompt() {
-        let big = "x".repeat(80000); // huge system prompt
-        let mut history = vec![make_msg("system", &big), make_msg("user", "hi")];
-        // Budget tiny — should remove user but never system
-        let removed = super::budget_based_trim(&mut history, 10);
-        assert_eq!(removed, 1);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].role, "system");
-    }
-
-    #[test]
-    fn budget_trim_empty_history() {
-        let mut history: Vec<ChatMessage> = vec![];
-        let removed = super::budget_based_trim(&mut history, 100);
-        assert_eq!(removed, 0);
-    }
-
-    // ── compact_old_tool_results tests ──────────────────────────────
-
-    #[test]
-    fn compact_tool_results_replaces_old_tool_msgs() {
-        let mut history = vec![
-            make_msg("system", "sys"),
-            make_msg("tool", "result1"),
-            make_msg("tool", "result2"),
-            make_msg("tool", "result3"),
-            make_msg("tool", "result4"),
-        ];
-        let compacted = super::compact_old_tool_results(&mut history, 2);
-        assert!(compacted);
-        // Last 2 tool msgs should be kept verbatim
-        assert_eq!(history[3].content, "result3");
-        assert_eq!(history[4].content, "result4");
-        // First 2 should be placeholders
-        assert_eq!(history[1].content, super::TOOL_RESULT_PLACEHOLDER);
-        assert_eq!(history[2].content, super::TOOL_RESULT_PLACEHOLDER);
-    }
-
-    #[test]
-    fn compact_tool_results_noop_when_few_tools() {
-        let mut history = vec![
-            make_msg("system", "sys"),
-            make_msg("tool", "result1"),
-            make_msg("tool", "result2"),
-        ];
-        let compacted = super::compact_old_tool_results(&mut history, 5);
-        assert!(!compacted);
-        assert_eq!(history[1].content, "result1");
-        assert_eq!(history[2].content, "result2");
-    }
-
-    #[test]
-    fn compact_tool_results_skips_already_compacted() {
-        let mut history = vec![
-            make_msg("system", "sys"),
-            make_msg("tool", super::TOOL_RESULT_PLACEHOLDER),
-            make_msg("tool", "result2"),
-            make_msg("tool", "result3"),
-        ];
-        // keep_recent = 1, only result3 should stay. result2 should be compacted.
-        // The already-compacted msg at index 1 should not count toward keep_recent.
-        let compacted = super::compact_old_tool_results(&mut history, 1);
-        assert!(compacted);
-        assert_eq!(history[1].content, super::TOOL_RESULT_PLACEHOLDER); // was already
-        assert_eq!(history[2].content, super::TOOL_RESULT_PLACEHOLDER); // newly compacted
-        assert_eq!(history[3].content, "result3"); // kept
-    }
-
-    #[test]
-    fn compact_tool_results_no_tool_messages() {
-        let mut history = vec![
-            make_msg("system", "sys"),
-            make_msg("user", "hi"),
-            make_msg("assistant", "hello"),
-        ];
-        let compacted = super::compact_old_tool_results(&mut history, 2);
-        assert!(!compacted);
-    }
-
-    // ── max_tool_result_chars tests ─────────────────────────────────
-
-    #[test]
-    fn max_tool_result_chars_proportional() {
-        // 128K tokens * 30% * 3 chars/tok = 115,200 chars
-        let cap = super::max_tool_result_chars(128_000);
-        assert_eq!(cap, 115_200);
-    }
-
-    #[test]
-    fn max_tool_result_chars_capped_at_hard_max() {
-        // Huge context: 2M tokens * 30% * 3 = 1,800,000 > 400K hard cap
-        let cap = super::max_tool_result_chars(2_000_000);
-        assert_eq!(cap, super::HARD_MAX_TOOL_RESULT_CHARS);
-    }
-
-    #[test]
-    fn max_tool_result_chars_zero_returns_hard_max() {
-        let cap = super::max_tool_result_chars(0);
-        assert_eq!(cap, super::HARD_MAX_TOOL_RESULT_CHARS);
     }
 }

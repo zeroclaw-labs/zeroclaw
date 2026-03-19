@@ -2304,7 +2304,7 @@ async fn process_channel_message(
                 },
                 ctx.tool_call_dedup_exempt.as_ref(),
                 ctx.activated_tools.as_ref(),
-                route.max_context_tokens,
+                None,
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -3284,12 +3284,16 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .telegram
                 .as_ref()
                 .context("Telegram channel is not configured")?;
+            let ack = tg
+                .ack_reactions
+                .unwrap_or(config.channels_config.ack_reactions);
             Ok(Arc::new(
                 TelegramChannel::new(
                     tg.bot_token.clone(),
                     tg.allowed_users.clone(),
                     tg.mention_only,
                 )
+                .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
                 .with_workspace_dir(config.workspace_dir.clone()),
@@ -3377,6 +3381,9 @@ fn collect_configured_channels(
     let mut channels = Vec::new();
 
     if let Some(ref tg) = config.channels_config.telegram {
+        let ack = tg
+            .ack_reactions
+            .unwrap_or(config.channels_config.ack_reactions);
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
             channel: Arc::new(
@@ -3385,6 +3392,7 @@ fn collect_configured_channels(
                     tg.allowed_users.clone(),
                     tg.mention_only,
                 )
+                .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
                 .with_workspace_dir(config.workspace_dir.clone()),
@@ -3477,7 +3485,7 @@ fn collect_configured_channels(
                 sig.allowed_from.clone(),
                 sig.mention_only,
                 sig.ignore_attachments,
-                sig.download_attachments.unwrap_or(false),
+                false, // download_attachments — not yet exposed in config
                 sig.ignore_stories,
             )),
         });
@@ -3990,6 +3998,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
 
+    // ── Load locale-aware tool descriptions ────────────────────────
+    let i18n_locale = config
+        .locale
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(crate::i18n::detect_locale);
+    let i18n_search_dirs = crate::i18n::default_search_dirs(&workspace);
+    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (
@@ -4069,7 +4087,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         config.skills.prompt_injection_mode,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
+        system_prompt.push_str(&build_tool_instructions(
+            tools_registry.as_ref(),
+            Some(&i18n_descs),
+        ));
     }
 
     // Append deferred MCP tool names so the LLM knows what is available
@@ -6861,7 +6882,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "build_system_prompt should not emit protocol block directly"
         );
 
-        prompt.push_str(&build_tool_instructions(&[]));
+        prompt.push_str(&build_tool_instructions(&[], None));
 
         assert_eq!(
             prompt.matches("## Tool Use Protocol").count(),
@@ -8801,6 +8822,7 @@ This is an example JSON object for profile settings."#;
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            ack_reactions: None,
         });
         match build_channel_by_id(&config, "telegram") {
             Ok(channel) => assert_eq!(channel.name(), "telegram"),

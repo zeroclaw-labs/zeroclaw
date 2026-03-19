@@ -706,6 +706,8 @@ impl ModelRoutingConfigTool {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: DEFAULT_AGENT_MAX_ITERATIONS,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             });
 
         next_agent.provider = provider;
