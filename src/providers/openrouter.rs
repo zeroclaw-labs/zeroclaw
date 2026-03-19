@@ -1034,4 +1034,20 @@ mod tests {
         assert!(json.contains("reasoning_content"));
         assert!(json.contains("thinking..."));
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // timeout_secs configuration tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn default_timeout_is_120() {
+        let provider = OpenRouterProvider::new(Some("key"));
+        assert_eq!(provider.timeout_secs, 120);
+    }
+
+    #[test]
+    fn with_timeout_secs_overrides_default() {
+        let provider = OpenRouterProvider::new(Some("key")).with_timeout_secs(300);
+        assert_eq!(provider.timeout_secs, 300);
+    }
 }
