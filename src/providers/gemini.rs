@@ -2219,7 +2219,7 @@ mod tests {
             "Image A: [IMAGE:data:image/png;base64,AAAA] Image B: [IMAGE:data:image/jpeg;base64,BBBB]";
         let parts = build_parts(content);
         assert_eq!(parts.len(), 3); // text + 2 images
-        // Verify both inline parts
+                                    // Verify both inline parts
         let inline_parts: Vec<_> = parts
             .iter()
             .filter(|p| matches!(p, Part::Inline { .. }))
