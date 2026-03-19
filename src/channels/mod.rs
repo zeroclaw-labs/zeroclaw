@@ -2240,6 +2240,7 @@ async fn process_channel_message(
                 true,
                 Some(&*ctx.approval_manager),
                 msg.channel.as_str(),
+                Some(msg.reply_target.as_str()),
                 &ctx.multimodal,
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
