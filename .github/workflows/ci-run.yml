@@ -147,11 +147,8 @@ jobs:
           toolchain: 1.92.0
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
-      - name: Cache apt packages
-        uses: awalsh128/cache-apt-pkgs-action@a6c3917cc929dd0345bfb2d3feaf9101823370ad # v1.4.2
-        with:
-          packages: libudev-dev
-          version: 1.0
+      - name: Install system dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev
 
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
