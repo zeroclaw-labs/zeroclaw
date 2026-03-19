@@ -273,6 +273,15 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
+[profile.release-arm]
+inherits = "release"
+# Low-memory ARM build profile for Raspberry Pi 3 (1GB RAM) and similar devices
+# Uses thin LTO instead of fat LTO to reduce peak memory usage during compilation
+lto = "thin"
+codegen-units = 1
+# Note: For Pi Zero (512MB) or very constrained systems, also use:
+# CARGO_BUILD_JOBS=1 cargo build --profile release-arm
+
 [dev-dependencies]
 tempfile = "3.26"
 criterion = { version = "0.8", features = ["async_tokio"] }
