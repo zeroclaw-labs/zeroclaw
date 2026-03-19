@@ -3466,6 +3466,7 @@ pub async fn run(
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
+        config.autonomy.level,
     );
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
@@ -4100,6 +4101,7 @@ pub async fn process_message(
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
+        config.autonomy.level,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
@@ -6672,6 +6674,7 @@ Let me check the result."#;
             None, // no bootstrap_max_chars
             true, // native_tools
             crate::config::SkillsPromptInjectionMode::Full,
+            crate::security::AutonomyLevel::default(),
         );
 
         // Must contain zero XML protocol artifacts
