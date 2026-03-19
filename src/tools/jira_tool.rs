@@ -45,7 +45,7 @@ impl JiraTool {
         timeout_secs: u64,
     ) -> Self {
         Self {
-            base_url,
+            base_url: base_url.trim_end_matches('/').to_string(),
             email,
             api_token,
             allowed_actions,
@@ -477,6 +477,13 @@ fn validate_issue_key(key: &str) -> anyhow::Result<()> {
 
 // ── Response shaping ──────────────────────────────────────────────────────────
 
+/// Safely extracts the first 10 characters (date prefix) from a string.
+/// Returns the full string if it is shorter than 10 characters instead of
+/// panicking on out-of-bounds slice indexing.
+fn date_prefix(s: &str) -> &str {
+    s.get(..10).unwrap_or(s)
+}
+
 fn shape_basic(raw: &Value) -> Value {
     let f = &raw["fields"];
     let rf = &raw["renderedFields"];
@@ -500,7 +507,7 @@ fn shape_basic(raw: &Value) -> Value {
                     let id = c["id"].as_str().unwrap_or("");
                     json!({
                         "author": c["author"]["displayName"],
-                        "created": &c["created"].as_str().unwrap_or("")[ ..10],
+                        "created": date_prefix(c["created"].as_str().unwrap_or("")),
                         "body": rendered_by_id.get(id).copied().unwrap_or("")
                     })
                 })
@@ -514,8 +521,8 @@ fn shape_basic(raw: &Value) -> Value {
         "status":      f["status"]["name"],
         "priority":    f["priority"]["name"],
         "assignee":    f["assignee"]["displayName"],
-        "created":     &f["created"].as_str().unwrap_or("")[ ..10],
-        "updated":     &f["updated"].as_str().unwrap_or("")[ ..10],
+        "created":     date_prefix(f["created"].as_str().unwrap_or("")),
+        "updated":     date_prefix(f["updated"].as_str().unwrap_or("")),
         "description": rf["description"].as_str().unwrap_or(""),
         "comments":    comments,
     })
@@ -529,8 +536,8 @@ fn shape_basic_search(raw: &Value) -> Value {
         "status":   f["status"]["name"],
         "priority": f["priority"]["name"],
         "assignee": f["assignee"]["displayName"],
-        "created":  &f["created"].as_str().unwrap_or("")[ ..10],
-        "updated":  &f["updated"].as_str().unwrap_or("")[ ..10],
+        "created":  date_prefix(f["created"].as_str().unwrap_or("")),
+        "updated":  date_prefix(f["updated"].as_str().unwrap_or("")),
     })
 }
 
@@ -570,7 +577,7 @@ fn shape_comment_response(raw: &Value) -> Value {
     json!({
         "id":      raw["id"],
         "author":  raw["author"]["displayName"],
-        "created": &raw["created"].as_str().unwrap_or("")[ ..10],
+        "created": date_prefix(raw["created"].as_str().unwrap_or("")),
     })
 }
 
@@ -594,7 +601,8 @@ fn extract_emails(text: &str) -> Vec<String> {
             }
         }
     }
-    emails.dedup();
+    let mut seen = std::collections::HashSet::new();
+    emails.retain(|e| seen.insert(e.clone()));
     emails
 }
 
@@ -982,6 +990,12 @@ mod tests {
     }
 
     #[test]
+    fn extract_emails_deduplicates_non_adjacent() {
+        let emails = extract_emails("@a@b.com @c@d.com @a@b.com");
+        assert_eq!(emails, vec!["a@b.com", "c@d.com"]);
+    }
+
+    #[test]
     fn extract_emails_strips_trailing_punctuation() {
         let emails = extract_emails("@john@company.com,");
         assert_eq!(emails, vec!["john@company.com"]);
@@ -1044,6 +1058,28 @@ mod tests {
         assert_eq!(shaped["created"], "2024-06-01");
         assert!(shaped.get("body").is_none());
         assert!(shaped.get("self").is_none());
+    }
+
+    // ── date_prefix helper ─────────────────────────────────────────────────
+
+    #[test]
+    fn date_prefix_normal_date_string() {
+        assert_eq!(date_prefix("2024-01-15T10:00:00.000Z"), "2024-01-15");
+    }
+
+    #[test]
+    fn date_prefix_empty_string() {
+        assert_eq!(date_prefix(""), "");
+    }
+
+    #[test]
+    fn date_prefix_short_string() {
+        assert_eq!(date_prefix("2024"), "2024");
+    }
+
+    #[test]
+    fn date_prefix_exactly_ten_chars() {
+        assert_eq!(date_prefix("2024-01-15"), "2024-01-15");
     }
 
     #[test]
