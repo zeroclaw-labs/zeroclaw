@@ -305,7 +305,11 @@ impl OpenRouterProvider {
     }
 
     fn http_client(&self) -> Client {
-        crate::config::build_runtime_proxy_client_with_timeouts("provider.openrouter", self.timeout_secs, 10)
+        crate::config::build_runtime_proxy_client_with_timeouts(
+            "provider.openrouter",
+            self.timeout_secs,
+            10,
+        )
     }
 }
 
@@ -378,8 +382,12 @@ impl Provider for OpenRouterProvider {
         }
 
         let text = response.text().await?;
-        let chat_response: ApiChatResponse = serde_json::from_str(&text)
-            .with_context(|| format!("OpenRouter: failed to decode response body: {}", &text[..text.len().min(500)]))?;
+        let chat_response: ApiChatResponse = serde_json::from_str(&text).with_context(|| {
+            format!(
+                "OpenRouter: failed to decode response body: {}",
+                &text[..text.len().min(500)]
+            )
+        })?;
 
         chat_response
             .choices
@@ -427,8 +435,12 @@ impl Provider for OpenRouterProvider {
         }
 
         let text = response.text().await?;
-        let chat_response: ApiChatResponse = serde_json::from_str(&text)
-            .with_context(|| format!("OpenRouter: failed to decode response body: {}", &text[..text.len().min(500)]))?;
+        let chat_response: ApiChatResponse = serde_json::from_str(&text).with_context(|| {
+            format!(
+                "OpenRouter: failed to decode response body: {}",
+                &text[..text.len().min(500)]
+            )
+        })?;
 
         chat_response
             .choices
@@ -474,8 +486,13 @@ impl Provider for OpenRouterProvider {
         }
 
         let text = response.text().await?;
-        let native_response: NativeChatResponse = serde_json::from_str(&text)
-            .with_context(|| format!("OpenRouter: failed to decode response body: {}", &text[..text.len().min(500)]))?;
+        let native_response: NativeChatResponse =
+            serde_json::from_str(&text).with_context(|| {
+                format!(
+                    "OpenRouter: failed to decode response body: {}",
+                    &text[..text.len().min(500)]
+                )
+            })?;
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
@@ -568,8 +585,13 @@ impl Provider for OpenRouterProvider {
         }
 
         let text = response.text().await?;
-        let native_response: NativeChatResponse = serde_json::from_str(&text)
-            .with_context(|| format!("OpenRouter: failed to decode response body: {}", &text[..text.len().min(500)]))?;
+        let native_response: NativeChatResponse =
+            serde_json::from_str(&text).with_context(|| {
+                format!(
+                    "OpenRouter: failed to decode response body: {}",
+                    &text[..text.len().min(500)]
+                )
+            })?;
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
