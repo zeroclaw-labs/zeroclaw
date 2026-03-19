@@ -88,27 +88,85 @@ Semantics:
 
 ## Operation Inventory Reference
 
-ZeroClaw should not try to freeze a hand-maintained global list of Google
-Workspace operations in this spec. The underlying `gws` command surface is
-derived from Google's Discovery Service, so the canonical operation inventory
-is external and changes over time.
+The first question operators need answered is not "where is the canonical API
+inventory?" It is "what string values are valid here?"
 
-Use these references when defining or reviewing `allowed_operations`:
+For `allowed_operations`, the runtime expects this exact shape:
 
-- Google API Discovery directory:
-  `https://developers.google.com/discovery/v1/reference/apis/list`
-- Discovery Service overview and document structure:
-  `https://developers.google.com/discovery/v1/using`
-- Google Workspace CLI docs entry point:
+- `service`: the same service identifier used in `allowed_services` and the
+  first `gws` command segment
+- `resource`: the Google API resource name used by that service
+- `method`: the operation name used on that resource
+
+Mental model:
+
+```text
+gws <service> <resource> <method> ...
+```
+
+maps to:
+
+```toml
+[[google_workspace.allowed_operations]]
+service = "<service>"
+resource = "<resource>"
+methods = ["<method>"]
+```
+
+Examples:
+
+| CLI shape | Config entry |
+|---|---|
+| `gws gmail messages list` | `service = "gmail"`, `resource = "messages"`, `method = "list"` |
+| `gws gmail drafts create` | `service = "gmail"`, `resource = "drafts"`, `method = "create"` |
+| `gws calendar events list` | `service = "calendar"`, `resource = "events"`, `method = "list"` |
+| `gws drive files get` | `service = "drive"`, `resource = "files"`, `method = "get"` |
+
+Verified starter examples for common supervised workflows:
+
+- Gmail read-only triage:
+  - `gmail/messages/list`
+  - `gmail/messages/get`
+  - `gmail/threads/list`
+  - `gmail/threads/get`
+- Gmail draft-without-send:
+  - `gmail/drafts/list`
+  - `gmail/drafts/get`
+  - `gmail/drafts/create`
+  - `gmail/drafts/update`
+- Calendar review:
+  - `calendar/events/list`
+  - `calendar/events/get`
+- Calendar scheduling:
+  - `calendar/events/list`
+  - `calendar/events/get`
+  - `calendar/events/insert`
+  - `calendar/events/update`
+- Drive lookup:
+  - `drive/files/list`
+  - `drive/files/get`
+- Drive metadata and sharing review:
+  - `drive/files/list`
+  - `drive/files/get`
+  - `drive/files/update`
+  - `drive/permissions/list`
+
+Important constraint:
+
+- This spec intentionally documents the value shape and a small set of verified
+  common examples.
+- It does not attempt to freeze a complete global list of every Google
+  Workspace operation, because the underlying `gws` command surface is derived
+  from Google's Discovery Service and can evolve over time.
+
+When you need to confirm whether a less-common operation exists:
+
+- Use the Google Workspace CLI docs as the operator-facing entry point:
   `https://googleworkspace-cli.mintlify.app/`
-
-Practical rule:
-
-- Use the Discovery directory to identify available Google APIs.
-- Use the per-service Discovery document or REST reference to enumerate the
-  resource and method names for a specific service.
-- Use the `gws` docs as the operator-facing reference for how those operations
-  map into CLI commands.
+- Use the Google API Discovery directory to identify the relevant API:
+  `https://developers.google.com/discovery/v1/reference/apis/list`
+- Use the per-service Discovery document or REST reference to confirm the exact
+  resource and method names for that API.
 
 ## Runtime Enforcement
 
