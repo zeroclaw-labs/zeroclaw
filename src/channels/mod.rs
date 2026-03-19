@@ -2812,6 +2812,14 @@ pub fn build_system_prompt_with_mode(
          you are about to use or just used, DELETE it and give the answer directly.\n\n",
     );
 
+    // ── 0b. Tool Honesty ───────────────────────────────────────
+    prompt.push_str(
+        "## CRITICAL: Tool Honesty\n\n\
+         - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
+         - If a tool call fails, report the error — never make up data to fill the gap.\n\
+         - When unsure whether a tool call succeeded, ask the user rather than guessing.\n\n",
+    );
+
     // ── 1. Tooling ──────────────────────────────────────────────
     if !tools.is_empty() {
         prompt.push_str("## Tools\n\n");
