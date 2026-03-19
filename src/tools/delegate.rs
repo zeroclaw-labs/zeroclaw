@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::agent::loop_::run_tool_call_loop;
-use crate::config::DelegateAgentConfig;
+use crate::config::{DelegateAgentConfig, DelegateToolConfig};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::security::policy::ToolOperation;
@@ -11,11 +11,6 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Default timeout for sub-agent provider calls.
-const DELEGATE_TIMEOUT_SECS: u64 = 120;
-/// Default timeout for agentic sub-agent runs.
-const DELEGATE_AGENTIC_TIMEOUT_SECS: u64 = 300;
 
 /// Tool that delegates a subtask to a named agent with a different
 /// provider/model configuration. Enables multi-agent workflows where
@@ -34,6 +29,8 @@ pub struct DelegateTool {
     parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
+    /// Global delegate tool config providing default timeout values.
+    delegate_config: DelegateToolConfig,
 }
 
 impl DelegateTool {
@@ -64,6 +61,7 @@ impl DelegateTool {
             depth: 0,
             parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
+            delegate_config: DelegateToolConfig::default(),
         }
     }
 
@@ -100,6 +98,7 @@ impl DelegateTool {
             depth,
             parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
+            delegate_config: DelegateToolConfig::default(),
         }
     }
 
@@ -112,6 +111,12 @@ impl DelegateTool {
     /// Attach multimodal configuration for sub-agent tool loops.
     pub fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
         self.multimodal_config = config;
+        self
+    }
+
+    /// Attach global delegate tool configuration for default timeout values.
+    pub fn with_delegate_config(mut self, config: DelegateToolConfig) -> Self {
+        self.delegate_config = config;
         self
     }
 
@@ -296,7 +301,9 @@ impl Tool for DelegateTool {
         }
 
         // Wrap the provider call in a timeout to prevent indefinite blocking
-        let timeout_secs = agent_config.timeout_secs.unwrap_or(DELEGATE_TIMEOUT_SECS);
+        let timeout_secs = agent_config
+            .timeout_secs
+            .unwrap_or(self.delegate_config.timeout_secs);
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
             provider.chat_with_system(
@@ -404,7 +411,7 @@ impl DelegateTool {
 
         let agentic_timeout_secs = agent_config
             .agentic_timeout_secs
-            .unwrap_or(DELEGATE_AGENTIC_TIMEOUT_SECS);
+            .unwrap_or(self.delegate_config.agentic_timeout_secs);
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(
@@ -514,6 +521,9 @@ impl Observer for NoopObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::schema::{
+        DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS, DEFAULT_DELEGATE_TIMEOUT_SECS,
+    };
     use crate::providers::{ChatRequest, ChatResponse, ToolCall};
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use anyhow::anyhow;
@@ -1256,11 +1266,14 @@ mod tests {
             timeout_secs: None,
             agentic_timeout_secs: None,
         };
-        assert_eq!(config.timeout_secs.unwrap_or(DELEGATE_TIMEOUT_SECS), 120);
+        assert_eq!(
+            config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
+            120
+        );
         assert_eq!(
             config
                 .agentic_timeout_secs
-                .unwrap_or(DELEGATE_AGENTIC_TIMEOUT_SECS),
+                .unwrap_or(DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS),
             300
         );
     }
@@ -1280,11 +1293,14 @@ mod tests {
             timeout_secs: Some(60),
             agentic_timeout_secs: Some(600),
         };
-        assert_eq!(config.timeout_secs.unwrap_or(DELEGATE_TIMEOUT_SECS), 60);
+        assert_eq!(
+            config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
+            60
+        );
         assert_eq!(
             config
                 .agentic_timeout_secs
-                .unwrap_or(DELEGATE_AGENTIC_TIMEOUT_SECS),
+                .unwrap_or(DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS),
             600
         );
     }
