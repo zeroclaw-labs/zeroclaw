@@ -85,9 +85,12 @@ impl GoogleWorkspaceTool {
         }
 
         self.allowed_operations.iter().any(|operation| {
-            operation.service == service
-                && operation.resource == resource
-                && operation.methods.iter().any(|allowed| allowed == method)
+            operation.service.trim() == service
+                && operation.resource.trim() == resource
+                && operation
+                    .methods
+                    .iter()
+                    .any(|allowed| allowed.trim() == method)
         })
     }
 }
@@ -352,26 +355,6 @@ impl Tool for GoogleWorkspaceTool {
             if let Ok(val) = std::env::var(key) {
                 cmd.env(key, val);
             }
-        }
-
-        // Apply credential path if configured
-        if let Some(ref creds) = self.credentials_path {
-            cmd.env("GOOGLE_APPLICATION_CREDENTIALS", creds);
-        }
-
-        // Apply default account if configured
-        if let Some(ref account) = self.default_account {
-            cmd.args(["--account", account]);
-        }
-
-        if self.audit_log {
-            tracing::info!(
-                tool = "google_workspace",
-                service = service,
-                resource = resource,
-                method = method,
-                "gws audit: executing API call"
-            );
         }
 
         // Apply credential path if configured

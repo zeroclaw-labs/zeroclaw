@@ -11127,6 +11127,22 @@ default_model = "legacy-model"
     }
 
     #[test]
+    async fn google_workspace_allowed_operations_reject_duplicate_methods_within_entry() {
+        let mut config = Config::default();
+        config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
+            service: "gmail".into(),
+            resource: "drafts".into(),
+            methods: vec!["create".into(), "create".into()],
+        }];
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate entry"),
+            "expected duplicate entry error, got: {err}"
+        );
+    }
+
+    #[test]
     async fn google_workspace_allowed_operations_accept_valid_entries() {
         let mut config = Config::default();
         config.google_workspace.allowed_operations = vec![
