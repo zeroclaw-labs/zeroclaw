@@ -12,11 +12,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Default timeout for sub-agent provider calls.
-const DELEGATE_TIMEOUT_SECS: u64 = 120;
-/// Default timeout for agentic sub-agent runs.
-const DELEGATE_AGENTIC_TIMEOUT_SECS: u64 = 300;
-
 /// Tool that delegates a subtask to a named agent with a different
 /// provider/model configuration. Enables multi-agent workflows where
 /// a primary agent can hand off specialized work (research, coding,
@@ -520,6 +515,7 @@ mod tests {
     }
 
     fn sample_agents() -> HashMap<String, DelegateAgentConfig> {
+        use crate::config::{DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS, DEFAULT_DELEGATE_TIMEOUT_SECS};
         let mut agents = HashMap::new();
         agents.insert(
             "researcher".to_string(),
@@ -533,8 +529,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
-                timeout_secs: 120,
-                agentic_timeout_secs: 300,
+                timeout_secs: DEFAULT_DELEGATE_TIMEOUT_SECS,
+                agentic_timeout_secs: DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
             },
         );
         agents.insert(
@@ -549,8 +545,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
-                timeout_secs: 120,
-                agentic_timeout_secs: 300,
+                timeout_secs: DEFAULT_DELEGATE_TIMEOUT_SECS,
+                agentic_timeout_secs: DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
             },
         );
         agents
@@ -694,6 +690,7 @@ mod tests {
     }
 
     fn agentic_config(allowed_tools: Vec<String>, max_iterations: usize) -> DelegateAgentConfig {
+        use crate::config::{DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS, DEFAULT_DELEGATE_TIMEOUT_SECS};
         DelegateAgentConfig {
             provider: "openrouter".to_string(),
             model: "model-test".to_string(),
@@ -704,8 +701,8 @@ mod tests {
             agentic: true,
             allowed_tools,
             max_iterations,
-            timeout_secs: 120,
-            agentic_timeout_secs: 300,
+            timeout_secs: DEFAULT_DELEGATE_TIMEOUT_SECS,
+            agentic_timeout_secs: DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
         }
     }
 
@@ -801,6 +798,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_provider_returns_error() {
+        use crate::config::{DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS, DEFAULT_DELEGATE_TIMEOUT_SECS};
         let mut agents = HashMap::new();
         agents.insert(
             "broken".to_string(),
@@ -814,8 +812,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
-                timeout_secs: 120,
-                agentic_timeout_secs: 300,
+                timeout_secs: DEFAULT_DELEGATE_TIMEOUT_SECS,
+                agentic_timeout_secs: DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());

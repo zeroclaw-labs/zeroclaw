@@ -284,6 +284,10 @@ pub struct Config {
     #[serde(default)]
     pub peripherals: PeripheralsConfig,
 
+    /// Delegate tool global default configuration (`[delegate]`).
+    #[serde(default)]
+    pub delegate: DelegateToolConfig,
+
     /// Delegate agent configurations for multi-agent workflows.
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
@@ -419,6 +423,23 @@ pub struct ModelProviderConfig {
     pub azure_openai_api_version: Option<String>,
 }
 
+// ── Delegate Tool Configuration ─────────────────────────────────
+
+/// Global delegate tool configuration for default timeout values.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct DelegateToolConfig {
+    /// Default timeout in seconds for non-agentic sub-agent provider calls.
+    /// Can be overridden per-agent in [[agents]] config.
+    /// Default: 120 seconds.
+    #[serde(default = "default_delegate_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Default timeout in seconds for agentic sub-agent runs.
+    /// Can be overridden per-agent in [[agents]] config.
+    /// Default: 300 seconds.
+    #[serde(default = "default_delegate_agentic_timeout_secs")]
+    pub agentic_timeout_secs: u64,
+}
+
 // ── Delegate Agents ──────────────────────────────────────────────
 
 /// Configuration for a delegate sub-agent used by the `delegate` tool.
@@ -460,11 +481,11 @@ pub struct DelegateAgentConfig {
 }
 
 fn default_delegate_timeout_secs() -> u64 {
-    120
+    DEFAULT_DELEGATE_TIMEOUT_SECS
 }
 
 fn default_delegate_agentic_timeout_secs() -> u64 {
-    300
+    DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS
 }
 
 // ── Swarms ──────────────────────────────────────────────────────
@@ -521,6 +542,12 @@ const DEFAULT_PROVIDER_TIMEOUT_SECS: u64 = 120;
 fn default_provider_timeout_secs() -> u64 {
     DEFAULT_PROVIDER_TIMEOUT_SECS
 }
+
+/// Default delegate tool timeout for non-agentic calls: 120 seconds.
+pub const DEFAULT_DELEGATE_TIMEOUT_SECS: u64 = 120;
+
+/// Default delegate tool timeout for agentic runs: 300 seconds.
+pub const DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS: u64 = 300;
 
 /// Validate that a temperature value is within the allowed range.
 pub fn validate_temperature(value: f64) -> std::result::Result<f64, String> {
