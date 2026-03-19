@@ -273,6 +273,11 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
+[profile.release-arm]
+inherits = "release"
+codegen-units = 1
+lto = "thin"  # Use thin LTO to reduce memory usage on low-memory ARM devices
+
 [dev-dependencies]
 tempfile = "3.26"
 criterion = { version = "0.8", features = ["async_tokio"] }

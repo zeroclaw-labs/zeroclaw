@@ -10,3 +10,10 @@ linker = "armv7a-linux-androideabi21-clang"
 
 [target.aarch64-linux-android]
 linker = "aarch64-linux-android21-clang"
+
+# Raspberry Pi ARM targets (ARMv7 and AArch64)
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
