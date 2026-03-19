@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::agent::loop_::run_tool_call_loop;
-use crate::config::DelegateAgentConfig;
+use crate::config::{DelegateAgentConfig, DelegateToolConfig};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::security::policy::ToolOperation;
@@ -29,6 +29,8 @@ pub struct DelegateTool {
     parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
+    /// Global delegate tool config providing default timeout values.
+    delegate_config: DelegateToolConfig,
 }
 
 impl DelegateTool {
@@ -59,6 +61,7 @@ impl DelegateTool {
             depth: 0,
             parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
+            delegate_config: DelegateToolConfig::default(),
         }
     }
 
@@ -95,6 +98,7 @@ impl DelegateTool {
             depth,
             parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
+            delegate_config: DelegateToolConfig::default(),
         }
     }
 
@@ -107,6 +111,12 @@ impl DelegateTool {
     /// Attach multimodal configuration for sub-agent tool loops.
     pub fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
         self.multimodal_config = config;
+        self
+    }
+
+    /// Attach global delegate tool configuration for default timeout values.
+    pub fn with_delegate_config(mut self, config: DelegateToolConfig) -> Self {
+        self.delegate_config = config;
         self
     }
 
@@ -291,7 +301,9 @@ impl Tool for DelegateTool {
         }
 
         // Wrap the provider call in a timeout to prevent indefinite blocking
-        let timeout_secs = agent_config.timeout_secs;
+        let timeout_secs = agent_config
+            .timeout_secs
+            .unwrap_or(self.delegate_config.timeout_secs);
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
             provider.chat_with_system(
@@ -397,7 +409,9 @@ impl DelegateTool {
 
         let noop_observer = NoopObserver;
 
-        let agentic_timeout_secs = agent_config.agentic_timeout_secs;
+        let agentic_timeout_secs = agent_config
+            .agentic_timeout_secs
+            .unwrap_or(self.delegate_config.agentic_timeout_secs);
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(
@@ -515,7 +529,6 @@ mod tests {
     }
 
     fn sample_agents() -> HashMap<String, DelegateAgentConfig> {
-        use crate::config::{DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS, DEFAULT_DELEGATE_TIMEOUT_SECS};
         let mut agents = HashMap::new();
         agents.insert(
             "researcher".to_string(),
@@ -529,8 +542,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
-                timeout_secs: DEFAULT_DELEGATE_TIMEOUT_SECS,
-                agentic_timeout_secs: DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
         agents.insert(
@@ -545,8 +558,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
-                timeout_secs: DEFAULT_DELEGATE_TIMEOUT_SECS,
-                agentic_timeout_secs: DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
         agents
@@ -690,7 +703,6 @@ mod tests {
     }
 
     fn agentic_config(allowed_tools: Vec<String>, max_iterations: usize) -> DelegateAgentConfig {
-        use crate::config::{DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS, DEFAULT_DELEGATE_TIMEOUT_SECS};
         DelegateAgentConfig {
             provider: "openrouter".to_string(),
             model: "model-test".to_string(),
@@ -701,8 +713,8 @@ mod tests {
             agentic: true,
             allowed_tools,
             max_iterations,
-            timeout_secs: DEFAULT_DELEGATE_TIMEOUT_SECS,
-            agentic_timeout_secs: DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
+            timeout_secs: None,
+            agentic_timeout_secs: None,
         }
     }
 
@@ -798,7 +810,6 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_provider_returns_error() {
-        use crate::config::{DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS, DEFAULT_DELEGATE_TIMEOUT_SECS};
         let mut agents = HashMap::new();
         agents.insert(
             "broken".to_string(),
@@ -812,8 +823,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
-                timeout_secs: DEFAULT_DELEGATE_TIMEOUT_SECS,
-                agentic_timeout_secs: DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -920,6 +931,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -955,6 +968,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
