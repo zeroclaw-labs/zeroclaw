@@ -34,9 +34,12 @@ mem0 backend calls the OpenMemory REST API via `reqwest`. It implements the `Mem
 ## Files to Create/Modify
 
 ### New file
+
 - `src/memory/mem0.rs` — `Mem0Memory` struct implementing `Memory` trait
 
 ### Modify
+
+
 1. **`Cargo.toml`** — add `memory-mem0 = []` feature (no extra deps, `reqwest` already in deps)
 2. **`src/memory/mod.rs`** — add `#[cfg(feature = "memory-mem0")] pub mod mem0;` + factory wiring
 3. **`src/memory/backend.rs`** — add `Mem0` variant to `MemoryBackendKind`, profile, and classification
