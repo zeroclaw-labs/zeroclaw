@@ -14,15 +14,6 @@ readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]
 rust-version = "1.87"
-
-[[bin]]
-name = "zeroclaw"
-path = "src/main.rs"
-
-[lib]
-name = "zeroclaw"
-path = "src/lib.rs"
-
 include = [
   "/src/**/*",
   "/build.rs",
@@ -33,6 +24,14 @@ include = [
   "/web/dist/**/*",
   "/tool_descriptions/**/*",
 ]
+
+[[bin]]
+name = "zeroclaw"
+path = "src/main.rs"
+
+[lib]
+name = "zeroclaw"
+path = "src/lib.rs"
 
 [dependencies]
 # CLI - minimal and fast
