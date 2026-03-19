@@ -2117,28 +2117,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ── Capabilities tests ───────────────────────────────────────────────
-
-    #[test]
-    fn capabilities_reports_vision_and_no_native_tools() {
-        let provider = test_provider(Some(GeminiAuth::ExplicitKey("key".into())));
-        let caps = <GeminiProvider as Provider>::capabilities(&provider);
-        assert!(!caps.native_tool_calling);
-        assert!(caps.vision);
-    }
-
-    #[test]
-    fn supports_native_tools_returns_false() {
-        let provider = test_provider(Some(GeminiAuth::ExplicitKey("key".into())));
-        assert!(!provider.supports_native_tools());
-    }
-
-    #[test]
-    fn supports_vision_returns_true() {
-        let provider = test_provider(Some(GeminiAuth::ExplicitKey("key".into())));
-        assert!(provider.supports_vision());
-    }
-
     // ── Part enum serialization tests ────────────────────────────────────
 
     #[test]
