@@ -2217,9 +2217,8 @@ mod tests {
 
     #[test]
     fn tool_schema_error_detects_groq_validation_failure() {
-        let err = anyhow::anyhow!(
-            r#"Groq API error (400 Bad Request): {"error":{"message":"tool call validation failed: attempted to call tool 'memory_recall' which was not in request"}}"#
-        );
+        let msg = r#"Groq API error (400 Bad Request): {"error":{"message":"tool call validation failed: attempted to call tool 'memory_recall' which was not in request"}}"#;
+        let err = anyhow::anyhow!("{}", msg);
         assert!(is_tool_schema_error(&err));
     }
 
@@ -2253,9 +2252,8 @@ mod tests {
     #[test]
     fn non_retryable_returns_false_for_tool_schema_400() {
         // A 400 error with tool schema validation text should NOT be non-retryable.
-        let err = anyhow::anyhow!(
-            r#"400 Bad Request: tool call validation failed: attempted to call tool 'x' which was not in request"#
-        );
+        let msg = "400 Bad Request: tool call validation failed: attempted to call tool 'x' which was not in request";
+        let err = anyhow::anyhow!("{}", msg);
         assert!(!is_non_retryable(&err));
     }
 
