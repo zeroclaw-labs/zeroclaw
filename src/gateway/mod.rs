@@ -8,6 +8,7 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api;
+pub mod api_graph;
 pub mod nodes;
 pub mod sse;
 pub mod static_files;
@@ -351,7 +352,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &providers::ProviderRuntimeOptions {
             auth_profile_override: None,
             provider_api_url: config.api_url.clone(),
-            zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+            jhedaiclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
             secrets_encrypt: config.secrets.encrypt,
             reasoning_enabled: config.runtime.reasoning_enabled,
             provider_timeout_secs: Some(config.provider_timeout_secs),
@@ -447,7 +448,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // WhatsApp app secret for webhook signature verification
     // Priority: environment variable > config file
-    let whatsapp_app_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_WHATSAPP_APP_SECRET")
+    let whatsapp_app_secret: Option<Arc<str>> = std::env::var("JHEDAICLAW_WHATSAPP_APP_SECRET")
         .ok()
         .and_then(|secret| {
             let secret = secret.trim();
@@ -475,7 +476,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // Linq signing secret for webhook signature verification
     // Priority: environment variable > config file
-    let linq_signing_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_LINQ_SIGNING_SECRET")
+    let linq_signing_secret: Option<Arc<str>> = std::env::var("JHEDAICLAW_LINQ_SIGNING_SECRET")
         .ok()
         .and_then(|secret| {
             let secret = secret.trim();
@@ -516,7 +517,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // Nextcloud Talk webhook secret for signature verification
     // Priority: environment variable > config file
     let nextcloud_talk_webhook_secret: Option<Arc<str>> =
-        std::env::var("ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET")
+        std::env::var("JHEDAICLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET")
             .ok()
             .and_then(|secret| {
                 let secret = secret.trim();
@@ -578,7 +579,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         }
     }
 
-    println!("🦀 ZeroClaw Gateway listening on http://{display_addr}");
+    println!("🦀 JhedaiClaw Gateway listening on http://{display_addr}");
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
     }
@@ -708,9 +709,35 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/memory", get(api::handle_api_memory_list))
         .route("/api/memory", post(api::handle_api_memory_store))
         .route("/api/memory/{key}", delete(api::handle_api_memory_delete))
+        .route(
+            "/api/memory/backend",
+            put(api::handle_api_memory_backend_put),
+        )
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
+        // ── Graph Knowledge API routes ──
+        .route("/api/graph/stats", get(api_graph::handle_graph_stats))
+        .route("/api/graph/search", get(api_graph::handle_graph_search))
+        .route("/api/graph/hot", get(api_graph::handle_graph_hot))
+        .route("/api/graph/nodes", get(api_graph::handle_graph_nodes))
+        .route(
+            "/api/graph/concept",
+            post(api_graph::handle_graph_add_concept),
+        )
+        .route(
+            "/api/graph/relation",
+            post(api_graph::handle_graph_add_relation),
+        )
+        .route(
+            "/api/graph/node/{id}",
+            get(api_graph::handle_graph_get_node),
+        )
+        .route(
+            "/api/graph/node/{id}",
+            delete(api_graph::handle_graph_delete_node),
+        )
+        .route("/api/graph/budget", get(api_graph::handle_graph_budget))
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
         // ── WebSocket agent chat ──
@@ -737,7 +764,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     )
     .with_graceful_shutdown(async move {
         let _ = shutdown_rx.changed().await;
-        tracing::info!("🦀 ZeroClaw Gateway shutting down...");
+        tracing::info!("🦀 JhedaiClaw Gateway shutting down...");
     })
     .await?;
 
@@ -1812,7 +1839,7 @@ mod tests {
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("zeroclaw_heartbeat_ticks_total 1"));
+        assert!(text.contains("jhedaiclaw_heartbeat_ticks_total 1"));
     }
 
     #[test]

@@ -3,6 +3,7 @@ pub mod chunker;
 pub mod cli;
 pub mod consolidation;
 pub mod embeddings;
+pub mod graph;
 pub mod hygiene;
 pub mod lucid;
 pub mod markdown;
@@ -56,7 +57,7 @@ where
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
         MemoryBackendKind::Postgres => postgres_builder(),
-        MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
+        MemoryBackendKind::Graph | MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
         }
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
@@ -318,6 +319,41 @@ pub fn create_memory_with_storage_and_routes(
         anyhow::bail!(
             "memory backend 'postgres' requested but this build was compiled without `memory-postgres`; rebuild with `--features memory-postgres`"
         );
+    }
+
+    // ── Graph backend (CozoDB knowledge graph) ──
+    if matches!(backend_kind, MemoryBackendKind::Graph) {
+        #[cfg(feature = "memory-graph")]
+        {
+            let graph_config = config.graph.clone().unwrap_or_default();
+            match graph::GraphMemoryBackend::new(workspace_dir, graph_config) {
+                Ok(backend) => {
+                    tracing::info!("🧠 Graph memory backend active");
+                    return Ok(Box::new(backend));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Graph memory backend failed to initialize: {e}; falling back to sqlite"
+                    );
+                    return Ok(Box::new(build_sqlite_memory(
+                        config,
+                        workspace_dir,
+                        &resolved_embedding,
+                    )?));
+                }
+            }
+        }
+        #[cfg(not(feature = "memory-graph"))]
+        {
+            tracing::warn!(
+                "memory backend 'graph' requested but compiled without `memory-graph` feature; falling back to sqlite"
+            );
+            return Ok(Box::new(build_sqlite_memory(
+                config,
+                workspace_dir,
+                &resolved_embedding,
+            )?));
+        }
     }
 
     if matches!(backend_kind, MemoryBackendKind::Qdrant) {

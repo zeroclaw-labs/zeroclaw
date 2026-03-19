@@ -115,7 +115,28 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         tracing::info!("Cron disabled; scheduler supervisor not started");
     }
 
-    println!("🧠 ZeroClaw daemon started");
+    // Graph memory synthesizer (knowledge consolidation)
+    let synthesis_enabled = config
+        .memory
+        .graph
+        .as_ref()
+        .map_or(false, |g| g.synthesis_enabled);
+    if synthesis_enabled && config.memory.backend == "graph" {
+        let synth_cfg = config.clone();
+        handles.push(spawn_component_supervisor(
+            "synthesizer",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let cfg = synth_cfg.clone();
+                async move { run_synthesizer_worker(cfg).await }
+            },
+        ));
+    } else {
+        crate::health::mark_component_ok("synthesizer");
+    }
+
+    println!("🧠 JhedaiClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
     println!("   Components: gateway, channels, heartbeat, scheduler");
     println!("   Ctrl+C or SIGTERM to stop");
@@ -200,6 +221,46 @@ where
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
     })
+}
+
+/// Synthesizer worker: runs periodic graph knowledge consolidation.
+async fn run_synthesizer_worker(config: Config) -> Result<()> {
+    use crate::memory::graph::budget::BudgetController;
+    use crate::memory::graph::synthesizer::Synthesizer;
+
+    let graph_config = config.memory.graph.clone().unwrap_or_default();
+    let budget = std::sync::Arc::new(BudgetController::new(
+        graph_config.rem_daily_budget_tokens,
+        graph_config.daily_cost_cap_usd,
+    ));
+
+    #[cfg(feature = "memory-graph")]
+    let synthesizer = {
+        let db_path = config.workspace_dir.join(&graph_config.db_path);
+        match cozo::DbInstance::new("sled", db_path.to_string_lossy().as_ref(), "") {
+            Ok(db) => Synthesizer::new(std::sync::Arc::new(db), budget, true),
+            Err(e) => {
+                tracing::error!("Synthesizer: failed to open graph DB: {e}");
+                return Err(anyhow::anyhow!("{e}"));
+            }
+        }
+    };
+
+    #[cfg(not(feature = "memory-graph"))]
+    let synthesizer = Synthesizer::new(budget, true);
+
+    // Run synthesis every 15 minutes
+    let mut interval = tokio::time::interval(Duration::from_secs(15 * 60));
+
+    crate::health::mark_component_ok("synthesizer");
+    tracing::info!("🧠 Graph synthesizer started (interval: 15min)");
+
+    loop {
+        interval.tick().await;
+        if let Err(e) = synthesizer.run_cycle().await {
+            tracing::warn!("Synthesizer cycle error: {e}");
+        }
+    }
 }
 
 async fn run_heartbeat_worker(config: Config) -> Result<()> {

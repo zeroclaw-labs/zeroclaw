@@ -36,6 +36,13 @@ pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
 pub mod glob_search;
+pub mod graph_add_concept;
+pub mod graph_connect;
+pub mod graph_hot_nodes;
+pub mod graph_hypothesis;
+pub mod graph_query;
+pub mod graph_search;
+pub mod graph_validate;
 #[cfg(feature = "hardware")]
 pub mod hardware_board_info;
 #[cfg(feature = "hardware")]
@@ -93,6 +100,20 @@ pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
+#[cfg(feature = "memory-graph")]
+pub use graph_add_concept::GraphAddConceptTool;
+#[cfg(feature = "memory-graph")]
+pub use graph_connect::GraphConnectTool;
+#[cfg(feature = "memory-graph")]
+pub use graph_hot_nodes::GraphHotNodesTool;
+#[cfg(feature = "memory-graph")]
+pub use graph_hypothesis::GraphHypothesisTool;
+#[cfg(feature = "memory-graph")]
+pub use graph_query::GraphQueryTool;
+#[cfg(feature = "memory-graph")]
+pub use graph_search::GraphSearchTool;
+#[cfg(feature = "memory-graph")]
+pub use graph_validate::GraphValidateTool;
 #[cfg(feature = "hardware")]
 pub use hardware_board_info::HardwareBoardInfoTool;
 #[cfg(feature = "hardware")]
@@ -285,7 +306,7 @@ pub fn all_tools_with_runtime(
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
-        Arc::new(MemoryForgetTool::new(memory, security.clone())),
+        Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
@@ -415,6 +436,32 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(CloudPatternsTool::new()));
     }
 
+    // Graph knowledge tools (conditionally registered when memory backend is "graph")
+    {
+        #[cfg(feature = "memory-graph")]
+        {
+            // Try to get the CozoDB instance from graph memory backend
+            let graph_db: Option<Arc<cozo::DbInstance>> = {
+                // Check if memory backend is graph by attempting downcast
+                let mem_any = &memory as &dyn std::any::Any;
+                mem_any
+                    .downcast_ref::<Arc<crate::memory::graph::GraphMemoryBackend>>()
+                    .map(|gm| Arc::clone(gm.db()))
+            };
+
+            if graph_db.is_some() {
+                tool_arcs.push(Arc::new(GraphQueryTool::new(graph_db.clone())));
+                tool_arcs.push(Arc::new(GraphAddConceptTool::new(graph_db.clone())));
+                tool_arcs.push(Arc::new(GraphHypothesisTool::new(graph_db.clone())));
+                tool_arcs.push(Arc::new(GraphValidateTool::new(graph_db.clone())));
+                tool_arcs.push(Arc::new(GraphConnectTool::new(graph_db.clone())));
+                tool_arcs.push(Arc::new(GraphHotNodesTool::new(graph_db.clone())));
+                tool_arcs.push(Arc::new(GraphSearchTool::new(graph_db)));
+                tracing::info!("🧠 7 graph knowledge tools registered");
+            }
+        }
+    }
+
     // PDF extraction (feature-gated at compile time via rag-pdf)
     tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
 
@@ -495,7 +542,7 @@ pub fn all_tools_with_runtime(
     let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: root_config.api_url.clone(),
-        zeroclaw_dir: root_config
+        jhedaiclaw_dir: root_config
             .config_path
             .parent()
             .map(std::path::PathBuf::from),

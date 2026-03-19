@@ -3,24 +3,24 @@ members = [".", "crates/robot-kit"]
 resolver = "2"
 
 [package]
-name = "zeroclawlabs"
+name = "jhedaiclaw"
 version = "0.3.4"
 edition = "2021"
-authors = ["theonlyhennygod"]
+authors = ["Edison Vasquez"]
 license = "MIT OR Apache-2.0"
-description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
-repository = "https://github.com/zeroclaw-labs/zeroclaw"
+description = "JhedaiClaw - AI agent runtime by Jhedai. Zero overhead. Zero compromise. 100% Rust."
+repository = "https://github.com/jhedai/jhedaiclaw"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]
 rust-version = "1.87"
 
 [[bin]]
-name = "zeroclaw"
+name = "jhedaiclaw"
 path = "src/main.rs"
 
 [lib]
-name = "zeroclaw"
+name = "jhedaiclaw"
 path = "src/lib.rs"
 
 include = [
@@ -120,6 +120,7 @@ prost = { version = "0.14", default-features = false, features = ["derive"], opt
 
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }
+cozo = { version = "0.7", default-features = false, features = ["graph-algo", "storage-sled"], optional = true }
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
@@ -163,7 +164,7 @@ mime_guess = "2"
 
 # OpenTelemetry — OTLP trace + metrics export.
 # Use the blocking HTTP exporter client to avoid Tokio-reactor panics in
-# OpenTelemetry background batch threads when ZeroClaw emits spans/metrics from
+# OpenTelemetry background batch threads when JhedaiClaw emits spans/metrics from
 # non-Tokio contexts.
 opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
@@ -211,6 +212,7 @@ hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
 channel-feishu = ["channel-lark"]  # Alias for Feishu users (Lark and Feishu are the same platform)
+memory-graph = ["dep:cozo"]
 memory-postgres = ["dep:postgres"]
 observability-prometheus = ["dep:prometheus"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
@@ -284,3 +286,9 @@ path = "tests/test_live.rs"
 [[bench]]
 name = "agent_benchmarks"
 harness = false
+
+[patch.crates-io]
+# graph_builder 0.4.1 calls into_par_iter() on Box<[T]> which returns an owned
+# IntoIter in rayon 1.11.0 but the return type is declared as Copied<slice::Iter>.
+# Fix: use par_iter() instead to get &T items. Remove once upstream is patched.
+graph_builder = { path = "vendor/graph_builder" }
