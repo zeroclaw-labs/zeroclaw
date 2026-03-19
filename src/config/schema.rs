@@ -5882,8 +5882,8 @@ fn default_conversational_ai_timeout_secs() -> u64 {
 
 /// Conversational AI agent builder configuration (`[conversational_ai]` section).
 ///
-/// Controls language detection, escalation behavior, conversation limits, and
-/// analytics for conversational agent workflows. Disabled by default.
+/// **Status: Reserved for future use.** This configuration is parsed but not yet
+/// consumed by the runtime. Setting `enabled = true` will produce a startup warning.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ConversationalAiConfig {
     /// Enable conversational AI features. Default: false.
@@ -7749,6 +7749,13 @@ impl Config {
         }
 
         set_runtime_proxy_config(self.proxy.clone());
+
+        if self.conversational_ai.enabled {
+            tracing::warn!(
+                "conversational_ai.enabled = true but conversational AI features are not yet \
+                 implemented; this section is reserved for future use and will be ignored"
+            );
+        }
     }
 
     async fn resolve_config_path_for_save(&self) -> Result<PathBuf> {
