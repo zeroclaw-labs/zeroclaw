@@ -1505,6 +1505,198 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
         .await
 }
 
+/// Try to relay a channel message to the user's local device for processing.
+///
+/// **Channel-to-Device Relay Architecture**:
+/// Instead of processing channel messages entirely on Railway, this function
+/// attempts to route them to the user's local MoA device. This ensures:
+///   - Local tool API keys are used (web search, browser, Composio, etc.)
+///   - Local settings/config are applied
+///   - LLM calls go through Railway's /api/llm/proxy if device has no LLM key
+///
+/// The user is identified via ChannelPairingStore: (channel, platform_uid) → user_id.
+/// If the user is not paired or their device is offline, returns None and the
+/// caller falls back to Railway processing.
+///
+/// Returns `Some(response_text)` if device handled the message, `None` otherwise.
+pub(super) async fn try_relay_channel_to_device(
+    state: &AppState,
+    channel_name: &str,
+    sender_platform_uid: &str,
+    content: &str,
+    session_id: &str,
+) -> Option<String> {
+    // 1. Look up MoA user_id from channel pairing
+    let channel_pairing = state.channel_pairing.as_ref()?;
+    let user_id = channel_pairing.lookup_user_id(channel_name, sender_platform_uid)?;
+
+    // 2. Check if user's device is online
+    let device_router = state.device_router.as_ref()?;
+    let auth_store = state.auth_store.as_ref()?;
+
+    let devices = auth_store.list_devices(&user_id).ok()?;
+    let online_device = devices
+        .iter()
+        .find(|d| device_router.is_device_online(&d.device_id))?;
+
+    let device_id = online_device.device_id.clone();
+    let device_name = online_device.device_name.clone();
+
+    // 3. Determine proxy URL for LLM calls
+    let proxy_url = if let Ok(domain) = std::env::var("RAILWAY_PUBLIC_DOMAIN") {
+        format!("https://{}/api/llm/proxy", domain.trim_end_matches('/'))
+    } else {
+        let config_guard = state.config.lock();
+        let host = &config_guard.gateway.host;
+        let port = config_guard.gateway.port;
+        format!("http://{}:{}/api/llm/proxy", host, port)
+    };
+
+    // 4. Issue a short-lived proxy token (15 min)
+    let proxy_token = auth_store
+        .create_session_with_ttl(
+            &user_id,
+            Some(&device_id),
+            Some(&device_name),
+            15 * 60, // 15 minutes
+        )
+        .ok()?;
+
+    let provider_name = {
+        let config_guard = state.config.lock();
+        config_guard
+            .default_provider
+            .clone()
+            .unwrap_or_else(|| "gemini".to_string())
+    };
+
+    tracing::info!(
+        channel = channel_name,
+        sender = sender_platform_uid,
+        user_id = user_id.as_str(),
+        device_id = device_id.as_str(),
+        "Channel relay: routing message to user's local device"
+    );
+
+    // 5. Send channel_relay message to device
+    let msg_id = uuid::Uuid::new_v4().to_string();
+    let (resp_tx, mut resp_rx) =
+        tokio::sync::mpsc::channel::<remote::RoutedMessage>(64);
+
+    {
+        remote::REMOTE_RESPONSE_CHANNELS
+            .lock()
+            .insert(msg_id.clone(), resp_tx);
+    }
+
+    let routed_msg = remote::RoutedMessage {
+        id: msg_id.clone(),
+        direction: "to_device".to_string(),
+        content: serde_json::json!({
+            "content": content,
+            "channel": channel_name,
+            "session_id": session_id,
+            "provider": provider_name,
+            "proxy_token": proxy_token,
+            "proxy_url": proxy_url,
+        })
+        .to_string(),
+        msg_type: "channel_relay".to_string(),
+    };
+
+    if device_router.send_to_device(&device_id, routed_msg).await.is_err() {
+        remote::REMOTE_RESPONSE_CHANNELS.lock().remove(&msg_id);
+        tracing::warn!(
+            device_id = device_id.as_str(),
+            "Channel relay: failed to send to device"
+        );
+        return None;
+    }
+
+    // 6. Wait for device response (up to 120 seconds for agent processing)
+    let mut response_text = String::new();
+    let mut got_response = false;
+
+    loop {
+        match tokio::time::timeout(
+            tokio::time::Duration::from_secs(120),
+            resp_rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(resp)) => {
+                got_response = true;
+                match resp.msg_type.as_str() {
+                    "done" => {
+                        response_text = resp.content;
+                        break;
+                    }
+                    "chunk" => {
+                        response_text.push_str(&resp.content);
+                    }
+                    "error" => {
+                        tracing::warn!(
+                            device_id = device_id.as_str(),
+                            error = resp.content.as_str(),
+                            "Channel relay: device returned error"
+                        );
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                tracing::warn!(
+                    device_id = device_id.as_str(),
+                    "Channel relay: device timed out (120s)"
+                );
+                break;
+            }
+        }
+    }
+
+    remote::REMOTE_RESPONSE_CHANNELS.lock().remove(&msg_id);
+
+    if got_response && !response_text.is_empty() {
+        Some(response_text)
+    } else {
+        None
+    }
+}
+
+/// Process a channel message with device-first relay.
+///
+/// Tries to route the message to the user's local device first.
+/// Falls back to Railway processing if device is offline or not paired.
+/// This is the primary entry point for all channel webhook handlers.
+pub(super) async fn process_channel_message(
+    state: &AppState,
+    channel_name: &str,
+    sender_platform_uid: &str,
+    content: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<String> {
+    let sid = session_id.unwrap_or("");
+
+    // Step 1: Try device relay (preserves local tool keys)
+    let device_response = try_relay_channel_to_device(
+        state,
+        channel_name,
+        sender_platform_uid,
+        content,
+        sid,
+    )
+    .await;
+
+    if let Some(response) = device_response {
+        return Ok(response);
+    }
+
+    // Step 2: Fallback to Railway processing
+    run_gateway_chat_with_tools(state, content, session_id).await
+}
+
 /// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
 pub(super) async fn run_gateway_chat_with_tools(
     state: &AppState,
@@ -2396,7 +2588,10 @@ async fn handle_whatsapp_message(
                 .await;
         }
 
-        match run_gateway_chat_with_tools(&state, &msg.content, Some(&session_id)).await {
+        // ── Device-first relay: try local device, fallback to Railway ──
+        match process_channel_message(
+            &state, "whatsapp", &msg.sender, &msg.content, Some(&session_id),
+        ).await {
             Ok(response) => {
                 let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
                 let safe_response = sanitize_gateway_response(
@@ -2525,7 +2720,7 @@ async fn handle_linq_webhook(
         }
 
         // Call the LLM
-        match run_gateway_chat_with_tools(&state, &msg.content, Some(&session_id)).await {
+        match process_channel_message(&state, "linq", &msg.sender, &msg.content, Some(&session_id)).await {
             Ok(response) => {
                 let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
                 let safe_response = sanitize_gateway_response(
@@ -2692,7 +2887,7 @@ async fn handle_github_webhook(
                 .await;
         }
 
-        match run_gateway_chat_with_tools(&state, &msg.content, None).await {
+        match process_channel_message(&state, "github", &msg.sender, &msg.content, None).await {
             Ok(response) => {
                 let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
                 let safe_response = sanitize_gateway_response(
@@ -2790,7 +2985,7 @@ async fn handle_bluebubbles_webhook(
         let _ = bluebubbles.start_typing(&msg.reply_target).await;
         let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
 
-        match run_gateway_chat_with_tools(&state, &msg.content, None).await {
+        match process_channel_message(&state, "bluebubbles", &msg.sender, &msg.content, None).await {
             Ok(response) => {
                 let _ = bluebubbles.stop_typing(&msg.reply_target).await;
                 let safe_response = sanitize_gateway_response(
@@ -2893,7 +3088,7 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
         }
 
         // Call the LLM
-        match run_gateway_chat_with_tools(&state, &msg.content, Some(&session_id)).await {
+        match process_channel_message(&state, "wati", &msg.sender, &msg.content, Some(&session_id)).await {
             Ok(response) => {
                 let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
                 let safe_response = sanitize_gateway_response(
@@ -3009,7 +3204,7 @@ async fn handle_nextcloud_talk_webhook(
                 .await;
         }
 
-        match run_gateway_chat_with_tools(&state, &msg.content, Some(&session_id)).await {
+        match process_channel_message(&state, "nextcloud_talk", &msg.sender, &msg.content, Some(&session_id)).await {
             Ok(response) => {
                 let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
                 let safe_response = sanitize_gateway_response(
@@ -3110,7 +3305,7 @@ async fn handle_qq_webhook(
                 .await;
         }
 
-        match run_gateway_chat_with_tools(&state, &msg.content, Some(&session_id)).await {
+        match process_channel_message(&state, "qq", &msg.sender, &msg.content, Some(&session_id)).await {
             Ok(response) => {
                 let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
                 let safe_response = sanitize_gateway_response(

@@ -985,6 +985,7 @@ async fn handle_device_link_socket(
             let wire_type = match routed_msg.msg_type.as_str() {
                 "check_key" => "check_key",
                 "hybrid_relay" => "hybrid_relay",
+                "channel_relay" => "channel_relay",
                 _ => "remote_message",
             };
             let json = serde_json::json!({

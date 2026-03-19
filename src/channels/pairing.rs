@@ -228,6 +228,20 @@ impl ChannelPairingStore {
             > 0
     }
 
+    /// Look up the MoA user_id for a paired channel identity.
+    /// Returns `None` if not paired.
+    /// Used by channel-to-device relay to route channel messages to the correct device.
+    pub fn lookup_user_id(&self, channel: &str, platform_uid: &str) -> Option<String> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT user_id FROM completed_pairs WHERE channel = ?1 AND platform_uid = ?2",
+            rusqlite::params![channel, platform_uid],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .filter(|uid| !uid.is_empty())
+    }
+
     /// Build the one-click auto-pair URL.
     pub fn auto_pair_url(gateway_base: &str, token: &str) -> String {
         format!("{gateway_base}/pair/auto/{token}")
