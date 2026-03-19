@@ -105,6 +105,10 @@ cargo build --release
 
 # Kør
 cargo run --release
+
+# Migrate from OpenClaw
+zeroclaw migrate openclaw --dry-run
+zeroclaw migrate openclaw
 ```
 
 ### Med Docker

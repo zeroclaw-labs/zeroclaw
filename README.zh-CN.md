@@ -190,6 +190,10 @@ zeroclaw gateway
 
 # 启动长期运行模式
 zeroclaw daemon
+
+# Migrate from OpenClaw
+zeroclaw migrate openclaw --dry-run
+zeroclaw migrate openclaw
 ```
 
 ## Subscription Auth（OpenAI Codex / Claude Code）

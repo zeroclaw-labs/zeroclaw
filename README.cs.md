@@ -370,6 +370,10 @@ zeroclaw pairing rotate      # Rotuje existující párovací tajemství
 zeroclaw tunnel start        # Spouští tunnel k lokálnímu daemon
 zeroclaw tunnel stop         # Zastavuje aktivní tunnel
 
+# Migrate from OpenClaw
+zeroclaw migrate openclaw --dry-run
+zeroclaw migrate openclaw
+
 # Diagnostika
 zeroclaw doctor              # Spouští kontroly zdraví systému
 zeroclaw version             # Zobrazuje verzi a build informace

@@ -370,6 +370,10 @@ zeroclaw pairing rotate      # 기존 페어링 시크릿 교체
 zeroclaw tunnel start        # 로컬 데몬으로 터널 시작
 zeroclaw tunnel stop         # 활성 터널 중지
 
+# Migrate from OpenClaw
+zeroclaw migrate openclaw --dry-run
+zeroclaw migrate openclaw
+
 # 진단
 zeroclaw doctor              # 시스템 상태 검사 실행
 zeroclaw version             # 버전 및 빌드 정보 표시

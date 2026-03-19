@@ -370,6 +370,10 @@ zeroclaw pairing rotate      # تدوير سر الاقتران الحالي
 zeroclaw tunnel start        # بدء نفق إلى البرنامج الخفي المحلي
 zeroclaw tunnel stop         # إيقاف النفق النشط
 
+# Migrate from OpenClaw
+zeroclaw migrate openclaw --dry-run
+zeroclaw migrate openclaw
+
 # التشخيص
 zeroclaw doctor              # تشغيل فحوصات صحة النظام
 zeroclaw version             # عرض الإصدار ومعلومات البناء

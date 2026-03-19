@@ -370,6 +370,10 @@ zeroclaw pairing rotate      # Mevcut eşleştirme sırrını döndürür
 zeroclaw tunnel start        # Yerel arka plan programına bir tünel başlatır
 zeroclaw tunnel stop         # Aktif tüneli durdurur
 
+# Migrate from OpenClaw
+zeroclaw migrate openclaw --dry-run
+zeroclaw migrate openclaw
+
 # Teşhis
 zeroclaw doctor              # Sistem sağlık kontrollerini çalıştırır
 zeroclaw version             # Sürüm ve derleme bilgilerini gösterir
