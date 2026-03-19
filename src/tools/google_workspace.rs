@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::config::GoogleWorkspaceAllowedOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -36,6 +37,7 @@ const DEFAULT_ALLOWED_SERVICES: &[&str] = &[
 pub struct GoogleWorkspaceTool {
     security: Arc<SecurityPolicy>,
     allowed_services: Vec<String>,
+    allowed_operations: Vec<GoogleWorkspaceAllowedOperation>,
     credentials_path: Option<String>,
     default_account: Option<String>,
     rate_limit_per_minute: u32,
@@ -50,6 +52,7 @@ impl GoogleWorkspaceTool {
     pub fn new(
         security: Arc<SecurityPolicy>,
         allowed_services: Vec<String>,
+        allowed_operations: Vec<GoogleWorkspaceAllowedOperation>,
         credentials_path: Option<String>,
         default_account: Option<String>,
         rate_limit_per_minute: u32,
@@ -67,12 +70,25 @@ impl GoogleWorkspaceTool {
         Self {
             security,
             allowed_services: services,
+            allowed_operations,
             credentials_path,
             default_account,
             rate_limit_per_minute,
             timeout_secs,
             audit_log,
         }
+    }
+
+    fn is_operation_allowed(&self, service: &str, resource: &str, method: &str) -> bool {
+        if self.allowed_operations.is_empty() {
+            return true;
+        }
+
+        self.allowed_operations.iter().any(|operation| {
+            operation.service == service
+                && operation.resource == resource
+                && operation.methods.iter().any(|allowed| allowed == method)
+        })
     }
 }
 
@@ -166,6 +182,16 @@ impl Tool for GoogleWorkspaceTool {
                     "Service '{service}' is not in the allowed services list. \
                      Allowed: {}",
                     self.allowed_services.join(", ")
+                )),
+            });
+        }
+
+        if !self.is_operation_allowed(service, resource, method) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Operation '{service}/{resource}/{method}' is not in the allowed operations list"
                 )),
             });
         }
@@ -437,19 +463,22 @@ mod tests {
 
     #[test]
     fn tool_name() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         assert_eq!(tool.name(), "google_workspace");
     }
 
     #[test]
     fn tool_description_non_empty() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         assert!(!tool.description().is_empty());
     }
 
     #[test]
     fn tool_schema_has_required_fields() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["service"].is_object());
         assert!(schema["properties"]["resource"].is_object());
@@ -464,7 +493,8 @@ mod tests {
 
     #[test]
     fn default_allowed_services_populated() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         assert!(!tool.allowed_services.is_empty());
         assert!(tool.allowed_services.contains(&"drive".to_string()));
         assert!(tool.allowed_services.contains(&"gmail".to_string()));
@@ -476,6 +506,7 @@ mod tests {
         let tool = GoogleWorkspaceTool::new(
             test_security(),
             vec!["drive".into(), "sheets".into()],
+            vec![],
             None,
             None,
             60,
@@ -493,6 +524,7 @@ mod tests {
         let tool = GoogleWorkspaceTool::new(
             test_security(),
             vec!["drive".into()],
+            vec![],
             None,
             None,
             60,
@@ -520,6 +552,7 @@ mod tests {
         let tool = GoogleWorkspaceTool::new(
             test_security(),
             vec!["drive; rm -rf /".into()],
+            vec![],
             None,
             None,
             60,
@@ -544,7 +577,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_shell_injection_in_resource() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -563,7 +597,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_invalid_format() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -583,7 +618,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_params() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -603,7 +639,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_body() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -623,7 +660,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_page_all() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -643,7 +681,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_page_limit() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -663,7 +702,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_sub_resource() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -683,7 +723,8 @@ mod tests {
 
     #[tokio::test]
     async fn missing_required_param_returns_error() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         let result = tool.execute(json!({"service": "drive"})).await;
         assert!(result.is_err());
     }
@@ -696,7 +737,7 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = GoogleWorkspaceTool::new(security, vec![], None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(security, vec![], vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -712,5 +753,68 @@ mod tests {
     #[test]
     fn gws_timeout_is_reasonable() {
         assert_eq!(DEFAULT_GWS_TIMEOUT_SECS, 30);
+    }
+
+    #[test]
+    fn operation_allowlist_defaults_to_allow_all() {
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
+        assert!(tool.is_operation_allowed("gmail", "messages", "send"));
+    }
+
+    #[test]
+    fn operation_allowlist_matches_exact_service_resource_and_method() {
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec!["gmail".into()],
+            vec![GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "drafts".into(),
+                methods: vec!["create".into(), "update".into()],
+            }],
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
+
+        assert!(tool.is_operation_allowed("gmail", "drafts", "create"));
+        assert!(!tool.is_operation_allowed("gmail", "drafts", "send"));
+        assert!(!tool.is_operation_allowed("gmail", "messages", "get"));
+    }
+
+    #[tokio::test]
+    async fn rejects_disallowed_operation() {
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec!["gmail".into()],
+            vec![GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "drafts".into(),
+                methods: vec!["create".into()],
+            }],
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
+
+        let result = tool
+            .execute(json!({
+                "service": "gmail",
+                "resource": "drafts",
+                "method": "send"
+            }))
+            .await
+            .expect("disallowed operation should return a result");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("allowed operations list"));
     }
 }

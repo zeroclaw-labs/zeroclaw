@@ -2267,6 +2267,41 @@ impl Default for DataRetentionConfig {
 /// To revert, remove the `[google_workspace]` section from the config file (or
 /// set `enabled = false`). No data migration is required; the tool simply stops
 /// being registered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GoogleWorkspaceAllowedOperation {
+    /// Google Workspace service ID (for example `gmail` or `drive`).
+    pub service: String,
+    /// Service resource name (for example `messages` or `files`).
+    pub resource: String,
+    /// Allowed methods for the service/resource pair.
+    #[serde(default)]
+    pub methods: Vec<String>,
+}
+
+/// Google Workspace CLI (`gws`) tool configuration (`[google_workspace]` section).
+///
+/// ## Defaults
+/// - `enabled`: `false` (tool is not registered unless explicitly opted-in).
+/// - `allowed_services`: empty vector, which grants access to the full default
+///   service set: `drive`, `sheets`, `gmail`, `calendar`, `docs`, `slides`,
+///   `tasks`, `people`, `chat`, `classroom`, `forms`, `keep`, `meet`, `events`.
+/// - `allowed_operations`: empty vector, which preserves the legacy behavior of
+///   allowing any resource/method under the allowed service set.
+/// - `credentials_path`: `None` (uses default `gws` credential discovery).
+/// - `default_account`: `None` (uses the `gws` active account).
+/// - `rate_limit_per_minute`: `60`.
+/// - `timeout_secs`: `30`.
+/// - `audit_log`: `false`.
+///
+/// ## Compatibility
+/// Configs that omit the `[google_workspace]` section entirely are treated as
+/// `GoogleWorkspaceConfig::default()` (disabled, all defaults allowed). Adding
+/// the section is purely opt-in and does not affect other config sections.
+///
+/// ## Rollback / Migration
+/// To revert, remove the `[google_workspace]` section from the config file (or
+/// set `enabled = false`). No data migration is required; the tool simply stops
+/// being registered.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GoogleWorkspaceConfig {
     /// Enable the `google_workspace` tool. Default: `false`.
@@ -2280,6 +2315,13 @@ pub struct GoogleWorkspaceConfig {
     /// optional underscores/hyphens, and unique.
     #[serde(default)]
     pub allowed_services: Vec<String>,
+    /// Restrict which resource/method combinations the agent can access.
+    ///
+    /// When empty (the default), all methods under `allowed_services` remain
+    /// available for backward compatibility. When non-empty, the runtime denies
+    /// any `(service, resource, method)` triple that is not explicitly listed.
+    #[serde(default)]
+    pub allowed_operations: Vec<GoogleWorkspaceAllowedOperation>,
     /// Path to service account JSON or OAuth client credentials file.
     ///
     /// When `None`, the tool relies on the default `gws` credential discovery
@@ -2317,6 +2359,7 @@ impl Default for GoogleWorkspaceConfig {
         Self {
             enabled: false,
             allowed_services: Vec::new(),
+            allowed_operations: Vec::new(),
             credentials_path: None,
             default_account: None,
             rate_limit_per_minute: default_gws_rate_limit(),
@@ -7326,6 +7369,70 @@ impl Config {
             }
         }
 
+        let mut seen_gws_operations = std::collections::HashSet::new();
+        for (i, operation) in self.google_workspace.allowed_operations.iter().enumerate() {
+            let service = operation.service.trim();
+            let resource = operation.resource.trim();
+
+            if service.is_empty() {
+                anyhow::bail!("google_workspace.allowed_operations[{i}].service must not be empty");
+            }
+            if resource.is_empty() {
+                anyhow::bail!(
+                    "google_workspace.allowed_operations[{i}].resource must not be empty"
+                );
+            }
+            if !service
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+            {
+                anyhow::bail!(
+                    "google_workspace.allowed_operations[{i}].service contains invalid characters: {service}"
+                );
+            }
+            if !resource
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+            {
+                anyhow::bail!(
+                    "google_workspace.allowed_operations[{i}].resource contains invalid characters: {resource}"
+                );
+            }
+            if operation.methods.is_empty() {
+                anyhow::bail!("google_workspace.allowed_operations[{i}].methods must not be empty");
+            }
+
+            let mut seen_methods = std::collections::HashSet::new();
+            for (j, method) in operation.methods.iter().enumerate() {
+                let normalized = method.trim();
+                if normalized.is_empty() {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].methods[{j}] must not be empty"
+                    );
+                }
+                if !normalized
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].methods[{j}] contains invalid characters: {normalized}"
+                    );
+                }
+                if !seen_methods.insert(normalized.to_string()) {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].methods contains duplicate entry: {normalized}"
+                    );
+                }
+            }
+
+            let operation_key = format!("{service}:{resource}");
+            if !seen_gws_operations.insert(operation_key.clone()) {
+                anyhow::bail!(
+                    "google_workspace.allowed_operations contains duplicate service/resource entry: {operation_key}"
+                );
+            }
+        }
+
         // Project intelligence
         if self.project_intel.enabled {
             let lang = &self.project_intel.default_language;
@@ -10986,6 +11093,58 @@ default_model = "legacy-model"
         clear_proxy_env_test_vars();
     }
 
+    #[test]
+    async fn google_workspace_allowed_operations_require_methods() {
+        let mut config = Config::default();
+        config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
+            service: "gmail".into(),
+            resource: "drafts".into(),
+            methods: Vec::new(),
+        }];
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("google_workspace.allowed_operations[0].methods"));
+    }
+
+    #[test]
+    async fn google_workspace_allowed_operations_reject_duplicate_service_resource_entries() {
+        let mut config = Config::default();
+        config.google_workspace.allowed_operations = vec![
+            GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "drafts".into(),
+                methods: vec!["create".into()],
+            },
+            GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "drafts".into(),
+                methods: vec!["update".into()],
+            },
+        ];
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("duplicate service/resource entry"));
+    }
+
+    #[test]
+    async fn google_workspace_allowed_operations_accept_valid_entries() {
+        let mut config = Config::default();
+        config.google_workspace.allowed_operations = vec![
+            GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "messages".into(),
+                methods: vec!["list".into(), "get".into()],
+            },
+            GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "drafts".into(),
+                methods: vec!["create".into(), "update".into()],
+            },
+        ];
+
+        assert!(config.validate().is_ok());
+    }
+
     fn runtime_proxy_cache_contains(cache_key: &str) -> bool {
         match runtime_proxy_client_cache().read() {
             Ok(guard) => guard.contains_key(cache_key),
@@ -12039,6 +12198,63 @@ require_otp_to_resume = true
             !effective,
             "must fall back to top-level false when channel omits field"
         );
+    }
+
+    #[test]
+    async fn google_workspace_allowed_operations_deserialize_from_toml() {
+        let toml_str = r#"
+            enabled = true
+
+            [[allowed_operations]]
+            service = "gmail"
+            resource = "drafts"
+            methods = ["create", "update"]
+        "#;
+
+        let cfg: GoogleWorkspaceConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.allowed_operations.len(), 1);
+        assert_eq!(cfg.allowed_operations[0].service, "gmail");
+        assert_eq!(cfg.allowed_operations[0].resource, "drafts");
+        assert_eq!(
+            cfg.allowed_operations[0].methods,
+            vec!["create".to_string(), "update".to_string()]
+        );
+    }
+
+    #[test]
+    async fn config_validate_accepts_google_workspace_allowed_operations() {
+        let mut cfg = Config::default();
+        cfg.google_workspace.enabled = true;
+        cfg.google_workspace.allowed_services = vec!["gmail".into()];
+        cfg.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
+            service: "gmail".into(),
+            resource: "drafts".into(),
+            methods: vec!["create".into(), "update".into()],
+        }];
+
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    async fn config_validate_rejects_duplicate_google_workspace_allowed_operations() {
+        let mut cfg = Config::default();
+        cfg.google_workspace.enabled = true;
+        cfg.google_workspace.allowed_services = vec!["gmail".into()];
+        cfg.google_workspace.allowed_operations = vec![
+            GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "drafts".into(),
+                methods: vec!["create".into()],
+            },
+            GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "drafts".into(),
+                methods: vec!["update".into()],
+            },
+        ];
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("duplicate service/resource entry"));
     }
 
     // ── Bootstrap files ─────────────────────────────────────
