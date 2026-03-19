@@ -1347,6 +1347,159 @@ html, body {
   cursor: not-allowed;
 }
 
+/* ── Chat Action Buttons (folder, github, mic) ── */
+
+.chat-action-buttons {
+  max-width: 768px;
+  margin: 6px auto 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 4px;
+}
+
+.chat-action-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  white-space: nowrap;
+}
+
+.chat-action-btn:hover:not(:disabled) {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+  background: rgba(99, 102, 241, 0.08);
+}
+
+.chat-action-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.chat-mic-btn:hover:not(:disabled) {
+  color: #22c55e;
+  border-color: #22c55e;
+  background: rgba(34, 197, 94, 0.08);
+}
+
+/* ── Workspace indicator in chat input area ── */
+
+.chat-workspace-indicator {
+  max-width: 768px;
+  margin: 0 auto 6px;
+  padding: 4px 10px;
+  background: rgba(74, 222, 128, 0.08);
+  border: 1px solid rgba(74, 222, 128, 0.25);
+  border-radius: var(--radius-md);
+  font-size: 0.72rem;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chat-workspace-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #4ade80;
+  flex-shrink: 0;
+}
+
+.chat-workspace-path {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #4ade80;
+}
+
+.chat-workspace-disconnect {
+  background: none;
+  border: none;
+  color: #888;
+  cursor: pointer;
+  font-size: 0.7rem;
+  padding: 0 2px;
+  flex-shrink: 0;
+}
+
+.chat-workspace-disconnect:hover {
+  color: #f87171;
+}
+
+.chat-github-input-row {
+  max-width: 768px;
+  margin: 0 auto 6px;
+  display: flex;
+  gap: 4px;
+}
+
+.chat-github-input {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-tertiary);
+  color: var(--color-text-primary);
+  font-size: 12px;
+  outline: none;
+}
+
+.chat-github-input:focus {
+  border-color: var(--color-primary);
+}
+
+.chat-github-ok-btn,
+.chat-github-cancel-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.chat-github-ok-btn:hover:not(:disabled) {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+}
+
+.chat-github-ok-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.chat-github-cancel-btn:hover {
+  color: #f87171;
+}
+
+.chat-workspace-status {
+  max-width: 768px;
+  margin: 0 auto 4px;
+  font-size: 0.7rem;
+  padding: 2px 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-workspace-status.success {
+  color: #4ade80;
+}
+
+.chat-workspace-status.error {
+  color: #f87171;
+}
+
 /* ── Chat Attachment Button ── */
 
 .chat-attach-btn {

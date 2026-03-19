@@ -631,6 +631,10 @@ function App() {
             onSendMessage={handleSendMessage}
             onRetry={handleRetry}
             onOpenSettings={() => setPage("settings")}
+            onOpenInterpreter={() => {
+              setPage("interpreter");
+              if (window.innerWidth <= 768) setSidebarOpen(false);
+            }}
             onToggleSidebar={() => setSidebarOpen((p) => !p)}
             sidebarOpen={sidebarOpen}
           />

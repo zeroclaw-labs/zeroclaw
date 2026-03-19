@@ -12,6 +12,8 @@ import {
   SUPPORTED_CHAT_EXTENSIONS,
   type AttachmentFile,
 } from "../lib/chat-attachments";
+import { apiClient } from "../lib/api";
+import { isTauri } from "../lib/tauri-bridge";
 
 interface ChatProps {
   chat: ChatSession | null;
@@ -20,6 +22,7 @@ interface ChatProps {
   onSendMessage: (content: string, attachments?: AttachmentFile[]) => Promise<void>;
   onRetry: (messages: ChatMessage[]) => void;
   onOpenSettings: () => void;
+  onOpenInterpreter: () => void;
   onToggleSidebar: () => void;
   sidebarOpen: boolean;
 }
@@ -31,6 +34,7 @@ export function Chat({
   onSendMessage,
   onRetry,
   onOpenSettings,
+  onOpenInterpreter,
   onToggleSidebar,
   sidebarOpen,
 }: ChatProps) {
@@ -42,6 +46,15 @@ export function Chat({
     show: boolean;
     pendingFiles: AttachmentFile[];
   }>({ show: false, pendingFiles: [] });
+
+  // Workspace connect state (moved from Sidebar)
+  const [showGitHubInput, setShowGitHubInput] = useState(false);
+  const [gitHubUrl, setGitHubUrl] = useState("");
+  const [workspaceStatus, setWorkspaceStatus] = useState<string | null>(null);
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [connectedWorkspace, setConnectedWorkspace] = useState<string | null>(
+    () => apiClient.getWorkspacePath(),
+  );
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -185,6 +198,57 @@ export function Chat({
       el.style.height = "auto";
       el.style.height = Math.min(el.scrollHeight, 120) + "px";
     }
+  }, []);
+
+  // ── Workspace handlers (moved from Sidebar) ──────────────────
+
+  const handleConnectFolder = useCallback(async () => {
+    if (workspaceLoading) return;
+    try {
+      if (isTauri()) {
+        const { open } = await import("@tauri-apps/plugin-dialog");
+        const selected = await open({ directory: true, multiple: false });
+        if (!selected) return;
+        const dirPath = typeof selected === "string" ? selected : selected[0];
+        if (!dirPath) return;
+        setWorkspaceLoading(true);
+        const resolved = await apiClient.setWorkspaceDir(dirPath);
+        setConnectedWorkspace(resolved);
+        setWorkspaceStatus(locale === "ko" ? "폴더가 연결되었습니다" : "Folder connected");
+        setTimeout(() => setWorkspaceStatus(null), 3000);
+      }
+    } catch (err) {
+      setWorkspaceStatus(err instanceof Error ? err.message : "Error");
+      setTimeout(() => setWorkspaceStatus(null), 4000);
+    } finally {
+      setWorkspaceLoading(false);
+    }
+  }, [workspaceLoading, locale]);
+
+  const handleConnectGitHub = useCallback(async () => {
+    const url = gitHubUrl.trim();
+    if (!url || workspaceLoading) return;
+    setWorkspaceLoading(true);
+    setWorkspaceStatus(null);
+    try {
+      const resolved = await apiClient.connectGitHubRepo(url);
+      setConnectedWorkspace(resolved);
+      setWorkspaceStatus(locale === "ko" ? "저장소가 연결되었습니다" : "Repository connected");
+      setGitHubUrl("");
+      setShowGitHubInput(false);
+      setTimeout(() => setWorkspaceStatus(null), 3000);
+    } catch (err) {
+      setWorkspaceStatus(err instanceof Error ? err.message : "Error");
+      setTimeout(() => setWorkspaceStatus(null), 4000);
+    } finally {
+      setWorkspaceLoading(false);
+    }
+  }, [gitHubUrl, workspaceLoading, locale]);
+
+  const handleDisconnectWorkspace = useCallback(() => {
+    apiClient.disconnectWorkspace();
+    setConnectedWorkspace(null);
+    setWorkspaceStatus(null);
   }, []);
 
   const canSend =
@@ -340,6 +404,57 @@ export function Chat({
           </div>
         )}
 
+        {/* Connected workspace indicator */}
+        {connectedWorkspace && (
+          <div className="chat-workspace-indicator">
+            <div className="chat-workspace-dot" />
+            <span className="chat-workspace-path" title={connectedWorkspace}>
+              {connectedWorkspace.split("/").pop() || connectedWorkspace}
+            </span>
+            <button
+              className="chat-workspace-disconnect"
+              onClick={handleDisconnectWorkspace}
+              title={locale === "ko" ? "연결 해제" : "Disconnect"}
+            >
+              {"\u2715"}
+            </button>
+          </div>
+        )}
+
+        {/* GitHub URL input (expandable) */}
+        {showGitHubInput && (
+          <div className="chat-github-input-row">
+            <input
+              className="chat-github-input"
+              type="text"
+              value={gitHubUrl}
+              onChange={(e) => setGitHubUrl(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") handleConnectGitHub(); }}
+              placeholder={t("connect_github_placeholder", locale)}
+            />
+            <button
+              className="chat-github-ok-btn"
+              disabled={!gitHubUrl.trim() || workspaceLoading}
+              onClick={handleConnectGitHub}
+            >
+              {workspaceLoading ? "..." : "OK"}
+            </button>
+            <button
+              className="chat-github-cancel-btn"
+              onClick={() => { setShowGitHubInput(false); setGitHubUrl(""); }}
+            >
+              {"\u2715"}
+            </button>
+          </div>
+        )}
+
+        {/* Workspace status message */}
+        {workspaceStatus && (
+          <div className={`chat-workspace-status ${workspaceStatus.includes("Error") || workspaceStatus.includes("failed") ? "error" : "success"}`}>
+            {workspaceStatus}
+          </div>
+        )}
+
         <form onSubmit={handleSubmit} className="chat-input-wrapper">
           {/* File attachment button */}
           <button
@@ -392,6 +507,49 @@ export function Chat({
             </svg>
           </button>
         </form>
+
+        {/* Action buttons row: folder, github, microphone */}
+        <div className="chat-action-buttons">
+          <button
+            type="button"
+            className="chat-action-btn"
+            onClick={handleConnectFolder}
+            disabled={workspaceLoading || !isConnected}
+            title={locale === "ko" ? "폴더 연결" : "Connect folder"}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+            </svg>
+            <span>{locale === "ko" ? "폴더 연결" : "Folder"}</span>
+          </button>
+          <button
+            type="button"
+            className="chat-action-btn"
+            onClick={() => setShowGitHubInput((prev) => !prev)}
+            disabled={workspaceLoading || !isConnected}
+            title={locale === "ko" ? "GitHub 연결" : "Connect GitHub"}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22" />
+            </svg>
+            <span>GitHub</span>
+          </button>
+          <button
+            type="button"
+            className="chat-action-btn chat-mic-btn"
+            onClick={onOpenInterpreter}
+            disabled={!isConnected}
+            title={locale === "ko" ? "음성 입력 (STT/TTS)" : "Voice input (STT/TTS)"}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+              <line x1="12" y1="19" x2="12" y2="23" />
+              <line x1="8" y1="23" x2="16" y2="23" />
+            </svg>
+            <span>{locale === "ko" ? "음성" : "Voice"}</span>
+          </button>
+        </div>
       </div>
     </div>
   );

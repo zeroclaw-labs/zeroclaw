@@ -117,6 +117,31 @@ interface SetupWizardProps {
   onComplete: () => void;
 }
 
+// Map wizard provider IDs → Settings/API provider IDs and default models.
+// Wizard uses "anthropic"/"google" but Settings/chat API uses "claude"/"gemini".
+const WIZARD_TO_SETTINGS: Record<string, { provider: string; model: string; keyName: string }> = {
+  anthropic: { provider: "claude", model: "claude-sonnet-4-20250514", keyName: "anthropic" },
+  openai:    { provider: "openai", model: "gpt-4.1", keyName: "openai" },
+  google:    { provider: "gemini", model: "gemini-2.5-flash", keyName: "gemini" },
+  openrouter:{ provider: "openrouter", model: "openrouter/auto", keyName: "openrouter" },
+  ollama:    { provider: "ollama", model: "llama3", keyName: "ollama" },
+};
+
+/** Persist the wizard's provider choice into the keys that the chat API reads. */
+function persistProviderToChat(wizardProviderId: string, apiKeyValue?: string) {
+  const mapping = WIZARD_TO_SETTINGS[wizardProviderId];
+  if (!mapping) return;
+
+  // These are the keys that api.ts chat() reads
+  localStorage.setItem("zeroclaw_llm_provider", mapping.provider);
+  localStorage.setItem("zeroclaw_llm_model", mapping.model);
+
+  // Also save the API key under the correct storage name
+  if (apiKeyValue && apiKeyValue.trim()) {
+    localStorage.setItem(`zeroclaw_api_key_${mapping.keyName}`, apiKeyValue.trim());
+  }
+}
+
 type Step = "language" | "provider" | "apikey" | "complete";
 const STEPS: Step[] = ["language", "provider", "apikey", "complete"];
 
@@ -159,6 +184,7 @@ export function SetupWizard({ locale, onLocaleChange, onComplete }: SetupWizardP
       if (selectedProvider === "ollama") {
         // Ollama doesn't need an API key — write config and skip to complete
         localStorage.setItem("zeroclaw_setup_provider", selectedProvider);
+        persistProviderToChat(selectedProvider);
         if (isTauri()) {
           await writeMoAConfig(selectedProvider).catch(() => {});
         }
@@ -174,6 +200,9 @@ export function SetupWizard({ locale, onLocaleChange, onComplete }: SetupWizardP
         // Save provider preference to localStorage (for frontend reference)
         localStorage.setItem("zeroclaw_setup_provider", selectedProvider);
 
+        // ★ Persist to the keys that chat API actually reads
+        persistProviderToChat(selectedProvider, apiKey.trim() || undefined);
+
         // Write directly to MoA's config.toml via Tauri bridge.
         // This ensures the gateway starts with the correct provider/key
         // even before the gateway is running.
@@ -185,13 +214,16 @@ export function SetupWizard({ locale, onLocaleChange, onComplete }: SetupWizardP
           );
         }
 
-        // Save API key to localStorage as backup
+        // Save API key to localStorage as backup (using wizard provider name)
         if (apiKey.trim()) {
           const storageKey = `zeroclaw_api_key_${selectedProvider}`;
           localStorage.setItem(storageKey, apiKey.trim());
 
           // Also try syncing to running gateway (best-effort)
-          await apiClient.saveApiKeyToAgent(selectedProvider, apiKey.trim()).catch(() => {});
+          // Use the Settings-compatible provider name for the gateway
+          const mapping = WIZARD_TO_SETTINGS[selectedProvider];
+          const gatewayProvider = mapping?.provider ?? selectedProvider;
+          await apiClient.saveApiKeyToAgent(gatewayProvider, apiKey.trim()).catch(() => {});
         }
 
         localStorage.setItem("zeroclaw_setup_complete", "true");
@@ -206,6 +238,8 @@ export function SetupWizard({ locale, onLocaleChange, onComplete }: SetupWizardP
 
   const handleSkipApiKey = useCallback(async () => {
     localStorage.setItem("zeroclaw_setup_provider", selectedProvider);
+    // ★ Persist to the keys that chat API actually reads
+    persistProviderToChat(selectedProvider);
     // Write provider to config.toml even without API key
     if (isTauri()) {
       await writeMoAConfig(selectedProvider).catch(() => {});

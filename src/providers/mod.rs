@@ -865,7 +865,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
     }
 
     let provider_env_candidates: Vec<&str> = match name {
-        "anthropic" => vec!["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+        "anthropic" | "claude" => vec!["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
         "openrouter" => vec!["OPENROUTER_API_KEY"],
         "openai" => vec!["OPENAI_API_KEY"],
         "gemini" | "google" | "google-gemini" => vec!["GEMINI_API_KEY"],
@@ -1076,7 +1076,7 @@ fn create_provider_with_url_and_options(
         "openrouter" => Ok(Box::new(
             openrouter::OpenRouterProvider::new_with_max_tokens(key, options.max_tokens_override),
         )),
-        "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
+        "anthropic" | "claude" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
         "openai" => Ok(Box::new(
             openai::OpenAiProvider::with_base_url_and_max_tokens(
                 api_url,
@@ -1730,7 +1730,7 @@ pub fn list_providers() -> Vec<ProviderInfo> {
         ProviderInfo {
             name: "anthropic",
             display_name: "Anthropic",
-            aliases: &[],
+            aliases: &["claude"],
             local: false,
         },
         ProviderInfo {
