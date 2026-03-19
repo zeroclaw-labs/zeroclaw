@@ -50,6 +50,7 @@ impl ClaudeCodeSession {
     ///
     /// Uses `--output-format stream-json` for structured output parsing.
     /// Does NOT use `--dangerously-skip-permissions` — hooks fire normally.
+    #[allow(clippy::unused_async)]
     pub async fn spawn(run_id: String, opts: SpawnOptions) -> Result<Self> {
         let mut cmd = Command::new("claude");
 
@@ -161,6 +162,7 @@ impl ClaudeCodeSession {
     }
 
     /// Cleanup worktree after session completes.
+    #[allow(clippy::unused_async)]
     pub async fn cleanup(&self) -> Result<()> {
         // Worktree cleanup is handled by the caller (the orchestrator)
         // since it needs to inspect the result before deciding whether
@@ -288,7 +290,7 @@ mod tests {
         });
         match parse_stream_event(&json) {
             SessionEvent::Completed { result } => {
-                assert_eq!(result, "Task completed successfully")
+                assert_eq!(result, "Task completed successfully");
             }
             other => panic!("Expected Completed, got {other:?}"),
         }

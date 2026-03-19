@@ -207,14 +207,17 @@ async fn main() -> Result<()> {
                 config.default_temperature = t;
             }
 
-            if let Some(msg) = message {
-                // Single-shot mode: send one message and exit
-                // TODO: implement single-shot via channel
-                println!("Single-shot mode not yet implemented: {msg}");
-            } else {
-                // Interactive CLI mode
-                channels::start_cli(config).await?;
-            }
+            let temp = config.default_temperature;
+            lightwave_sys::agent::loop_::run(
+                config,
+                message,
+                None, // provider already applied to config above
+                None, // model already applied to config above
+                temp,
+                vec![],
+                true, // interactive (enables approval manager)
+            )
+            .await?;
         }
 
         Commands::Channel { channel_command } => match channel_command {

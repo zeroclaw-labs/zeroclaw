@@ -91,7 +91,6 @@ impl AgentHealth {
                         consecutive_failures: failures,
                     };
                 }
-                return;
             }
         }
     }

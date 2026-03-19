@@ -53,14 +53,10 @@ impl FeedEventType {
     pub fn symbol(&self) -> &str {
         match self {
             Self::AgentStarted => symbols::CREATED,
-            Self::AgentStopped => symbols::COMPLETED,
+            Self::AgentStopped | Self::TaskCompleted | Self::PingSuccess => symbols::COMPLETED,
             Self::AgentStuck => symbols::PATROL,
-            Self::AgentKilled => symbols::FAILED,
+            Self::AgentKilled | Self::TaskFailed | Self::PingFailed => symbols::FAILED,
             Self::TaskAssigned => symbols::IN_PROGRESS,
-            Self::TaskCompleted => symbols::COMPLETED,
-            Self::TaskFailed => symbols::FAILED,
-            Self::PingSuccess => symbols::COMPLETED,
-            Self::PingFailed => symbols::FAILED,
             Self::Nudge => symbols::NUDGE,
             Self::Handoff => symbols::HANDOFF,
             Self::Custom(_) => symbols::TARGET,
