@@ -84,6 +84,9 @@ Semantics:
 - If `allowed_operations` is non-empty, only explicit `(service, resource, method)`
   combinations are allowed.
 - Service-level and operation-level checks both apply.
+- If `allowed_operations` is non-empty and the caller supplies `sub_resource`,
+  the call is denied fail-closed. Sub-resource operations cannot be individually
+  allowlisted in this version; see the sub-resource limitation section below.
 
 ## Operation Inventory Reference
 
@@ -97,7 +100,7 @@ For `allowed_operations`, the runtime expects this exact shape:
 - `resource`: the Google API resource name used by that service
 - `method`: the operation name used on that resource
 
-Mental model:
+Mental model for 3-segment operations (the fully supported case):
 
 ```text
 gws <service> <resource> <method> ...
@@ -111,6 +114,17 @@ service = "<service>"
 resource = "<resource>"
 methods = ["<method>"]
 ```
+
+Some `gws` commands use a 4-segment shape:
+
+```text
+gws <service> <resource> <sub_resource> <method> ...
+```
+
+For example: `gws drive files permissions list`. When `allowed_operations` is
+configured, any call with a `sub_resource` is denied fail-closed. There is no
+config syntax to allowlist a nested `(service, resource, sub_resource, method)`
+combination in this version.
 
 Examples:
 
@@ -171,11 +185,14 @@ When you need to confirm whether a less-common operation exists:
 
 Validation order inside `google_workspace`:
 
-1. Check rate limits and action budget.
+1. Check rate limits.
 2. Check `service` against `allowed_services`.
-3. Check `(service, resource, method)` against `allowed_operations` when configured.
-4. Reject any invalid identifiers.
-5. Build and execute the `gws` command.
+3. Extract and validate `sub_resource` if present (character check, type check).
+4. Check `(service, resource, sub_resource, method)` against `allowed_operations`
+   when configured. Any non-`None` `sub_resource` is denied fail-closed.
+5. Validate `service`, `resource`, and `method` for shell-safe characters.
+6. Build and execute the `gws` command.
+7. Charge action budget (only after all validation passes).
 
 This must be fail-closed. A missing operation match is a hard deny, not a warning.
 
@@ -234,11 +251,38 @@ For `email-assistant`, the safe Gmail-native draft profile is:
 This still is not a credential-level send prohibition. It is a strong runtime
 boundary inside the ZeroClaw wrapper.
 
+## Sub-Resource Limitation
+
+`gws` supports a 4-segment command shape for nested resources:
+
+```text
+gws drive files permissions list
+gws gmail users settings filters list
+```
+
+The `allowed_operations` config model is `(service, resource, methods[])`. There is
+no field for `sub_resource`. When `allowed_operations` is non-empty, the runtime
+denies any call that includes a `sub_resource` fail-closed rather than attempting
+partial policy enforcement on an unsupported shape.
+
+Operator impact:
+
+- If you need access to sub-resource operations (for example Drive file permissions),
+  do not configure `allowed_operations`. Service-level scoping via `allowed_services`
+  remains available and gives the pre-existing behavior.
+- If you configure `allowed_operations` for fine-grained control, sub-resource
+  operations are unavailable for the duration of this limitation.
+
+This is intentional for this slice. The fix is a follow-on config model extension.
+
 ## Follow-On Work
 
-Future credential-hardening work should be tracked separately:
+Future work tracked separately:
 
-1. Declared credential profiles in `google_workspace` config
-2. Startup verification of granted scopes against declared policy
-3. Multiple credential files per trust tier
-4. Optional profile-to-operation binding
+1. Extend `allowed_operations` to support `sub_resource` as an optional fourth
+   segment — `(service, resource, sub_resource, method)` — so nested operations can
+   be individually allowlisted without disabling the feature entirely.
+2. Declared credential profiles in `google_workspace` config.
+3. Startup verification of granted scopes against declared policy.
+4. Multiple credential files per trust tier.
+5. Optional profile-to-operation binding.

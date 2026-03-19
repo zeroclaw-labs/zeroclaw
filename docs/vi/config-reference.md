@@ -252,6 +252,47 @@ Lưu ý:
 - Mặc định từ chối tất cả: nếu `allowed_domains` rỗng, mọi yêu cầu HTTP bị từ chối.
 - Dùng khớp tên miền chính xác hoặc subdomain (ví dụ `"api.example.com"`, `"example.com"`).
 
+## `[google_workspace]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable the `google_workspace` tool |
+| `credentials_path` | unset | Path to Google service account or OAuth credentials JSON |
+| `default_account` | unset | Default Google account passed as `--account` to `gws` |
+| `allowed_services` | (built-in list) | Services the agent may access: `drive`, `gmail`, `calendar`, `sheets`, `docs`, `slides`, `tasks`, `people`, `chat`, `forms`, `keep`, `meet` |
+| `rate_limit_per_minute` | `60` | Maximum `gws` calls per minute |
+| `timeout_secs` | `30` | Per-call execution timeout before kill |
+| `audit_log` | `false` | Emit an `INFO` log line for every `gws` call |
+
+### `[[google_workspace.allowed_operations]]`
+
+When non-empty, only the listed `(service, resource, method)` triples are permitted.
+Any unlisted combination is denied fail-closed. When empty (the default), all
+resource and method combinations within `allowed_services` are available.
+
+| Key | Required | Purpose |
+|---|---|---|
+| `service` | yes | Service identifier (must match an entry in `allowed_services`) |
+| `resource` | yes | Google API resource name for that service |
+| `methods` | yes | One or more method names allowed on that resource |
+
+Sub-resource limitation: when `allowed_operations` is non-empty, any call with a
+`sub_resource` argument is denied fail-closed. Omit `allowed_operations` for
+service-level scoping if sub-resource access is needed.
+
+```toml
+[google_workspace]
+enabled = true
+default_account = "owner@company.com"
+allowed_services = ["gmail"]
+audit_log = true
+
+[[google_workspace.allowed_operations]]
+service = "gmail"
+resource = "drafts"
+methods = ["list", "get", "create", "update"]
+```
+
 ## `[gateway]`
 
 | Khóa | Mặc định | Mục đích |

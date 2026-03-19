@@ -314,6 +314,45 @@ temperature = 0.2
 - 使用精确域或子域匹配（例如 `"api.example.com"`、`"example.com"`），或 `"*"` 允许任何公共域。
 - 即使配置了 `"*"`，本地/私有目标仍然被阻止。
 
+## `[google_workspace]`
+
+| 键 | 默认值 | 用途 |
+|---|---|---|
+| `enabled` | `false` | 启用 `google_workspace` 工具 |
+| `credentials_path` | 未设置 | Google 服务账号或 OAuth 凭据 JSON 的路径 |
+| `default_account` | 未设置 | 传递给 `gws` 的 `--account` 默认 Google 账号 |
+| `allowed_services` | （内置列表） | 代理可访问的服务：`drive`、`gmail`、`calendar`、`sheets`、`docs`、`slides`、`tasks`、`people`、`chat`、`forms`、`keep`、`meet` |
+| `rate_limit_per_minute` | `60` | 每分钟最大 `gws` 调用次数 |
+| `timeout_secs` | `30` | 每次调用超时时间（秒） |
+| `audit_log` | `false` | 为每次 `gws` 调用记录 `INFO` 日志 |
+
+### `[[google_workspace.allowed_operations]]`
+
+非空时，仅允许列出的 `(service, resource, method)` 三元组。未列出的组合将被拒绝（fail-closed）。
+为空时（默认），`allowed_services` 内的所有资源和方法组合均可用。
+
+| 键 | 是否必填 | 用途 |
+|---|---|---|
+| `service` | 是 | 服务标识符（须匹配 `allowed_services` 中的条目） |
+| `resource` | 是 | 该服务的 Google API 资源名称 |
+| `methods` | 是 | 该资源上允许的一个或多个方法名称 |
+
+子资源限制：当 `allowed_operations` 非空时，包含 `sub_resource` 参数的调用将被拒绝（fail-closed）。
+如需子资源访问，请省略 `allowed_operations` 以使用服务级别的范围控制。
+
+```toml
+[google_workspace]
+enabled = true
+default_account = "owner@company.com"
+allowed_services = ["gmail"]
+audit_log = true
+
+[[google_workspace.allowed_operations]]
+service = "gmail"
+resource = "drafts"
+methods = ["list", "get", "create", "update"]
+```
+
 ## `[gateway]`
 
 | 键 | 默认值 | 用途 |
