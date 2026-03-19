@@ -187,6 +187,10 @@ enum Commands {
         /// Memory backend (sqlite, lucid, markdown, none) - used in quick mode, default: sqlite
         #[arg(long)]
         memory: Option<String>,
+
+        /// Force interactive wizard mode (ignore TTY auto-detection)
+        #[arg(long)]
+        interactive: bool,
     },
 
     /// Start the AI agent loop
@@ -815,6 +819,7 @@ async fn main() -> Result<()> {
         provider,
         model,
         memory,
+        interactive,
     } = &cli.command
     {
         let force = *force;
@@ -824,6 +829,7 @@ async fn main() -> Result<()> {
         let provider = provider.clone();
         let model = model.clone();
         let memory = memory.clone();
+        let interactive = *interactive;
 
         if reinit && channels_only {
             bail!("--reinit and --channels-only cannot be used together");
@@ -886,7 +892,7 @@ async fn main() -> Result<()> {
 
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
-        } else if is_tty && !has_provider_flags {
+        } else if interactive || (is_tty && !has_provider_flags) {
             Box::pin(onboard::run_wizard(force)).await
         } else {
             Box::pin(onboard::run_quick_setup(
