@@ -2108,9 +2108,20 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
     parts.join("\n")
 }
 
-fn resolve_display_text(response_text: &str, parsed_text: &str, has_tool_calls: bool) -> String {
+fn resolve_display_text(
+    response_text: &str,
+    parsed_text: &str,
+    has_tool_calls: bool,
+    has_native_tool_calls: bool,
+) -> String {
     if has_tool_calls {
-        return parsed_text.to_string();
+        if !parsed_text.is_empty() {
+            return parsed_text.to_string();
+        }
+        if has_native_tool_calls {
+            return response_text.to_string();
+        }
+        return String::new();
     }
 
     if parsed_text.is_empty() {
@@ -2680,8 +2691,12 @@ pub(crate) async fn run_tool_call_loop(
                 }
             };
 
-        let display_text =
-            resolve_display_text(&response_text, &parsed_text, !tool_calls.is_empty());
+        let display_text = resolve_display_text(
+            &response_text,
+            &parsed_text,
+            !tool_calls.is_empty(),
+            !native_tool_calls.is_empty(),
+        );
         let display_text = strip_tool_result_blocks(&display_text);
 
         // ── Progress: LLM responded ─────────────────────────────
@@ -2742,10 +2757,18 @@ pub(crate) async fn run_tool_call_loop(
             return Ok(display_text);
         }
 
-        // Print any text the LLM produced alongside tool calls (unless silent)
-        if !silent && !display_text.is_empty() {
-            print!("{display_text}");
-            let _ = std::io::stdout().flush();
+        // Native tool-call providers can return assistant text separately from
+        // the structured call payload; relay it to draft-capable channels.
+        if !display_text.is_empty() {
+            if !native_tool_calls.is_empty() {
+                if let Some(ref tx) = on_delta {
+                    let _ = tx.send(display_text.clone()).await;
+                }
+            }
+            if !silent {
+                print!("{display_text}");
+                let _ = std::io::stdout().flush();
+            }
         }
 
         // Execute tool calls and build results. `individual_results` tracks per-call output so
@@ -5185,6 +5208,98 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn run_tool_call_loop_relays_native_tool_call_text_via_on_delta() {
+        let provider = ScriptedProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from(vec![
+                ChatResponse {
+                    text: Some("Task started. Waiting 30 seconds before checking status.".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "call_wait".into(),
+                        name: "count_tool".into(),
+                        arguments: r#"{"value":"A"}"#.into(),
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("Final answer".into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]))),
+            capabilities: ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            },
+        };
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+        )
+        .await
+        .expect("native tool-call text should be relayed through on_delta");
+
+        let mut deltas = Vec::new();
+        while let Some(delta) = rx.recv().await {
+            deltas.push(delta);
+        }
+
+        let explanation_idx = deltas
+            .iter()
+            .position(|delta| delta == "Task started. Waiting 30 seconds before checking status.")
+            .expect("native assistant text should be relayed to on_delta");
+        let clear_idx = deltas
+            .iter()
+            .position(|delta| delta == DRAFT_CLEAR_SENTINEL)
+            .expect("final answer streaming should clear prior draft state");
+
+        assert!(
+            deltas
+                .iter()
+                .any(|delta| delta.starts_with("\u{1f4ac} Got 1 tool call(s)")),
+            "tool-call progress line should still be relayed"
+        );
+        assert!(
+            explanation_idx < clear_idx,
+            "native assistant text should arrive before final-answer draft clearing"
+        );
+        assert_eq!(result, "Final answer");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn agent_turn_executes_activated_tool_from_wrapper() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -5249,6 +5364,7 @@ mod tests {
             "<tool_call>{\"name\":\"memory_store\"}</tool_call>",
             "",
             true,
+            false,
         );
         assert!(display.is_empty());
     }
@@ -5259,13 +5375,20 @@ mod tests {
             "<tool_call>{\"name\":\"shell\"}</tool_call>",
             "Let me check that.",
             true,
+            false,
         );
         assert_eq!(display, "Let me check that.");
     }
 
     #[test]
+    fn resolve_display_text_uses_response_text_for_native_tool_turns() {
+        let display = resolve_display_text("Task started.", "", true, true);
+        assert_eq!(display, "Task started.");
+    }
+
+    #[test]
     fn resolve_display_text_uses_response_text_for_final_turns() {
-        let display = resolve_display_text("Final answer", "", false);
+        let display = resolve_display_text("Final answer", "", false, false);
         assert_eq!(display, "Final answer");
     }
 
