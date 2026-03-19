@@ -518,6 +518,7 @@ mod tests {
             identity_config: None,
             dispatcher_instructions: "",
             tool_descriptions: None,
+            security_summary: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -538,7 +539,9 @@ mod tests {
     #[test]
     fn safety_section_includes_security_summary_when_present() {
         let tools: Vec<Box<dyn Tool>> = vec![];
-        let summary = "**Autonomy level**: Supervised\n**Allowed shell commands**: `git`, `ls`.\n".to_string();
+        let summary = "**Autonomy level**: Supervised\n\
+                        **Allowed shell commands**: `git`, `ls`.\n"
+            .to_string();
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
@@ -552,10 +555,22 @@ mod tests {
         };
 
         let output = SafetySection.build(&ctx).unwrap();
-        assert!(output.contains("## Safety"), "should contain base safety header");
-        assert!(output.contains("### Active Security Policy"), "should contain security policy header");
-        assert!(output.contains("Autonomy level"), "should contain autonomy level from summary");
-        assert!(output.contains("`git`"), "should contain allowed commands from summary");
+        assert!(
+            output.contains("## Safety"),
+            "should contain base safety header"
+        );
+        assert!(
+            output.contains("### Active Security Policy"),
+            "should contain security policy header"
+        );
+        assert!(
+            output.contains("Autonomy level"),
+            "should contain autonomy level from summary"
+        );
+        assert!(
+            output.contains("`git`"),
+            "should contain allowed commands from summary"
+        );
     }
 
     #[test]
@@ -574,7 +589,13 @@ mod tests {
         };
 
         let output = SafetySection.build(&ctx).unwrap();
-        assert!(output.contains("## Safety"), "should contain base safety header");
-        assert!(!output.contains("### Active Security Policy"), "should NOT contain security policy header when None");
+        assert!(
+            output.contains("## Safety"),
+            "should contain base safety header"
+        );
+        assert!(
+            !output.contains("### Active Security Policy"),
+            "should NOT contain security policy header when None"
+        );
     }
 }

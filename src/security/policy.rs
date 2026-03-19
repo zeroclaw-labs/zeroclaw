@@ -1322,36 +1322,60 @@ impl SecurityPolicy {
 
         // Allowed roots
         if !self.allowed_roots.is_empty() {
-            let roots: Vec<String> = self.allowed_roots.iter().map(|p| format!("`{}`", p.display())).collect();
-            let _ = writeln!(out, "**Additional allowed paths**: {}", roots.join(", "));
+            let roots: Vec<String> = self
+                .allowed_roots
+                .iter()
+                .map(|p| format!("`{}`", p.display()))
+                .collect();
+            let _ = writeln!(
+                out,
+                "**Additional allowed paths**: {}",
+                roots.join(", ")
+            );
         }
 
         // Allowed commands
         if !self.allowed_commands.is_empty() {
-            let cmds: Vec<String> = self.allowed_commands.iter().map(|c| format!("`{c}`")).collect();
+            let cmds: Vec<String> = self
+                .allowed_commands
+                .iter()
+                .map(|c| format!("`{c}`"))
+                .collect();
             let _ = writeln!(
                 out,
-                "**Allowed shell commands**: {}. Commands not on this list will be rejected.",
+                "**Allowed shell commands**: {}. \
+                 Commands not on this list will be rejected.",
                 cmds.join(", ")
             );
         }
 
         // Forbidden paths
         if !self.forbidden_paths.is_empty() {
-            let paths: Vec<String> = self.forbidden_paths.iter().map(|p| format!("`{p}`")).collect();
+            let paths: Vec<String> = self
+                .forbidden_paths
+                .iter()
+                .map(|p| format!("`{p}`"))
+                .collect();
             let _ = writeln!(
                 out,
-                "**Forbidden paths**: {}. Any read/write/exec targeting these paths will be blocked.",
+                "**Forbidden paths**: {}. \
+                 Any read/write/exec targeting these paths will be blocked.",
                 paths.join(", ")
             );
         }
 
         // Risk controls
         if self.block_high_risk_commands {
-            let _ = writeln!(out, "**High-risk commands** (rm, kill, reboot, etc.) are blocked.");
+            let _ = writeln!(
+                out,
+                "**High-risk commands** (rm, kill, reboot, etc.) are blocked."
+            );
         }
         if self.require_approval_for_medium_risk {
-            let _ = writeln!(out, "**Medium-risk commands** require user approval before execution.");
+            let _ = writeln!(
+                out,
+                "**Medium-risk commands** require user approval before execution."
+            );
         }
 
         // Rate limit
@@ -1366,7 +1390,8 @@ impl SecurityPolicy {
 }
 
 #[cfg(test)]
-mod tests {    use super::*;
+mod tests {
+    use super::*;
 
     fn default_policy() -> SecurityPolicy {
         SecurityPolicy::default()
@@ -2828,8 +2853,14 @@ mod tests {    use super::*;
             ..SecurityPolicy::default()
         };
         let summary = p.prompt_summary();
-        assert!(summary.contains("Workspace boundary"), "should mention workspace boundary");
-        assert!(summary.contains("/home/user/project"), "should mention workspace path");
+        assert!(
+            summary.contains("Workspace boundary"),
+            "should mention workspace boundary"
+        );
+        assert!(
+            summary.contains("/home/user/project"),
+            "should mention workspace path"
+        );
     }
 
     #[test]
@@ -2839,7 +2870,10 @@ mod tests {    use super::*;
             ..SecurityPolicy::default()
         };
         let summary = p.prompt_summary();
-        assert!(!summary.contains("Workspace boundary"), "should not mention workspace boundary");
+        assert!(
+            !summary.contains("Workspace boundary"),
+            "should not mention workspace boundary"
+        );
     }
 
     #[test]
@@ -2849,9 +2883,18 @@ mod tests {    use super::*;
             ..SecurityPolicy::default()
         };
         let summary = p.prompt_summary();
-        assert!(summary.contains("`git`"), "should list allowed commands");
-        assert!(summary.contains("`ls`"), "should list allowed commands");
-        assert!(summary.contains("not on this list will be rejected"), "should warn about rejection");
+        assert!(
+            summary.contains("`git`"),
+            "should list allowed commands"
+        );
+        assert!(
+            summary.contains("`ls`"),
+            "should list allowed commands"
+        );
+        assert!(
+            summary.contains("not on this list will be rejected"),
+            "should warn about rejection"
+        );
     }
 
     #[test]
