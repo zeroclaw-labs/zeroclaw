@@ -86,6 +86,30 @@ Semantics:
   combinations are allowed.
 - Service-level and operation-level checks both apply.
 
+## Operation Inventory Reference
+
+ZeroClaw should not try to freeze a hand-maintained global list of Google
+Workspace operations in this spec. The underlying `gws` command surface is
+derived from Google's Discovery Service, so the canonical operation inventory
+is external and changes over time.
+
+Use these references when defining or reviewing `allowed_operations`:
+
+- Google API Discovery directory:
+  `https://developers.google.com/discovery/v1/reference/apis/list`
+- Discovery Service overview and document structure:
+  `https://developers.google.com/discovery/v1/using`
+- Google Workspace CLI docs entry point:
+  `https://googleworkspace-cli.mintlify.app/`
+
+Practical rule:
+
+- Use the Discovery directory to identify available Google APIs.
+- Use the per-service Discovery document or REST reference to enumerate the
+  resource and method names for a specific service.
+- Use the `gws` docs as the operator-facing reference for how those operations
+  map into CLI commands.
+
 ## Runtime Enforcement
 
 Validation order inside `google_workspace`:
