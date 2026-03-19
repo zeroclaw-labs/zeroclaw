@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 pub struct OpenRouterProvider {
     credential: Option<String>,
+    timeout_secs: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,7 +150,14 @@ impl OpenRouterProvider {
     pub fn new(credential: Option<&str>) -> Self {
         Self {
             credential: credential.map(ToString::to_string),
+            timeout_secs: 120,
         }
+    }
+
+    /// Override the HTTP request timeout for LLM API calls.
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout_secs = secs;
+        self
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -296,7 +304,7 @@ impl OpenRouterProvider {
     }
 
     fn http_client(&self) -> Client {
-        crate::config::build_runtime_proxy_client_with_timeouts("provider.openrouter", 120, 10)
+        crate::config::build_runtime_proxy_client_with_timeouts("provider.openrouter", self.timeout_secs, 10)
     }
 }
 
