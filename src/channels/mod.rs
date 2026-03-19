@@ -5441,7 +5441,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[tokio::test]
     async fn process_channel_message_executes_tool_calls_instead_of_sending_raw_json() {
-        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
         let mut channels_by_name = HashMap::new();
