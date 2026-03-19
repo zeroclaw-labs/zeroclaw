@@ -1327,11 +1327,7 @@ impl SecurityPolicy {
                 .iter()
                 .map(|p| format!("`{}`", p.display()))
                 .collect();
-            let _ = writeln!(
-                out,
-                "**Additional allowed paths**: {}",
-                roots.join(", ")
-            );
+            let _ = writeln!(out, "**Additional allowed paths**: {}", roots.join(", "));
         }
 
         // Allowed commands
@@ -2842,7 +2838,10 @@ mod tests {
     fn prompt_summary_includes_autonomy_level() {
         let p = default_policy();
         let summary = p.prompt_summary();
-        assert!(summary.contains("Supervised"), "should mention autonomy level");
+        assert!(
+            summary.contains("Supervised"),
+            "should mention autonomy level"
+        );
     }
 
     #[test]
@@ -2883,14 +2882,8 @@ mod tests {
             ..SecurityPolicy::default()
         };
         let summary = p.prompt_summary();
-        assert!(
-            summary.contains("`git`"),
-            "should list allowed commands"
-        );
-        assert!(
-            summary.contains("`ls`"),
-            "should list allowed commands"
-        );
+        assert!(summary.contains("`git`"), "should list allowed commands");
+        assert!(summary.contains("`ls`"), "should list allowed commands");
         assert!(
             summary.contains("not on this list will be rejected"),
             "should warn about rejection"
@@ -2917,7 +2910,10 @@ mod tests {
         };
         let summary = p.prompt_summary();
         assert!(summary.contains("42"), "should mention rate limit");
-        assert!(summary.contains("actions per hour"), "should explain rate limit");
+        assert!(
+            summary.contains("actions per hour"),
+            "should explain rate limit"
+        );
     }
 
     #[test]
@@ -2928,8 +2924,14 @@ mod tests {
             ..SecurityPolicy::default()
         };
         let summary = p.prompt_summary();
-        assert!(summary.contains("High-risk commands"), "should mention high-risk block");
-        assert!(summary.contains("Medium-risk commands"), "should mention medium-risk approval");
+        assert!(
+            summary.contains("High-risk commands"),
+            "should mention high-risk block"
+        );
+        assert!(
+            summary.contains("Medium-risk commands"),
+            "should mention medium-risk approval"
+        );
     }
 
     #[test]
@@ -2939,7 +2941,13 @@ mod tests {
             ..SecurityPolicy::default()
         };
         let summary = p.prompt_summary();
-        assert!(summary.contains("`/shared/data`"), "should list allowed roots");
-        assert!(summary.contains("`/opt/tools`"), "should list allowed roots");
+        assert!(
+            summary.contains("`/shared/data`"),
+            "should list allowed roots"
+        );
+        assert!(
+            summary.contains("`/opt/tools`"),
+            "should list allowed roots"
+        );
     }
 }
