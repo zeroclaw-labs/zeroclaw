@@ -4081,6 +4081,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
         ),
     ];
 
+    if matches!(
+        config.skills.prompt_injection_mode,
+        crate::config::SkillsPromptInjectionMode::Compact
+    ) {
+        tool_descs.push((
+            "read_skill",
+            "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
+        ));
+    }
+
     if config.browser.enabled {
         tool_descs.push((
             "browser_open",
