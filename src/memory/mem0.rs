@@ -379,10 +379,7 @@ impl Memory for Mem0Memory {
         let resp = self
             .client
             .get(self.api_url("/memories/"))
-            .query(&[
-                ("user_id", effective_user),
-                ("size", "100"),
-            ])
+            .query(&[("user_id", effective_user), ("size", "100")])
             .send()
             .await?;
 
@@ -579,7 +576,10 @@ mod tests {
             score: None,
         };
         let entry = mem.to_entry(item);
-        assert_eq!(entry.category, MemoryCategory::Custom("project_notes".into()));
+        assert_eq!(
+            entry.category,
+            MemoryCategory::Custom("project_notes".into())
+        );
         assert_eq!(entry.session_id.as_deref(), Some("s1"));
     }
 

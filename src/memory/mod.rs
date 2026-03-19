@@ -351,9 +351,7 @@ pub fn create_memory_with_storage_and_routes(
     }
 
     #[cfg(not(feature = "memory-mem0"))]
-    fn build_mem0_memory(
-        _config: &crate::config::MemoryConfig,
-    ) -> anyhow::Result<Box<dyn Memory>> {
+    fn build_mem0_memory(_config: &crate::config::MemoryConfig) -> anyhow::Result<Box<dyn Memory>> {
         anyhow::bail!(
             "memory backend 'mem0' requested but this build was compiled without `memory-mem0`; rebuild with `--features memory-mem0`"
         );
