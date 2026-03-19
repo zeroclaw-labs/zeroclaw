@@ -82,6 +82,7 @@ Operational note for container users:
 | `parallel_tools` | `false` | Enable parallel tool execution within a single iteration |
 | `tool_dispatcher` | `auto` | Tool dispatch strategy |
 | `tool_call_dedup_exempt` | `[]` | Tool names exempt from within-turn duplicate-call suppression |
+| `tool_filter_groups` | `[]` | Per-turn MCP tool schema filter groups (see below) |
 
 Notes:
 
@@ -90,6 +91,36 @@ Notes:
 - In CLI, gateway, and channel tool loops, multiple independent tool calls are executed concurrently by default when the pending calls do not require approval gating; result order remains stable.
 - `parallel_tools` applies to the `Agent::turn()` API surface. It does not gate the runtime loop used by CLI, gateway, or channel handlers.
 - `tool_call_dedup_exempt` accepts an array of exact tool names. Tools listed here are allowed to be called multiple times with identical arguments in the same turn, bypassing the dedup check. Example: `tool_call_dedup_exempt = ["browser"]`.
+
+### `tool_filter_groups`
+
+Reduces per-turn token overhead by limiting which MCP tool schemas are sent to the LLM on each turn. Built-in (non-MCP) tools always pass through unchanged.
+
+Each entry is a table with:
+
+| Field | Type | Purpose |
+|---|---|---|
+| `mode` | `"always"` \| `"dynamic"` | `always`: tool is included unconditionally. `dynamic`: tool is included only when the user message contains a keyword. |
+| `tools` | `[string]` | Tool name patterns. Single `*` wildcard supported (prefix/suffix/infix), e.g. `"mcp_vikunja_*"`. |
+| `keywords` | `[string]` | (Dynamic only) Case-insensitive substrings matched against the last user message. |
+
+When `tool_filter_groups` is empty the feature is inactive and all tools pass through (backward-compatible default).
+
+Example:
+
+```toml
+[agent]
+# Vikunja task-management MCP tools are always available.
+[[agent.tool_filter_groups]]
+mode = "always"
+tools = ["mcp_vikunja_*"]
+
+# Browser MCP tools are only included when the user message mentions browsing.
+[[agent.tool_filter_groups]]
+mode = "dynamic"
+tools = ["mcp_browser_*"]
+keywords = ["browse", "navigate", "open url", "screenshot"]
+```
 
 ## `[security.otp]`
 
@@ -152,6 +183,8 @@ Delegate sub-agent configurations. Each key under `[agents]` defines a named sub
 | `agentic` | `false` | Enable multi-turn tool-call loop mode for the sub-agent |
 | `allowed_tools` | `[]` | Tool allowlist for agentic mode |
 | `max_iterations` | `10` | Max tool-call iterations for agentic mode |
+| `timeout_secs` | `120` | Timeout in seconds for non-agentic provider calls (1–3600) |
+| `agentic_timeout_secs` | `300` | Timeout in seconds for agentic sub-agent loops (1–3600) |
 
 Notes:
 
@@ -168,11 +201,13 @@ max_depth = 2
 agentic = true
 allowed_tools = ["web_search", "http_request", "file_read"]
 max_iterations = 8
+agentic_timeout_secs = 600
 
 [agents.coder]
 provider = "ollama"
 model = "qwen2.5-coder:32b"
 temperature = 0.2
+timeout_secs = 60
 ```
 
 ## `[runtime]`

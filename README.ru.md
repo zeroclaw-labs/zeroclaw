@@ -13,7 +13,10 @@
   <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
   <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
   <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
-  <a href="https://www.facebook.com/groups/zeroclaw"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
+  <a href="https://www.facebook.com/groups/zeroclawlabs"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
+  <a href="https://discord.com/invite/wDshRVqRjx"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
+  <a href="https://www.tiktok.com/@zeroclawlabs"><img src="https://img.shields.io/badge/TikTok-%40zeroclawlabs-000000?style=flat&logo=tiktok&logoColor=white" alt="TikTok: @zeroclawlabs" /></a>
+  <a href="https://www.rednote.com/user/profile/69b735e6000000002603927e"><img src="https://img.shields.io/badge/RedNote-Official-FF2442?style=flat" alt="RedNote" /></a>
   <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
 </p>
 
@@ -53,7 +56,7 @@
 </p>
 
 <p align="center">
-  <a href="install.sh">Установка в 1 клик</a> |
+  <a href="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh">Установка в 1 клик</a> |
   <a href="docs/setup-guides/README.md">Быстрый старт</a> |
   <a href="docs/README.ru.md">Хаб документации</a> |
   <a href="docs/SUMMARY.md">TOC docs</a>
@@ -75,6 +78,16 @@
 >
 > Последняя синхронизация: **2026-02-19**.
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.3.1 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| ci | add Termux (aarch64-linux-android) release target |
+
+<!-- END:WHATS_NEW -->
+
 ## 📢 Доска объявлений
 
 Публикуйте здесь важные уведомления (breaking changes, security advisories, окна обслуживания и блокеры релиза).
@@ -82,7 +95,7 @@
 | Дата (UTC) | Уровень | Объявление | Действие |
 |---|---|---|---|
 | 2026-02-19 | _Срочно_ | Мы **не аффилированы** с `openagen/zeroclaw` и `zeroclaw.org`. Домен `zeroclaw.org` сейчас указывает на fork `openagen/zeroclaw`, и этот домен/репозиторий выдают себя за наш официальный сайт и проект. | Не доверяйте информации, бинарникам, сборам средств и «официальным» объявлениям из этих источников. Используйте только [этот репозиторий](https://github.com/zeroclaw-labs/zeroclaw) и наши верифицированные соцсети. |
-| 2026-02-21 | _Важно_ | Наш официальный сайт уже запущен: [zeroclawlabs.ai](https://zeroclawlabs.ai). Спасибо, что дождались запуска. При этом попытки выдавать себя за ZeroClaw продолжаются, поэтому не участвуйте в инвестициях, сборах средств и похожих активностях, если они не подтверждены через наши официальные каналы. | Ориентируйтесь только на [этот репозиторий](https://github.com/zeroclaw-labs/zeroclaw); также следите за [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Telegram (@zeroclawlabs)](https://t.me/zeroclawlabs), [Facebook (группа)](https://www.facebook.com/groups/zeroclaw), [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/) и [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) для официальных обновлений. |
+| 2026-02-21 | _Важно_ | Наш официальный сайт уже запущен: [zeroclawlabs.ai](https://zeroclawlabs.ai). Спасибо, что дождались запуска. При этом попытки выдавать себя за ZeroClaw продолжаются, поэтому не участвуйте в инвестициях, сборах средств и похожих активностях, если они не подтверждены через наши официальные каналы. | Ориентируйтесь только на [этот репозиторий](https://github.com/zeroclaw-labs/zeroclaw); также следите за [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Telegram (@zeroclawlabs)](https://t.me/zeroclawlabs), [Facebook (группа)](https://www.facebook.com/groups/zeroclawlabs), [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/) и [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) для официальных обновлений. |
 | 2026-02-19 | _Важно_ | Anthropic обновил раздел Authentication and Credential Use 2026-02-19. В нем указано, что OAuth authentication (Free/Pro/Max) предназначена только для Claude Code и Claude.ai; использование OAuth-токенов, полученных через Claude Free/Pro/Max, в любых других продуктах, инструментах или сервисах (включая Agent SDK), не допускается и может считаться нарушением Consumer Terms of Service. | Чтобы избежать потерь, временно не используйте Claude Code OAuth-интеграции. Оригинал: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use). |
 
 ## О проекте
@@ -163,7 +176,7 @@ cargo build --release --locked
 cargo install --path . --force --locked
 
 zeroclaw onboard --api-key sk-... --provider openrouter
-zeroclaw onboard --interactive
+zeroclaw onboard
 
 zeroclaw agent -m "Hello, ZeroClaw!"
 
@@ -218,110 +231,26 @@ zeroclaw agent --provider openai-codex --auth-profile openai-codex:work -m "hell
 zeroclaw agent --provider anthropic -m "hello"
 ```
 
-## Архитектура
-
-Каждая подсистема — это **Trait**: меняйте реализации через конфигурацию, без изменения кода.
-
-<p align="center">
-  <img src="docs/assets/architecture.svg" alt="Архитектура ZeroClaw" width="900" />
-</p>
-
-| Подсистема | Trait | Встроенные реализации | Расширение |
-|-----------|-------|---------------------|------------|
-| **AI-модели** | `Provider` | Каталог через `zeroclaw providers` (сейчас 28 встроенных + алиасы, плюс пользовательские endpoint) | `custom:https://your-api.com` (OpenAI-совместимый) или `anthropic-custom:https://your-api.com` |
-| **Каналы** | `Channel` | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, Signal, WhatsApp, Linq, Email, IRC, Lark, DingTalk, QQ, Webhook | Любой messaging API |
-| **Память** | `Memory` | SQLite гибридный поиск, PostgreSQL-бэкенд, Lucid-мост, Markdown-файлы, явный `none`-бэкенд, snapshot/hydrate, опциональный кэш ответов | Любой persistence-бэкенд |
-| **Инструменты** | `Tool` | shell/file/memory, cron/schedule, git, pushover, browser, http_request, screenshot/image_info, composio (opt-in), delegate, аппаратные инструменты | Любая функциональность |
-| **Наблюдаемость** | `Observer` | Noop, Log, Multi | Prometheus, OTel |
-| **Runtime** | `RuntimeAdapter` | Native, Docker (sandbox) | Через adapter; неподдерживаемые kind завершаются с ошибкой |
-| **Безопасность** | `SecurityPolicy` | Gateway pairing, sandbox, allowlist, rate limits, scoping файловой системы, шифрование секретов | — |
-| **Идентификация** | `IdentityConfig` | OpenClaw (markdown), AIEOS v1.1 (JSON) | Любой формат идентификации |
-| **Туннели** | `Tunnel` | None, Cloudflare, Tailscale, ngrok, Custom | Любой tunnel-бинарник |
-| **Heartbeat** | Engine | HEARTBEAT.md — периодические задачи | — |
-| **Навыки** | Loader | TOML-манифесты + SKILL.md-инструкции | Пакеты навыков сообщества |
-| **Интеграции** | Registry | 70+ интеграций в 9 категориях | Плагинная система |
-
-### Поддержка runtime (текущая)
-
-- ✅ Поддерживается сейчас: `runtime.kind = "native"` или `runtime.kind = "docker"`
-- 🚧 Запланировано, но ещё не реализовано: WASM / edge-runtime
-
-При указании неподдерживаемого `runtime.kind` ZeroClaw завершается с явной ошибкой, а не молча откатывается к native.
-
-### Система памяти (полнофункциональный поисковый движок)
-
-Полностью собственная реализация, ноль внешних зависимостей — без Pinecone, Elasticsearch, LangChain:
-
-| Уровень | Реализация |
-|---------|-----------|
-| **Векторная БД** | Embeddings хранятся как BLOB в SQLite, поиск по косинусному сходству |
-| **Поиск по ключевым словам** | Виртуальные таблицы FTS5 со скорингом BM25 |
-| **Гибридное слияние** | Пользовательская взвешенная функция слияния (`vector.rs`) |
-| **Embeddings** | Trait `EmbeddingProvider` — OpenAI, пользовательский URL или noop |
-| **Чанкинг** | Построчный Markdown-чанкер с сохранением заголовков |
-| **Кэширование** | Таблица `embedding_cache` в SQLite с LRU-вытеснением |
-| **Безопасная переиндексация** | Атомарная перестройка FTS5 + повторное встраивание отсутствующих векторов |
-
-Agent автоматически вспоминает, сохраняет и управляет памятью через инструменты.
-
-```toml
-[memory]
-backend = "sqlite"             # "sqlite", "lucid", "postgres", "markdown", "none"
-auto_save = true
-embedding_provider = "none"    # "none", "openai", "custom:https://..."
-vector_weight = 0.7
-keyword_weight = 0.3
-```
-
-## Важные security-дефолты
-
-- Gateway по умолчанию: `127.0.0.1:42617`
-- Pairing обязателен по умолчанию: `require_pairing = true`
-- Публичный bind запрещён по умолчанию: `allow_public_bind = false`
-- Семантика allowlist каналов:
-  - `[]` => deny-by-default
-  - `["*"]` => allow all (используйте осознанно)
-
-## Пример конфигурации
-
-```toml
-api_key = "sk-..."
-default_provider = "openrouter"
-default_model = "anthropic/claude-sonnet-4-6"
-default_temperature = 0.7
-
-[memory]
-backend = "sqlite"
-auto_save = true
-embedding_provider = "none"
-
-[gateway]
-host = "127.0.0.1"
-port = 42617
-require_pairing = true
-allow_public_bind = false
-```
-
-## Навигация по документации
-
-- Хаб документации (English): [`docs/README.md`](docs/README.md)
-- Единый TOC docs: [`docs/SUMMARY.md`](docs/SUMMARY.md)
-- Хаб документации (Русский): [`docs/README.ru.md`](docs/README.ru.md)
-- Справочник команд: [`docs/reference/cli/commands-reference.md`](docs/reference/cli/commands-reference.md)
-- Справочник конфигурации: [`docs/reference/api/config-reference.md`](docs/reference/api/config-reference.md)
-- Справочник providers: [`docs/reference/api/providers-reference.md`](docs/reference/api/providers-reference.md)
-- Справочник channels: [`docs/reference/api/channels-reference.md`](docs/reference/api/channels-reference.md)
-- Операционный runbook: [`docs/ops/operations-runbook.md`](docs/ops/operations-runbook.md)
-- Устранение неполадок: [`docs/ops/troubleshooting.md`](docs/ops/troubleshooting.md)
-- Инвентарь и классификация docs: [`docs/maintainers/docs-inventory.md`](docs/maintainers/docs-inventory.md)
-- Снимок triage проекта: [`docs/maintainers/project-triage-snapshot-2026-02-18.md`](docs/maintainers/project-triage-snapshot-2026-02-18.md)
-
 ## Вклад и лицензия
 
 - Contribution guide: [`CONTRIBUTING.md`](CONTRIBUTING.md)
 - PR workflow: [`docs/contributing/pr-workflow.md`](docs/contributing/pr-workflow.md)
 - Reviewer playbook: [`docs/contributing/reviewer-playbook.md`](docs/contributing/reviewer-playbook.md)
 - License: MIT or Apache 2.0 ([`LICENSE-MIT`](LICENSE-MIT), [`LICENSE-APACHE`](LICENSE-APACHE), [`NOTICE`](NOTICE))
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.3.1)
+
+3 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+- **argenis de la rosa**
+- **Claude Opus 4.6**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ---
 

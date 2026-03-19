@@ -412,8 +412,8 @@ impl Tool for ProxyConfigTool {
                 }
 
                 match action.as_str() {
-                    "set" => self.handle_set(&args).await,
-                    "disable" => self.handle_disable(&args).await,
+                    "set" => Box::pin(self.handle_set(&args)).await,
+                    "disable" => Box::pin(self.handle_disable(&args)).await,
                     "apply_env" => self.handle_apply_env(),
                     "clear_env" => self.handle_clear_env(),
                     _ => unreachable!("handled above"),
@@ -462,7 +462,7 @@ mod tests {
     #[tokio::test]
     async fn list_services_action_returns_known_keys() {
         let tmp = TempDir::new().unwrap();
-        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+        let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let result = tool
             .execute(json!({"action": "list_services"}))
@@ -476,7 +476,7 @@ mod tests {
     #[tokio::test]
     async fn set_scope_services_requires_services_entries() {
         let tmp = TempDir::new().unwrap();
-        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+        let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let result = tool
             .execute(json!({
@@ -499,7 +499,7 @@ mod tests {
     #[tokio::test]
     async fn set_and_get_round_trip_proxy_scope() {
         let tmp = TempDir::new().unwrap();
-        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+        let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let set_result = tool
             .execute(json!({
@@ -521,7 +521,7 @@ mod tests {
     #[tokio::test]
     async fn set_null_proxy_url_clears_existing_value() {
         let tmp = TempDir::new().unwrap();
-        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+        let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let set_result = tool
             .execute(json!({

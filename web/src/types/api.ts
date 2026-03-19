@@ -42,6 +42,16 @@ export interface CronJob {
   enabled: boolean;
 }
 
+export interface CronRun {
+  id: number;
+  job_id: string;
+  started_at: string;
+  finished_at: string;
+  status: string;
+  output: string | null;
+  duration_ms: number | null;
+}
+
 export interface Integration {
   name: string;
   description: string;

@@ -179,7 +179,9 @@ fn format_attachment_content(
     local_path: &Path,
 ) -> String {
     match kind {
-        IncomingAttachmentKind::Photo if is_image_extension(local_path) => {
+        IncomingAttachmentKind::Photo | IncomingAttachmentKind::Document
+            if is_image_extension(local_path) =>
+        {
             format!("[IMAGE:{}]", local_path.display())
         }
         _ => {
@@ -246,6 +248,23 @@ fn strip_tool_call_tags(message: &str) -> String {
     super::strip_tool_call_tags(message)
 }
 
+fn find_matching_close(s: &str) -> Option<usize> {
+    let mut depth = 1usize;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) {
     let mut cleaned = String::with_capacity(message.len());
     let mut attachments = Vec::new();
@@ -260,12 +279,12 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
         let open = cursor + open_rel;
         cleaned.push_str(&message[cursor..open]);
 
-        let Some(close_rel) = message[open..].find(']') else {
+        let Some(close_rel) = find_matching_close(&message[open + 1..]) else {
             cleaned.push_str(&message[open..]);
             break;
         };
 
-        let close = open + close_rel;
+        let close = open + 1 + close_rel;
         let marker = &message[open + 1..close];
 
         let parsed = marker.split_once(':').and_then(|(kind, target)| {
@@ -313,6 +332,14 @@ pub struct TelegramChannel {
     transcription: Option<crate::config::TranscriptionConfig>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
+    ack_reactions: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditMessageResult {
+    Success,
+    NotModified,
+    Failed(reqwest::StatusCode),
 }
 
 impl TelegramChannel {
@@ -344,7 +371,14 @@ impl TelegramChannel {
             transcription: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
+            ack_reactions: true,
         }
+    }
+
+    /// Configure whether Telegram-native acknowledgement reactions are sent.
+    pub fn with_ack_reactions(mut self, enabled: bool) -> Self {
+        self.ack_reactions = enabled;
+        self
     }
 
     /// Configure workspace directory for saving downloaded attachments.
@@ -519,6 +553,20 @@ impl TelegramChannel {
 
     fn api_url(&self, method: &str) -> String {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
+    }
+
+    async fn classify_edit_message_response(resp: reqwest::Response) -> EditMessageResult {
+        if resp.status().is_success() {
+            return EditMessageResult::Success;
+        }
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if body.contains("message is not modified") {
+            return EditMessageResult::NotModified;
+        }
+
+        EditMessageResult::Failed(status)
     }
 
     async fn fetch_bot_username(&self) -> anyhow::Result<String> {
@@ -711,7 +759,7 @@ impl TelegramChannel {
 
                         if let Some(identity) = bind_identity {
                             self.add_allowed_identity_runtime(&identity);
-                            match self.persist_allowed_identity(&identity).await {
+                            match Box::pin(self.persist_allowed_identity(&identity)).await {
                                 Ok(()) => {
                                     let _ = self
                                         .send(&SendMessage::new(
@@ -2355,11 +2403,17 @@ impl Channel for TelegramChannel {
             .send()
             .await?;
 
-        if resp.status().is_success() {
-            return Ok(());
+        match Self::classify_edit_message_response(resp).await {
+            EditMessageResult::Success | EditMessageResult::NotModified => return Ok(()),
+            EditMessageResult::Failed(status) => {
+                tracing::debug!(
+                    status = ?status,
+                    "Telegram finalize_draft HTML edit failed; retrying without parse_mode"
+                );
+            }
         }
 
-        // Markdown failed — retry without parse_mode
+        // HTML failed — retry without parse_mode
         let plain_body = serde_json::json!({
             "chat_id": chat_id,
             "message_id": id,
@@ -2373,14 +2427,45 @@ impl Channel for TelegramChannel {
             .send()
             .await?;
 
-        if resp.status().is_success() {
-            return Ok(());
+        match Self::classify_edit_message_response(resp).await {
+            EditMessageResult::Success | EditMessageResult::NotModified => return Ok(()),
+            EditMessageResult::Failed(status) => {
+                tracing::warn!(
+                    status = ?status,
+                    "Telegram finalize_draft plain edit failed; attempting delete+send fallback"
+                );
+            }
         }
 
-        // Edit failed entirely — fall back to new message
-        tracing::warn!("Telegram finalize_draft edit failed; falling back to sendMessage");
-        self.send_text_chunks(text, &chat_id, thread_id.as_deref())
-            .await
+        let delete_resp = self
+            .client
+            .post(self.api_url("deleteMessage"))
+            .json(&serde_json::json!({
+                "chat_id": chat_id,
+                "message_id": id,
+            }))
+            .send()
+            .await;
+
+        match delete_resp {
+            Ok(resp) if resp.status().is_success() => {
+                self.send_text_chunks(text, &chat_id, thread_id.as_deref())
+                    .await
+            }
+            Ok(resp) => {
+                tracing::warn!(
+                    status = ?resp.status(),
+                    "Telegram finalize_draft delete failed; skipping sendMessage to avoid duplicate"
+                );
+                Ok(())
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Telegram finalize_draft delete request failed: {err}; skipping sendMessage to avoid duplicate"
+                );
+                Ok(())
+            }
+        }
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
@@ -2608,17 +2693,19 @@ Ensure only one `zeroclaw` process is using this bot token."
                     } else if let Some(m) = self.try_parse_attachment_message(update).await {
                         m
                     } else {
-                        self.handle_unauthorized_message(update).await;
+                        Box::pin(self.handle_unauthorized_message(update)).await;
                         continue;
                     };
 
-                    if let Some((reaction_chat_id, reaction_message_id)) =
-                        Self::extract_update_message_target(update)
-                    {
-                        self.try_add_ack_reaction_nonblocking(
-                            reaction_chat_id,
-                            reaction_message_id,
-                        );
+                    if self.ack_reactions {
+                        if let Some((reaction_chat_id, reaction_message_id)) =
+                            Self::extract_update_message_target(update)
+                        {
+                            self.try_add_ack_reaction_nonblocking(
+                                reaction_chat_id,
+                                reaction_message_id,
+                            );
+                        }
                     }
 
                     // Send "typing" indicator immediately when we receive a message
@@ -4603,5 +4690,25 @@ mod tests {
         // The combination of marker_count > 0 && !supports_vision() means
         // the agent loop will return ProviderCapabilityError before calling
         // the provider, and the channel will send "⚠️ Error: ..." to the user.
+    }
+
+    #[test]
+    fn ack_reactions_defaults_to_true() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        assert!(ch.ack_reactions);
+    }
+
+    #[test]
+    fn with_ack_reactions_false_disables_reactions() {
+        let ch =
+            TelegramChannel::new("token".into(), vec!["*".into()], false).with_ack_reactions(false);
+        assert!(!ch.ack_reactions);
+    }
+
+    #[test]
+    fn with_ack_reactions_true_keeps_reactions() {
+        let ch =
+            TelegramChannel::new("token".into(), vec!["*".into()], false).with_ack_reactions(true);
+        assert!(ch.ack_reactions);
     }
 }

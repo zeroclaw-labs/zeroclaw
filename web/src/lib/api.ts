@@ -2,6 +2,7 @@ import type {
   StatusResponse,
   ToolSpec,
   CronJob,
+  CronRun,
   Integration,
   DiagResult,
   MemoryEntry,
@@ -92,6 +93,14 @@ export async function pair(code: string): Promise<{ token: string }> {
   return data;
 }
 
+export async function getAdminPairCode(): Promise<{ pairing_code: string | null; pairing_required: boolean }> {
+  const response = await fetch('/admin/paircode');
+  if (!response.ok) {
+    throw new Error(`Failed to fetch pairing code (${response.status})`);
+  }
+  return response.json() as Promise<{ pairing_code: string | null; pairing_required: boolean }>;
+}
+
 // ---------------------------------------------------------------------------
 // Public health (no auth required)
 // ---------------------------------------------------------------------------
@@ -172,6 +181,16 @@ export function deleteCronJob(id: string): Promise<void> {
   return apiFetch<void>(`/api/cron/${encodeURIComponent(id)}`, {
     method: 'DELETE',
   });
+}
+
+export function getCronRuns(
+  jobId: string,
+  limit: number = 20,
+): Promise<CronRun[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  return apiFetch<CronRun[] | { runs: CronRun[] }>(
+    `/api/cron/${encodeURIComponent(jobId)}/runs?${params}`,
+  ).then((data) => unwrapField(data, 'runs'));
 }
 
 // ---------------------------------------------------------------------------

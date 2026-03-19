@@ -17,7 +17,10 @@
   <a href="https://zeroclawlabs.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
   <a href="https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search"><img src="https://img.shields.io/badge/Xiaohongshu-Official-FF2442?style=flat" alt="Xiaohongshu: Official" /></a>
   <a href="https://t.me/zeroclawlabs"><img src="https://img.shields.io/badge/Telegram-%40zeroclawlabs-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @zeroclawlabs" /></a>
-  <a href="https://www.facebook.com/groups/zeroclaw"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
+  <a href="https://www.facebook.com/groups/zeroclawlabs"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
+  <a href="https://discord.com/invite/wDshRVqRjx"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
+  <a href="https://www.tiktok.com/@zeroclawlabs"><img src="https://img.shields.io/badge/TikTok-%40zeroclawlabs-000000?style=flat&logo=tiktok&logoColor=white" alt="TikTok: @zeroclawlabs" /></a>
+  <a href="https://www.rednote.com/user/profile/69b735e6000000002603927e"><img src="https://img.shields.io/badge/RedNote-Official-FF2442?style=flat" alt="RedNote" /></a>
   <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
 </p>
 <p align="center">
@@ -86,6 +89,16 @@ Postaveno studenty a členy komunit Harvard, MIT a Sundai.Club.
 
 <p align="center"><code>Architektura založená na traitech · bezpečný runtime defaultně · vyměnitelný poskytovatel/kanál/nástroj · vše je připojitelné</code></p>
 
+<!-- BEGIN:WHATS_NEW -->
+
+### 🚀 What's New in v0.3.1 (March 2026)
+
+| Area | Highlights |
+|---|---|
+| ci | add Termux (aarch64-linux-android) release target |
+
+<!-- END:WHATS_NEW -->
+
 ### 📢 Oznámení
 
 Použijte tuto tabulku pro důležitá oznámení (změny kompatibility, bezpečnostní upozornění, servisní okna a blokování verzí).
@@ -93,7 +106,7 @@ Použijte tuto tabulku pro důležitá oznámení (změny kompatibility, bezpeč
 | Datum (UTC) | Úroveň      | Oznámení                                                                                                                                                                                                                                                                                                                                                                                                              | Akce                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ---------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 2026-02-19 | _Kritické_  | **Nejsme propojeni** s `openagen/zeroclaw` nebo `zeroclaw.org`. Doména `zeroclaw.org` aktuálně směřuje na fork `openagen/zeroclaw`, a tato doména/repoziťář se vydává za náš oficiální web/projekt.                                                                                                                                                                                 | Nevěřte informacím, binárním souborům, fundraisingu nebo oznámením z těchto zdrojů. Používejte pouze [tento repoziťář](https://github.com/zeroclaw-labs/zeroclaw) a naše ověřené sociální účty.                                                                                                                                                                                                                                                                                                                                                          |
-| 2026-02-21 | _Důležité_ | Náš oficiální web je nyní online: [zeroclawlabs.ai](https://zeroclawlabs.ai). Děkujeme za trpělivost během čekání. Stále detekujeme pokusy o vydávání se: neúčastněte žádné investiční/fundraisingové aktivity ve jménu ZeroClaw pokud není publikována přes naše oficiální kanály.                                                                                                                   | Používejte [tento repoziťář](https://github.com/zeroclaw-labs/zeroclaw) jako jediný zdroj pravdy. Sledujte [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Telegram (@zeroclawlabs)](https://t.me/zeroclawlabs), [Facebook (skupina)](https://www.facebook.com/groups/zeroclaw), [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/), a [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) pro oficiální aktualizace. |
+| 2026-02-21 | _Důležité_ | Náš oficiální web je nyní online: [zeroclawlabs.ai](https://zeroclawlabs.ai). Děkujeme za trpělivost během čekání. Stále detekujeme pokusy o vydávání se: neúčastněte žádné investiční/fundraisingové aktivity ve jménu ZeroClaw pokud není publikována přes naše oficiální kanály.                                                                                                                   | Používejte [tento repoziťář](https://github.com/zeroclaw-labs/zeroclaw) jako jediný zdroj pravdy. Sledujte [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Telegram (@zeroclawlabs)](https://t.me/zeroclawlabs), [Facebook (skupina)](https://www.facebook.com/groups/zeroclawlabs), [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/), a [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) pro oficiální aktualizace. |
 | 2026-02-19 | _Důležité_ | Anthropic aktualizoval podmínky použití autentizace a přihlašovacích údajů dne 2026-02-19. OAuth autentizace (Free, Pro, Max) je výhradně pro Claude Code a Claude.ai; použití Claude Free/Pro/Max OAuth tokenů v jakémkoliv jiném produktu, nástroji nebo službě (včetně Agent SDK) není povoleno a může porušit Podmínky použití spotřebitele. | Prosím dočasně se vyhněte Claude Code OAuth integracím pro předcházení potenciálním ztrátám. Původní klauzule: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).                                                                                                                                                                                                                                                                                                                      |
 
 ### ✨ Funkce
@@ -363,443 +376,6 @@ zeroclaw version             # Zobrazuje verzi a build informace
 
 Viz [Příkazová reference](docs/commands-reference.md) pro kompletní možnosti a příklady.
 
-## Architektura
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Kanály (trait)                           │
-│  Telegram │ Matrix │ Slack │ Discord │ Web │ CLI │ Custom       │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Agent Orchestrátor                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │   Směrování  │  │   Kontext    │  │  Provedení   │          │
-│  │   Zpráva     │  │   Paměť      │  │   Nástroj    │          │
-│  └──────────────┘  └──────────────┘  └──────────────┘          │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │
-          ┌───────────────┼───────────────┐
-          ▼               ▼               ▼
-┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│  Poskytovatel│  │   Paměť      │  │  Nástroje    │
-│   (trait)    │  │   (trait)    │  │   (trait)    │
-├──────────────┤  ├──────────────┤  ├──────────────┤
-│  Anthropic   │  │   Markdown   │  │  Filesystem  │
-│   OpenAI     │  │    SQLite    │  │     Bash     │
-│   Gemini     │  │     None     │  │   Web Fetch  │
-│   Ollama     │  │    Custom    │  │   Custom     │
-│   Custom     │  └──────────────┘  └──────────────┘
-└──────────────┘
-          │
-          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Runtime (trait)                               │
-│                  Native │ Docker                                │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**Klíčové principy:**
-
-- Vše je **trait** — poskytovatelé, kanály, nástroje, paměť, tunely
-- Kanály volají orchestrátor; orchestrátor volá poskytovatele + nástroje
-- Paměťový systém spravuje konverzační kontext (markdown, SQLite, nebo žádný)
-- Runtime abstrahuje provádění kódu (nativní nebo Docker)
-- Žádné vendor lock-in — vyměňujte Anthropic ↔ OpenAI ↔ Gemini ↔ Ollama beze změn kódu
-
-Viz [dokumentace architektury](docs/architecture.svg) pro detailní diagramy a detaily implementace.
-
-## Příklady
-
-### Telegram Bot
-
-```toml
-[channels.telegram]
-enabled = true
-bot_token = "123456:ABC-DEF..."
-allowed_users = [987654321]  # Vaše Telegram user ID
-```
-
-Spusťte daemon + agent, pak pošlete zprávu vašemu botovi na Telegram:
-
-```
-/start
-Ahoj! Mohl bys mi pomoci napsat Python skript?
-```
-
-Bot odpoví AI-generovaným kódem, provede nástroje pokud požadováno a udržuje konverzační kontext.
-
-### Matrix (end-to-end šifrování)
-
-```toml
-[channels.matrix]
-enabled = true
-homeserver_url = "https://matrix.org"
-username = "@zeroclaw:matrix.org"
-password = "..."
-device_name = "zeroclaw-prod"
-e2ee_enabled = true
-```
-
-Pozvěte `@zeroclaw:matrix.org` do šifrované místnosti a bot odpoví s plným šifrováním. Viz [Matrix E2EE Guide](docs/matrix-e2ee-guide.md) pro nastavení ověření zařízení.
-
-### Multi-Poskytovatel
-
-```toml
-[providers.anthropic]
-enabled = true
-api_key = "sk-ant-..."
-model = "claude-sonnet-4-20250514"
-
-[providers.openai]
-enabled = true
-api_key = "sk-..."
-model = "gpt-4o"
-
-[orchestrator]
-default_provider = "anthropic"
-fallback_providers = ["openai"]  # Failover při chybě poskytovatele
-```
-
-Pokud Anthropic selže nebo má rate-limit, orchestrátor automaticky přepne na OpenAI.
-
-### Vlastní Paměť
-
-```toml
-[memory]
-kind = "sqlite"
-path = "~/.zeroclaw/workspace/memory/conversations.db"
-retention_days = 90  # Automatické čištění po 90 dnech
-```
-
-Nebo použijte Markdown pro lidsky čitelné ukládání:
-
-```toml
-[memory]
-kind = "markdown"
-path = "~/.zeroclaw/workspace/memory/"
-```
-
-Viz [Konfigurační reference](docs/config-reference.md#memory) pro všechny možnosti paměti.
-
-## Podpora Poskytovatelů
-
-| Poskytovatel       | Stav      | API Klíč             | Příklad Modelů                                      |
-| ----------------- | ----------- | ------------------- | ---------------------------------------------------- |
-| **Anthropic**     | ✅ Stabilní   | `ANTHROPIC_API_KEY` | `claude-sonnet-4-20250514`, `claude-opus-4-20250514` |
-| **OpenAI**        | ✅ Stabilní   | `OPENAI_API_KEY`    | `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini`             |
-| **Google Gemini** | ✅ Stabilní   | `GOOGLE_API_KEY`    | `gemini-2.0-flash-exp`, `gemini-exp-1206`            |
-| **Ollama**        | ✅ Stabilní   | N/A (lokální)         | `llama3.3`, `qwen2.5`, `phi4`                        |
-| **Cerebras**      | ✅ Stabilní   | `CEREBRAS_API_KEY`  | `llama-3.3-70b`                                      |
-| **Groq**          | ✅ Stabilní   | `GROQ_API_KEY`      | `llama-3.3-70b-versatile`                            |
-| **Mistral**       | 🚧 Plánováno | `MISTRAL_API_KEY`   | TBD                                                  |
-| **Cohere**        | 🚧 Plánováno | `COHERE_API_KEY`    | TBD                                                  |
-
-### Vlastní Endpointy
-
-ZeroClaw podporuje OpenAI-kompatibilní endpointy:
-
-```toml
-[providers.custom]
-enabled = true
-api_key = "..."
-base_url = "https://api.your-llm-provider.com/v1"
-model = "your-model-name"
-```
-
-Příklad: použijte [LiteLLM](https://github.com/BerriAI/litellm) jako proxy pro přístup k jakémukoli LLM přes OpenAI rozhraní.
-
-Viz [Poskytovatel reference](docs/providers-reference.md) pro kompletní detaily konfigurace.
-
-## Podpora Kanálů
-
-| Kanál        | Stav      | Autentizace         | Poznámky                                                     |
-| ------------ | ----------- | ------------------------ | --------------------------------------------------------- |
-| **Telegram** | ✅ Stabilní   | Bot Token                | Plná podpora včetně souborů, obrázků, inline tlačítek |
-| **Matrix**   | ✅ Stabilní   | Heslo nebo Token    | E2EE podpora s ověřením zařízení              |
-| **Slack**    | 🚧 Plánováno | OAuth nebo Bot Token       | Vyžaduje workspace přístup                                    |
-| **Discord**  | 🚧 Plánováno | Bot Token                | Vyžaduje guild oprávnění                                |
-| **WhatsApp** | 🚧 Plánováno | Twilio nebo oficiální API | Vyžaduje business účet                                    |
-| **CLI**      | ✅ Stabilní   | Žádné                    | Přímé konverzační rozhraní                       |
-| **Web**      | 🚧 Plánováno | API Klíč nebo OAuth         | Prohlížečové chat rozhraní                        |
-
-Viz [Kanálová reference](docs/channels-reference.md) pro kompletní instrukce konfigurace.
-
-## Podpora Nástrojů
-
-ZeroClaw poskytuje vestavěné nástroje pro provádění kódu, přístup k souborovému systému a web retrieval:
-
-| Nástroj                | Popis                 | Vyžadovaný Runtime                |
-| -------------------- | --------------------------- | ----------------------------- |
-| **bash**             | Provádí shell příkazy | Nativní nebo Docker              |
-| **python**           | Provádí Python skripty  | Python 3.8+ (nativní) nebo Docker |
-| **javascript**       | Provádí Node.js kód     | Node.js 18+ (nativní) nebo Docker |
-| **filesystem_read**  | Čte soubory            | Nativní nebo Docker              |
-| **filesystem_write** | Zapisuje soubory          | Nativní nebo Docker              |
-| **web_fetch**        | Získává web obsah     | Nativní nebo Docker              |
-
-### Bezpečnost Provedení
-
-- **Nativní Runtime** — běží jako uživatelský proces daemon, plný přístup k souborovému systému
-- **Docker Runtime** — plná kontejnerová izolace, oddělené souborové systémy a sítě
-
-Nakonfigurujte politiku provedení v `config.toml`:
-
-```toml
-[runtime]
-kind = "docker"
-allowed_tools = ["bash", "python", "filesystem_read"]  # Explicitní allowlist
-```
-
-Viz [Konfigurační reference](docs/config-reference.md#runtime) pro kompletní možnosti bezpečnosti.
-
-## Nasazení
-
-### Lokální Nasazení (Vývoj)
-
-```bash
-zeroclaw daemon start
-zeroclaw agent start
-```
-
-### Serverové Nasazení (Produkce)
-
-Použijte systemd pro správu daemon a agent jako služby:
-
-```bash
-# Nainstalujte binary
-cargo install --path . --locked
-
-# Nakonfigurujte workspace
-zeroclaw init
-
-# Vytvořte systemd servisní soubory
-sudo cp deployment/systemd/zeroclaw-daemon.service /etc/systemd/system/
-sudo cp deployment/systemd/zeroclaw-agent.service /etc/systemd/system/
-
-# Povolte a spusťte služby
-sudo systemctl enable zeroclaw-daemon zeroclaw-agent
-sudo systemctl start zeroclaw-daemon zeroclaw-agent
-
-# Ověřte stav
-sudo systemctl status zeroclaw-daemon
-sudo systemctl status zeroclaw-agent
-```
-
-Viz [Průvodce síťovým nasazením](docs/network-deployment.md) pro kompletní instrukce produkčního nasazení.
-
-### Docker
-
-```bash
-# Sestavte image
-docker build -t zeroclaw:latest .
-
-# Spusťte kontejner
-docker run -d \
-  --name zeroclaw \
-  -v ~/.zeroclaw/workspace:/workspace \
-  -e ANTHROPIC_API_KEY=sk-ant-... \
-  zeroclaw:latest
-```
-
-Viz [`Dockerfile`](Dockerfile) pro detaily sestavení a konfigurační možnosti.
-
-### Edge Hardware
-
-ZeroClaw je navržen pro běh na nízko-příkonovém hardwaru:
-
-- **Raspberry Pi Zero 2 W** — ~512 MB RAM, jedno ARMv8 jádro, < $5 hardwarové náklady
-- **Raspberry Pi 4/5** — 1 GB+ RAM, vícejádrový, ideální pro souběžné úlohy
-- **Orange Pi Zero 2** — ~512 MB RAM, čtyřjádrový ARMv8, ultra-nízké náklady
-- **x86 SBCs (Intel N100)** — 4-8 GB RAM, rychlé buildy, nativní Docker podpora
-
-Viz [Hardware Guide](docs/hardware/README.md) pro instrukce nastavení specifické pro zařízení.
-
-## Tunneling (Veřejná Expozice)
-
-Exponujte svůj lokální ZeroClaw daemon do veřejné sítě přes bezpečné tunely:
-
-```bash
-zeroclaw tunnel start --provider cloudflare
-```
-
-Podporovaní tunnel poskytovatelé:
-
-- **Cloudflare Tunnel** — bezplatný HTTPS, bez expozice portů, multi-doména podpora
-- **Ngrok** — rychlé nastavení, vlastní domény (placený plán)
-- **Tailscale** — soukromá mesh síť, bez veřejného portu
-
-Viz [Konfigurační reference](docs/config-reference.md#tunnel) pro kompletní konfigurační možnosti.
-
-## Bezpečnost
-
-ZeroClaw implementuje více vrstev bezpečnosti:
-
-### Párování
-
-Daemon generuje párovací tajemství při prvním spuštění uložené v `~/.zeroclaw/workspace/.pairing`. Klienti (agent, CLI) musí předložit toto tajemství pro připojení.
-
-```bash
-zeroclaw pairing rotate  # Generuje nové tajemství a zneplatňuje staré
-```
-
-### Sandboxing
-
-- **Docker Runtime** — plná kontejnerová izolace s oddělenými souborovými systémy a sítěmi
-- **Nativní Runtime** — běží jako uživatelský proces, scoped na workspace defaultně
-
-### Allowlisty
-
-Kanály mohou omezit přístup podle user ID:
-
-```toml
-[channels.telegram]
-enabled = true
-allowed_users = [123456789, 987654321]  # Explicitní allowlist
-```
-
-### Šifrování
-
-- **Matrix E2EE** — plné end-to-end šifrování s ověřením zařízení
-- **TLS Transport** — veškerý API a tunnel provoz používá HTTPS/TLS
-
-Viz [Bezpečnostní dokumentace](docs/security/README.md) pro kompletní politiky a praktiky.
-
-## Pozorovatelnost
-
-ZeroClaw loguje do `~/.zeroclaw/workspace/logs/` defaultně. Logy jsou ukládány podle komponenty:
-
-```
-~/.zeroclaw/workspace/logs/
-├── daemon.log           # Daemon logy (startup, API požadavky, chyby)
-├── agent.log            # Agent logy (směrování zpráv, provedení nástrojů)
-├── telegram.log         # Kanál-specifické logy (pokud povoleno)
-└── matrix.log           # Kanál-specifické logy (pokud povoleno)
-```
-
-### Konfigurace Logování
-
-```toml
-[logging]
-level = "info"                           # debug, info, warn, error
-path = "~/.zeroclaw/workspace/logs/"
-rotation = "daily"                       # daily, hourly, size
-max_size_mb = 100                        # Pro rotaci založenou na velikosti
-retention_days = 30                      # Automatické čištění po N dnech
-```
-
-Viz [Konfigurační reference](docs/config-reference.md#logging) pro všechny možnosti logování.
-
-### Metriky (Plánováno)
-
-Podpora Prometheus metrik pro produkční monitoring již brzy. Sledování v [#234](https://github.com/zeroclaw-labs/zeroclaw/issues/234).
-
-## Dovednosti
-
-ZeroClaw podporuje vlastní dovednosti — opakovaně použitelné moduly rozšiřující schopnosti systému.
-
-### Definice Dovednosti
-
-Dovednosti jsou uloženy v `~/.zeroclaw/workspace/skills/<skill-name>/` s touto strukturou:
-
-```
-skills/
-└── my-skill/
-    ├── skill.toml       # Metadata dovednosti (název, popis, závislosti)
-    ├── prompt.md        # Systémový prompt pro AI
-    └── tools/           # Volitelné vlastní nástroje
-        └── my_tool.py
-```
-
-### Příklad Dovednosti
-
-```toml
-# skills/web-research/skill.toml
-[skill]
-name = "web-research"
-description = "Hledá na webu a shrnuje výsledky"
-version = "1.0.0"
-
-[dependencies]
-tools = ["web_fetch", "bash"]
-```
-
-```markdown
-<!-- skills/web-research/prompt.md -->
-
-Jste výzkumný asistent. Když požádáte o výzkum něčeho:
-
-1. Použijte web_fetch pro získání obsahu
-2. Shrňte výsledky v snadno čitelném formátu
-3. Citujte zdroje s URL
-```
-
-### Použití Dovedností
-
-Dovednosti jsou automaticky načítány při startu agenta. Odkazujte na ně jménem v konverzacích:
-
-```
-Uživatel: Použij dovednost web-research k nalezení nejnovějších AI zpráv
-Bot: [načte dovednost web-research, provede web_fetch, shrne výsledky]
-```
-
-Viz sekce [Dovednosti](#dovednosti) pro kompletní instrukce tvorby dovedností.
-
-## Open Skills
-
-ZeroClaw podporuje [Open Skills](https://github.com/openagents-com/open-skills) — modulární a poskytovatel-agnostický systém pro rozšíření schopností AI agentů.
-
-### Povolit Open Skills
-
-```toml
-[skills]
-open_skills_enabled = true
-# open_skills_dir = "/path/to/open-skills"  # volitelné
-```
-
-Můžete také přepsat za běhu pomocí `ZEROCLAW_OPEN_SKILLS_ENABLED` a `ZEROCLAW_OPEN_SKILLS_DIR`.
-
-## Vývoj
-
-```bash
-cargo build              # Dev build
-cargo build --release    # Release build (codegen-units=1, funguje na všech zařízeních včetně Raspberry Pi)
-cargo build --profile release-fast    # Rychlejší build (codegen-units=8, vyžaduje 16 GB+ RAM)
-cargo test               # Spustí plnou testovací sadu
-cargo clippy --locked --all-targets -- -D clippy::correctness
-cargo fmt                # Formátování
-
-# Spusťte SQLite vs Markdown srovnávací benchmark
-cargo test --test memory_comparison -- --nocapture
-```
-
-### Pre-push hook
-
-Git hook spouští `cargo fmt --check`, `cargo clippy -- -D warnings`, a `cargo test` před každým push. Povolte jej jednou:
-
-```bash
-git config core.hooksPath .githooks
-```
-
-### Řešení problémů s Buildem (OpenSSL chyby na Linuxu)
-
-Pokud narazíte na `openssl-sys` build chybu, synchronizujte závislosti a znovu zkompilujte s lockfile repoziťáře:
-
-```bash
-git pull
-cargo build --release --locked
-cargo install --path . --force --locked
-```
-
-ZeroClaw je nakonfigurován pro použití `rustls` pro HTTP/TLS závislosti; `--locked` udržuje transitivní graf deterministický v čistých prostředích.
-
-Pro přeskočení hooku když potřebujete rychlý push během vývoje:
-
-```bash
-git push --no-verify
-```
-
 ## Spolupráce & Docs
 
 Začněte s dokumentačním centrem pro task-based mapu:
@@ -849,6 +425,20 @@ Upřímné poděkování komunitám a institucím které inspirují a živí tut
 - **Svět a Dál** 🌍✨ — každému přispěvateli, snílkovi, a staviteli tam venku který dělá z open source sílu pro dobro. To je pro tebe.
 
 Stavíme v open source protože nejlepší nápady přicházejí odkudkoliv. Pokud toto čtete, jste součástí toho. Vítejte. 🦀❤️
+
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+
+### 🌟 Recent Contributors (v0.3.1)
+
+3 contributors shipped features, fixes, and improvements in this release cycle:
+
+- **Argenis**
+- **argenis de la rosa**
+- **Claude Opus 4.6**
+
+Thank you to everyone who opened issues, reviewed PRs, translated docs, and helped test. Every contribution matters. 🦀
+
+<!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ Oficiální Repoziťář a Varování před Vydáváním se
 

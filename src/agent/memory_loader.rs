@@ -4,8 +4,12 @@ use std::fmt::Write;
 
 #[async_trait]
 pub trait MemoryLoader: Send + Sync {
-    async fn load_context(&self, memory: &dyn Memory, user_message: &str)
-        -> anyhow::Result<String>;
+    async fn load_context(
+        &self,
+        memory: &dyn Memory,
+        user_message: &str,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<String>;
 }
 
 pub struct DefaultMemoryLoader {
@@ -37,8 +41,9 @@ impl MemoryLoader for DefaultMemoryLoader {
         &self,
         memory: &dyn Memory,
         user_message: &str,
+        session_id: Option<&str>,
     ) -> anyhow::Result<String> {
-        let entries = memory.recall(user_message, self.limit, None).await?;
+        let entries = memory.recall(user_message, self.limit, session_id).await?;
         if entries.is_empty() {
             return Ok(String::new());
         }
@@ -46,6 +51,9 @@ impl MemoryLoader for DefaultMemoryLoader {
         let mut context = String::from("[Memory context]\n");
         for entry in entries {
             if memory::is_assistant_autosave_key(&entry.key) {
+                continue;
+            }
+            if memory::should_skip_autosave_content(&entry.content) {
                 continue;
             }
             if let Some(score) = entry.score {
@@ -191,7 +199,10 @@ mod tests {
     #[tokio::test]
     async fn default_loader_formats_context() {
         let loader = DefaultMemoryLoader::default();
-        let context = loader.load_context(&MockMemory, "hello").await.unwrap();
+        let context = loader
+            .load_context(&MockMemory, "hello", None)
+            .await
+            .unwrap();
         assert!(context.contains("[Memory context]"));
         assert!(context.contains("- k: v"));
     }
@@ -222,7 +233,10 @@ mod tests {
             ]),
         };
 
-        let context = loader.load_context(&memory, "answer style").await.unwrap();
+        let context = loader
+            .load_context(&memory, "answer style", None)
+            .await
+            .unwrap();
         assert!(context.contains("user_fact"));
         assert!(!context.contains("assistant_resp_legacy"));
         assert!(!context.contains("fabricated detail"));

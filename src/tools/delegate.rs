@@ -6,6 +6,7 @@ use crate::providers::{self, ChatMessage, Provider};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,7 +31,7 @@ pub struct DelegateTool {
     /// Depth at which this tool instance lives in the delegation chain.
     depth: u32,
     /// Parent tool registry for agentic sub-agents.
-    parent_tools: Arc<Vec<Arc<dyn Tool>>>,
+    parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
 }
@@ -61,7 +62,7 @@ impl DelegateTool {
             fallback_credential,
             provider_runtime_options,
             depth: 0,
-            parent_tools: Arc::new(Vec::new()),
+            parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
         }
     }
@@ -97,13 +98,13 @@ impl DelegateTool {
             fallback_credential,
             provider_runtime_options,
             depth,
-            parent_tools: Arc::new(Vec::new()),
+            parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
         }
     }
 
     /// Attach parent tools used to build sub-agent allowlist registries.
-    pub fn with_parent_tools(mut self, parent_tools: Arc<Vec<Arc<dyn Tool>>>) -> Self {
+    pub fn with_parent_tools(mut self, parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>) -> Self {
         self.parent_tools = parent_tools;
         self
     }
@@ -112,6 +113,12 @@ impl DelegateTool {
     pub fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
         self.multimodal_config = config;
         self
+    }
+
+    /// Return a shared handle to the parent tools list.
+    /// Callers can push additional tools (e.g. MCP wrappers) after construction.
+    pub fn parent_tools_handle(&self) -> Arc<RwLock<Vec<Arc<dyn Tool>>>> {
+        Arc::clone(&self.parent_tools)
     }
 }
 
@@ -289,8 +296,9 @@ impl Tool for DelegateTool {
         }
 
         // Wrap the provider call in a timeout to prevent indefinite blocking
+        let timeout_secs = agent_config.timeout_secs.unwrap_or(DELEGATE_TIMEOUT_SECS);
         let result = tokio::time::timeout(
-            Duration::from_secs(DELEGATE_TIMEOUT_SECS),
+            Duration::from_secs(timeout_secs),
             provider.chat_with_system(
                 agent_config.system_prompt.as_deref(),
                 &full_prompt,
@@ -307,7 +315,7 @@ impl Tool for DelegateTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!(
-                        "Agent '{agent_name}' timed out after {DELEGATE_TIMEOUT_SECS}s"
+                        "Agent '{agent_name}' timed out after {timeout_secs}s"
                     )),
                 });
             }
@@ -365,13 +373,15 @@ impl DelegateTool {
             .filter(|name| !name.is_empty())
             .collect::<std::collections::HashSet<_>>();
 
-        let sub_tools: Vec<Box<dyn Tool>> = self
-            .parent_tools
-            .iter()
-            .filter(|tool| allowed.contains(tool.name()))
-            .filter(|tool| tool.name() != "delegate")
-            .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
-            .collect();
+        let sub_tools: Vec<Box<dyn Tool>> = {
+            let parent_tools = self.parent_tools.read();
+            parent_tools
+                .iter()
+                .filter(|tool| allowed.contains(tool.name()))
+                .filter(|tool| tool.name() != "delegate")
+                .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
+                .collect()
+        };
 
         if sub_tools.is_empty() {
             return Ok(ToolResult {
@@ -392,8 +402,11 @@ impl DelegateTool {
 
         let noop_observer = NoopObserver;
 
+        let agentic_timeout_secs = agent_config
+            .agentic_timeout_secs
+            .unwrap_or(DELEGATE_AGENTIC_TIMEOUT_SECS);
         let result = tokio::time::timeout(
-            Duration::from_secs(DELEGATE_AGENTIC_TIMEOUT_SECS),
+            Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(
                 provider,
                 &mut history,
@@ -412,6 +425,8 @@ impl DelegateTool {
                 None,
                 &[],
                 &[],
+                None,
+                None,
             ),
         )
         .await;
@@ -443,7 +458,7 @@ impl DelegateTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Agent '{agent_name}' timed out after {DELEGATE_AGENTIC_TIMEOUT_SECS}s"
+                    "Agent '{agent_name}' timed out after {agentic_timeout_secs}s"
                 )),
             }),
         }
@@ -520,6 +535,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
         agents.insert(
@@ -534,6 +551,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
         agents
@@ -687,6 +706,8 @@ mod tests {
             agentic: true,
             allowed_tools,
             max_iterations,
+            timeout_secs: None,
+            agentic_timeout_secs: None,
         }
     }
 
@@ -795,6 +816,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -901,6 +924,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -936,6 +961,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1001,7 +1028,7 @@ mod tests {
         );
 
         let tool = DelegateTool::new(agents, None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
         let result = tool
             .execute(json!({"agent": "agentic", "prompt": "test"}))
             .await
@@ -1019,10 +1046,10 @@ mod tests {
     async fn execute_agentic_runs_tool_call_loop_with_filtered_tools() {
         let config = agentic_config(vec!["echo_tool".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
-            Arc::new(vec![
+            Arc::new(RwLock::new(vec![
                 Arc::new(EchoTool),
                 Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
-            ]),
+            ])),
         );
 
         let provider = OneToolThenFinalProvider;
@@ -1040,11 +1067,11 @@ mod tests {
     async fn execute_agentic_excludes_delegate_even_if_allowlisted() {
         let config = agentic_config(vec!["delegate".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
-            Arc::new(vec![Arc::new(DelegateTool::new(
+            Arc::new(RwLock::new(vec![Arc::new(DelegateTool::new(
                 HashMap::new(),
                 None,
                 test_security(),
-            ))]),
+            ))])),
         );
 
         let provider = OneToolThenFinalProvider;
@@ -1065,7 +1092,7 @@ mod tests {
     async fn execute_agentic_respects_max_iterations() {
         let config = agentic_config(vec!["echo_tool".to_string()], 2);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
 
         let provider = InfiniteToolCallProvider;
         let result = tool
@@ -1085,7 +1112,7 @@ mod tests {
     async fn execute_agentic_propagates_provider_errors() {
         let config = agentic_config(vec!["echo_tool".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
 
         let provider = FailingProvider;
         let result = tool
@@ -1099,5 +1126,337 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("provider boom"));
+    }
+
+    /// MCP tools pushed into the shared parent_tools handle after DelegateTool
+    /// construction must be visible to the sub-agent tool list.
+    #[derive(Default)]
+    struct FakeMcpTool;
+
+    #[async_trait]
+    impl Tool for FakeMcpTool {
+        fn name(&self) -> &str {
+            "mcp_fake"
+        }
+
+        fn description(&self) -> &str {
+            "Fake MCP tool for testing."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "mcp_fake_output".into(),
+                error: None,
+            })
+        }
+    }
+
+    struct McpToolThenFinalProvider;
+
+    #[async_trait]
+    impl Provider for McpToolThenFinalProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let has_tool_message = request.messages.iter().any(|m| m.role == "tool");
+            if has_tool_message {
+                Ok(ChatResponse {
+                    text: Some("mcp done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_mcp".to_string(),
+                        name: "mcp_fake".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_included_in_subagent_tool_list() {
+        // Build DelegateTool with NO parent tools initially
+        let config = agentic_config(vec!["mcp_fake".to_string()], 10);
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        // Simulate late MCP tool injection via the shared handle
+        let handle = tool.parent_tools_handle();
+        handle.write().push(Arc::new(FakeMcpTool));
+
+        let provider = McpToolThenFinalProvider;
+        let result = tool
+            .execute_agentic("agentic", &config, &provider, "run mcp", 0.2)
+            .await
+            .unwrap();
+
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+        assert!(
+            result.output.contains("mcp done"),
+            "Expected output containing 'mcp done', got: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn parent_tools_handle_returns_shared_reference() {
+        let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
+            Arc::new(RwLock::new(vec![Arc::new(EchoTool) as Arc<dyn Tool>])),
+        );
+
+        let handle = tool.parent_tools_handle();
+        assert_eq!(handle.read().len(), 1);
+
+        // Push a new tool via the handle
+        handle.write().push(Arc::new(FakeMcpTool));
+        assert_eq!(handle.read().len(), 2);
+    }
+
+    // ── Configurable timeout tests ──────────────────────────────────
+
+    #[test]
+    fn default_timeout_values_used_when_config_unset() {
+        let config = DelegateAgentConfig {
+            provider: "ollama".to_string(),
+            model: "llama3".to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: false,
+            allowed_tools: Vec::new(),
+            max_iterations: 10,
+            timeout_secs: None,
+            agentic_timeout_secs: None,
+        };
+        assert_eq!(config.timeout_secs.unwrap_or(DELEGATE_TIMEOUT_SECS), 120);
+        assert_eq!(
+            config
+                .agentic_timeout_secs
+                .unwrap_or(DELEGATE_AGENTIC_TIMEOUT_SECS),
+            300
+        );
+    }
+
+    #[test]
+    fn custom_timeout_values_are_respected() {
+        let config = DelegateAgentConfig {
+            provider: "ollama".to_string(),
+            model: "llama3".to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: false,
+            allowed_tools: Vec::new(),
+            max_iterations: 10,
+            timeout_secs: Some(60),
+            agentic_timeout_secs: Some(600),
+        };
+        assert_eq!(config.timeout_secs.unwrap_or(DELEGATE_TIMEOUT_SECS), 60);
+        assert_eq!(
+            config
+                .agentic_timeout_secs
+                .unwrap_or(DELEGATE_AGENTIC_TIMEOUT_SECS),
+            600
+        );
+    }
+
+    #[test]
+    fn timeout_deserialization_defaults_to_none() {
+        let toml_str = r#"
+            provider = "ollama"
+            model = "llama3"
+        "#;
+        let config: DelegateAgentConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.timeout_secs.is_none());
+        assert!(config.agentic_timeout_secs.is_none());
+    }
+
+    #[test]
+    fn timeout_deserialization_with_custom_values() {
+        let toml_str = r#"
+            provider = "ollama"
+            model = "llama3"
+            timeout_secs = 45
+            agentic_timeout_secs = 900
+        "#;
+        let config: DelegateAgentConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.timeout_secs, Some(45));
+        assert_eq!(config.agentic_timeout_secs, Some(900));
+    }
+
+    #[test]
+    fn config_validation_rejects_zero_timeout() {
+        let mut config = crate::config::Config::default();
+        config.agents.insert(
+            "bad".into(),
+            DelegateAgentConfig {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                timeout_secs: Some(0),
+                agentic_timeout_secs: None,
+            },
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("timeout_secs must be greater than 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_validation_rejects_zero_agentic_timeout() {
+        let mut config = crate::config::Config::default();
+        config.agents.insert(
+            "bad".into(),
+            DelegateAgentConfig {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: Some(0),
+            },
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("agentic_timeout_secs must be greater than 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_validation_rejects_excessive_timeout() {
+        let mut config = crate::config::Config::default();
+        config.agents.insert(
+            "bad".into(),
+            DelegateAgentConfig {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                timeout_secs: Some(7200),
+                agentic_timeout_secs: None,
+            },
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("exceeds max 3600"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_validation_rejects_excessive_agentic_timeout() {
+        let mut config = crate::config::Config::default();
+        config.agents.insert(
+            "bad".into(),
+            DelegateAgentConfig {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: Some(5000),
+            },
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("exceeds max 3600"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_validation_accepts_max_boundary_timeout() {
+        let mut config = crate::config::Config::default();
+        config.agents.insert(
+            "ok".into(),
+            DelegateAgentConfig {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                timeout_secs: Some(3600),
+                agentic_timeout_secs: Some(3600),
+            },
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_validation_accepts_none_timeouts() {
+        let mut config = crate::config::Config::default();
+        config.agents.insert(
+            "ok".into(),
+            DelegateAgentConfig {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
+            },
+        );
+        assert!(config.validate().is_ok());
     }
 }

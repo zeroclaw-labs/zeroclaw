@@ -1,14 +1,21 @@
 //! Audit logging for security events
+//!
+//! Each audit entry is chained via a Merkle hash: `entry_hash = SHA-256(prev_hash || canonical_json)`.
+//! This makes the trail tamper-evident — modifying any entry invalidates all subsequent hashes.
 
 use crate::config::AuditConfig;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+/// Well-known seed for the genesis entry's `prev_hash`.
+const GENESIS_PREV_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Audit event types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,7 +64,7 @@ pub struct SecurityContext {
     pub sandbox_backend: Option<String>,
 }
 
-/// Complete audit event
+/// Complete audit event with Merkle hash-chain fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub timestamp: DateTime<Utc>,
@@ -67,6 +74,16 @@ pub struct AuditEvent {
     pub action: Option<Action>,
     pub result: Option<ExecutionResult>,
     pub security: SecurityContext,
+
+    /// Monotonically increasing sequence number.
+    #[serde(default)]
+    pub sequence: u64,
+    /// SHA-256 hash of the previous entry (genesis uses [`GENESIS_PREV_HASH`]).
+    #[serde(default)]
+    pub prev_hash: String,
+    /// SHA-256 hash of (`prev_hash` || canonical JSON of this entry's content fields).
+    #[serde(default)]
+    pub entry_hash: String,
 }
 
 impl AuditEvent {
@@ -84,6 +101,9 @@ impl AuditEvent {
                 rate_limit_remaining: None,
                 sandbox_backend: None,
             },
+            sequence: 0,
+            prev_hash: String::new(),
+            entry_hash: String::new(),
         }
     }
 
@@ -143,11 +163,42 @@ impl AuditEvent {
     }
 }
 
+/// Compute the SHA-256 entry hash: `H(prev_hash || content_json)`.
+///
+/// `content_json` is the canonical JSON of the event *without* the chain fields
+/// (`sequence`, `prev_hash`, `entry_hash`), so the hash covers only the payload.
+fn compute_entry_hash(prev_hash: &str, event: &AuditEvent) -> String {
+    // Build a canonical representation of the content fields only.
+    let content = serde_json::json!({
+        "timestamp": event.timestamp,
+        "event_id": event.event_id,
+        "event_type": event.event_type,
+        "actor": event.actor,
+        "action": event.action,
+        "result": event.result,
+        "security": event.security,
+        "sequence": event.sequence,
+    });
+    let content_json = serde_json::to_string(&content).expect("serialize canonical content");
+
+    let mut hasher = Sha256::new();
+    hasher.update(prev_hash.as_bytes());
+    hasher.update(content_json.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Internal chain state tracked across writes.
+struct ChainState {
+    prev_hash: String,
+    sequence: u64,
+}
+
 /// Audit logger
 pub struct AuditLogger {
     log_path: PathBuf,
     config: AuditConfig,
     buffer: Mutex<Vec<AuditEvent>>,
+    chain: Mutex<ChainState>,
 }
 
 /// Structured command execution details for audit logging.
@@ -163,13 +214,18 @@ pub struct CommandExecutionLog<'a> {
 }
 
 impl AuditLogger {
-    /// Create a new audit logger
+    /// Create a new audit logger.
+    ///
+    /// If the log file already exists, the chain state is recovered from the last
+    /// entry so that new writes continue the existing hash chain.
     pub fn new(config: AuditConfig, zeroclaw_dir: PathBuf) -> Result<Self> {
         let log_path = zeroclaw_dir.join(&config.log_path);
+        let chain_state = recover_chain_state(&log_path);
         Ok(Self {
             log_path,
             config,
             buffer: Mutex::new(Vec::new()),
+            chain: Mutex::new(chain_state),
         })
     }
 
@@ -182,8 +238,19 @@ impl AuditLogger {
         // Check log size and rotate if needed
         self.rotate_if_needed()?;
 
+        // Populate chain fields under the lock
+        let mut chained = event.clone();
+        {
+            let mut state = self.chain.lock();
+            chained.sequence = state.sequence;
+            chained.prev_hash = state.prev_hash.clone();
+            chained.entry_hash = compute_entry_hash(&state.prev_hash, &chained);
+            state.prev_hash = chained.entry_hash.clone();
+            state.sequence += 1;
+        }
+
         // Serialize and write
-        let line = serde_json::to_string(event)?;
+        let line = serde_json::to_string(&chained)?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -258,6 +325,102 @@ impl AuditLogger {
     }
 }
 
+/// Recover chain state from an existing log file.
+///
+/// Returns the genesis state if the file does not exist or is empty.
+fn recover_chain_state(log_path: &Path) -> ChainState {
+    let file = match std::fs::File::open(log_path) {
+        Ok(f) => f,
+        Err(_) => {
+            return ChainState {
+                prev_hash: GENESIS_PREV_HASH.to_string(),
+                sequence: 0,
+            };
+        }
+    };
+
+    let reader = BufReader::new(file);
+    let mut last_entry: Option<AuditEvent> = None;
+    for l in reader.lines().map_while(Result::ok) {
+        if let Ok(entry) = serde_json::from_str::<AuditEvent>(&l) {
+            last_entry = Some(entry);
+        }
+    }
+
+    match last_entry {
+        Some(entry) => ChainState {
+            prev_hash: entry.entry_hash,
+            sequence: entry.sequence + 1,
+        },
+        None => ChainState {
+            prev_hash: GENESIS_PREV_HASH.to_string(),
+            sequence: 0,
+        },
+    }
+}
+
+/// Verify the integrity of an audit log's Merkle hash chain.
+///
+/// Reads every entry from the log file and checks:
+/// - Each `entry_hash` matches the recomputed `SHA-256(prev_hash || content)`.
+/// - `prev_hash` links to the preceding entry (or the genesis seed for the first).
+/// - Sequence numbers are contiguous starting from 0.
+///
+/// Returns `Ok(entry_count)` on success, or an error describing the first violation.
+pub fn verify_chain(log_path: &Path) -> Result<u64> {
+    let file = std::fs::File::open(log_path)?;
+    let reader = BufReader::new(file);
+
+    let mut expected_prev_hash = GENESIS_PREV_HASH.to_string();
+    let mut expected_sequence: u64 = 0;
+
+    for (line_idx, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: AuditEvent = serde_json::from_str(&line)?;
+
+        // Check sequence continuity
+        if entry.sequence != expected_sequence {
+            bail!(
+                "sequence gap at line {}: expected {}, got {}",
+                line_idx + 1,
+                expected_sequence,
+                entry.sequence
+            );
+        }
+
+        // Check prev_hash linkage
+        if entry.prev_hash != expected_prev_hash {
+            bail!(
+                "prev_hash mismatch at line {} (sequence {}): expected {}, got {}",
+                line_idx + 1,
+                entry.sequence,
+                expected_prev_hash,
+                entry.prev_hash
+            );
+        }
+
+        // Recompute and verify entry_hash
+        let recomputed = compute_entry_hash(&entry.prev_hash, &entry);
+        if entry.entry_hash != recomputed {
+            bail!(
+                "entry_hash mismatch at line {} (sequence {}): expected {}, got {}",
+                line_idx + 1,
+                entry.sequence,
+                recomputed,
+                entry.entry_hash
+            );
+        }
+
+        expected_prev_hash = entry.entry_hash.clone();
+        expected_sequence += 1;
+    }
+
+    Ok(expected_sequence)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,14 +438,14 @@ mod tests {
         let event = AuditEvent::new(AuditEventType::CommandExecution).with_actor(
             "telegram".to_string(),
             Some("123".to_string()),
-            Some("@alice".to_string()),
+            Some("@zeroclaw_user".to_string()),
         );
 
         assert!(event.actor.is_some());
         let actor = event.actor.as_ref().unwrap();
         assert_eq!(actor.channel, "telegram");
         assert_eq!(actor.user_id, Some("123".to_string()));
-        assert_eq!(actor.username, Some("@alice".to_string()));
+        assert_eq!(actor.username, Some("@zeroclaw_user".to_string()));
     }
 
     #[test]
@@ -418,6 +581,190 @@ mod tests {
             std::path::Path::new(&rotated).exists(),
             "rotation must create .1.log backup"
         );
+        Ok(())
+    }
+
+    // ── Merkle hash-chain tests ─────────────────────────────
+
+    #[test]
+    fn merkle_chain_genesis_uses_well_known_seed() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        let event = AuditEvent::new(AuditEventType::SecurityEvent);
+        logger.log(&event)?;
+
+        let log_path = tmp.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path)?;
+        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+
+        assert_eq!(parsed.sequence, 0);
+        assert_eq!(parsed.prev_hash, GENESIS_PREV_HASH);
+        assert!(!parsed.entry_hash.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn merkle_chain_multiple_entries_verify() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        // Write several events
+        for i in 0..5 {
+            let event = AuditEvent::new(AuditEventType::CommandExecution).with_action(
+                format!("cmd-{}", i),
+                "low".to_string(),
+                false,
+                true,
+            );
+            logger.log(&event)?;
+        }
+
+        let log_path = tmp.path().join("audit.log");
+        let count = verify_chain(&log_path)?;
+        assert_eq!(count, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn merkle_chain_detects_tampered_entry() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        for i in 0..3 {
+            let event = AuditEvent::new(AuditEventType::CommandExecution).with_action(
+                format!("cmd-{}", i),
+                "low".to_string(),
+                false,
+                true,
+            );
+            logger.log(&event)?;
+        }
+
+        // Tamper with the second entry (change the command text)
+        let log_path = tmp.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path)?;
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3);
+
+        let mut entry: serde_json::Value = serde_json::from_str(lines[1])?;
+        entry["action"]["command"] = serde_json::Value::String("TAMPERED".to_string());
+        let tampered_line = serde_json::to_string(&entry)?;
+
+        let tampered_content = format!("{}\n{}\n{}\n", lines[0], tampered_line, lines[2]);
+        std::fs::write(&log_path, tampered_content)?;
+
+        // Verification must fail
+        let result = verify_chain(&log_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("entry_hash mismatch"),
+            "expected entry_hash mismatch, got: {}",
+            err_msg
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merkle_chain_detects_sequence_gap() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        for i in 0..3 {
+            let event = AuditEvent::new(AuditEventType::CommandExecution).with_action(
+                format!("cmd-{}", i),
+                "low".to_string(),
+                false,
+                true,
+            );
+            logger.log(&event)?;
+        }
+
+        // Remove the second entry to create a sequence gap
+        let log_path = tmp.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path)?;
+        let lines: Vec<&str> = content.lines().collect();
+        let gapped_content = format!("{}\n{}\n", lines[0], lines[2]);
+        std::fs::write(&log_path, gapped_content)?;
+
+        let result = verify_chain(&log_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("sequence gap"),
+            "expected sequence gap, got: {}",
+            err_msg
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merkle_chain_recovery_continues_after_restart() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let log_path = tmp.path().join("audit.log");
+
+        // First logger writes 2 entries
+        {
+            let config = AuditConfig {
+                enabled: true,
+                max_size_mb: 10,
+                ..Default::default()
+            };
+            let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+            for i in 0..2 {
+                let event = AuditEvent::new(AuditEventType::CommandExecution).with_action(
+                    format!("batch1-{}", i),
+                    "low".to_string(),
+                    false,
+                    true,
+                );
+                logger.log(&event)?;
+            }
+        }
+
+        // Second logger (simulating restart) continues the chain
+        {
+            let config = AuditConfig {
+                enabled: true,
+                max_size_mb: 10,
+                ..Default::default()
+            };
+            let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+            for i in 0..2 {
+                let event = AuditEvent::new(AuditEventType::CommandExecution).with_action(
+                    format!("batch2-{}", i),
+                    "low".to_string(),
+                    false,
+                    true,
+                );
+                logger.log(&event)?;
+            }
+        }
+
+        // Full chain should verify (4 entries, sequences 0..3)
+        let count = verify_chain(&log_path)?;
+        assert_eq!(count, 4);
         Ok(())
     }
 }
