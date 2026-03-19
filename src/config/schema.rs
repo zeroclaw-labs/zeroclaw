@@ -137,7 +137,7 @@ pub struct Config {
     pub cloud_ops: CloudOpsConfig,
 
     /// Conversational AI agent builder configuration (`[conversational_ai]`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ConversationalAiConfig::is_default")]
     pub conversational_ai: ConversationalAiConfig,
 
     /// Managed cybersecurity service configuration (`[security_ops]`).
@@ -5903,6 +5903,22 @@ pub struct ConversationalAiConfig {
     /// Optional tool name for RAG-based knowledge base lookup during conversations.
     #[serde(default)]
     pub knowledge_base_tool: Option<String>,
+}
+
+impl ConversationalAiConfig {
+    /// Check if the config is in default (disabled) state.
+    /// Used to skip serializing when the feature is not explicitly enabled.
+    pub fn is_default(&self) -> bool {
+        !self.enabled
+            && self.default_language == default_conversational_ai_language()
+            && self.supported_languages == default_conversational_ai_supported_languages()
+            && self.auto_detect_language
+            && (self.escalation_confidence_threshold - default_conversational_ai_escalation_threshold()).abs() < f64::EPSILON
+            && self.max_conversation_turns == default_conversational_ai_max_turns()
+            && self.conversation_timeout_secs == default_conversational_ai_timeout_secs()
+            && !self.analytics_enabled
+            && self.knowledge_base_tool.is_none()
+    }
 }
 
 impl Default for ConversationalAiConfig {
@@ -12053,5 +12069,69 @@ require_otp_to_resume = true
             .await
             .unwrap();
         assert!(identity.contains("IDENTITY.md"));
+    }
+
+    /// Regression test for GitHub issue #3958:
+    /// Default conversational_ai config should not be serialized to file.
+    #[tokio::test]
+    async fn conversational_ai_default_not_serialized() {
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_conv_ai_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let mut config = Config::default();
+        config.workspace_dir = dir.join("workspace");
+        config.config_path = dir.join("config.toml");
+        // conversational_ai is default (enabled: false)
+        assert!(!config.conversational_ai.enabled);
+        assert!(config.conversational_ai.is_default());
+
+        config.save().await.unwrap();
+
+        let contents = fs::read_to_string(&config.config_path).await.unwrap();
+        // The [conversational_ai] section should NOT appear in the saved file
+        assert!(
+            !contents.contains("[conversational_ai]"),
+            "Default conversational_ai config should not be serialized. File contents:\n{}",
+            contents
+        );
+
+        // But it should still deserialize correctly
+        let loaded: Config = toml::from_str(&contents).unwrap();
+        assert!(!loaded.conversational_ai.enabled);
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    /// Test that explicitly enabled conversational_ai IS serialized.
+    #[tokio::test]
+    async fn conversational_ai_enabled_is_serialized() {
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_conv_ai_enabled_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let mut config = Config::default();
+        config.workspace_dir = dir.join("workspace");
+        config.config_path = dir.join("config.toml");
+        // Enable conversational_ai
+        config.conversational_ai.enabled = true;
+        assert!(!config.conversational_ai.is_default());
+
+        config.save().await.unwrap();
+
+        let contents = fs::read_to_string(&config.config_path).await.unwrap();
+        // The [conversational_ai] section SHOULD appear when enabled
+        assert!(
+            contents.contains("[conversational_ai]"),
+            "Enabled conversational_ai config should be serialized. File contents:\n{}",
+            contents
+        );
+        assert!(contents.contains("enabled = true"));
+
+        let _ = fs::remove_dir_all(&dir).await;
     }
 }
