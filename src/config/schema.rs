@@ -4133,6 +4133,15 @@ pub struct CronConfig {
     /// Enable the cron subsystem. Default: `true`.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Run all overdue jobs at scheduler startup. Default: `true`.
+    ///
+    /// When the machine boots late or the daemon restarts, jobs whose
+    /// `next_run` is in the past are considered "missed". With this
+    /// option enabled the scheduler fires them once before entering
+    /// the normal polling loop. Disable if you prefer missed jobs to
+    /// simply wait for their next scheduled occurrence.
+    #[serde(default = "default_true")]
+    pub catch_up_on_startup: bool,
     /// Maximum number of historical cron run records to retain. Default: `50`.
     #[serde(default = "default_max_run_history")]
     pub max_run_history: u32,
@@ -4146,6 +4155,7 @@ impl Default for CronConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            catch_up_on_startup: true,
             max_run_history: default_max_run_history(),
         }
     }

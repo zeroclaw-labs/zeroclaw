@@ -12,7 +12,15 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import type { CronJob, CronRun } from '@/types/api';
-import { getCronJobs, addCronJob, deleteCronJob, getCronRuns } from '@/lib/api';
+import {
+  getCronJobs,
+  addCronJob,
+  deleteCronJob,
+  getCronRuns,
+  getCronSettings,
+  patchCronSettings,
+} from '@/lib/api';
+import type { CronSettings } from '@/lib/api';
 import { t } from '@/lib/i18n';
 
 function formatDate(iso: string | null): string {
@@ -143,6 +151,8 @@ export default function Cron() {
   const [showForm, setShowForm] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
+  const [settings, setSettings] = useState<CronSettings | null>(null);
+  const [togglingCatchUp, setTogglingCatchUp] = useState(false);
 
   // Form state
   const [formName, setFormName] = useState('');
@@ -159,8 +169,28 @@ export default function Cron() {
       .finally(() => setLoading(false));
   };
 
+  const fetchSettings = () => {
+    getCronSettings().then(setSettings).catch(() => {});
+  };
+
+  const toggleCatchUp = async () => {
+    if (!settings) return;
+    setTogglingCatchUp(true);
+    try {
+      const updated = await patchCronSettings({
+        catch_up_on_startup: !settings.catch_up_on_startup,
+      });
+      setSettings(updated);
+    } catch {
+      // silently fail — user can retry
+    } finally {
+      setTogglingCatchUp(false);
+    }
+  };
+
   useEffect(() => {
     fetchJobs();
+    fetchSettings();
   }, []);
 
   const handleAdd = async () => {
@@ -249,6 +279,37 @@ export default function Cron() {
           {t('cron.add_job')}
         </button>
       </div>
+
+      {/* Catch-up toggle */}
+      {settings && (
+        <div className="glass-card px-4 py-3 flex items-center justify-between">
+          <div>
+            <span className="text-sm font-medium text-white">
+              Catch up missed jobs on startup
+            </span>
+            <p className="text-xs text-[#556080] mt-0.5">
+              Run all overdue jobs when ZeroClaw starts after downtime
+            </p>
+          </div>
+          <button
+            onClick={toggleCatchUp}
+            disabled={togglingCatchUp}
+            className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-300 focus:outline-none ${
+              settings.catch_up_on_startup
+                ? 'bg-[#0080ff]'
+                : 'bg-[#1a1a3e]'
+            }`}
+          >
+            <span
+              className={`inline-block h-4 w-4 rounded-full bg-white transition-transform duration-300 ${
+                settings.catch_up_on_startup
+                  ? 'translate-x-6'
+                  : 'translate-x-1'
+              }`}
+            />
+          </button>
+        </div>
+      )}
 
       {/* Add Job Form Modal */}
       {showForm && (

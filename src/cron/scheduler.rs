@@ -39,7 +39,12 @@ pub async fn run(config: Config) -> Result<()> {
     //    which could leave some overdue jobs waiting across many cycles
     //    if the machine was off for a while. The catch-up phase fetches
     //    without the `max_tasks` limit so every missed job fires once.
-    catch_up_overdue_jobs(&config, &security).await;
+    //    Controlled by `[cron] catch_up_on_startup` (default: true).
+    if config.cron.catch_up_on_startup {
+        catch_up_overdue_jobs(&config, &security).await;
+    } else {
+        tracing::info!("Scheduler startup: catch-up disabled by config");
+    }
 
     loop {
         interval.tick().await;
