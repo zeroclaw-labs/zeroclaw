@@ -363,22 +363,20 @@ Notes:
 
 ### `[[google_workspace.allowed_operations]]`
 
-When this array is non-empty, only the listed `(service, resource, method)` triples
-are permitted. Any unlisted combination is denied fail-closed. When the array is
-empty (the default), all resource and method combinations within `allowed_services`
-are available.
+When this array is non-empty, only exact matches pass. An entry matches a call when
+`service`, `resource`, `sub_resource`, and `method` all agree. When the array is
+empty (the default), all combinations within `allowed_services` are available.
 
 | Key | Required | Purpose |
 |---|---|---|
 | `service` | yes | Service identifier (must match an entry in `allowed_services`) |
-| `resource` | yes | Google API resource name for that service |
-| `methods` | yes | One or more method names allowed on that resource |
+| `resource` | yes | Top-level resource name (`users` for Gmail, `files` for Drive, `events` for Calendar) |
+| `sub_resource` | no | Sub-resource for 4-segment gws commands (required for all Gmail operations; omit for Drive, Calendar, etc.) |
+| `methods` | yes | One or more method names allowed on that resource/sub_resource |
 
-Sub-resource limitation: when `allowed_operations` is non-empty, any call that
-includes a `sub_resource` argument (4-segment `gws` commands such as
-`gws drive files permissions list`) is denied fail-closed. Sub-resource operations
-are not expressible in `allowed_operations` in this version. Omit `allowed_operations`
-to fall back to service-level scoping if sub-resource access is needed.
+Gmail uses `gws gmail users <sub_resource> <method>` for all operations, so every
+Gmail entry requires `sub_resource`. Drive and Calendar use 3-segment commands and
+omit it.
 
 ```toml
 [google_workspace]
@@ -389,12 +387,14 @@ audit_log = true
 
 [[google_workspace.allowed_operations]]
 service = "gmail"
-resource = "messages"
+resource = "users"
+sub_resource = "messages"
 methods = ["list", "get"]
 
 [[google_workspace.allowed_operations]]
 service = "gmail"
-resource = "drafts"
+resource = "users"
+sub_resource = "drafts"
 methods = ["list", "get", "create", "update"]
 ```
 

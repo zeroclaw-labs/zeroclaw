@@ -266,19 +266,16 @@ Lưu ý:
 
 ### `[[google_workspace.allowed_operations]]`
 
-When non-empty, only the listed `(service, resource, method)` triples are permitted.
-Any unlisted combination is denied fail-closed. When empty (the default), all
-resource and method combinations within `allowed_services` are available.
+When non-empty, only exact matches pass. An entry matches a call when `service`,
+`resource`, `sub_resource`, and `method` all agree. When empty (the default), all
+combinations within `allowed_services` are available.
 
 | Key | Required | Purpose |
 |---|---|---|
 | `service` | yes | Service identifier (must match an entry in `allowed_services`) |
-| `resource` | yes | Google API resource name for that service |
-| `methods` | yes | One or more method names allowed on that resource |
-
-Sub-resource limitation: when `allowed_operations` is non-empty, any call with a
-`sub_resource` argument is denied fail-closed. Omit `allowed_operations` for
-service-level scoping if sub-resource access is needed.
+| `resource` | yes | Top-level resource name (`users` for Gmail, `files` for Drive, `events` for Calendar) |
+| `sub_resource` | no | Sub-resource for 4-segment gws commands (required for all Gmail operations; omit for Drive, Calendar, etc.) |
+| `methods` | yes | One or more method names allowed on that resource/sub_resource |
 
 ```toml
 [google_workspace]
@@ -289,7 +286,8 @@ audit_log = true
 
 [[google_workspace.allowed_operations]]
 service = "gmail"
-resource = "drafts"
+resource = "users"
+sub_resource = "drafts"
 methods = ["list", "get", "create", "update"]
 ```
 

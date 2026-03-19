@@ -89,13 +89,10 @@ impl GoogleWorkspaceTool {
         if self.allowed_operations.is_empty() {
             return true;
         }
-        // Sub-resources are not modeled in the allowlist; deny nested operations fail-closed.
-        if sub_resource.is_some() {
-            return false;
-        }
         self.allowed_operations.iter().any(|operation| {
             operation.service.trim() == service
                 && operation.resource.trim() == resource
+                && operation.sub_resource.as_deref().map(str::trim) == sub_resource
                 && operation
                     .methods
                     .iter()
@@ -759,17 +756,20 @@ mod tests {
     fn operation_allowlist_defaults_to_allow_all() {
         let tool =
             GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
-        assert!(tool.is_operation_allowed("gmail", "messages", None, "send"));
+        // Empty allowlist: everything passes regardless of sub_resource
+        assert!(tool.is_operation_allowed("gmail", "users", Some("messages"), "send"));
+        assert!(tool.is_operation_allowed("drive", "files", None, "list"));
     }
 
     #[test]
-    fn operation_allowlist_matches_exact_service_resource_and_method() {
+    fn operation_allowlist_matches_gmail_sub_resource_shape() {
         let tool = GoogleWorkspaceTool::new(
             test_security(),
             vec!["gmail".into()],
             vec![GoogleWorkspaceAllowedOperation {
                 service: "gmail".into(),
-                resource: "drafts".into(),
+                resource: "users".into(),
+                sub_resource: Some("drafts".into()),
                 methods: vec!["create".into(), "update".into()],
             }],
             None,
@@ -779,9 +779,41 @@ mod tests {
             false,
         );
 
-        assert!(tool.is_operation_allowed("gmail", "drafts", None, "create"));
-        assert!(!tool.is_operation_allowed("gmail", "drafts", None, "send"));
-        assert!(!tool.is_operation_allowed("gmail", "messages", None, "get"));
+        // Exact match: allowed
+        assert!(tool.is_operation_allowed("gmail", "users", Some("drafts"), "create"));
+        assert!(tool.is_operation_allowed("gmail", "users", Some("drafts"), "update"));
+        // Send not in methods: denied
+        assert!(!tool.is_operation_allowed("gmail", "users", Some("drafts"), "send"));
+        // Different sub_resource: denied
+        assert!(!tool.is_operation_allowed("gmail", "users", Some("messages"), "list"));
+        // No sub_resource when entry requires one: denied
+        assert!(!tool.is_operation_allowed("gmail", "users", None, "create"));
+    }
+
+    #[test]
+    fn operation_allowlist_matches_drive_3_segment_shape() {
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec!["drive".into()],
+            vec![GoogleWorkspaceAllowedOperation {
+                service: "drive".into(),
+                resource: "files".into(),
+                sub_resource: None,
+                methods: vec!["list".into(), "get".into()],
+            }],
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
+
+        assert!(tool.is_operation_allowed("drive", "files", None, "list"));
+        assert!(tool.is_operation_allowed("drive", "files", None, "get"));
+        // Delete not in methods: denied
+        assert!(!tool.is_operation_allowed("drive", "files", None, "delete"));
+        // Entry has no sub_resource; call with sub_resource must not match
+        assert!(!tool.is_operation_allowed("drive", "files", Some("permissions"), "list"));
     }
 
     #[tokio::test]
@@ -791,7 +823,8 @@ mod tests {
             vec!["gmail".into()],
             vec![GoogleWorkspaceAllowedOperation {
                 service: "gmail".into(),
-                resource: "drafts".into(),
+                resource: "users".into(),
+                sub_resource: Some("drafts".into()),
                 methods: vec!["create".into()],
             }],
             None,
@@ -801,10 +834,12 @@ mod tests {
             false,
         );
 
+        // send is not in the allowed methods list
         let result = tool
             .execute(json!({
                 "service": "gmail",
-                "resource": "drafts",
+                "resource": "users",
+                "sub_resource": "drafts",
                 "method": "send"
             }))
             .await
@@ -818,15 +853,16 @@ mod tests {
             .contains("allowed operations list"));
     }
 
-    #[test]
-    fn operation_allowlist_rejects_sub_resource_when_operations_configured() {
+    #[tokio::test]
+    async fn rejects_operation_with_unlisted_sub_resource() {
         let tool = GoogleWorkspaceTool::new(
             test_security(),
-            vec!["drive".into()],
+            vec!["gmail".into()],
             vec![GoogleWorkspaceAllowedOperation {
-                service: "drive".into(),
-                resource: "files".into(),
-                methods: vec!["list".into()],
+                service: "gmail".into(),
+                resource: "users".into(),
+                sub_resource: Some("drafts".into()),
+                methods: vec!["create".into()],
             }],
             None,
             None,
@@ -834,9 +870,23 @@ mod tests {
             30,
             false,
         );
-        // With a non-empty allowlist, any sub_resource must be denied fail-closed.
-        assert!(!tool.is_operation_allowed("drive", "files", Some("permissions"), "list"));
-        // Without sub_resource, the listed operation is still allowed.
-        assert!(tool.is_operation_allowed("drive", "files", None, "list"));
+
+        // messages is not in the allowlist (only drafts is)
+        let result = tool
+            .execute(json!({
+                "service": "gmail",
+                "resource": "users",
+                "sub_resource": "messages",
+                "method": "send"
+            }))
+            .await
+            .expect("unlisted sub_resource should return a result");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("allowed operations list"));
     }
 }

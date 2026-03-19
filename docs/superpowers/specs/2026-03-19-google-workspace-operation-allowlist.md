@@ -54,6 +54,10 @@ Those are valid follow-on items, but they are separate features.
 
 ## Proposed Config
 
+Gmail uses a 4-segment gws command shape (`gws gmail users <sub_resource> <method>`),
+so `sub_resource` is required for all Gmail entries. Drive and Calendar use
+3-segment commands and omit `sub_resource`.
+
 ```toml
 [google_workspace]
 enabled = true
@@ -63,17 +67,20 @@ audit_log = true
 
 [[google_workspace.allowed_operations]]
 service = "gmail"
-resource = "messages"
+resource = "users"
+sub_resource = "messages"
 methods = ["list", "get"]
 
 [[google_workspace.allowed_operations]]
 service = "gmail"
-resource = "threads"
+resource = "users"
+sub_resource = "threads"
 methods = ["get"]
 
 [[google_workspace.allowed_operations]]
 service = "gmail"
-resource = "drafts"
+resource = "users"
+sub_resource = "drafts"
 methods = ["list", "get", "create", "update"]
 ```
 
@@ -81,72 +88,71 @@ Semantics:
 
 - If `allowed_operations` is empty, behavior stays backward compatible:
   all resource/method combinations remain available within `allowed_services`.
-- If `allowed_operations` is non-empty, only explicit `(service, resource, method)`
-  combinations are allowed.
+- If `allowed_operations` is non-empty, only exact matches pass. An entry matches
+  a call when `service`, `resource`, `sub_resource`, and `method` all agree.
+  `sub_resource` in the entry is optional: an entry without `sub_resource` matches
+  only calls with no sub_resource; an entry with `sub_resource` matches only calls
+  with that exact sub_resource value.
 - Service-level and operation-level checks both apply.
-- If `allowed_operations` is non-empty and the caller supplies `sub_resource`,
-  the call is denied fail-closed. Sub-resource operations cannot be individually
-  allowlisted in this version; see the sub-resource limitation section below.
 
 ## Operation Inventory Reference
 
 The first question operators need answered is not "where is the canonical API
 inventory?" It is "what string values are valid here?"
 
-For `allowed_operations`, the runtime expects this exact shape:
+For `allowed_operations`, the runtime expects `service`, `resource`, an optional
+`sub_resource`, and `methods`. The values come directly from the `gws` command
+segments in the same order.
 
-- `service`: the same service identifier used in `allowed_services` and the
-  first `gws` command segment
-- `resource`: the Google API resource name used by that service
-- `method`: the operation name used on that resource
-
-Mental model for 3-segment operations (the fully supported case):
+3-segment commands (Drive, Calendar, Sheets, etc.):
 
 ```text
 gws <service> <resource> <method> ...
 ```
 
-maps to:
-
 ```toml
 [[google_workspace.allowed_operations]]
 service = "<service>"
 resource = "<resource>"
+# sub_resource omitted
 methods = ["<method>"]
 ```
 
-Some `gws` commands use a 4-segment shape:
+4-segment commands (Gmail and other user-scoped APIs):
 
 ```text
 gws <service> <resource> <sub_resource> <method> ...
 ```
 
-For example: `gws drive files permissions list`. When `allowed_operations` is
-configured, any call with a `sub_resource` is denied fail-closed. There is no
-config syntax to allowlist a nested `(service, resource, sub_resource, method)`
-combination in this version.
+```toml
+[[google_workspace.allowed_operations]]
+service = "<service>"
+resource = "<resource>"
+sub_resource = "<sub_resource>"
+methods = ["<method>"]
+```
 
-Examples:
+Examples verified against `gws` discovery output:
 
 | CLI shape | Config entry |
 |---|---|
-| `gws gmail messages list` | `service = "gmail"`, `resource = "messages"`, `method = "list"` |
-| `gws gmail drafts create` | `service = "gmail"`, `resource = "drafts"`, `method = "create"` |
+| `gws gmail users messages list` | `service = "gmail"`, `resource = "users"`, `sub_resource = "messages"`, `method = "list"` |
+| `gws gmail users drafts create` | `service = "gmail"`, `resource = "users"`, `sub_resource = "drafts"`, `method = "create"` |
 | `gws calendar events list` | `service = "calendar"`, `resource = "events"`, `method = "list"` |
 | `gws drive files get` | `service = "drive"`, `resource = "files"`, `method = "get"` |
 
 Verified starter examples for common supervised workflows:
 
 - Gmail read-only triage:
-  - `gmail/messages/list`
-  - `gmail/messages/get`
-  - `gmail/threads/list`
-  - `gmail/threads/get`
+  - `gmail/users/messages/list`
+  - `gmail/users/messages/get`
+  - `gmail/users/threads/list`
+  - `gmail/users/threads/get`
 - Gmail draft-without-send:
-  - `gmail/drafts/list`
-  - `gmail/drafts/get`
-  - `gmail/drafts/create`
-  - `gmail/drafts/update`
+  - `gmail/users/drafts/list`
+  - `gmail/users/drafts/get`
+  - `gmail/users/drafts/create`
+  - `gmail/users/drafts/update`
 - Calendar review:
   - `calendar/events/list`
   - `calendar/events/get`
@@ -189,7 +195,7 @@ Validation order inside `google_workspace`:
 2. Check `service` against `allowed_services`.
 3. Extract and validate `sub_resource` if present (character check, type check).
 4. Check `(service, resource, sub_resource, method)` against `allowed_operations`
-   when configured. Any non-`None` `sub_resource` is denied fail-closed.
+   when configured. Unmatched combinations are denied fail-closed.
 5. Validate `service`, `resource`, and `method` for shell-safe characters.
 6. Build and execute the `gws` command.
 7. Charge action budget (only after all validation passes).
@@ -198,17 +204,18 @@ This must be fail-closed. A missing operation match is a hard deny, not a warnin
 
 ## Data Model
 
-Add a config type:
+Config type:
 
 ```rust
 pub struct GoogleWorkspaceAllowedOperation {
     pub service: String,
     pub resource: String,
+    pub sub_resource: Option<String>,
     pub methods: Vec<String>,
 }
 ```
 
-Add to `GoogleWorkspaceConfig`:
+Added to `GoogleWorkspaceConfig`:
 
 ```rust
 pub allowed_operations: Vec<GoogleWorkspaceAllowedOperation>
@@ -218,10 +225,11 @@ pub allowed_operations: Vec<GoogleWorkspaceAllowedOperation>
 
 - `service` must be non-empty, lowercase alphanumeric with `_` or `-`
 - `resource` must be non-empty, lowercase alphanumeric with `_` or `-`
+- `sub_resource`, when present, must be non-empty, lowercase alphanumeric with `_` or `-`
 - `methods` must be non-empty
 - each method must be non-empty, lowercase alphanumeric with `_` or `-`
-- duplicate methods within one entry are rejected
-- duplicate `(service, resource)` entries are rejected
+- duplicate methods within one entry are rejected by validation
+- duplicate `(service, resource, sub_resource)` entries are rejected by validation
 
 ## TDD Plan
 
@@ -236,53 +244,36 @@ pub allowed_operations: Vec<GoogleWorkspaceAllowedOperation>
 
 For `email-assistant`, the safe Gmail-native draft profile is:
 
-- allow:
-  - `gmail/messages/list`
-  - `gmail/messages/get`
-  - `gmail/threads/get`
-  - `gmail/drafts/list`
-  - `gmail/drafts/get`
-  - `gmail/drafts/create`
-  - `gmail/drafts/update`
-- deny:
-  - `gmail/messages/send`
-  - `gmail/drafts/send`
+```toml
+[[google_workspace.allowed_operations]]
+service = "gmail"
+resource = "users"
+sub_resource = "messages"
+methods = ["list", "get"]
 
-This still is not a credential-level send prohibition. It is a strong runtime
-boundary inside the ZeroClaw wrapper.
+[[google_workspace.allowed_operations]]
+service = "gmail"
+resource = "users"
+sub_resource = "threads"
+methods = ["get"]
 
-## Sub-Resource Limitation
-
-`gws` supports a 4-segment command shape for nested resources:
-
-```text
-gws drive files permissions list
-gws gmail users settings filters list
+[[google_workspace.allowed_operations]]
+service = "gmail"
+resource = "users"
+sub_resource = "drafts"
+methods = ["list", "get", "create", "update"]
 ```
 
-The `allowed_operations` config model is `(service, resource, methods[])`. There is
-no field for `sub_resource`. When `allowed_operations` is non-empty, the runtime
-denies any call that includes a `sub_resource` fail-closed rather than attempting
-partial policy enforcement on an unsupported shape.
+Operations denied by omission: `gmail/users/messages/send`, `gmail/users/drafts/send`.
 
-Operator impact:
-
-- If you need access to sub-resource operations (for example Drive file permissions),
-  do not configure `allowed_operations`. Service-level scoping via `allowed_services`
-  remains available and gives the pre-existing behavior.
-- If you configure `allowed_operations` for fine-grained control, sub-resource
-  operations are unavailable for the duration of this limitation.
-
-This is intentional for this slice. The fix is a follow-on config model extension.
+This is not a credential-level send prohibition. It is a runtime boundary inside
+the ZeroClaw wrapper.
 
 ## Follow-On Work
 
-Future work tracked separately:
+Future credential-hardening work tracked separately:
 
-1. Extend `allowed_operations` to support `sub_resource` as an optional fourth
-   segment — `(service, resource, sub_resource, method)` — so nested operations can
-   be individually allowlisted without disabling the feature entirely.
-2. Declared credential profiles in `google_workspace` config.
-3. Startup verification of granted scopes against declared policy.
-4. Multiple credential files per trust tier.
-5. Optional profile-to-operation binding.
+1. Declared credential profiles in `google_workspace` config.
+2. Startup verification of granted scopes against declared policy.
+3. Multiple credential files per trust tier.
+4. Optional profile-to-operation binding.

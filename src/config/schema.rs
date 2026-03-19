@@ -2271,9 +2271,15 @@ impl Default for DataRetentionConfig {
 pub struct GoogleWorkspaceAllowedOperation {
     /// Google Workspace service ID (for example `gmail` or `drive`).
     pub service: String,
-    /// Service resource name (for example `messages` or `files`).
+    /// Top-level resource name for the service (for example `users` for Gmail or `files` for Drive).
     pub resource: String,
-    /// Allowed methods for the service/resource pair.
+    /// Optional sub-resource for 4-segment gws commands
+    /// (for example `messages` or `drafts` under `gmail users`).
+    /// When present, the entry only matches calls that include this exact sub_resource.
+    /// When absent, the entry only matches calls with no sub_resource.
+    #[serde(default)]
+    pub sub_resource: Option<String>,
+    /// Allowed methods for the service/resource/sub_resource combination.
     #[serde(default)]
     pub methods: Vec<String>,
 }
@@ -7398,6 +7404,24 @@ impl Config {
                     "google_workspace.allowed_operations[{i}].resource contains invalid characters: {resource}"
                 );
             }
+
+            if let Some(ref sub_resource) = operation.sub_resource {
+                let sub = sub_resource.trim();
+                if sub.is_empty() {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].sub_resource must not be empty when present"
+                    );
+                }
+                if !sub
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].sub_resource contains invalid characters: {sub}"
+                    );
+                }
+            }
+
             if operation.methods.is_empty() {
                 anyhow::bail!("google_workspace.allowed_operations[{i}].methods must not be empty");
             }
@@ -7425,10 +7449,15 @@ impl Config {
                 }
             }
 
-            let operation_key = format!("{service}:{resource}");
+            let sub_key = operation
+                .sub_resource
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("");
+            let operation_key = format!("{service}:{resource}:{sub_key}");
             if !seen_gws_operations.insert(operation_key.clone()) {
                 anyhow::bail!(
-                    "google_workspace.allowed_operations contains duplicate service/resource entry: {operation_key}"
+                    "google_workspace.allowed_operations contains duplicate service/resource/sub_resource entry: {operation_key}"
                 );
             }
         }
@@ -11098,7 +11127,8 @@ default_model = "legacy-model"
         let mut config = Config::default();
         config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
             service: "gmail".into(),
-            resource: "drafts".into(),
+            resource: "users".into(),
+            sub_resource: Some("drafts".into()),
             methods: Vec::new(),
         }];
 
@@ -11107,23 +11137,47 @@ default_model = "legacy-model"
     }
 
     #[test]
-    async fn google_workspace_allowed_operations_reject_duplicate_service_resource_entries() {
+    async fn google_workspace_allowed_operations_reject_duplicate_service_resource_sub_resource_entries(
+    ) {
         let mut config = Config::default();
         config.google_workspace.allowed_operations = vec![
             GoogleWorkspaceAllowedOperation {
                 service: "gmail".into(),
-                resource: "drafts".into(),
+                resource: "users".into(),
+                sub_resource: Some("drafts".into()),
                 methods: vec!["create".into()],
             },
             GoogleWorkspaceAllowedOperation {
                 service: "gmail".into(),
-                resource: "drafts".into(),
+                resource: "users".into(),
+                sub_resource: Some("drafts".into()),
                 methods: vec!["update".into()],
             },
         ];
 
         let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("duplicate service/resource entry"));
+        assert!(err.contains("duplicate service/resource/sub_resource entry"));
+    }
+
+    #[test]
+    async fn google_workspace_allowed_operations_allow_same_resource_different_sub_resource() {
+        let mut config = Config::default();
+        config.google_workspace.allowed_operations = vec![
+            GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "users".into(),
+                sub_resource: Some("messages".into()),
+                methods: vec!["list".into(), "get".into()],
+            },
+            GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "users".into(),
+                sub_resource: Some("drafts".into()),
+                methods: vec!["create".into(), "update".into()],
+            },
+        ];
+
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -11131,7 +11185,8 @@ default_model = "legacy-model"
         let mut config = Config::default();
         config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
             service: "gmail".into(),
-            resource: "drafts".into(),
+            resource: "users".into(),
+            sub_resource: Some("drafts".into()),
             methods: vec!["create".into(), "create".into()],
         }];
 
@@ -11148,17 +11203,33 @@ default_model = "legacy-model"
         config.google_workspace.allowed_operations = vec![
             GoogleWorkspaceAllowedOperation {
                 service: "gmail".into(),
-                resource: "messages".into(),
+                resource: "users".into(),
+                sub_resource: Some("messages".into()),
                 methods: vec!["list".into(), "get".into()],
             },
             GoogleWorkspaceAllowedOperation {
-                service: "gmail".into(),
-                resource: "drafts".into(),
-                methods: vec!["create".into(), "update".into()],
+                service: "drive".into(),
+                resource: "files".into(),
+                sub_resource: None,
+                methods: vec!["list".into(), "get".into()],
             },
         ];
 
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    async fn google_workspace_allowed_operations_reject_invalid_sub_resource_characters() {
+        let mut config = Config::default();
+        config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
+            service: "gmail".into(),
+            resource: "users".into(),
+            sub_resource: Some("bad resource!".into()),
+            methods: vec!["list".into()],
+        }];
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("sub_resource contains invalid characters"));
     }
 
     fn runtime_proxy_cache_contains(cache_key: &str) -> bool {
@@ -12223,18 +12294,38 @@ require_otp_to_resume = true
 
             [[allowed_operations]]
             service = "gmail"
-            resource = "drafts"
+            resource = "users"
+            sub_resource = "drafts"
             methods = ["create", "update"]
         "#;
 
         let cfg: GoogleWorkspaceConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.allowed_operations.len(), 1);
         assert_eq!(cfg.allowed_operations[0].service, "gmail");
-        assert_eq!(cfg.allowed_operations[0].resource, "drafts");
+        assert_eq!(cfg.allowed_operations[0].resource, "users");
+        assert_eq!(
+            cfg.allowed_operations[0].sub_resource.as_deref(),
+            Some("drafts")
+        );
         assert_eq!(
             cfg.allowed_operations[0].methods,
             vec!["create".to_string(), "update".to_string()]
         );
+    }
+
+    #[test]
+    async fn google_workspace_allowed_operations_deserialize_without_sub_resource() {
+        let toml_str = r#"
+            enabled = true
+
+            [[allowed_operations]]
+            service = "drive"
+            resource = "files"
+            methods = ["list", "get"]
+        "#;
+
+        let cfg: GoogleWorkspaceConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.allowed_operations[0].sub_resource, None);
     }
 
     #[test]
@@ -12244,7 +12335,8 @@ require_otp_to_resume = true
         cfg.google_workspace.allowed_services = vec!["gmail".into()];
         cfg.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
             service: "gmail".into(),
-            resource: "drafts".into(),
+            resource: "users".into(),
+            sub_resource: Some("drafts".into()),
             methods: vec!["create".into(), "update".into()],
         }];
 
@@ -12259,18 +12351,20 @@ require_otp_to_resume = true
         cfg.google_workspace.allowed_operations = vec![
             GoogleWorkspaceAllowedOperation {
                 service: "gmail".into(),
-                resource: "drafts".into(),
+                resource: "users".into(),
+                sub_resource: Some("drafts".into()),
                 methods: vec!["create".into()],
             },
             GoogleWorkspaceAllowedOperation {
                 service: "gmail".into(),
-                resource: "drafts".into(),
+                resource: "users".into(),
+                sub_resource: Some("drafts".into()),
                 methods: vec!["update".into()],
             },
         ];
 
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("duplicate service/resource entry"));
+        assert!(err.contains("duplicate service/resource/sub_resource entry"));
     }
 
     // ── Bootstrap files ─────────────────────────────────────

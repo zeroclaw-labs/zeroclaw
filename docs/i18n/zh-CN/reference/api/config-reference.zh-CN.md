@@ -328,17 +328,18 @@ temperature = 0.2
 
 ### `[[google_workspace.allowed_operations]]`
 
-非空时，仅允许列出的 `(service, resource, method)` 三元组。未列出的组合将被拒绝（fail-closed）。
-为空时（默认），`allowed_services` 内的所有资源和方法组合均可用。
+非空时，仅精确匹配的调用通过。当 `service`、`resource`、`sub_resource` 和 `method` 全部一致时，条目匹配。
+为空时（默认），`allowed_services` 内的所有组合均可用。
 
 | 键 | 是否必填 | 用途 |
 |---|---|---|
 | `service` | 是 | 服务标识符（须匹配 `allowed_services` 中的条目） |
-| `resource` | 是 | 该服务的 Google API 资源名称 |
-| `methods` | 是 | 该资源上允许的一个或多个方法名称 |
+| `resource` | 是 | 顶层资源名称（Gmail 为 `users`，Drive 为 `files`，Calendar 为 `events`） |
+| `sub_resource` | 否 | 4 段 gws 命令的子资源（Gmail 所有操作必填；Drive、Calendar 等省略） |
+| `methods` | 是 | 该资源/子资源上允许的一个或多个方法名称 |
 
-子资源限制：当 `allowed_operations` 非空时，包含 `sub_resource` 参数的调用将被拒绝（fail-closed）。
-如需子资源访问，请省略 `allowed_operations` 以使用服务级别的范围控制。
+Gmail 所有操作均使用 `gws gmail users <sub_resource> <method>` 的 4 段命令格式，
+因此每个 Gmail 条目均需填写 `sub_resource`。Drive 和 Calendar 使用 3 段命令，无需填写。
 
 ```toml
 [google_workspace]
@@ -349,7 +350,8 @@ audit_log = true
 
 [[google_workspace.allowed_operations]]
 service = "gmail"
-resource = "drafts"
+resource = "users"
+sub_resource = "drafts"
 methods = ["list", "get", "create", "update"]
 ```
 
