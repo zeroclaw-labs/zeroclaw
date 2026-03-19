@@ -2451,7 +2451,12 @@ async fn process_channel_message(
             // added during run_tool_call_loop, so the LLM retains awareness
             // of what it did on subsequent turns.
             let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
-            let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
+            let history_response = if tool_summary.is_empty()
+                || matches!(
+                    msg.channel.as_str(),
+                    "telegram" | "whatsapp" | "signal"
+                )
+            {
                 delivered_response.clone()
             } else {
                 format!("{tool_summary}\n{delivered_response}")
@@ -3475,6 +3480,7 @@ fn collect_configured_channels(
                 sig.allowed_from.clone(),
                 sig.mention_only,
                 sig.ignore_attachments,
+                sig.download_attachments.unwrap_or(false),
                 sig.ignore_stories,
             )),
         });
