@@ -98,7 +98,7 @@ use crate::observability::traits::{ObserverEvent, ObserverMetric};
 use crate::observability::{self, runtime_trace, Observer};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
-use crate::security::SecurityPolicy;
+use crate::security::{AutonomyLevel, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -2785,6 +2785,7 @@ pub fn build_system_prompt(
         bootstrap_max_chars,
         false,
         crate::config::SkillsPromptInjectionMode::Full,
+        AutonomyLevel::default(),
     )
 }
 
@@ -2797,6 +2798,7 @@ pub fn build_system_prompt_with_mode(
     bootstrap_max_chars: Option<usize>,
     native_tools: bool,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    autonomy_level: AutonomyLevel,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -2862,13 +2864,18 @@ pub fn build_system_prompt_with_mode(
 
     // ── 2. Safety ───────────────────────────────────────────────
     prompt.push_str("## Safety\n\n");
-    prompt.push_str(
-        "- Do not exfiltrate private data.\n\
-         - Do not run destructive commands without asking.\n\
-         - Do not bypass oversight or approval mechanisms.\n\
-         - Prefer `trash` over `rm` (recoverable beats gone forever).\n\
-         - When in doubt, ask before acting externally.\n\n",
-    );
+    prompt.push_str("- Do not exfiltrate private data.\n");
+    if autonomy_level != AutonomyLevel::Full {
+        prompt.push_str(
+            "- Do not run destructive commands without asking.\n\
+             - Do not bypass oversight or approval mechanisms.\n",
+        );
+    }
+    prompt.push_str("- Prefer `trash` over `rm` (recoverable beats gone forever).\n");
+    if autonomy_level != AutonomyLevel::Full {
+        prompt.push_str("- When in doubt, ask before acting externally.\n");
+    }
+    prompt.push('\n');
 
     // ── 3. Skills (full or compact, based on config) ─────────────
     if !skills.is_empty() {
@@ -4026,6 +4033,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         bootstrap_max_chars,
         native_tools,
         config.skills.prompt_injection_mode,
+        config.autonomy.level,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(
@@ -6956,6 +6964,7 @@ BTC is currently around $65,000 based on latest tool output."#
             None,
             false,
             crate::config::SkillsPromptInjectionMode::Compact,
+            AutonomyLevel::default(),
         );
 
         assert!(prompt.contains("<available_skills>"), "missing skills XML");
@@ -7076,6 +7085,65 @@ BTC is currently around $65,000 based on latest tool output."#
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
         assert!(prompt.contains(&format!("Working directory: `{}`", ws.path().display())));
+    }
+
+    #[test]
+    fn full_autonomy_omits_approval_instructions() {
+        let ws = make_workspace();
+        let prompt = build_system_prompt_with_mode(
+            ws.path(),
+            "model",
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            crate::config::SkillsPromptInjectionMode::Full,
+            AutonomyLevel::Full,
+        );
+
+        assert!(
+            !prompt.contains("without asking"),
+            "full autonomy prompt must not tell the model to ask before acting"
+        );
+        assert!(
+            !prompt.contains("ask before acting externally"),
+            "full autonomy prompt must not contain ask-before-acting instruction"
+        );
+        // Core safety rules should still be present
+        assert!(
+            prompt.contains("Do not exfiltrate private data"),
+            "data exfiltration guard must remain"
+        );
+        assert!(
+            prompt.contains("Prefer `trash` over `rm`"),
+            "trash-over-rm hint must remain"
+        );
+    }
+
+    #[test]
+    fn supervised_autonomy_includes_approval_instructions() {
+        let ws = make_workspace();
+        let prompt = build_system_prompt_with_mode(
+            ws.path(),
+            "model",
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            crate::config::SkillsPromptInjectionMode::Full,
+            AutonomyLevel::Supervised,
+        );
+
+        assert!(
+            prompt.contains("without asking"),
+            "supervised prompt must include ask-before-acting instruction"
+        );
+        assert!(
+            prompt.contains("ask before acting externally"),
+            "supervised prompt must include ask-before-acting instruction"
+        );
     }
 
     #[test]

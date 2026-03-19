@@ -137,7 +137,12 @@ pub struct Config {
     pub cloud_ops: CloudOpsConfig,
 
     /// Conversational AI agent builder configuration (`[conversational_ai]`).
-    #[serde(default)]
+    ///
+    /// Experimental / future feature — not yet wired into the agent runtime.
+    /// Omitted from generated config files when disabled (the default).
+    /// Existing configs that already contain this section will continue to
+    /// deserialize correctly thanks to `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "ConversationalAiConfig::is_disabled")]
     pub conversational_ai: ConversationalAiConfig,
 
     /// Managed cybersecurity service configuration (`[security_ops]`).
@@ -4045,7 +4050,8 @@ pub struct ClassificationRule {
 pub struct HeartbeatConfig {
     /// Enable periodic heartbeat pings. Default: `false`.
     pub enabled: bool,
-    /// Interval in minutes between heartbeat pings. Default: `30`.
+    /// Interval in minutes between heartbeat pings. Default: `5`.
+    #[serde(default = "default_heartbeat_interval")]
     pub interval_minutes: u32,
     /// Enable two-phase heartbeat: Phase 1 asks LLM whether to run, Phase 2
     /// executes only when the LLM decides there is work to do. Saves API cost
@@ -4089,6 +4095,10 @@ pub struct HeartbeatConfig {
     pub max_run_history: u32,
 }
 
+fn default_heartbeat_interval() -> u32 {
+    5
+}
+
 fn default_two_phase() -> bool {
     true
 }
@@ -4109,7 +4119,7 @@ impl Default for HeartbeatConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            interval_minutes: 30,
+            interval_minutes: default_heartbeat_interval(),
             two_phase: true,
             message: None,
             target: None,
@@ -5903,6 +5913,17 @@ pub struct ConversationalAiConfig {
     /// Optional tool name for RAG-based knowledge base lookup during conversations.
     #[serde(default)]
     pub knowledge_base_tool: Option<String>,
+}
+
+impl ConversationalAiConfig {
+    /// Returns `true` when the feature is disabled (the default).
+    ///
+    /// Used by `#[serde(skip_serializing_if)]` to omit the entire
+    /// `[conversational_ai]` section from newly-generated config files,
+    /// avoiding user confusion over an undocumented / experimental section.
+    pub fn is_disabled(&self) -> bool {
+        !self.enabled
+    }
 }
 
 impl Default for ConversationalAiConfig {
@@ -8335,7 +8356,7 @@ mod tests {
     async fn heartbeat_config_default() {
         let h = HeartbeatConfig::default();
         assert!(!h.enabled);
-        assert_eq!(h.interval_minutes, 30);
+        assert_eq!(h.interval_minutes, 5);
         assert!(h.message.is_none());
         assert!(h.target.is_none());
         assert!(h.to.is_none());
