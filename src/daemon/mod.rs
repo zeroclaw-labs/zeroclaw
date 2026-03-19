@@ -315,7 +315,10 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
         // ── Phase 1: LLM decision (two-phase mode) ──────────────
         let tasks_to_run = if two_phase {
-            let decision_prompt = HeartbeatEngine::build_decision_prompt(&tasks);
+            let decision_prompt = format!(
+                "[Heartbeat Task | decision] {}",
+                HeartbeatEngine::build_decision_prompt(&tasks),
+            );
             match Box::pin(crate::agent::run(
                 config.clone(),
                 Some(decision_prompt),
