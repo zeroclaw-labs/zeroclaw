@@ -8379,11 +8379,13 @@ recipient = "42"
     async fn cron_config_serde_roundtrip() {
         let c = CronConfig {
             enabled: false,
+            catch_up_on_startup: false,
             max_run_history: 100,
         };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: CronConfig = serde_json::from_str(&json).unwrap();
         assert!(!parsed.enabled);
+        assert!(!parsed.catch_up_on_startup);
         assert_eq!(parsed.max_run_history, 100);
     }
 
@@ -8397,6 +8399,7 @@ default_temperature = 0.7
 
         let parsed: Config = toml::from_str(toml_str).unwrap();
         assert!(parsed.cron.enabled);
+        assert!(parsed.cron.catch_up_on_startup);
         assert_eq!(parsed.cron.max_run_history, 50);
     }
 
