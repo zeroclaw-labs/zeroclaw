@@ -46,6 +46,8 @@ pub struct Agent {
     /// so the LLM knows the concrete constraints before making tool calls.
     security_summary: Option<String>,
 }
+
+pub struct AgentBuilder {
     provider: Option<Box<dyn Provider>>,
     tools: Option<Vec<Box<dyn Tool>>>,
     memory: Option<Arc<dyn Memory>>,
