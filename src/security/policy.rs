@@ -1296,11 +1296,77 @@ impl SecurityPolicy {
             tracker: ActionTracker::new(),
         }
     }
+
+    /// Render a human-readable summary of the active security constraints
+    /// suitable for injection into the LLM system prompt.
+    ///
+    /// Giving the LLM visibility into these constraints prevents it from
+    /// wasting tokens on commands / paths that will be rejected at runtime.
+    /// See issue #2404.
+    pub fn prompt_summary(&self) -> String {
+        use std::fmt::Write;
+
+        let mut out = String::new();
+
+        // Autonomy level
+        let _ = writeln!(out, "**Autonomy level**: {:?}", self.autonomy);
+
+        // Workspace constraint
+        if self.workspace_only {
+            let _ = writeln!(
+                out,
+                "**Workspace boundary**: file operations are restricted to `{}`.",
+                self.workspace_dir.display()
+            );
+        }
+
+        // Allowed roots
+        if !self.allowed_roots.is_empty() {
+            let roots: Vec<String> = self.allowed_roots.iter().map(|p| format!("`{}`", p.display())).collect();
+            let _ = writeln!(out, "**Additional allowed paths**: {}", roots.join(", "));
+        }
+
+        // Allowed commands
+        if !self.allowed_commands.is_empty() {
+            let cmds: Vec<String> = self.allowed_commands.iter().map(|c| format!("`{c}`")).collect();
+            let _ = writeln!(
+                out,
+                "**Allowed shell commands**: {}. Commands not on this list will be rejected.",
+                cmds.join(", ")
+            );
+        }
+
+        // Forbidden paths
+        if !self.forbidden_paths.is_empty() {
+            let paths: Vec<String> = self.forbidden_paths.iter().map(|p| format!("`{p}`")).collect();
+            let _ = writeln!(
+                out,
+                "**Forbidden paths**: {}. Any read/write/exec targeting these paths will be blocked.",
+                paths.join(", ")
+            );
+        }
+
+        // Risk controls
+        if self.block_high_risk_commands {
+            let _ = writeln!(out, "**High-risk commands** (rm, kill, reboot, etc.) are blocked.");
+        }
+        if self.require_approval_for_medium_risk {
+            let _ = writeln!(out, "**Medium-risk commands** require user approval before execution.");
+        }
+
+        // Rate limit
+        let _ = writeln!(
+            out,
+            "**Rate limit**: max {} actions per hour.",
+            self.max_actions_per_hour
+        );
+
+        out
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests {    use super::*;
 
     fn default_policy() -> SecurityPolicy {
         SecurityPolicy::default()
@@ -2743,5 +2809,94 @@ mod tests {
             ..SecurityPolicy::default()
         };
         assert!(!p.is_under_allowed_root("/any/path"));
+    }
+
+    // ── prompt_summary ──────────────────────────────────────
+
+    #[test]
+    fn prompt_summary_includes_autonomy_level() {
+        let p = default_policy();
+        let summary = p.prompt_summary();
+        assert!(summary.contains("Supervised"), "should mention autonomy level");
+    }
+
+    #[test]
+    fn prompt_summary_includes_workspace_boundary_when_workspace_only() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/home/user/project"),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        let summary = p.prompt_summary();
+        assert!(summary.contains("Workspace boundary"), "should mention workspace boundary");
+        assert!(summary.contains("/home/user/project"), "should mention workspace path");
+    }
+
+    #[test]
+    fn prompt_summary_omits_workspace_boundary_when_not_workspace_only() {
+        let p = SecurityPolicy {
+            workspace_only: false,
+            ..SecurityPolicy::default()
+        };
+        let summary = p.prompt_summary();
+        assert!(!summary.contains("Workspace boundary"), "should not mention workspace boundary");
+    }
+
+    #[test]
+    fn prompt_summary_includes_allowed_commands() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into(), "ls".into()],
+            ..SecurityPolicy::default()
+        };
+        let summary = p.prompt_summary();
+        assert!(summary.contains("`git`"), "should list allowed commands");
+        assert!(summary.contains("`ls`"), "should list allowed commands");
+        assert!(summary.contains("not on this list will be rejected"), "should warn about rejection");
+    }
+
+    #[test]
+    fn prompt_summary_includes_forbidden_paths() {
+        let p = SecurityPolicy {
+            workspace_only: false,
+            forbidden_paths: vec!["/etc".into(), "~/.ssh".into()],
+            ..SecurityPolicy::default()
+        };
+        let summary = p.prompt_summary();
+        assert!(summary.contains("`/etc`"), "should list forbidden paths");
+        assert!(summary.contains("`~/.ssh`"), "should list forbidden paths");
+    }
+
+    #[test]
+    fn prompt_summary_includes_rate_limit() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 42,
+            ..SecurityPolicy::default()
+        };
+        let summary = p.prompt_summary();
+        assert!(summary.contains("42"), "should mention rate limit");
+        assert!(summary.contains("actions per hour"), "should explain rate limit");
+    }
+
+    #[test]
+    fn prompt_summary_includes_risk_controls() {
+        let p = SecurityPolicy {
+            block_high_risk_commands: true,
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        };
+        let summary = p.prompt_summary();
+        assert!(summary.contains("High-risk commands"), "should mention high-risk block");
+        assert!(summary.contains("Medium-risk commands"), "should mention medium-risk approval");
+    }
+
+    #[test]
+    fn prompt_summary_includes_allowed_roots() {
+        let p = SecurityPolicy {
+            allowed_roots: vec![PathBuf::from("/shared/data"), PathBuf::from("/opt/tools")],
+            ..SecurityPolicy::default()
+        };
+        let summary = p.prompt_summary();
+        assert!(summary.contains("`/shared/data`"), "should list allowed roots");
+        assert!(summary.contains("`/opt/tools`"), "should list allowed roots");
     }
 }
