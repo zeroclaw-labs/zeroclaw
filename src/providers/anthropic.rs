@@ -211,9 +211,9 @@ impl AnthropicProvider {
         text.len() > 3072
     }
 
-    /// Cache conversations with more than 4 messages (excluding system)
+    /// Cache conversations with more than 1 non-system message (i.e. after first exchange)
     fn should_cache_conversation(messages: &[ChatMessage]) -> bool {
-        messages.iter().filter(|m| m.role != "system").count() > 4
+        messages.iter().filter(|m| m.role != "system").count() > 1
     }
 
     /// Apply cache control to the last message content block
