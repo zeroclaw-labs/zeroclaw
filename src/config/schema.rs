@@ -289,6 +289,10 @@ pub struct Config {
     #[serde(default)]
     pub peripherals: PeripheralsConfig,
 
+    /// Delegate tool global default configuration (`[delegate]`).
+    #[serde(default)]
+    pub delegate: DelegateToolConfig,
+
     /// Delegate agent configurations for multi-agent workflows.
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
@@ -439,6 +443,32 @@ pub struct ModelProviderConfig {
     pub azure_openai_api_version: Option<String>,
 }
 
+// ── Delegate Tool Configuration ─────────────────────────────────
+
+/// Global delegate tool configuration for default timeout values.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DelegateToolConfig {
+    /// Default timeout in seconds for non-agentic sub-agent provider calls.
+    /// Can be overridden per-agent in `[agents.<name>]` config.
+    /// Default: 120 seconds.
+    #[serde(default = "default_delegate_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Default timeout in seconds for agentic sub-agent runs.
+    /// Can be overridden per-agent in `[agents.<name>]` config.
+    /// Default: 300 seconds.
+    #[serde(default = "default_delegate_agentic_timeout_secs")]
+    pub agentic_timeout_secs: u64,
+}
+
+impl Default for DelegateToolConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: DEFAULT_DELEGATE_TIMEOUT_SECS,
+            agentic_timeout_secs: DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
+        }
+    }
+}
+
 // ── Delegate Agents ──────────────────────────────────────────────
 
 /// Configuration for a delegate sub-agent used by the `delegate` tool.
@@ -469,14 +499,22 @@ pub struct DelegateAgentConfig {
     /// Maximum tool-call iterations in agentic mode.
     #[serde(default = "default_max_tool_iterations")]
     pub max_iterations: usize,
-    /// Timeout in seconds for non-agentic provider calls.
-    /// Defaults to 120 when unset. Must be between 1 and 3600.
+    /// Optional timeout in seconds for non-agentic sub-agent provider calls.
+    /// When `None`, falls back to `[delegate].timeout_secs` (default: 120).
     #[serde(default)]
     pub timeout_secs: Option<u64>,
-    /// Timeout in seconds for agentic sub-agent loops.
-    /// Defaults to 300 when unset. Must be between 1 and 3600.
+    /// Optional timeout in seconds for agentic sub-agent runs.
+    /// When `None`, falls back to `[delegate].agentic_timeout_secs` (default: 300).
     #[serde(default)]
     pub agentic_timeout_secs: Option<u64>,
+}
+
+fn default_delegate_timeout_secs() -> u64 {
+    DEFAULT_DELEGATE_TIMEOUT_SECS
+}
+
+fn default_delegate_agentic_timeout_secs() -> u64 {
+    DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS
 }
 
 // ── Swarms ──────────────────────────────────────────────────────
@@ -533,6 +571,12 @@ const DEFAULT_PROVIDER_TIMEOUT_SECS: u64 = 120;
 fn default_provider_timeout_secs() -> u64 {
     DEFAULT_PROVIDER_TIMEOUT_SECS
 }
+
+/// Default delegate tool timeout for non-agentic calls: 120 seconds.
+pub const DEFAULT_DELEGATE_TIMEOUT_SECS: u64 = 120;
+
+/// Default delegate tool timeout for agentic runs: 300 seconds.
+pub const DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS: u64 = 300;
 
 /// Validate that a temperature value is within the allowed range.
 pub fn validate_temperature(value: f64) -> std::result::Result<f64, String> {
@@ -6140,6 +6184,7 @@ impl Default for Config {
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
+            delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             swarms: HashMap::new(),
             hooks: HooksConfig::default(),
@@ -7535,6 +7580,28 @@ impl Config {
             }
         }
 
+        // Delegate tool global defaults
+        if self.delegate.timeout_secs == 0 {
+            anyhow::bail!("delegate.timeout_secs must be greater than 0");
+        }
+        if self.delegate.agentic_timeout_secs == 0 {
+            anyhow::bail!("delegate.agentic_timeout_secs must be greater than 0");
+        }
+
+        // Per-agent delegate timeout overrides
+        for (name, agent) in &self.agents {
+            if let Some(t) = agent.timeout_secs {
+                if t == 0 {
+                    anyhow::bail!("agents.{name}.timeout_secs must be greater than 0");
+                }
+            }
+            if let Some(t) = agent.agentic_timeout_secs {
+                if t == 0 {
+                    anyhow::bail!("agents.{name}.agentic_timeout_secs must be greater than 0");
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -8779,6 +8846,7 @@ default_temperature = 0.7
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
+            delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             swarms: HashMap::new(),
             hooks: HooksConfig::default(),
@@ -9114,6 +9182,7 @@ tool_dispatcher = "xml"
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
+            delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             swarms: HashMap::new(),
             hooks: HooksConfig::default(),
