@@ -1,5 +1,5 @@
-import type { SSEEvent } from '../types/api';
-import { getToken } from './auth';
+import type { SSEEvent } from "../types/api";
+import { getToken } from "./auth";
 
 export type SSEEventHandler = (event: SSEEvent) => void;
 export type SSEErrorHandler = (error: Event | Error) => void;
@@ -19,7 +19,7 @@ const DEFAULT_RECONNECT_DELAY = 1000;
 const MAX_RECONNECT_DELAY = 30000;
 
 /**
- * SSE client that connects to the ZeroClaw event stream.
+ * SSE client that connects to the JhedaiClaw event stream.
  *
  * Because the native EventSource API does not support custom headers, we use
  * the fetch API with a ReadableStream to consume the text/event-stream
@@ -41,7 +41,7 @@ export class SSEClient {
   private readonly autoReconnect: boolean;
 
   constructor(options: SSEClientOptions = {}) {
-    this.path = options.path ?? '/api/events';
+    this.path = options.path ?? "/api/events";
     this.reconnectDelay = options.reconnectDelay ?? DEFAULT_RECONNECT_DELAY;
     this.maxReconnectDelay = options.maxReconnectDelay ?? MAX_RECONNECT_DELAY;
     this.autoReconnect = options.autoReconnect ?? true;
@@ -56,10 +56,10 @@ export class SSEClient {
 
     const token = getToken();
     const headers: Record<string, string> = {
-      Accept: 'text/event-stream',
+      Accept: "text/event-stream",
     };
     if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
+      headers["Authorization"] = `Bearer ${token}`;
     }
 
     fetch(this.path, {
@@ -71,7 +71,7 @@ export class SSEClient {
           throw new Error(`SSE connection failed: ${response.status}`);
         }
         if (!response.body) {
-          throw new Error('SSE response has no body');
+          throw new Error("SSE response has no body");
         }
 
         this.currentDelay = this.reconnectDelay;
@@ -80,7 +80,7 @@ export class SSEClient {
         return this.consumeStream(response.body);
       })
       .catch((err: unknown) => {
-        if (err instanceof DOMException && err.name === 'AbortError') {
+        if (err instanceof DOMException && err.name === "AbortError") {
           return; // intentional disconnect
         }
         this.onError?.(err instanceof Error ? err : new Error(String(err)));
@@ -105,7 +105,7 @@ export class SSEClient {
   private async consumeStream(body: ReadableStream<Uint8Array>): Promise<void> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
-    let buffer = '';
+    let buffer = "";
 
     try {
       for (;;) {
@@ -115,15 +115,15 @@ export class SSEClient {
         buffer += decoder.decode(value, { stream: true });
 
         // SSE events are separated by double newlines
-        const parts = buffer.split('\n\n');
-        buffer = parts.pop() ?? '';
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() ?? "";
 
         for (const part of parts) {
           this.parseEvent(part);
         }
       }
     } catch (err: unknown) {
-      if (err instanceof DOMException && err.name === 'AbortError') {
+      if (err instanceof DOMException && err.name === "AbortError") {
         return;
       }
       this.onError?.(err instanceof Error ? err : new Error(String(err)));
@@ -136,13 +136,13 @@ export class SSEClient {
   }
 
   private parseEvent(raw: string): void {
-    let eventType = 'message';
+    let eventType = "message";
     const dataLines: string[] = [];
 
-    for (const line of raw.split('\n')) {
-      if (line.startsWith('event:')) {
+    for (const line of raw.split("\n")) {
+      if (line.startsWith("event:")) {
         eventType = line.slice(6).trim();
-      } else if (line.startsWith('data:')) {
+      } else if (line.startsWith("data:")) {
         dataLines.push(line.slice(5).trim());
       }
       // Ignore comments (lines starting with ':') and other fields
@@ -150,7 +150,7 @@ export class SSEClient {
 
     if (dataLines.length === 0) return;
 
-    const dataStr = dataLines.join('\n');
+    const dataStr = dataLines.join("\n");
     let parsed: SSEEvent;
 
     try {
@@ -171,7 +171,10 @@ export class SSEClient {
     if (this.intentionallyClosed || !this.autoReconnect) return;
 
     this.reconnectTimer = setTimeout(() => {
-      this.currentDelay = Math.min(this.currentDelay * 2, this.maxReconnectDelay);
+      this.currentDelay = Math.min(
+        this.currentDelay * 2,
+        this.maxReconnectDelay,
+      );
       this.connect();
     }, this.currentDelay);
   }

@@ -9,17 +9,17 @@ This document defines the current GitHub Actions source-control policy for this 
 
 Selected allowlist (all actions currently used across Quality Gate, Release Beta, and Release Stable workflows):
 
-| Action | Used In | Purpose |
-|--------|---------|---------|
-| `actions/checkout@v4` | All workflows | Repository checkout |
-| `actions/upload-artifact@v4` | release, promote-release | Upload build artifacts |
-| `actions/download-artifact@v4` | release, promote-release | Download build artifacts for packaging |
-| `dtolnay/rust-toolchain@stable` | All workflows | Install Rust toolchain (1.92.0) |
-| `Swatinem/rust-cache@v2` | All workflows | Cargo build/dependency caching |
-| `softprops/action-gh-release@v2` | release, promote-release | Create GitHub Releases |
-| `docker/setup-buildx-action@v3` | release, promote-release | Docker Buildx setup |
-| `docker/login-action@v3` | release, promote-release | GHCR authentication |
-| `docker/build-push-action@v6` | release, promote-release | Multi-platform Docker image build and push |
+| Action                           | Used In                  | Purpose                                    |
+| -------------------------------- | ------------------------ | ------------------------------------------ |
+| `actions/checkout@v4`            | All workflows            | Repository checkout                        |
+| `actions/upload-artifact@v4`     | release, promote-release | Upload build artifacts                     |
+| `actions/download-artifact@v4`   | release, promote-release | Download build artifacts for packaging     |
+| `dtolnay/rust-toolchain@stable`  | All workflows            | Install Rust toolchain (1.92.0)            |
+| `Swatinem/rust-cache@v2`         | All workflows            | Cargo build/dependency caching             |
+| `softprops/action-gh-release@v2` | release, promote-release | Create GitHub Releases                     |
+| `docker/setup-buildx-action@v3`  | release, promote-release | Docker Buildx setup                        |
+| `docker/login-action@v3`         | release, promote-release | GHCR authentication                        |
+| `docker/build-push-action@v6`    | release, promote-release | Multi-platform Docker image build and push |
 
 Equivalent allowlist patterns:
 
@@ -31,10 +31,10 @@ Equivalent allowlist patterns:
 
 ## Workflows
 
-| Workflow | File | Trigger |
-|----------|------|---------|
-| Quality Gate | `.github/workflows/checks-on-pr.yml` | Pull requests to `master` |
-| Release Beta | `.github/workflows/release-beta-on-push.yml` | Push to `master` |
+| Workflow       | File                                          | Trigger                    |
+| -------------- | --------------------------------------------- | -------------------------- |
+| Quality Gate   | `.github/workflows/checks-on-pr.yml`          | Pull requests to `master`  |
+| Release Beta   | `.github/workflows/release-beta-on-push.yml`  | Push to `master`           |
 | Release Stable | `.github/workflows/release-stable-manual.yml` | Manual `workflow_dispatch` |
 
 ## Change Control
@@ -50,8 +50,8 @@ Record each policy change with:
 Use these commands to export the current effective policy:
 
 ```bash
-gh api repos/zeroclaw-labs/zeroclaw/actions/permissions
-gh api repos/zeroclaw-labs/zeroclaw/actions/permissions/selected-actions
+gh api repos/jhedai/jhedaiclaw/actions/permissions
+gh api repos/jhedai/jhedaiclaw/actions/permissions/selected-actions
 ```
 
 ## Guardrails
@@ -64,11 +64,11 @@ gh api repos/zeroclaw-labs/zeroclaw/actions/permissions/selected-actions
 
 - 2026-03-10: Renamed workflows — CI → Quality Gate (`checks-on-pr.yml`), Beta Release → Release Beta (`release-beta-on-push.yml`), Promote Release → Release Stable (`release-stable-manual.yml`). Added `lint` and `security` jobs to Quality Gate. Added Cross-Platform Build (`cross-platform-build-manual.yml`).
 - 2026-03-05: Complete workflow overhaul — replaced 22 workflows with 3 (CI, Beta Release, Promote Release)
-    - Removed patterns no longer in use: `DavidAnson/markdownlint-cli2-action@*`, `lycheeverse/lychee-action@*`, `EmbarkStudios/cargo-deny-action@*`, `rustsec/audit-check@*`, `rhysd/actionlint@*`, `sigstore/cosign-installer@*`, `Checkmarx/vorpal-reviewdog-github-action@*`, `useblacksmith/*`
-    - Added: `Swatinem/rust-cache@*` (replaces `useblacksmith/*` rust-cache fork)
-    - Retained: `actions/*`, `dtolnay/rust-toolchain@*`, `softprops/action-gh-release@*`, `docker/*`
+  - Removed patterns no longer in use: `DavidAnson/markdownlint-cli2-action@*`, `lycheeverse/lychee-action@*`, `EmbarkStudios/cargo-deny-action@*`, `rustsec/audit-check@*`, `rhysd/actionlint@*`, `sigstore/cosign-installer@*`, `Checkmarx/vorpal-reviewdog-github-action@*`, `useblacksmith/*`
+  - Added: `Swatinem/rust-cache@*` (replaces `useblacksmith/*` rust-cache fork)
+  - Retained: `actions/*`, `dtolnay/rust-toolchain@*`, `softprops/action-gh-release@*`, `docker/*`
 - 2026-03-05: CI build optimization — added mold linker, cargo-nextest, CARGO_INCREMENTAL=0
-    - sccache removed due to fragile GHA cache backend causing build failures
+  - sccache removed due to fragile GHA cache backend causing build failures
 
 ## Rollback
 

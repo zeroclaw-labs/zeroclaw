@@ -1,6 +1,6 @@
-# Quy trình PR ZeroClaw (Cộng tác khối lượng cao)
+# Quy trình PR JhedaiClaw (Cộng tác khối lượng cao)
 
-Tài liệu này định nghĩa cách ZeroClaw xử lý khối lượng PR lớn trong khi vẫn duy trì:
+Tài liệu này định nghĩa cách JhedaiClaw xử lý khối lượng PR lớn trong khi vẫn duy trì:
 
 - Hiệu suất cao
 - Hiệu quả cao
@@ -150,7 +150,7 @@ Duy trì các quy tắc branch protection sau trên `master`:
 - Bằng chứng validation đã đính kèm (không chỉ là "CI sẽ kiểm tra").
 - Các trường bảo mật và rollback đã hoàn thành cho các đường dẫn rủi ro.
 - Kiểm tra tính riêng tư/vệ sinh dữ liệu đã hoàn thành và ngôn ngữ test trung lập/theo phạm vi dự án.
-- Nếu có ngôn ngữ giống danh tính trong test/ví dụ, cần được chuẩn hóa về nhãn gốc ZeroClaw/dự án.
+- Nếu có ngôn ngữ giống danh tính trong test/ví dụ, cần được chuẩn hóa về nhãn gốc JhedaiClaw/dự án.
 
 ### 5.2 Definition of Done (DoD) sẵn sàng merge
 
@@ -305,7 +305,7 @@ Nếu một PR đã merge gây ra hồi quy:
 - Xác nhận phân loại rủi ro qua nhãn và các đường dẫn đã chạm.
 - Xác nhận tuyên bố rollback tồn tại.
 - Xác nhận phần tính riêng tư/vệ sinh dữ liệu và các yêu cầu diễn đạt trung lập đã được thỏa mãn.
-- Xác nhận bất kỳ ngôn ngữ giống danh tính nào đều sử dụng thuật ngữ gốc ZeroClaw/dự án.
+- Xác nhận bất kỳ ngôn ngữ giống danh tính nào đều sử dụng thuật ngữ gốc JhedaiClaw/dự án.
 
 ### 12.2 Làn B: review sâu (dựa trên rủi ro)
 

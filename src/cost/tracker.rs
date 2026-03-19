@@ -177,7 +177,7 @@ impl CostTracker {
 
 fn resolve_storage_path(workspace_dir: &Path) -> Result<PathBuf> {
     let storage_path = workspace_dir.join("state").join("costs.jsonl");
-    let legacy_path = workspace_dir.join(".zeroclaw").join("costs.db");
+    let legacy_path = workspace_dir.join(".jhedaiclaw").join("costs.db");
 
     if !storage_path.exists() && legacy_path.exists() {
         if let Some(parent) = storage_path.parent() {

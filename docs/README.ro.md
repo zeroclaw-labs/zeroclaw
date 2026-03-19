@@ -1,4 +1,4 @@
-# Centrul de Documentație ZeroClaw
+# Centrul de Documentație JhedaiClaw
 
 Această pagină este punctul de intrare principal al sistemului de documentație.
 
@@ -8,20 +8,20 @@ Centre localizate: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) 
 
 ## Începeți Aici
 
-| Vreau să…                                                           | Citiți aceasta                                                                 |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| Instalez și rulez ZeroClaw rapid                                    | [README.md (Start Rapid)](../README.md#quick-start)                            |
-| Bootstrap cu o singură comandă                                      | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                   |
-| Găsesc comenzi după sarcină                                         | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| Verific rapid cheile de configurare și valorile implicite           | [config-reference.md](reference/api/config-reference.md)                       |
-| Configurez furnizori/endpoint-uri personalizate                     | [custom-providers.md](contributing/custom-providers.md)                         |
-| Configurez furnizorul Z.AI / GLM                                    | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                              |
-| Folosesc modelele de integrare LangGraph                            | [langgraph-integration.md](contributing/langgraph-integration.md)               |
-| Administrez runtime-ul (runbook ziua-2)                             | [operations-runbook.md](ops/operations-runbook.md)                             |
-| Depanez probleme de instalare/runtime/canal                         | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| Configurez și diagnostichez camerele criptate Matrix                | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                           |
-| Navighez documentația pe categorii                                  | [SUMMARY.md](SUMMARY.md)                                                       |
-| Văd instantaneul documentației PR-urilor/issue-urilor proiectului   | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| Vreau să…                                                         | Citiți aceasta                                                                             |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Instalez și rulez JhedaiClaw rapid                                | [README.md (Start Rapid)](../README.md#quick-start)                                        |
+| Bootstrap cu o singură comandă                                    | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| Găsesc comenzi după sarcină                                       | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| Verific rapid cheile de configurare și valorile implicite         | [config-reference.md](reference/api/config-reference.md)                                   |
+| Configurez furnizori/endpoint-uri personalizate                   | [custom-providers.md](contributing/custom-providers.md)                                    |
+| Configurez furnizorul Z.AI / GLM                                  | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| Folosesc modelele de integrare LangGraph                          | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| Administrez runtime-ul (runbook ziua-2)                           | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| Depanez probleme de instalare/runtime/canal                       | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| Configurez și diagnostichez camerele criptate Matrix              | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| Navighez documentația pe categorii                                | [SUMMARY.md](SUMMARY.md)                                                                   |
+| Văd instantaneul documentației PR-urilor/issue-urilor proiectului | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## Arbore de Decizie Rapid (10 secunde)
 

@@ -1,4 +1,4 @@
-# Sommaire de la documentation ZeroClaw (Table des matières unifiée)
+# Sommaire de la documentation JhedaiClaw (Table des matières unifiée)
 
 Ce fichier constitue la table des matières canonique du système de documentation.
 

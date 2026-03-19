@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="zeroclaw.png" alt="ZeroClaw" width="200" />
+  <img src="jhedaiclaw.png" alt="JhedaiClaw" width="200" />
 </p>
 
-<h1 align="center">ZeroClaw 🦀</h1>
+<h1 align="center">JhedaiClaw 🦀</h1>
 
 <p align="center">
   <strong>Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.</strong><br>
@@ -13,12 +13,12 @@
   <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
   <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
   <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
-  <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
-  <a href="https://zeroclawlabs.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
+  <a href="https://x.com/jhedaiclaw?s=21"><img src="https://img.shields.io/badge/X-%40jhedaiclaw-000000?style=flat&logo=x&logoColor=white" alt="X: @jhedaiclaw" /></a>
+  <a href="https://jhedaiclaw.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
   <a href="https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search"><img src="https://img.shields.io/badge/Xiaohongshu-Official-FF2442?style=flat" alt="Xiaohongshu: Official" /></a>
-  <a href="https://t.me/zeroclawlabs"><img src="https://img.shields.io/badge/Telegram-%40zeroclawlabs-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @zeroclawlabs" /></a>
-  <a href="https://www.facebook.com/groups/zeroclaw"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
-  <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
+  <a href="https://t.me/jhedaiclaw"><img src="https://img.shields.io/badge/Telegram-%40jhedaiclaw-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @jhedaiclaw" /></a>
+  <a href="https://www.facebook.com/groups/jhedaiclaw"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
+  <a href="https://www.reddit.com/r/jhedaiclaw/"><img src="https://img.shields.io/badge/Reddit-r%2Fjhedaiclaw-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/jhedaiclaw" /></a>
 </p>
 <p align="center">
 Binuo ng mga mag-aaral at miyembro ng Harvard, MIT, at Sundai.Club na komunidad.
@@ -81,7 +81,7 @@ Binuo ng mga mag-aaral at miyembro ng Harvard, MIT, at Sundai.Club na komunidad.
 </p>
 
 <p align="center">
-  Ang ZeroClaw ay ang <strong>runtime operating system</strong> para sa agent workflows — isang infrastructure na nag-a-abstract ng mga modelo, tools, memory, at execution upang bumuo ng mga agent nang isang beses at patakbuhin ang mga ito kahit saan.
+  Ang JhedaiClaw ay ang <strong>runtime operating system</strong> para sa agent workflows — isang infrastructure na nag-a-abstract ng mga modelo, tools, memory, at execution upang bumuo ng mga agent nang isang beses at patakbuhin ang mga ito kahit saan.
 </p>
 
 <p align="center"><code>Trait-driven architecture · secure-by-default runtime · swappable provider/channel/tool · lahat ay pluggable</code></p>
@@ -90,9 +90,9 @@ Binuo ng mga mag-aaral at miyembro ng Harvard, MIT, at Sundai.Club na komunidad.
 
 ### 🚀 What's New in v0.3.1 (March 2026)
 
-| Area | Highlights |
-|---|---|
-| ci | add Termux (aarch64-linux-android) release target |
+| Area | Highlights                                        |
+| ---- | ------------------------------------------------- |
+| ci   | add Termux (aarch64-linux-android) release target |
 
 <!-- END:WHATS_NEW -->
 
@@ -100,11 +100,11 @@ Binuo ng mga mag-aaral at miyembro ng Harvard, MIT, at Sundai.Club na komunidad.
 
 Gamitin ang talahanayang ito para sa mahahalagang paunawa (compatibility changes, security notices, maintenance windows, at version blocks).
 
-| Petsa (UTC) | Antas      | Paunawa                                                                                                                                                                                                                                                                                                                                                                                                              | Aksyon                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| ---------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2026-02-19 | _Kritikal_  | **Hindi kami kaugnay** sa `openagen/zeroclaw` o `zeroclaw.org`. Ang domain na `zeroclaw.org` ay kasalukuyang tumuturo sa fork na `openagen/zeroclaw`, at ang domain/repository na ito ay nanggagaya sa aming opisyal na website/proyekto.                                                                                                                                                                                 | Huwag magtiwala sa impormasyon, binaries, fundraising, o mga anunsyo mula sa mga pinagmulang ito. Gamitin lamang [ang repository na ito](https://github.com/zeroclaw-labs/zeroclaw) at aming mga verified social media accounts.                                                                                                                                                                                                                                                                                                                                                          |
-| 2026-02-21 | _Mahalaga_ | Ang aming opisyal na website ay ngayon online: [zeroclawlabs.ai](https://zeroclawlabs.ai). Salamat sa iyong pasensya sa panahon ng paghihintay. Nakikita pa rin namin ang mga pagtatangka ng panliliko: huwag lumahok sa anumang investment/funding activity sa ngalan ng ZeroClaw kung hindi ito nai-publish sa pamamagitan ng aming mga opisyal na channel.                                                                                                                   | Gamitin [ang repository na ito](https://github.com/zeroclaw-labs/zeroclaw) bilang nag-iisang source of truth. Sundan [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Telegram (@zeroclawlabs)](https://t.me/zeroclawlabs), [Facebook (grupo)](https://www.facebook.com/groups/zeroclaw), [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/), at [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) para sa mga opisyal na update. |
-| 2026-02-19 | _Mahalaga_ | In-update ng Anthropic ang authentication at credential use terms noong 2026-02-19. Ang OAuth authentication (Free, Pro, Max) ay eksklusibo para sa Claude Code at Claude.ai; ang paggamit ng Claude Free/Pro/Max OAuth tokens sa anumang iba pang produkto, tool, o serbisyo (kasama ang Agent SDK) ay hindi pinapayagan at maaaring lumabag sa Consumer Terms of Use. | Mangyaring pansamantalang iwasan ang Claude Code OAuth integrations upang maiwasan ang anumang potensyal na pagkawala. Orihinal na clause: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).                                                                                                                                                                                                                                                                                                                      |
+| Petsa (UTC) | Antas      | Paunawa                                                                                                                                                                                                                                                                                                                                                                 | Aksyon                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ----------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2026-02-19  | _Kritikal_ | **Hindi kami kaugnay** sa `openagen/jhedaiclaw` o `jhedaiclaw.org`. Ang domain na `jhedaiclaw.org` ay kasalukuyang tumuturo sa fork na `openagen/jhedaiclaw`, at ang domain/repository na ito ay nanggagaya sa aming opisyal na website/proyekto.                                                                                                                       | Huwag magtiwala sa impormasyon, binaries, fundraising, o mga anunsyo mula sa mga pinagmulang ito. Gamitin lamang [ang repository na ito](https://github.com/jhedai/jhedaiclaw) at aming mga verified social media accounts.                                                                                                                                                                                                                                                                                                                              |
+| 2026-02-21  | _Mahalaga_ | Ang aming opisyal na website ay ngayon online: [jhedaiclaw.ai](https://jhedaiclaw.ai). Salamat sa iyong pasensya sa panahon ng paghihintay. Nakikita pa rin namin ang mga pagtatangka ng panliliko: huwag lumahok sa anumang investment/funding activity sa ngalan ng JhedaiClaw kung hindi ito nai-publish sa pamamagitan ng aming mga opisyal na channel.             | Gamitin [ang repository na ito](https://github.com/jhedai/jhedaiclaw) bilang nag-iisang source of truth. Sundan [X (@jhedaiclaw)](https://x.com/jhedaiclaw?s=21), [Telegram (@jhedaiclaw)](https://t.me/jhedaiclaw), [Facebook (grupo)](https://www.facebook.com/groups/jhedaiclaw), [Reddit (r/jhedaiclaw)](https://www.reddit.com/r/jhedaiclaw/), at [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) para sa mga opisyal na update. |
+| 2026-02-19  | _Mahalaga_ | In-update ng Anthropic ang authentication at credential use terms noong 2026-02-19. Ang OAuth authentication (Free, Pro, Max) ay eksklusibo para sa Claude Code at Claude.ai; ang paggamit ng Claude Free/Pro/Max OAuth tokens sa anumang iba pang produkto, tool, o serbisyo (kasama ang Agent SDK) ay hindi pinapayagan at maaaring lumabag sa Consumer Terms of Use. | Mangyaring pansamantalang iwasan ang Claude Code OAuth integrations upang maiwasan ang anumang potensyal na pagkawala. Orihinal na clause: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).                                                                                                                                                                                                                                                                                  |
 
 ### ✨ Mga Tampok
 
@@ -113,29 +113,29 @@ Gamitin ang talahanayang ito para sa mahahalagang paunawa (compatibility changes
 - ⚡ **Fast Cold Starts:** Ang single-binary Rust runtime ay nagpapanatili ng command at daemon startup na halos instant para sa pang-araw-araw na operasyon.
 - 🌍 **Portable Architecture:** Isang single-binary workflow sa ARM, x86, at RISC-V na may swappable na provider/channel/tool.
 
-### Bakit pinipili ng mga team ang ZeroClaw
+### Bakit pinipili ng mga team ang JhedaiClaw
 
 - **Lightweight by default:** maliit na Rust binary, mabilis na startup, mababang memory footprint.
 - **Secure by design:** pairing, strict sandboxing, explicit allowlists, workspace scope.
 - **Fully swappable:** ang core systems ay traits (providers, channels, tools, memory, tunnels).
 - **No vendor lock-in:** OpenAI-compatible provider support + pluggable custom endpoints.
 
-## Benchmark Snapshot (ZeroClaw vs OpenClaw, Reproducible)
+## Benchmark Snapshot (JhedaiClaw vs OpenClaw, Reproducible)
 
 Mabilis na benchmark sa lokal na machine (macOS arm64, Peb. 2026) na normalized para sa 0.8 GHz edge hardware.
 
-|                              | OpenClaw      | NanoBot        | PicoClaw        | ZeroClaw 🦀           |
-| ---------------------------- | ------------- | -------------- | --------------- | --------------------- |
-| **Wika**                  | TypeScript    | Python         | Go              | **Rust**              |
-| **RAM**                      | > 1 GB        | > 100 MB       | < 10 MB         | **< 5 MB**            |
-| **Startup (0.8 GHz core)** | > 500s        | > 30s          | < 1s            | **< 10ms**            |
-| **Binary Size**           | ~28 MB (dist) | N/A (Scripts)  | ~8 MB           | **3.4 MB**            |
-| **Gastos**                     | Mac Mini $599 | Linux SBC ~$50 | Linux board $10 | **Kahit anong hardware $10** |
+|                            | OpenClaw      | NanoBot        | PicoClaw        | JhedaiClaw 🦀                |
+| -------------------------- | ------------- | -------------- | --------------- | ---------------------------- |
+| **Wika**                   | TypeScript    | Python         | Go              | **Rust**                     |
+| **RAM**                    | > 1 GB        | > 100 MB       | < 10 MB         | **< 5 MB**                   |
+| **Startup (0.8 GHz core)** | > 500s        | > 30s          | < 1s            | **< 10ms**                   |
+| **Binary Size**            | ~28 MB (dist) | N/A (Scripts)  | ~8 MB           | **3.4 MB**                   |
+| **Gastos**                 | Mac Mini $599 | Linux SBC ~$50 | Linux board $10 | **Kahit anong hardware $10** |
 
-> Mga Tala: Ang mga resulta ng ZeroClaw ay sinusukat sa production builds gamit ang `/usr/bin/time -l`. Ang OpenClaw ay nangangailangan ng Node.js runtime (typically ~390 MB additional memory overhead), habang ang NanoBot ay nangangailangan ng Python runtime. Ang PicoClaw at ZeroClaw ay static binaries. Ang mga RAM figure sa itaas ay runtime memory; ang build-time compilation requirements ay mas mataas.
+> Mga Tala: Ang mga resulta ng JhedaiClaw ay sinusukat sa production builds gamit ang `/usr/bin/time -l`. Ang OpenClaw ay nangangailangan ng Node.js runtime (typically ~390 MB additional memory overhead), habang ang NanoBot ay nangangailangan ng Python runtime. Ang PicoClaw at JhedaiClaw ay static binaries. Ang mga RAM figure sa itaas ay runtime memory; ang build-time compilation requirements ay mas mataas.
 
 <p align="center">
-  <img src="zero-claw.jpeg" alt="ZeroClaw vs OpenClaw Comparison" width="800" />
+  <img src="zero-claw.jpeg" alt="JhedaiClaw vs OpenClaw Comparison" width="800" />
 </p>
 
 ### Reproducible Local Measurement
@@ -144,17 +144,17 @@ Ang mga benchmark claim ay maaaring mag-drift habang ang code at toolchains ay n
 
 ```bash
 cargo build --release
-ls -lh target/release/zeroclaw
+ls -lh target/release/jhedaiclaw
 
-/usr/bin/time -l target/release/zeroclaw --help
-/usr/bin/time -l target/release/zeroclaw status
+/usr/bin/time -l target/release/jhedaiclaw --help
+/usr/bin/time -l target/release/jhedaiclaw status
 ```
 
 Halimbawa ng sample (macOS arm64, nasukat noong Pebrero 18, 2026):
 
 - Release binary size: `8.8M`
-- `zeroclaw --help`: real time na humigit-kumulang `0.02s`, peak memory footprint ~`3.9 MB`
-- `zeroclaw status`: real time na humigit-kumulang `0.01s`, peak memory footprint ~`4.1 MB`
+- `jhedaiclaw --help`: real time na humigit-kumulang `0.02s`, peak memory footprint ~`3.9 MB`
+- `jhedaiclaw status`: real time na humigit-kumulang `0.01s`, peak memory footprint ~`4.1 MB`
 
 ## Mga Kinakailangan
 
@@ -165,25 +165,25 @@ Halimbawa ng sample (macOS arm64, nasukat noong Pebrero 18, 2026):
 
 1. **Visual Studio Build Tools** (nagbibigay ng MSVC linker at Windows SDK):
 
-    ```powershell
-    winget install Microsoft.VisualStudio.2022.BuildTools
-    ```
+   ```powershell
+   winget install Microsoft.VisualStudio.2022.BuildTools
+   ```
 
-    Sa panahon ng installation (o sa pamamagitan ng Visual Studio Installer), piliin ang **"Desktop development with C++"** workload.
+   Sa panahon ng installation (o sa pamamagitan ng Visual Studio Installer), piliin ang **"Desktop development with C++"** workload.
 
 2. **Rust Toolchain:**
 
-    ```powershell
-    winget install Rustlang.Rustup
-    ```
+   ```powershell
+   winget install Rustlang.Rustup
+   ```
 
-    Pagkatapos ng installation, magbukas ng bagong terminal at patakbuhin ang `rustup default stable` upang matiyak na ang stable toolchain ay aktibo.
+   Pagkatapos ng installation, magbukas ng bagong terminal at patakbuhin ang `rustup default stable` upang matiyak na ang stable toolchain ay aktibo.
 
 3. **I-verify** na ang pareho ay gumagana:
-    ```powershell
-    rustc --version
-    cargo --version
-    ```
+   ```powershell
+   rustc --version
+   cargo --version
+   ```
 
 ### Windows — Opsyonal
 
@@ -197,30 +197,30 @@ Halimbawa ng sample (macOS arm64, nasukat noong Pebrero 18, 2026):
 ### Linux / macOS — Kinakailangan
 
 1. **Essential build tools:**
-    - **Linux (Debian/Ubuntu):** `sudo apt install build-essential pkg-config`
-    - **Linux (Fedora/RHEL):** `sudo dnf group install development-tools && sudo dnf install pkg-config`
-    - **macOS:** I-install ang Xcode Command Line Tools: `xcode-select --install`
+   - **Linux (Debian/Ubuntu):** `sudo apt install build-essential pkg-config`
+   - **Linux (Fedora/RHEL):** `sudo dnf group install development-tools && sudo dnf install pkg-config`
+   - **macOS:** I-install ang Xcode Command Line Tools: `xcode-select --install`
 
 2. **Rust Toolchain:**
 
-    ```bash
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-    ```
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   ```
 
-    Tingnan ang [rustup.rs](https://rustup.rs) para sa mga detalye.
+   Tingnan ang [rustup.rs](https://rustup.rs) para sa mga detalye.
 
 3. **I-verify:**
-    ```bash
-    rustc --version
-    cargo --version
-    ```
+   ```bash
+   rustc --version
+   cargo --version
+   ```
 
 ### Linux / macOS — Opsyonal
 
 - **Docker** — kinakailangan lamang kung gagamit ka ng [Docker sandboxed runtime](#current-runtime-support) (`runtime.kind = "docker"`).
-    - **Linux (Debian/Ubuntu):** tingnan ang [docs.docker.com](https://docs.docker.com/engine/install/ubuntu/)
-    - **Linux (Fedora/RHEL):** tingnan ang [docs.docker.com](https://docs.docker.com/engine/install/fedora/)
-    - **macOS:** i-install ang Docker Desktop sa pamamagitan ng [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/)
+  - **Linux (Debian/Ubuntu):** tingnan ang [docs.docker.com](https://docs.docker.com/engine/install/ubuntu/)
+  - **Linux (Fedora/RHEL):** tingnan ang [docs.docker.com](https://docs.docker.com/engine/install/fedora/)
+  - **macOS:** i-install ang Docker Desktop sa pamamagitan ng [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/)
 
 </details>
 
@@ -228,22 +228,22 @@ Halimbawa ng sample (macOS arm64, nasukat noong Pebrero 18, 2026):
 
 ### Option 1: Automated setup (inirerekomenda)
 
-Ang `bootstrap.sh` script ay nag-i-install ng Rust, nagi-clone ng ZeroClaw, nagi-compile, at nagse-set up ng iyong paunang development environment:
+Ang `bootstrap.sh` script ay nag-i-install ng Rust, nagi-clone ng JhedaiClaw, nagi-compile, at nagse-set up ng iyong paunang development environment:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jhedai/jhedaiclaw/master/bootstrap.sh | bash
 ```
 
 Ito ay:
 
 1. Mag-i-install ng Rust (kung wala)
-2. Magi-clone ng ZeroClaw repository
-3. Magi-compile ng ZeroClaw sa release mode
-4. Mag-i-install ng `zeroclaw` sa `~/.cargo/bin/`
-5. Gagawa ng default workspace structure sa `~/.zeroclaw/workspace/`
-6. Gagawa ng paunang configuration file na `~/.zeroclaw/workspace/config.toml`
+2. Magi-clone ng JhedaiClaw repository
+3. Magi-compile ng JhedaiClaw sa release mode
+4. Mag-i-install ng `jhedaiclaw` sa `~/.cargo/bin/`
+5. Gagawa ng default workspace structure sa `~/.jhedaiclaw/workspace/`
+6. Gagawa ng paunang configuration file na `~/.jhedaiclaw/workspace/config.toml`
 
-Pagkatapos ng bootstrap, i-reload ang iyong shell o patakbuhin ang `source ~/.cargo/env` para gamitin ang `zeroclaw` command globally.
+Pagkatapos ng bootstrap, i-reload ang iyong shell o patakbuhin ang `source ~/.cargo/env` para gamitin ang `jhedaiclaw` command globally.
 
 ### Option 2: Manual installation
 
@@ -252,8 +252,8 @@ Pagkatapos ng bootstrap, i-reload ang iyong shell o patakbuhin ang `source ~/.ca
 
 ```bash
 # 1. I-clone ang repository
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/jhedai/jhedaiclaw.git
+cd jhedaiclaw
 
 # 2. I-compile sa release
 cargo build --release --locked
@@ -262,11 +262,11 @@ cargo build --release --locked
 cargo install --path . --locked
 
 # 4. I-initialize ang workspace
-zeroclaw init
+jhedaiclaw init
 
 # 5. I-verify ang installation
-zeroclaw --version
-zeroclaw status
+jhedaiclaw --version
+jhedaiclaw status
 ```
 
 </details>
@@ -276,7 +276,7 @@ zeroclaw status
 Kapag na-install (sa pamamagitan ng bootstrap o manual), dapat mong makita:
 
 ```
-~/.zeroclaw/workspace/
+~/.jhedaiclaw/workspace/
 ├── config.toml          # Main configuration
 ├── .pairing             # Pairing secrets (generated on first launch)
 ├── logs/                # Daemon/agent logs
@@ -286,14 +286,14 @@ Kapag na-install (sa pamamagitan ng bootstrap o manual), dapat mong makita:
 
 **Mga susunod na hakbang:**
 
-1. I-configure ang iyong AI providers sa `~/.zeroclaw/workspace/config.toml`
+1. I-configure ang iyong AI providers sa `~/.jhedaiclaw/workspace/config.toml`
 2. Tingnan ang [configuration reference](docs/config-reference.md) para sa advanced options
-3. Simulan ang agent: `zeroclaw agent start`
+3. Simulan ang agent: `jhedaiclaw agent start`
 4. I-test sa pamamagitan ng iyong preferred channel (tingnan ang [channels reference](docs/channels-reference.md))
 
 ## Configuration
 
-I-edit ang `~/.zeroclaw/workspace/config.toml` para i-configure ang providers, channels, at system behavior.
+I-edit ang `~/.jhedaiclaw/workspace/config.toml` para i-configure ang providers, channels, at system behavior.
 
 ### Quick Configuration Reference
 
@@ -332,7 +332,7 @@ kind = "native"    # o "docker" (nangangailangan ng Docker)
 
 ### Current Runtime Support
 
-Sinusuportahan ng ZeroClaw ang dalawang code execution backends:
+Sinusuportahan ng JhedaiClaw ang dalawang code execution backends:
 
 - **`native`** (default) — direct process execution, pinakamabilis na path, ideal para sa trusted environments
 - **`docker`** — full container isolation, hardened security policies, nangangailangan ng Docker
@@ -343,32 +343,32 @@ Gamitin ang `runtime.kind = "docker"` kung kailangan mo ng strict sandboxing o n
 
 ```bash
 # Workspace management
-zeroclaw init                # Nag-initialize ng bagong workspace
-zeroclaw status              # Nagpapakita ng daemon/agent status
-zeroclaw config validate     # Nag-verify ng config.toml syntax at values
+jhedaiclaw init                # Nag-initialize ng bagong workspace
+jhedaiclaw status              # Nagpapakita ng daemon/agent status
+jhedaiclaw config validate     # Nag-verify ng config.toml syntax at values
 
 # Daemon management
-zeroclaw daemon start        # Nagse-start ng daemon sa background
-zeroclaw daemon stop         # Naghihinto sa running daemon
-zeroclaw daemon restart      # Nagre-restart ng daemon (config reload)
-zeroclaw daemon logs         # Nagpapakita ng daemon logs
+jhedaiclaw daemon start        # Nagse-start ng daemon sa background
+jhedaiclaw daemon stop         # Naghihinto sa running daemon
+jhedaiclaw daemon restart      # Nagre-restart ng daemon (config reload)
+jhedaiclaw daemon logs         # Nagpapakita ng daemon logs
 
 # Agent management
-zeroclaw agent start         # Nagse-start ng agent (nangangailangan ng running daemon)
-zeroclaw agent stop          # Naghihinto sa agent
-zeroclaw agent restart       # Nagre-restart ng agent (config reload)
+jhedaiclaw agent start         # Nagse-start ng agent (nangangailangan ng running daemon)
+jhedaiclaw agent stop          # Naghihinto sa agent
+jhedaiclaw agent restart       # Nagre-restart ng agent (config reload)
 
 # Pairing operations
-zeroclaw pairing init        # Nag-generate ng bagong pairing secret
-zeroclaw pairing rotate      # Nag-rotate ng existing pairing secret
+jhedaiclaw pairing init        # Nag-generate ng bagong pairing secret
+jhedaiclaw pairing rotate      # Nag-rotate ng existing pairing secret
 
 # Tunneling (para sa public exposure)
-zeroclaw tunnel start        # Nagse-start ng tunnel sa local daemon
-zeroclaw tunnel stop         # Naghihinto sa active tunnel
+jhedaiclaw tunnel start        # Nagse-start ng tunnel sa local daemon
+jhedaiclaw tunnel stop         # Naghihinto sa active tunnel
 
 # Diagnostics
-zeroclaw doctor              # Nagpapatakbo ng system health checks
-zeroclaw version             # Nagpapakita ng version at build info
+jhedaiclaw doctor              # Nagpapatakbo ng system health checks
+jhedaiclaw version             # Nagpapakita ng version at build info
 ```
 
 Tingnan ang [Commands Reference](docs/commands-reference.md) para sa buong options at examples.
@@ -406,9 +406,9 @@ Para sa deployment at runtime operations:
 - Network Deployment Guide: [docs/network-deployment.md](docs/network-deployment.md)
 - Proxy Agent Playbook: [docs/proxy-agent-playbook.md](docs/proxy-agent-playbook.md)
 
-## Suportahan ang ZeroClaw
+## Suportahan ang JhedaiClaw
 
-Kung tinutulungan ng ZeroClaw ang iyong trabaho at nais mong suportahan ang patuloy na development, maaari kang mag-donate dito:
+Kung tinutulungan ng JhedaiClaw ang iyong trabaho at nais mong suportahan ang patuloy na development, maaari kang mag-donate dito:
 
 <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=for-the-badge&logo=buy-me-a-coffee" alt="Bilhan Mo Ako ng Kape" /></a>
 
@@ -439,30 +439,30 @@ Thank you to everyone who opened issues, reviewed PRs, translated docs, and help
 
 ## ⚠️ Official Repository at Impersonation Warning
 
-**Ito ang tanging opisyal na ZeroClaw repository:**
+**Ito ang tanging opisyal na JhedaiClaw repository:**
 
-> <https://github.com/zeroclaw-labs/zeroclaw>
+> <https://github.com/jhedai/jhedaiclaw>
 
-Ang anumang iba pang repository, organization, domain, o package na nagpapanggap na "ZeroClaw" o nagpapahiwatig ng affiliation sa ZeroClaw Labs ay **hindi awtorisado at hindi kaugnay sa proyektong ito**. Ang mga kilalang unauthorized forks ay ililista sa [TRADEMARK.md](TRADEMARK.md).
+Ang anumang iba pang repository, organization, domain, o package na nagpapanggap na "JhedaiClaw" o nagpapahiwatig ng affiliation sa JhedaiClaw Labs ay **hindi awtorisado at hindi kaugnay sa proyektong ito**. Ang mga kilalang unauthorized forks ay ililista sa [TRADEMARK.md](TRADEMARK.md).
 
-Kung makakita ka ng impersonation o trademark misuse, mangyaring [magbukas ng isyu](https://github.com/zeroclaw-labs/zeroclaw/issues).
+Kung makakita ka ng impersonation o trademark misuse, mangyaring [magbukas ng isyu](https://github.com/jhedai/jhedaiclaw/issues).
 
 ---
 
 ## License
 
-Ang ZeroClaw ay dual-licensed para sa maximum openness at contributor protection:
+Ang JhedaiClaw ay dual-licensed para sa maximum openness at contributor protection:
 
-| License                      | Use Cases                                            |
-| ---------------------------- | ------------------------------------------------------------ |
-| [MIT](LICENSE-MIT)               | Open-source, research, academic, personal use          |
+| License                      | Use Cases                                               |
+| ---------------------------- | ------------------------------------------------------- |
+| [MIT](LICENSE-MIT)           | Open-source, research, academic, personal use           |
 | [Apache 2.0](LICENSE-APACHE) | Patent protection, institutional, commercial deployment |
 
 Maaari mong piliin ang alinmang license. **Ang mga contributor ay awtomatikong nagbibigay ng rights sa ilalim ng pareho** — tingnan ang [CLA.md](CLA.md) para sa kumpletong contributor agreement.
 
 ### Trademark
 
-Ang pangalang **ZeroClaw** at logo ay mga rehistradong trademark ng ZeroClaw Labs. Ang license na ito ay hindi nagbibigay ng pahintulot na gamitin ang mga ito upang ipahiwatig ang endorsement o affiliation. Tingnan ang [TRADEMARK.md](TRADEMARK.md) para sa mga allowed at prohibited uses.
+Ang pangalang **JhedaiClaw** at logo ay mga rehistradong trademark ng JhedaiClaw Labs. Ang license na ito ay hindi nagbibigay ng pahintulot na gamitin ang mga ito upang ipahiwatig ang endorsement o affiliation. Tingnan ang [TRADEMARK.md](TRADEMARK.md) para sa mga allowed at prohibited uses.
 
 ### Contributor Protections
 
@@ -482,20 +482,20 @@ Tingnan ang [CONTRIBUTING.md](CONTRIBUTING.md) at [CLA.md](CLA.md). Mag-implemen
 - Bagong `Tool` → `src/tools/`
 - Bagong `Memory` → `src/memory/`
 - Bagong `Tunnel` → `src/tunnel/`
-- Bagong `Skill` → `~/.zeroclaw/workspace/skills/<n>/`
+- Bagong `Skill` → `~/.jhedaiclaw/workspace/skills/<n>/`
 
 ---
 
-**ZeroClaw** — Zero overhead. Zero compromise. Deploy anywhere. Swap anything. 🦀
+**JhedaiClaw** — Zero overhead. Zero compromise. Deploy anywhere. Swap anything. 🦀
 
 ## Star History
 
 <p align="center">
-  <a href="https://www.star-history.com/#zeroclaw-labs/zeroclaw&type=date&legend=top-left">
+  <a href="https://www.star-history.com/#jhedai/jhedaiclaw&type=date&legend=top-left">
     <picture>
-     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&theme=dark&legend=top-left" />
-     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
-     <img alt="Star History Graph" src="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
+     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=jhedai/jhedaiclaw&type=date&theme=dark&legend=top-left" />
+     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=jhedai/jhedaiclaw&type=date&legend=top-left" />
+     <img alt="Star History Graph" src="https://api.star-history.com/svg?repos=jhedai/jhedaiclaw&type=date&legend=top-left" />
     </picture>
   </a>
 </p>

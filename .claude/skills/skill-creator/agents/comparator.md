@@ -53,6 +53,7 @@ Based on the task, generate a rubric with two dimensions:
 | Usability | Difficult to use | Usable with effort | Easy to use |
 
 Adapt criteria to the specific task. For example:
+
 - PDF form → "Field alignment", "Text readability", "Data placement"
 - Document → "Section structure", "Heading hierarchy", "Paragraph flow"
 - Data output → "Schema correctness", "Data types", "Completeness"
@@ -131,38 +132,46 @@ Write a JSON file with this structure:
   "output_quality": {
     "A": {
       "score": 9,
-      "strengths": ["Complete solution", "Well-formatted", "All fields present"],
+      "strengths": [
+        "Complete solution",
+        "Well-formatted",
+        "All fields present"
+      ],
       "weaknesses": ["Minor style inconsistency in header"]
     },
     "B": {
       "score": 5,
       "strengths": ["Readable output", "Correct basic structure"],
-      "weaknesses": ["Missing date field", "Formatting inconsistencies", "Partial data extraction"]
+      "weaknesses": [
+        "Missing date field",
+        "Formatting inconsistencies",
+        "Partial data extraction"
+      ]
     }
   },
   "expectation_results": {
     "A": {
       "passed": 4,
       "total": 5,
-      "pass_rate": 0.80,
+      "pass_rate": 0.8,
       "details": [
-        {"text": "Output includes name", "passed": true},
-        {"text": "Output includes date", "passed": true},
-        {"text": "Format is PDF", "passed": true},
-        {"text": "Contains signature", "passed": false},
-        {"text": "Readable text", "passed": true}
+        { "text": "Output includes name", "passed": true },
+        { "text": "Output includes date", "passed": true },
+        { "text": "Format is PDF", "passed": true },
+        { "text": "Contains signature", "passed": false },
+        { "text": "Readable text", "passed": true }
       ]
     },
     "B": {
       "passed": 3,
       "total": 5,
-      "pass_rate": 0.60,
+      "pass_rate": 0.6,
       "details": [
-        {"text": "Output includes name", "passed": true},
-        {"text": "Output includes date", "passed": false},
-        {"text": "Format is PDF", "passed": true},
-        {"text": "Contains signature", "passed": false},
-        {"text": "Readable text", "passed": true}
+        { "text": "Output includes name", "passed": true },
+        { "text": "Output includes date", "passed": false },
+        { "text": "Format is PDF", "passed": true },
+        { "text": "Contains signature", "passed": false },
+        { "text": "Readable text", "passed": true }
       ]
     }
   }

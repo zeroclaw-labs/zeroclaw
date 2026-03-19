@@ -1,32 +1,32 @@
-# Thêm Board và Tool — Hướng dẫn phần cứng ZeroClaw
+# Thêm Board và Tool — Hướng dẫn phần cứng JhedaiClaw
 
-Hướng dẫn này giải thích cách thêm board phần cứng mới và tool tùy chỉnh vào ZeroClaw.
+Hướng dẫn này giải thích cách thêm board phần cứng mới và tool tùy chỉnh vào JhedaiClaw.
 
 ## Bắt đầu nhanh: Thêm board qua CLI
 
 ```bash
-# Thêm board (cập nhật ~/.zeroclaw/config.toml)
-zeroclaw peripheral add nucleo-f401re /dev/ttyACM0
-zeroclaw peripheral add arduino-uno /dev/cu.usbmodem12345
-zeroclaw peripheral add rpi-gpio native   # cho Raspberry Pi GPIO (Linux)
+# Thêm board (cập nhật ~/.jhedaiclaw/config.toml)
+jhedaiclaw peripheral add nucleo-f401re /dev/ttyACM0
+jhedaiclaw peripheral add arduino-uno /dev/cu.usbmodem12345
+jhedaiclaw peripheral add rpi-gpio native   # cho Raspberry Pi GPIO (Linux)
 
 # Khởi động lại daemon để áp dụng
-zeroclaw daemon --host 127.0.0.1 --port 3000
+jhedaiclaw daemon --host 127.0.0.1 --port 3000
 ```
 
 ## Các board được hỗ trợ
 
-| Board | Transport | Ví dụ đường dẫn |
-|-------|-----------|-----------------|
-| nucleo-f401re | serial | /dev/ttyACM0, /dev/cu.usbmodem* |
-| arduino-uno | serial | /dev/ttyACM0, /dev/cu.usbmodem* |
-| arduino-uno-q | bridge | (IP của Uno Q) |
-| rpi-gpio | native | native |
-| esp32 | serial | /dev/ttyUSB0 |
+| Board         | Transport | Ví dụ đường dẫn                  |
+| ------------- | --------- | -------------------------------- |
+| nucleo-f401re | serial    | /dev/ttyACM0, /dev/cu.usbmodem\* |
+| arduino-uno   | serial    | /dev/ttyACM0, /dev/cu.usbmodem\* |
+| arduino-uno-q | bridge    | (IP của Uno Q)                   |
+| rpi-gpio      | native    | native                           |
+| esp32         | serial    | /dev/ttyUSB0                     |
 
 ## Cấu hình thủ công
 
-Chỉnh sửa `~/.zeroclaw/config.toml`:
+Chỉnh sửa `~/.jhedaiclaw/config.toml`:
 
 ```toml
 [peripherals]
@@ -60,7 +60,7 @@ Thêm mục `## Pin Aliases` để agent có thể ánh xạ "red led" → pin 1
 ## Pin Aliases
 
 | alias       | pin |
-|-------------|-----|
+| ----------- | --- |
 | red_led     | 13  |
 | builtin_led | 13  |
 | user_led    | 5   |
@@ -70,13 +70,14 @@ Hoặc dùng định dạng key-value:
 
 ```markdown
 ## Pin Aliases
+
 red_led: 13
 builtin_led: 13
 ```
 
 ### PDF Datasheets
 
-Với feature `rag-pdf`, ZeroClaw có thể lập chỉ mục file PDF:
+Với feature `rag-pdf`, JhedaiClaw có thể lập chỉ mục file PDF:
 
 ```bash
 cargo build --features hardware,rag-pdf
@@ -87,7 +88,7 @@ cargo build --features hardware,rag-pdf
 ## Thêm loại board mới
 
 1. **Tạo datasheet** — `docs/datasheets/my-board.md` với pin aliases và thông tin GPIO.
-2. **Thêm vào config** — `zeroclaw peripheral add my-board /dev/ttyUSB0`
+2. **Thêm vào config** — `jhedaiclaw peripheral add my-board /dev/ttyUSB0`
 3. **Triển khai peripheral** (tùy chọn) — Với giao thức tùy chỉnh, hãy implement trait `Peripheral` trong `src/peripherals/` và đăng ký trong `create_peripheral_tools`.
 
 Xem `docs/hardware-peripherals-design.md` để hiểu toàn bộ thiết kế.
@@ -100,14 +101,14 @@ Xem `docs/hardware-peripherals-design.md` để hiểu toàn bộ thiết kế.
 
 ## Tham chiếu CLI
 
-| Lệnh | Mô tả |
-|------|-------|
-| `zeroclaw peripheral list` | Liệt kê các board đã cấu hình |
-| `zeroclaw peripheral add <board> <path>` | Thêm board (ghi vào config) |
-| `zeroclaw peripheral flash` | Nạp firmware Arduino |
-| `zeroclaw peripheral flash-nucleo` | Nạp firmware Nucleo |
-| `zeroclaw hardware discover` | Liệt kê thiết bị USB |
-| `zeroclaw hardware info` | Thông tin chip qua probe-rs |
+| Lệnh                                       | Mô tả                         |
+| ------------------------------------------ | ----------------------------- |
+| `jhedaiclaw peripheral list`               | Liệt kê các board đã cấu hình |
+| `jhedaiclaw peripheral add <board> <path>` | Thêm board (ghi vào config)   |
+| `jhedaiclaw peripheral flash`              | Nạp firmware Arduino          |
+| `jhedaiclaw peripheral flash-nucleo`       | Nạp firmware Nucleo           |
+| `jhedaiclaw hardware discover`             | Liệt kê thiết bị USB          |
+| `jhedaiclaw hardware info`                 | Thông tin chip qua probe-rs   |
 
 ## Xử lý sự cố
 

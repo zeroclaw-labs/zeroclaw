@@ -12,7 +12,7 @@
 
 ## 1. 概述
 
-ZeroClaw 通过统一的 SOP 调度器（`dispatch_sop_event`）路由 MQTT/webhook/cron/外围设备事件。
+JhedaiClaw 通过统一的 SOP 调度器（`dispatch_sop_event`）路由 MQTT/webhook/cron/外围设备事件。
 
 关键行为：
 
@@ -29,7 +29,7 @@ ZeroClaw 通过统一的 SOP 调度器（`dispatch_sop_event`）路由 MQTT/webh
 ```toml
 [channels_config.mqtt]
 broker_url = \"mqtts://broker.example.com:8883\"  # 明文使用 mqtt://
-client_id = \"zeroclaw-agent-1\"
+client_id = \"jhedaiclaw-agent-1\"
 topics = [\"sensors/alert\", \"ops/deploy/#\"]
 qos = 1
 username = \"mqtt-user\"      # 可选
@@ -48,7 +48,7 @@ topic = \"sensors/alert\"
 condition = \"$.severity >= 2\"
 ```
 
-MQTT  payload 会被转发到 SOP 事件 payload（`event.payload`），然后显示在步骤上下文中。
+MQTT payload 会被转发到 SOP 事件 payload（`event.payload`），然后显示在步骤上下文中。
 
 ## 3. Webhook 集成
 
@@ -124,20 +124,20 @@ Cron 表达式支持 5、6 或 7 个字段。
 
 ## 5. 安全默认值
 
-| 功能 | 机制 |
-|---|---|
-| **MQTT 传输** | `mqtts://` + `use_tls = true` 实现 TLS 传输 |
-| **Webhook 认证** | 配对 bearer 令牌（默认需要），可选共享密钥头 |
-| **速率限制** | webhook 路由的单客户端限制（`webhook_rate_limit_per_minute`，默认 `60`） |
-| **幂等性** | 基于头的重复数据删除（`X-Idempotency-Key`，默认 TTL `300s`） |
-| **Cron 验证** | 无效的 cron 表达式在解析/缓存构建期间失败关闭 |
+| 功能             | 机制                                                                     |
+| ---------------- | ------------------------------------------------------------------------ |
+| **MQTT 传输**    | `mqtts://` + `use_tls = true` 实现 TLS 传输                              |
+| **Webhook 认证** | 配对 bearer 令牌（默认需要），可选共享密钥头                             |
+| **速率限制**     | webhook 路由的单客户端限制（`webhook_rate_limit_per_minute`，默认 `60`） |
+| **幂等性**       | 基于头的重复数据删除（`X-Idempotency-Key`，默认 TTL `300s`）             |
+| **Cron 验证**    | 无效的 cron 表达式在解析/缓存构建期间失败关闭                            |
 
 ## 6. 故障排除
 
-| 症状 | 可能原因 | 修复 |
-|---|---|---|
-| **MQTT** 连接错误 | broker URL/TLS 不匹配 | 验证 scheme + TLS 标志配对（`mqtt://`/`false`、`mqtts://`/`true`） |
-| **Webhook** `401 Unauthorized` | 缺少 bearer 或无效密钥 | 重新配对令牌（`POST /pair`）并验证 `X-Webhook-Secret`（如果配置） |
-| **`/sop/*` 返回 404** | 触发器路径不匹配 | 确保 `SOP.toml` 使用精确路径（例如 `/sop/deploy`） |
-| **SOP 已启动但步骤未执行** | 无活动代理循环的无头触发器 | 运行代理循环执行 `ExecuteStep`，或设计运行在审批点暂停 |
-| **Cron 未触发** | 守护进程未运行或表达式无效 | 运行 `zeroclaw daemon`；检查日志中的 cron 解析警告 |
+| 症状                           | 可能原因                   | 修复                                                               |
+| ------------------------------ | -------------------------- | ------------------------------------------------------------------ |
+| **MQTT** 连接错误              | broker URL/TLS 不匹配      | 验证 scheme + TLS 标志配对（`mqtt://`/`false`、`mqtts://`/`true`） |
+| **Webhook** `401 Unauthorized` | 缺少 bearer 或无效密钥     | 重新配对令牌（`POST /pair`）并验证 `X-Webhook-Secret`（如果配置）  |
+| **`/sop/*` 返回 404**          | 触发器路径不匹配           | 确保 `SOP.toml` 使用精确路径（例如 `/sop/deploy`）                 |
+| **SOP 已启动但步骤未执行**     | 无活动代理循环的无头触发器 | 运行代理循环执行 `ExecuteStep`，或设计运行在审批点暂停             |
+| **Cron 未触发**                | 守护进程未运行或表达式无效 | 运行 `jhedaiclaw daemon`；检查日志中的 cron 解析警告               |

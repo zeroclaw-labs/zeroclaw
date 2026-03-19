@@ -2,7 +2,7 @@
 //!
 //! Each workspace represents an isolated client engagement with its own
 //! memory namespace, audit trail, secrets scope, and tool restrictions.
-//! Profiles are stored under `~/.zeroclaw/workspaces/<client_name>/`.
+//! Profiles are stored under `~/.jhedaiclaw/workspaces/<client_name>/`.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};

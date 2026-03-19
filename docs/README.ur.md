@@ -1,4 +1,4 @@
-# ZeroClaw دستاویزات کا مرکز
+# JhedaiClaw دستاویزات کا مرکز
 
 یہ صفحہ دستاویزات کے نظام کا بنیادی داخلی نقطہ ہے۔
 
@@ -8,20 +8,20 @@
 
 ## یہاں سے شروع کریں
 
-| مجھے چاہیے…                                                          | یہ پڑھیں                                                                       |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| ZeroClaw کو تیزی سے انسٹال اور چلانا                                 | [README.md (فوری آغاز)](../README.md#quick-start)                               |
-| ایک کمانڈ سے بوٹسٹریپ                                                | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                   |
-| کام کے مطابق کمانڈز تلاش کرنا                                        | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| کنفیگریشن کیز اور ڈیفالٹ اقدار کی فوری جانچ                         | [config-reference.md](reference/api/config-reference.md)                       |
-| حسب ضرورت فراہم کنندہ/اینڈ پوائنٹ ترتیب دینا                         | [custom-providers.md](contributing/custom-providers.md)                         |
-| Z.AI / GLM فراہم کنندہ ترتیب دینا                                    | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                              |
-| LangGraph انضمام کے نمونے استعمال کرنا                                | [langgraph-integration.md](contributing/langgraph-integration.md)               |
-| رن ٹائم چلانا (دوسرے دن کا رن بک)                                    | [operations-runbook.md](ops/operations-runbook.md)                             |
-| تنصیب/رن ٹائم/چینل مسائل حل کرنا                                     | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| خفیہ کردہ Matrix کمرے کی ترتیب اور تشخیص چلانا                       | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                           |
-| زمرے کے مطابق دستاویزات براؤز کرنا                                   | [SUMMARY.md](SUMMARY.md)                                                       |
-| پراجیکٹ PR/مسائل کا سنیپ شاٹ دیکھنا                                 | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| مجھے چاہیے…                                    | یہ پڑھیں                                                                                   |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| JhedaiClaw کو تیزی سے انسٹال اور چلانا         | [README.md (فوری آغاز)](../README.md#quick-start)                                          |
+| ایک کمانڈ سے بوٹسٹریپ                          | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| کام کے مطابق کمانڈز تلاش کرنا                  | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| کنفیگریشن کیز اور ڈیفالٹ اقدار کی فوری جانچ    | [config-reference.md](reference/api/config-reference.md)                                   |
+| حسب ضرورت فراہم کنندہ/اینڈ پوائنٹ ترتیب دینا   | [custom-providers.md](contributing/custom-providers.md)                                    |
+| Z.AI / GLM فراہم کنندہ ترتیب دینا              | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| LangGraph انضمام کے نمونے استعمال کرنا         | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| رن ٹائم چلانا (دوسرے دن کا رن بک)              | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| تنصیب/رن ٹائم/چینل مسائل حل کرنا               | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| خفیہ کردہ Matrix کمرے کی ترتیب اور تشخیص چلانا | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| زمرے کے مطابق دستاویزات براؤز کرنا             | [SUMMARY.md](SUMMARY.md)                                                                   |
+| پراجیکٹ PR/مسائل کا سنیپ شاٹ دیکھنا            | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## فوری فیصلے کا درخت (10 سیکنڈ)
 

@@ -1,4 +1,4 @@
-# Resumo da Documentação ZeroClaw (Índice Unificado)
+# Resumo da Documentação JhedaiClaw (Índice Unificado)
 
 Este arquivo constitui o índice canônico do sistema de documentação.
 

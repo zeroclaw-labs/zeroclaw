@@ -1,5 +1,5 @@
 """
-Discord bot integration for ZeroClaw.
+Discord bot integration for JhedaiClaw.
 """
 
 import os
@@ -21,12 +21,12 @@ from ..tools import shell, file_read, file_write, web_search
 
 class DiscordBot:
     """
-    Discord bot powered by ZeroClaw agent with LangGraph tool calling.
+    Discord bot powered by JhedaiClaw agent with LangGraph tool calling.
 
     Example:
         ```python
         import os
-        from zeroclaw_tools.integrations import DiscordBot
+        from jhedaiclaw_tools.integrations import DiscordBot
 
         bot = DiscordBot(
             token=os.environ["DISCORD_TOKEN"],
@@ -52,7 +52,7 @@ class DiscordBot:
         if not DISCORD_AVAILABLE:
             raise ImportError(
                 "discord.py is required for Discord integration. "
-                "Install with: pip install zeroclaw-tools[discord]"
+                "Install with: pip install jhedaiclaw-tools[discord]"
             )
 
         self.token = token
@@ -88,7 +88,7 @@ class DiscordBot:
     def _setup_events(self):
         @self.client.event
         async def on_ready():
-            print(f"ZeroClaw Discord Bot ready: {self.client.user}")
+            print(f"JhedaiClaw Discord Bot ready: {self.client.user}")
             print(f"Guild: {self.guild_id}")
             print(f"Allowed users: {self.allowed_users}")
 

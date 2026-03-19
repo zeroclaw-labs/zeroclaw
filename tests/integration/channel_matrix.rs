@@ -4,12 +4,12 @@
 //! contract, covering: identity semantics, threading, default methods,
 //! capability declarations, cross-channel parity, and edge cases.
 //!
-//! This matrix ensures ZeroClaw channels are fully tested to maintain
+//! This matrix ensures JhedaiClaw channels are fully tested to maintain
 //! competitive feature parity across all supported platforms.
 
 use async_trait::async_trait;
+use jhedaiclaw::channels::traits::{Channel, ChannelMessage, SendMessage};
 use std::sync::{Arc, Mutex};
-use zeroclaw::channels::traits::{Channel, ChannelMessage, SendMessage};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Matrix test channel — records all trait method calls for assertion
@@ -664,7 +664,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
         "irc" => ChannelMessage {
             id: "irc_1".into(),
             sender: "coolnick".into(),
-            reply_target: "#zeroclaw".into(),
+            reply_target: "#jhedaiclaw".into(),
             content: "hi".into(),
             channel: "irc".into(),
             timestamp: 1700000000,

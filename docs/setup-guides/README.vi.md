@@ -10,18 +10,18 @@ Dành cho cài đặt lần đầu và làm quen nhanh.
 
 ## Chọn hướng đi
 
-| Tình huống | Lệnh |
-|----------|---------|
-| Có API key, muốn cài nhanh nhất | `zeroclaw onboard --api-key sk-... --provider openrouter` |
-| Muốn được hướng dẫn từng bước | `zeroclaw onboard` |
-| Đã có config, chỉ cần sửa kênh | `zeroclaw onboard --channels-only` |
-| Dùng xác thực subscription | Xem [Subscription Auth](../../README.vi.md#subscription-auth-openai-codex--claude-code) |
+| Tình huống                      | Lệnh                                                                                    |
+| ------------------------------- | --------------------------------------------------------------------------------------- |
+| Có API key, muốn cài nhanh nhất | `jhedaiclaw onboard --api-key sk-... --provider openrouter`                             |
+| Muốn được hướng dẫn từng bước   | `jhedaiclaw onboard`                                                                    |
+| Đã có config, chỉ cần sửa kênh  | `jhedaiclaw onboard --channels-only`                                                    |
+| Dùng xác thực subscription      | Xem [Subscription Auth](../../README.vi.md#subscription-auth-openai-codex--claude-code) |
 
 ## Thiết lập và kiểm tra
 
-- Thiết lập nhanh: `zeroclaw onboard --api-key "sk-..." --provider openrouter`
-- Thiết lập hướng dẫn: `zeroclaw onboard`
-- Kiểm tra môi trường: `zeroclaw status` + `zeroclaw doctor`
+- Thiết lập nhanh: `jhedaiclaw onboard --api-key "sk-..." --provider openrouter`
+- Thiết lập hướng dẫn: `jhedaiclaw onboard`
+- Kiểm tra môi trường: `jhedaiclaw status` + `jhedaiclaw doctor`
 
 ## Tiếp theo
 

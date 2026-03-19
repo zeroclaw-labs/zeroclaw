@@ -33,7 +33,7 @@ use tokio::sync::{mpsc, oneshot};
 const BEARER_SUBPROTO_PREFIX: &str = "bearer.";
 
 /// The sub-protocol we support for node connections.
-const WS_NODE_PROTOCOL: &str = "zeroclaw.nodes.v1";
+const WS_NODE_PROTOCOL: &str = "jhedaiclaw.nodes.v1";
 
 /// A single capability advertised by a node.
 #[derive(Debug, Clone, Serialize, Deserialize)]

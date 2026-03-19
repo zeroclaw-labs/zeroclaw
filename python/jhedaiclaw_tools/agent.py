@@ -12,7 +12,7 @@ from langgraph.graph import StateGraph, MessagesState, END
 from langgraph.prebuilt import ToolNode
 
 
-SYSTEM_PROMPT = """You are ZeroClaw, an AI assistant with tool access. Use tools to accomplish tasks.
+SYSTEM_PROMPT = """You are JhedaiClaw, an AI assistant with tool access. Use tools to accomplish tasks.
 Be concise and helpful. Execute tools directly when needed without excessive explanation."""
 GLM_DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
 
@@ -129,7 +129,7 @@ def create_agent(
     system_prompt: Optional[str] = None,
 ) -> ZeroclawAgent:
     """
-    Create a ZeroClaw agent with LangGraph-based tool calling.
+    Create a JhedaiClaw agent with LangGraph-based tool calling.
 
     Args:
         tools: List of tools. Defaults to shell, file_read, file_write.
@@ -144,7 +144,7 @@ def create_agent(
 
     Example:
         ```python
-        from zeroclaw_tools import create_agent, shell, file_read
+        from jhedaiclaw_tools import create_agent, shell, file_read
         from langchain_core.messages import HumanMessage
 
         agent = create_agent(

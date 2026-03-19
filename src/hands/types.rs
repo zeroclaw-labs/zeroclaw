@@ -8,7 +8,7 @@ use crate::cron::Schedule;
 /// A Hand is an autonomous agent package that runs on a schedule,
 /// accumulates knowledge over time, and reports results.
 ///
-/// Hands are defined as TOML files in `~/.zeroclaw/hands/` and each
+/// Hands are defined as TOML files in `~/.jhedaiclaw/hands/` and each
 /// maintains a rolling context of findings across runs so the agent
 /// grows smarter with every execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,7 +84,7 @@ pub struct HandRun {
 
 /// Rolling context that accumulates across hand runs.
 ///
-/// Persisted as `~/.zeroclaw/hands/{name}/context.json`.
+/// Persisted as `~/.jhedaiclaw/hands/{name}/context.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandContext {
     /// Name of the hand this context belongs to

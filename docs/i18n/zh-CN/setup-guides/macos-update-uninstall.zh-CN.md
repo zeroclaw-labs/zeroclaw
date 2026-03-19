@@ -1,20 +1,20 @@
 # macOS 更新与卸载指南
 
-本页面记录了 macOS（OS X）上 ZeroClaw 支持的更新和卸载流程。
+本页面记录了 macOS（OS X）上 JhedaiClaw 支持的更新和卸载流程。
 
 最后验证时间：**2026年2月22日**。
 
 ## 1) 检查当前安装方式
 
 ```bash
-which zeroclaw
-zeroclaw --version
+which jhedaiclaw
+jhedaiclaw --version
 ```
 
 典型安装位置：
 
-- Homebrew：`/opt/homebrew/bin/zeroclaw`（Apple Silicon）或 `/usr/local/bin/zeroclaw`（Intel）
-- Cargo/引导安装/手动安装：`~/.cargo/bin/zeroclaw`
+- Homebrew：`/opt/homebrew/bin/jhedaiclaw`（Apple Silicon）或 `/usr/local/bin/jhedaiclaw`（Intel）
+- Cargo/引导安装/手动安装：`~/.cargo/bin/jhedaiclaw`
 
 如果两者都存在，由你的 shell `PATH` 顺序决定运行哪一个。
 
@@ -24,8 +24,8 @@ zeroclaw --version
 
 ```bash
 brew update
-brew upgrade zeroclaw
-zeroclaw --version
+brew upgrade jhedaiclaw
+jhedaiclaw --version
 ```
 
 ### B) 克隆 + 引导安装
@@ -35,7 +35,7 @@ zeroclaw --version
 ```bash
 git pull --ff-only
 ./install.sh --prefer-prebuilt
-zeroclaw --version
+jhedaiclaw --version
 ```
 
 如果你想要仅源码更新：
@@ -43,7 +43,7 @@ zeroclaw --version
 ```bash
 git pull --ff-only
 cargo install --path . --force --locked
-zeroclaw --version
+jhedaiclaw --version
 ```
 
 ### C) 手动预编译二进制安装
@@ -51,7 +51,7 @@ zeroclaw --version
 使用最新的发布资产重新运行你的下载/安装流程，然后验证：
 
 ```bash
-zeroclaw --version
+jhedaiclaw --version
 ```
 
 ## 3) 在 macOS 上卸载
@@ -61,27 +61,27 @@ zeroclaw --version
 这可以防止守护进程在二进制文件被移除后继续运行。
 
 ```bash
-zeroclaw service stop || true
-zeroclaw service uninstall || true
+jhedaiclaw service stop || true
+jhedaiclaw service uninstall || true
 ```
 
 `service uninstall` 会移除的服务文件：
 
-- `~/Library/LaunchAgents/com.zeroclaw.daemon.plist`
+- `~/Library/LaunchAgents/com.jhedaiclaw.daemon.plist`
 
 ### B) 根据安装方式移除二进制文件
 
 Homebrew：
 
 ```bash
-brew uninstall zeroclaw
+brew uninstall jhedaiclaw
 ```
 
-Cargo/引导安装/手动安装（`~/.cargo/bin/zeroclaw`）：
+Cargo/引导安装/手动安装（`~/.cargo/bin/jhedaiclaw`）：
 
 ```bash
-cargo uninstall zeroclaw || true
-rm -f ~/.cargo/bin/zeroclaw
+cargo uninstall jhedaiclaw || true
+rm -f ~/.cargo/bin/jhedaiclaw
 ```
 
 ### C) 可选：移除本地运行时数据
@@ -89,20 +89,20 @@ rm -f ~/.cargo/bin/zeroclaw
 仅当你想要完全清理配置、认证配置文件、日志和工作区状态时运行此命令。
 
 ```bash
-rm -rf ~/.zeroclaw
+rm -rf ~/.jhedaiclaw
 ```
 
 ## 4) 验证卸载完成
 
 ```bash
-command -v zeroclaw || echo \"zeroclaw 二进制文件未找到\"
-pgrep -fl zeroclaw || echo \"没有运行中的 zeroclaw 进程\"
+command -v jhedaiclaw || echo \"jhedaiclaw 二进制文件未找到\"
+pgrep -fl jhedaiclaw || echo \"没有运行中的 jhedaiclaw 进程\"
 ```
 
 如果 `pgrep` 仍然找到进程，手动停止它并重新检查：
 
 ```bash
-pkill -f zeroclaw
+pkill -f jhedaiclaw
 ```
 
 ## 相关文档

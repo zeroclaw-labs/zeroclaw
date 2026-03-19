@@ -2,7 +2,7 @@
 
 用于开发板集成、固件流程和外设架构。
 
-ZeroClaw 的硬件子系统通过 `Peripheral` 特征实现对微控制器和外设的直接控制。每个开发板暴露 GPIO（通用输入输出）、ADC（模数转换器）和传感器操作工具，允许代理在 STM32 Nucleo、树莓派和 ESP32 等开发板上驱动硬件交互。完整架构请参见 [hardware-peripherals-design.md](hardware-peripherals-design.zh-CN.md)。
+JhedaiClaw 的硬件子系统通过 `Peripheral` 特征实现对微控制器和外设的直接控制。每个开发板暴露 GPIO（通用输入输出）、ADC（模数转换器）和传感器操作工具，允许代理在 STM32 Nucleo、树莓派和 ESP32 等开发板上驱动硬件交互。完整架构请参见 [hardware-peripherals-design.md](hardware-peripherals-design.zh-CN.md)。
 
 ## 入口点
 

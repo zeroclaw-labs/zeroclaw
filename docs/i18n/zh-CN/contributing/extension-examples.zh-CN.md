@@ -1,6 +1,6 @@
 # 扩展示例
 
-ZeroClaw 的架构是特征（trait）驱动和模块化的。
+JhedaiClaw 的架构是特征（trait）驱动和模块化的。
 要添加新的提供商、渠道、工具或内存后端，实现对应的特征并在工厂模块中注册即可。
 
 本页面包含每个核心扩展点的最小可运行示例。
@@ -21,7 +21,7 @@ ZeroClaw 的架构是特征（trait）驱动和模块化的。
 在 `src/tools/mod.rs` 中通过 `default_tools()` 注册你的工具。
 
 ```rust
-// In your crate: use zeroclaw::tools::traits::{Tool, ToolResult};
+// In your crate: use jhedaiclaw::tools::traits::{Tool, ToolResult};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -79,7 +79,7 @@ impl Tool for HttpGetTool {
 
 ## 渠道（`src/channels/traits.rs`）
 
-渠道让 ZeroClaw 可以通过任何消息平台通信。
+渠道让 JhedaiClaw 可以通过任何消息平台通信。
 
 **必需方法：** `name()`、`send(&SendMessage)`、`listen()`。
 以下方法有默认实现：`health_check()`、`start_typing()`、`stop_typing()`、
@@ -89,7 +89,7 @@ impl Tool for HttpGetTool {
 在 `src/channels/mod.rs` 中注册你的渠道，并在 `src/config/schema.rs` 的 `ChannelsConfig` 中添加配置。
 
 ```rust
-// In your crate: use zeroclaw::channels::traits::{Channel, ChannelMessage, SendMessage};
+// In your crate: use jhedaiclaw::channels::traits::{Channel, ChannelMessage, SendMessage};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -199,7 +199,7 @@ impl Channel for TelegramChannel {
 
 ## 提供商（`src/providers/traits.rs`）
 
-提供商是 LLM 后端适配器。每个提供商将 ZeroClaw 连接到不同的模型 API。
+提供商是 LLM 后端适配器。每个提供商将 JhedaiClaw 连接到不同的模型 API。
 
 **必需方法：** `chat_with_system(system_prompt: Option<&str>, message: &str, model: &str, temperature: f64) -> Result<String>`。
 其他所有方法都有默认实现：
@@ -210,7 +210,7 @@ impl Channel for TelegramChannel {
 在 `src/providers/mod.rs` 中注册你的提供商。
 
 ```rust
-// In your crate: use zeroclaw::providers::traits::Provider;
+// In your crate: use jhedaiclaw::providers::traits::Provider;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -281,7 +281,7 @@ impl Provider for OllamaProvider {
 在 `src/memory/mod.rs` 中注册你的后端。
 
 ```rust
-// In your crate: use zeroclaw::memory::traits::{Memory, MemoryEntry, MemoryCategory};
+// In your crate: use jhedaiclaw::memory::traits::{Memory, MemoryEntry, MemoryCategory};
 
 use async_trait::async_trait;
 use std::collections::HashMap;

@@ -1,6 +1,6 @@
 # PR Discipline
 
-Rules for pull request quality, attribution, privacy, and handoff in ZeroClaw.
+Rules for pull request quality, attribution, privacy, and handoff in JhedaiClaw.
 
 ## Privacy / Sensitive Data (Required)
 
@@ -10,11 +10,11 @@ Treat privacy and neutrality as merge gates, not best-effort guidelines.
 - Prohibited data includes (non-exhaustive): real names, personal emails, phone numbers, addresses, access tokens, API keys, credentials, IDs, and private URLs.
 - Use neutral project-scoped placeholders (e.g., `user_a`, `test_user`, `project_bot`, `example.com`) instead of real identity data.
 - Test names/messages/fixtures must be impersonal and system-focused; avoid first-person or identity-specific language.
-- If identity-like context is unavoidable, use ZeroClaw-scoped roles/labels only (e.g., `ZeroClawAgent`, `ZeroClawOperator`, `zeroclaw_user`).
+- If identity-like context is unavoidable, use JhedaiClaw-scoped roles/labels only (e.g., `JhedaiClawAgent`, `JhedaiClawOperator`, `jhedaiclaw_user`).
 - Recommended identity-safe naming palette:
-    - actor labels: `ZeroClawAgent`, `ZeroClawOperator`, `ZeroClawMaintainer`, `zeroclaw_user`
-    - service/runtime labels: `zeroclaw_bot`, `zeroclaw_service`, `zeroclaw_runtime`, `zeroclaw_node`
-    - environment labels: `zeroclaw_project`, `zeroclaw_workspace`, `zeroclaw_channel`
+  - actor labels: `JhedaiClawAgent`, `JhedaiClawOperator`, `JhedaiClawMaintainer`, `jhedaiclaw_user`
+  - service/runtime labels: `jhedaiclaw_bot`, `jhedaiclaw_service`, `jhedaiclaw_runtime`, `jhedaiclaw_node`
+  - environment labels: `jhedaiclaw_project`, `jhedaiclaw_workspace`, `jhedaiclaw_channel`
 - If reproducing external incidents, redact and anonymize all payloads before committing.
 - Before push, review `git diff --cached` specifically for accidental sensitive strings and identity leakage.
 
@@ -37,21 +37,26 @@ When a PR supersedes another contributor's PR and carries forward substantive co
 
 ```md
 ## Supersedes
+
 - #<pr_a> by @<author_a>
 - #<pr_b> by @<author_b>
 
 ## Integrated Scope
+
 - From #<pr_a>: <what was materially incorporated>
 - From #<pr_b>: <what was materially incorporated>
 
 ## Attribution
+
 - Co-authored-by trailers added for materially incorporated contributors: Yes/No
 - If No, explain why
 
 ## Non-goals
+
 - <explicitly list what was not carried over>
 
 ## Risk and Rollback
+
 - Risk: <summary>
 - Rollback: <revert commit/PR strategy>
 ```

@@ -5,7 +5,7 @@
 //! behavior through the public API surface: configuration defaults, autonomy
 //! config validation, and credential scrubbing patterns.
 
-use zeroclaw::config::{AutonomyConfig, Config};
+use jhedaiclaw::config::{AutonomyConfig, Config};
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Autonomy configuration defaults and validation

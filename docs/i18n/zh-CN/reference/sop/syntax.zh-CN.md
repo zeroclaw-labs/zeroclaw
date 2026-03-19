@@ -62,13 +62,13 @@ condition = \"$.env == \\\"prod\\\"\"
 
 ## 4. 触发器类型
 
-| 类型 | 字段 | 说明 |
-|---|---|---|
-| `manual` | 无 | 通过工具 `sop_execute` 触发（不是 `zeroclaw sop run` CLI 命令）。 |
-| `webhook` | `path` | 与请求路径精确匹配（`/sop/...` 或 `/webhook`）。 |
-| `mqtt` | `topic`，可选 `condition` | MQTT 主题支持 `+` 和 `#` 通配符。 |
-| `cron` | `expression` | 支持 5、6 或 7 个字段（5 字段会在内部前置秒数）。 |
-| `peripheral` | `board`、`signal`，可选 `condition` | 匹配 `\"{board}/{signal}\"`。 |
+| 类型         | 字段                                | 说明                                                                |
+| ------------ | ----------------------------------- | ------------------------------------------------------------------- |
+| `manual`     | 无                                  | 通过工具 `sop_execute` 触发（不是 `jhedaiclaw sop run` CLI 命令）。 |
+| `webhook`    | `path`                              | 与请求路径精确匹配（`/sop/...` 或 `/webhook`）。                    |
+| `mqtt`       | `topic`，可选 `condition`           | MQTT 主题支持 `+` 和 `#` 通配符。                                   |
+| `cron`       | `expression`                        | 支持 5、6 或 7 个字段（5 字段会在内部前置秒数）。                   |
+| `peripheral` | `board`、`signal`，可选 `condition` | 匹配 `\"{board}/{signal}\"`。                                       |
 
 ## 5. 条件语法
 
@@ -83,8 +83,8 @@ condition = \"$.env == \\\"prod\\\"\"
 使用：
 
 ```bash
-zeroclaw sop validate
-zeroclaw sop validate <name>
+jhedaiclaw sop validate
+jhedaiclaw sop validate <name>
 ```
 
 验证会对空名称/描述、缺少触发器、缺少步骤和步骤编号间隙发出警告。

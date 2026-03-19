@@ -1,4 +1,4 @@
-# ZeroClaw Project Triage Snapshot (2026-02-18)
+# JhedaiClaw Project Triage Snapshot (2026-02-18)
 
 As-of date: **February 18, 2026**.
 
@@ -6,7 +6,7 @@ This snapshot captures open PR/issue signals to guide docs and information-archi
 
 ## Data Source
 
-Collected via GitHub CLI against `zeroclaw-labs/zeroclaw`:
+Collected via GitHub CLI against `jhedai/jhedaiclaw`:
 
 - `gh repo view ...`
 - `gh pr list --state open --limit 500 ...`
@@ -54,19 +54,19 @@ Implication for docs:
 
 ## Docs-Relevant Open PRs
 
-- [#716](https://github.com/zeroclaw-labs/zeroclaw/pull/716) — OpenRC support (service behavior/docs impact)
-- [#725](https://github.com/zeroclaw-labs/zeroclaw/pull/725) — shell completion commands (CLI docs impact)
-- [#732](https://github.com/zeroclaw-labs/zeroclaw/pull/732) — CI action replacement (contributor workflow docs impact)
-- [#759](https://github.com/zeroclaw-labs/zeroclaw/pull/759) — daemon/channel response handling fix (channel troubleshooting impact)
-- [#679](https://github.com/zeroclaw-labs/zeroclaw/pull/679) — pairing lockout accounting change (security behavior docs impact)
+- [#716](https://github.com/jhedai/jhedaiclaw/pull/716) — OpenRC support (service behavior/docs impact)
+- [#725](https://github.com/jhedai/jhedaiclaw/pull/725) — shell completion commands (CLI docs impact)
+- [#732](https://github.com/jhedai/jhedaiclaw/pull/732) — CI action replacement (contributor workflow docs impact)
+- [#759](https://github.com/jhedai/jhedaiclaw/pull/759) — daemon/channel response handling fix (channel troubleshooting impact)
+- [#679](https://github.com/jhedai/jhedaiclaw/pull/679) — pairing lockout accounting change (security behavior docs impact)
 
 ## Docs-Relevant Open Issues
 
-- [#426](https://github.com/zeroclaw-labs/zeroclaw/issues/426) — explicit request for clearer capabilities documentation
-- [#666](https://github.com/zeroclaw-labs/zeroclaw/issues/666) — operational runbook and alert/logging guidance request
-- [#745](https://github.com/zeroclaw-labs/zeroclaw/issues/745) — Docker pull failure (`ghcr.io`) suggests deployment troubleshooting demand
-- [#761](https://github.com/zeroclaw-labs/zeroclaw/issues/761) — Armbian compile error highlights platform troubleshooting needs
-- [#758](https://github.com/zeroclaw-labs/zeroclaw/issues/758) — storage backend flexibility request impacts config/reference docs
+- [#426](https://github.com/jhedai/jhedaiclaw/issues/426) — explicit request for clearer capabilities documentation
+- [#666](https://github.com/jhedai/jhedaiclaw/issues/666) — operational runbook and alert/logging guidance request
+- [#745](https://github.com/jhedai/jhedaiclaw/issues/745) — Docker pull failure (`ghcr.io`) suggests deployment troubleshooting demand
+- [#761](https://github.com/jhedai/jhedaiclaw/issues/761) — Armbian compile error highlights platform troubleshooting needs
+- [#758](https://github.com/jhedai/jhedaiclaw/issues/758) — storage backend flexibility request impacts config/reference docs
 
 ## Recommended Docs Backlog (Priority Order)
 

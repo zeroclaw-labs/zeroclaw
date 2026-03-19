@@ -1,30 +1,30 @@
-import { useState, useEffect } from 'react';
-import { Puzzle, Check, Zap, Clock } from 'lucide-react';
-import type { Integration } from '@/types/api';
-import { getIntegrations } from '@/lib/api';
+import { useState, useEffect } from "react";
+import { Puzzle, Check, Zap, Clock } from "lucide-react";
+import type { Integration } from "@/types/api";
+import { getIntegrations } from "@/lib/api";
 
-function statusBadge(status: Integration['status']) {
+function statusBadge(status: Integration["status"]) {
   switch (status) {
-    case 'Active':
+    case "Active":
       return {
         icon: Check,
-        label: 'Active',
-        classes: 'text-[#00e68a] border-[#00e68a30]',
-        bg: 'rgba(0,230,138,0.06)',
+        label: "Active",
+        classes: "text-[#00e68a] border-[#00e68a30]",
+        bg: "rgba(0,230,138,0.06)",
       };
-    case 'Available':
+    case "Available":
       return {
         icon: Zap,
-        label: 'Available',
-        classes: 'text-[#0080ff] border-[#0080ff30]',
-        bg: 'rgba(0,128,255,0.06)',
+        label: "Available",
+        classes: "text-[#0080ff] border-[#0080ff30]",
+        bg: "rgba(0,128,255,0.06)",
       };
-    case 'ComingSoon':
+    case "ComingSoon":
       return {
         icon: Clock,
-        label: 'Coming Soon',
-        classes: 'text-[#556080] border-[#1a1a3e]',
-        bg: 'rgba(26,26,62,0.3)',
+        label: "Coming Soon",
+        classes: "text-[#556080] border-[#1a1a3e]",
+        bg: "rgba(26,26,62,0.3)",
       };
   }
 }
@@ -33,7 +33,7 @@ export default function Integrations() {
   const [integrations, setIntegrations] = useState<Integration[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [activeCategory, setActiveCategory] = useState<string>('all');
+  const [activeCategory, setActiveCategory] = useState<string>("all");
 
   useEffect(() => {
     getIntegrations()
@@ -43,22 +43,25 @@ export default function Integrations() {
   }, []);
 
   const categories = [
-    'all',
+    "all",
     ...Array.from(new Set(integrations.map((i) => i.category))).sort(),
   ];
 
   const filtered =
-    activeCategory === 'all'
+    activeCategory === "all"
       ? integrations
       : integrations.filter((i) => i.category === activeCategory);
 
   // Group by category for display
-  const grouped = filtered.reduce<Record<string, Integration[]>>((acc, item) => {
-    const key = item.category;
-    if (!acc[key]) acc[key] = [];
-    acc[key].push(item);
-    return acc;
-  }, {});
+  const grouped = filtered.reduce<Record<string, Integration[]>>(
+    (acc, item) => {
+      const key = item.category;
+      if (!acc[key]) acc[key] = [];
+      acc[key].push(item);
+      return acc;
+    },
+    {},
+  );
 
   if (error) {
     return (
@@ -96,10 +99,14 @@ export default function Integrations() {
             onClick={() => setActiveCategory(cat)}
             className={`px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-all duration-300 capitalize ${
               activeCategory === cat
-                ? 'text-white shadow-[0_0_15px_rgba(0,128,255,0.2)]'
-                : 'text-[#556080] border border-[#1a1a3e] hover:text-white hover:border-[#0080ff40]'
+                ? "text-white shadow-[0_0_15px_rgba(0,128,255,0.2)]"
+                : "text-[#556080] border border-[#1a1a3e] hover:text-white hover:border-[#0080ff40]"
             }`}
-            style={activeCategory === cat ? { background: 'linear-gradient(135deg, #0080ff, #0066cc)' } : {}}
+            style={
+              activeCategory === cat
+                ? { background: "linear-gradient(135deg, #0080ff, #0066cc)" }
+                : {}
+            }
           >
             {cat}
           </button>

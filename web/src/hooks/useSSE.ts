@@ -1,8 +1,8 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { SSEClient, type SSEClientOptions } from '../lib/sse';
-import type { SSEEvent } from '../types/api';
+import { useState, useEffect, useRef, useCallback } from "react";
+import { SSEClient, type SSEClientOptions } from "../lib/sse";
+import type { SSEEvent } from "../types/api";
 
-export type SSEConnectionStatus = 'disconnected' | 'connecting' | 'connected';
+export type SSEConnectionStatus = "disconnected" | "connecting" | "connected";
 
 export interface UseSSEResult {
   /** Array of all events received during this session. */
@@ -41,7 +41,7 @@ export function useSSE(options: UseSSEOptions = {}): UseSSEResult {
   } = options;
 
   const clientRef = useRef<SSEClient | null>(null);
-  const [status, setStatus] = useState<SSEConnectionStatus>('disconnected');
+  const [status, setStatus] = useState<SSEConnectionStatus>("disconnected");
   const [events, setEvents] = useState<SSEEvent[]>([]);
 
   // Keep filter in a ref so the callback doesn't need to be recreated
@@ -64,7 +64,7 @@ export function useSSE(options: UseSSEOptions = {}): UseSSEResult {
     const client = getClient();
 
     client.onConnect = () => {
-      setStatus('connected');
+      setStatus("connected");
     };
 
     client.onEvent = (event: SSEEvent) => {
@@ -84,11 +84,11 @@ export function useSSE(options: UseSSEOptions = {}): UseSSEResult {
     };
 
     client.onError = () => {
-      setStatus('disconnected');
+      setStatus("disconnected");
     };
 
     if (autoConnect) {
-      setStatus('connecting');
+      setStatus("connecting");
       client.connect();
     }
 
@@ -100,14 +100,14 @@ export function useSSE(options: UseSSEOptions = {}): UseSSEResult {
 
   const connect = useCallback(() => {
     const client = getClient();
-    setStatus('connecting');
+    setStatus("connecting");
     client.connect();
   }, [getClient]);
 
   const disconnect = useCallback(() => {
     const client = getClient();
     client.disconnect();
-    setStatus('disconnected');
+    setStatus("disconnected");
   }, [getClient]);
 
   const clearEvents = useCallback(() => {

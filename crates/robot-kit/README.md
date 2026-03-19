@@ -1,23 +1,23 @@
-# ZeroClaw Robot Kit
+# JhedaiClaw Robot Kit
 
-A complete toolkit for building AI-powered robots with ZeroClaw. Designed for Raspberry Pi deployment with offline Ollama inference.
+A complete toolkit for building AI-powered robots with JhedaiClaw. Designed for Raspberry Pi deployment with offline Ollama inference.
 
 ## Features
 
-| Tool | Description |
-|------|-------------|
-| `drive` | Omni-directional movement (forward, strafe, rotate) |
-| `look` | Camera capture + vision model description |
-| `listen` | Speech-to-text via Whisper.cpp |
-| `speak` | Text-to-speech via Piper TTS |
-| `sense` | LIDAR, motion sensors, ultrasonic distance |
-| `emote` | LED expressions and sound effects |
+| Tool     | Description                                         |
+| -------- | --------------------------------------------------- |
+| `drive`  | Omni-directional movement (forward, strafe, rotate) |
+| `look`   | Camera capture + vision model description           |
+| `listen` | Speech-to-text via Whisper.cpp                      |
+| `speak`  | Text-to-speech via Piper TTS                        |
+| `sense`  | LIDAR, motion sensors, ultrasonic distance          |
+| `emote`  | LED expressions and sound effects                   |
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                 ZeroClaw + Ollama                       │
+│                 JhedaiClaw + Ollama                       │
 │              (High-Level AI Brain)                      │
 └─────────────────────┬───────────────────────────────────┘
                       │
@@ -38,6 +38,7 @@ A complete toolkit for building AI-powered robots with ZeroClaw. Designed for Ra
 ## Hardware Requirements
 
 ### Minimum
+
 - Raspberry Pi 4 (4GB) or Pi 5
 - USB webcam
 - USB microphone
@@ -46,6 +47,7 @@ A complete toolkit for building AI-powered robots with ZeroClaw. Designed for Ra
 - 4 DC motors + omni wheels
 
 ### Recommended
+
 - Raspberry Pi 5 (8GB)
 - RPLidar A1 for obstacle avoidance
 - LED matrix (8x8) for expressions
@@ -84,25 +86,25 @@ pip install piper-tts
 
 ## Quick Start
 
-### 1. Build ZeroClaw with robot tools
+### 1. Build JhedaiClaw with robot tools
 
 ```bash
 # Clone and build
-git clone https://github.com/zeroclaw-labs/zeroclaw
-cd zeroclaw
-cargo build -p zeroclaw-robot-kit --release
+git clone https://github.com/jhedai/jhedaiclaw
+cd jhedaiclaw
+cargo build -p jhedaiclaw-robot-kit --release
 ```
 
 ### 2. Configure
 
 ```bash
 # Copy config
-mkdir -p ~/.zeroclaw
-cp crates/robot-kit/robot.toml ~/.zeroclaw/
-cp crates/robot-kit/SOUL.md ~/.zeroclaw/workspace/
+mkdir -p ~/.jhedaiclaw
+cp crates/robot-kit/robot.toml ~/.jhedaiclaw/
+cp crates/robot-kit/SOUL.md ~/.jhedaiclaw/workspace/
 
 # Edit for your hardware
-nano ~/.zeroclaw/robot.toml
+nano ~/.jhedaiclaw/robot.toml
 ```
 
 ### 3. Test
@@ -112,11 +114,11 @@ nano ~/.zeroclaw/robot.toml
 ollama serve &
 
 # Test in mock mode
-./target/release/zeroclaw agent -m "Say hello and show a happy face"
+./target/release/jhedaiclaw agent -m "Say hello and show a happy face"
 
 # Test with real hardware
 # (after configuring robot.toml)
-./target/release/zeroclaw agent -m "Move forward 1 meter"
+./target/release/jhedaiclaw agent -m "Move forward 1 meter"
 ```
 
 ## Integration
@@ -127,7 +129,7 @@ It is not auto-registered in the core runtime by default.
 Use it directly from Rust:
 
 ```rust
-use zeroclaw_robot_kit::{create_tools, RobotConfig};
+use jhedaiclaw_robot_kit::{create_tools, RobotConfig};
 
 fn build_robot_tools() {
     let config = RobotConfig::default();
@@ -136,7 +138,7 @@ fn build_robot_tools() {
 }
 ```
 
-If you want runtime registration in `zeroclaw`, add a thin adapter that maps this
+If you want runtime registration in `jhedaiclaw`, add a thin adapter that maps this
 crate's tools to the project's `src/tools::Tool` and register it in the factory.
 
 ## Usage Examples
@@ -183,21 +185,21 @@ Robot:
 
 ```bash
 # Package everything needed
-mkdir zeroclaw-robot-kit
-cp -r target/release/zeroclaw zeroclaw-robot-kit/
-cp -r examples/robot_kit zeroclaw-robot-kit/
-cp -r ~/.zeroclaw zeroclaw-robot-kit/dot-zeroclaw
+mkdir jhedaiclaw-robot-kit
+cp -r target/release/jhedaiclaw jhedaiclaw-robot-kit/
+cp -r examples/robot_kit jhedaiclaw-robot-kit/
+cp -r ~/.jhedaiclaw jhedaiclaw-robot-kit/dot-jhedaiclaw
 
 # Include models
-mkdir -p zeroclaw-robot-kit/models
-cp ~/.zeroclaw/models/ggml-base.bin zeroclaw-robot-kit/models/
+mkdir -p jhedaiclaw-robot-kit/models
+cp ~/.jhedaiclaw/models/ggml-base.bin jhedaiclaw-robot-kit/models/
 # Note: Ollama models are large, may want to download on target
 
 # Create tarball
-tar -czvf zeroclaw-robot-kit.tar.gz zeroclaw-robot-kit/
+tar -czvf jhedaiclaw-robot-kit.tar.gz jhedaiclaw-robot-kit/
 
 # Copy to USB
-cp zeroclaw-robot-kit.tar.gz /media/usb/TarBalls/
+cp jhedaiclaw-robot-kit.tar.gz /media/usb/TarBalls/
 ```
 
 ## Safety Notes
@@ -210,4 +212,4 @@ cp zeroclaw-robot-kit.tar.gz /media/usb/TarBalls/
 
 ## License
 
-MIT - Same as ZeroClaw
+MIT - Same as JhedaiClaw

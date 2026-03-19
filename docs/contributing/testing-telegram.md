@@ -16,49 +16,53 @@ cargo test telegram --lib
 ## 📝 What Was Created For You
 
 ### 1. **test_telegram_integration.sh** (Main Test Suite)
-   - **20+ automated tests** covering all fixes
-   - **6 test phases**: Code quality, build, config, health, features, manual
-   - **Colored output** with pass/fail indicators
-   - **Detailed summary** at the end
 
-   ```bash
-   ./tests/telegram/test_telegram_integration.sh
-   ```
+- **20+ automated tests** covering all fixes
+- **6 test phases**: Code quality, build, config, health, features, manual
+- **Colored output** with pass/fail indicators
+- **Detailed summary** at the end
+
+```bash
+./tests/telegram/test_telegram_integration.sh
+```
 
 ### 2. **quick_test.sh** (Fast Validation)
-   - **4 essential tests** for quick feedback
-   - **<10 second** execution time
-   - Perfect for **pre-commit** checks
 
-   ```bash
-   ./tests/telegram/quick_test.sh
-   ```
+- **4 essential tests** for quick feedback
+- **<10 second** execution time
+- Perfect for **pre-commit** checks
+
+```bash
+./tests/telegram/quick_test.sh
+```
 
 ### 3. **generate_test_messages.py** (Test Helper)
-   - Generates test messages of various lengths
-   - Tests message splitting functionality
-   - 8 different message types
 
-   ```bash
-   # Generate a long message (>4096 chars)
-   python3 tests/telegram/generate_test_messages.py long
+- Generates test messages of various lengths
+- Tests message splitting functionality
+- 8 different message types
 
-   # Show all message types
-   python3 tests/telegram/generate_test_messages.py all
-   ```
+```bash
+# Generate a long message (>4096 chars)
+python3 tests/telegram/generate_test_messages.py long
+
+# Show all message types
+python3 tests/telegram/generate_test_messages.py all
+```
 
 ### 4. **TESTING_TELEGRAM.md** (Complete Guide)
-   - Comprehensive testing documentation
-   - Troubleshooting guide
-   - Performance benchmarks
-   - CI/CD integration examples
+
+- Comprehensive testing documentation
+- Troubleshooting guide
+- Performance benchmarks
+- CI/CD integration examples
 
 ## 🚀 Step-by-Step: First Run
 
 ### Step 1: Run Automated Tests
 
 ```bash
-cd /Users/abdzsam/zeroclaw
+cd /Users/abdzsam/jhedaiclaw
 
 # Make scripts executable (already done)
 chmod +x tests/telegram/test_telegram_integration.sh tests/telegram/quick_test.sh
@@ -68,6 +72,7 @@ chmod +x tests/telegram/test_telegram_integration.sh tests/telegram/quick_test.s
 ```
 
 **Expected output:**
+
 ```
 ⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡
 
@@ -102,13 +107,14 @@ Pass Rate:     100%
 
 ```bash
 # Guided setup
-zeroclaw onboard
+jhedaiclaw onboard
 
 # Or channels-only setup
-zeroclaw onboard --channels-only
+jhedaiclaw onboard --channels-only
 ```
 
 When prompted:
+
 1. Select **Telegram** channel
 2. Enter your **bot token** from @BotFather
 3. Enter your **Telegram user ID** or username
@@ -116,12 +122,13 @@ When prompted:
 ### Step 3: Verify Health
 
 ```bash
-zeroclaw channel doctor
+jhedaiclaw channel doctor
 ```
 
 **Expected output:**
+
 ```
-🩺 ZeroClaw Channel Doctor
+🩺 JhedaiClaw Channel Doctor
 
   ✅ Telegram  healthy
 
@@ -134,10 +141,11 @@ Summary: 1 healthy, 0 unhealthy, 0 timed out
 
 ```bash
 # Terminal 1: Start the channel
-zeroclaw channel start
+jhedaiclaw channel start
 ```
 
 **In Telegram:**
+
 - Find your bot
 - Send: `Hello bot!`
 - **Verify**: Bot responds within 3 seconds
@@ -172,6 +180,7 @@ python3 tests/telegram/generate_test_messages.py word
 After running all tests, verify:
 
 ### Automated Tests
+
 - [ ] ✅ All 20 automated tests passed
 - [ ] ✅ Build completed successfully
 - [ ] ✅ Binary size <10MB
@@ -179,6 +188,7 @@ After running all tests, verify:
 - [ ] ✅ No clippy warnings
 
 ### Manual Tests
+
 - [ ] ✅ Bot responds to basic messages
 - [ ] ✅ Long messages split correctly
 - [ ] ✅ Continuation markers appear
@@ -187,6 +197,7 @@ After running all tests, verify:
 - [ ] ✅ No errors in logs
 
 ### Performance
+
 - [ ] ✅ Response time <3 seconds
 - [ ] ✅ Memory usage <10MB
 - [ ] ✅ No message loss
@@ -209,10 +220,10 @@ cargo update
 
 ```bash
 # Check config
-cat ~/.zeroclaw/config.toml | grep -A 5 telegram
+cat ~/.jhedaiclaw/config.toml | grep -A 5 telegram
 
 # Reconfigure
-zeroclaw onboard --channels-only
+jhedaiclaw onboard --channels-only
 ```
 
 ### Issue: Health check fails
@@ -228,7 +239,7 @@ curl "https://api.telegram.org/bot<YOUR_TOKEN>/getMe"
 
 ```bash
 # Enable debug logging
-RUST_LOG=debug zeroclaw channel start
+RUST_LOG=debug jhedaiclaw channel start
 
 # Look for:
 # - "Telegram channel listening for messages..."
@@ -240,15 +251,15 @@ RUST_LOG=debug zeroclaw channel start
 
 After all fixes, you should see:
 
-| Metric | Target | Command |
-|--------|--------|---------|
-| Unit test pass | 24/24 | `cargo test telegram --lib` |
-| Build time | <30s | `time cargo build --release` |
-| Binary size | ~3-4MB | `ls -lh target/release/zeroclaw` |
-| Health check | <5s | `time zeroclaw channel doctor` |
-| First response | <3s | Manual test in Telegram |
-| Message split | <50ms | Check debug logs |
-| Memory usage | <10MB | `ps aux \| grep zeroclaw` |
+| Metric         | Target | Command                            |
+| -------------- | ------ | ---------------------------------- |
+| Unit test pass | 24/24  | `cargo test telegram --lib`        |
+| Build time     | <30s   | `time cargo build --release`       |
+| Binary size    | ~3-4MB | `ls -lh target/release/jhedaiclaw` |
+| Health check   | <5s    | `time jhedaiclaw channel doctor`   |
+| First response | <3s    | Manual test in Telegram            |
+| Message split  | <50ms  | Check debug logs                   |
+| Memory usage   | <10MB  | `ps aux \| grep jhedaiclaw`        |
 
 ## 🔄 CI/CD Integration
 
@@ -266,6 +277,7 @@ Add to your workflow:
 ## 📚 Next Steps
 
 1. **Run the tests:**
+
    ```bash
    ./tests/telegram/test_telegram_integration.sh
    ```
@@ -278,14 +290,15 @@ Add to your workflow:
 
 5. **Monitor logs** for any issues:
    ```bash
-   zeroclaw daemon
+   jhedaiclaw daemon
    # or
-   RUST_LOG=info zeroclaw channel start
+   RUST_LOG=info jhedaiclaw channel start
    ```
 
 ## 🎉 Success!
 
 If all tests pass:
+
 - ✅ Message splitting works (4096 char limit)
 - ✅ Health check has 5s timeout
 - ✅ Empty chat_id is handled safely
@@ -298,6 +311,6 @@ If all tests pass:
 
 ## 📞 Support
 
-- Issues: https://github.com/zeroclaw-labs/zeroclaw/issues
+- Issues: https://github.com/jhedai/jhedaiclaw/issues
 - Docs: [testing-telegram.md](../../tests/telegram/testing-telegram.md)
-- Help: `zeroclaw --help`
+- Help: `jhedaiclaw --help`

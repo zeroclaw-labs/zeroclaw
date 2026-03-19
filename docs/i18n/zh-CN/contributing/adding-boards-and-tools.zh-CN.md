@@ -1,32 +1,32 @@
-# 添加开发板和工具 — ZeroClaw 硬件指南
+# 添加开发板和工具 — JhedaiClaw 硬件指南
 
-本指南解释如何向 ZeroClaw 添加新的硬件开发板和自定义工具。
+本指南解释如何向 JhedaiClaw 添加新的硬件开发板和自定义工具。
 
 ## 快速开始：通过 CLI 添加开发板
 
 ```bash
-# 添加开发板（更新 ~/.zeroclaw/config.toml）
-zeroclaw peripheral add nucleo-f401re /dev/ttyACM0
-zeroclaw peripheral add arduino-uno /dev/cu.usbmodem12345
-zeroclaw peripheral add rpi-gpio native   # 用于树莓派 GPIO（Linux）
+# 添加开发板（更新 ~/.jhedaiclaw/config.toml）
+jhedaiclaw peripheral add nucleo-f401re /dev/ttyACM0
+jhedaiclaw peripheral add arduino-uno /dev/cu.usbmodem12345
+jhedaiclaw peripheral add rpi-gpio native   # 用于树莓派 GPIO（Linux）
 
 # 重启守护进程应用更改
-zeroclaw daemon --host 127.0.0.1 --port 42617
+jhedaiclaw daemon --host 127.0.0.1 --port 42617
 ```
 
 ## 支持的开发板
 
-| 开发板           | 传输方式 | 路径示例              |
-|-----------------|-----------|---------------------------|
-| nucleo-f401re   | 串口    | /dev/ttyACM0, /dev/cu.usbmodem* |
-| arduino-uno     | 串口    | /dev/ttyACM0, /dev/cu.usbmodem* |
-| arduino-uno-q   | 桥接    | （Uno Q IP 地址）                |
-| rpi-gpio        | 原生    | native                    |
-| esp32           | 串口    | /dev/ttyUSB0              |
+| 开发板        | 传输方式 | 路径示例                         |
+| ------------- | -------- | -------------------------------- |
+| nucleo-f401re | 串口     | /dev/ttyACM0, /dev/cu.usbmodem\* |
+| arduino-uno   | 串口     | /dev/ttyACM0, /dev/cu.usbmodem\* |
+| arduino-uno-q | 桥接     | （Uno Q IP 地址）                |
+| rpi-gpio      | 原生     | native                           |
+| esp32         | 串口     | /dev/ttyUSB0                     |
 
 ## 手动配置
 
-编辑 `~/.zeroclaw/config.toml`：
+编辑 `~/.jhedaiclaw/config.toml`：
 
 ```toml
 [peripherals]
@@ -59,24 +59,25 @@ baud = 115200
 
 ## 引脚别名
 
-| 别名       | 引脚 |
-|-------------|-----|
-| red_led     | 13  |
-| builtin_led | 13  |
-| user_led    | 5   |
+| 别名        | 引脚 |
+| ----------- | ---- |
+| red_led     | 13   |
+| builtin_led | 13   |
+| user_led    | 5    |
 ```
 
 或使用键值格式：
 
 ```markdown
 ## 引脚别名
+
 red_led: 13
 builtin_led: 13
 ```
 
 ### PDF 数据手册
 
-使用 `rag-pdf` 特性时，ZeroClaw 可以索引 PDF 文件：
+使用 `rag-pdf` 特性时，JhedaiClaw 可以索引 PDF 文件：
 
 ```bash
 cargo build --features hardware,rag-pdf
@@ -87,7 +88,7 @@ cargo build --features hardware,rag-pdf
 ## 添加新的开发板类型
 
 1. **创建数据手册** — `docs/datasheets/my-board.md`，包含引脚别名和 GPIO（通用输入输出）信息。
-2. **添加到配置** — `zeroclaw peripheral add my-board /dev/ttyUSB0`
+2. **添加到配置** — `jhedaiclaw peripheral add my-board /dev/ttyUSB0`
 3. **实现外设**（可选）—— 对于自定义协议，在 `src/peripherals/` 中实现 `Peripheral` 特征，并在 `create_peripheral_tools` 中注册。
 
 完整设计请参见 [`docs/hardware/hardware-peripherals-design.md`](../hardware/hardware-peripherals-design.zh-CN.md)。
@@ -100,14 +101,14 @@ cargo build --features hardware,rag-pdf
 
 ## CLI 参考
 
-| 命令 | 描述 |
-|---------|-------------|
-| `zeroclaw peripheral list` | 列出已配置的开发板 |
-| `zeroclaw peripheral add <board> <path>` | 添加开发板（写入配置） |
-| `zeroclaw peripheral flash` | 烧录 Arduino 固件 |
-| `zeroclaw peripheral flash-nucleo` | 烧录 Nucleo 固件 |
-| `zeroclaw hardware discover` | 列出 USB 设备 |
-| `zeroclaw hardware info` | 通过 probe-rs 获取芯片信息 |
+| 命令                                       | 描述                       |
+| ------------------------------------------ | -------------------------- |
+| `jhedaiclaw peripheral list`               | 列出已配置的开发板         |
+| `jhedaiclaw peripheral add <board> <path>` | 添加开发板（写入配置）     |
+| `jhedaiclaw peripheral flash`              | 烧录 Arduino 固件          |
+| `jhedaiclaw peripheral flash-nucleo`       | 烧录 Nucleo 固件           |
+| `jhedaiclaw hardware discover`             | 列出 USB 设备              |
+| `jhedaiclaw hardware info`                 | 通过 probe-rs 获取芯片信息 |
 
 ## 故障排除
 

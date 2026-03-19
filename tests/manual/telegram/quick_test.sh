@@ -17,7 +17,7 @@ cargo test telegram_split --lib --quiet 2>&1 && echo "✓" || { echo "✗ FAILED
 
 # Test 3: Health check
 echo -n "3. Health check... "
-timeout 7 target/release/zeroclaw channel doctor &>/dev/null && echo "✓" || echo "⚠ (configure bot first)"
+timeout 7 target/release/jhedaiclaw channel doctor &>/dev/null && echo "✓" || echo "⚠ (configure bot first)"
 
 # Test 4: File checks
 echo -n "4. Code structure... "

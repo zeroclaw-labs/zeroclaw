@@ -20,9 +20,9 @@ SOP 审计条目通过 `SopAuditLogger` 持久化到配置的内存后端的 `so
 ### 2.1 定义级 CLI
 
 ```bash
-zeroclaw sop list
-zeroclaw sop validate [name]
-zeroclaw sop show <name>
+jhedaiclaw sop list
+jhedaiclaw sop validate [name]
+jhedaiclaw sop show <name>
 ```
 
 ### 2.2 运行时运行状态工具
@@ -37,5 +37,5 @@ SOP 运行状态通过代理内工具查询：
 ## 3. 指标
 
 - 当 `[observability] backend = \"prometheus\"` 时，`/metrics` 暴露观察者指标。
-- 当前导出的名称是 `zeroclaw_*` 系列（通用运行时指标）。
+- 当前导出的名称是 `jhedaiclaw_*` 系列（通用运行时指标）。
 - SOP 特定的聚合可通过带 `include_metrics: true` 的 `sop_status` 获取。

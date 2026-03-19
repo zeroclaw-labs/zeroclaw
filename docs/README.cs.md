@@ -1,4 +1,4 @@
-# Dokumentační hub ZeroClaw
+# Dokumentační hub JhedaiClaw
 
 Tato stránka je hlavním vstupním bodem do dokumentačního systému.
 
@@ -8,20 +8,20 @@ Lokalizované huby: [简体中文](README.zh-CN.md) · [日本語](README.ja.md)
 
 ## Začněte zde
 
-| Chci…                                                                | Přečtěte si toto                                                               |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| Rychle nainstalovat a spustit ZeroClaw                              | [README.md (Rychlý start)](../README.md#quick-start)                           |
-| Bootstrap jedním příkazem                                           | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                   |
-| Najít příkazy podle úkolu                                           | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| Rychle ověřit konfigurační klíče a výchozí hodnoty                  | [config-reference.md](reference/api/config-reference.md)                       |
-| Nastavit vlastní poskytovatele/endpointy                            | [custom-providers.md](contributing/custom-providers.md)                         |
-| Nastavit poskytovatele Z.AI / GLM                                   | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                              |
-| Použít integrační vzory LangGraph                                   | [langgraph-integration.md](contributing/langgraph-integration.md)               |
-| Provozovat runtime (provozní příručka)                              | [operations-runbook.md](ops/operations-runbook.md)                             |
-| Řešit problémy s instalací/runtime/kanály                           | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| Spustit nastavení a diagnostiku šifrovaných místností Matrix        | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                           |
-| Procházet dokumentaci podle kategorie                               | [SUMMARY.md](SUMMARY.md)                                                       |
-| Zobrazit snapshot dokumentace PR/issues projektu                    | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| Chci…                                                        | Přečtěte si toto                                                                           |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| Rychle nainstalovat a spustit JhedaiClaw                     | [README.md (Rychlý start)](../README.md#quick-start)                                       |
+| Bootstrap jedním příkazem                                    | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| Najít příkazy podle úkolu                                    | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| Rychle ověřit konfigurační klíče a výchozí hodnoty           | [config-reference.md](reference/api/config-reference.md)                                   |
+| Nastavit vlastní poskytovatele/endpointy                     | [custom-providers.md](contributing/custom-providers.md)                                    |
+| Nastavit poskytovatele Z.AI / GLM                            | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| Použít integrační vzory LangGraph                            | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| Provozovat runtime (provozní příručka)                       | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| Řešit problémy s instalací/runtime/kanály                    | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| Spustit nastavení a diagnostiku šifrovaných místností Matrix | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| Procházet dokumentaci podle kategorie                        | [SUMMARY.md](SUMMARY.md)                                                                   |
+| Zobrazit snapshot dokumentace PR/issues projektu             | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## Rychlý rozhodovací strom (10 sekund)
 

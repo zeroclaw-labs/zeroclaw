@@ -65,7 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           status=$(curl -s -o /dev/null -w "%{http_code}" \
-            "https://crates.io/api/v1/crates/zeroclawlabs/${VERSION}")
+            "https://crates.io/api/v1/crates/jhedaiclaw/${VERSION}")
 
           if [[ "$status" == "200" ]]; then
             echo "Version ${VERSION} already exists on crates.io — skipping"
@@ -115,10 +115,10 @@ jobs:
           echo "Waiting for crates.io to index..."
           sleep 15
           status=$(curl -s -o /dev/null -w "%{http_code}" \
-            "https://crates.io/api/v1/crates/zeroclawlabs/${VERSION}")
+            "https://crates.io/api/v1/crates/jhedaiclaw/${VERSION}")
           if [[ "$status" == "200" ]]; then
-            echo "zeroclawlabs v${VERSION} is live on crates.io"
-            echo "Install: cargo install zeroclawlabs"
+            echo "jhedaiclaw v${VERSION} is live on crates.io"
+            echo "Install: cargo install jhedaiclaw"
           else
-            echo "::warning::Version may still be indexing — check https://crates.io/crates/zeroclawlabs"
+            echo "::warning::Version may still be indexing — check https://crates.io/crates/jhedaiclaw"
           fi

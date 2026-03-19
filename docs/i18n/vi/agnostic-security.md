@@ -171,15 +171,15 @@ pub fn create_sandbox() -> Box<dyn Sandbox> {
 
 ### Ma trận hành vi đa nền tảng
 
-| Nền tảng | Build trên | Hành vi runtime |
-|----------|-----------|------------------|
-| **Linux ARM** (Raspberry Pi) | ✅ Có | Landlock → None (graceful) |
-| **Linux x86_64** | ✅ Có | Landlock → Firejail → None |
-| **macOS ARM** (M1/M2) | ✅ Có | Bubblewrap → None |
-| **macOS x86_64** | ✅ Có | Bubblewrap → None |
-| **Windows ARM** | ✅ Có | None (app-layer) |
-| **Windows x86_64** | ✅ Có | None (app-layer) |
-| **RISC-V Linux** | ✅ Có | Landlock → None |
+| Nền tảng                     | Build trên | Hành vi runtime            |
+| ---------------------------- | ---------- | -------------------------- |
+| **Linux ARM** (Raspberry Pi) | ✅ Có      | Landlock → None (graceful) |
+| **Linux x86_64**             | ✅ Có      | Landlock → Firejail → None |
+| **macOS ARM** (M1/M2)        | ✅ Có      | Bubblewrap → None          |
+| **macOS x86_64**             | ✅ Có      | Bubblewrap → None          |
+| **Windows ARM**              | ✅ Có      | None (app-layer)           |
+| **Windows x86_64**           | ✅ Có      | None (app-layer)           |
+| **RISC-V Linux**             | ✅ Có      | Landlock → None            |
 
 ### Cơ chế hoạt động: phát hiện tại runtime
 
@@ -223,32 +223,32 @@ impl SandboxingStrategy {
 
 ### Tác động kích thước binary (ước tính)
 
-| Tính năng | Kích thước code | RAM overhead | Trạng thái |
-|---------|-----------|--------------|--------|
-| **ZeroClaw cơ bản** | 3.4MB | <5MB | ✅ Hiện tại |
-| **+ Landlock** | +50KB | +100KB | ✅ Linux 5.13+ |
-| **+ Firejail wrapper** | +20KB | +0KB (external) | ✅ Linux + firejail |
-| **+ Memory monitoring** | +30KB | +50KB | ✅ Tất cả nền tảng |
-| **+ Audit logging** | +40KB | +200KB (buffered) | ✅ Tất cả nền tảng |
-| **Full security** | +140KB | +350KB | ✅ Vẫn <6MB tổng |
+| Tính năng               | Kích thước code | RAM overhead      | Trạng thái          |
+| ----------------------- | --------------- | ----------------- | ------------------- |
+| **JhedaiClaw cơ bản**   | 3.4MB           | <5MB              | ✅ Hiện tại         |
+| **+ Landlock**          | +50KB           | +100KB            | ✅ Linux 5.13+      |
+| **+ Firejail wrapper**  | +20KB           | +0KB (external)   | ✅ Linux + firejail |
+| **+ Memory monitoring** | +30KB           | +50KB             | ✅ Tất cả nền tảng  |
+| **+ Audit logging**     | +40KB           | +200KB (buffered) | ✅ Tất cả nền tảng  |
+| **Full security**       | +140KB          | +350KB            | ✅ Vẫn <6MB tổng    |
 
 ### Tương thích phần cứng $10
 
-| Phần cứng | RAM | ZeroClaw (cơ bản) | ZeroClaw (full security) | Trạng thái |
-|----------|-----|-----------------|--------------------------|--------|
-| **Raspberry Pi Zero** | 512MB | ✅ 2% | ✅ 2.5% | Hoạt động |
-| **Orange Pi Zero** | 512MB | ✅ 2% | ✅ 2.5% | Hoạt động |
-| **NanoPi NEO** | 256MB | ✅ 4% | ✅ 5% | Hoạt động |
-| **C.H.I.P.** | 512MB | ✅ 2% | ✅ 2.5% | Hoạt động |
-| **Rock64** | 1GB | ✅ 1% | ✅ 1.2% | Hoạt động |
+| Phần cứng             | RAM   | JhedaiClaw (cơ bản) | JhedaiClaw (full security) | Trạng thái |
+| --------------------- | ----- | ------------------- | -------------------------- | ---------- |
+| **Raspberry Pi Zero** | 512MB | ✅ 2%               | ✅ 2.5%                    | Hoạt động  |
+| **Orange Pi Zero**    | 512MB | ✅ 2%               | ✅ 2.5%                    | Hoạt động  |
+| **NanoPi NEO**        | 256MB | ✅ 4%               | ✅ 5%                      | Hoạt động  |
+| **C.H.I.P.**          | 512MB | ✅ 2%               | ✅ 2.5%                    | Hoạt động  |
+| **Rock64**            | 1GB   | ✅ 1%               | ✅ 1.2%                    | Hoạt động  |
 
-**Ngay cả với full security, ZeroClaw chỉ dùng <5% RAM trên board $10.**
+**Ngay cả với full security, JhedaiClaw chỉ dùng <5% RAM trên board $10.**
 
 ---
 
 ## 5. Tính hoán đổi: mọi thứ vẫn pluggable
 
-### Cam kết chính của ZeroClaw: hoán đổi bất kỳ thứ gì
+### Cam kết chính của JhedaiClaw: hoán đổi bất kỳ thứ gì
 
 ```rust
 // Providers (đã pluggable)
@@ -304,16 +304,17 @@ axum, tracing, opentelemetry, ...
 
 ### Phụ thuộc của các security feature
 
-| Tính năng | Phụ thuộc mới | Nền tảng |
-|---------|------------------|----------|
-| **Landlock** | `landlock` crate (pure Rust) | Chỉ Linux |
-| **Firejail** | Không (binary ngoài) | Chỉ Linux |
-| **Bubblewrap** | Không (binary ngoài) | macOS/Linux |
-| **Docker** | `bollard` crate (Docker API) | Tất cả nền tảng |
-| **Memory monitoring** | Không (std::alloc) | Tất cả nền tảng |
-| **Audit logging** | Không (đã có hmac/sha2) | Tất cả nền tảng |
+| Tính năng             | Phụ thuộc mới                | Nền tảng        |
+| --------------------- | ---------------------------- | --------------- |
+| **Landlock**          | `landlock` crate (pure Rust) | Chỉ Linux       |
+| **Firejail**          | Không (binary ngoài)         | Chỉ Linux       |
+| **Bubblewrap**        | Không (binary ngoài)         | macOS/Linux     |
+| **Docker**            | `bollard` crate (Docker API) | Tất cả nền tảng |
+| **Memory monitoring** | Không (std::alloc)           | Tất cả nền tảng |
+| **Audit logging**     | Không (đã có hmac/sha2)      | Tất cả nền tảng |
 
 **Kết quả**: Hầu hết tính năng **không thêm phụ thuộc Rust mới** — chúng hoặc:
+
 1. Dùng pure-Rust crate (landlock)
 2. Bọc binary ngoài (Firejail, Bubblewrap)
 3. Dùng phụ thuộc sẵn có (hmac, sha2 đã có trong Cargo.toml)
@@ -322,15 +323,15 @@ axum, tracing, opentelemetry, ...
 
 ## Tóm tắt: các giá trị chính được bảo toàn
 
-| Giá trị | Trước | Sau (có bảo mật) | Trạng thái |
-|------------|--------|----------------------|--------|
-| **<5MB RAM** | ✅ <5MB | ✅ <6MB (trường hợp xấu nhất) | ✅ Bảo toàn |
-| **<10ms startup** | ✅ <10ms | ✅ <15ms (detection) | ✅ Bảo toàn |
-| **3.4MB binary** | ✅ 3.4MB | ✅ 3.5MB (với tất cả features) | ✅ Bảo toàn |
-| **ARM + x86 + RISC-V** | ✅ Tất cả | ✅ Tất cả | ✅ Bảo toàn |
-| **Phần cứng $10** | ✅ Hoạt động | ✅ Hoạt động | ✅ Bảo toàn |
-| **Pluggable everything** | ✅ Có | ✅ Có (cả bảo mật) | ✅ Cải thiện |
-| **Cross-platform** | ✅ Có | ✅ Có | ✅ Bảo toàn |
+| Giá trị                  | Trước        | Sau (có bảo mật)               | Trạng thái   |
+| ------------------------ | ------------ | ------------------------------ | ------------ |
+| **<5MB RAM**             | ✅ <5MB      | ✅ <6MB (trường hợp xấu nhất)  | ✅ Bảo toàn  |
+| **<10ms startup**        | ✅ <10ms     | ✅ <15ms (detection)           | ✅ Bảo toàn  |
+| **3.4MB binary**         | ✅ 3.4MB     | ✅ 3.5MB (với tất cả features) | ✅ Bảo toàn  |
+| **ARM + x86 + RISC-V**   | ✅ Tất cả    | ✅ Tất cả                      | ✅ Bảo toàn  |
+| **Phần cứng $10**        | ✅ Hoạt động | ✅ Hoạt động                   | ✅ Bảo toàn  |
+| **Pluggable everything** | ✅ Có        | ✅ Có (cả bảo mật)             | ✅ Cải thiện |
+| **Cross-platform**       | ✅ Có        | ✅ Có                          | ✅ Bảo toàn  |
 
 ---
 

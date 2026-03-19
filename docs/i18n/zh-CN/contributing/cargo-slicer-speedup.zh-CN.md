@@ -4,11 +4,11 @@
 
 ## 基准测试结果
 
-| 环境 | 模式 | 基准时间 | 使用 cargo-slicer | 耗时节省 |
-|---|---|---|---|---|
-| 48 核服务器 | syn 预分析 | 3分52秒 | 3分31秒 | **-9.1%** |
-| 48 核服务器 | MIR 精确模式 | 3分52秒 | 2分49秒 | **-27.2%** |
-| 树莓派 4 | syn 预分析 | 25分03秒 | 17分54秒 | **-28.6%** |
+| 环境        | 模式         | 基准时间 | 使用 cargo-slicer | 耗时节省   |
+| ----------- | ------------ | -------- | ----------------- | ---------- |
+| 48 核服务器 | syn 预分析   | 3分52秒  | 3分31秒           | **-9.1%**  |
+| 48 核服务器 | MIR 精确模式 | 3分52秒  | 2分49秒           | **-27.2%** |
+| 树莓派 4    | syn 预分析   | 25分03秒 | 17分54秒          | **-28.6%** |
 
 所有测量都是干净的 `cargo +nightly build --release`。MIR 精确模式读取实际的编译器 MIR 来构建更准确的调用图，相比基于 syn 的分析的 799 个单体项，它可以桩实现 1060 个单体项。
 
@@ -17,6 +17,7 @@
 工作流 `.github/workflows/ci-build-fast.yml`（尚未实现）旨在与标准版本构建并行运行加速版本构建。它在 Rust 代码变更和工作流变更时触发，不阻塞合并，作为非阻塞检查并行运行。
 
 CI 使用弹性双路径策略：
+
 - **快速路径：** 安装 `cargo-slicer` 和 `rustc-driver` 二进制文件，运行 MIR 精确模式的切片构建。
 - **回退路径：** 如果 `rustc-driver` 安装失败（例如由于 nightly `rustc` API 变化），则运行普通的 `cargo +nightly build --release`，而不是让检查失败。
 
@@ -32,7 +33,7 @@ cargo +nightly install cargo-slicer --profile release-rustc \
   --bin cargo-slicer-rustc --bin cargo_slicer_dispatch \
   --features rustc-driver
 
-# 使用 syn 预分析构建（在 zeroclaw 根目录执行）
+# 使用 syn 预分析构建（在 jhedaiclaw 根目录执行）
 cargo-slicer pre-analyze
 CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
   RUSTC_WRAPPER=$(which cargo_slicer_dispatch) \
@@ -40,7 +41,7 @@ CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
 
 # 使用 MIR 精确模式构建（更多桩实现，更大节省）
 # 步骤 1：生成 .mir-cache（首次构建使用 MIR_PRECISE）
-CARGO_SLICER_MIR_PRECISE=1 CARGO_SLICER_WORKSPACE_CRATES=zeroclaw,zeroclaw_robot_kit \
+CARGO_SLICER_MIR_PRECISE=1 CARGO_SLICER_WORKSPACE_CRATES=jhedaiclaw,jhedaiclaw_robot_kit \
   CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
   RUSTC_WRAPPER=$(which cargo_slicer_dispatch) \
   cargo +nightly build --release

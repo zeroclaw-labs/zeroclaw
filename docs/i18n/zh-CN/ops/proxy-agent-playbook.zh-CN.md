@@ -7,9 +7,9 @@
 ## 0. 摘要
 
 - **目的：** 提供可直接使用的代理范围管理和回滚的代理工具调用。
-- **受众：** 在代理网络中运行 ZeroClaw 的运维人员和维护者。
+- **受众：** 在代理网络中运行 JhedaiClaw 的运维人员和维护者。
 - **范围：** `proxy_config` 操作、模式选择、验证流程和故障排除。
-- **非目标：** ZeroClaw 运行时行为之外的通用网络调试。
+- **非目标：** JhedaiClaw 运行时行为之外的通用网络调试。
 
 ---
 
@@ -17,15 +17,15 @@
 
 使用本节进行快速运维路由。
 
-### 1.1 仅代理 ZeroClaw 内部流量
+### 1.1 仅代理 JhedaiClaw 内部流量
 
-1. 使用范围 `zeroclaw`。
+1. 使用范围 `jhedaiclaw`。
 2. 设置 `http_proxy`/`https_proxy` 或 `all_proxy`。
 3. 使用 `{\"action\":\"get\"}` 验证。
 
 前往：
 
-- [第 4 节](#4-模式-a--仅代理-zeroclaw-内部流量)
+- [第 4 节](#4-模式-a--仅代理-jhedaiclaw-内部流量)
 
 ### 1.2 仅代理选定服务
 
@@ -61,11 +61,11 @@
 
 ## 2. 范围决策矩阵
 
-| 范围 | 影响 | 导出环境变量 | 典型用途 |
-|---|---|---|---|
-| `zeroclaw` | ZeroClaw 内部 HTTP 客户端 | 否 | 无进程级副作用的正常运行时代理 |
-| `services` | 仅选定的服务键/选择器 | 否 | 特定提供商/工具/渠道的细粒度路由 |
-| `environment` | 运行时 + 进程环境代理变量 | 是 | 需要 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 的集成 |
+| 范围          | 影响                        | 导出环境变量 | 典型用途                                           |
+| ------------- | --------------------------- | ------------ | -------------------------------------------------- |
+| `jhedaiclaw`  | JhedaiClaw 内部 HTTP 客户端 | 否           | 无进程级副作用的正常运行时代理                     |
+| `services`    | 仅选定的服务键/选择器       | 否           | 特定提供商/工具/渠道的细粒度路由                   |
+| `environment` | 运行时 + 进程环境代理变量   | 是           | 需要 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 的集成 |
 
 ---
 
@@ -88,20 +88,20 @@
 
 ---
 
-## 4. 模式 A — 仅代理 ZeroClaw 内部流量
+## 4. 模式 A — 仅代理 JhedaiClaw 内部流量
 
-当 ZeroClaw 提供商/渠道/工具 HTTP 流量应使用代理，但不导出进程级代理环境变量时使用。
+当 JhedaiClaw 提供商/渠道/工具 HTTP 流量应使用代理，但不导出进程级代理环境变量时使用。
 
 工具调用：
 
 ```json
-{\"action\":\"set\",\"enabled\":true,\"scope\":\"zeroclaw\",\"http_proxy\":\"http://127.0.0.1:7890\",\"https_proxy\":\"http://127.0.0.1:7890\",\"no_proxy\":[\"localhost\",\"127.0.0.1\"]}
+{\"action\":\"set\",\"enabled\":true,\"scope\":\"jhedaiclaw\",\"http_proxy\":\"http://127.0.0.1:7890\",\"https_proxy\":\"http://127.0.0.1:7890\",\"no_proxy\":[\"localhost\",\"127.0.0.1\"]}
 {\"action\":\"get\"}
 ```
 
 预期行为：
 
-- ZeroClaw HTTP 客户端的运行时代理处于活动状态。
+- JhedaiClaw HTTP 客户端的运行时代理处于活动状态。
 - 不需要 `HTTP_PROXY` / `HTTPS_PROXY` 进程环境导出。
 
 ---

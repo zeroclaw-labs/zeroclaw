@@ -1,4 +1,4 @@
-# ZeroClaw 沙箱策略
+# JhedaiClaw 沙箱策略
 
 > ⚠️ **状态：提案 / 路线图**
 >
@@ -7,7 +7,7 @@
 
 ## 问题
 
-ZeroClaw 当前具有应用层安全（白名单、路径阻止、命令注入保护），但缺少操作系统级别的 containment。如果攻击者在白名单中，他们可以使用 zeroclaw 的用户权限运行任何允许的命令。
+JhedaiClaw 当前具有应用层安全（白名单、路径阻止、命令注入保护），但缺少操作系统级别的 containment。如果攻击者在白名单中，他们可以使用 jhedaiclaw 的用户权限运行任何允许的命令。
 
 ## 提议的解决方案
 
@@ -66,6 +66,7 @@ impl FirejailSandbox {
 ```
 
 **配置选项：**
+
 ```toml
 [security]
 enable_sandbox = true
@@ -148,12 +149,12 @@ pub fn apply_landlock() -> Result<()> {
 
 ## 实现优先级顺序
 
-| 阶段 | 解决方案 | 工作量 | 安全收益 |
-|-------|----------|--------|---------------|
-| **P0** | Landlock（仅 Linux，原生） | 低 | 高（文件系统） |
-| **P1** | Firejail 集成 | 低 | 极高 |
-| **P2** | Bubblewrap 包装 | 中 | 极高 |
-| **P3** | Docker 沙箱模式 | 高 | 完全 |
+| 阶段   | 解决方案                   | 工作量 | 安全收益       |
+| ------ | -------------------------- | ------ | -------------- |
+| **P0** | Landlock（仅 Linux，原生） | 低     | 高（文件系统） |
+| **P1** | Firejail 集成              | 低     | 极高           |
+| **P2** | Bubblewrap 包装            | 中     | 极高           |
+| **P3** | Docker 沙箱模式            | 高     | 完全           |
 
 ## 配置模式扩展
 
@@ -169,7 +170,7 @@ extra_args = [\"--seccomp\", \"--caps.drop=all\"]
 # Landlock 特定配置
 [security.sandbox.landlock]
 readonly_paths = [\"/usr\", \"/bin\", \"/lib\"]
-readwrite_paths = [\"$HOME/workspace\", \"/tmp/zeroclaw\"]
+readwrite_paths = [\"$HOME/workspace\", \"/tmp/jhedaiclaw\"]
 ```
 
 ## 测试策略

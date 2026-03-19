@@ -1,4 +1,4 @@
-# Κέντρο Τεκμηρίωσης ZeroClaw
+# Κέντρο Τεκμηρίωσης JhedaiClaw
 
 Αυτή η σελίδα είναι το κύριο σημείο εισόδου για το σύστημα τεκμηρίωσης.
 
@@ -8,20 +8,20 @@
 
 ## Ξεκινήστε Εδώ
 
-| Θέλω να…                                                            | Διαβάστε αυτό                                                                  |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| Εγκαταστήσω και εκτελέσω το ZeroClaw γρήγορα                       | [README.md (Γρήγορη Εκκίνηση)](../README.md#quick-start)                      |
-| Εκκίνηση με μία εντολή                                              | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                  |
-| Βρω εντολές ανά εργασία                                             | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| Ελέγξω γρήγορα κλειδιά και προεπιλογές ρυθμίσεων                   | [config-reference.md](reference/api/config-reference.md)                       |
-| Ρυθμίσω προσαρμοσμένους παρόχους/endpoints                         | [custom-providers.md](contributing/custom-providers.md)                        |
-| Ρυθμίσω τον πάροχο Z.AI / GLM                                      | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                             |
-| Χρησιμοποιήσω τα πρότυπα ενσωμάτωσης LangGraph                     | [langgraph-integration.md](contributing/langgraph-integration.md)              |
-| Λειτουργήσω το runtime (runbook ημέρας-2)                           | [operations-runbook.md](ops/operations-runbook.md)                             |
-| Αντιμετωπίσω προβλήματα εγκατάστασης/runtime/καναλιού               | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| Εκτελέσω ρύθμιση και διαγνωστικά κρυπτογραφημένων δωματίων Matrix  | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                          |
-| Περιηγηθώ στα έγγραφα ανά κατηγορία                                 | [SUMMARY.md](SUMMARY.md)                                                      |
-| Δω το στιγμιότυπο εγγράφων PR/issues του έργου                     | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| Θέλω να…                                                          | Διαβάστε αυτό                                                                              |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Εγκαταστήσω και εκτελέσω το JhedaiClaw γρήγορα                    | [README.md (Γρήγορη Εκκίνηση)](../README.md#quick-start)                                   |
+| Εκκίνηση με μία εντολή                                            | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| Βρω εντολές ανά εργασία                                           | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| Ελέγξω γρήγορα κλειδιά και προεπιλογές ρυθμίσεων                  | [config-reference.md](reference/api/config-reference.md)                                   |
+| Ρυθμίσω προσαρμοσμένους παρόχους/endpoints                        | [custom-providers.md](contributing/custom-providers.md)                                    |
+| Ρυθμίσω τον πάροχο Z.AI / GLM                                     | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| Χρησιμοποιήσω τα πρότυπα ενσωμάτωσης LangGraph                    | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| Λειτουργήσω το runtime (runbook ημέρας-2)                         | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| Αντιμετωπίσω προβλήματα εγκατάστασης/runtime/καναλιού             | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| Εκτελέσω ρύθμιση και διαγνωστικά κρυπτογραφημένων δωματίων Matrix | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| Περιηγηθώ στα έγγραφα ανά κατηγορία                               | [SUMMARY.md](SUMMARY.md)                                                                   |
+| Δω το στιγμιότυπο εγγράφων PR/issues του έργου                    | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## Δέντρο Γρήγορης Απόφασης (10 δευτερόλεπτα)
 

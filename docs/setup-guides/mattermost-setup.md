@@ -1,6 +1,6 @@
 # Mattermost Integration Guide
 
-ZeroClaw supports native integration with Mattermost via its REST API v4. This integration is ideal for self-hosted, private, or air-gapped environments where sovereign communication is a requirement.
+JhedaiClaw supports native integration with Mattermost via its REST API v4. This integration is ideal for self-hosted, private, or air-gapped environments where sovereign communication is a requirement.
 
 ## Prerequisites
 
@@ -8,7 +8,7 @@ ZeroClaw supports native integration with Mattermost via its REST API v4. This i
 2.  **Bot Account**:
     - Go to **Main Menu > Integrations > Bot Accounts**.
     - Click **Add Bot Account**.
-    - Set a username (e.g., `zeroclaw-bot`).
+    - Set a username (e.g., `jhedaiclaw-bot`).
     - Enable **post:all** and **channel:read** permissions (or appropriate scopes).
     - Save the **Access Token**.
 3.  **Channel ID**:
@@ -32,25 +32,26 @@ mention_only = true
 
 ### Configuration Fields
 
-| Field | Description |
-|---|---|
-| `url` | The base URL of your Mattermost server. |
-| `bot_token` | The Personal Access Token for the bot account. |
-| `channel_id` | (Optional) The ID of the channel to listen to. Required for `listen` mode. |
-| `allowed_users` | (Optional) A list of Mattermost User IDs permitted to interact with the bot. Use `["*"]` to allow everyone. |
-| `thread_replies` | (Optional) Whether top-level user messages should be answered in a thread. Default: `true`. Existing thread replies always remain in-thread. |
-| `mention_only` | (Optional) When `true`, only messages that explicitly mention the bot username (for example `@zeroclaw-bot`) are processed. Default: `false`. |
+| Field            | Description                                                                                                                                     |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `url`            | The base URL of your Mattermost server.                                                                                                         |
+| `bot_token`      | The Personal Access Token for the bot account.                                                                                                  |
+| `channel_id`     | (Optional) The ID of the channel to listen to. Required for `listen` mode.                                                                      |
+| `allowed_users`  | (Optional) A list of Mattermost User IDs permitted to interact with the bot. Use `["*"]` to allow everyone.                                     |
+| `thread_replies` | (Optional) Whether top-level user messages should be answered in a thread. Default: `true`. Existing thread replies always remain in-thread.    |
+| `mention_only`   | (Optional) When `true`, only messages that explicitly mention the bot username (for example `@jhedaiclaw-bot`) are processed. Default: `false`. |
 
 ## Threaded Conversations
 
-ZeroClaw supports Mattermost threads in both modes:
-- If a user sends a message in an existing thread, ZeroClaw always replies within that same thread.
+JhedaiClaw supports Mattermost threads in both modes:
+
+- If a user sends a message in an existing thread, JhedaiClaw always replies within that same thread.
 - If `thread_replies = true` (default), top-level messages are answered by threading on that post.
 - If `thread_replies = false`, top-level messages are answered at channel root level.
 
 ## Mention-Only Mode
 
-When `mention_only = true`, ZeroClaw applies an extra filter after `allowed_users` authorization:
+When `mention_only = true`, JhedaiClaw applies an extra filter after `allowed_users` authorization:
 
 - Messages without an explicit bot mention are ignored.
 - Messages with `@bot_username` are processed.

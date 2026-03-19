@@ -1,44 +1,44 @@
-# ZeroClaw Commands Reference
+# JhedaiClaw Commands Reference
 
-This reference is derived from the current CLI surface (`zeroclaw --help`).
+This reference is derived from the current CLI surface (`jhedaiclaw --help`).
 
 Last verified: **February 21, 2026**.
 
 ## Top-Level Commands
 
-| Command | Purpose |
-|---|---|
-| `onboard` | Initialize workspace/config quickly or interactively |
-| `agent` | Run interactive chat or single-message mode |
-| `gateway` | Start webhook and WhatsApp HTTP gateway |
-| `daemon` | Start supervised runtime (gateway + channels + optional heartbeat/scheduler) |
-| `service` | Manage user-level OS service lifecycle |
-| `doctor` | Run diagnostics and freshness checks |
-| `status` | Print current configuration and system summary |
-| `estop` | Engage/resume emergency stop levels and inspect estop state |
-| `cron` | Manage scheduled tasks |
-| `models` | Refresh provider model catalogs |
-| `providers` | List provider IDs, aliases, and active provider |
-| `channel` | Manage channels and channel health checks |
-| `integrations` | Inspect integration details |
-| `skills` | List/install/remove skills |
-| `migrate` | Import from external runtimes (currently OpenClaw) |
-| `config` | Export machine-readable config schema |
-| `completions` | Generate shell completion scripts to stdout |
-| `hardware` | Discover and introspect USB hardware |
-| `peripheral` | Configure and flash peripherals |
+| Command        | Purpose                                                                      |
+| -------------- | ---------------------------------------------------------------------------- |
+| `onboard`      | Initialize workspace/config quickly or interactively                         |
+| `agent`        | Run interactive chat or single-message mode                                  |
+| `gateway`      | Start webhook and WhatsApp HTTP gateway                                      |
+| `daemon`       | Start supervised runtime (gateway + channels + optional heartbeat/scheduler) |
+| `service`      | Manage user-level OS service lifecycle                                       |
+| `doctor`       | Run diagnostics and freshness checks                                         |
+| `status`       | Print current configuration and system summary                               |
+| `estop`        | Engage/resume emergency stop levels and inspect estop state                  |
+| `cron`         | Manage scheduled tasks                                                       |
+| `models`       | Refresh provider model catalogs                                              |
+| `providers`    | List provider IDs, aliases, and active provider                              |
+| `channel`      | Manage channels and channel health checks                                    |
+| `integrations` | Inspect integration details                                                  |
+| `skills`       | List/install/remove skills                                                   |
+| `migrate`      | Import from external runtimes (currently OpenClaw)                           |
+| `config`       | Export machine-readable config schema                                        |
+| `completions`  | Generate shell completion scripts to stdout                                  |
+| `hardware`     | Discover and introspect USB hardware                                         |
+| `peripheral`   | Configure and flash peripherals                                              |
 
 ## Command Groups
 
 ### `onboard`
 
-- `zeroclaw onboard`
-- `zeroclaw onboard --channels-only`
-- `zeroclaw onboard --force`
-- `zeroclaw onboard --reinit`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none> --force`
+- `jhedaiclaw onboard`
+- `jhedaiclaw onboard --channels-only`
+- `jhedaiclaw onboard --force`
+- `jhedaiclaw onboard --reinit`
+- `jhedaiclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
+- `jhedaiclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
+- `jhedaiclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none> --force`
 
 `onboard` safety behavior:
 
@@ -46,15 +46,15 @@ Last verified: **February 21, 2026**.
   - Full onboarding (overwrite `config.toml`)
   - Provider-only update (update provider/model/API key while preserving existing channels, tunnel, memory, hooks, and other settings)
 - In non-interactive environments, existing `config.toml` causes a safe refusal unless `--force` is passed.
-- Use `zeroclaw onboard --channels-only` when you only need to rotate channel tokens/allowlists.
-- Use `zeroclaw onboard --reinit` to start fresh. This backs up your existing config directory with a timestamp suffix and creates a new configuration from scratch.
+- Use `jhedaiclaw onboard --channels-only` when you only need to rotate channel tokens/allowlists.
+- Use `jhedaiclaw onboard --reinit` to start fresh. This backs up your existing config directory with a timestamp suffix and creates a new configuration from scratch.
 
 ### `agent`
 
-- `zeroclaw agent`
-- `zeroclaw agent -m "Hello"`
-- `zeroclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
-- `zeroclaw agent --peripheral <board:path>`
+- `jhedaiclaw agent`
+- `jhedaiclaw agent -m "Hello"`
+- `jhedaiclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
+- `jhedaiclaw agent --peripheral <board:path>`
 
 Tip:
 
@@ -62,21 +62,21 @@ Tip:
 
 ### `gateway` / `daemon`
 
-- `zeroclaw gateway [--host <HOST>] [--port <PORT>]`
-- `zeroclaw daemon [--host <HOST>] [--port <PORT>]`
+- `jhedaiclaw gateway [--host <HOST>] [--port <PORT>]`
+- `jhedaiclaw daemon [--host <HOST>] [--port <PORT>]`
 
 ### `estop`
 
-- `zeroclaw estop` (engage `kill-all`)
-- `zeroclaw estop --level network-kill`
-- `zeroclaw estop --level domain-block --domain "*.chase.com" [--domain "*.paypal.com"]`
-- `zeroclaw estop --level tool-freeze --tool shell [--tool browser]`
-- `zeroclaw estop status`
-- `zeroclaw estop resume`
-- `zeroclaw estop resume --network`
-- `zeroclaw estop resume --domain "*.chase.com"`
-- `zeroclaw estop resume --tool shell`
-- `zeroclaw estop resume --otp <123456>`
+- `jhedaiclaw estop` (engage `kill-all`)
+- `jhedaiclaw estop --level network-kill`
+- `jhedaiclaw estop --level domain-block --domain "*.chase.com" [--domain "*.paypal.com"]`
+- `jhedaiclaw estop --level tool-freeze --tool shell [--tool browser]`
+- `jhedaiclaw estop status`
+- `jhedaiclaw estop resume`
+- `jhedaiclaw estop resume --network`
+- `jhedaiclaw estop resume --domain "*.chase.com"`
+- `jhedaiclaw estop resume --tool shell`
+- `jhedaiclaw estop resume --otp <123456>`
 
 Notes:
 
@@ -86,23 +86,23 @@ Notes:
 
 ### `service`
 
-- `zeroclaw service install`
-- `zeroclaw service start`
-- `zeroclaw service stop`
-- `zeroclaw service restart`
-- `zeroclaw service status`
-- `zeroclaw service uninstall`
+- `jhedaiclaw service install`
+- `jhedaiclaw service start`
+- `jhedaiclaw service stop`
+- `jhedaiclaw service restart`
+- `jhedaiclaw service status`
+- `jhedaiclaw service uninstall`
 
 ### `cron`
 
-- `zeroclaw cron list`
-- `zeroclaw cron add <expr> [--tz <IANA_TZ>] <command>`
-- `zeroclaw cron add-at <rfc3339_timestamp> <command>`
-- `zeroclaw cron add-every <every_ms> <command>`
-- `zeroclaw cron once <delay> <command>`
-- `zeroclaw cron remove <id>`
-- `zeroclaw cron pause <id>`
-- `zeroclaw cron resume <id>`
+- `jhedaiclaw cron list`
+- `jhedaiclaw cron add <expr> [--tz <IANA_TZ>] <command>`
+- `jhedaiclaw cron add-at <rfc3339_timestamp> <command>`
+- `jhedaiclaw cron add-every <every_ms> <command>`
+- `jhedaiclaw cron once <delay> <command>`
+- `jhedaiclaw cron remove <id>`
+- `jhedaiclaw cron pause <id>`
+- `jhedaiclaw cron resume <id>`
 
 Notes:
 
@@ -111,29 +111,29 @@ Notes:
 
 ### `models`
 
-- `zeroclaw models refresh`
-- `zeroclaw models refresh --provider <ID>`
-- `zeroclaw models refresh --force`
+- `jhedaiclaw models refresh`
+- `jhedaiclaw models refresh --provider <ID>`
+- `jhedaiclaw models refresh --force`
 
 `models refresh` currently supports live catalog refresh for provider IDs: `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `llamacpp`, `sglang`, `vllm`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `glm`, `zai`, `qwen`, and `nvidia`.
 
 ### `doctor`
 
-- `zeroclaw doctor`
-- `zeroclaw doctor models [--provider <ID>] [--use-cache]`
-- `zeroclaw doctor traces [--limit <N>] [--event <TYPE>] [--contains <TEXT>]`
-- `zeroclaw doctor traces --id <TRACE_ID>`
+- `jhedaiclaw doctor`
+- `jhedaiclaw doctor models [--provider <ID>] [--use-cache]`
+- `jhedaiclaw doctor traces [--limit <N>] [--event <TYPE>] [--contains <TEXT>]`
+- `jhedaiclaw doctor traces --id <TRACE_ID>`
 
 `doctor traces` reads runtime tool/model diagnostics from `observability.runtime_trace_path`.
 
 ### `channel`
 
-- `zeroclaw channel list`
-- `zeroclaw channel start`
-- `zeroclaw channel doctor`
-- `zeroclaw channel bind-telegram <IDENTITY>`
-- `zeroclaw channel add <type> <json>`
-- `zeroclaw channel remove <name>`
+- `jhedaiclaw channel list`
+- `jhedaiclaw channel start`
+- `jhedaiclaw channel doctor`
+- `jhedaiclaw channel bind-telegram <IDENTITY>`
+- `jhedaiclaw channel add <type> <json>`
+- `jhedaiclaw channel remove <name>`
 
 Runtime in-chat commands (Telegram/Discord while channel server is running):
 
@@ -144,6 +144,7 @@ Runtime in-chat commands (Telegram/Discord while channel server is running):
 - `/new`
 
 Channel runtime also watches `config.toml` and hot-applies updates to:
+
 - `default_provider`
 - `default_model`
 - `default_temperature`
@@ -154,18 +155,19 @@ Channel runtime also watches `config.toml` and hot-applies updates to:
 
 ### `integrations`
 
-- `zeroclaw integrations info <name>`
+- `jhedaiclaw integrations info <name>`
 
 ### `skills`
 
-- `zeroclaw skills list`
-- `zeroclaw skills audit <source_or_name>`
-- `zeroclaw skills install <source>`
-- `zeroclaw skills remove <name>`
+- `jhedaiclaw skills list`
+- `jhedaiclaw skills audit <source_or_name>`
+- `jhedaiclaw skills install <source>`
+- `jhedaiclaw skills remove <name>`
 
 `<source>` accepts git remotes (`https://...`, `http://...`, `ssh://...`, and `git@host:owner/repo.git`) or a local filesystem path.
 
 `skills install` always runs a built-in static security audit before the skill is accepted. The audit blocks:
+
 - symlinks inside the skill package
 - script-like files (`.sh`, `.bash`, `.zsh`, `.ps1`, `.bat`, `.cmd`)
 - high-risk command snippets (for example pipe-to-shell payloads)
@@ -177,43 +179,43 @@ Skill manifests (`SKILL.toml`) support `prompts` and `[[tools]]`; both are injec
 
 ### `migrate`
 
-- `zeroclaw migrate openclaw [--source <path>] [--dry-run]`
+- `jhedaiclaw migrate openclaw [--source <path>] [--dry-run]`
 
 ### `config`
 
-- `zeroclaw config schema`
+- `jhedaiclaw config schema`
 
 `config schema` prints a JSON Schema (draft 2020-12) for the full `config.toml` contract to stdout.
 
 ### `completions`
 
-- `zeroclaw completions bash`
-- `zeroclaw completions fish`
-- `zeroclaw completions zsh`
-- `zeroclaw completions powershell`
-- `zeroclaw completions elvish`
+- `jhedaiclaw completions bash`
+- `jhedaiclaw completions fish`
+- `jhedaiclaw completions zsh`
+- `jhedaiclaw completions powershell`
+- `jhedaiclaw completions elvish`
 
 `completions` is stdout-only by design so scripts can be sourced directly without log/warning contamination.
 
 ### `hardware`
 
-- `zeroclaw hardware discover`
-- `zeroclaw hardware introspect <path>`
-- `zeroclaw hardware info [--chip <chip_name>]`
+- `jhedaiclaw hardware discover`
+- `jhedaiclaw hardware introspect <path>`
+- `jhedaiclaw hardware info [--chip <chip_name>]`
 
 ### `peripheral`
 
-- `zeroclaw peripheral list`
-- `zeroclaw peripheral add <board> <path>`
-- `zeroclaw peripheral flash [--port <serial_port>]`
-- `zeroclaw peripheral setup-uno-q [--host <ip_or_host>]`
-- `zeroclaw peripheral flash-nucleo`
+- `jhedaiclaw peripheral list`
+- `jhedaiclaw peripheral add <board> <path>`
+- `jhedaiclaw peripheral flash [--port <serial_port>]`
+- `jhedaiclaw peripheral setup-uno-q [--host <ip_or_host>]`
+- `jhedaiclaw peripheral flash-nucleo`
 
 ## Validation Tip
 
 To verify docs against your current binary quickly:
 
 ```bash
-zeroclaw --help
-zeroclaw <command> --help
+jhedaiclaw --help
+jhedaiclaw <command> --help
 ```

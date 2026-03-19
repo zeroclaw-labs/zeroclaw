@@ -1,4 +1,4 @@
-# Документация ZeroClaw (Русский)
+# Документация JhedaiClaw (Русский)
 
 Эта страница — русскоязычная точка входа в документацию.
 
@@ -8,19 +8,19 @@
 
 ## Быстрые ссылки
 
-| Что нужно | Куда смотреть |
-|---|---|
-| Быстро установить и запустить | [../README.ru.md](../README.ru.md) / [../README.md](../README.md) |
-| Установить одной командой | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md) |
-| Найти команды по задаче | [commands-reference.md](reference/cli/commands-reference.md) |
-| Проверить ключи конфигурации и дефолты | [config-reference.md](reference/api/config-reference.md) |
-| Подключить кастомный provider / endpoint | [custom-providers.md](contributing/custom-providers.md) |
-| Настроить provider Z.AI / GLM | [zai-glm-setup.md](setup-guides/zai-glm-setup.md) |
-| Использовать интеграцию LangGraph | [langgraph-integration.md](contributing/langgraph-integration.md) |
-| Операционный runbook (day-2) | [operations-runbook.md](ops/operations-runbook.md) |
-| Быстро устранить типовые проблемы | [troubleshooting.md](ops/troubleshooting.md) |
-| Открыть общий TOC docs | [SUMMARY.md](SUMMARY.md) |
-| Посмотреть snapshot PR/Issue | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| Что нужно                                | Куда смотреть                                                                              |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Быстро установить и запустить            | [../README.ru.md](../README.ru.md) / [../README.md](../README.md)                          |
+| Установить одной командой                | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| Найти команды по задаче                  | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| Проверить ключи конфигурации и дефолты   | [config-reference.md](reference/api/config-reference.md)                                   |
+| Подключить кастомный provider / endpoint | [custom-providers.md](contributing/custom-providers.md)                                    |
+| Настроить provider Z.AI / GLM            | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| Использовать интеграцию LangGraph        | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| Операционный runbook (day-2)             | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| Быстро устранить типовые проблемы        | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| Открыть общий TOC docs                   | [SUMMARY.md](SUMMARY.md)                                                                   |
+| Посмотреть snapshot PR/Issue             | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## Дерево решений на 10 секунд
 

@@ -26,7 +26,7 @@ def http_request(url: str, method: str = "GET", headers: str = "", body: str = "
         The response status and body
     """
     try:
-        req_headers = {"User-Agent": "ZeroClaw/1.0"}
+        req_headers = {"User-Agent": "JhedaiClaw/1.0"}
         if headers:
             for h in headers.split(","):
                 if ":" in h:

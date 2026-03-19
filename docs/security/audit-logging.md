@@ -1,4 +1,4 @@
-# Audit Logging for ZeroClaw
+# Audit Logging for JhedaiClaw
 
 > ⚠️ **Status: Proposal / Roadmap**
 >
@@ -6,7 +6,9 @@
 > For current runtime behavior, see [config-reference.md](../reference/api/config-reference.md), [operations-runbook.md](../ops/operations-runbook.md), and [troubleshooting.md](../ops/troubleshooting.md).
 
 ## Problem
-ZeroClaw logs actions but lacks tamper-evident audit trails for:
+
+JhedaiClaw logs actions but lacks tamper-evident audit trails for:
+
 - Who executed what command
 - When and from which channel
 - What resources were accessed
@@ -41,7 +43,7 @@ ZeroClaw logs actions but lacks tamper-evident audit trails for:
     "policy_violation": false,
     "rate_limit_remaining": 19
   },
-  "signature": "SHA256:abc123..."  // HMAC for tamper evidence
+  "signature": "SHA256:abc123..." // HMAC for tamper evidence
 }
 ```
 
@@ -115,13 +117,13 @@ impl AuditLogger {
 ```toml
 [security.audit]
 enabled = true
-log_path = "~/.config/zeroclaw/audit.log"
+log_path = "~/.config/jhedaiclaw/audit.log"
 max_size_mb = 100
 rotate = "daily"  # daily | weekly | size
 
 # Tamper evidence
 sign_events = true
-signing_key_path = "~/.config/zeroclaw/audit.key"
+signing_key_path = "~/.config/jhedaiclaw/audit.key"
 
 # What to log
 log_commands = true
@@ -136,19 +138,19 @@ log_policy_violations = true
 
 ```bash
 # Show all commands executed by @alice
-zeroclaw audit --user @alice
+jhedaiclaw audit --user @alice
 
 # Show all high-risk commands
-zeroclaw audit --risk high
+jhedaiclaw audit --risk high
 
 # Show violations from last 24 hours
-zeroclaw audit --since 24h --violations-only
+jhedaiclaw audit --since 24h --violations-only
 
 # Export to JSON for analysis
-zeroclaw audit --format json --output audit.json
+jhedaiclaw audit --format json --output audit.json
 
 # Verify log integrity
-zeroclaw audit --verify-signatures
+jhedaiclaw audit --verify-signatures
 ```
 
 ---
@@ -183,9 +185,9 @@ pub fn rotate_audit_log(log_path: &PathBuf, max_size: u64) -> anyhow::Result<()>
 
 ## Implementation Priority
 
-| Phase | Feature | Effort | Security Value |
-|-------|---------|--------|----------------|
-| **P0** | Basic event logging | Low | Medium |
-| **P1** | Query CLI | Medium | Medium |
-| **P2** | HMAC signing | Medium | High |
-| **P3** | Log rotation + archival | Low | Medium |
+| Phase  | Feature                 | Effort | Security Value |
+| ------ | ----------------------- | ------ | -------------- |
+| **P0** | Basic event logging     | Low    | Medium         |
+| **P1** | Query CLI               | Medium | Medium         |
+| **P2** | HMAC signing            | Medium | High           |
+| **P3** | Log rotation + archival | Low    | Medium         |

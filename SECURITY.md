@@ -13,7 +13,7 @@
 Instead, please report them responsibly:
 
 1. **Email**: Send details to the maintainers via GitHub private vulnerability reporting
-2. **GitHub**: Use [GitHub Security Advisories](https://github.com/zeroclaw-labs/zeroclaw/security/advisories/new)
+2. **GitHub**: Use [GitHub Security Advisories](https://github.com/jhedai/jhedaiclaw/security/advisories/new)
 
 ### What to Include
 
@@ -30,14 +30,16 @@ Instead, please report them responsibly:
 
 ## Security Architecture
 
-ZeroClaw implements defense-in-depth security:
+JhedaiClaw implements defense-in-depth security:
 
 ### Autonomy Levels
+
 - **ReadOnly** — Agent can only read, no shell or write access
 - **Supervised** — Agent can act within allowlists (default)
 - **Full** — Agent has full access within workspace sandbox
 
 ### Sandboxing Layers
+
 1. **Workspace isolation** — All file operations confined to workspace directory
 2. **Path traversal blocking** — `..` sequences and absolute paths rejected
 3. **Command allowlisting** — Only explicitly approved commands can execute
@@ -45,6 +47,7 @@ ZeroClaw implements defense-in-depth security:
 5. **Rate limiting** — Max actions per hour and cost per day caps
 
 ### What We Protect Against
+
 - Path traversal attacks (`../../../etc/passwd`)
 - Command injection (`rm -rf /`, `curl | sh`)
 - Workspace escape via symlinks or absolute paths
@@ -64,30 +67,31 @@ cargo test -- tools::file_write
 
 ## Container Security
 
-ZeroClaw Docker images follow CIS Docker Benchmark best practices:
+JhedaiClaw Docker images follow CIS Docker Benchmark best practices:
 
-| Control | Implementation |
-|---------|----------------|
-| **4.1 Non-root user** | Container runs as UID 65534 (distroless nonroot) |
-| **4.2 Minimal base image** | `gcr.io/distroless/cc-debian12:nonroot` — no shell, no package manager |
-| **4.6 HEALTHCHECK** | Not applicable (stateless CLI/gateway) |
-| **5.25 Read-only filesystem** | Supported via `docker run --read-only` with `/workspace` volume |
+| Control                       | Implementation                                                         |
+| ----------------------------- | ---------------------------------------------------------------------- |
+| **4.1 Non-root user**         | Container runs as UID 65534 (distroless nonroot)                       |
+| **4.2 Minimal base image**    | `gcr.io/distroless/cc-debian12:nonroot` — no shell, no package manager |
+| **4.6 HEALTHCHECK**           | Not applicable (stateless CLI/gateway)                                 |
+| **5.25 Read-only filesystem** | Supported via `docker run --read-only` with `/workspace` volume        |
 
 ### Verifying Container Security
 
 ```bash
 # Build and verify non-root user
-docker build -t zeroclaw .
-docker inspect --format='{{.Config.User}}' zeroclaw
+docker build -t jhedaiclaw .
+docker inspect --format='{{.Config.User}}' jhedaiclaw
 # Expected: 65534:65534
 
 # Run with read-only filesystem (production hardening)
-docker run --read-only -v /path/to/workspace:/workspace zeroclaw gateway
+docker run --read-only -v /path/to/workspace:/workspace jhedaiclaw gateway
 ```
 
 ### CI Enforcement
 
 The `docker` job in `.github/workflows/checks-on-pr.yml` automatically verifies:
+
 1. Container does not run as root (UID 0)
 2. Runtime stage uses `:nonroot` variant
 3. Explicit `USER` directive with numeric UID exists

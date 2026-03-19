@@ -1,4 +1,4 @@
-# Resource Limits for ZeroClaw
+# Resource Limits for JhedaiClaw
 
 > ⚠️ **Status: Proposal / Roadmap**
 >
@@ -6,7 +6,9 @@
 > For current runtime behavior, see [config-reference.md](../reference/api/config-reference.md), [operations-runbook.md](operations-runbook.md), and [troubleshooting.md](troubleshooting.md).
 
 ## Problem
-ZeroClaw has rate limiting (20 actions/hour) but no resource caps. A runaway agent could:
+
+JhedaiClaw has rate limiting (20 actions/hour) but no resource caps. A runaway agent could:
+
 - Exhaust available memory
 - Spin CPU at 100%
 - Fill disk with logs/output
@@ -16,7 +18,8 @@ ZeroClaw has rate limiting (20 actions/hour) but no resource caps. A runaway age
 ## Proposed Solutions
 
 ### Option 1: cgroups v2 (Linux, Recommended)
-Automatically create a cgroup for zeroclaw with limits.
+
+Automatically create a cgroup for jhedaiclaw with limits.
 
 ```bash
 # Create systemd service with limits
@@ -29,6 +32,7 @@ TasksMax=100
 ```
 
 ### Option 2: tokio::task::deadlock detection
+
 Prevent task starvation.
 
 ```rust
@@ -48,6 +52,7 @@ where
 ```
 
 ### Option 3: Memory monitoring
+
 Track heap usage and kill if over limit.
 
 ```rust
@@ -97,9 +102,9 @@ max_open_files = 100
 
 ## Implementation Priority
 
-| Phase | Feature | Effort | Impact |
-|-------|---------|--------|--------|
-| **P0** | Memory monitoring + kill | Low | High |
-| **P1** | CPU timeout per command | Low | High |
+| Phase  | Feature                     | Effort | Impact    |
+| ------ | --------------------------- | ------ | --------- |
+| **P0** | Memory monitoring + kill    | Low    | High      |
+| **P1** | CPU timeout per command     | Low    | High      |
 | **P2** | cgroups integration (Linux) | Medium | Very High |
-| **P3** | Disk I/O limits | Medium | Medium |
+| **P3** | Disk I/O limits             | Medium | Medium    |

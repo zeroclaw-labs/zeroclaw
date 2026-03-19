@@ -1,6 +1,6 @@
 # Skill: github-pr
 
-Open or update a GitHub Pull Request for ZeroClaw. Handles creating new PRs with a fully filled-out template body, and updating existing PRs (title, body sections, labels, comments). Use this skill whenever the user wants to open a PR, create a pull request, update a PR, edit PR description, add labels to a PR, or sync a PR after new commits — even if they don't say "PR" explicitly (e.g., "submit this for review", "push and open for merge").
+Open or update a GitHub Pull Request for JhedaiClaw. Handles creating new PRs with a fully filled-out template body, and updating existing PRs (title, body sections, labels, comments). Use this skill whenever the user wants to open a PR, create a pull request, update a PR, edit PR description, add labels to a PR, or sync a PR after new commits — even if they don't say "PR" explicitly (e.g., "submit this for review", "push and open for merge").
 
 ## Instructions
 
@@ -73,11 +73,13 @@ Iterate on changes until the user approves.
 ### Step 4: Push and Create
 
 1. If the branch isn't pushed yet, push it:
+
    ```bash
    git push -u origin <branch>
    ```
 
 2. Create the PR using a HEREDOC for the body:
+
    ```bash
    gh pr create --title "<title>" --base master --body "$(cat <<'PR_BODY_EOF'
    <full body>
@@ -86,6 +88,7 @@ Iterate on changes until the user approves.
    ```
 
 3. If labels were agreed on, add them:
+
    ```bash
    gh pr edit <number> --add-label "<label1>,<label2>"
    ```
@@ -106,10 +109,12 @@ Iterate on changes until the user approves.
 3. **If neither**: ask the user for the PR number.
 
 Verify the current user is the PR author:
+
 ```bash
 CURRENT_USER=$(gh api user --jq '.login')
 PR_AUTHOR=$(gh pr view <number> --json author --jq '.author.login')
 ```
+
 If not the author, stop and inform the user.
 
 ### Step 2: Fetch Current State
@@ -119,6 +124,7 @@ gh pr view <number> --json number,title,body,labels,state,baseRefName,headRefNam
 ```
 
 Display a summary:
+
 ```
 ## PR #<number>: <title>
 **State**: <open/closed/merged>
@@ -132,16 +138,16 @@ Display a summary:
 
 Support these operations:
 
-| Operation | How |
-|---|---|
-| **Edit title** | `gh pr edit <number> --title "<new title>"` |
-| **Edit full body** | `gh pr edit <number> --body "<new body>"` |
-| **Add labels** | `gh pr edit <number> --add-label "<label1>,<label2>"` |
-| **Remove labels** | `gh pr edit <number> --remove-label "<label1>"` |
-| **Edit specific section** | Parse body by `## ` headers, modify target section, re-submit full body |
-| **Add a comment** | `gh pr comment <number> --body "<comment>"` |
-| **Link an issue** | Edit the linked-issue section in the body |
-| **Smart update after new commits** | Re-analyze and suggest section updates |
+| Operation                          | How                                                                     |
+| ---------------------------------- | ----------------------------------------------------------------------- |
+| **Edit title**                     | `gh pr edit <number> --title "<new title>"`                             |
+| **Edit full body**                 | `gh pr edit <number> --body "<new body>"`                               |
+| **Add labels**                     | `gh pr edit <number> --add-label "<label1>,<label2>"`                   |
+| **Remove labels**                  | `gh pr edit <number> --remove-label "<label1>"`                         |
+| **Edit specific section**          | Parse body by `## ` headers, modify target section, re-submit full body |
+| **Add a comment**                  | `gh pr comment <number> --body "<comment>"`                             |
+| **Link an issue**                  | Edit the linked-issue section in the body                               |
+| **Smart update after new commits** | Re-analyze and suggest section updates                                  |
 
 ### Step 4: Handle Body Section Edits
 
@@ -157,6 +163,7 @@ When editing a specific section:
 When the user wants to sync the PR description after pushing new changes:
 
 1. Identify new commits:
+
    ```bash
    gh pr view <number> --json commits --jq '.commits[].messageHeadline'
    git log <base>..<head> --oneline
@@ -172,6 +179,7 @@ When the user wants to sync the PR description after pushing new changes:
 For title/label changes, use direct `gh pr edit` flags.
 
 For body edits, use a HEREDOC:
+
 ```bash
 gh pr edit <number> --body "$(cat <<'PR_BODY_EOF'
 <full updated body>
@@ -180,6 +188,7 @@ PR_BODY_EOF
 ```
 
 For comments:
+
 ```bash
 gh pr comment <number> --body "$(cat <<'COMMENT_EOF'
 <comment text>
@@ -190,6 +199,7 @@ COMMENT_EOF
 ### Step 7: Confirm
 
 Fetch and display the updated state:
+
 ```bash
 gh pr view <number> --json number,title,labels,url
 ```
@@ -203,7 +213,7 @@ Return the PR URL.
 - **Always read `.github/pull_request_template.md`** before filling or editing a PR body. Never assume section names, fields, or structure — derive everything from the template. It's the source of truth and may change.
 - **For updates, only modify requested sections.** Preserve everything else exactly as-is.
 - **Always show diffs before applying body edits.** Present current vs proposed for each changed section.
-- **Never include personal/sensitive data** in PR content per ZeroClaw's privacy contract.
+- **Never include personal/sensitive data** in PR content per JhedaiClaw's privacy contract.
 - **For label changes**, only use labels that exist in the repository. Check with `gh label list` if unsure.
 - **Fetch the latest body before editing** to avoid clobbering concurrent changes.
 - **For new PRs**, push the branch before creating (with `-u` to set upstream tracking).

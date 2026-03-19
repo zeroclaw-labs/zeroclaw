@@ -1,4 +1,4 @@
-# Sentro ng Dokumentasyon ng ZeroClaw
+# Sentro ng Dokumentasyon ng JhedaiClaw
 
 Ang pahinang ito ang pangunahing entry point ng sistema ng dokumentasyon.
 
@@ -8,20 +8,20 @@ Mga lokal na sentro: [简体中文](README.zh-CN.md) · [日本語](README.ja.md
 
 ## Magsimula Dito
 
-| Gusto ko…                                                           | Basahin ito                                                                    |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| I-install at patakbuhin ang ZeroClaw nang mabilis                    | [README.md (Mabilis na Pagsisimula)](../README.md#quick-start)                 |
-| Bootstrap sa isang utos                                              | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                   |
-| Hanapin ang mga utos ayon sa gawain                                  | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| Mabilisang suriin ang mga config key at default na halaga             | [config-reference.md](reference/api/config-reference.md)                       |
-| Mag-set up ng custom na provider/endpoint                            | [custom-providers.md](contributing/custom-providers.md)                         |
-| I-set up ang Z.AI / GLM provider                                    | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                              |
-| Gamitin ang mga pattern ng integrasyon ng LangGraph                  | [langgraph-integration.md](contributing/langgraph-integration.md)               |
-| Pamahalaan ang runtime (day-2 runbook)                               | [operations-runbook.md](ops/operations-runbook.md)                             |
-| I-troubleshoot ang mga isyu sa pag-install/runtime/channel           | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| Patakbuhin ang setup at diagnostics ng encrypted Matrix room         | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                           |
-| I-browse ang mga dokumento ayon sa kategorya                         | [SUMMARY.md](SUMMARY.md)                                                       |
-| Tingnan ang snapshot ng mga PR/issue ng proyekto                     | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| Gusto ko…                                                    | Basahin ito                                                                                |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| I-install at patakbuhin ang JhedaiClaw nang mabilis          | [README.md (Mabilis na Pagsisimula)](../README.md#quick-start)                             |
+| Bootstrap sa isang utos                                      | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| Hanapin ang mga utos ayon sa gawain                          | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| Mabilisang suriin ang mga config key at default na halaga    | [config-reference.md](reference/api/config-reference.md)                                   |
+| Mag-set up ng custom na provider/endpoint                    | [custom-providers.md](contributing/custom-providers.md)                                    |
+| I-set up ang Z.AI / GLM provider                             | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| Gamitin ang mga pattern ng integrasyon ng LangGraph          | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| Pamahalaan ang runtime (day-2 runbook)                       | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| I-troubleshoot ang mga isyu sa pag-install/runtime/channel   | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| Patakbuhin ang setup at diagnostics ng encrypted Matrix room | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| I-browse ang mga dokumento ayon sa kategorya                 | [SUMMARY.md](SUMMARY.md)                                                                   |
+| Tingnan ang snapshot ng mga PR/issue ng proyekto             | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## Mabilisang Decision Tree (10 segundo)
 

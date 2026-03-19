@@ -57,11 +57,11 @@ Xem tiếp:
 
 ## 2. Ma trận quyết định độ sâu review
 
-| Nhãn rủi ro | Đường dẫn thường gặp | Độ sâu review tối thiểu | Bằng chứng bắt buộc |
-|---|---|---|---|
-| `risk: low` | docs/tests/chore, thay đổi không ảnh hưởng runtime | 1 reviewer + CI gate | validation cục bộ nhất quán + không mơ hồ hành vi |
-| `risk: medium` | `src/providers/**`, `src/channels/**`, `src/memory/**`, `src/config/**` | 1 reviewer có hiểu biết về hệ thống con + xác minh hành vi | bằng chứng kịch bản tập trung + tác dụng phụ rõ ràng |
-| `risk: high` | `src/security/**`, `src/runtime/**`, `src/gateway/**`, `src/tools/**`, `.github/workflows/**` | triage nhanh + review sâu + sẵn sàng rollback | kiểm tra bảo mật/failure mode + rõ ràng về rollback |
+| Nhãn rủi ro    | Đường dẫn thường gặp                                                                          | Độ sâu review tối thiểu                                    | Bằng chứng bắt buộc                                  |
+| -------------- | --------------------------------------------------------------------------------------------- | ---------------------------------------------------------- | ---------------------------------------------------- |
+| `risk: low`    | docs/tests/chore, thay đổi không ảnh hưởng runtime                                            | 1 reviewer + CI gate                                       | validation cục bộ nhất quán + không mơ hồ hành vi    |
+| `risk: medium` | `src/providers/**`, `src/channels/**`, `src/memory/**`, `src/config/**`                       | 1 reviewer có hiểu biết về hệ thống con + xác minh hành vi | bằng chứng kịch bản tập trung + tác dụng phụ rõ ràng |
+| `risk: high`   | `src/security/**`, `src/runtime/**`, `src/gateway/**`, `src/tools/**`, `.github/workflows/**` | triage nhanh + review sâu + sẵn sàng rollback              | kiểm tra bảo mật/failure mode + rõ ràng về rollback  |
 
 Khi không chắc chắn, coi là `risk: high`.
 
@@ -96,7 +96,7 @@ Nếu bất kỳ yêu cầu intake nào thất bại, để lại một comment 
 - Đường dẫn rollback cụ thể (không chỉ là "revert").
 - Tác động tương thích/migration rõ ràng.
 - Không có rò rỉ dữ liệu cá nhân/nhạy cảm trong diff artifact; ví dụ/test giữ trung lập và theo phạm vi dự án.
-- Nếu có ngôn ngữ giống danh tính, nó sử dụng vai trò gốc ZeroClaw/dự án (không phải danh tính cá nhân hay thực tế).
+- Nếu có ngôn ngữ giống danh tính, nó sử dụng vai trò gốc JhedaiClaw/dự án (không phải danh tính cá nhân hay thực tế).
 - Quy ước đặt tên và ranh giới kiến trúc tuân theo hợp đồng dự án (`AGENTS.md`, `CONTRIBUTING.md`).
 
 ### 3.3 Checklist review sâu (rủi ro cao)

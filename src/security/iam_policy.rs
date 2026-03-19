@@ -8,13 +8,13 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Maps a single Nevis role to ZeroClaw permissions.
+/// Maps a single Nevis role to JhedaiClaw permissions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleMapping {
     /// Nevis role name (case-insensitive matching).
     pub nevis_role: String,
     /// Tool names this role can access. Use `"all"` to grant all tools.
-    pub zeroclaw_permissions: Vec<String>,
+    pub jhedaiclaw_permissions: Vec<String>,
     /// Workspace names this role can access. Use `"all"` for unrestricted.
     #[serde(default)]
     pub workspace_access: Vec<String>,
@@ -35,7 +35,7 @@ impl PolicyDecision {
     }
 }
 
-/// IAM policy engine that maps Nevis roles to ZeroClaw tool permissions.
+/// IAM policy engine that maps Nevis roles to JhedaiClaw tool permissions.
 ///
 /// Deny-by-default: if no role mapping grants access, the request is denied.
 #[derive(Debug, Clone)]
@@ -71,11 +71,11 @@ impl IamPolicy {
             }
 
             let all_tools = mapping
-                .zeroclaw_permissions
+                .jhedaiclaw_permissions
                 .iter()
                 .any(|p| p.eq_ignore_ascii_case("all"));
             let allowed_tools: Vec<String> = mapping
-                .zeroclaw_permissions
+                .jhedaiclaw_permissions
                 .iter()
                 .filter(|p| !p.eq_ignore_ascii_case("all"))
                 .map(|p| p.trim().to_ascii_lowercase())
@@ -218,12 +218,12 @@ mod tests {
         vec![
             RoleMapping {
                 nevis_role: "admin".into(),
-                zeroclaw_permissions: vec!["all".into()],
+                jhedaiclaw_permissions: vec!["all".into()],
                 workspace_access: vec!["all".into()],
             },
             RoleMapping {
                 nevis_role: "operator".into(),
-                zeroclaw_permissions: vec![
+                jhedaiclaw_permissions: vec![
                     "shell".into(),
                     "file_read".into(),
                     "file_write".into(),
@@ -233,7 +233,7 @@ mod tests {
             },
             RoleMapping {
                 nevis_role: "viewer".into(),
-                zeroclaw_permissions: vec!["file_read".into(), "memory_search".into()],
+                jhedaiclaw_permissions: vec!["file_read".into(), "memory_search".into()],
                 workspace_access: vec!["staging".into()],
             },
         ]
@@ -241,7 +241,7 @@ mod tests {
 
     fn identity_with_roles(roles: Vec<&str>) -> NevisIdentity {
         NevisIdentity {
-            user_id: "zeroclaw_user".into(),
+            user_id: "jhedaiclaw_user".into(),
             roles: roles.into_iter().map(String::from).collect(),
             scopes: vec!["openid".into()],
             mfa_verified: true,
@@ -420,12 +420,12 @@ mod tests {
         let mappings = vec![
             RoleMapping {
                 nevis_role: "admin".into(),
-                zeroclaw_permissions: vec!["all".into()],
+                jhedaiclaw_permissions: vec!["all".into()],
                 workspace_access: vec!["all".into()],
             },
             RoleMapping {
                 nevis_role: " ADMIN ".into(),
-                zeroclaw_permissions: vec!["file_read".into()],
+                jhedaiclaw_permissions: vec!["file_read".into()],
                 workspace_access: vec![],
             },
         ];
@@ -440,7 +440,7 @@ mod tests {
     fn empty_role_name_in_mapping_is_skipped() {
         let mappings = vec![RoleMapping {
             nevis_role: "  ".into(),
-            zeroclaw_permissions: vec!["all".into()],
+            jhedaiclaw_permissions: vec!["all".into()],
             workspace_access: vec![],
         }];
         let policy = IamPolicy::from_mappings(&mappings).unwrap();

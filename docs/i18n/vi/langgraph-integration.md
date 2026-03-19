@@ -1,10 +1,10 @@
 # Hướng dẫn Tích hợp LangGraph
 
-Hướng dẫn này giải thích cách sử dụng gói Python `zeroclaw-tools` để gọi tool nhất quán với bất kỳ LLM provider nào tương thích OpenAI.
+Hướng dẫn này giải thích cách sử dụng gói Python `jhedaiclaw-tools` để gọi tool nhất quán với bất kỳ LLM provider nào tương thích OpenAI.
 
 ## Bối cảnh
 
-Một số LLM provider, đặc biệt là các model Trung Quốc như GLM-5 (Zhipu AI), có hành vi gọi tool không nhất quán khi dùng phương thức text-based tool invocation. Core Rust của ZeroClaw sử dụng structured tool calling theo định dạng OpenAI API, nhưng một số model phản hồi tốt hơn với cách tiếp cận khác.
+Một số LLM provider, đặc biệt là các model Trung Quốc như GLM-5 (Zhipu AI), có hành vi gọi tool không nhất quán khi dùng phương thức text-based tool invocation. Core Rust của JhedaiClaw sử dụng structured tool calling theo định dạng OpenAI API, nhưng một số model phản hồi tốt hơn với cách tiếp cận khác.
 
 LangGraph cung cấp một stateful graph execution engine đảm bảo hành vi gọi tool nhất quán bất kể khả năng native của model nền tảng.
 
@@ -14,7 +14,7 @@ LangGraph cung cấp một stateful graph execution engine đảm bảo hành vi
 ┌─────────────────────────────────────────────────────────────┐
 │                      Your Application                        │
 ├─────────────────────────────────────────────────────────────┤
-│                   zeroclaw-tools Agent                       │
+│                   jhedaiclaw-tools Agent                       │
 │                                                              │
 │   ┌─────────────────────────────────────────────────────┐   │
 │   │              LangGraph StateGraph                    │   │
@@ -44,14 +44,14 @@ LangGraph cung cấp một stateful graph execution engine đảm bảo hành vi
 ### Cài đặt
 
 ```bash
-pip install zeroclaw-tools
+pip install jhedaiclaw-tools
 ```
 
 ### Sử dụng cơ bản
 
 ```python
 import asyncio
-from zeroclaw_tools import create_agent, shell, file_read, file_write
+from jhedaiclaw_tools import create_agent, shell, file_read, file_write
 from langchain_core.messages import HumanMessage
 
 async def main():
@@ -75,27 +75,27 @@ asyncio.run(main())
 
 ### Tool cốt lõi
 
-| Tool | Mô tả |
-|------|-------|
-| `shell` | Thực thi lệnh shell |
-| `file_read` | Đọc nội dung file |
+| Tool         | Mô tả                 |
+| ------------ | --------------------- |
+| `shell`      | Thực thi lệnh shell   |
+| `file_read`  | Đọc nội dung file     |
 | `file_write` | Ghi nội dung vào file |
 
 ### Tool mở rộng
 
-| Tool | Mô tả |
-|------|-------|
-| `web_search` | Tìm kiếm web (yêu cầu `BRAVE_API_KEY`) |
-| `http_request` | Thực hiện HTTP request |
-| `memory_store` | Lưu dữ liệu vào bộ nhớ lâu dài |
-| `memory_recall` | Truy xuất dữ liệu đã lưu |
+| Tool            | Mô tả                                  |
+| --------------- | -------------------------------------- |
+| `web_search`    | Tìm kiếm web (yêu cầu `BRAVE_API_KEY`) |
+| `http_request`  | Thực hiện HTTP request                 |
+| `memory_store`  | Lưu dữ liệu vào bộ nhớ lâu dài         |
+| `memory_recall` | Truy xuất dữ liệu đã lưu               |
 
 ## Tool tùy chỉnh
 
 Tạo tool riêng của bạn bằng decorator `@tool`:
 
 ```python
-from zeroclaw_tools import tool, create_agent
+from jhedaiclaw_tools import tool, create_agent
 
 @tool
 def get_weather(city: str) -> str:
@@ -161,7 +161,7 @@ agent = create_agent(
 
 ```python
 import os
-from zeroclaw_tools.integrations import DiscordBot
+from jhedaiclaw_tools.integrations import DiscordBot
 
 bot = DiscordBot(
     token=os.environ["DISCORD_TOKEN"],
@@ -182,29 +182,31 @@ export API_KEY="your-key"
 export BRAVE_API_KEY="your-brave-key"  # Optional, for web search
 
 # Single message
-zeroclaw-tools "What is the current date?"
+jhedaiclaw-tools "What is the current date?"
 
 # Interactive mode
-zeroclaw-tools -i
+jhedaiclaw-tools -i
 ```
 
-## So sánh với Rust ZeroClaw
+## So sánh với Rust JhedaiClaw
 
-| Khía cạnh | Rust ZeroClaw | zeroclaw-tools |
-|--------|---------------|-----------------|
-| **Hiệu năng** | Cực nhanh (~10ms khởi động) | Khởi động Python (~500ms) |
-| **Bộ nhớ** | <5 MB | ~50 MB |
-| **Kích thước binary** | ~3.4 MB | pip package |
-| **Tính nhất quán của tool** | Phụ thuộc model | LangGraph đảm bảo |
-| **Khả năng mở rộng** | Rust traits | Python decorators |
-| **Hệ sinh thái** | Rust crates | PyPI packages |
+| Khía cạnh                   | Rust JhedaiClaw             | jhedaiclaw-tools          |
+| --------------------------- | --------------------------- | ------------------------- |
+| **Hiệu năng**               | Cực nhanh (~10ms khởi động) | Khởi động Python (~500ms) |
+| **Bộ nhớ**                  | <5 MB                       | ~50 MB                    |
+| **Kích thước binary**       | ~3.4 MB                     | pip package               |
+| **Tính nhất quán của tool** | Phụ thuộc model             | LangGraph đảm bảo         |
+| **Khả năng mở rộng**        | Rust traits                 | Python decorators         |
+| **Hệ sinh thái**            | Rust crates                 | PyPI packages             |
 
-**Khi nào dùng Rust ZeroClaw:**
+**Khi nào dùng Rust JhedaiClaw:**
+
 - Triển khai edge cho môi trường production
 - Môi trường hạn chế tài nguyên (Raspberry Pi, v.v.)
 - Yêu cầu hiệu năng tối đa
 
-**Khi nào dùng zeroclaw-tools:**
+**Khi nào dùng jhedaiclaw-tools:**
+
 - Các model có tool calling native không nhất quán
 - Phát triển trung tâm vào Python
 - Prototyping nhanh

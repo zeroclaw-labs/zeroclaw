@@ -1,4 +1,4 @@
-# مركز توثيق ZeroClaw
+# مركز توثيق JhedaiClaw
 
 هذه الصفحة هي نقطة الدخول الرئيسية لنظام التوثيق.
 
@@ -8,20 +8,20 @@
 
 ## ابدأ من هنا
 
-| أريد أن…                                                            | اقرأ هذا                                                                       |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| تثبيت وتشغيل ZeroClaw بسرعة                                        | [README.md (البدء السريع)](../README.md#quick-start)                           |
-| إعداد بأمر واحد                                                     | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                   |
-| البحث عن أوامر حسب المهمة                                           | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| التحقق السريع من مفاتيح وقيم الإعدادات الافتراضية                   | [config-reference.md](reference/api/config-reference.md)                       |
-| إعداد مزودين/نقاط وصول مخصصة                                       | [custom-providers.md](contributing/custom-providers.md)                         |
-| إعداد مزود Z.AI / GLM                                               | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                              |
-| استخدام أنماط تكامل LangGraph                                       | [langgraph-integration.md](contributing/langgraph-integration.md)               |
-| تشغيل بيئة التنفيذ (دليل العمليات اليومية)                          | [operations-runbook.md](ops/operations-runbook.md)                             |
-| استكشاف مشاكل التثبيت/التشغيل/القنوات وإصلاحها                     | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| تشغيل إعداد وتشخيص غرف Matrix المشفرة                               | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                           |
-| تصفح التوثيق حسب الفئة                                              | [SUMMARY.md](SUMMARY.md)                                                       |
-| عرض لقطة توثيق طلبات السحب/المشاكل                                  | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| أريد أن…                                          | اقرأ هذا                                                                                   |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| تثبيت وتشغيل JhedaiClaw بسرعة                     | [README.md (البدء السريع)](../README.md#quick-start)                                       |
+| إعداد بأمر واحد                                   | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| البحث عن أوامر حسب المهمة                         | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| التحقق السريع من مفاتيح وقيم الإعدادات الافتراضية | [config-reference.md](reference/api/config-reference.md)                                   |
+| إعداد مزودين/نقاط وصول مخصصة                      | [custom-providers.md](contributing/custom-providers.md)                                    |
+| إعداد مزود Z.AI / GLM                             | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| استخدام أنماط تكامل LangGraph                     | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| تشغيل بيئة التنفيذ (دليل العمليات اليومية)        | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| استكشاف مشاكل التثبيت/التشغيل/القنوات وإصلاحها    | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| تشغيل إعداد وتشخيص غرف Matrix المشفرة             | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| تصفح التوثيق حسب الفئة                            | [SUMMARY.md](SUMMARY.md)                                                                   |
+| عرض لقطة توثيق طلبات السحب/المشاكل                | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## شجرة القرار السريعة (10 ثوانٍ)
 

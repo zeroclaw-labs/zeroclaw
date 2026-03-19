@@ -1,4 +1,4 @@
-# Tóm tắt Tài liệu ZeroClaw (Mục lục Thống nhất)
+# Tóm tắt Tài liệu JhedaiClaw (Mục lục Thống nhất)
 
 Tệp này là mục lục chính thức của hệ thống tài liệu.
 

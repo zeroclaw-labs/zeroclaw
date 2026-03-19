@@ -2,9 +2,9 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use jhedaiclaw::providers::traits::{ChatMessage, TokenUsage};
+use jhedaiclaw::providers::{ChatRequest, ChatResponse, Provider, ToolCall};
 use std::sync::{Arc, Mutex};
-use zeroclaw::providers::traits::{ChatMessage, TokenUsage};
-use zeroclaw::providers::{ChatRequest, ChatResponse, Provider, ToolCall};
 
 use super::trace::{LlmTrace, TraceResponse};
 

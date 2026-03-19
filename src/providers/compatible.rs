@@ -1205,7 +1205,7 @@ impl Provider for OpenAiCompatibleProvider {
     ) -> anyhow::Result<String> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
+                "{} API key not set. Run `jhedaiclaw onboard` or set the appropriate env var.",
                 self.name
             )
         })?;
@@ -1334,7 +1334,7 @@ impl Provider for OpenAiCompatibleProvider {
     ) -> anyhow::Result<String> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
+                "{} API key not set. Run `jhedaiclaw onboard` or set the appropriate env var.",
                 self.name
             )
         })?;
@@ -1444,7 +1444,7 @@ impl Provider for OpenAiCompatibleProvider {
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
+                "{} API key not set. Run `jhedaiclaw onboard` or set the appropriate env var.",
                 self.name
             )
         })?;
@@ -1556,7 +1556,7 @@ impl Provider for OpenAiCompatibleProvider {
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
+                "{} API key not set. Run `jhedaiclaw onboard` or set the appropriate env var.",
                 self.name
             )
         })?;
@@ -1849,7 +1849,7 @@ mod tests {
             messages: vec![
                 Message {
                     role: "system".to_string(),
-                    content: MessageContent::Text("You are ZeroClaw".to_string()),
+                    content: MessageContent::Text("You are JhedaiClaw".to_string()),
                 },
                 Message {
                     role: "user".to_string(),
@@ -2494,12 +2494,12 @@ mod tests {
             "https://example.com",
             Some("k"),
             AuthStyle::Bearer,
-            "zeroclaw-test/1.0",
+            "jhedaiclaw-test/1.0",
         );
         let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(!caps.vision);
-        assert_eq!(p.user_agent.as_deref(), Some("zeroclaw-test/1.0"));
+        assert_eq!(p.user_agent.as_deref(), Some("jhedaiclaw-test/1.0"));
     }
 
     #[test]
@@ -2509,13 +2509,13 @@ mod tests {
             "https://example.com",
             Some("k"),
             AuthStyle::Bearer,
-            "zeroclaw-test/vision",
+            "jhedaiclaw-test/vision",
             true,
         );
         let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
-        assert_eq!(p.user_agent.as_deref(), Some("zeroclaw-test/vision"));
+        assert_eq!(p.user_agent.as_deref(), Some("jhedaiclaw-test/vision"));
     }
 
     #[test]
@@ -3050,14 +3050,14 @@ mod tests {
     #[test]
     fn with_extra_headers_sets_headers() {
         let mut headers = std::collections::HashMap::new();
-        headers.insert("X-Title".to_string(), "zeroclaw".to_string());
+        headers.insert("X-Title".to_string(), "jhedaiclaw".to_string());
         headers.insert(
             "HTTP-Referer".to_string(),
             "https://example.com".to_string(),
         );
         let p = make_provider("test", "https://example.com", None).with_extra_headers(headers);
         assert_eq!(p.extra_headers.len(), 2);
-        assert_eq!(p.extra_headers.get("X-Title").unwrap(), "zeroclaw");
+        assert_eq!(p.extra_headers.get("X-Title").unwrap(), "jhedaiclaw");
         assert_eq!(
             p.extra_headers.get("HTTP-Referer").unwrap(),
             "https://example.com"
@@ -3067,7 +3067,7 @@ mod tests {
     #[test]
     fn http_client_with_extra_headers_builds_successfully() {
         let mut headers = std::collections::HashMap::new();
-        headers.insert("X-Title".to_string(), "zeroclaw".to_string());
+        headers.insert("X-Title".to_string(), "jhedaiclaw".to_string());
         headers.insert("User-Agent".to_string(), "TestAgent/1.0".to_string());
         let p = make_provider("test", "https://example.com", None).with_extra_headers(headers);
         // Should not panic
@@ -3084,7 +3084,7 @@ mod tests {
     #[test]
     fn extra_headers_combined_with_user_agent() {
         let mut headers = std::collections::HashMap::new();
-        headers.insert("X-Title".to_string(), "zeroclaw".to_string());
+        headers.insert("X-Title".to_string(), "jhedaiclaw".to_string());
         let p = OpenAiCompatibleProvider::new_with_user_agent(
             "test",
             "https://example.com",

@@ -1,4 +1,4 @@
-# Quy trình Release ZeroClaw
+# Quy trình Release JhedaiClaw
 
 Runbook này định nghĩa quy trình release tiêu chuẩn của maintainer.
 
@@ -105,7 +105,7 @@ Chạy `Pub Homebrew Core` thủ công:
 Cài đặt repository bắt buộc cho non-dry-run:
 
 - secret: `HOMEBREW_CORE_BOT_TOKEN` (token từ tài khoản bot chuyên dụng, không phải tài khoản maintainer cá nhân)
-- variable: `HOMEBREW_CORE_BOT_FORK_REPO` (ví dụ `zeroclaw-release-bot/homebrew-core`)
+- variable: `HOMEBREW_CORE_BOT_FORK_REPO` (ví dụ `jhedaiclaw-release-bot/homebrew-core`)
 - variable tùy chọn: `HOMEBREW_CORE_BOT_EMAIL`
 
 Các guardrail workflow:

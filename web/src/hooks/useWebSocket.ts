@@ -1,8 +1,8 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { WebSocketClient, type WebSocketClientOptions } from '../lib/ws';
-import type { WsMessage } from '../types/api';
+import { useState, useEffect, useRef, useCallback } from "react";
+import { WebSocketClient, type WebSocketClientOptions } from "../lib/ws";
+import type { WsMessage } from "../types/api";
 
-export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected';
+export type ConnectionStatus = "disconnected" | "connecting" | "connected";
 
 export interface UseWebSocketResult {
   /** Send a chat message to the agent. */
@@ -36,7 +36,7 @@ export function useWebSocket(
   const { autoConnect = true, ...wsOptions } = options;
 
   const clientRef = useRef<WebSocketClient | null>(null);
-  const [status, setStatus] = useState<ConnectionStatus>('disconnected');
+  const [status, setStatus] = useState<ConnectionStatus>("disconnected");
   const [messages, setMessages] = useState<WsMessage[]>([]);
 
   // Stable reference to the client across renders
@@ -52,11 +52,11 @@ export function useWebSocket(
     const client = getClient();
 
     client.onOpen = () => {
-      setStatus('connected');
+      setStatus("connected");
     };
 
     client.onClose = () => {
-      setStatus('disconnected');
+      setStatus("disconnected");
     };
 
     client.onMessage = (msg: WsMessage) => {
@@ -68,7 +68,7 @@ export function useWebSocket(
     };
 
     if (autoConnect) {
-      setStatus('connecting');
+      setStatus("connecting");
       client.connect();
     }
 
@@ -80,14 +80,14 @@ export function useWebSocket(
 
   const connect = useCallback(() => {
     const client = getClient();
-    setStatus('connecting');
+    setStatus("connecting");
     client.connect();
   }, [getClient]);
 
   const disconnect = useCallback(() => {
     const client = getClient();
     client.disconnect();
-    setStatus('disconnected');
+    setStatus("disconnected");
   }, [getClient]);
 
   const sendMessage = useCallback(
@@ -97,7 +97,7 @@ export function useWebSocket(
       // Optimistically add the user message to the local list
       setMessages((prev) => [
         ...prev,
-        { type: 'message', content } as WsMessage,
+        { type: "message", content } as WsMessage,
       ]);
     },
     [getClient],

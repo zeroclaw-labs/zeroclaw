@@ -1,4 +1,4 @@
-# ZeroClaw 文档导航（简体中文）
+# JhedaiClaw 文档导航（简体中文）
 
 这是文档系统的中文入口页。
 
@@ -8,21 +8,21 @@
 
 ## 快速入口
 
-| 我想要… | 建议阅读 |
-|---|---|
-| 快速安装并运行 | [../README.zh-CN.md](../README.zh-CN.md) / [../README.md](../README.md) |
-| macOS 平台更新与卸载 | [macos-update-uninstall.md](i18n/zh-CN/setup-guides/macos-update-uninstall.zh-CN.md) |
-| 一键安装与初始化 | [one-click-bootstrap.md](i18n/zh-CN/setup-guides/one-click-bootstrap.zh-CN.md) |
-| 按任务找命令 | [commands-reference.md](i18n/zh-CN/reference/cli/commands-reference.zh-CN.md) |
-| 快速查看配置默认值与关键项 | [config-reference.md](i18n/zh-CN/reference/api/config-reference.zh-CN.md) |
-| 接入自定义 Provider / endpoint | [custom-providers.md](i18n/zh-CN/contributing/custom-providers.zh-CN.md) |
-| 配置 Z.AI / GLM Provider | [zai-glm-setup.md](i18n/zh-CN/setup-guides/zai-glm-setup.zh-CN.md) |
-| 使用 LangGraph 工具调用集成 | [langgraph-integration.md](i18n/zh-CN/contributing/langgraph-integration.zh-CN.md) |
-| 进行日常运维（runbook） | [operations-runbook.md](i18n/zh-CN/ops/operations-runbook.zh-CN.md) |
-| 快速排查安装/运行/通道问题 | [troubleshooting.md](i18n/zh-CN/ops/troubleshooting.zh-CN.md) |
-| Matrix 加密房间配置与诊断 | [matrix-e2ee-guide.md](i18n/zh-CN/security/matrix-e2ee-guide.zh-CN.md) |
-| 统一目录导航 | [SUMMARY.md](SUMMARY.md) |
-| 查看 PR/Issue 扫描快照 | [project-triage-snapshot-2026-02-18.md](i18n/zh-CN/maintainers/project-triage-snapshot-2026-02-18.zh-CN.md) |
+| 我想要…                        | 建议阅读                                                                                                    |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| 快速安装并运行                 | [../README.zh-CN.md](../README.zh-CN.md) / [../README.md](../README.md)                                     |
+| macOS 平台更新与卸载           | [macos-update-uninstall.md](i18n/zh-CN/setup-guides/macos-update-uninstall.zh-CN.md)                        |
+| 一键安装与初始化               | [one-click-bootstrap.md](i18n/zh-CN/setup-guides/one-click-bootstrap.zh-CN.md)                              |
+| 按任务找命令                   | [commands-reference.md](i18n/zh-CN/reference/cli/commands-reference.zh-CN.md)                               |
+| 快速查看配置默认值与关键项     | [config-reference.md](i18n/zh-CN/reference/api/config-reference.zh-CN.md)                                   |
+| 接入自定义 Provider / endpoint | [custom-providers.md](i18n/zh-CN/contributing/custom-providers.zh-CN.md)                                    |
+| 配置 Z.AI / GLM Provider       | [zai-glm-setup.md](i18n/zh-CN/setup-guides/zai-glm-setup.zh-CN.md)                                          |
+| 使用 LangGraph 工具调用集成    | [langgraph-integration.md](i18n/zh-CN/contributing/langgraph-integration.zh-CN.md)                          |
+| 进行日常运维（runbook）        | [operations-runbook.md](i18n/zh-CN/ops/operations-runbook.zh-CN.md)                                         |
+| 快速排查安装/运行/通道问题     | [troubleshooting.md](i18n/zh-CN/ops/troubleshooting.zh-CN.md)                                               |
+| Matrix 加密房间配置与诊断      | [matrix-e2ee-guide.md](i18n/zh-CN/security/matrix-e2ee-guide.zh-CN.md)                                      |
+| 统一目录导航                   | [SUMMARY.md](SUMMARY.md)                                                                                    |
+| 查看 PR/Issue 扫描快照         | [project-triage-snapshot-2026-02-18.md](i18n/zh-CN/maintainers/project-triage-snapshot-2026-02-18.zh-CN.md) |
 
 ## 10 秒决策树（先看这个）
 

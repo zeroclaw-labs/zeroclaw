@@ -1,5 +1,5 @@
 name: Bug Report
-description: Report a reproducible defect in ZeroClaw
+description: Report a reproducible defect in JhedaiClaw
 title: "[Bug]: "
 labels:
   - bug
@@ -63,8 +63,8 @@ body:
       label: Steps to reproduce
       description: Please provide exact commands/config.
       placeholder: |
-        1. zeroclaw onboard
-        2. zeroclaw daemon
+        1. jhedaiclaw onboard
+        2. jhedaiclaw daemon
         3. Observe crash in logs
       render: bash
     validations:
@@ -94,7 +94,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: ZeroClaw version
+      label: JhedaiClaw version
       placeholder: v0.1.0 / commit SHA
     validations:
       required: true

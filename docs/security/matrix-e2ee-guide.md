@@ -1,6 +1,6 @@
 # Matrix E2EE Guide
 
-This guide explains how to run ZeroClaw reliably in Matrix rooms, including end-to-end encrypted (E2EE) rooms.
+This guide explains how to run JhedaiClaw reliably in Matrix rooms, including end-to-end encrypted (E2EE) rooms.
 
 It focuses on the common failure mode reported by users:
 
@@ -26,7 +26,7 @@ Before testing message flow, make sure all of the following are true:
 2. The access token belongs to the same bot account.
 3. `room_id` is correct:
    - preferred: canonical room ID (`!room:server`)
-   - supported: room alias (`#alias:server`) and ZeroClaw will resolve it
+   - supported: room alias (`#alias:server`) and JhedaiClaw will resolve it
 4. `allowed_users` allows the sender (`["*"]` for open testing).
 5. For E2EE rooms, the bot device has received encryption keys for the room.
 
@@ -34,7 +34,7 @@ Before testing message flow, make sure all of the following are true:
 
 ## 2. Configuration
 
-Use `~/.zeroclaw/config.toml`:
+Use `~/.jhedaiclaw/config.toml`:
 
 ```toml
 [channels_config.matrix]
@@ -42,7 +42,7 @@ homeserver = "https://matrix.example.com"
 access_token = "syt_your_token"
 
 # Optional but recommended for E2EE stability:
-user_id = "@zeroclaw:matrix.example.com"
+user_id = "@jhedaiclaw:matrix.example.com"
 device_id = "DEVICEID123"
 
 # Room ID or alias
@@ -55,7 +55,7 @@ allowed_users = ["*"]
 
 ### About `user_id` and `device_id`
 
-- ZeroClaw attempts to read identity from Matrix `/_matrix/client/v3/account/whoami`.
+- JhedaiClaw attempts to read identity from Matrix `/_matrix/client/v3/account/whoami`.
 - If `whoami` does not return `device_id`, set `device_id` manually.
 - These hints are especially important for E2EE session restore.
 
@@ -66,13 +66,13 @@ allowed_users = ["*"]
 1. Run channel setup and daemon:
 
 ```bash
-zeroclaw onboard --channels-only
-zeroclaw daemon
+jhedaiclaw onboard --channels-only
+jhedaiclaw daemon
 ```
 
 2. Send a plain text message in the configured Matrix room.
 
-3. Confirm ZeroClaw logs contain Matrix listener startup and no repeated sync/auth errors.
+3. Confirm JhedaiClaw logs contain Matrix listener startup and no repeated sync/auth errors.
 
 4. In an encrypted room, verify the bot can read and reply to encrypted messages from allowed users.
 
@@ -114,9 +114,9 @@ curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
 
 ### E. Message formatting (Markdown)
 
-- ZeroClaw sends Matrix text replies as markdown-capable `m.room.message` text content.
+- JhedaiClaw sends Matrix text replies as markdown-capable `m.room.message` text content.
 - Matrix clients that support `formatted_body` should render emphasis, lists, and code blocks.
-- If formatting appears as plain text, check client capability first, then confirm ZeroClaw is running a build that includes markdown-enabled Matrix output.
+- If formatting appears as plain text, check client capability first, then confirm JhedaiClaw is running a build that includes markdown-enabled Matrix output.
 
 ### F. Fresh start test
 

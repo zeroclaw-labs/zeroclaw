@@ -1,7 +1,7 @@
-//! ZeroClaw ESP32 firmware — JSON-over-serial peripheral.
+//! JhedaiClaw ESP32 firmware — JSON-over-serial peripheral.
 //!
 //! Listens for newline-delimited JSON commands on UART0, executes gpio_read/gpio_write,
-//! responds with JSON. Compatible with host ZeroClaw SerialPeripheral protocol.
+//! responds with JSON. Compatible with host JhedaiClaw SerialPeripheral protocol.
 //!
 //! Protocol: same as STM32 — see docs/hardware-peripherals-design.md
 
@@ -52,7 +52,7 @@ fn main() -> anyhow::Result<()> {
         &config,
     )?;
 
-    info!("ZeroClaw ESP32 firmware ready on UART0 (115200)");
+    info!("JhedaiClaw ESP32 firmware ready on UART0 (115200)");
 
     let mut buf = [0u8; 512];
     let mut line = Vec::new();

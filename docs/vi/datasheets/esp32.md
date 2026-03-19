@@ -3,7 +3,7 @@
 ## Pin Aliases
 
 | alias       | pin |
-|-------------|-----|
+| ----------- | --- |
 | builtin_led | 2   |
 | red_led     | 2   |
 
@@ -15,7 +15,8 @@
 
 ## Giao thức
 
-ZeroClaw host gửi JSON qua serial (115200 baud):
+JhedaiClaw host gửi JSON qua serial (115200 baud):
+
 - `gpio_read`: `{"id":"1","cmd":"gpio_read","args":{"pin":13}}`
 - `gpio_write`: `{"id":"1","cmd":"gpio_write","args":{"pin":13,"value":1}}`
 

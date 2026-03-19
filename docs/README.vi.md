@@ -1,4 +1,4 @@
-# Hub Tài liệu ZeroClaw (Tiếng Việt)
+# Hub Tài liệu JhedaiClaw (Tiếng Việt)
 
 Đây là trang chủ tiếng Việt của hệ thống tài liệu.
 
@@ -10,20 +10,20 @@ Hub bản địa hóa: [简体中文](README.zh-CN.md) · [日本語](README.ja.
 
 ## Tra cứu nhanh
 
-| Tôi muốn…                                         | Xem tài liệu                                                                  |
-| -------------------------------------------------- | ------------------------------------------------------------------------------ |
-| Cài đặt và chạy nhanh                              | [README.vi.md (Khởi động nhanh)](../README.vi.md) / [../README.md](../README.md) |
-| Cài đặt bằng một lệnh                              | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                   |
-| Tìm lệnh theo tác vụ                               | [commands-reference.md](i18n/vi/commands-reference.md)                         |
-| Kiểm tra giá trị mặc định và khóa cấu hình         | [config-reference.md](i18n/vi/config-reference.md)                             |
-| Kết nối provider / endpoint tùy chỉnh               | [custom-providers.md](i18n/vi/custom-providers.md)                             |
-| Cấu hình Z.AI / GLM provider                        | [zai-glm-setup.md](i18n/vi/zai-glm-setup.md)                                  |
-| Sử dụng tích hợp LangGraph                          | [langgraph-integration.md](i18n/vi/langgraph-integration.md)                   |
-| Vận hành hàng ngày (runbook)                        | [operations-runbook.md](i18n/vi/operations-runbook.md)                         |
-| Khắc phục sự cố cài đặt/chạy/kênh                   | [troubleshooting.md](i18n/vi/troubleshooting.md)                               |
-| Cấu hình Matrix phòng mã hóa (E2EE)                | [matrix-e2ee-guide.md](i18n/vi/matrix-e2ee-guide.md)                           |
-| Xem theo danh mục                                   | [SUMMARY.md](i18n/vi/SUMMARY.md)                                              |
-| Xem bản chụp PR/Issue                               | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| Tôi muốn…                                  | Xem tài liệu                                                                               |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| Cài đặt và chạy nhanh                      | [README.vi.md (Khởi động nhanh)](../README.vi.md) / [../README.md](../README.md)           |
+| Cài đặt bằng một lệnh                      | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| Tìm lệnh theo tác vụ                       | [commands-reference.md](i18n/vi/commands-reference.md)                                     |
+| Kiểm tra giá trị mặc định và khóa cấu hình | [config-reference.md](i18n/vi/config-reference.md)                                         |
+| Kết nối provider / endpoint tùy chỉnh      | [custom-providers.md](i18n/vi/custom-providers.md)                                         |
+| Cấu hình Z.AI / GLM provider               | [zai-glm-setup.md](i18n/vi/zai-glm-setup.md)                                               |
+| Sử dụng tích hợp LangGraph                 | [langgraph-integration.md](i18n/vi/langgraph-integration.md)                               |
+| Vận hành hàng ngày (runbook)               | [operations-runbook.md](i18n/vi/operations-runbook.md)                                     |
+| Khắc phục sự cố cài đặt/chạy/kênh          | [troubleshooting.md](i18n/vi/troubleshooting.md)                                           |
+| Cấu hình Matrix phòng mã hóa (E2EE)        | [matrix-e2ee-guide.md](i18n/vi/matrix-e2ee-guide.md)                                       |
+| Xem theo danh mục                          | [SUMMARY.md](i18n/vi/SUMMARY.md)                                                           |
+| Xem bản chụp PR/Issue                      | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## Tìm nhanh (10 giây)
 

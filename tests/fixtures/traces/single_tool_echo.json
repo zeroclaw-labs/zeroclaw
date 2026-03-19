@@ -11,7 +11,7 @@
               {
                 "id": "call_1",
                 "name": "echo",
-                "arguments": {"message": "hello"}
+                "arguments": { "message": "hello" }
               }
             ],
             "input_tokens": 30,

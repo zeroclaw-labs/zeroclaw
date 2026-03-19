@@ -70,7 +70,7 @@ if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; the
   exit 1
 fi
 
-MESSAGE="zeroclaw $TAG"
+MESSAGE="jhedaiclaw $TAG"
 git tag -a "$TAG" -m "$MESSAGE"
 echo "Created annotated tag: $TAG"
 

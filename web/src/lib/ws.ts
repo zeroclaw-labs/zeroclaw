@@ -1,6 +1,6 @@
-import type { WsMessage } from '../types/api';
-import { getToken } from './auth';
-import { generateUUID } from './uuid';
+import type { WsMessage } from "../types/api";
+import { getToken } from "./auth";
+import { generateUUID } from "./uuid";
 
 export type WsMessageHandler = (msg: WsMessage) => void;
 export type WsOpenHandler = () => void;
@@ -21,7 +21,7 @@ export interface WebSocketClientOptions {
 const DEFAULT_RECONNECT_DELAY = 1000;
 const MAX_RECONNECT_DELAY = 30000;
 
-const SESSION_STORAGE_KEY = 'zeroclaw_session_id';
+const SESSION_STORAGE_KEY = "jhedaiclaw_session_id";
 
 /** Return a stable session ID, persisted in sessionStorage across reconnects. */
 function getOrCreateSessionId(): string {
@@ -50,9 +50,8 @@ export class WebSocketClient {
   private readonly autoReconnect: boolean;
 
   constructor(options: WebSocketClientOptions = {}) {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    this.baseUrl =
-      options.baseUrl ?? `${protocol}//${window.location.host}`;
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    this.baseUrl = options.baseUrl ?? `${protocol}//${window.location.host}`;
     this.reconnectDelay = options.reconnectDelay ?? DEFAULT_RECONNECT_DELAY;
     this.maxReconnectDelay = options.maxReconnectDelay ?? MAX_RECONNECT_DELAY;
     this.autoReconnect = options.autoReconnect ?? true;
@@ -67,11 +66,11 @@ export class WebSocketClient {
     const token = getToken();
     const sessionId = getOrCreateSessionId();
     const params = new URLSearchParams();
-    if (token) params.set('token', token);
-    params.set('session_id', sessionId);
+    if (token) params.set("token", token);
+    params.set("session_id", sessionId);
     const url = `${this.baseUrl}/ws/chat?${params.toString()}`;
 
-    this.ws = new WebSocket(url, ['zeroclaw.v1']);
+    this.ws = new WebSocket(url, ["jhedaiclaw.v1"]);
 
     this.ws.onopen = () => {
       this.currentDelay = this.reconnectDelay;
@@ -100,9 +99,9 @@ export class WebSocketClient {
   /** Send a chat message to the agent. */
   sendMessage(content: string): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error('WebSocket is not connected');
+      throw new Error("WebSocket is not connected");
     }
-    this.ws.send(JSON.stringify({ type: 'message', content }));
+    this.ws.send(JSON.stringify({ type: "message", content }));
   }
 
   /** Close the connection without auto-reconnecting. */
@@ -128,7 +127,10 @@ export class WebSocketClient {
     if (this.intentionallyClosed || !this.autoReconnect) return;
 
     this.reconnectTimer = setTimeout(() => {
-      this.currentDelay = Math.min(this.currentDelay * 2, this.maxReconnectDelay);
+      this.currentDelay = Math.min(
+        this.currentDelay * 2,
+        this.maxReconnectDelay,
+      );
       this.connect();
     }, this.currentDelay);
   }

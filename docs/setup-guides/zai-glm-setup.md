@@ -1,16 +1,16 @@
 # Z.AI GLM Setup
 
-ZeroClaw supports Z.AI's GLM models through OpenAI-compatible endpoints.
-This guide covers practical setup options that match current ZeroClaw provider behavior.
+JhedaiClaw supports Z.AI's GLM models through OpenAI-compatible endpoints.
+This guide covers practical setup options that match current JhedaiClaw provider behavior.
 
 ## Overview
 
-ZeroClaw supports these Z.AI aliases and endpoints out of the box:
+JhedaiClaw supports these Z.AI aliases and endpoints out of the box:
 
-| Alias | Endpoint | Notes |
-|-------|----------|-------|
-| `zai` | `https://api.z.ai/api/coding/paas/v4` | Global endpoint |
-| `zai-cn` | `https://open.bigmodel.cn/api/paas/v4` | China endpoint |
+| Alias    | Endpoint                               | Notes           |
+| -------- | -------------------------------------- | --------------- |
+| `zai`    | `https://api.z.ai/api/coding/paas/v4`  | Global endpoint |
+| `zai-cn` | `https://open.bigmodel.cn/api/paas/v4` | China endpoint  |
 
 If you need a custom base URL, see [`../contributing/custom-providers.md`](../contributing/custom-providers.md).
 
@@ -19,14 +19,14 @@ If you need a custom base URL, see [`../contributing/custom-providers.md`](../co
 ### Quick Start
 
 ```bash
-zeroclaw onboard \
+jhedaiclaw onboard \
   --provider "zai" \
   --api-key "YOUR_ZAI_API_KEY"
 ```
 
 ### Manual Configuration
 
-Edit `~/.zeroclaw/config.toml`:
+Edit `~/.jhedaiclaw/config.toml`:
 
 ```toml
 api_key = "YOUR_ZAI_API_KEY"
@@ -37,12 +37,12 @@ default_temperature = 0.7
 
 ## Available Models
 
-| Model | Description |
-|-------|-------------|
-| `glm-5` | Default in onboarding; strongest reasoning |
-| `glm-4.7` | Strong general-purpose quality |
-| `glm-4.6` | Balanced baseline |
-| `glm-4.5-air` | Lower-latency option |
+| Model         | Description                                |
+| ------------- | ------------------------------------------ |
+| `glm-5`       | Default in onboarding; strongest reasoning |
+| `glm-4.7`     | Strong general-purpose quality             |
+| `glm-4.6`     | Balanced baseline                          |
+| `glm-4.5-air` | Lower-latency option                       |
 
 Model availability can vary by account/region, so use the `/models` API when in doubt.
 
@@ -62,25 +62,28 @@ curl -X POST "https://api.z.ai/api/coding/paas/v4/chat/completions" \
 ```
 
 Expected response:
+
 ```json
 {
-  "choices": [{
-    "message": {
-      "content": "Hello! How can I help you today?",
-      "role": "assistant"
+  "choices": [
+    {
+      "message": {
+        "content": "Hello! How can I help you today?",
+        "role": "assistant"
+      }
     }
-  }]
+  ]
 }
 ```
 
-### Test with ZeroClaw CLI
+### Test with JhedaiClaw CLI
 
 ```bash
 # Test agent directly
-echo "Hello" | zeroclaw agent
+echo "Hello" | jhedaiclaw agent
 
 # Check status
-zeroclaw status
+jhedaiclaw status
 ```
 
 ## Environment Variables
@@ -104,6 +107,7 @@ The key format is `id.secret` (for example: `abc123.xyz789`).
 **Symptom:** `rate_limited` errors
 
 **Solution:**
+
 - Wait and retry
 - Check your Z.AI plan limits
 - Try `glm-4.5-air` for lower latency and higher quota tolerance
@@ -113,6 +117,7 @@ The key format is `id.secret` (for example: `abc123.xyz789`).
 **Symptom:** 401 or 403 errors
 
 **Solution:**
+
 - Verify your API key format is `id.secret`
 - Check the key hasn't expired
 - Ensure no extra whitespace in the key
@@ -122,7 +127,9 @@ The key format is `id.secret` (for example: `abc123.xyz789`).
 **Symptom:** Model not available error
 
 **Solution:**
+
 - List available models:
+
 ```bash
 curl -s "https://api.z.ai/api/coding/paas/v4/models" \
   -H "Authorization: Bearer YOUR_ZAI_API_KEY" | jq '.data[].id'
@@ -137,6 +144,6 @@ curl -s "https://api.z.ai/api/coding/paas/v4/models" \
 
 ## Related Documentation
 
-- [ZeroClaw README](../README.md)
+- [JhedaiClaw README](../README.md)
 - [Custom Provider Endpoints](../contributing/custom-providers.md)
 - [Contributing Guide](../../CONTRIBUTING.md)

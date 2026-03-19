@@ -7,7 +7,8 @@
 
 ## Vấn đề
 
-ZeroClaw có rate limiting (20 actions/hour) nhưng chưa có giới hạn tài nguyên. Một agent bị lỗi lặp vòng có thể:
+JhedaiClaw có rate limiting (20 actions/hour) nhưng chưa có giới hạn tài nguyên. Một agent bị lỗi lặp vòng có thể:
+
 - Làm cạn kiệt bộ nhớ khả dụng
 - Quay CPU liên tục ở 100%
 - Lấp đầy ổ đĩa bằng log/output
@@ -18,7 +19,7 @@ ZeroClaw có rate limiting (20 actions/hour) nhưng chưa có giới hạn tài 
 
 ### Tùy chọn 1: cgroups v2 (Linux, khuyến nghị)
 
-Tự động tạo cgroup cho zeroclaw với các giới hạn.
+Tự động tạo cgroup cho jhedaiclaw với các giới hạn.
 
 ```bash
 # Tạo systemd service với giới hạn
@@ -101,9 +102,9 @@ max_open_files = 100
 
 ## Thứ tự triển khai
 
-| Giai đoạn | Tính năng | Công sức | Tác động |
-|-------|---------|--------|--------|
-| **P0** | Memory monitoring + kill | Thấp | Cao |
-| **P1** | CPU timeout mỗi lệnh | Thấp | Cao |
-| **P2** | Tích hợp cgroups (Linux) | Trung bình | Rất cao |
-| **P3** | Giới hạn Disk I/O | Trung bình | Trung bình |
+| Giai đoạn | Tính năng                | Công sức   | Tác động   |
+| --------- | ------------------------ | ---------- | ---------- |
+| **P0**    | Memory monitoring + kill | Thấp       | Cao        |
+| **P1**    | CPU timeout mỗi lệnh     | Thấp       | Cao        |
+| **P2**    | Tích hợp cgroups (Linux) | Trung bình | Rất cao    |
+| **P3**    | Giới hạn Disk I/O        | Trung bình | Trung bình |

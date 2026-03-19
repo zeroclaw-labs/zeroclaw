@@ -1,4 +1,4 @@
-# ZeroClaw-dokumentaatiokeskus
+# JhedaiClaw-dokumentaatiokeskus
 
 Tämä sivu on dokumentaatiojärjestelmän ensisijainen aloituspiste.
 
@@ -8,20 +8,20 @@ Lokalisoidut keskukset: [简体中文](README.zh-CN.md) · [日本語](README.ja
 
 ## Aloita Tästä
 
-| Haluan…                                                             | Lue tämä                                                                       |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| Asentaa ja ajaa ZeroClaw nopeasti                                   | [README.md (Pikaopas)](../README.md#quick-start)                               |
-| Käynnistys yhdellä komennolla                                       | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                  |
-| Löytää komentoja tehtävän mukaan                                    | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| Tarkistaa nopeasti asetusavaimet ja oletusarvot                     | [config-reference.md](reference/api/config-reference.md)                       |
-| Määrittää mukautettuja tarjoajia/päätepisteitä                      | [custom-providers.md](contributing/custom-providers.md)                        |
-| Määrittää Z.AI / GLM -tarjoajan                                     | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                             |
-| Käyttää LangGraph-integrointimalleja                                | [langgraph-integration.md](contributing/langgraph-integration.md)              |
-| Käyttää ajonaikaa (päivä-2 runbook)                                 | [operations-runbook.md](ops/operations-runbook.md)                             |
-| Ratkaista asennus-/ajonaika-/kanavaongelmia                         | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| Ajaa Matrix-salattujen huoneiden asetukset ja diagnostiikka         | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                          |
-| Selata dokumentaatiota kategorioittain                               | [SUMMARY.md](SUMMARY.md)                                                      |
-| Nähdä projektin PR/issue-dokumenttien tilannekuva                   | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| Haluan…                                                     | Lue tämä                                                                                   |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Asentaa ja ajaa JhedaiClaw nopeasti                         | [README.md (Pikaopas)](../README.md#quick-start)                                           |
+| Käynnistys yhdellä komennolla                               | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| Löytää komentoja tehtävän mukaan                            | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| Tarkistaa nopeasti asetusavaimet ja oletusarvot             | [config-reference.md](reference/api/config-reference.md)                                   |
+| Määrittää mukautettuja tarjoajia/päätepisteitä              | [custom-providers.md](contributing/custom-providers.md)                                    |
+| Määrittää Z.AI / GLM -tarjoajan                             | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| Käyttää LangGraph-integrointimalleja                        | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| Käyttää ajonaikaa (päivä-2 runbook)                         | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| Ratkaista asennus-/ajonaika-/kanavaongelmia                 | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| Ajaa Matrix-salattujen huoneiden asetukset ja diagnostiikka | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| Selata dokumentaatiota kategorioittain                      | [SUMMARY.md](SUMMARY.md)                                                                   |
+| Nähdä projektin PR/issue-dokumenttien tilannekuva           | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## Nopea Päätöspuu (10 sekuntia)
 

@@ -1,18 +1,19 @@
 # Skill: github-issue
 
-File a structured GitHub issue (bug report or feature request) for ZeroClaw interactively from Claude Code.
+File a structured GitHub issue (bug report or feature request) for JhedaiClaw interactively from Claude Code.
 
 ## When to Use
 
-Trigger when the user wants to file a GitHub issue, report a bug, or request a feature for ZeroClaw. Keywords: "file issue", "report bug", "feature request", "open issue", "create issue", "github issue".
+Trigger when the user wants to file a GitHub issue, report a bug, or request a feature for JhedaiClaw. Keywords: "file issue", "report bug", "feature request", "open issue", "create issue", "github issue".
 
 ## Instructions
 
-You are filing a GitHub issue against the ZeroClaw repository using structured issue forms. Follow this workflow exactly.
+You are filing a GitHub issue against the JhedaiClaw repository using structured issue forms. Follow this workflow exactly.
 
 ### Step 1: Detect Issue Type and Read the Template
 
 Determine from the user's message whether this is a **bug report** or **feature request**.
+
 - If unclear, use AskUserQuestion to ask: "Is this a bug report or a feature request?"
 
 Then read the corresponding issue template to understand the required fields:
@@ -21,6 +22,7 @@ Then read the corresponding issue template to understand the required fields:
 - Feature request: `.github/ISSUE_TEMPLATE/feature_request.yml`
 
 Parse the YAML to extract:
+
 - The `title` prefix (e.g. `[Bug]: `, `[Feature]: `)
 - The `labels` array
 - Each field in the `body` array: its `type` (dropdown, textarea, input, checkboxes, markdown), `id`, `attributes.label`, `attributes.options` (for dropdowns), `attributes.description`, `attributes.placeholder`, and `validations.required`
@@ -41,7 +43,7 @@ git diff --stat HEAD~1 2>/dev/null
 uname -s -r -m                          # OS info
 sw_vers 2>/dev/null                     # macOS version
 rustc --version 2>/dev/null             # Rust version
-cargo metadata --format-version=1 --no-deps 2>/dev/null | jq -r '.packages[] | select(.name=="zeroclaw") | .version' 2>/dev/null   # ZeroClaw version
+cargo metadata --format-version=1 --no-deps 2>/dev/null | jq -r '.packages[] | select(.name=="jhedaiclaw") | .version' 2>/dev/null   # JhedaiClaw version
 git rev-parse --short HEAD              # commit SHA fallback
 ```
 
@@ -73,6 +75,7 @@ Present the complete draft to the user in a clean readable format:
 ```
 
 Use AskUserQuestion to ask the user to review:
+
 - "Here's the pre-filled issue. Please review and let me know what to change, or say 'submit' to file it."
 
 If the user requests changes, update the draft and re-present. Iterate until the user approves.
@@ -80,10 +83,12 @@ If the user requests changes, update the draft and re-present. Iterate until the
 ### Step 4: Scope Guard
 
 Before final submission, analyze the collected content for scope creep:
+
 - Does the bug report describe multiple independent defects?
 - Does the feature request bundle unrelated changes?
 
 If multi-concept issues are detected:
+
 1. Inform the user: "This issue appears to cover multiple distinct topics. Focused, single-concept issues are strongly preferred and more likely to be accepted."
 2. Break down the distinct groups found.
 3. Offer to file separate issues for each group, reusing shared context (environment, etc.).
@@ -104,8 +109,9 @@ For each non-markdown field from the template, in order:
 For optional fields with no content, use `_No response_` as the value (this matches GitHub's native rendering for empty optional fields).
 
 For checkbox fields, render each option as:
+
 ```markdown
-- [X] <option label text>
+- [x] <option label text>
 ```
 
 ### Step 6: Final Preview and Submit
@@ -127,7 +133,7 @@ Return the resulting issue URL to the user.
 
 - **Always read the template file** — never assume field names, options, or structure. The templates are the source of truth and may change over time.
 - **Never include personal/sensitive data** in the issue. Redact secrets, tokens, emails, real names.
-- **Use neutral project-scoped placeholders** per ZeroClaw's privacy contract.
+- **Use neutral project-scoped placeholders** per JhedaiClaw's privacy contract.
 - **One concept per issue** — enforce the scope guard.
 - **Auto-detect, don't guess** — use real command output for environment fields.
 - **Match GitHub's rendering** — use `### Field Label` sections so issues look consistent whether filed via web UI or this skill.

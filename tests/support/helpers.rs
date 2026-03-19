@@ -2,16 +2,16 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use jhedaiclaw::agent::agent::Agent;
+use jhedaiclaw::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
+use jhedaiclaw::agent::memory_loader::MemoryLoader;
+use jhedaiclaw::config::MemoryConfig;
+use jhedaiclaw::memory;
+use jhedaiclaw::memory::Memory;
+use jhedaiclaw::observability::{NoopObserver, Observer};
+use jhedaiclaw::providers::{ChatResponse, Provider, ToolCall};
+use jhedaiclaw::tools::Tool;
 use std::sync::Arc;
-use zeroclaw::agent::agent::Agent;
-use zeroclaw::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
-use zeroclaw::agent::memory_loader::MemoryLoader;
-use zeroclaw::config::MemoryConfig;
-use zeroclaw::memory;
-use zeroclaw::memory::Memory;
-use zeroclaw::observability::{NoopObserver, Observer};
-use zeroclaw::providers::{ChatResponse, Provider, ToolCall};
-use zeroclaw::tools::Tool;
 
 /// Create an in-memory "none" backend for tests.
 pub fn make_memory() -> Arc<dyn Memory> {

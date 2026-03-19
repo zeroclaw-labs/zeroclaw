@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="zeroclaw.png" alt="ZeroClaw" width="200" />
+  <img src="jhedaiclaw.png" alt="JhedaiClaw" width="200" />
 </p>
 
-<h1 align="center">ZeroClaw 🦀</h1>
+<h1 align="center">JhedaiClaw 🦀</h1>
 
 <p align="center">
   <strong>Nulla többletköltség. Nulla kompromisszum. 100% Rust. 100% Agnosztikus.</strong><br>
@@ -13,11 +13,11 @@
   <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
   <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
   <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
-  <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
-  <a href="https://zeroclawlabs.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
+  <a href="https://x.com/jhedaiclaw?s=21"><img src="https://img.shields.io/badge/X-%40jhedaiclaw-000000?style=flat&logo=x&logoColor=white" alt="X: @jhedaiclaw" /></a>
+  <a href="https://jhedaiclaw.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
   <a href="https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search"><img src="https://img.shields.io/badge/Xiaohongshu-Official-FF2442?style=flat" alt="Xiaohongshu: Official" /></a>
-  <a href="https://t.me/zeroclawlabs"><img src="https://img.shields.io/badge/Telegram-%40zeroclawlabs-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @zeroclawlabs" /></a>
-  <a href="https://www.facebook.com/groups/zeroclaw"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
+  <a href="https://t.me/jhedaiclaw"><img src="https://img.shields.io/badge/Telegram-%40jhedaiclaw-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @jhedaiclaw" /></a>
+  <a href="https://www.facebook.com/groups/jhedaiclaw"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
 </p>
 
 <p align="center">
@@ -61,15 +61,15 @@
 
 ### 🚀 What's New in v0.3.1 (March 2026)
 
-| Area | Highlights |
-|---|---|
-| ci | add Termux (aarch64-linux-android) release target |
+| Area | Highlights                                        |
+| ---- | ------------------------------------------------- |
+| ci   | add Termux (aarch64-linux-android) release target |
 
 <!-- END:WHATS_NEW -->
 
-## Mi az a ZeroClaw?
+## Mi az a JhedaiClaw?
 
-A ZeroClaw egy könnyűsúlyú, változtatható és bővíthető AI asszisztens infrastruktúra, amely Rust nyelven készült. Különböző LLM szolgáltatókat (Anthropic, OpenAI, Google, Ollama stb.) köt össze egy egységes felületen keresztül, és több csatornát támogat (Telegram, Matrix, CLI stb.).
+A JhedaiClaw egy könnyűsúlyú, változtatható és bővíthető AI asszisztens infrastruktúra, amely Rust nyelven készült. Különböző LLM szolgáltatókat (Anthropic, OpenAI, Google, Ollama stb.) köt össze egy egységes felületen keresztül, és több csatornát támogat (Telegram, Matrix, CLI stb.).
 
 ### Fő jellemzők
 
@@ -93,8 +93,8 @@ A ZeroClaw egy könnyűsúlyú, változtatható és bővíthető AI asszisztens 
 
 ```bash
 # Klónozza a repositoryt
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/jhedai/jhedaiclaw.git
+cd jhedaiclaw
 
 # Építés
 cargo build --release
@@ -107,17 +107,17 @@ cargo run --release
 
 ```bash
 docker run -d \
-  --name zeroclaw \
+  --name jhedaiclaw \
   -e ANTHROPIC_API_KEY=your_key \
-  -v zeroclaw-data:/app/data \
-  zeroclaw/zeroclaw:latest
+  -v jhedaiclaw-data:/app/data \
+  jhedaiclaw/jhedaiclaw:latest
 ```
 
 ---
 
 ## Konfiguráció
 
-A ZeroClaw egy YAML konfigurációs fájlt használ. Alapértelmezés szerint a `config.yaml` fájlt keresi.
+A JhedaiClaw egy YAML konfigurációs fájlt használ. Alapértelmezés szerint a `config.yaml` fájlt keresi.
 
 ```yaml
 # Alapértelmezett szolgáltató
@@ -176,15 +176,15 @@ Részletekért lásd a [LICENSE-APACHE](LICENSE-APACHE) és [LICENSE-MIT](LICENS
 
 ## Közösség
 
-- [Telegram](https://t.me/zeroclawlabs)
-- [Facebook Group](https://www.facebook.com/groups/zeroclaw)
-- [WeChat Group](https://zeroclawlabs.cn/group.jpg)
+- [Telegram](https://t.me/jhedaiclaw)
+- [Facebook Group](https://www.facebook.com/groups/jhedaiclaw)
+- [WeChat Group](https://jhedaiclaw.cn/group.jpg)
 
 ---
 
 ## Szponzorok
 
-Ha a ZeroClaw hasznos az Ön számára, kérjük, fontolja meg, hogy vesz nekünk egy kávét:
+Ha a JhedaiClaw hasznos az Ön számára, kérjük, fontolja meg, hogy vesz nekünk egy kávét:
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee)](https://buymeacoffee.com/argenistherose)
 

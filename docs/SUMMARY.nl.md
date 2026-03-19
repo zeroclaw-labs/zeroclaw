@@ -1,4 +1,4 @@
-# ZeroClaw Documentatieoverzicht (Uniforme Inhoudsopgave)
+# JhedaiClaw Documentatieoverzicht (Uniforme Inhoudsopgave)
 
 Dit bestand is de canonieke inhoudsopgave van het documentatiesysteem.
 

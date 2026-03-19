@@ -547,6 +547,60 @@ pub async fn handle_api_memory_delete(
     }
 }
 
+/// PUT /api/memory/backend — switch memory backend and restart
+pub async fn handle_api_memory_backend_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(backend) = body.get("backend").and_then(|v| v.as_str()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing 'backend' field"})),
+        )
+            .into_response();
+    };
+
+    let valid = ["sqlite", "graph", "markdown", "postgres", "qdrant", "none"];
+    if !valid.contains(&backend) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Invalid backend: {backend}")})),
+        )
+            .into_response();
+    }
+
+    // Update in-memory config
+    {
+        let mut config = state.config.lock();
+        config.memory.backend = backend.to_string();
+    }
+
+    // Save to disk
+    let config_snapshot = state.config.lock().clone();
+    if let Err(e) = config_snapshot.save().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
+        )
+            .into_response();
+    }
+
+    // Trigger graceful restart
+    let _ = state.shutdown_tx.send(true);
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "backend": backend,
+        "restarting": true,
+    }))
+    .into_response()
+}
+
 /// GET /api/cost — cost summary
 pub async fn handle_api_cost(
     State(state): State<AppState>,
@@ -1117,7 +1171,7 @@ mod tests {
             from_address: "agent@example.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
-            default_subject: "ZeroClaw Message".to_string(),
+            default_subject: "JhedaiClaw Message".to_string(),
         });
         cfg.model_routes = vec![crate::config::schema::ModelRouteConfig {
             hint: "reasoning".to_string(),
@@ -1251,7 +1305,7 @@ mod tests {
             from_address: "agent@example.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
-            default_subject: "ZeroClaw Message".to_string(),
+            default_subject: "JhedaiClaw Message".to_string(),
         });
         current.model_routes = vec![
             crate::config::schema::ModelRouteConfig {

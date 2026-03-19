@@ -395,7 +395,7 @@ impl TtsProvider for EdgeTtsProvider {
 
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
         let temp_dir = std::env::temp_dir();
-        let output_file = temp_dir.join(format!("zeroclaw_tts_{}.mp3", uuid::Uuid::new_v4()));
+        let output_file = temp_dir.join(format!("jhedaiclaw_tts_{}.mp3", uuid::Uuid::new_v4()));
         let output_path = output_file
             .to_str()
             .context("Failed to build temp file path for Edge TTS")?;

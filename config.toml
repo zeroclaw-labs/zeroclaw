@@ -1,0 +1,7 @@
+default_provider = "openai"
+default_model = "gpt-4o-mini"
+default_temperature = 0.7
+
+[gateway]
+port = 42617
+host = "127.0.0.1"

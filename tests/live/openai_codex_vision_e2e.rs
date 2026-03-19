@@ -12,7 +12,7 @@
 //! Run manually: `cargo test provider_vision -- --ignored --nocapture`
 
 use anyhow::Result;
-use zeroclaw::providers::{ChatMessage, ChatRequest, ProviderRuntimeOptions};
+use jhedaiclaw::providers::{ChatMessage, ChatRequest, ProviderRuntimeOptions};
 
 /// Tests that provider supports vision input.
 ///
@@ -26,7 +26,7 @@ use zeroclaw::providers::{ChatMessage, ChatRequest, ProviderRuntimeOptions};
 async fn provider_vision_support() -> Result<()> {
     // Use Gemini provider (OpenAI Codex is rate-limited until 21 Feb)
     println!("Creating Gemini provider...");
-    let provider = zeroclaw::providers::create_provider("gemini", None)?;
+    let provider = jhedaiclaw::providers::create_provider("gemini", None)?;
     let provider_name = "gemini";
     let model = "gemini-2.5-pro";
 
@@ -148,7 +148,7 @@ async fn openai_codex_second_vision_support() -> Result<()> {
     let opts = ProviderRuntimeOptions {
         auth_profile_override: Some("second".to_string()),
         provider_api_url: None,
-        zeroclaw_dir: None,
+        jhedaiclaw_dir: None,
         secrets_encrypt: false,
         reasoning_enabled: None,
         provider_timeout_secs: None,
@@ -156,7 +156,8 @@ async fn openai_codex_second_vision_support() -> Result<()> {
         api_path: None,
     };
 
-    let provider = zeroclaw::providers::create_provider_with_options("openai-codex", None, &opts)?;
+    let provider =
+        jhedaiclaw::providers::create_provider_with_options("openai-codex", None, &opts)?;
     let provider_name = "openai-codex:second";
     let model = "gpt-5.3-codex";
 

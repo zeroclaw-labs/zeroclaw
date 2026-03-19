@@ -1,4 +1,4 @@
-# ZeroClaw Dokumentasjonshub
+# JhedaiClaw Dokumentasjonshub
 
 Denne siden er hovedinngangen til dokumentasjonssystemet.
 
@@ -8,21 +8,21 @@ Lokaliserte huber: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) 
 
 ## Start her
 
-| Jeg vil…                                                            | Les dette                                                                      |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| Installere og kjøre ZeroClaw raskt                                  | [README.md (Hurtigstart)](../README.md#quick-start)                            |
-| Bootstrap med en enkelt kommando                                    | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                  |
-| Oppdatere eller avinstallere på macOS                               | [macos-update-uninstall.md](setup-guides/macos-update-uninstall.md)            |
-| Finne kommandoer etter oppgave                                      | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| Raskt sjekke konfigurasjonsstandarder og nøkler                     | [config-reference.md](reference/api/config-reference.md)                       |
-| Konfigurere egendefinerte leverandører/endepunkter                  | [custom-providers.md](contributing/custom-providers.md)                        |
-| Konfigurere Z.AI / GLM-leverandøren                                | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                             |
-| Bruke LangGraph-integrasjonsmønstre                                | [langgraph-integration.md](contributing/langgraph-integration.md)              |
-| Drifte kjøretidsmiljøet (dag 2-runbook)                             | [operations-runbook.md](ops/operations-runbook.md)                             |
-| Feilsøke installasjon/kjøretid/kanal-problemer                     | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| Kjøre Matrix-kryptert rom-oppsett og diagnostikk                   | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                          |
-| Bla gjennom dokumentasjon etter kategori                            | [SUMMARY.md](SUMMARY.md)                                                      |
-| Se prosjektets PR/issue-dokumentasjonsøyeblikksbilde                | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| Jeg vil…                                             | Les dette                                                                                  |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Installere og kjøre JhedaiClaw raskt                 | [README.md (Hurtigstart)](../README.md#quick-start)                                        |
+| Bootstrap med en enkelt kommando                     | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| Oppdatere eller avinstallere på macOS                | [macos-update-uninstall.md](setup-guides/macos-update-uninstall.md)                        |
+| Finne kommandoer etter oppgave                       | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| Raskt sjekke konfigurasjonsstandarder og nøkler      | [config-reference.md](reference/api/config-reference.md)                                   |
+| Konfigurere egendefinerte leverandører/endepunkter   | [custom-providers.md](contributing/custom-providers.md)                                    |
+| Konfigurere Z.AI / GLM-leverandøren                  | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| Bruke LangGraph-integrasjonsmønstre                  | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| Drifte kjøretidsmiljøet (dag 2-runbook)              | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| Feilsøke installasjon/kjøretid/kanal-problemer       | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| Kjøre Matrix-kryptert rom-oppsett og diagnostikk     | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| Bla gjennom dokumentasjon etter kategori             | [SUMMARY.md](SUMMARY.md)                                                                   |
+| Se prosjektets PR/issue-dokumentasjonsøyeblikksbilde | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## Raskt beslutningstre (10 sekunder)
 

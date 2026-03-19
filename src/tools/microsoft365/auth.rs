@@ -36,7 +36,7 @@ pub struct TokenCache {
 impl TokenCache {
     pub fn new(
         config: super::types::Microsoft365ResolvedConfig,
-        zeroclaw_dir: &std::path::Path,
+        jhedaiclaw_dir: &std::path::Path,
     ) -> anyhow::Result<Self> {
         if config.token_cache_encrypted {
             anyhow::bail!(
@@ -54,7 +54,7 @@ impl TokenCache {
         config.auth_flow.hash(&mut hasher);
         let fingerprint = format!("{:016x}", hasher.finish());
 
-        let cache_path = zeroclaw_dir.join(format!("ms365_token_cache_{fingerprint}.json"));
+        let cache_path = jhedaiclaw_dir.join(format!("ms365_token_cache_{fingerprint}.json"));
         let cached = Self::load_from_disk(&cache_path);
         Ok(Self {
             inner: RwLock::new(cached),

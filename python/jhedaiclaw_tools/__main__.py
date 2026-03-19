@@ -1,5 +1,5 @@
 """
-CLI entry point for zeroclaw-tools.
+CLI entry point for jhedaiclaw-tools.
 """
 
 import argparse
@@ -22,7 +22,7 @@ from .tools import (
 )
 
 
-DEFAULT_SYSTEM_PROMPT = """You are ZeroClaw, an AI assistant with full system access. Use tools to accomplish tasks.
+DEFAULT_SYSTEM_PROMPT = """You are JhedaiClaw, an AI assistant with full system access. Use tools to accomplish tasks.
 Be concise and helpful. Execute tools directly without excessive explanation."""
 
 
@@ -43,7 +43,7 @@ async def chat(message: str, api_key: str, base_url: Optional[str], model: str) 
 def _build_parser() -> argparse.ArgumentParser:
     """Build CLI argument parser."""
     parser = argparse.ArgumentParser(
-        description="ZeroClaw Tools - LangGraph-based tool calling for LLMs"
+        description="JhedaiClaw Tools - LangGraph-based tool calling for LLMs"
     )
     parser.add_argument(
         "message",
@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None):
         sys.exit(1)
 
     if args.interactive:
-        print("ZeroClaw Tools CLI (Interactive Mode)")
+        print("JhedaiClaw Tools CLI (Interactive Mode)")
         print("Type 'exit' to quit\n")
 
         agent = create_agent(
@@ -118,7 +118,7 @@ def main(argv: list[str] | None = None):
                     history.append(msg)
 
                 response = result["messages"][-1].content or "Done."
-                print(f"\nZeroClaw: {response}\n")
+                print(f"\nJhedaiClaw: {response}\n")
 
             except KeyboardInterrupt:
                 print("\nGoodbye!")

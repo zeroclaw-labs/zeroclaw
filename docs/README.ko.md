@@ -1,4 +1,4 @@
-# ZeroClaw 문서 허브
+# JhedaiClaw 문서 허브
 
 이 페이지는 문서 시스템의 기본 진입점입니다.
 
@@ -8,21 +8,21 @@
 
 ## 여기서 시작하세요
 
-| 하고 싶은 것…                                                       | 이것을 읽으세요                                                                |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| ZeroClaw를 빠르게 설치하고 실행                                     | [README.md (빠른 시작)](../README.md#quick-start)                              |
-| 한 번의 명령으로 부트스트랩                                         | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                  |
-| macOS에서 업데이트 또는 제거                                        | [macos-update-uninstall.md](setup-guides/macos-update-uninstall.md)            |
-| 작업별 명령어 찾기                                                  | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| 구성 기본값과 키를 빠르게 확인                                      | [config-reference.md](reference/api/config-reference.md)                       |
-| 사용자 정의 프로바이더/엔드포인트 구성                              | [custom-providers.md](contributing/custom-providers.md)                        |
-| Z.AI / GLM 프로바이더 구성                                          | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                             |
-| LangGraph 통합 패턴 사용                                            | [langgraph-integration.md](contributing/langgraph-integration.md)              |
-| 런타임 운영 (2일차 런북)                                            | [operations-runbook.md](ops/operations-runbook.md)                             |
-| 설치/런타임/채널 문제 해결                                          | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| Matrix 암호화 방 설정 및 진단 실행                                  | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                          |
-| 카테고리별 문서 찾아보기                                            | [SUMMARY.md](SUMMARY.md)                                                      |
-| 프로젝트 PR/이슈 문서 스냅샷 보기                                   | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| 하고 싶은 것…                          | 이것을 읽으세요                                                                            |
+| -------------------------------------- | ------------------------------------------------------------------------------------------ |
+| JhedaiClaw를 빠르게 설치하고 실행      | [README.md (빠른 시작)](../README.md#quick-start)                                          |
+| 한 번의 명령으로 부트스트랩            | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| macOS에서 업데이트 또는 제거           | [macos-update-uninstall.md](setup-guides/macos-update-uninstall.md)                        |
+| 작업별 명령어 찾기                     | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| 구성 기본값과 키를 빠르게 확인         | [config-reference.md](reference/api/config-reference.md)                                   |
+| 사용자 정의 프로바이더/엔드포인트 구성 | [custom-providers.md](contributing/custom-providers.md)                                    |
+| Z.AI / GLM 프로바이더 구성             | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| LangGraph 통합 패턴 사용               | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| 런타임 운영 (2일차 런북)               | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| 설치/런타임/채널 문제 해결             | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| Matrix 암호화 방 설정 및 진단 실행     | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| 카테고리별 문서 찾아보기               | [SUMMARY.md](SUMMARY.md)                                                                   |
+| 프로젝트 PR/이슈 문서 스냅샷 보기      | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## 빠른 의사결정 트리 (10초)
 

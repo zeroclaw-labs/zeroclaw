@@ -3,7 +3,7 @@
 ## Pin Aliases
 
 | alias       | pin |
-|-------------|-----|
+| ----------- | --- |
 | red_led     | 13  |
 | builtin_led | 13  |
 | user_led    | 13  |
@@ -22,16 +22,16 @@ Arduino Uno là board vi điều khiển dựa trên ATmega328P. Có 14 pin digi
 
 - `digitalWrite(pin, HIGH)` hoặc `digitalWrite(pin, LOW)` để xuất tín hiệu.
 - `digitalRead(pin)` để đọc đầu vào (trả về 0 hoặc 1).
-- Số pin trong giao thức ZeroClaw: 0–13.
+- Số pin trong giao thức JhedaiClaw: 0–13.
 
 ## Serial
 
 - UART trên pin 0 (RX) và 1 (TX).
 - USB qua ATmega16U2 hoặc CH340 (bản clone).
-- Baud rate: 115200 cho firmware ZeroClaw.
+- Baud rate: 115200 cho firmware JhedaiClaw.
 
-## ZeroClaw Tools
+## JhedaiClaw Tools
 
 - `gpio_read`: Đọc giá trị pin (0 hoặc 1).
 - `gpio_write`: Đặt pin lên cao (1) hoặc xuống thấp (0).
-- `arduino_upload`: Agent tạo code Arduino sketch đầy đủ; ZeroClaw biên dịch và tải lên qua arduino-cli. Dùng cho "make a heart", các pattern tùy chỉnh — agent viết code, không cần chỉnh sửa thủ công. Pin 13 = LED tích hợp.
+- `arduino_upload`: Agent tạo code Arduino sketch đầy đủ; JhedaiClaw biên dịch và tải lên qua arduino-cli. Dùng cho "make a heart", các pattern tùy chỉnh — agent viết code, không cần chỉnh sửa thủ công. Pin 13 = LED tích hợp.

@@ -1,6 +1,6 @@
 # Matrix 端到端加密指南
 
-本指南介绍如何在 Matrix 房间（包括端到端加密 (E2EE) 房间）中可靠运行 ZeroClaw。
+本指南介绍如何在 Matrix 房间（包括端到端加密 (E2EE) 房间）中可靠运行 JhedaiClaw。
 
 它重点关注用户报告的常见故障模式：
 
@@ -26,7 +26,7 @@
 2. 访问令牌属于同一个机器人账户。
 3. `room_id` 正确：
    - 首选：标准房间 ID（`!room:server`）
-   - 支持：房间别名（`#alias:server`），ZeroClaw 会解析它
+   - 支持：房间别名（`#alias:server`），JhedaiClaw 会解析它
 4. `allowed_users` 允许发送者（开放测试时使用 `[\"*\"]`）。
 5. 对于 E2EE 房间，机器人设备已收到房间的加密密钥。
 
@@ -34,7 +34,7 @@
 
 ## 2. 配置
 
-使用 `~/.zeroclaw/config.toml`：
+使用 `~/.jhedaiclaw/config.toml`：
 
 ```toml
 [channels_config.matrix]
@@ -42,7 +42,7 @@ homeserver = \"https://matrix.example.com\"
 access_token = \"syt_your_token\"
 
 # E2EE 稳定性可选但推荐：
-user_id = \"@zeroclaw:matrix.example.com\"
+user_id = \"@jhedaiclaw:matrix.example.com\"
 device_id = \"DEVICEID123\"
 
 # 房间 ID 或别名
@@ -55,7 +55,7 @@ allowed_users = [\"*\"]
 
 ### 关于 `user_id` 和 `device_id`
 
-- ZeroClaw 尝试从 Matrix `/_matrix/client/v3/account/whoami` 读取身份信息。
+- JhedaiClaw 尝试从 Matrix `/_matrix/client/v3/account/whoami` 读取身份信息。
 - 如果 `whoami` 不返回 `device_id`，请手动设置 `device_id`。
 - 这些提示对于 E2EE 会话恢复尤为重要。
 
@@ -66,13 +66,13 @@ allowed_users = [\"*\"]
 1. 运行渠道设置和守护进程：
 
 ```bash
-zeroclaw onboard --channels-only
-zeroclaw daemon
+jhedaiclaw onboard --channels-only
+jhedaiclaw daemon
 ```
 
 2. 在配置的 Matrix 房间中发送纯文本消息。
 
-3. 确认 ZeroClaw 日志包含 Matrix 监听器启动信息，没有重复的同步/认证错误。
+3. 确认 JhedaiClaw 日志包含 Matrix 监听器启动信息，没有重复的同步/认证错误。
 
 4. 在加密房间中，验证机器人可以读取并回复允许用户的加密消息。
 
@@ -114,9 +114,9 @@ curl -sS -H \"Authorization: Bearer $MATRIX_TOKEN\" \
 
 ### E. 消息格式（Markdown）
 
-- ZeroClaw 将 Matrix 文本回复作为支持 markdown 的 `m.room.message` 文本内容发送。
+- JhedaiClaw 将 Matrix 文本回复作为支持 markdown 的 `m.room.message` 文本内容发送。
 - 支持 `formatted_body` 的 Matrix 客户端应渲染强调、列表和代码块。
-- 如果格式显示为纯文本，首先检查客户端能力，然后确认 ZeroClaw 运行的构建包含启用 markdown 的 Matrix 输出。
+- 如果格式显示为纯文本，首先检查客户端能力，然后确认 JhedaiClaw 运行的构建包含启用 markdown 的 Matrix 输出。
 
 ### F. 全新启动测试
 

@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn boundary_denies_cross_workspace_path_access() {
         let boundary = WorkspaceBoundary::new(Some(test_profile()), false);
-        let base = PathBuf::from("/home/zeroclaw_user/.zeroclaw/workspaces");
+        let base = PathBuf::from("/home/jhedaiclaw_user/.jhedaiclaw/workspaces");
 
         // Access to own workspace is allowed
         let own_path = base.join("client_a").join("data.db");
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn boundary_allows_cross_workspace_when_enabled() {
         let boundary = WorkspaceBoundary::new(Some(test_profile()), true);
-        let base = PathBuf::from("/home/zeroclaw_user/.zeroclaw/workspaces");
+        let base = PathBuf::from("/home/jhedaiclaw_user/.jhedaiclaw/workspaces");
         let other_path = base.join("client_b").join("data.db");
 
         assert_eq!(
@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn boundary_allows_paths_outside_workspaces_dir() {
         let boundary = WorkspaceBoundary::new(Some(test_profile()), false);
-        let base = PathBuf::from("/home/zeroclaw_user/.zeroclaw/workspaces");
+        let base = PathBuf::from("/home/jhedaiclaw_user/.jhedaiclaw/workspaces");
         let outside_path = PathBuf::from("/tmp/something");
 
         assert_eq!(

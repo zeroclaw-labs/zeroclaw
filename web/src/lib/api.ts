@@ -9,8 +9,14 @@ import type {
   CostSummary,
   CliTool,
   HealthSnapshot,
-} from '../types/api';
-import { clearToken, getToken, setToken } from './auth';
+  GraphStats,
+  GraphSearchResult,
+  GraphHotResponse,
+  GraphNodesResponse,
+  GraphBudget,
+  GraphNode,
+} from "../types/api";
+import { clearToken, getToken, setToken } from "./auth";
 
 // ---------------------------------------------------------------------------
 // Base fetch wrapper
@@ -18,8 +24,8 @@ import { clearToken, getToken, setToken } from './auth';
 
 export class UnauthorizedError extends Error {
   constructor() {
-    super('Unauthorized');
-    this.name = 'UnauthorizedError';
+    super("Unauthorized");
+    this.name = "UnauthorizedError";
   }
 }
 
@@ -31,27 +37,27 @@ export async function apiFetch<T = unknown>(
   const headers = new Headers(options.headers);
 
   if (token) {
-    headers.set('Authorization', `Bearer ${token}`);
+    headers.set("Authorization", `Bearer ${token}`);
   }
 
   if (
     options.body &&
-    typeof options.body === 'string' &&
-    !headers.has('Content-Type')
+    typeof options.body === "string" &&
+    !headers.has("Content-Type")
   ) {
-    headers.set('Content-Type', 'application/json');
+    headers.set("Content-Type", "application/json");
   }
 
   const response = await fetch(path, { ...options, headers });
 
   if (response.status === 401) {
     clearToken();
-    window.dispatchEvent(new Event('zeroclaw-unauthorized'));
+    window.dispatchEvent(new Event("jhedaiclaw-unauthorized"));
     throw new UnauthorizedError();
   }
 
   if (!response.ok) {
-    const text = await response.text().catch(() => '');
+    const text = await response.text().catch(() => "");
     throw new Error(`API ${response.status}: ${text || response.statusText}`);
   }
 
@@ -64,7 +70,12 @@ export async function apiFetch<T = unknown>(
 }
 
 function unwrapField<T>(value: T | Record<string, T>, key: string): T {
-  if (value !== null && typeof value === 'object' && !Array.isArray(value) && key in value) {
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    key in value
+  ) {
     const unwrapped = (value as Record<string, T | undefined>)[key];
     if (unwrapped !== undefined) {
       return unwrapped;
@@ -78,14 +89,16 @@ function unwrapField<T>(value: T | Record<string, T>, key: string): T {
 // ---------------------------------------------------------------------------
 
 export async function pair(code: string): Promise<{ token: string }> {
-  const response = await fetch('/pair', {
-    method: 'POST',
-    headers: { 'X-Pairing-Code': code },
+  const response = await fetch("/pair", {
+    method: "POST",
+    headers: { "X-Pairing-Code": code },
   });
 
   if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`Pairing failed (${response.status}): ${text || response.statusText}`);
+    const text = await response.text().catch(() => "");
+    throw new Error(
+      `Pairing failed (${response.status}): ${text || response.statusText}`,
+    );
   }
 
   const data = (await response.json()) as { token: string };
@@ -97,12 +110,18 @@ export async function pair(code: string): Promise<{ token: string }> {
 // Public health (no auth required)
 // ---------------------------------------------------------------------------
 
-export async function getPublicHealth(): Promise<{ require_pairing: boolean; paired: boolean }> {
-  const response = await fetch('/health');
+export async function getPublicHealth(): Promise<{
+  require_pairing: boolean;
+  paired: boolean;
+}> {
+  const response = await fetch("/health");
   if (!response.ok) {
     throw new Error(`Health check failed (${response.status})`);
   }
-  return response.json() as Promise<{ require_pairing: boolean; paired: boolean }>;
+  return response.json() as Promise<{
+    require_pairing: boolean;
+    paired: boolean;
+  }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -110,13 +129,13 @@ export async function getPublicHealth(): Promise<{ require_pairing: boolean; pai
 // ---------------------------------------------------------------------------
 
 export function getStatus(): Promise<StatusResponse> {
-  return apiFetch<StatusResponse>('/api/status');
+  return apiFetch<StatusResponse>("/api/status");
 }
 
 export function getHealth(): Promise<HealthSnapshot> {
-  return apiFetch<HealthSnapshot | { health: HealthSnapshot }>('/api/health').then((data) =>
-    unwrapField(data, 'health'),
-  );
+  return apiFetch<HealthSnapshot | { health: HealthSnapshot }>(
+    "/api/health",
+  ).then((data) => unwrapField(data, "health"));
 }
 
 // ---------------------------------------------------------------------------
@@ -124,15 +143,15 @@ export function getHealth(): Promise<HealthSnapshot> {
 // ---------------------------------------------------------------------------
 
 export function getConfig(): Promise<string> {
-  return apiFetch<string | { format?: string; content: string }>('/api/config').then((data) =>
-    typeof data === 'string' ? data : data.content,
-  );
+  return apiFetch<string | { format?: string; content: string }>(
+    "/api/config",
+  ).then((data) => (typeof data === "string" ? data : data.content));
 }
 
 export function putConfig(toml: string): Promise<void> {
-  return apiFetch<void>('/api/config', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/toml' },
+  return apiFetch<void>("/api/config", {
+    method: "PUT",
+    headers: { "Content-Type": "application/toml" },
     body: toml,
   });
 }
@@ -142,8 +161,8 @@ export function putConfig(toml: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export function getTools(): Promise<ToolSpec[]> {
-  return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>('/api/tools').then((data) =>
-    unwrapField(data, 'tools'),
+  return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>("/api/tools").then(
+    (data) => unwrapField(data, "tools"),
   );
 }
 
@@ -152,8 +171,8 @@ export function getTools(): Promise<ToolSpec[]> {
 // ---------------------------------------------------------------------------
 
 export function getCronJobs(): Promise<CronJob[]> {
-  return apiFetch<CronJob[] | { jobs: CronJob[] }>('/api/cron').then((data) =>
-    unwrapField(data, 'jobs'),
+  return apiFetch<CronJob[] | { jobs: CronJob[] }>("/api/cron").then((data) =>
+    unwrapField(data, "jobs"),
   );
 }
 
@@ -163,15 +182,19 @@ export function addCronJob(body: {
   schedule: string;
   enabled?: boolean;
 }): Promise<CronJob> {
-  return apiFetch<CronJob | { status: string; job: CronJob }>('/api/cron', {
-    method: 'POST',
+  return apiFetch<CronJob | { status: string; job: CronJob }>("/api/cron", {
+    method: "POST",
     body: JSON.stringify(body),
-  }).then((data) => (typeof (data as { job?: CronJob }).job === 'object' ? (data as { job: CronJob }).job : (data as CronJob)));
+  }).then((data) =>
+    typeof (data as { job?: CronJob }).job === "object"
+      ? (data as { job: CronJob }).job
+      : (data as CronJob),
+  );
 }
 
 export function deleteCronJob(id: string): Promise<void> {
   return apiFetch<void>(`/api/cron/${encodeURIComponent(id)}`, {
-    method: 'DELETE',
+    method: "DELETE",
   });
 }
 
@@ -182,7 +205,7 @@ export function getCronRuns(
   const params = new URLSearchParams({ limit: String(limit) });
   return apiFetch<CronRun[] | { runs: CronRun[] }>(
     `/api/cron/${encodeURIComponent(jobId)}/runs?${params}`,
-  ).then((data) => unwrapField(data, 'runs'));
+  ).then((data) => unwrapField(data, "runs"));
 }
 
 // ---------------------------------------------------------------------------
@@ -190,9 +213,9 @@ export function getCronRuns(
 // ---------------------------------------------------------------------------
 
 export function getIntegrations(): Promise<Integration[]> {
-  return apiFetch<Integration[] | { integrations: Integration[] }>('/api/integrations').then(
-    (data) => unwrapField(data, 'integrations'),
-  );
+  return apiFetch<Integration[] | { integrations: Integration[] }>(
+    "/api/integrations",
+  ).then((data) => unwrapField(data, "integrations"));
 }
 
 // ---------------------------------------------------------------------------
@@ -200,10 +223,13 @@ export function getIntegrations(): Promise<Integration[]> {
 // ---------------------------------------------------------------------------
 
 export function runDoctor(): Promise<DiagResult[]> {
-  return apiFetch<DiagResult[] | { results: DiagResult[]; summary?: unknown }>('/api/doctor', {
-    method: 'POST',
-    body: JSON.stringify({}),
-  }).then((data) => (Array.isArray(data) ? data : data.results));
+  return apiFetch<DiagResult[] | { results: DiagResult[]; summary?: unknown }>(
+    "/api/doctor",
+    {
+      method: "POST",
+      body: JSON.stringify({}),
+    },
+  ).then((data) => (Array.isArray(data) ? data : data.results));
 }
 
 // ---------------------------------------------------------------------------
@@ -215,12 +241,12 @@ export function getMemory(
   category?: string,
 ): Promise<MemoryEntry[]> {
   const params = new URLSearchParams();
-  if (query) params.set('query', query);
-  if (category) params.set('category', category);
+  if (query) params.set("query", query);
+  if (category) params.set("category", category);
   const qs = params.toString();
-  return apiFetch<MemoryEntry[] | { entries: MemoryEntry[] }>(`/api/memory${qs ? `?${qs}` : ''}`).then(
-    (data) => unwrapField(data, 'entries'),
-  );
+  return apiFetch<MemoryEntry[] | { entries: MemoryEntry[] }>(
+    `/api/memory${qs ? `?${qs}` : ""}`,
+  ).then((data) => unwrapField(data, "entries"));
 }
 
 export function storeMemory(
@@ -228,15 +254,15 @@ export function storeMemory(
   content: string,
   category?: string,
 ): Promise<void> {
-  return apiFetch<unknown>('/api/memory', {
-    method: 'POST',
+  return apiFetch<unknown>("/api/memory", {
+    method: "POST",
     body: JSON.stringify({ key, content, category }),
   }).then(() => undefined);
 }
 
 export function deleteMemory(key: string): Promise<void> {
   return apiFetch<void>(`/api/memory/${encodeURIComponent(key)}`, {
-    method: 'DELETE',
+    method: "DELETE",
   });
 }
 
@@ -245,8 +271,8 @@ export function deleteMemory(key: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export function getCost(): Promise<CostSummary> {
-  return apiFetch<CostSummary | { cost: CostSummary }>('/api/cost').then((data) =>
-    unwrapField(data, 'cost'),
+  return apiFetch<CostSummary | { cost: CostSummary }>("/api/cost").then(
+    (data) => unwrapField(data, "cost"),
   );
 }
 
@@ -255,7 +281,95 @@ export function getCost(): Promise<CostSummary> {
 // ---------------------------------------------------------------------------
 
 export function getCliTools(): Promise<CliTool[]> {
-  return apiFetch<CliTool[] | { cli_tools: CliTool[] }>('/api/cli-tools').then((data) =>
-    unwrapField(data, 'cli_tools'),
+  return apiFetch<CliTool[] | { cli_tools: CliTool[] }>("/api/cli-tools").then(
+    (data) => unwrapField(data, "cli_tools"),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge Graph (Memory OS)
+// ---------------------------------------------------------------------------
+
+export function getGraphStats(): Promise<GraphStats> {
+  return apiFetch<GraphStats>("/api/graph/stats");
+}
+
+export function searchGraph(
+  query: string,
+  limit: number = 20,
+): Promise<GraphSearchResult> {
+  const params = new URLSearchParams({ q: query, limit: String(limit) });
+  return apiFetch<GraphSearchResult>(`/api/graph/search?${params}`);
+}
+
+export function getHotNodes(
+  threshold: number = 0.0,
+  limit: number = 20,
+): Promise<GraphHotResponse> {
+  const params = new URLSearchParams({
+    threshold: String(threshold),
+    limit: String(limit),
+  });
+  return apiFetch<GraphHotResponse>(`/api/graph/hot?${params}`);
+}
+
+export function getGraphNodes(): Promise<GraphNodesResponse> {
+  return apiFetch<GraphNodesResponse>("/api/graph/nodes");
+}
+
+export function createGraphConcept(body: {
+  name: string;
+  description: string;
+  category?: string;
+}): Promise<{ status: string; key: string; name: string }> {
+  return apiFetch("/api/graph/concept", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function createGraphRelation(body: {
+  from_id: string;
+  to_id: string;
+  relation_type?: string;
+  weight?: number;
+}): Promise<{
+  status: string;
+  from_id: string;
+  to_id: string;
+  relation_type: string;
+}> {
+  return apiFetch("/api/graph/relation", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function getGraphNode(id: string): Promise<GraphNode> {
+  return apiFetch<GraphNode>(`/api/graph/node/${encodeURIComponent(id)}`);
+}
+
+export function deleteGraphNode(
+  id: string,
+): Promise<{ status: string; id: string }> {
+  return apiFetch(`/api/graph/node/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+export function getGraphBudget(): Promise<GraphBudget> {
+  return apiFetch<GraphBudget>("/api/graph/budget");
+}
+
+// ---------------------------------------------------------------------------
+// Memory Backend Switch
+// ---------------------------------------------------------------------------
+
+export function switchMemoryBackend(
+  backend: string,
+): Promise<{ status: string; backend: string; restarting: boolean }> {
+  return apiFetch("/api/memory/backend", {
+    method: "PUT",
+    body: JSON.stringify({ backend }),
+  });
 }

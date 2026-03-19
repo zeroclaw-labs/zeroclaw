@@ -1,5 +1,5 @@
 """
-ZeroClaw Tools - LangGraph-based tool calling for consistent LLM agent execution.
+JhedaiClaw Tools - LangGraph-based tool calling for consistent LLM agent execution.
 
 This package provides a reliable tool-calling layer for LLM providers that may have
 inconsistent native tool calling behavior. Built on LangGraph for guaranteed execution.

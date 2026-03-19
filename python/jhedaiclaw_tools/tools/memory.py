@@ -10,7 +10,7 @@ from langchain_core.tools import tool
 
 def _get_memory_path() -> Path:
     """Get the path to the memory storage file."""
-    return Path.home() / ".zeroclaw" / "memory_store.json"
+    return Path.home() / ".jhedaiclaw" / "memory_store.json"
 
 
 def _load_memory() -> dict:

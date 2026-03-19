@@ -56,11 +56,11 @@ export interface Integration {
   name: string;
   description: string;
   category: string;
-  status: 'Available' | 'Active' | 'ComingSoon';
+  status: "Available" | "Active" | "ComingSoon";
 }
 
 export interface DiagResult {
-  severity: 'ok' | 'warn' | 'error';
+  severity: "ok" | "warn" | "error";
   category: string;
   message: string;
 }
@@ -105,11 +105,61 @@ export interface SSEEvent {
 }
 
 export interface WsMessage {
-  type: 'message' | 'chunk' | 'tool_call' | 'tool_result' | 'done' | 'error';
+  type: "message" | "chunk" | "tool_call" | "tool_result" | "done" | "error";
   content?: string;
   full_response?: string;
   name?: string;
   args?: any;
   output?: string;
   message?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Graph / Memory OS types
+// ---------------------------------------------------------------------------
+
+export interface GraphNode {
+  id: string;
+  key: string;
+  content: string;
+  category: string;
+  score: number | null;
+  timestamp: string;
+}
+
+export interface GraphHotNode {
+  id: string;
+  key: string;
+  content: string;
+  heat: number;
+  category: string;
+}
+
+export interface GraphStats {
+  total_nodes: number;
+  backend: string;
+  healthy: boolean;
+}
+
+export interface GraphSearchResult {
+  results: GraphNode[];
+  count: number;
+  query: string;
+}
+
+export interface GraphHotResponse {
+  nodes: GraphHotNode[];
+  count: number;
+  threshold: number;
+}
+
+export interface GraphNodesResponse {
+  nodes: GraphNode[];
+  count: number;
+}
+
+export interface GraphBudget {
+  daily_cost_usd: number;
+  total_tokens: number;
+  backend: string;
 }

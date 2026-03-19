@@ -1,4 +1,4 @@
-# ZeroClaw 发布流程
+# JhedaiClaw 发布流程
 
 本操作手册定义了维护者的标准发布流程。
 
@@ -105,7 +105,7 @@ scripts/release/cut_release_tag.sh vX.Y.Z --push
 非试运行所需的仓库设置：
 
 - 密钥：`HOMEBREW_CORE_BOT_TOKEN`（专用机器人账户的令牌，而非个人维护者账户）
-- 变量：`HOMEBREW_CORE_BOT_FORK_REPO`（例如 `zeroclaw-release-bot/homebrew-core`）
+- 变量：`HOMEBREW_CORE_BOT_FORK_REPO`（例如 `jhedaiclaw-release-bot/homebrew-core`）
 - 可选变量：`HOMEBREW_CORE_BOT_EMAIL`
 
 工作流护栏：

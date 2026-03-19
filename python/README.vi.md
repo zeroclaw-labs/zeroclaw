@@ -1,6 +1,6 @@
-# zeroclaw-tools
+# jhedaiclaw-tools
 
-Gói Python đồng hành cho [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) — gọi công cụ dựa trên LangGraph cho thực thi agent LLM nhất quán.
+Gói Python đồng hành cho [JhedaiClaw](https://github.com/jhedai/jhedaiclaw) — gọi công cụ dựa trên LangGraph cho thực thi agent LLM nhất quán.
 
 ## Tại sao cần gói này?
 
@@ -14,13 +14,13 @@ Một số nhà cung cấp LLM (đặc biệt là GLM-5/Zhipu và các model tư
 ## Cài đặt
 
 ```bash
-pip install zeroclaw-tools
+pip install jhedaiclaw-tools
 ```
 
 Kèm tích hợp Discord:
 
 ```bash
-pip install zeroclaw-tools[discord]
+pip install jhedaiclaw-tools[discord]
 ```
 
 ## Bắt đầu nhanh
@@ -29,7 +29,7 @@ pip install zeroclaw-tools[discord]
 
 ```python
 import asyncio
-from zeroclaw_tools import create_agent, shell, file_read, file_write
+from jhedaiclaw_tools import create_agent, shell, file_read, file_write
 from langchain_core.messages import HumanMessage
 
 async def main():
@@ -59,17 +59,17 @@ export API_KEY="your-api-key"
 export API_BASE="https://api.z.ai/api/coding/paas/v4"
 
 # Chạy CLI
-zeroclaw-tools "List files in the current directory"
+jhedaiclaw-tools "List files in the current directory"
 
 # Chế độ tương tác (không cần tin nhắn)
-zeroclaw-tools -i
+jhedaiclaw-tools -i
 ```
 
 ### Bot Discord
 
 ```python
 import os
-from zeroclaw_tools.integrations import DiscordBot
+from jhedaiclaw_tools.integrations import DiscordBot
 
 bot = DiscordBot(
     token=os.environ["DISCORD_TOKEN"],
@@ -82,20 +82,20 @@ bot.run()
 
 ## Công cụ có sẵn
 
-| Công cụ | Mô tả |
-|------|-------------|
-| `shell` | Thực thi lệnh shell |
-| `file_read` | Đọc nội dung file |
-| `file_write` | Ghi nội dung vào file |
-| `web_search` | Tìm kiếm web (cần Brave API key) |
-| `http_request` | Gửi yêu cầu HTTP |
-| `memory_store` | Lưu dữ liệu vào bộ nhớ |
-| `memory_recall` | Truy xuất dữ liệu đã lưu |
+| Công cụ         | Mô tả                            |
+| --------------- | -------------------------------- |
+| `shell`         | Thực thi lệnh shell              |
+| `file_read`     | Đọc nội dung file                |
+| `file_write`    | Ghi nội dung vào file            |
+| `web_search`    | Tìm kiếm web (cần Brave API key) |
+| `http_request`  | Gửi yêu cầu HTTP                 |
+| `memory_store`  | Lưu dữ liệu vào bộ nhớ           |
+| `memory_recall` | Truy xuất dữ liệu đã lưu         |
 
 ## Tạo công cụ tùy chỉnh
 
 ```python
-from zeroclaw_tools import tool
+from jhedaiclaw_tools import tool
 
 @tool
 def my_custom_tool(query: str) -> str:
@@ -124,7 +124,7 @@ Hoạt động với mọi provider tương thích OpenAI:
 ┌─────────────────────────────────────────────┐
 │              Ứng dụng của bạn               │
 ├─────────────────────────────────────────────┤
-│           zeroclaw-tools Agent              │
+│           jhedaiclaw-tools Agent              │
 │  ┌─────────────────────────────────────┐   │
 │  │         LangGraph StateGraph         │   │
 │  │    ┌───────────┐    ┌──────────┐    │   │
@@ -137,17 +137,17 @@ Hoạt động với mọi provider tương thích OpenAI:
 └─────────────────────────────────────────────┘
 ```
 
-## So sánh với Rust ZeroClaw
+## So sánh với Rust JhedaiClaw
 
-| Tính năng | Rust ZeroClaw | zeroclaw-tools |
-|---------|---------------|----------------|
-| **Kích thước binary** | ~3.4 MB | Gói Python |
-| **Bộ nhớ** | <5 MB | ~50 MB |
-| **Thời gian khởi động** | <10ms | ~500ms |
+| Tính năng                | Rust JhedaiClaw | jhedaiclaw-tools  |
+| ------------------------ | --------------- | ----------------- |
+| **Kích thước binary**    | ~3.4 MB         | Gói Python        |
+| **Bộ nhớ**               | <5 MB           | ~50 MB            |
+| **Thời gian khởi động**  | <10ms           | ~500ms            |
 | **Độ nhất quán công cụ** | Phụ thuộc model | LangGraph đảm bảo |
-| **Khả năng mở rộng** | Rust traits | Python decorators |
+| **Khả năng mở rộng**     | Rust traits     | Python decorators |
 
-Dùng **Rust ZeroClaw** cho triển khai biên (edge) trong sản phẩm. Dùng **zeroclaw-tools** khi cần đảm bảo tính nhất quán gọi công cụ hoặc tích hợp hệ sinh thái Python.
+Dùng **Rust JhedaiClaw** cho triển khai biên (edge) trong sản phẩm. Dùng **jhedaiclaw-tools** khi cần đảm bảo tính nhất quán gọi công cụ hoặc tích hợp hệ sinh thái Python.
 
 ## Giấy phép
 

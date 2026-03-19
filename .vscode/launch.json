@@ -14,7 +14,7 @@
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Agent",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "program": "${workspaceFolder}/target/debug/jhedaiclaw",
       "args": ["agent"],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "Build: Debug"
@@ -23,7 +23,7 @@
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Gateway",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "program": "${workspaceFolder}/target/debug/jhedaiclaw",
       "args": ["gateway"],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "Build: Debug"
@@ -32,7 +32,7 @@
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Daemon",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "program": "${workspaceFolder}/target/debug/jhedaiclaw",
       "args": ["daemon"],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "Build: Debug"
@@ -41,7 +41,7 @@
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Status",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "program": "${workspaceFolder}/target/debug/jhedaiclaw",
       "args": ["status"],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "Build: Debug"
@@ -50,7 +50,7 @@
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Onboard",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "program": "${workspaceFolder}/target/debug/jhedaiclaw",
       "args": ["onboard"],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "Build: Debug"

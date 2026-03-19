@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect } from "react";
 import {
   Wrench,
   Search,
@@ -6,14 +6,14 @@ import {
   ChevronRight,
   Terminal,
   Package,
-} from 'lucide-react';
-import type { ToolSpec, CliTool } from '@/types/api';
-import { getTools, getCliTools } from '@/lib/api';
+} from "lucide-react";
+import type { ToolSpec, CliTool } from "@/types/api";
+import { getTools, getCliTools } from "@/lib/api";
 
 export default function Tools() {
   const [tools, setTools] = useState<ToolSpec[]>([]);
   const [cliTools, setCliTools] = useState<CliTool[]>([]);
-  const [search, setSearch] = useState('');
+  const [search, setSearch] = useState("");
   const [expandedTool, setExpandedTool] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -121,7 +121,10 @@ export default function Tools() {
                       <p className="text-[10px] text-[#334060] mb-2 font-semibold uppercase tracking-wider">
                         Parameter Schema
                       </p>
-                      <pre className="text-xs text-[#8892a8] rounded-xl p-3 overflow-x-auto max-h-64 overflow-y-auto" style={{ background: 'rgba(5,5,16,0.8)' }}>
+                      <pre
+                        className="text-xs text-[#8892a8] rounded-xl p-3 overflow-x-auto max-h-64 overflow-y-auto"
+                        style={{ background: "rgba(5,5,16,0.8)" }}
+                      >
                         {JSON.stringify(tool.parameters, null, 2)}
                       </pre>
                     </div>
@@ -135,7 +138,10 @@ export default function Tools() {
 
       {/* CLI Tools Section */}
       {filteredCli.length > 0 && (
-        <div className="animate-slide-in-up" style={{ animationDelay: '200ms' }}>
+        <div
+          className="animate-slide-in-up"
+          style={{ animationDelay: "200ms" }}
+        >
           <div className="flex items-center gap-2 mb-4">
             <Terminal className="h-5 w-5 text-[#00e68a]" />
             <h2 className="text-sm font-semibold text-white uppercase tracking-wider">
@@ -163,10 +169,13 @@ export default function Tools() {
                       {tool.path}
                     </td>
                     <td className="px-4 py-3 text-[#556080] text-sm">
-                      {tool.version ?? '-'}
+                      {tool.version ?? "-"}
                     </td>
                     <td className="px-4 py-3">
-                      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-semibold capitalize border border-[#1a1a3e] text-[#8892a8]" style={{ background: 'rgba(0,128,255,0.06)' }}>
+                      <span
+                        className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-semibold capitalize border border-[#1a1a3e] text-[#8892a8]"
+                        style={{ background: "rgba(0,128,255,0.06)" }}
+                      >
                         {tool.category}
                       </span>
                     </td>

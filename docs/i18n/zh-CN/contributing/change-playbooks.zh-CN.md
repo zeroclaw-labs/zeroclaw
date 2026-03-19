@@ -1,6 +1,6 @@
 # 变更操作手册
 
-ZeroClaw 常见扩展和修改模式的分步指南。
+JhedaiClaw 常见扩展和修改模式的分步指南。
 
 每个扩展特征的完整代码示例请参见 [extension-examples.md](./extension-examples.zh-CN.md)。
 

@@ -1,4 +1,4 @@
-# ZeroClaw Dokumentationsoversigt (Samlet indholdsfortegnelse)
+# JhedaiClaw Dokumentationsoversigt (Samlet indholdsfortegnelse)
 
 Denne fil er den kanoniske indholdsfortegnelse for dokumentationssystemet.
 

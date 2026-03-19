@@ -1,4 +1,4 @@
-# Pusat Dokumentasi ZeroClaw
+# Pusat Dokumentasi JhedaiClaw
 
 Halaman ini adalah titik masuk utama untuk sistem dokumentasi.
 
@@ -8,21 +8,21 @@ Hub terlokalisasi: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) 
 
 ## Mulai di Sini
 
-| Saya ingin…                                                         | Baca ini                                                                       |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| Menginstal dan menjalankan ZeroClaw dengan cepat                    | [README.md (Mulai Cepat)](../README.md#quick-start)                            |
-| Bootstrap dalam satu perintah                                       | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                  |
-| Memperbarui atau menghapus di macOS                                 | [macos-update-uninstall.md](setup-guides/macos-update-uninstall.md)            |
-| Mencari perintah berdasarkan tugas                                  | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| Memeriksa default dan kunci konfigurasi dengan cepat                | [config-reference.md](reference/api/config-reference.md)                       |
-| Mengonfigurasi penyedia/endpoint kustom                             | [custom-providers.md](contributing/custom-providers.md)                        |
-| Mengonfigurasi penyedia Z.AI / GLM                                  | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                             |
-| Menggunakan pola integrasi LangGraph                                | [langgraph-integration.md](contributing/langgraph-integration.md)              |
-| Mengoperasikan runtime (buku panduan hari ke-2)                     | [operations-runbook.md](ops/operations-runbook.md)                             |
-| Memecahkan masalah instalasi/runtime/kanal                          | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| Menjalankan pengaturan ruang terenkripsi Matrix dan diagnostik      | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                          |
-| Menjelajahi dokumentasi berdasarkan kategori                        | [SUMMARY.md](SUMMARY.md)                                                      |
-| Melihat snapshot dokumen PR/issue proyek                            | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| Saya ingin…                                                    | Baca ini                                                                                   |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Menginstal dan menjalankan JhedaiClaw dengan cepat             | [README.md (Mulai Cepat)](../README.md#quick-start)                                        |
+| Bootstrap dalam satu perintah                                  | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| Memperbarui atau menghapus di macOS                            | [macos-update-uninstall.md](setup-guides/macos-update-uninstall.md)                        |
+| Mencari perintah berdasarkan tugas                             | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| Memeriksa default dan kunci konfigurasi dengan cepat           | [config-reference.md](reference/api/config-reference.md)                                   |
+| Mengonfigurasi penyedia/endpoint kustom                        | [custom-providers.md](contributing/custom-providers.md)                                    |
+| Mengonfigurasi penyedia Z.AI / GLM                             | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| Menggunakan pola integrasi LangGraph                           | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| Mengoperasikan runtime (buku panduan hari ke-2)                | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| Memecahkan masalah instalasi/runtime/kanal                     | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| Menjalankan pengaturan ruang terenkripsi Matrix dan diagnostik | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| Menjelajahi dokumentasi berdasarkan kategori                   | [SUMMARY.md](SUMMARY.md)                                                                   |
+| Melihat snapshot dokumen PR/issue proyek                       | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## Pohon Keputusan Cepat (10 detik)
 

@@ -621,7 +621,7 @@ mod tests {
         let result = t
             .execute(json!({
                 "action": "draft_update",
-                "project_name": "ZeroClaw",
+                "project_name": "JhedaiClaw",
                 "audience": "internal",
                 "tone": "casual",
                 "highlights": "Core loop stabilized"

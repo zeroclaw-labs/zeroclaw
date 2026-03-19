@@ -1,11 +1,11 @@
 [package]
-name = "zeroclaw-robot-kit"
+name = "jhedaiclaw-robot-kit"
 version = "0.1.0"
 edition = "2021"
-authors = ["theonlyhennygod"]
+authors = ["Edison Vasquez"]
 license = "MIT OR Apache-2.0"
-description = "Robot control toolkit for ZeroClaw - drive, vision, speech, sensors, safety"
-repository = "https://github.com/zeroclaw-labs/zeroclaw"
+description = "Robot control toolkit for JhedaiClaw - drive, vision, speech, sensors, safety"
+repository = "https://github.com/jhedai/jhedaiclaw"
 readme = "README.md"
 keywords = ["robotics", "raspberry-pi", "ai", "agent", "ros2"]
 categories = ["science::robotics", "embedded", "hardware-support"]
@@ -21,8 +21,8 @@ lidar = []            # LIDAR support
 vision = []           # Camera + vision model
 
 [dependencies]
-# Re-use zeroclaw's tool trait (optional - can also be standalone)
-# zeroclaw = { path = "../..", optional = true }
+# Re-use jhedaiclaw's tool trait (optional - can also be standalone)
+# jhedaiclaw = { path = "../..", optional = true }
 
 # Async runtime
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "time", "sync", "process", "fs", "io-util"] }

@@ -1,4 +1,4 @@
-//! Wraps a discovered MCP tool as a zeroclaw [`Tool`] so it is dispatched
+//! Wraps a discovered MCP tool as a jhedaiclaw [`Tool`] so it is dispatched
 //! through the existing tool registry and agent loop without modification.
 
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use crate::tools::mcp_client::McpRegistry;
 use crate::tools::mcp_protocol::McpToolDef;
 use crate::tools::traits::{Tool, ToolResult};
 
-/// A zeroclaw [`Tool`] backed by an MCP server tool.
+/// A jhedaiclaw [`Tool`] backed by an MCP server tool.
 ///
 /// The `prefixed_name` (e.g. `filesystem__read_file`) is what the agent loop
 /// sees. The registry knows how to route it to the correct server.
@@ -53,7 +53,7 @@ impl Tool for McpToolWrapper {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         // Strip the `approved` field before forwarding to the MCP server.
-        // ZeroClaw's security model injects `approved: bool` into built-in tool
+        // JhedaiClaw's security model injects `approved: bool` into built-in tool
         // calls for supervised-mode confirmation. MCP servers have no knowledge
         // of this field and will reject calls that include it as an unexpected
         // parameter. We strip it here so MCP servers always receive clean args.
@@ -185,7 +185,7 @@ mod tests {
     }
 
     // ── approved-field stripping ───────────────────────────────────────────
-    // ZeroClaw's security model injects `approved: bool` into built-in tool args.
+    // JhedaiClaw's security model injects `approved: bool` into built-in tool args.
     // MCP servers are unaware of this field and reject calls that include it.
     // execute() must strip it before forwarding.
 

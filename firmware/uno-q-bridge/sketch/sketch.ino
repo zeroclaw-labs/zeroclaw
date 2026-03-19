@@ -1,4 +1,4 @@
-// ZeroClaw Bridge — expose digitalWrite/digitalRead for agent GPIO control
+// JhedaiClaw Bridge — expose digitalWrite/digitalRead for agent GPIO control
 // SPDX-License-Identifier: MPL-2.0
 
 #include "Arduino_RouterBridge.h"

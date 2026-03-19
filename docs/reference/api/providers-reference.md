@@ -1,4 +1,4 @@
-# ZeroClaw Providers Reference
+# JhedaiClaw Providers Reference
 
 This document maps provider IDs, aliases, and credential environment variables.
 
@@ -7,7 +7,7 @@ Last verified: **February 21, 2026**.
 ## How to List Providers
 
 ```bash
-zeroclaw providers
+jhedaiclaw providers
 ```
 
 ## Credential Resolution Order
@@ -16,7 +16,7 @@ Runtime resolution order is:
 
 1. Explicit credential from config/CLI
 2. Provider-specific env var(s)
-3. Generic fallback env vars: `ZEROCLAW_API_KEY` then `API_KEY`
+3. Generic fallback env vars: `JHEDAICLAW_API_KEY` then `API_KEY`
 
 For resilient fallback chains (`reliability.fallback_providers`), each fallback
 provider resolves credentials independently. The primary provider's explicit
@@ -24,44 +24,44 @@ credential is not reused for fallback providers.
 
 ## Provider Catalog
 
-| Canonical ID | Aliases | Local | Provider-specific env var(s) |
-|---|---|---:|---|
-| `openrouter` | — | No | `OPENROUTER_API_KEY` |
-| `anthropic` | — | No | `ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` |
-| `openai` | — | No | `OPENAI_API_KEY` |
-| `ollama` | — | Yes | `OLLAMA_API_KEY` (optional) |
-| `gemini` | `google`, `google-gemini` | No | `GEMINI_API_KEY`, `GOOGLE_API_KEY` |
-| `venice` | — | No | `VENICE_API_KEY` |
-| `vercel` | `vercel-ai` | No | `VERCEL_API_KEY` |
-| `cloudflare` | `cloudflare-ai` | No | `CLOUDFLARE_API_KEY` |
-| `moonshot` | `kimi` | No | `MOONSHOT_API_KEY` |
-| `kimi-code` | `kimi_coding`, `kimi_for_coding` | No | `KIMI_CODE_API_KEY`, `MOONSHOT_API_KEY` |
-| `synthetic` | — | No | `SYNTHETIC_API_KEY` |
-| `opencode` | `opencode-zen` | No | `OPENCODE_API_KEY` |
-| `opencode-go` | — | No | `OPENCODE_GO_API_KEY` |
-| `zai` | `z.ai` | No | `ZAI_API_KEY` |
-| `glm` | `zhipu` | No | `GLM_API_KEY` |
-| `minimax` | `minimax-intl`, `minimax-io`, `minimax-global`, `minimax-cn`, `minimaxi`, `minimax-oauth`, `minimax-oauth-cn`, `minimax-portal`, `minimax-portal-cn` | No | `MINIMAX_OAUTH_TOKEN`, `MINIMAX_API_KEY` |
-| `bedrock` | `aws-bedrock` | No | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (optional: `AWS_REGION`) |
-| `qianfan` | `baidu` | No | `QIANFAN_API_KEY` |
-| `doubao` | `volcengine`, `ark`, `doubao-cn` | No | `ARK_API_KEY`, `DOUBAO_API_KEY` |
-| `qwen` | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us`, `qwen-code`, `qwen-oauth`, `qwen_oauth` | No | `QWEN_OAUTH_TOKEN`, `DASHSCOPE_API_KEY` |
-| `groq` | — | No | `GROQ_API_KEY` |
-| `mistral` | — | No | `MISTRAL_API_KEY` |
-| `xai` | `grok` | No | `XAI_API_KEY` |
-| `deepseek` | — | No | `DEEPSEEK_API_KEY` |
-| `together` | `together-ai` | No | `TOGETHER_API_KEY` |
-| `fireworks` | `fireworks-ai` | No | `FIREWORKS_API_KEY` |
-| `novita` | — | No | `NOVITA_API_KEY` |
-| `perplexity` | — | No | `PERPLEXITY_API_KEY` |
-| `cohere` | — | No | `COHERE_API_KEY` |
-| `copilot` | `github-copilot` | No | (use config/`API_KEY` fallback with GitHub token) |
-| `lmstudio` | `lm-studio` | Yes | (optional; local by default) |
-| `llamacpp` | `llama.cpp` | Yes | `LLAMACPP_API_KEY` (optional; only if server auth is enabled) |
-| `sglang` | — | Yes | `SGLANG_API_KEY` (optional) |
-| `vllm` | — | Yes | `VLLM_API_KEY` (optional) |
-| `osaurus` | — | Yes | `OSAURUS_API_KEY` (optional; defaults to `"osaurus"`) |
-| `nvidia` | `nvidia-nim`, `build.nvidia.com` | No | `NVIDIA_API_KEY` |
+| Canonical ID  | Aliases                                                                                                                                              | Local | Provider-specific env var(s)                                           |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ----: | ---------------------------------------------------------------------- |
+| `openrouter`  | —                                                                                                                                                    |    No | `OPENROUTER_API_KEY`                                                   |
+| `anthropic`   | —                                                                                                                                                    |    No | `ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`                           |
+| `openai`      | —                                                                                                                                                    |    No | `OPENAI_API_KEY`                                                       |
+| `ollama`      | —                                                                                                                                                    |   Yes | `OLLAMA_API_KEY` (optional)                                            |
+| `gemini`      | `google`, `google-gemini`                                                                                                                            |    No | `GEMINI_API_KEY`, `GOOGLE_API_KEY`                                     |
+| `venice`      | —                                                                                                                                                    |    No | `VENICE_API_KEY`                                                       |
+| `vercel`      | `vercel-ai`                                                                                                                                          |    No | `VERCEL_API_KEY`                                                       |
+| `cloudflare`  | `cloudflare-ai`                                                                                                                                      |    No | `CLOUDFLARE_API_KEY`                                                   |
+| `moonshot`    | `kimi`                                                                                                                                               |    No | `MOONSHOT_API_KEY`                                                     |
+| `kimi-code`   | `kimi_coding`, `kimi_for_coding`                                                                                                                     |    No | `KIMI_CODE_API_KEY`, `MOONSHOT_API_KEY`                                |
+| `synthetic`   | —                                                                                                                                                    |    No | `SYNTHETIC_API_KEY`                                                    |
+| `opencode`    | `opencode-zen`                                                                                                                                       |    No | `OPENCODE_API_KEY`                                                     |
+| `opencode-go` | —                                                                                                                                                    |    No | `OPENCODE_GO_API_KEY`                                                  |
+| `zai`         | `z.ai`                                                                                                                                               |    No | `ZAI_API_KEY`                                                          |
+| `glm`         | `zhipu`                                                                                                                                              |    No | `GLM_API_KEY`                                                          |
+| `minimax`     | `minimax-intl`, `minimax-io`, `minimax-global`, `minimax-cn`, `minimaxi`, `minimax-oauth`, `minimax-oauth-cn`, `minimax-portal`, `minimax-portal-cn` |    No | `MINIMAX_OAUTH_TOKEN`, `MINIMAX_API_KEY`                               |
+| `bedrock`     | `aws-bedrock`                                                                                                                                        |    No | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (optional: `AWS_REGION`) |
+| `qianfan`     | `baidu`                                                                                                                                              |    No | `QIANFAN_API_KEY`                                                      |
+| `doubao`      | `volcengine`, `ark`, `doubao-cn`                                                                                                                     |    No | `ARK_API_KEY`, `DOUBAO_API_KEY`                                        |
+| `qwen`        | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us`, `qwen-code`, `qwen-oauth`, `qwen_oauth`                                       |    No | `QWEN_OAUTH_TOKEN`, `DASHSCOPE_API_KEY`                                |
+| `groq`        | —                                                                                                                                                    |    No | `GROQ_API_KEY`                                                         |
+| `mistral`     | —                                                                                                                                                    |    No | `MISTRAL_API_KEY`                                                      |
+| `xai`         | `grok`                                                                                                                                               |    No | `XAI_API_KEY`                                                          |
+| `deepseek`    | —                                                                                                                                                    |    No | `DEEPSEEK_API_KEY`                                                     |
+| `together`    | `together-ai`                                                                                                                                        |    No | `TOGETHER_API_KEY`                                                     |
+| `fireworks`   | `fireworks-ai`                                                                                                                                       |    No | `FIREWORKS_API_KEY`                                                    |
+| `novita`      | —                                                                                                                                                    |    No | `NOVITA_API_KEY`                                                       |
+| `perplexity`  | —                                                                                                                                                    |    No | `PERPLEXITY_API_KEY`                                                   |
+| `cohere`      | —                                                                                                                                                    |    No | `COHERE_API_KEY`                                                       |
+| `copilot`     | `github-copilot`                                                                                                                                     |    No | (use config/`API_KEY` fallback with GitHub token)                      |
+| `lmstudio`    | `lm-studio`                                                                                                                                          |   Yes | (optional; local by default)                                           |
+| `llamacpp`    | `llama.cpp`                                                                                                                                          |   Yes | `LLAMACPP_API_KEY` (optional; only if server auth is enabled)          |
+| `sglang`      | —                                                                                                                                                    |   Yes | `SGLANG_API_KEY` (optional)                                            |
+| `vllm`        | —                                                                                                                                                    |   Yes | `VLLM_API_KEY` (optional)                                              |
+| `osaurus`     | —                                                                                                                                                    |   Yes | `OSAURUS_API_KEY` (optional; defaults to `"osaurus"`)                  |
+| `nvidia`      | `nvidia-nim`, `build.nvidia.com`                                                                                                                     |    No | `NVIDIA_API_KEY`                                                       |
 
 ### Vercel AI Gateway Notes
 
@@ -82,15 +82,15 @@ credential is not reused for fallback providers.
 ### Ollama Vision Notes
 
 - Provider ID: `ollama`
-- Vision input is supported through user message image markers: ``[IMAGE:<source>]``.
-- After multimodal normalization, ZeroClaw sends image payloads through Ollama's native `messages[].images` field.
-- If a non-vision provider is selected, ZeroClaw returns a structured capability error instead of silently ignoring images.
+- Vision input is supported through user message image markers: `[IMAGE:<source>]`.
+- After multimodal normalization, JhedaiClaw sends image payloads through Ollama's native `messages[].images` field.
+- If a non-vision provider is selected, JhedaiClaw returns a structured capability error instead of silently ignoring images.
 
 ### Ollama Cloud Routing Notes
 
 - Use `:cloud` model suffix only with a remote Ollama endpoint.
 - Remote endpoint should be set in `api_url` (example: `https://ollama.com`).
-- ZeroClaw normalizes a trailing `/api` in `api_url` automatically.
+- JhedaiClaw normalizes a trailing `/api` in `api_url` automatically.
 - If `default_model` ends with `:cloud` while `api_url` is local or unset, config validation fails early with an actionable error.
 - Local Ollama model discovery intentionally excludes `:cloud` entries to avoid selecting cloud-only models in local mode.
 
@@ -99,7 +99,7 @@ credential is not reused for fallback providers.
 - Provider ID: `llamacpp` (alias: `llama.cpp`)
 - Default endpoint: `http://localhost:8080/v1`
 - API key is optional by default; set `LLAMACPP_API_KEY` only when `llama-server` is started with `--api-key`.
-- Model discovery: `zeroclaw models refresh --provider llamacpp`
+- Model discovery: `jhedaiclaw models refresh --provider llamacpp`
 
 ### SGLang Server Notes
 
@@ -107,21 +107,21 @@ credential is not reused for fallback providers.
 - Default endpoint: `http://localhost:30000/v1`
 - API key is optional by default; set `SGLANG_API_KEY` only when the server requires authentication.
 - Tool calling requires launching SGLang with `--tool-call-parser` (e.g. `hermes`, `llama3`, `qwen25`).
-- Model discovery: `zeroclaw models refresh --provider sglang`
+- Model discovery: `jhedaiclaw models refresh --provider sglang`
 
 ### vLLM Server Notes
 
 - Provider ID: `vllm`
 - Default endpoint: `http://localhost:8000/v1`
 - API key is optional by default; set `VLLM_API_KEY` only when the server requires authentication.
-- Model discovery: `zeroclaw models refresh --provider vllm`
+- Model discovery: `jhedaiclaw models refresh --provider vllm`
 
 ### Osaurus Server Notes
 
 - Provider ID: `osaurus`
 - Default endpoint: `http://localhost:1337/v1`
 - API key defaults to `"osaurus"` but is optional; set `OSAURUS_API_KEY` to override or leave unset for keyless access.
-- Model discovery: `zeroclaw models refresh --provider osaurus`
+- Model discovery: `jhedaiclaw models refresh --provider osaurus`
 - [Osaurus](https://github.com/dinoki-ai/osaurus) is a unified AI edge runtime for macOS (Apple Silicon) that combines local MLX inference with cloud provider proxying through a single endpoint.
 - Supports multiple API formats simultaneously: OpenAI-compatible (`/v1/chat/completions`), Anthropic (`/messages`), Ollama (`/chat`), and Open Responses (`/v1/responses`).
 - Built-in MCP (Model Context Protocol) support for tool and context server connectivity.
@@ -165,7 +165,7 @@ Behavior:
 - Canonical provider ID: `nvidia`
 - Aliases: `nvidia-nim`, `build.nvidia.com`
 - Base API URL: `https://integrate.api.nvidia.com/v1`
-- Model discovery: `zeroclaw models refresh --provider nvidia`
+- Model discovery: `jhedaiclaw models refresh --provider nvidia`
 
 Recommended starter model IDs (verified against NVIDIA API catalog on February 18, 2026):
 
@@ -304,8 +304,8 @@ Recommended workflow:
 1. Keep call sites stable (`hint:reasoning`, `hint:semantic`).
 2. Change only the target model under `[[model_routes]]` or `[[embedding_routes]]`.
 3. Run:
-   - `zeroclaw doctor`
-   - `zeroclaw status`
+   - `jhedaiclaw doctor`
+   - `jhedaiclaw status`
 4. Smoke test one representative flow (chat + memory retrieval) before rollout.
 
 This minimizes breakage because integrations and prompts do not need to change when model IDs are upgraded.

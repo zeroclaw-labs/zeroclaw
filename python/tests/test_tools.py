@@ -1,5 +1,5 @@
 """
-Tests for zeroclaw-tools package.
+Tests for jhedaiclaw-tools package.
 """
 
 import pytest
@@ -7,7 +7,7 @@ import pytest
 
 def test_import_main():
     """Test that main package imports work."""
-    from zeroclaw_tools import create_agent, shell, file_read, file_write
+    from jhedaiclaw_tools import create_agent, shell, file_read, file_write
 
     assert callable(create_agent)
     assert hasattr(shell, "invoke")
@@ -17,7 +17,7 @@ def test_import_main():
 
 def test_import_tool_decorator():
     """Test that tool decorator works."""
-    from zeroclaw_tools import tool
+    from jhedaiclaw_tools import tool
 
     @tool
     def test_func(x: str) -> str:
@@ -29,7 +29,7 @@ def test_import_tool_decorator():
 
 def test_tool_decorator_custom_metadata():
     """Test that custom tool metadata is preserved."""
-    from zeroclaw_tools import tool
+    from jhedaiclaw_tools import tool
 
     @tool(name="echo_tool", description="Echo input back")
     def echo(value: str) -> str:
@@ -41,7 +41,7 @@ def test_tool_decorator_custom_metadata():
 
 def test_agent_creation():
     """Test that agent can be created with default tools."""
-    from zeroclaw_tools import create_agent, shell, file_read, file_write
+    from jhedaiclaw_tools import create_agent, shell, file_read, file_write
 
     agent = create_agent(
         tools=[shell, file_read, file_write], model="test-model", api_key="test-key"
@@ -53,7 +53,7 @@ def test_agent_creation():
 
 def test_cli_allows_interactive_without_message():
     """Interactive mode should not require positional message."""
-    from zeroclaw_tools.__main__ import parse_args
+    from jhedaiclaw_tools.__main__ import parse_args
 
     args = parse_args(["-i"])
 
@@ -63,7 +63,7 @@ def test_cli_allows_interactive_without_message():
 
 def test_cli_requires_message_when_not_interactive():
     """Non-interactive mode requires at least one message token."""
-    from zeroclaw_tools.__main__ import parse_args
+    from jhedaiclaw_tools.__main__ import parse_args
 
     with pytest.raises(SystemExit):
         parse_args([])
@@ -72,7 +72,7 @@ def test_cli_requires_message_when_not_interactive():
 @pytest.mark.asyncio
 async def test_invoke_in_event_loop_raises():
     """invoke() should fail fast when called from an active event loop."""
-    from zeroclaw_tools import create_agent, shell
+    from jhedaiclaw_tools import create_agent, shell
 
     agent = create_agent(tools=[shell], model="test-model", api_key="test-key")
 
@@ -83,7 +83,7 @@ async def test_invoke_in_event_loop_raises():
 @pytest.mark.asyncio
 async def test_shell_tool():
     """Test shell tool execution."""
-    from zeroclaw_tools import shell
+    from jhedaiclaw_tools import shell
 
     result = await shell.ainvoke({"command": "echo hello"})
     assert "hello" in result
@@ -92,7 +92,7 @@ async def test_shell_tool():
 @pytest.mark.asyncio
 async def test_file_tools(tmp_path):
     """Test file read/write tools."""
-    from zeroclaw_tools import file_read, file_write
+    from jhedaiclaw_tools import file_read, file_write
 
     test_file = tmp_path / "test.txt"
 

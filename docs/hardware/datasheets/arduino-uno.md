@@ -3,7 +3,7 @@
 ## Pin Aliases
 
 | alias       | pin |
-|-------------|-----|
+| ----------- | --- |
 | red_led     | 13  |
 | builtin_led | 13  |
 | user_led    | 13  |
@@ -22,16 +22,16 @@ Arduino Uno is a microcontroller board based on the ATmega328P. It has 14 digita
 
 - `digitalWrite(pin, HIGH)` or `digitalWrite(pin, LOW)` for output.
 - `digitalRead(pin)` for input (returns 0 or 1).
-- Pin numbers in ZeroClaw protocol: 0–13.
+- Pin numbers in JhedaiClaw protocol: 0–13.
 
 ## Serial
 
 - UART on pins 0 (RX) and 1 (TX).
 - USB via ATmega16U2 or CH340 (clones).
-- Baud rate: 115200 for ZeroClaw firmware.
+- Baud rate: 115200 for JhedaiClaw firmware.
 
-## ZeroClaw Tools
+## JhedaiClaw Tools
 
 - `gpio_read`: Read pin value (0 or 1).
 - `gpio_write`: Set pin high (1) or low (0).
-- `arduino_upload`: Agent generates full Arduino sketch code; ZeroClaw compiles and uploads it via arduino-cli. Use for "make a heart", custom patterns — agent writes the code, no manual editing. Pin 13 = built-in LED.
+- `arduino_upload`: Agent generates full Arduino sketch code; JhedaiClaw compiles and uploads it via arduino-cli. Use for "make a heart", custom patterns — agent writes the code, no manual editing. Pin 13 = built-in LED.

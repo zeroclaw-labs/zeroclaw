@@ -60,4 +60,3 @@ Keep sections that apply; remove non-applicable placeholders before merging.
 - **Owner:** <team/persona/area>
 - **Update trigger:** <what changes should force this doc update>
 - **Last reviewed:** <YYYY-MM-DD>
-

@@ -10,26 +10,26 @@ Use this with:
 
 ## Branching Model
 
-ZeroClaw uses a single default branch: `master`. All contributor PRs target `master` directly. There is no `dev` or promotion branch.
+JhedaiClaw uses a single default branch: `master`. All contributor PRs target `master` directly. There is no `dev` or promotion branch.
 
-Current maintainers with PR approval authority: `theonlyhennygod`, `JordanTheJet`, and `SimianAstronaut7`.
+Current maintainers with PR approval authority: `Edison Vasquez`, `JordanTheJet`, and `SimianAstronaut7`.
 
 ## Active Workflows
 
-| File | Trigger | Purpose |
-| --- | --- | --- |
-| `checks-on-pr.yml` | `pull_request` → `master` | Lint + test + build + security audit on every PR |
-| `cross-platform-build-manual.yml` | `workflow_dispatch` | Full platform build matrix (manual) |
-| `release-beta-on-push.yml` | `push` → `master` | Beta release on every master commit |
-| `release-stable-manual.yml` | `workflow_dispatch` | Stable release (manual, version-gated) |
+| File                              | Trigger                   | Purpose                                          |
+| --------------------------------- | ------------------------- | ------------------------------------------------ |
+| `checks-on-pr.yml`                | `pull_request` → `master` | Lint + test + build + security audit on every PR |
+| `cross-platform-build-manual.yml` | `workflow_dispatch`       | Full platform build matrix (manual)              |
+| `release-beta-on-push.yml`        | `push` → `master`         | Beta release on every master commit              |
+| `release-stable-manual.yml`       | `workflow_dispatch`       | Stable release (manual, version-gated)           |
 
 ## Event Summary
 
-| Event | Workflows triggered |
-| --- | --- |
-| PR opened or updated against `master` | `checks-on-pr.yml` |
-| Push to `master` (including after merge) | `release-beta-on-push.yml` |
-| Manual dispatch | `cross-platform-build-manual.yml`, `release-stable-manual.yml` |
+| Event                                    | Workflows triggered                                            |
+| ---------------------------------------- | -------------------------------------------------------------- |
+| PR opened or updated against `master`    | `checks-on-pr.yml`                                             |
+| Push to `master` (including after merge) | `release-beta-on-push.yml`                                     |
+| Manual dispatch                          | `cross-platform-build-manual.yml`, `release-stable-manual.yml` |
 
 ## Step-By-Step
 
@@ -43,7 +43,7 @@ Current maintainers with PR approval authority: `theonlyhennygod`, `JordanTheJet
    - `security` job: runs `cargo audit` and `cargo deny check licenses sources`.
    - Concurrency group cancels in-progress runs for the same PR on new pushes.
 3. All jobs must pass before merge.
-4. Maintainer (`theonlyhennygod`, `JordanTheJet`, or `SimianAstronaut7`) merges PR once checks and review policy are satisfied.
+4. Maintainer (`Edison Vasquez`, `JordanTheJet`, or `SimianAstronaut7`) merges PR once checks and review policy are satisfied.
 5. Merge emits a `push` event on `master` (see section 2).
 
 ### 2) Push to `master` (including after merge)
@@ -75,13 +75,13 @@ Current maintainers with PR approval authority: `theonlyhennygod`, `JordanTheJet
 
 ## Build Targets by Workflow
 
-| Target | `checks-on-pr.yml` | `cross-platform-build-manual.yml` | `release-beta-on-push.yml` | `release-stable-manual.yml` |
-| --- | :---: | :---: | :---: | :---: |
-| `x86_64-unknown-linux-gnu` | ✓ | | ✓ | ✓ |
-| `aarch64-unknown-linux-gnu` | | ✓ | ✓ | ✓ |
-| `aarch64-apple-darwin` | ✓ | | ✓ | ✓ |
-| `x86_64-apple-darwin` | | ✓ | | |
-| `x86_64-pc-windows-msvc` | ✓ | ✓ | ✓ | ✓ |
+| Target                      | `checks-on-pr.yml` | `cross-platform-build-manual.yml` | `release-beta-on-push.yml` | `release-stable-manual.yml` |
+| --------------------------- | :----------------: | :-------------------------------: | :------------------------: | :-------------------------: |
+| `x86_64-unknown-linux-gnu`  |         ✓          |                                   |             ✓              |              ✓              |
+| `aarch64-unknown-linux-gnu` |                    |                 ✓                 |             ✓              |              ✓              |
+| `aarch64-apple-darwin`      |         ✓          |                                   |             ✓              |              ✓              |
+| `x86_64-apple-darwin`       |                    |                 ✓                 |                            |                             |
+| `x86_64-pc-windows-msvc`    |         ✓          |                 ✓                 |             ✓              |              ✓              |
 
 ## Mermaid Diagrams
 

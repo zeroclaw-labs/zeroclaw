@@ -16,6 +16,9 @@
   "files.autoSaveDelay": 1000,
   "rust-analyzer.check.command": "clippy",
   "rust-analyzer.check.extraArgs": ["--all-targets", "--", "-D", "warnings"],
+  "rust-analyzer.cargo.extraEnv": {
+    "RUSTUP_TOOLCHAIN": "stable"
+  },
   "window.title": "${activeRepositoryBranchName}",
   "coverage-gutters.coverageFileNames": ["lcov.info"],
   "git.postCommitCommand": "push"

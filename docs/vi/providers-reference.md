@@ -1,4 +1,4 @@
-# Tài liệu tham khảo Providers — ZeroClaw
+# Tài liệu tham khảo Providers — JhedaiClaw
 
 Tài liệu này liệt kê các provider ID, alias và biến môi trường chứa thông tin xác thực.
 
@@ -7,7 +7,7 @@ Cập nhật lần cuối: **2026-03-10**.
 ## Cách liệt kê các Provider
 
 ```bash
-zeroclaw providers
+jhedaiclaw providers
 ```
 
 ## Thứ tự ưu tiên khi giải quyết thông tin xác thực
@@ -16,44 +16,44 @@ Thứ tự ưu tiên tại runtime:
 
 1. Thông tin xác thực tường minh từ config/CLI
 2. Biến môi trường dành riêng cho provider
-3. Biến môi trường dự phòng chung: `ZEROCLAW_API_KEY`, sau đó là `API_KEY`
+3. Biến môi trường dự phòng chung: `JHEDAICLAW_API_KEY`, sau đó là `API_KEY`
 
 Với chuỗi provider dự phòng (`reliability.fallback_providers`), mỗi provider dự phòng tự giải quyết thông tin xác thực của mình độc lập. Key xác thực của provider chính không tự động dùng cho provider dự phòng.
 
 ## Danh mục Provider
 
-| Canonical ID | Alias | Cục bộ | Biến môi trường dành riêng |
-|---|---|---:|---|
-| `openrouter` | — | Không | `OPENROUTER_API_KEY` |
-| `anthropic` | — | Không | `ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` |
-| `openai` | — | Không | `OPENAI_API_KEY` |
-| `ollama` | — | Có | `OLLAMA_API_KEY` (tùy chọn) |
-| `gemini` | `google`, `google-gemini` | Không | `GEMINI_API_KEY`, `GOOGLE_API_KEY` |
-| `venice` | — | Không | `VENICE_API_KEY` |
-| `vercel` | `vercel-ai` | Không | `VERCEL_API_KEY` |
-| `cloudflare` | `cloudflare-ai` | Không | `CLOUDFLARE_API_KEY` |
-| `moonshot` | `kimi` | Không | `MOONSHOT_API_KEY` |
-| `kimi-code` | `kimi_coding`, `kimi_for_coding` | Không | `KIMI_CODE_API_KEY`, `MOONSHOT_API_KEY` |
-| `synthetic` | — | Không | `SYNTHETIC_API_KEY` |
-| `opencode` | `opencode-zen` | Không | `OPENCODE_API_KEY` |
-| `opencode-go` | — | Không | `OPENCODE_GO_API_KEY` |
-| `zai` | `z.ai` | Không | `ZAI_API_KEY` |
-| `glm` | `zhipu` | Không | `GLM_API_KEY` |
-| `minimax` | `minimax-intl`, `minimax-io`, `minimax-global`, `minimax-cn`, `minimaxi`, `minimax-oauth`, `minimax-oauth-cn`, `minimax-portal`, `minimax-portal-cn` | Không | `MINIMAX_OAUTH_TOKEN`, `MINIMAX_API_KEY` |
-| `bedrock` | `aws-bedrock` | Không | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (tùy chọn: `AWS_REGION`) |
-| `qianfan` | `baidu` | Không | `QIANFAN_API_KEY` |
-| `qwen` | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us`, `qwen-code`, `qwen-oauth`, `qwen_oauth` | Không | `QWEN_OAUTH_TOKEN`, `DASHSCOPE_API_KEY` |
-| `groq` | — | Không | `GROQ_API_KEY` |
-| `mistral` | — | Không | `MISTRAL_API_KEY` |
-| `xai` | `grok` | Không | `XAI_API_KEY` |
-| `deepseek` | — | Không | `DEEPSEEK_API_KEY` |
-| `together` | `together-ai` | Không | `TOGETHER_API_KEY` |
-| `fireworks` | `fireworks-ai` | Không | `FIREWORKS_API_KEY` |
-| `perplexity` | — | Không | `PERPLEXITY_API_KEY` |
-| `cohere` | — | Không | `COHERE_API_KEY` |
-| `copilot` | `github-copilot` | Không | (dùng config/`API_KEY` fallback với GitHub token) |
-| `lmstudio` | `lm-studio` | Có | (tùy chọn; mặc định là cục bộ) |
-| `nvidia` | `nvidia-nim`, `build.nvidia.com` | Không | `NVIDIA_API_KEY` |
+| Canonical ID  | Alias                                                                                                                                                | Cục bộ | Biến môi trường dành riêng                                             |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | -----: | ---------------------------------------------------------------------- |
+| `openrouter`  | —                                                                                                                                                    |  Không | `OPENROUTER_API_KEY`                                                   |
+| `anthropic`   | —                                                                                                                                                    |  Không | `ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`                           |
+| `openai`      | —                                                                                                                                                    |  Không | `OPENAI_API_KEY`                                                       |
+| `ollama`      | —                                                                                                                                                    |     Có | `OLLAMA_API_KEY` (tùy chọn)                                            |
+| `gemini`      | `google`, `google-gemini`                                                                                                                            |  Không | `GEMINI_API_KEY`, `GOOGLE_API_KEY`                                     |
+| `venice`      | —                                                                                                                                                    |  Không | `VENICE_API_KEY`                                                       |
+| `vercel`      | `vercel-ai`                                                                                                                                          |  Không | `VERCEL_API_KEY`                                                       |
+| `cloudflare`  | `cloudflare-ai`                                                                                                                                      |  Không | `CLOUDFLARE_API_KEY`                                                   |
+| `moonshot`    | `kimi`                                                                                                                                               |  Không | `MOONSHOT_API_KEY`                                                     |
+| `kimi-code`   | `kimi_coding`, `kimi_for_coding`                                                                                                                     |  Không | `KIMI_CODE_API_KEY`, `MOONSHOT_API_KEY`                                |
+| `synthetic`   | —                                                                                                                                                    |  Không | `SYNTHETIC_API_KEY`                                                    |
+| `opencode`    | `opencode-zen`                                                                                                                                       |  Không | `OPENCODE_API_KEY`                                                     |
+| `opencode-go` | —                                                                                                                                                    |  Không | `OPENCODE_GO_API_KEY`                                                  |
+| `zai`         | `z.ai`                                                                                                                                               |  Không | `ZAI_API_KEY`                                                          |
+| `glm`         | `zhipu`                                                                                                                                              |  Không | `GLM_API_KEY`                                                          |
+| `minimax`     | `minimax-intl`, `minimax-io`, `minimax-global`, `minimax-cn`, `minimaxi`, `minimax-oauth`, `minimax-oauth-cn`, `minimax-portal`, `minimax-portal-cn` |  Không | `MINIMAX_OAUTH_TOKEN`, `MINIMAX_API_KEY`                               |
+| `bedrock`     | `aws-bedrock`                                                                                                                                        |  Không | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (tùy chọn: `AWS_REGION`) |
+| `qianfan`     | `baidu`                                                                                                                                              |  Không | `QIANFAN_API_KEY`                                                      |
+| `qwen`        | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us`, `qwen-code`, `qwen-oauth`, `qwen_oauth`                                       |  Không | `QWEN_OAUTH_TOKEN`, `DASHSCOPE_API_KEY`                                |
+| `groq`        | —                                                                                                                                                    |  Không | `GROQ_API_KEY`                                                         |
+| `mistral`     | —                                                                                                                                                    |  Không | `MISTRAL_API_KEY`                                                      |
+| `xai`         | `grok`                                                                                                                                               |  Không | `XAI_API_KEY`                                                          |
+| `deepseek`    | —                                                                                                                                                    |  Không | `DEEPSEEK_API_KEY`                                                     |
+| `together`    | `together-ai`                                                                                                                                        |  Không | `TOGETHER_API_KEY`                                                     |
+| `fireworks`   | `fireworks-ai`                                                                                                                                       |  Không | `FIREWORKS_API_KEY`                                                    |
+| `perplexity`  | —                                                                                                                                                    |  Không | `PERPLEXITY_API_KEY`                                                   |
+| `cohere`      | —                                                                                                                                                    |  Không | `COHERE_API_KEY`                                                       |
+| `copilot`     | `github-copilot`                                                                                                                                     |  Không | (dùng config/`API_KEY` fallback với GitHub token)                      |
+| `lmstudio`    | `lm-studio`                                                                                                                                          |     Có | (tùy chọn; mặc định là cục bộ)                                         |
+| `nvidia`      | `nvidia-nim`, `build.nvidia.com`                                                                                                                     |  Không | `NVIDIA_API_KEY`                                                       |
 
 ### Ghi chú về Gemini
 
@@ -65,9 +65,9 @@ Với chuỗi provider dự phòng (`reliability.fallback_providers`), mỗi pro
 ### Ghi chú về Ollama Vision
 
 - Provider ID: `ollama`
-- Hỗ trợ đầu vào hình ảnh qua marker nội tuyến trong tin nhắn: ``[IMAGE:<source>]``
-- Sau khi chuẩn hóa multimodal, ZeroClaw gửi payload hình ảnh qua trường `messages[].images` gốc của Ollama.
-- Nếu chọn provider không hỗ trợ vision, ZeroClaw trả về lỗi rõ ràng thay vì âm thầm bỏ qua hình ảnh.
+- Hỗ trợ đầu vào hình ảnh qua marker nội tuyến trong tin nhắn: `[IMAGE:<source>]`
+- Sau khi chuẩn hóa multimodal, JhedaiClaw gửi payload hình ảnh qua trường `messages[].images` gốc của Ollama.
+- Nếu chọn provider không hỗ trợ vision, JhedaiClaw trả về lỗi rõ ràng thay vì âm thầm bỏ qua hình ảnh.
 
 ### Ghi chú về Bedrock
 
@@ -107,7 +107,7 @@ Hành vi:
 - Canonical provider ID: `nvidia`
 - Alias: `nvidia-nim`, `build.nvidia.com`
 - Base API URL: `https://integrate.api.nvidia.com/v1`
-- Khám phá model: `zeroclaw models refresh --provider nvidia`
+- Khám phá model: `jhedaiclaw models refresh --provider nvidia`
 
 Các model ID khởi đầu được khuyến nghị (đã xác minh với danh mục NVIDIA API ngày 2026-02-18):
 
@@ -246,8 +246,8 @@ Quy trình được khuyến nghị:
 1. Giữ nguyên các call site (`hint:reasoning`, `hint:semantic`).
 2. Chỉ thay đổi model đích trong `[[model_routes]]` hoặc `[[embedding_routes]]`.
 3. Chạy:
-   - `zeroclaw doctor`
-   - `zeroclaw status`
+   - `jhedaiclaw doctor`
+   - `jhedaiclaw status`
 4. Smoke test một luồng đại diện (chat + memory retrieval) trước khi triển khai.
 
 Cách này giảm thiểu rủi ro phá vỡ vì các tích hợp và prompt không cần thay đổi khi nâng cấp model ID.

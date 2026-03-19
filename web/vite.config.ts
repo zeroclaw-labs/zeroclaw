@@ -16,4 +16,14 @@ export default defineConfig({
   build: {
     outDir: "dist",
   },
+  server: {
+    proxy: {
+      "/pair": "http://127.0.0.1:42617",
+      "/health": "http://127.0.0.1:42617",
+      "/api": "http://127.0.0.1:42617",
+      "/ws": { target: "ws://127.0.0.1:42617", ws: true },
+      "/webhook": "http://127.0.0.1:42617",
+      "/metrics": "http://127.0.0.1:42617",
+    },
+  },
 });

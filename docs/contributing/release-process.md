@@ -1,4 +1,4 @@
-# ZeroClaw Release Process
+# JhedaiClaw Release Process
 
 This runbook defines the maintainers' standard release flow.
 
@@ -105,7 +105,7 @@ Run `Pub Homebrew Core` manually:
 Required repository settings for non-dry-run:
 
 - secret: `HOMEBREW_CORE_BOT_TOKEN` (token from a dedicated bot account, not a personal maintainer account)
-- variable: `HOMEBREW_CORE_BOT_FORK_REPO` (for example `zeroclaw-release-bot/homebrew-core`)
+- variable: `HOMEBREW_CORE_BOT_FORK_REPO` (for example `jhedaiclaw-release-bot/homebrew-core`)
 - optional variable: `HOMEBREW_CORE_BOT_EMAIL`
 
 Workflow guardrails:

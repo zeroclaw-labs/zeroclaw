@@ -12,7 +12,7 @@ SOP 是由 `SopEngine` 执行的确定性流程。它们提供显式的触发器
 ## 1. 运行时契约（当前）
 
 - SOP 定义从 `<workspace>/sops/<sop_name>/SOP.toml` 加载，外加可选的 `SOP.md`。
-- CLI `zeroclaw sop` 当前仅管理定义：`list`、`validate`、`show`。
+- CLI `jhedaiclaw sop` 当前仅管理定义：`list`、`validate`、`show`。
 - SOP 运行由事件扇入（MQTT/webhook/cron/外围设备）或代理内工具 `sop_execute` 启动。
 - 运行进度使用工具：`sop_status`、`sop_approve`、`sop_advance`。
 - SOP 审计记录持久化在配置的内存后端的 `sop` 类别下。
@@ -47,16 +47,16 @@ graph LR
 2. 创建 SOP 目录，例如：
 
    ```text
-   ~/.zeroclaw/workspace/sops/deploy-prod/SOP.toml
-   ~/.zeroclaw/workspace/sops/deploy-prod/SOP.md
+   ~/.jhedaiclaw/workspace/sops/deploy-prod/SOP.toml
+   ~/.jhedaiclaw/workspace/sops/deploy-prod/SOP.md
    ```
 
 3. 验证和检查定义：
 
    ```bash
-   zeroclaw sop list
-   zeroclaw sop validate
-   zeroclaw sop show deploy-prod
+   jhedaiclaw sop list
+   jhedaiclaw sop validate
+   jhedaiclaw sop show deploy-prod
    ```
 
 4. 通过配置的事件源触发运行，或在代理轮次中使用 `sop_execute` 手动触发。

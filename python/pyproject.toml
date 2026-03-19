@@ -3,21 +3,21 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "zeroclaw-tools"
+name = "jhedaiclaw-tools"
 version = "0.1.0"
-description = "Python companion package for ZeroClaw - LangGraph-based tool calling for consistent LLM agent execution"
+description = "Python companion package for JhedaiClaw - LangGraph-based tool calling for consistent LLM agent execution"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }
 requires-python = ">=3.10"
 authors = [
-    { name = "ZeroClaw Community" }
+    { name = "JhedaiClaw Community" }
 ]
 keywords = [
     "ai",
     "llm",
     "agent",
     "langgraph",
-    "zeroclaw",
+    "jhedaiclaw",
     "tool-calling",
 ]
 classifiers = [
@@ -39,7 +39,7 @@ dependencies = [
 ]
 
 [project.scripts]
-zeroclaw-tools = "zeroclaw_tools.__main__:main"
+jhedaiclaw-tools = "jhedaiclaw_tools.__main__:main"
 
 [project.optional-dependencies]
 discord = ["discord.py>=2.3.0"]
@@ -51,13 +51,13 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/zeroclaw-labs/zeroclaw"
-Documentation = "https://github.com/zeroclaw-labs/zeroclaw/tree/master/python"
-Repository = "https://github.com/zeroclaw-labs/zeroclaw"
-Issues = "https://github.com/zeroclaw-labs/zeroclaw/issues"
+Homepage = "https://github.com/jhedai/jhedaiclaw"
+Documentation = "https://github.com/jhedai/jhedaiclaw/tree/master/python"
+Repository = "https://github.com/jhedai/jhedaiclaw"
+Issues = "https://github.com/jhedai/jhedaiclaw/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["zeroclaw_tools"]
+packages = ["jhedaiclaw_tools"]
 
 [tool.ruff]
 line-length = 100

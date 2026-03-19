@@ -770,7 +770,7 @@ impl BrowserTool {
             },
             "metadata": {
                 "session_name": self.session_name,
-                "source": "zeroclaw.browser",
+                "source": "jhedaiclaw.browser",
                 "version": env!("CARGO_PKG_VERSION"),
             }
         });

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   getStatus,
   getTools,
@@ -9,7 +9,7 @@ import {
   getCliTools,
   getHealth,
   runDoctor,
-} from '../lib/api';
+} from "../lib/api";
 import type {
   StatusResponse,
   ToolSpec,
@@ -20,7 +20,7 @@ import type {
   CliTool,
   HealthSnapshot,
   DiagResult,
-} from '../types/api';
+} from "../types/api";
 
 // ---------------------------------------------------------------------------
 // Generic async-data hook

@@ -1,4 +1,4 @@
-# CodeRabbit configuration for ZeroClaw
+# CodeRabbit configuration for JhedaiClaw
 # Documentation: https://docs.coderabbit.ai/reference/configuration
 
 language: en-US
@@ -8,13 +8,13 @@ early_access: false
 reviews:
   # Request changes workflow
   request_changes_workflow: false
-  
+
   # High level summary of the PR
   high_level_summary: true
-  
+
   # Generate sequence diagrams
   sequence_diagrams: true
-  
+
   # Auto-review configuration
   auto_review:
     enabled: true
@@ -23,17 +23,17 @@ reviews:
       - master
     # Skip reviews for draft PRs or WIP
     drafts: false
-  
+
   # Poem feature toggle (must be a boolean, not an object)
   poem: false
-  
+
   # Reviewer suggestions
   reviewer:
     # Suggest reviewers based on blame data
     enabled: true
     # Automatically assign suggested reviewers
     auto_assign: false
-  
+
   # Enable finishing touches
   finishing_touches:
     # Generate docstrings
@@ -48,7 +48,7 @@ tools:
   # Rust-specific tools
   cargo:
     enabled: true
-  
+
 # Chat configuration
 chat:
   auto_reply: true

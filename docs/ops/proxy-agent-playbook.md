@@ -7,9 +7,9 @@ Use this document when you want the agent to switch proxy scope quickly and safe
 ## 0. Summary
 
 - **Purpose:** provide copy-ready agent tool calls for proxy scope management and rollback.
-- **Audience:** operators and maintainers running ZeroClaw in proxied networks.
+- **Audience:** operators and maintainers running JhedaiClaw in proxied networks.
 - **Scope:** `proxy_config` actions, mode selection, verification flow, and troubleshooting.
-- **Non-goals:** generic network debugging outside ZeroClaw runtime behavior.
+- **Non-goals:** generic network debugging outside JhedaiClaw runtime behavior.
 
 ---
 
@@ -17,15 +17,15 @@ Use this document when you want the agent to switch proxy scope quickly and safe
 
 Use this section for quick operational routing.
 
-### 1.1 Proxy only ZeroClaw internal traffic
+### 1.1 Proxy only JhedaiClaw internal traffic
 
-1. Use scope `zeroclaw`.
+1. Use scope `jhedaiclaw`.
 2. Set `http_proxy`/`https_proxy` or `all_proxy`.
 3. Validate with `{"action":"get"}`.
 
 Go to:
 
-- [Section 4](#4-mode-a--proxy-only-for-zeroclaw-internals)
+- [Section 4](#4-mode-a--proxy-only-for-jhedaiclaw-internals)
 
 ### 1.2 Proxy only selected services
 
@@ -61,11 +61,11 @@ Go to:
 
 ## 2. Scope Decision Matrix
 
-| Scope | Affects | Exports env vars | Typical use |
-|---|---|---|---|
-| `zeroclaw` | ZeroClaw internal HTTP clients | No | Normal runtime proxying without process-level side effects |
-| `services` | Only selected service keys/selectors | No | Fine-grained routing for specific providers/tools/channels |
-| `environment` | Runtime + process environment proxy variables | Yes | Integrations that require `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` |
+| Scope         | Affects                                       | Exports env vars | Typical use                                                      |
+| ------------- | --------------------------------------------- | ---------------- | ---------------------------------------------------------------- |
+| `jhedaiclaw`  | JhedaiClaw internal HTTP clients              | No               | Normal runtime proxying without process-level side effects       |
+| `services`    | Only selected service keys/selectors          | No               | Fine-grained routing for specific providers/tools/channels       |
+| `environment` | Runtime + process environment proxy variables | Yes              | Integrations that require `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` |
 
 ---
 
@@ -88,20 +88,20 @@ Tool calls:
 
 ---
 
-## 4. Mode A — Proxy Only for ZeroClaw Internals
+## 4. Mode A — Proxy Only for JhedaiClaw Internals
 
-Use when ZeroClaw provider/channel/tool HTTP traffic should use proxy, without exporting process-level proxy env vars.
+Use when JhedaiClaw provider/channel/tool HTTP traffic should use proxy, without exporting process-level proxy env vars.
 
 Tool calls:
 
 ```json
-{"action":"set","enabled":true,"scope":"zeroclaw","http_proxy":"http://127.0.0.1:7890","https_proxy":"http://127.0.0.1:7890","no_proxy":["localhost","127.0.0.1"]}
+{"action":"set","enabled":true,"scope":"jhedaiclaw","http_proxy":"http://127.0.0.1:7890","https_proxy":"http://127.0.0.1:7890","no_proxy":["localhost","127.0.0.1"]}
 {"action":"get"}
 ```
 
 Expected behavior:
 
-- Runtime proxy is active for ZeroClaw HTTP clients.
+- Runtime proxy is active for JhedaiClaw HTTP clients.
 - `HTTP_PROXY` / `HTTPS_PROXY` process env exports are not required.
 
 ---

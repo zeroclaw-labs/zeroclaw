@@ -71,7 +71,7 @@ impl McpServer {
                 "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": {
-                    "name": "zeroclaw",
+                    "name": "jhedaiclaw",
                     "version": env!("CARGO_PKG_VERSION")
                 }
             }),
@@ -309,7 +309,7 @@ mod tests {
         // A command that doesn't exist should fail at spawn, not panic.
         let config = McpServerConfig {
             name: "nonexistent".to_string(),
-            command: "/usr/bin/this_binary_does_not_exist_zeroclaw_test".to_string(),
+            command: "/usr/bin/this_binary_does_not_exist_jhedaiclaw_test".to_string(),
             args: vec![],
             env: std::collections::HashMap::default(),
             tool_timeout_secs: None,

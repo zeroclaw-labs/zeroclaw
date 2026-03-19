@@ -1,4 +1,4 @@
-# Tài liệu ZeroClaw (Tiếng Việt)
+# Tài liệu JhedaiClaw (Tiếng Việt)
 
 Đây là trang chủ tiếng Việt của hệ thống tài liệu.
 
@@ -8,20 +8,20 @@
 
 ## Tra cứu nhanh
 
-| Tôi muốn… | Xem tài liệu |
-|---|---|
-| Cài đặt và chạy nhanh | [../../../README.vi.md](../../../README.vi.md) / [../../../README.md](../../../README.md) |
-| Cài đặt bằng một lệnh | [one-click-bootstrap.md](one-click-bootstrap.md) |
-| Tìm lệnh theo tác vụ | [commands-reference.md](commands-reference.md) |
-| Kiểm tra giá trị mặc định và khóa cấu hình | [config-reference.md](config-reference.md) |
-| Kết nối provider / endpoint tùy chỉnh | [custom-providers.md](custom-providers.md) |
-| Cấu hình Z.AI / GLM provider | [zai-glm-setup.md](zai-glm-setup.md) |
-| Sử dụng tích hợp LangGraph | [langgraph-integration.md](langgraph-integration.md) |
-| Vận hành hàng ngày (runbook) | [operations-runbook.md](operations-runbook.md) |
-| Khắc phục sự cố cài đặt/chạy/kênh | [troubleshooting.md](troubleshooting.md) |
-| Cấu hình Matrix phòng mã hóa (E2EE) | [matrix-e2ee-guide.md](matrix-e2ee-guide.md) |
-| Xem theo danh mục | [SUMMARY.md](SUMMARY.md) |
-| Xem bản chụp PR/Issue | [project-triage-snapshot-2026-02-18.md](../../maintainers/project-triage-snapshot-2026-02-18.md) |
+| Tôi muốn…                                  | Xem tài liệu                                                                                     |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| Cài đặt và chạy nhanh                      | [../../../README.vi.md](../../../README.vi.md) / [../../../README.md](../../../README.md)        |
+| Cài đặt bằng một lệnh                      | [one-click-bootstrap.md](one-click-bootstrap.md)                                                 |
+| Tìm lệnh theo tác vụ                       | [commands-reference.md](commands-reference.md)                                                   |
+| Kiểm tra giá trị mặc định và khóa cấu hình | [config-reference.md](config-reference.md)                                                       |
+| Kết nối provider / endpoint tùy chỉnh      | [custom-providers.md](custom-providers.md)                                                       |
+| Cấu hình Z.AI / GLM provider               | [zai-glm-setup.md](zai-glm-setup.md)                                                             |
+| Sử dụng tích hợp LangGraph                 | [langgraph-integration.md](langgraph-integration.md)                                             |
+| Vận hành hàng ngày (runbook)               | [operations-runbook.md](operations-runbook.md)                                                   |
+| Khắc phục sự cố cài đặt/chạy/kênh          | [troubleshooting.md](troubleshooting.md)                                                         |
+| Cấu hình Matrix phòng mã hóa (E2EE)        | [matrix-e2ee-guide.md](matrix-e2ee-guide.md)                                                     |
+| Xem theo danh mục                          | [SUMMARY.md](SUMMARY.md)                                                                         |
+| Xem bản chụp PR/Issue                      | [project-triage-snapshot-2026-02-18.md](../../maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## Tìm nhanh
 

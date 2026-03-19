@@ -1,6 +1,6 @@
 # Extension Examples
 
-ZeroClaw's architecture is trait-driven and modular.
+JhedaiClaw's architecture is trait-driven and modular.
 To add a new provider, channel, tool, or memory backend, implement the corresponding trait and register it in the factory module.
 
 This page contains minimal, working examples for each core extension point.
@@ -21,7 +21,7 @@ The `spec()` method has a default implementation that composes the others.
 Register your tool in `src/tools/mod.rs` via `default_tools()`.
 
 ```rust
-// In your crate: use zeroclaw::tools::traits::{Tool, ToolResult};
+// In your crate: use jhedaiclaw::tools::traits::{Tool, ToolResult};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -79,7 +79,7 @@ impl Tool for HttpGetTool {
 
 ## Channel (`src/channels/traits.rs`)
 
-Channels let ZeroClaw communicate through any messaging platform.
+Channels let JhedaiClaw communicate through any messaging platform.
 
 **Required methods**: `name()`, `send(&SendMessage)`, `listen()`.
 Default implementations exist for `health_check()`, `start_typing()`, `stop_typing()`,
@@ -89,7 +89,7 @@ and reaction methods (`add_reaction`, `remove_reaction`).
 Register your channel in `src/channels/mod.rs` and add config to `ChannelsConfig` in `src/config/schema.rs`.
 
 ```rust
-// In your crate: use zeroclaw::channels::traits::{Channel, ChannelMessage, SendMessage};
+// In your crate: use jhedaiclaw::channels::traits::{Channel, ChannelMessage, SendMessage};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -199,7 +199,7 @@ impl Channel for TelegramChannel {
 
 ## Provider (`src/providers/traits.rs`)
 
-Providers are LLM backend adapters. Each provider connects ZeroClaw to a different model API.
+Providers are LLM backend adapters. Each provider connects JhedaiClaw to a different model API.
 
 **Required method**: `chat_with_system(system_prompt: Option<&str>, message: &str, model: &str, temperature: f64) -> Result<String>`.
 Everything else has default implementations:
@@ -210,7 +210,7 @@ streaming methods return empty/error streams by default.
 Register your provider in `src/providers/mod.rs`.
 
 ```rust
-// In your crate: use zeroclaw::providers::traits::Provider;
+// In your crate: use jhedaiclaw::providers::traits::Provider;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -281,7 +281,7 @@ Both `store()` and `recall()` accept an optional `session_id` for scoping.
 Register your backend in `src/memory/mod.rs`.
 
 ```rust
-// In your crate: use zeroclaw::memory::traits::{Memory, MemoryEntry, MemoryCategory};
+// In your crate: use jhedaiclaw::memory::traits::{Memory, MemoryEntry, MemoryCategory};
 
 use async_trait::async_trait;
 use std::collections::HashMap;

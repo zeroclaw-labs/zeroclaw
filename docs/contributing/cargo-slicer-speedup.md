@@ -4,11 +4,11 @@
 
 ## Benchmark Results
 
-| Environment | Mode | Baseline | With cargo-slicer | Wall-time savings |
-|---|---|---|---|---|
-| 48-core server | syn pre-analysis | 3m 52s | 3m 31s | **-9.1%** |
-| 48-core server | MIR-precise | 3m 52s | 2m 49s | **-27.2%** |
-| Raspberry Pi 4 | syn pre-analysis | 25m 03s | 17m 54s | **-28.6%** |
+| Environment    | Mode             | Baseline | With cargo-slicer | Wall-time savings |
+| -------------- | ---------------- | -------- | ----------------- | ----------------- |
+| 48-core server | syn pre-analysis | 3m 52s   | 3m 31s            | **-9.1%**         |
+| 48-core server | MIR-precise      | 3m 52s   | 2m 49s            | **-27.2%**        |
+| Raspberry Pi 4 | syn pre-analysis | 25m 03s  | 17m 54s           | **-28.6%**        |
 
 All measurements are clean `cargo +nightly build --release`. MIR-precise mode reads actual compiler MIR to build a more accurate call graph, stubbing 1,060 mono items vs 799 with syn-based analysis.
 
@@ -17,6 +17,7 @@ All measurements are clean `cargo +nightly build --release`. MIR-precise mode re
 The workflow `.github/workflows/ci-build-fast.yml` (not yet implemented) is intended to run an accelerated release build alongside the standard one. It triggers on Rust-code changes and workflow changes, does not gate merges, and runs in parallel as a non-blocking check.
 
 CI uses a resilient two-path strategy:
+
 - **Fast path**: install `cargo-slicer` plus the `rustc-driver` binaries and run the MIR-precise sliced build.
 - **Fallback path**: if `rustc-driver` install fails (for example due to nightly `rustc` API drift), run a plain `cargo +nightly build --release` instead of failing the check.
 
@@ -32,7 +33,7 @@ cargo +nightly install cargo-slicer --profile release-rustc \
   --bin cargo-slicer-rustc --bin cargo_slicer_dispatch \
   --features rustc-driver
 
-# Build with syn pre-analysis (from zeroclaw root)
+# Build with syn pre-analysis (from jhedaiclaw root)
 cargo-slicer pre-analyze
 CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
   RUSTC_WRAPPER=$(which cargo_slicer_dispatch) \
@@ -40,7 +41,7 @@ CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
 
 # Build with MIR-precise analysis (more stubs, bigger savings)
 # Step 1: generate .mir-cache (first build with MIR_PRECISE)
-CARGO_SLICER_MIR_PRECISE=1 CARGO_SLICER_WORKSPACE_CRATES=zeroclaw,zeroclaw_robot_kit \
+CARGO_SLICER_MIR_PRECISE=1 CARGO_SLICER_WORKSPACE_CRATES=jhedaiclaw,jhedaiclaw_robot_kit \
   CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
   RUSTC_WRAPPER=$(which cargo_slicer_dispatch) \
   cargo +nightly build --release

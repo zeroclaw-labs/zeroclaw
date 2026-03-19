@@ -1,4 +1,4 @@
-# Hub della Documentazione ZeroClaw
+# Hub della Documentazione JhedaiClaw
 
 Questa pagina è il punto di ingresso principale del sistema di documentazione.
 
@@ -8,21 +8,21 @@ Hub localizzati: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) ·
 
 ## Inizia Qui
 
-| Voglio…                                                             | Leggi questo                                                                   |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| Installare ed eseguire ZeroClaw rapidamente                         | [README.md (Avvio Rapido)](../README.md#quick-start)                           |
-| Bootstrap con un singolo comando                                    | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                  |
-| Aggiornare o disinstallare su macOS                                 | [macos-update-uninstall.md](setup-guides/macos-update-uninstall.md)            |
-| Trovare comandi per attività                                        | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| Controllare rapidamente valori predefiniti e chiavi di configurazione | [config-reference.md](reference/api/config-reference.md)                      |
-| Configurare provider/endpoint personalizzati                        | [custom-providers.md](contributing/custom-providers.md)                        |
-| Configurare il provider Z.AI / GLM                                  | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                             |
-| Usare i pattern di integrazione LangGraph                           | [langgraph-integration.md](contributing/langgraph-integration.md)              |
-| Gestire il runtime (runbook giorno 2)                               | [operations-runbook.md](ops/operations-runbook.md)                             |
-| Risolvere problemi di installazione/runtime/canale                  | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| Eseguire configurazione e diagnostica delle stanze crittografate Matrix | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                      |
-| Sfogliare la documentazione per categoria                           | [SUMMARY.md](SUMMARY.md)                                                      |
-| Vedere lo snapshot dei documenti PR/issue del progetto              | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| Voglio…                                                                 | Leggi questo                                                                               |
+| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Installare ed eseguire JhedaiClaw rapidamente                           | [README.md (Avvio Rapido)](../README.md#quick-start)                                       |
+| Bootstrap con un singolo comando                                        | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| Aggiornare o disinstallare su macOS                                     | [macos-update-uninstall.md](setup-guides/macos-update-uninstall.md)                        |
+| Trovare comandi per attività                                            | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| Controllare rapidamente valori predefiniti e chiavi di configurazione   | [config-reference.md](reference/api/config-reference.md)                                   |
+| Configurare provider/endpoint personalizzati                            | [custom-providers.md](contributing/custom-providers.md)                                    |
+| Configurare il provider Z.AI / GLM                                      | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| Usare i pattern di integrazione LangGraph                               | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| Gestire il runtime (runbook giorno 2)                                   | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| Risolvere problemi di installazione/runtime/canale                      | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| Eseguire configurazione e diagnostica delle stanze crittografate Matrix | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| Sfogliare la documentazione per categoria                               | [SUMMARY.md](SUMMARY.md)                                                                   |
+| Vedere lo snapshot dei documenti PR/issue del progetto                  | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## Albero Decisionale Rapido (10 secondi)
 

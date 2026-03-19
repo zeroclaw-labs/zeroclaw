@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="zeroclaw.png" alt="ZeroClaw" width="200" />
+  <img src="jhedaiclaw.png" alt="JhedaiClaw" width="200" />
 </p>
 
-<h1 align="center">ZeroClaw 🦀</h1>
+<h1 align="center">JhedaiClaw 🦀</h1>
 
 <p align="center">
   <strong>Zero overhead. Zero compromesso. 100% Rust. 100% Agnostico.</strong><br>
@@ -13,12 +13,12 @@
   <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
   <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
   <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
-  <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
-  <a href="https://zeroclawlabs.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
+  <a href="https://x.com/jhedaiclaw?s=21"><img src="https://img.shields.io/badge/X-%40jhedaiclaw-000000?style=flat&logo=x&logoColor=white" alt="X: @jhedaiclaw" /></a>
+  <a href="https://jhedaiclaw.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
   <a href="https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search"><img src="https://img.shields.io/badge/Xiaohongshu-Official-FF2442?style=flat" alt="Xiaohongshu: Official" /></a>
-  <a href="https://t.me/zeroclawlabs"><img src="https://img.shields.io/badge/Telegram-%40zeroclawlabs-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @zeroclawlabs" /></a>
-  <a href="https://www.facebook.com/groups/zeroclaw"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
-  <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
+  <a href="https://t.me/jhedaiclaw"><img src="https://img.shields.io/badge/Telegram-%40jhedaiclaw-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @jhedaiclaw" /></a>
+  <a href="https://www.facebook.com/groups/jhedaiclaw"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
+  <a href="https://www.reddit.com/r/jhedaiclaw/"><img src="https://img.shields.io/badge/Reddit-r%2Fjhedaiclaw-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/jhedaiclaw" /></a>
 </p>
 <p align="center">
 Costruito da studenti e membri delle comunità Harvard, MIT e Sundai.Club.
@@ -81,7 +81,7 @@ Costruito da studenti e membri delle comunità Harvard, MIT e Sundai.Club.
 </p>
 
 <p align="center">
-  ZeroClaw è il <strong>sistema operativo runtime</strong> per i workflow degli agenti — un'infrastruttura che astrae modelli, strumenti, memoria ed esecuzione per costruire agenti una volta e eseguirli ovunque.
+  JhedaiClaw è il <strong>sistema operativo runtime</strong> per i workflow degli agenti — un'infrastruttura che astrae modelli, strumenti, memoria ed esecuzione per costruire agenti una volta e eseguirli ovunque.
 </p>
 
 <p align="center"><code>Architettura basata su trait · runtime sicuro di default · provider/canale/strumento intercambiabili · tutto è collegabile</code></p>
@@ -90,9 +90,9 @@ Costruito da studenti e membri delle comunità Harvard, MIT e Sundai.Club.
 
 ### 🚀 What's New in v0.3.1 (March 2026)
 
-| Area | Highlights |
-|---|---|
-| ci | add Termux (aarch64-linux-android) release target |
+| Area | Highlights                                        |
+| ---- | ------------------------------------------------- |
+| ci   | add Termux (aarch64-linux-android) release target |
 
 <!-- END:WHATS_NEW -->
 
@@ -100,11 +100,11 @@ Costruito da studenti e membri delle comunità Harvard, MIT e Sundai.Club.
 
 Usa questa tabella per avvisi importanti (cambiamenti di compatibilità, avvisi di sicurezza, finestre di manutenzione e blocchi di versione).
 
-| Data (UTC) | Livello      | Avviso                                                                                                                                                                                                                                                                                                                                                                                                              | Azione                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| ---------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2026-02-19 | _Critico_  | **Non siamo affiliati** con `openagen/zeroclaw` o `zeroclaw.org`. Il dominio `zeroclaw.org` punta attualmente al fork `openagen/zeroclaw`, e questo dominio/repository sta contraffacendo il nostro sito web/progetto ufficiale.                                                                                                                                                                                 | Non fidarti di informazioni, binari, raccolte fondi o annunci da queste fonti. Usa solo [questo repository](https://github.com/zeroclaw-labs/zeroclaw) e i nostri account social verificati.                                                                                                                                                                                                                                                                                                                                                          |
-| 2026-02-21 | _Importante_ | Il nostro sito ufficiale è ora online: [zeroclawlabs.ai](https://zeroclawlabs.ai). Grazie per la pazienza durante l'attesa. Rileviamo ancora tentativi di contraffazione: non partecipare ad alcuna attività di investimento/finanziamento a nome di ZeroClaw se non pubblicata tramite i nostri canali ufficiali.                                                                                                                   | Usa [questo repository](https://github.com/zeroclaw-labs/zeroclaw) come unica fonte di verità. Segui [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Telegram (@zeroclawlabs)](https://t.me/zeroclawlabs), [Facebook (gruppo)](https://www.facebook.com/groups/zeroclaw), [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/), e [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) per aggiornamenti ufficiali. |
-| 2026-02-19 | _Importante_ | Anthropic ha aggiornato i termini di utilizzo di autenticazione e credenziali il 2026-02-19. L'autenticazione OAuth (Free, Pro, Max) è esclusivamente per Claude Code e Claude.ai; l'uso di token OAuth di Claude Free/Pro/Max in qualsiasi altro prodotto, strumento o servizio (incluso Agent SDK) non è consentito e può violare i Termini di Utilizzo del Consumatore. | Si prega di evitare temporaneamente le integrazioni OAuth di Claude Code per prevenire qualsiasi potenziale perdita. Clausola originale: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).                                                                                                                                                                                                                                                                                                                      |
+| Data (UTC) | Livello      | Avviso                                                                                                                                                                                                                                                                                                                                                                     | Azione                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ---------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2026-02-19 | _Critico_    | **Non siamo affiliati** con `openagen/jhedaiclaw` o `jhedaiclaw.org`. Il dominio `jhedaiclaw.org` punta attualmente al fork `openagen/jhedaiclaw`, e questo dominio/repository sta contraffacendo il nostro sito web/progetto ufficiale.                                                                                                                                   | Non fidarti di informazioni, binari, raccolte fondi o annunci da queste fonti. Usa solo [questo repository](https://github.com/jhedai/jhedaiclaw) e i nostri account social verificati.                                                                                                                                                                                                                                                                                                                                                |
+| 2026-02-21 | _Importante_ | Il nostro sito ufficiale è ora online: [jhedaiclaw.ai](https://jhedaiclaw.ai). Grazie per la pazienza durante l'attesa. Rileviamo ancora tentativi di contraffazione: non partecipare ad alcuna attività di investimento/finanziamento a nome di JhedaiClaw se non pubblicata tramite i nostri canali ufficiali.                                                           | Usa [questo repository](https://github.com/jhedai/jhedaiclaw) come unica fonte di verità. Segui [X (@jhedaiclaw)](https://x.com/jhedaiclaw?s=21), [Telegram (@jhedaiclaw)](https://t.me/jhedaiclaw), [Facebook (gruppo)](https://www.facebook.com/groups/jhedaiclaw), [Reddit (r/jhedaiclaw)](https://www.reddit.com/r/jhedaiclaw/), e [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) per aggiornamenti ufficiali. |
+| 2026-02-19 | _Importante_ | Anthropic ha aggiornato i termini di utilizzo di autenticazione e credenziali il 2026-02-19. L'autenticazione OAuth (Free, Pro, Max) è esclusivamente per Claude Code e Claude.ai; l'uso di token OAuth di Claude Free/Pro/Max in qualsiasi altro prodotto, strumento o servizio (incluso Agent SDK) non è consentito e può violare i Termini di Utilizzo del Consumatore. | Si prega di evitare temporaneamente le integrazioni OAuth di Claude Code per prevenire qualsiasi potenziale perdita. Clausola originale: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).                                                                                                                                                                                                                                                                  |
 
 ### ✨ Funzionalità
 
@@ -113,29 +113,29 @@ Usa questa tabella per avvisi importanti (cambiamenti di compatibilità, avvisi 
 - ⚡ **Avvii a Freddo Rapidi:** Il runtime Rust a binario singolo mantiene l'avvio di comandi e demoni quasi istantaneo per le operazioni quotidiane.
 - 🌍 **Architettura Portabile:** Un workflow a binario singolo su ARM, x86 e RISC-V con provider/canale/strumento intercambiabili.
 
-### Perché i team scelgono ZeroClaw
+### Perché i team scelgono JhedaiClaw
 
 - **Leggero di default:** binario Rust piccolo, avvio rapido, basso impatto di memoria.
 - **Sicuro per design:** pairing, sandboxing rigoroso, liste di autorizzazione esplicite, scope del workspace.
 - **Completamente intercambiabile:** i sistemi centrali sono trait (provider, canali, strumenti, memoria, tunnel).
 - **Nessun lock-in del provider:** supporto provider compatibile OpenAI + endpoint personalizzati collegabili.
 
-## Snapshot Benchmark (ZeroClaw vs OpenClaw, Riproducibile)
+## Snapshot Benchmark (JhedaiClaw vs OpenClaw, Riproducibile)
 
 Benchmark rapido su macchina locale (macOS arm64, feb. 2026) normalizzato per hardware edge a 0.8 GHz.
 
-|                              | OpenClaw      | NanoBot        | PicoClaw        | ZeroClaw 🦀           |
-| ---------------------------- | ------------- | -------------- | --------------- | --------------------- |
-| **Linguaggio**                  | TypeScript    | Python         | Go              | **Rust**              |
-| **RAM**                      | > 1 GB        | > 100 MB       | < 10 MB         | **< 5 MB**            |
-| **Avvio (core 0.8 GHz)** | > 500s        | > 30s          | < 1s            | **< 10ms**            |
-| **Dimensione Binario**           | ~28 MB (dist) | N/A (Scripts)  | ~8 MB           | **3.4 MB**            |
-| **Costo**                     | Mac Mini $599 | Linux SBC ~$50 | Scheda Linux $10 | **Qualsiasi hardware $10** |
+|                          | OpenClaw      | NanoBot        | PicoClaw         | JhedaiClaw 🦀              |
+| ------------------------ | ------------- | -------------- | ---------------- | -------------------------- |
+| **Linguaggio**           | TypeScript    | Python         | Go               | **Rust**                   |
+| **RAM**                  | > 1 GB        | > 100 MB       | < 10 MB          | **< 5 MB**                 |
+| **Avvio (core 0.8 GHz)** | > 500s        | > 30s          | < 1s             | **< 10ms**                 |
+| **Dimensione Binario**   | ~28 MB (dist) | N/A (Scripts)  | ~8 MB            | **3.4 MB**                 |
+| **Costo**                | Mac Mini $599 | Linux SBC ~$50 | Scheda Linux $10 | **Qualsiasi hardware $10** |
 
-> Note: I risultati di ZeroClaw sono misurati su build di produzione usando `/usr/bin/time -l`. OpenClaw richiede il runtime Node.js (tipicamente ~390 MB di overhead memoria aggiuntivo), mentre NanoBot richiede il runtime Python. PicoClaw e ZeroClaw sono binari statici. Le cifre RAM sopra sono memoria runtime; i requisiti di compilazione in build-time sono maggiori.
+> Note: I risultati di JhedaiClaw sono misurati su build di produzione usando `/usr/bin/time -l`. OpenClaw richiede il runtime Node.js (tipicamente ~390 MB di overhead memoria aggiuntivo), mentre NanoBot richiede il runtime Python. PicoClaw e JhedaiClaw sono binari statici. Le cifre RAM sopra sono memoria runtime; i requisiti di compilazione in build-time sono maggiori.
 
 <p align="center">
-  <img src="zero-claw.jpeg" alt="Confronto ZeroClaw vs OpenClaw" width="800" />
+  <img src="zero-claw.jpeg" alt="Confronto JhedaiClaw vs OpenClaw" width="800" />
 </p>
 
 ### Misurazione Locale Riproducibile
@@ -144,17 +144,17 @@ Le affermazioni di benchmark possono derivare man mano che il codice e le toolch
 
 ```bash
 cargo build --release
-ls -lh target/release/zeroclaw
+ls -lh target/release/jhedaiclaw
 
-/usr/bin/time -l target/release/zeroclaw --help
-/usr/bin/time -l target/release/zeroclaw status
+/usr/bin/time -l target/release/jhedaiclaw --help
+/usr/bin/time -l target/release/jhedaiclaw status
 ```
 
 Esempio di campione (macOS arm64, misurato il 18 febbraio 2026):
 
 - Dimensione binario release: `8.8M`
-- `zeroclaw --help`: tempo reale circa `0.02s`, impatto memoria massimo ~`3.9 MB`
-- `zeroclaw status`: tempo reale circa `0.01s`, impatto memoria massimo ~`4.1 MB`
+- `jhedaiclaw --help`: tempo reale circa `0.02s`, impatto memoria massimo ~`3.9 MB`
+- `jhedaiclaw status`: tempo reale circa `0.01s`, impatto memoria massimo ~`4.1 MB`
 
 ## Prerequisiti
 
@@ -165,25 +165,25 @@ Esempio di campione (macOS arm64, misurato il 18 febbraio 2026):
 
 1. **Visual Studio Build Tools** (fornisce il linker MSVC e il Windows SDK):
 
-    ```powershell
-    winget install Microsoft.VisualStudio.2022.BuildTools
-    ```
+   ```powershell
+   winget install Microsoft.VisualStudio.2022.BuildTools
+   ```
 
-    Durante l'installazione (o via Visual Studio Installer), seleziona il carico di lavoro **"Sviluppo desktop con C++"**.
+   Durante l'installazione (o via Visual Studio Installer), seleziona il carico di lavoro **"Sviluppo desktop con C++"**.
 
 2. **Toolchain Rust:**
 
-    ```powershell
-    winget install Rustlang.Rustup
-    ```
+   ```powershell
+   winget install Rustlang.Rustup
+   ```
 
-    Dopo l'installazione, apri un nuovo terminale ed esegui `rustup default stable` per assicurarti che la toolchain stabile sia attiva.
+   Dopo l'installazione, apri un nuovo terminale ed esegui `rustup default stable` per assicurarti che la toolchain stabile sia attiva.
 
 3. **Verifica** che entrambi funzionano:
-    ```powershell
-    rustc --version
-    cargo --version
-    ```
+   ```powershell
+   rustc --version
+   cargo --version
+   ```
 
 ### Windows — Opzionale
 
@@ -197,30 +197,30 @@ Esempio di campione (macOS arm64, misurato il 18 febbraio 2026):
 ### Linux / macOS — Richiesto
 
 1. **Strumenti di build essenziali:**
-    - **Linux (Debian/Ubuntu):** `sudo apt install build-essential pkg-config`
-    - **Linux (Fedora/RHEL):** `sudo dnf group install development-tools && sudo dnf install pkg-config`
-    - **macOS:** Installa Xcode Command Line Tools: `xcode-select --install`
+   - **Linux (Debian/Ubuntu):** `sudo apt install build-essential pkg-config`
+   - **Linux (Fedora/RHEL):** `sudo dnf group install development-tools && sudo dnf install pkg-config`
+   - **macOS:** Installa Xcode Command Line Tools: `xcode-select --install`
 
 2. **Toolchain Rust:**
 
-    ```bash
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-    ```
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   ```
 
-    Vedi [rustup.rs](https://rustup.rs) per dettagli.
+   Vedi [rustup.rs](https://rustup.rs) per dettagli.
 
 3. **Verifica:**
-    ```bash
-    rustc --version
-    cargo --version
-    ```
+   ```bash
+   rustc --version
+   cargo --version
+   ```
 
 ### Linux / macOS — Opzionale
 
 - **Docker** — richiesto solo se usi il [runtime Docker sandboxed](#supporto-runtime-attuale) (`runtime.kind = "docker"`).
-    - **Linux (Debian/Ubuntu):** vedi [docs.docker.com](https://docs.docker.com/engine/install/ubuntu/)
-    - **Linux (Fedora/RHEL):** vedi [docs.docker.com](https://docs.docker.com/engine/install/fedora/)
-    - **macOS:** installa Docker Desktop via [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/)
+  - **Linux (Debian/Ubuntu):** vedi [docs.docker.com](https://docs.docker.com/engine/install/ubuntu/)
+  - **Linux (Fedora/RHEL):** vedi [docs.docker.com](https://docs.docker.com/engine/install/fedora/)
+  - **macOS:** installa Docker Desktop via [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/)
 
 </details>
 
@@ -228,22 +228,22 @@ Esempio di campione (macOS arm64, misurato il 18 febbraio 2026):
 
 ### Opzione 1: Configurazione automatizzata (consigliata)
 
-Lo script `bootstrap.sh` installa Rust, clona ZeroClaw, lo compila, e configura il tuo ambiente di sviluppo iniziale:
+Lo script `bootstrap.sh` installa Rust, clona JhedaiClaw, lo compila, e configura il tuo ambiente di sviluppo iniziale:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jhedai/jhedaiclaw/master/bootstrap.sh | bash
 ```
 
 Questo:
 
 1. Installerà Rust (se non presente)
-2. Clonerà il repository ZeroClaw
-3. Compilerà ZeroClaw in modalità release
-4. Installerà `zeroclaw` in `~/.cargo/bin/`
-5. Creerà la struttura del workspace di default in `~/.zeroclaw/workspace/`
-6. Genererà un file di configurazione iniziale `~/.zeroclaw/workspace/config.toml`
+2. Clonerà il repository JhedaiClaw
+3. Compilerà JhedaiClaw in modalità release
+4. Installerà `jhedaiclaw` in `~/.cargo/bin/`
+5. Creerà la struttura del workspace di default in `~/.jhedaiclaw/workspace/`
+6. Genererà un file di configurazione iniziale `~/.jhedaiclaw/workspace/config.toml`
 
-Dopo il bootstrap, ricarica la tua shell o esegui `source ~/.cargo/env` per usare il comando `zeroclaw` globalmente.
+Dopo il bootstrap, ricarica la tua shell o esegui `source ~/.cargo/env` per usare il comando `jhedaiclaw` globalmente.
 
 ### Opzione 2: Installazione manuale
 
@@ -252,8 +252,8 @@ Dopo il bootstrap, ricarica la tua shell o esegui `source ~/.cargo/env` per usar
 
 ```bash
 # 1. Clona il repository
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/jhedai/jhedaiclaw.git
+cd jhedaiclaw
 
 # 2. Compila in release
 cargo build --release --locked
@@ -262,11 +262,11 @@ cargo build --release --locked
 cargo install --path . --locked
 
 # 4. Inizializza il workspace
-zeroclaw init
+jhedaiclaw init
 
 # 5. Verifica l'installazione
-zeroclaw --version
-zeroclaw status
+jhedaiclaw --version
+jhedaiclaw status
 ```
 
 </details>
@@ -276,7 +276,7 @@ zeroclaw status
 Una volta installato (via bootstrap o manualmente), dovresti vedere:
 
 ```
-~/.zeroclaw/workspace/
+~/.jhedaiclaw/workspace/
 ├── config.toml          # Configurazione principale
 ├── .pairing             # Segreti di pairing (generati al primo avvio)
 ├── logs/                # Log di daemon/agent
@@ -286,14 +286,14 @@ Una volta installato (via bootstrap o manualmente), dovresti vedere:
 
 **Prossimi passi:**
 
-1. Configura i tuoi provider AI in `~/.zeroclaw/workspace/config.toml`
+1. Configura i tuoi provider AI in `~/.jhedaiclaw/workspace/config.toml`
 2. Controlla la [riferimento configurazione](docs/config-reference.md) per opzioni avanzate
-3. Avvia l'agente: `zeroclaw agent start`
+3. Avvia l'agente: `jhedaiclaw agent start`
 4. Testa tramite il tuo canale preferito (vedi [riferimento canali](docs/channels-reference.md))
 
 ## Configurazione
 
-Modifica `~/.zeroclaw/workspace/config.toml` per configurare provider, canali e comportamento del sistema.
+Modifica `~/.jhedaiclaw/workspace/config.toml` per configurare provider, canali e comportamento del sistema.
 
 ### Riferimento Configurazione Rapida
 
@@ -332,7 +332,7 @@ kind = "native"    # o "docker" (richiede Docker)
 
 ### Supporto Runtime (attuale)
 
-ZeroClaw supporta due backend di esecuzione del codice:
+JhedaiClaw supporta due backend di esecuzione del codice:
 
 - **`native`** (default) — esecuzione processo diretta, percorso più veloce, ideale per ambienti fidati
 - **`docker`** — isolamento container completo, politiche di sicurezza potenziate, richiede Docker
@@ -343,32 +343,32 @@ Usa `runtime.kind = "docker"` se hai bisogno di sandboxing rigoroso o isolamento
 
 ```bash
 # Gestione workspace
-zeroclaw init                # Inizializza un nuovo workspace
-zeroclaw status              # Mostra stato daemon/agent
-zeroclaw config validate     # Verifica sintassi e valori di config.toml
+jhedaiclaw init                # Inizializza un nuovo workspace
+jhedaiclaw status              # Mostra stato daemon/agent
+jhedaiclaw config validate     # Verifica sintassi e valori di config.toml
 
 # Gestione daemon
-zeroclaw daemon start        # Avvia il daemon in background
-zeroclaw daemon stop         # Ferma il daemon in esecuzione
-zeroclaw daemon restart      # Riavvia il daemon (ricaricamento config)
-zeroclaw daemon logs         # Mostra log del daemon
+jhedaiclaw daemon start        # Avvia il daemon in background
+jhedaiclaw daemon stop         # Ferma il daemon in esecuzione
+jhedaiclaw daemon restart      # Riavvia il daemon (ricaricamento config)
+jhedaiclaw daemon logs         # Mostra log del daemon
 
 # Gestione agent
-zeroclaw agent start         # Avvia l'agent (richiede daemon in esecuzione)
-zeroclaw agent stop          # Ferma l'agent
-zeroclaw agent restart       # Riavvia l'agent (ricaricamento config)
+jhedaiclaw agent start         # Avvia l'agent (richiede daemon in esecuzione)
+jhedaiclaw agent stop          # Ferma l'agent
+jhedaiclaw agent restart       # Riavvia l'agent (ricaricamento config)
 
 # Operazioni di pairing
-zeroclaw pairing init        # Genera un nuovo segreto di pairing
-zeroclaw pairing rotate      # Ruota il segreto di pairing esistente
+jhedaiclaw pairing init        # Genera un nuovo segreto di pairing
+jhedaiclaw pairing rotate      # Ruota il segreto di pairing esistente
 
 # Tunneling (per esposizione pubblica)
-zeroclaw tunnel start        # Avvia un tunnel verso il daemon locale
-zeroclaw tunnel stop         # Ferma il tunnel attivo
+jhedaiclaw tunnel start        # Avvia un tunnel verso il daemon locale
+jhedaiclaw tunnel stop         # Ferma il tunnel attivo
 
 # Diagnostica
-zeroclaw doctor              # Esegue controlli di salute del sistema
-zeroclaw version             # Mostra versione e informazioni di build
+jhedaiclaw doctor              # Esegue controlli di salute del sistema
+jhedaiclaw version             # Mostra versione e informazioni di build
 ```
 
 Vedi [Riferimento Comandi](docs/commands-reference.md) per opzioni ed esempi completi.
@@ -406,9 +406,9 @@ Per distribuzione e operazioni runtime:
 - Guida Distribuzione di Rete: [docs/network-deployment.md](docs/network-deployment.md)
 - Playbook Agent Proxy: [docs/proxy-agent-playbook.md](docs/proxy-agent-playbook.md)
 
-## Supportare ZeroClaw
+## Supportare JhedaiClaw
 
-Se ZeroClaw aiuta il tuo lavoro e desideri supportare lo sviluppo continuo, puoi donare qui:
+Se JhedaiClaw aiuta il tuo lavoro e desideri supportare lo sviluppo continuo, puoi donare qui:
 
 <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=for-the-badge&logo=buy-me-a-coffee" alt="Offrimi un Caffè" /></a>
 
@@ -439,30 +439,30 @@ Thank you to everyone who opened issues, reviewed PRs, translated docs, and help
 
 ## ⚠️ Repository Ufficiale e Avviso di Contraffazione
 
-**Questo è l'unico repository ufficiale di ZeroClaw:**
+**Questo è l'unico repository ufficiale di JhedaiClaw:**
 
-> <https://github.com/zeroclaw-labs/zeroclaw>
+> <https://github.com/jhedai/jhedaiclaw>
 
-Qualsiasi altro repository, organizzazione, dominio o pacchetto che afferma di essere "ZeroClaw" o che implica affiliazione con ZeroClaw Labs è **non autorizzato e non affiliato a questo progetto**. I fork non autorizzati noti saranno elencati in [TRADEMARK.md](TRADEMARK.md).
+Qualsiasi altro repository, organizzazione, dominio o pacchetto che afferma di essere "JhedaiClaw" o che implica affiliazione con JhedaiClaw Labs è **non autorizzato e non affiliato a questo progetto**. I fork non autorizzati noti saranno elencati in [TRADEMARK.md](TRADEMARK.md).
 
-Se incontri contraffazione o uso improprio del marchio, per favore [apri una issue](https://github.com/zeroclaw-labs/zeroclaw/issues).
+Se incontri contraffazione o uso improprio del marchio, per favore [apri una issue](https://github.com/jhedai/jhedaiclaw/issues).
 
 ---
 
 ## Licenza
 
-ZeroClaw è doppia licenza per massima apertura e protezione dei contributori:
+JhedaiClaw è doppia licenza per massima apertura e protezione dei contributori:
 
-| Licenza                      | Casi d'Uso                                            |
-| ---------------------------- | ------------------------------------------------------------ |
-| [MIT](LICENSE-MIT)               | Open-source, ricerca, accademico, uso personale          |
+| Licenza                      | Casi d'Uso                                                    |
+| ---------------------------- | ------------------------------------------------------------- |
+| [MIT](LICENSE-MIT)           | Open-source, ricerca, accademico, uso personale               |
 | [Apache 2.0](LICENSE-APACHE) | Protezione brevetti, istituzionale, distribuzione commerciale |
 
 Puoi scegliere una delle due licenze. **I contributori concedono automaticamente diritti sotto entrambe** — vedi [CLA.md](CLA.md) per l'accordo completo dei contributori.
 
 ### Marchio
 
-Il nome **ZeroClaw** e il logo sono marchi registrati di ZeroClaw Labs. Questa licenza non concede il permesso di usarli per implicare approvazione o affiliazione. Vedi [TRADEMARK.md](TRADEMARK.md) per usi permessi e proibiti.
+Il nome **JhedaiClaw** e il logo sono marchi registrati di JhedaiClaw Labs. Questa licenza non concede il permesso di usarli per implicare approvazione o affiliazione. Vedi [TRADEMARK.md](TRADEMARK.md) per usi permessi e proibiti.
 
 ### Protezioni dei Contributori
 
@@ -482,20 +482,20 @@ Vedi [CONTRIBUTING.md](CONTRIBUTING.md) e [CLA.md](CLA.md). Implementa un trait,
 - Nuovo `Tool` → `src/tools/`
 - Nuova `Memory` → `src/memory/`
 - Nuovo `Tunnel` → `src/tunnel/`
-- Nuova `Skill` → `~/.zeroclaw/workspace/skills/<n>/`
+- Nuova `Skill` → `~/.jhedaiclaw/workspace/skills/<n>/`
 
 ---
 
-**ZeroClaw** — Zero overhead. Zero compromesso. Distribuisci ovunque. Scambia qualsiasi cosa. 🦀
+**JhedaiClaw** — Zero overhead. Zero compromesso. Distribuisci ovunque. Scambia qualsiasi cosa. 🦀
 
 ## Storico Stelle
 
 <p align="center">
-  <a href="https://www.star-history.com/#zeroclaw-labs/zeroclaw&type=date&legend=top-left">
+  <a href="https://www.star-history.com/#jhedai/jhedaiclaw&type=date&legend=top-left">
     <picture>
-     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&theme=dark&legend=top-left" />
-     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
-     <img alt="Grafico Storico Stelle" src="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
+     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=jhedai/jhedaiclaw&type=date&theme=dark&legend=top-left" />
+     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=jhedai/jhedaiclaw&type=date&legend=top-left" />
+     <img alt="Grafico Storico Stelle" src="https://api.star-history.com/svg?repos=jhedai/jhedaiclaw&type=date&legend=top-left" />
     </picture>
   </a>
 </p>

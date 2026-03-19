@@ -114,7 +114,7 @@ impl WatiChannel {
             tracing::warn!(
                 "WATI: ignoring message from unauthorized sender: {normalized_phone}. \
                 Add to channels.wati.allowed_numbers in config.toml, \
-                or run `zeroclaw onboard --channels-only` to configure interactively."
+                or run `jhedaiclaw onboard --channels-only` to configure interactively."
             );
             return messages;
         }

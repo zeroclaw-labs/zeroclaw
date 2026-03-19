@@ -1,4 +1,4 @@
-# Tham khảo cấu hình ZeroClaw
+# Tham khảo cấu hình JhedaiClaw
 
 Các mục cấu hình thường dùng và giá trị mặc định.
 
@@ -6,33 +6,33 @@ Xác minh lần cuối: **2026-02-19**.
 
 Thứ tự tìm config khi khởi động:
 
-1. Biến `ZEROCLAW_WORKSPACE` (nếu được đặt)
-2. Marker `~/.zeroclaw/active_workspace.toml` (nếu có)
-3. Mặc định `~/.zeroclaw/config.toml`
+1. Biến `JHEDAICLAW_WORKSPACE` (nếu được đặt)
+2. Marker `~/.jhedaiclaw/active_workspace.toml` (nếu có)
+3. Mặc định `~/.jhedaiclaw/config.toml`
 
-ZeroClaw ghi log đường dẫn config đã giải quyết khi khởi động ở mức `INFO`:
+JhedaiClaw ghi log đường dẫn config đã giải quyết khi khởi động ở mức `INFO`:
 
 - `Config loaded` với các trường: `path`, `workspace`, `source`, `initialized`
 
 Lệnh xuất schema:
 
-- `zeroclaw config schema` (xuất JSON Schema draft 2020-12 ra stdout)
+- `jhedaiclaw config schema` (xuất JSON Schema draft 2020-12 ra stdout)
 
 ## Khóa chính
 
-| Khóa | Mặc định | Ghi chú |
-|---|---|---|
-| `default_provider` | `openrouter` | ID hoặc bí danh provider |
-| `default_model` | `anthropic/claude-sonnet-4-6` | Model định tuyến qua provider đã chọn |
-| `default_temperature` | `0.7` | Nhiệt độ model |
+| Khóa                  | Mặc định                      | Ghi chú                               |
+| --------------------- | ----------------------------- | ------------------------------------- |
+| `default_provider`    | `openrouter`                  | ID hoặc bí danh provider              |
+| `default_model`       | `anthropic/claude-sonnet-4-6` | Model định tuyến qua provider đã chọn |
+| `default_temperature` | `0.7`                         | Nhiệt độ model                        |
 
 ## `[observability]`
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `backend` | `none` | Backend quan sát: `none`, `noop`, `log`, `prometheus`, `otel`, `opentelemetry` hoặc `otlp` |
-| `otel_endpoint` | `http://localhost:4318` | Endpoint OTLP HTTP khi backend là `otel` |
-| `otel_service_name` | `zeroclaw` | Tên dịch vụ gửi đến OTLP collector |
+| Khóa                | Mặc định                | Mục đích                                                                                   |
+| ------------------- | ----------------------- | ------------------------------------------------------------------------------------------ |
+| `backend`           | `none`                  | Backend quan sát: `none`, `noop`, `log`, `prometheus`, `otel`, `opentelemetry` hoặc `otlp` |
+| `otel_endpoint`     | `http://localhost:4318` | Endpoint OTLP HTTP khi backend là `otel`                                                   |
+| `otel_service_name` | `jhedaiclaw`            | Tên dịch vụ gửi đến OTLP collector                                                         |
 
 Lưu ý:
 
@@ -45,32 +45,32 @@ Ví dụ:
 [observability]
 backend = "otel"
 otel_endpoint = "http://localhost:4318"
-otel_service_name = "zeroclaw"
+otel_service_name = "jhedaiclaw"
 ```
 
 ## Ghi đè provider qua biến môi trường
 
 Provider cũng có thể chọn qua biến môi trường. Thứ tự ưu tiên:
 
-1. `ZEROCLAW_PROVIDER` (ghi đè tường minh, luôn thắng khi có giá trị)
+1. `JHEDAICLAW_PROVIDER` (ghi đè tường minh, luôn thắng khi có giá trị)
 2. `PROVIDER` (dự phòng kiểu cũ, chỉ áp dụng khi provider trong config chưa đặt hoặc vẫn là `openrouter`)
 3. `default_provider` trong `config.toml`
 
 Lưu ý cho người dùng container:
 
 - Nếu `config.toml` đặt provider tùy chỉnh như `custom:https://.../v1`, biến `PROVIDER=openrouter` mặc định từ Docker/container sẽ không thay thế nó.
-- Dùng `ZEROCLAW_PROVIDER` khi cố ý muốn biến môi trường ghi đè provider đã cấu hình.
+- Dùng `JHEDAICLAW_PROVIDER` khi cố ý muốn biến môi trường ghi đè provider đã cấu hình.
 
 ## `[agent]`
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `compact_context` | `false` | Khi bật: bootstrap_max_chars=6000, rag_chunk_limit=2. Dùng cho model 13B trở xuống |
-| `max_tool_iterations` | `10` | Số vòng lặp tool-call tối đa mỗi tin nhắn trên CLI, gateway và channels |
-| `max_history_messages` | `50` | Số tin nhắn lịch sử tối đa giữ lại mỗi phiên |
-| `parallel_tools` | `false` | Bật thực thi tool song song trong một lượt |
-| `tool_dispatcher` | `auto` | Chiến lược dispatch tool |
-| `tool_call_dedup_exempt` | `[]` | Tên tool được miễn kiểm tra trùng lặp trong cùng một lượt |
+| Khóa                     | Mặc định | Mục đích                                                                           |
+| ------------------------ | -------- | ---------------------------------------------------------------------------------- |
+| `compact_context`        | `false`  | Khi bật: bootstrap_max_chars=6000, rag_chunk_limit=2. Dùng cho model 13B trở xuống |
+| `max_tool_iterations`    | `10`     | Số vòng lặp tool-call tối đa mỗi tin nhắn trên CLI, gateway và channels            |
+| `max_history_messages`   | `50`     | Số tin nhắn lịch sử tối đa giữ lại mỗi phiên                                       |
+| `parallel_tools`         | `false`  | Bật thực thi tool song song trong một lượt                                         |
+| `tool_dispatcher`        | `auto`   | Chiến lược dispatch tool                                                           |
+| `tool_call_dedup_exempt` | `[]`     | Tên tool được miễn kiểm tra trùng lặp trong cùng một lượt                          |
 
 Lưu ý:
 
@@ -84,17 +84,17 @@ Lưu ý:
 
 Cấu hình agent phụ (sub-agent). Mỗi khóa dưới `[agents]` định nghĩa một agent phụ có tên mà agent chính có thể ủy quyền.
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `provider` | _bắt buộc_ | Tên provider (ví dụ `"ollama"`, `"openrouter"`, `"anthropic"`) |
-| `model` | _bắt buộc_ | Tên model cho agent phụ |
-| `system_prompt` | chưa đặt | System prompt tùy chỉnh cho agent phụ (tùy chọn) |
-| `api_key` | chưa đặt | API key tùy chỉnh (mã hóa khi `secrets.encrypt = true`) |
-| `temperature` | chưa đặt | Temperature tùy chỉnh cho agent phụ |
-| `max_depth` | `3` | Độ sâu đệ quy tối đa cho ủy quyền lồng nhau |
-| `agentic` | `false` | Bật chế độ vòng lặp tool-call nhiều lượt cho agent phụ |
-| `allowed_tools` | `[]` | Danh sách tool được phép ở chế độ agentic |
-| `max_iterations` | `10` | Số vòng tool-call tối đa cho chế độ agentic |
+| Khóa             | Mặc định   | Mục đích                                                       |
+| ---------------- | ---------- | -------------------------------------------------------------- |
+| `provider`       | _bắt buộc_ | Tên provider (ví dụ `"ollama"`, `"openrouter"`, `"anthropic"`) |
+| `model`          | _bắt buộc_ | Tên model cho agent phụ                                        |
+| `system_prompt`  | chưa đặt   | System prompt tùy chỉnh cho agent phụ (tùy chọn)               |
+| `api_key`        | chưa đặt   | API key tùy chỉnh (mã hóa khi `secrets.encrypt = true`)        |
+| `temperature`    | chưa đặt   | Temperature tùy chỉnh cho agent phụ                            |
+| `max_depth`      | `3`        | Độ sâu đệ quy tối đa cho ủy quyền lồng nhau                    |
+| `agentic`        | `false`    | Bật chế độ vòng lặp tool-call nhiều lượt cho agent phụ         |
+| `allowed_tools`  | `[]`       | Danh sách tool được phép ở chế độ agentic                      |
+| `max_iterations` | `10`       | Số vòng tool-call tối đa cho chế độ agentic                    |
 
 Lưu ý:
 
@@ -120,8 +120,8 @@ temperature = 0.2
 
 ## `[runtime]`
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
+| Khóa                | Mặc định          | Mục đích                                                    |
+| ------------------- | ----------------- | ----------------------------------------------------------- |
 | `reasoning_enabled` | chưa đặt (`None`) | Ghi đè toàn cục cho reasoning/thinking trên provider hỗ trợ |
 
 Lưu ý:
@@ -132,44 +132,44 @@ Lưu ý:
 
 ## `[skills]`
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `open_skills_enabled` | `false` | Cho phép tải/đồng bộ kho `open-skills` cộng đồng |
-| `open_skills_dir` | chưa đặt | Đường dẫn cục bộ cho `open-skills` (mặc định `$HOME/open-skills` khi bật) |
+| Khóa                  | Mặc định | Mục đích                                                                  |
+| --------------------- | -------- | ------------------------------------------------------------------------- |
+| `open_skills_enabled` | `false`  | Cho phép tải/đồng bộ kho `open-skills` cộng đồng                          |
+| `open_skills_dir`     | chưa đặt | Đường dẫn cục bộ cho `open-skills` (mặc định `$HOME/open-skills` khi bật) |
 
 Lưu ý:
 
-- Mặc định an toàn: ZeroClaw **không** clone hay đồng bộ `open-skills` trừ khi `open_skills_enabled = true`.
+- Mặc định an toàn: JhedaiClaw **không** clone hay đồng bộ `open-skills` trừ khi `open_skills_enabled = true`.
 - Ghi đè qua biến môi trường:
-  - `ZEROCLAW_OPEN_SKILLS_ENABLED` chấp nhận `1/0`, `true/false`, `yes/no`, `on/off`.
-  - `ZEROCLAW_OPEN_SKILLS_DIR` ghi đè đường dẫn kho khi có giá trị.
-- Thứ tự ưu tiên: `ZEROCLAW_OPEN_SKILLS_ENABLED` → `skills.open_skills_enabled` trong `config.toml` → mặc định `false`.
+  - `JHEDAICLAW_OPEN_SKILLS_ENABLED` chấp nhận `1/0`, `true/false`, `yes/no`, `on/off`.
+  - `JHEDAICLAW_OPEN_SKILLS_DIR` ghi đè đường dẫn kho khi có giá trị.
+- Thứ tự ưu tiên: `JHEDAICLAW_OPEN_SKILLS_ENABLED` → `skills.open_skills_enabled` trong `config.toml` → mặc định `false`.
 
 ## `[composio]`
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `enabled` | `false` | Bật công cụ OAuth do Composio quản lý |
-| `api_key` | chưa đặt | API key Composio cho tool `composio` |
+| Khóa        | Mặc định  | Mục đích                                       |
+| ----------- | --------- | ---------------------------------------------- |
+| `enabled`   | `false`   | Bật công cụ OAuth do Composio quản lý          |
+| `api_key`   | chưa đặt  | API key Composio cho tool `composio`           |
 | `entity_id` | `default` | `user_id` mặc định gửi khi gọi connect/execute |
 
 Lưu ý:
 
 - Tương thích ngược: `enable = true` kiểu cũ được chấp nhận như bí danh cho `enabled = true`.
 - Nếu `enabled = false` hoặc thiếu `api_key`, tool `composio` không được đăng ký.
-- ZeroClaw yêu cầu Composio v3 tools với `toolkit_versions=latest` và thực thi với `version="latest"` để tránh bản tool mặc định cũ.
+- JhedaiClaw yêu cầu Composio v3 tools với `toolkit_versions=latest` và thực thi với `version="latest"` để tránh bản tool mặc định cũ.
 - Luồng thông thường: gọi `connect`, hoàn tất OAuth trên trình duyệt, rồi chạy `execute` cho hành động mong muốn.
 - Nếu Composio trả lỗi thiếu connected-account, gọi `list_accounts` (tùy chọn với `app`) và truyền `connected_account_id` trả về cho `execute`.
 
 ## `[cost]`
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `enabled` | `false` | Bật theo dõi chi phí |
-| `daily_limit_usd` | `10.00` | Giới hạn chi tiêu hàng ngày (USD) |
-| `monthly_limit_usd` | `100.00` | Giới hạn chi tiêu hàng tháng (USD) |
-| `warn_at_percent` | `80` | Cảnh báo khi chi tiêu đạt tỷ lệ phần trăm này |
-| `allow_override` | `false` | Cho phép vượt ngân sách khi dùng cờ `--override` |
+| Khóa                | Mặc định | Mục đích                                         |
+| ------------------- | -------- | ------------------------------------------------ |
+| `enabled`           | `false`  | Bật theo dõi chi phí                             |
+| `daily_limit_usd`   | `10.00`  | Giới hạn chi tiêu hàng ngày (USD)                |
+| `monthly_limit_usd` | `100.00` | Giới hạn chi tiêu hàng tháng (USD)               |
+| `warn_at_percent`   | `80`     | Cảnh báo khi chi tiêu đạt tỷ lệ phần trăm này    |
+| `allow_override`    | `false`  | Cho phép vượt ngân sách khi dùng cờ `--override` |
 
 Lưu ý:
 
@@ -179,11 +179,11 @@ Lưu ý:
 
 ## `[identity]`
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `format` | `openclaw` | Định dạng danh tính: `"openclaw"` (mặc định) hoặc `"aieos"` |
-| `aieos_path` | chưa đặt | Đường dẫn file AIEOS JSON (tương đối với workspace) |
-| `aieos_inline` | chưa đặt | AIEOS JSON nội tuyến (thay thế cho đường dẫn file) |
+| Khóa           | Mặc định   | Mục đích                                                    |
+| -------------- | ---------- | ----------------------------------------------------------- |
+| `format`       | `openclaw` | Định dạng danh tính: `"openclaw"` (mặc định) hoặc `"aieos"` |
+| `aieos_path`   | chưa đặt   | Đường dẫn file AIEOS JSON (tương đối với workspace)         |
+| `aieos_inline` | chưa đặt   | AIEOS JSON nội tuyến (thay thế cho đường dẫn file)          |
 
 Lưu ý:
 
@@ -192,45 +192,45 @@ Lưu ý:
 
 ## `[multimodal]`
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `max_images` | `4` | Số marker ảnh tối đa mỗi yêu cầu |
-| `max_image_size_mb` | `5` | Giới hạn kích thước ảnh trước khi mã hóa base64 |
-| `allow_remote_fetch` | `false` | Cho phép tải ảnh từ URL `http(s)` trong marker |
+| Khóa                 | Mặc định | Mục đích                                        |
+| -------------------- | -------- | ----------------------------------------------- |
+| `max_images`         | `4`      | Số marker ảnh tối đa mỗi yêu cầu                |
+| `max_image_size_mb`  | `5`      | Giới hạn kích thước ảnh trước khi mã hóa base64 |
+| `allow_remote_fetch` | `false`  | Cho phép tải ảnh từ URL `http(s)` trong marker  |
 
 Lưu ý:
 
-- Runtime chấp nhận marker ảnh trong tin nhắn với cú pháp: ``[IMAGE:<source>]``.
+- Runtime chấp nhận marker ảnh trong tin nhắn với cú pháp: `[IMAGE:<source>]`.
 - Nguồn hỗ trợ:
-  - Đường dẫn file cục bộ (ví dụ ``[IMAGE:/tmp/screenshot.png]``)
-- Data URI (ví dụ ``[IMAGE:data:image/png;base64,...]``)
+  - Đường dẫn file cục bộ (ví dụ `[IMAGE:/tmp/screenshot.png]`)
+- Data URI (ví dụ `[IMAGE:data:image/png;base64,...]`)
 - URL từ xa chỉ khi `allow_remote_fetch = true`
 - Kiểu MIME cho phép: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/bmp`.
 - Khi provider đang dùng không hỗ trợ vision, yêu cầu thất bại với lỗi capability có cấu trúc (`capability=vision`) thay vì bỏ qua ảnh.
 
 ## `[browser]`
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `enabled` | `false` | Bật tool `browser_open` (mở URL trong trình duyệt mặc định hệ thống, không thu thập dữ liệu) |
-| `allowed_domains` | `[]` | Tên miền cho phép cho `browser_open` (khớp chính xác hoặc subdomain) |
-| `session_name` | chưa đặt | Tên phiên trình duyệt (cho tự động hóa agent-browser) |
-| `backend` | `agent_browser` | Backend tự động hóa: `"agent_browser"`, `"rust_native"`, `"computer_use"` hoặc `"auto"` |
-| `native_headless` | `true` | Chế độ headless cho backend rust-native |
-| `native_webdriver_url` | `http://127.0.0.1:9515` | URL endpoint WebDriver cho backend rust-native |
-| `native_chrome_path` | chưa đặt | Đường dẫn Chrome/Chromium tùy chọn cho backend rust-native |
+| Khóa                   | Mặc định                | Mục đích                                                                                     |
+| ---------------------- | ----------------------- | -------------------------------------------------------------------------------------------- |
+| `enabled`              | `false`                 | Bật tool `browser_open` (mở URL trong trình duyệt mặc định hệ thống, không thu thập dữ liệu) |
+| `allowed_domains`      | `[]`                    | Tên miền cho phép cho `browser_open` (khớp chính xác hoặc subdomain)                         |
+| `session_name`         | chưa đặt                | Tên phiên trình duyệt (cho tự động hóa agent-browser)                                        |
+| `backend`              | `agent_browser`         | Backend tự động hóa: `"agent_browser"`, `"rust_native"`, `"computer_use"` hoặc `"auto"`      |
+| `native_headless`      | `true`                  | Chế độ headless cho backend rust-native                                                      |
+| `native_webdriver_url` | `http://127.0.0.1:9515` | URL endpoint WebDriver cho backend rust-native                                               |
+| `native_chrome_path`   | chưa đặt                | Đường dẫn Chrome/Chromium tùy chọn cho backend rust-native                                   |
 
 ### `[browser.computer_use]`
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `endpoint` | `http://127.0.0.1:8787/v1/actions` | Endpoint sidecar cho hành động computer-use (chuột/bàn phím/screenshot cấp OS) |
-| `api_key` | chưa đặt | Bearer token tùy chọn cho sidecar computer-use (mã hóa khi lưu) |
-| `timeout_ms` | `15000` | Thời gian chờ mỗi hành động (mili giây) |
-| `allow_remote_endpoint` | `false` | Cho phép endpoint từ xa/công khai cho sidecar |
-| `window_allowlist` | `[]` | Danh sách cho phép tiêu đề cửa sổ/tiến trình gửi đến sidecar |
-| `max_coordinate_x` | chưa đặt | Giới hạn trục X cho hành động dựa trên tọa độ (tùy chọn) |
-| `max_coordinate_y` | chưa đặt | Giới hạn trục Y cho hành động dựa trên tọa độ (tùy chọn) |
+| Khóa                    | Mặc định                           | Mục đích                                                                       |
+| ----------------------- | ---------------------------------- | ------------------------------------------------------------------------------ |
+| `endpoint`              | `http://127.0.0.1:8787/v1/actions` | Endpoint sidecar cho hành động computer-use (chuột/bàn phím/screenshot cấp OS) |
+| `api_key`               | chưa đặt                           | Bearer token tùy chọn cho sidecar computer-use (mã hóa khi lưu)                |
+| `timeout_ms`            | `15000`                            | Thời gian chờ mỗi hành động (mili giây)                                        |
+| `allow_remote_endpoint` | `false`                            | Cho phép endpoint từ xa/công khai cho sidecar                                  |
+| `window_allowlist`      | `[]`                               | Danh sách cho phép tiêu đề cửa sổ/tiến trình gửi đến sidecar                   |
+| `max_coordinate_x`      | chưa đặt                           | Giới hạn trục X cho hành động dựa trên tọa độ (tùy chọn)                       |
+| `max_coordinate_y`      | chưa đặt                           | Giới hạn trục Y cho hành động dựa trên tọa độ (tùy chọn)                       |
 
 Lưu ý:
 
@@ -240,12 +240,12 @@ Lưu ý:
 
 ## `[http_request]`
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `enabled` | `false` | Bật tool `http_request` cho tương tác API |
-| `allowed_domains` | `[]` | Tên miền cho phép (khớp chính xác hoặc subdomain) |
+| Khóa                | Mặc định  | Mục đích                                          |
+| ------------------- | --------- | ------------------------------------------------- |
+| `enabled`           | `false`   | Bật tool `http_request` cho tương tác API         |
+| `allowed_domains`   | `[]`      | Tên miền cho phép (khớp chính xác hoặc subdomain) |
 | `max_response_size` | `1000000` | Kích thước response tối đa (byte, mặc định: 1 MB) |
-| `timeout_secs` | `30` | Thời gian chờ yêu cầu (giây) |
+| `timeout_secs`      | `30`      | Thời gian chờ yêu cầu (giây)                      |
 
 Lưu ý:
 
@@ -254,27 +254,27 @@ Lưu ý:
 
 ## `[gateway]`
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `host` | `127.0.0.1` | Địa chỉ bind |
-| `port` | `3000` | Cổng lắng nghe gateway |
-| `require_pairing` | `true` | Yêu cầu ghép nối trước khi xác thực bearer |
-| `allow_public_bind` | `false` | Chặn lộ public do vô ý |
+| Khóa                | Mặc định    | Mục đích                                   |
+| ------------------- | ----------- | ------------------------------------------ |
+| `host`              | `127.0.0.1` | Địa chỉ bind                               |
+| `port`              | `3000`      | Cổng lắng nghe gateway                     |
+| `require_pairing`   | `true`      | Yêu cầu ghép nối trước khi xác thực bearer |
+| `allow_public_bind` | `false`     | Chặn lộ public do vô ý                     |
 
 ## `[autonomy]`
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `level` | `supervised` | `read_only`, `supervised` hoặc `full` |
-| `workspace_only` | `true` | Giới hạn ghi/lệnh trong phạm vi workspace |
-| `allowed_commands` | _bắt buộc để chạy shell_ | Danh sách lệnh được phép |
-| `forbidden_paths` | `[]` | Danh sách đường dẫn bị cấm |
-| `max_actions_per_hour` | `100` | Ngân sách hành động mỗi giờ |
-| `max_cost_per_day_cents` | `1000` | Giới hạn chi tiêu mỗi ngày (cent) |
-| `require_approval_for_medium_risk` | `true` | Yêu cầu phê duyệt cho lệnh rủi ro trung bình |
-| `block_high_risk_commands` | `true` | Chặn cứng lệnh rủi ro cao |
-| `auto_approve` | `[]` | Thao tác tool luôn được tự động phê duyệt |
-| `always_ask` | `[]` | Thao tác tool luôn yêu cầu phê duyệt |
+| Khóa                               | Mặc định                 | Mục đích                                     |
+| ---------------------------------- | ------------------------ | -------------------------------------------- |
+| `level`                            | `supervised`             | `read_only`, `supervised` hoặc `full`        |
+| `workspace_only`                   | `true`                   | Giới hạn ghi/lệnh trong phạm vi workspace    |
+| `allowed_commands`                 | _bắt buộc để chạy shell_ | Danh sách lệnh được phép                     |
+| `forbidden_paths`                  | `[]`                     | Danh sách đường dẫn bị cấm                   |
+| `max_actions_per_hour`             | `100`                    | Ngân sách hành động mỗi giờ                  |
+| `max_cost_per_day_cents`           | `1000`                   | Giới hạn chi tiêu mỗi ngày (cent)            |
+| `require_approval_for_medium_risk` | `true`                   | Yêu cầu phê duyệt cho lệnh rủi ro trung bình |
+| `block_high_risk_commands`         | `true`                   | Chặn cứng lệnh rủi ro cao                    |
+| `auto_approve`                     | `[]`                     | Thao tác tool luôn được tự động phê duyệt    |
+| `always_ask`                       | `[]`                     | Thao tác tool luôn yêu cầu phê duyệt         |
 
 Lưu ý:
 
@@ -284,15 +284,15 @@ Lưu ý:
 
 ## `[memory]`
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `backend` | `sqlite` | `sqlite`, `lucid`, `markdown`, `none` |
-| `auto_save` | `true` | Chỉ lưu đầu vào người dùng (đầu ra assistant bị loại) |
-| `embedding_provider` | `none` | `none`, `openai` hoặc endpoint tùy chỉnh |
-| `embedding_model` | `text-embedding-3-small` | ID model embedding, hoặc tuyến `hint:<name>` |
-| `embedding_dimensions` | `1536` | Kích thước vector mong đợi cho model embedding đã chọn |
-| `vector_weight` | `0.7` | Trọng số vector trong xếp hạng kết hợp |
-| `keyword_weight` | `0.3` | Trọng số từ khóa trong xếp hạng kết hợp |
+| Khóa                   | Mặc định                 | Mục đích                                               |
+| ---------------------- | ------------------------ | ------------------------------------------------------ |
+| `backend`              | `sqlite`                 | `sqlite`, `lucid`, `markdown`, `none`                  |
+| `auto_save`            | `true`                   | Chỉ lưu đầu vào người dùng (đầu ra assistant bị loại)  |
+| `embedding_provider`   | `none`                   | `none`, `openai` hoặc endpoint tùy chỉnh               |
+| `embedding_model`      | `text-embedding-3-small` | ID model embedding, hoặc tuyến `hint:<name>`           |
+| `embedding_dimensions` | `1536`                   | Kích thước vector mong đợi cho model embedding đã chọn |
+| `vector_weight`        | `0.7`                    | Trọng số vector trong xếp hạng kết hợp                 |
+| `keyword_weight`       | `0.3`                    | Trọng số từ khóa trong xếp hạng kết hợp                |
 
 Lưu ý:
 
@@ -304,22 +304,22 @@ Route hint giúp tên tích hợp ổn định khi model ID thay đổi.
 
 ### `[[model_routes]]`
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `hint` | _bắt buộc_ | Tên hint tác vụ (ví dụ `"reasoning"`, `"fast"`, `"code"`, `"summarize"`) |
-| `provider` | _bắt buộc_ | Provider đích (phải khớp tên provider đã biết) |
-| `model` | _bắt buộc_ | Model sử dụng với provider đó |
-| `api_key` | chưa đặt | API key tùy chỉnh cho provider của route này (tùy chọn) |
+| Khóa       | Mặc định   | Mục đích                                                                 |
+| ---------- | ---------- | ------------------------------------------------------------------------ |
+| `hint`     | _bắt buộc_ | Tên hint tác vụ (ví dụ `"reasoning"`, `"fast"`, `"code"`, `"summarize"`) |
+| `provider` | _bắt buộc_ | Provider đích (phải khớp tên provider đã biết)                           |
+| `model`    | _bắt buộc_ | Model sử dụng với provider đó                                            |
+| `api_key`  | chưa đặt   | API key tùy chỉnh cho provider của route này (tùy chọn)                  |
 
 ### `[[embedding_routes]]`
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `hint` | _bắt buộc_ | Tên route hint (ví dụ `"semantic"`, `"archive"`, `"faq"`) |
-| `provider` | _bắt buộc_ | Embedding provider (`"none"`, `"openai"` hoặc `"custom:<url>"`) |
-| `model` | _bắt buộc_ | Model embedding sử dụng với provider đó |
-| `dimensions` | chưa đặt | Ghi đè kích thước embedding cho route này (tùy chọn) |
-| `api_key` | chưa đặt | API key tùy chỉnh cho provider của route này (tùy chọn) |
+| Khóa         | Mặc định   | Mục đích                                                        |
+| ------------ | ---------- | --------------------------------------------------------------- |
+| `hint`       | _bắt buộc_ | Tên route hint (ví dụ `"semantic"`, `"archive"`, `"faq"`)       |
+| `provider`   | _bắt buộc_ | Embedding provider (`"none"`, `"openai"` hoặc `"custom:<url>"`) |
+| `model`      | _bắt buộc_ | Model embedding sử dụng với provider đó                         |
+| `dimensions` | chưa đặt   | Ghi đè kích thước embedding cho route này (tùy chọn)            |
+| `api_key`    | chưa đặt   | API key tùy chỉnh cho provider của route này (tùy chọn)         |
 
 ```toml
 [memory]
@@ -341,27 +341,27 @@ Chiến lược nâng cấp:
 
 1. Giữ hint ổn định (`hint:reasoning`, `hint:semantic`).
 2. Chỉ cập nhật `model = "...phiên-bản-mới..."` trong mục route.
-3. Kiểm tra bằng `zeroclaw doctor` trước khi khởi động lại/triển khai.
+3. Kiểm tra bằng `jhedaiclaw doctor` trước khi khởi động lại/triển khai.
 
 ## `[query_classification]`
 
 Tự động định tuyến tin nhắn đến hint `[[model_routes]]` theo mẫu nội dung.
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `enabled` | `false` | Bật phân loại truy vấn tự động |
-| `rules` | `[]` | Quy tắc phân loại (đánh giá theo thứ tự ưu tiên) |
+| Khóa      | Mặc định | Mục đích                                         |
+| --------- | -------- | ------------------------------------------------ |
+| `enabled` | `false`  | Bật phân loại truy vấn tự động                   |
+| `rules`   | `[]`     | Quy tắc phân loại (đánh giá theo thứ tự ưu tiên) |
 
 Mỗi rule trong `rules`:
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `hint` | _bắt buộc_ | Phải khớp giá trị hint trong `[[model_routes]]` |
-| `keywords` | `[]` | Khớp chuỗi con không phân biệt hoa thường |
-| `patterns` | `[]` | Khớp chuỗi chính xác phân biệt hoa thường (cho code fence, từ khóa như `"fn "`) |
-| `min_length` | chưa đặt | Chỉ khớp nếu độ dài tin nhắn ≥ N ký tự |
-| `max_length` | chưa đặt | Chỉ khớp nếu độ dài tin nhắn ≤ N ký tự |
-| `priority` | `0` | Rule ưu tiên cao hơn được kiểm tra trước |
+| Khóa         | Mặc định   | Mục đích                                                                        |
+| ------------ | ---------- | ------------------------------------------------------------------------------- |
+| `hint`       | _bắt buộc_ | Phải khớp giá trị hint trong `[[model_routes]]`                                 |
+| `keywords`   | `[]`       | Khớp chuỗi con không phân biệt hoa thường                                       |
+| `patterns`   | `[]`       | Khớp chuỗi chính xác phân biệt hoa thường (cho code fence, từ khóa như `"fn "`) |
+| `min_length` | chưa đặt   | Chỉ khớp nếu độ dài tin nhắn ≥ N ký tự                                          |
+| `max_length` | chưa đặt   | Chỉ khớp nếu độ dài tin nhắn ≤ N ký tự                                          |
+| `priority`   | `0`        | Rule ưu tiên cao hơn được kiểm tra trước                                        |
 
 ```toml
 [query_classification]
@@ -384,9 +384,9 @@ priority = 5
 
 Cấu hình kênh cấp cao nằm dưới `channels_config`.
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `message_timeout_secs` | `300` | Thời gian chờ cơ bản (giây) cho xử lý tin nhắn kênh; runtime tự điều chỉnh theo độ sâu tool-loop (lên đến 4x) |
+| Khóa                   | Mặc định | Mục đích                                                                                                      |
+| ---------------------- | -------- | ------------------------------------------------------------------------------------------------------------- |
+| `message_timeout_secs` | `300`    | Thời gian chờ cơ bản (giây) cho xử lý tin nhắn kênh; runtime tự điều chỉnh theo độ sâu tool-loop (lên đến 4x) |
 
 Ví dụ:
 
@@ -405,7 +405,7 @@ Lưu ý:
 - Khi timeout xảy ra, người dùng nhận: `⚠️ Request timed out while waiting for the model. Please try again.`
 - Hành vi ngắt chỉ Telegram được điều khiển bằng `channels_config.telegram.interrupt_on_new_message` (mặc định `false`).
   Khi bật, tin nhắn mới từ cùng người gửi trong cùng chat sẽ hủy yêu cầu đang xử lý và giữ ngữ cảnh người dùng bị ngắt.
-- Khi `zeroclaw channel start` đang chạy, thay đổi `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url` và `reliability.*` được áp dụng nóng từ `config.toml` ở tin nhắn tiếp theo.
+- Khi `jhedaiclaw channel start` đang chạy, thay đổi `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url` và `reliability.*` được áp dụng nóng từ `config.toml` ở tin nhắn tiếp theo.
 
 Xem ma trận kênh và hành vi allowlist chi tiết tại [channels-reference.md](channels-reference.md).
 
@@ -415,21 +415,21 @@ WhatsApp hỗ trợ hai backend dưới cùng một bảng config.
 
 Chế độ Cloud API (webhook Meta):
 
-| Khóa | Bắt buộc | Mục đích |
-|---|---|---|
-| `access_token` | Có | Bearer token Meta Cloud API |
-| `phone_number_id` | Có | ID số điện thoại Meta |
-| `verify_token` | Có | Token xác minh webhook |
-| `app_secret` | Tùy chọn | Bật xác minh chữ ký webhook (`X-Hub-Signature-256`) |
+| Khóa              | Bắt buộc    | Mục đích                                                                        |
+| ----------------- | ----------- | ------------------------------------------------------------------------------- |
+| `access_token`    | Có          | Bearer token Meta Cloud API                                                     |
+| `phone_number_id` | Có          | ID số điện thoại Meta                                                           |
+| `verify_token`    | Có          | Token xác minh webhook                                                          |
+| `app_secret`      | Tùy chọn    | Bật xác minh chữ ký webhook (`X-Hub-Signature-256`)                             |
 | `allowed_numbers` | Khuyến nghị | Số điện thoại cho phép gửi đến (`[]` = từ chối tất cả, `"*"` = cho phép tất cả) |
 
 Chế độ WhatsApp Web (client gốc):
 
-| Khóa | Bắt buộc | Mục đích |
-|---|---|---|
-| `session_path` | Có | Đường dẫn phiên SQLite lưu trữ lâu dài |
-| `pair_phone` | Tùy chọn | Số điện thoại cho luồng pair-code (chỉ chữ số) |
-| `pair_code` | Tùy chọn | Mã pair tùy chỉnh (nếu không sẽ tự tạo) |
+| Khóa              | Bắt buộc    | Mục đích                                                                        |
+| ----------------- | ----------- | ------------------------------------------------------------------------------- |
+| `session_path`    | Có          | Đường dẫn phiên SQLite lưu trữ lâu dài                                          |
+| `pair_phone`      | Tùy chọn    | Số điện thoại cho luồng pair-code (chỉ chữ số)                                  |
+| `pair_code`       | Tùy chọn    | Mã pair tùy chỉnh (nếu không sẽ tự tạo)                                         |
 | `allowed_numbers` | Khuyến nghị | Số điện thoại cho phép gửi đến (`[]` = từ chối tất cả, `"*"` = cho phép tất cả) |
 
 Lưu ý:
@@ -441,14 +441,14 @@ Lưu ý:
 
 Cấu hình truy cập phần cứng vật lý (STM32, probe, serial).
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `enabled` | `false` | Bật truy cập phần cứng |
-| `transport` | `none` | Chế độ truyền: `"none"`, `"native"`, `"serial"` hoặc `"probe"` |
-| `serial_port` | chưa đặt | Đường dẫn cổng serial (ví dụ `"/dev/ttyACM0"`) |
-| `baud_rate` | `115200` | Tốc độ baud serial |
-| `probe_target` | chưa đặt | Chip đích cho probe (ví dụ `"STM32F401RE"`) |
-| `workspace_datasheets` | `false` | Bật RAG datasheet workspace (đánh chỉ mục PDF schematic để AI tra cứu chân) |
+| Khóa                   | Mặc định | Mục đích                                                                    |
+| ---------------------- | -------- | --------------------------------------------------------------------------- |
+| `enabled`              | `false`  | Bật truy cập phần cứng                                                      |
+| `transport`            | `none`   | Chế độ truyền: `"none"`, `"native"`, `"serial"` hoặc `"probe"`              |
+| `serial_port`          | chưa đặt | Đường dẫn cổng serial (ví dụ `"/dev/ttyACM0"`)                              |
+| `baud_rate`            | `115200` | Tốc độ baud serial                                                          |
+| `probe_target`         | chưa đặt | Chip đích cho probe (ví dụ `"STM32F401RE"`)                                 |
+| `workspace_datasheets` | `false`  | Bật RAG datasheet workspace (đánh chỉ mục PDF schematic để AI tra cứu chân) |
 
 Lưu ý:
 
@@ -460,20 +460,20 @@ Lưu ý:
 
 Bo mạch ngoại vi trở thành tool agent khi được bật.
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `enabled` | `false` | Bật hỗ trợ ngoại vi (bo mạch trở thành tool agent) |
-| `boards` | `[]` | Danh sách cấu hình bo mạch |
+| Khóa            | Mặc định | Mục đích                                                   |
+| --------------- | -------- | ---------------------------------------------------------- |
+| `enabled`       | `false`  | Bật hỗ trợ ngoại vi (bo mạch trở thành tool agent)         |
+| `boards`        | `[]`     | Danh sách cấu hình bo mạch                                 |
 | `datasheet_dir` | chưa đặt | Đường dẫn tài liệu datasheet (tương đối workspace) cho RAG |
 
 Mỗi mục trong `boards`:
 
-| Khóa | Mặc định | Mục đích |
-|---|---|---|
-| `board` | _bắt buộc_ | Loại bo mạch: `"nucleo-f401re"`, `"rpi-gpio"`, `"esp32"`, v.v. |
-| `transport` | `serial` | Kiểu truyền: `"serial"`, `"native"`, `"websocket"` |
-| `path` | chưa đặt | Đường dẫn serial: `"/dev/ttyACM0"`, `"/dev/ttyUSB0"` |
-| `baud` | `115200` | Tốc độ baud cho serial |
+| Khóa        | Mặc định   | Mục đích                                                       |
+| ----------- | ---------- | -------------------------------------------------------------- |
+| `board`     | _bắt buộc_ | Loại bo mạch: `"nucleo-f401re"`, `"rpi-gpio"`, `"esp32"`, v.v. |
+| `transport` | `serial`   | Kiểu truyền: `"serial"`, `"native"`, `"websocket"`             |
+| `path`      | chưa đặt   | Đường dẫn serial: `"/dev/ttyACM0"`, `"/dev/ttyUSB0"`           |
+| `baud`      | `115200`   | Tốc độ baud cho serial                                         |
 
 ```toml
 [peripherals]
@@ -507,10 +507,10 @@ Lưu ý:
 Sau khi chỉnh config:
 
 ```bash
-zeroclaw status
-zeroclaw doctor
-zeroclaw channel doctor
-zeroclaw service restart
+jhedaiclaw status
+jhedaiclaw doctor
+jhedaiclaw channel doctor
+jhedaiclaw service restart
 ```
 
 ## Tài liệu liên quan

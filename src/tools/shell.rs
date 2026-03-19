@@ -456,7 +456,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn shell_does_not_leak_api_key() {
         let _g1 = EnvGuard::set("API_KEY", "sk-test-secret-12345");
-        let _g2 = EnvGuard::set("ZEROCLAW_API_KEY", "sk-test-secret-67890");
+        let _g2 = EnvGuard::set("JHEDAICLAW_API_KEY", "sk-test-secret-67890");
 
         let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
         let result = tool
@@ -470,7 +470,7 @@ mod tests {
         );
         assert!(
             !result.output.contains("sk-test-secret-67890"),
-            "ZEROCLAW_API_KEY leaked to shell command output"
+            "JHEDAICLAW_API_KEY leaked to shell command output"
         );
     }
 
@@ -510,9 +510,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn shell_allows_configured_env_passthrough() {
-        let _guard = EnvGuard::set("ZEROCLAW_TEST_PASSTHROUGH", "db://unit-test");
+        let _guard = EnvGuard::set("JHEDAICLAW_TEST_PASSTHROUGH", "db://unit-test");
         let tool = ShellTool::new(
-            test_security_with_env_passthrough(&["ZEROCLAW_TEST_PASSTHROUGH"]),
+            test_security_with_env_passthrough(&["JHEDAICLAW_TEST_PASSTHROUGH"]),
             test_runtime(),
         );
 
@@ -523,7 +523,7 @@ mod tests {
         assert!(result.success);
         assert!(result
             .output
-            .contains("ZEROCLAW_TEST_PASSTHROUGH=db://unit-test"));
+            .contains("JHEDAICLAW_TEST_PASSTHROUGH=db://unit-test"));
     }
 
     #[test]
@@ -555,7 +555,7 @@ mod tests {
 
         let tool = ShellTool::new(security.clone(), test_runtime());
         let denied = tool
-            .execute(json!({"command": "touch zeroclaw_shell_approval_test"}))
+            .execute(json!({"command": "touch jhedaiclaw_shell_approval_test"}))
             .await
             .expect("unapproved command should return a result");
         assert!(!denied.success);
@@ -567,15 +567,15 @@ mod tests {
 
         let allowed = tool
             .execute(json!({
-                "command": "touch zeroclaw_shell_approval_test",
+                "command": "touch jhedaiclaw_shell_approval_test",
                 "approved": true
             }))
             .await
             .expect("approved command execution should succeed");
         assert!(allowed.success);
 
-        let _ =
-            tokio::fs::remove_file(std::env::temp_dir().join("zeroclaw_shell_approval_test")).await;
+        let _ = tokio::fs::remove_file(std::env::temp_dir().join("jhedaiclaw_shell_approval_test"))
+            .await;
     }
 
     // ── shell timeout enforcement tests ─────────────────

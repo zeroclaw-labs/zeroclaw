@@ -1,6 +1,6 @@
-# Contributing to ZeroClaw
+# Contributing to JhedaiClaw
 
-Thanks for your interest in contributing to ZeroClaw! This guide will help you get started.
+Thanks for your interest in contributing to JhedaiClaw! This guide will help you get started.
 
 ---
 
@@ -23,7 +23,7 @@ git push origin --delete main 2>/dev/null
 
 All PRs must target **`master`**. PRs targeting `main` will be rejected.
 
-**Background:** ZeroClaw previously used `main` in some documentation and scripts, which caused 404 errors, broken CI refs, and contributor confusion (see [#2929](https://github.com/zeroclaw-labs/zeroclaw/issues/2929), [#3061](https://github.com/zeroclaw-labs/zeroclaw/issues/3061), [#3194](https://github.com/zeroclaw-labs/zeroclaw/pull/3194)). As of March 2026, all references have been corrected, stale branches cleaned up, and the `main` branch permanently deleted.
+**Background:** JhedaiClaw previously used `main` in some documentation and scripts, which caused 404 errors, broken CI refs, and contributor confusion (see [#2929](https://github.com/jhedai/jhedaiclaw/issues/2929), [#3061](https://github.com/jhedai/jhedaiclaw/issues/3061), [#3194](https://github.com/jhedai/jhedaiclaw/pull/3194)). As of March 2026, all references have been corrected, stale branches cleaned up, and the `main` branch permanently deleted.
 
 ---
 
@@ -32,6 +32,7 @@ All PRs must target **`master`**. PRs targeting `main` will be rejected.
 > **`master`** is the single source-of-truth branch.
 >
 > **How contributors should work:**
+>
 > 1. Fork the repository
 > 2. Create a `feat/*` or `fix/*` branch from `master`
 > 3. Open a PR targeting `master`
@@ -42,7 +43,7 @@ All PRs must target **`master`**. PRs targeting `main` will be rejected.
 
 Welcome — contributions of all sizes are valued. If this is your first contribution, here is how to get started:
 
-1. **Find an issue.** Look for issues labeled [`good first issue`](https://github.com/zeroclaw-labs/zeroclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) — these are scoped for newcomers and include context to get moving quickly.
+1. **Find an issue.** Look for issues labeled [`good first issue`](https://github.com/jhedai/jhedaiclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) — these are scoped for newcomers and include context to get moving quickly.
 
 2. **Pick a scope.** Good first contributions include:
    - Typo and documentation fixes
@@ -55,7 +56,7 @@ Welcome — contributions of all sizes are valued. If this is your first contrib
    - Make your changes and run `cargo fmt && cargo clippy && cargo test`
    - Open a PR against `master` using the PR template
 
-4. **Start with Track A.** ZeroClaw uses three [collaboration tracks](#collaboration-tracks-risk-based) (A/B/C) based on risk. First-time contributors should target **Track A** (docs, tests, chore) — these require lighter review and are the fastest path to a merged PR.
+4. **Start with Track A.** JhedaiClaw uses three [collaboration tracks](#collaboration-tracks-risk-based) (A/B/C) based on risk. First-time contributors should target **Track A** (docs, tests, chore) — these require lighter review and are the fastest path to a merged PR.
 
 If you get stuck, open a draft PR early and ask questions in the description.
 
@@ -63,8 +64,8 @@ If you get stuck, open a draft PR early and ask questions in the description.
 
 ```bash
 # Clone the repo
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/jhedai/jhedaiclaw.git
+cd jhedaiclaw
 
 # Enable the pre-push hook (runs fmt, clippy, tests before every push)
 git config core.hooksPath .githooks
@@ -101,25 +102,25 @@ The repo includes a pre-push hook in `.githooks/` that enforces `./scripts/ci/ru
 For an opt-in strict lint pass during pre-push, set:
 
 ```bash
-ZEROCLAW_STRICT_LINT=1 git push
+JHEDAICLAW_STRICT_LINT=1 git push
 ```
 
 For an opt-in strict lint delta pass during pre-push (changed Rust lines only), set:
 
 ```bash
-ZEROCLAW_STRICT_DELTA_LINT=1 git push
+JHEDAICLAW_STRICT_DELTA_LINT=1 git push
 ```
 
 For an opt-in docs quality pass during pre-push (changed-line markdown gate), set:
 
 ```bash
-ZEROCLAW_DOCS_LINT=1 git push
+JHEDAICLAW_DOCS_LINT=1 git push
 ```
 
 For an opt-in docs links pass during pre-push (added-links gate), set:
 
 ```bash
-ZEROCLAW_DOCS_LINKS=1 git push
+JHEDAICLAW_DOCS_LINKS=1 git push
 ```
 
 For full CI parity in Docker, run:
@@ -138,20 +139,20 @@ git push --no-verify
 
 ## Local Secret Management (Required)
 
-ZeroClaw supports layered secret management for local development and CI hygiene.
+JhedaiClaw supports layered secret management for local development and CI hygiene.
 
 ### Secret Storage Options
 
 1. **Environment variables** (recommended for local development)
-    - Copy `.env.example` to `.env` and fill in values
-    - `.env` files are Git-ignored and should stay local
-    - Best for temporary/local API keys
+   - Copy `.env.example` to `.env` and fill in values
+   - `.env` files are Git-ignored and should stay local
+   - Best for temporary/local API keys
 
-2. **Config file** (`~/.zeroclaw/config.toml`)
-    - Persistent setup for long-term use
-    - When `secrets.encrypt = true` (default), secret values are encrypted before save
-    - Secret key is stored at `~/.zeroclaw/.secret_key` with restricted permissions
-    - Use `zeroclaw onboard` for guided setup
+2. **Config file** (`~/.jhedaiclaw/config.toml`)
+   - Persistent setup for long-term use
+   - When `secrets.encrypt = true` (default), secret values are encrypted before save
+   - Secret key is stored at `~/.jhedaiclaw/.secret_key` with restricted permissions
+   - Use `jhedaiclaw onboard` for guided setup
 
 ### Runtime Resolution Rules
 
@@ -159,12 +160,12 @@ API key resolution follows this order:
 
 1. Explicit key passed from config/CLI
 2. Provider-specific env vars (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, ...)
-3. Generic env vars (`ZEROCLAW_API_KEY`, `API_KEY`)
+3. Generic env vars (`JHEDAICLAW_API_KEY`, `API_KEY`)
 
 Provider/model config overrides:
 
-- `ZEROCLAW_PROVIDER` / `PROVIDER`
-- `ZEROCLAW_MODEL`
+- `JHEDAICLAW_PROVIDER` / `PROVIDER`
+- `JHEDAICLAW_MODEL`
 
 See `.env.example` for practical examples and currently supported provider key env vars.
 
@@ -211,7 +212,7 @@ If gitleaks is not installed, the pre-commit hook prints a warning and continues
 - API keys, tokens, passwords, or credentials (plain or encrypted)
 - OAuth tokens or session identifiers
 - Webhook signing secrets
-- `~/.zeroclaw/.secret_key` or similar key files
+- `~/.jhedaiclaw/.secret_key` or similar key files
 - Personal identifiers or real user data in tests/fixtures
 
 ### If a Secret Is Committed Accidentally
@@ -228,11 +229,11 @@ Reference: [GitHub guide: removing sensitive data from a repository](https://doc
 
 To keep review throughput high without lowering quality, every PR should map to one track:
 
-| Track | Typical scope | Required review depth |
-|---|---|---|
-| **Track A (Low risk)** | docs/tests/chore, isolated refactors, no security/runtime/CI impact | 1 maintainer review + green `CI Required Gate` |
-| **Track B (Medium risk)** | providers/channels/memory/tools behavior changes | 1 subsystem-aware review + explicit validation evidence |
-| **Track C (High risk)** | `src/security/**`, `src/runtime/**`, `src/gateway/**`, `.github/workflows/**`, access-control boundaries | 2-pass review (fast triage + deep risk review), rollback plan required |
+| Track                     | Typical scope                                                                                            | Required review depth                                                  |
+| ------------------------- | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| **Track A (Low risk)**    | docs/tests/chore, isolated refactors, no security/runtime/CI impact                                      | 1 maintainer review + green `CI Required Gate`                         |
+| **Track B (Medium risk)** | providers/channels/memory/tools behavior changes                                                         | 1 subsystem-aware review + explicit validation evidence                |
+| **Track C (High risk)**   | `src/security/**`, `src/runtime/**`, `src/gateway/**`, `.github/workflows/**`, access-control boundaries | 2-pass review (fast triage + deep risk review), rollback plan required |
 
 When in doubt, choose the higher track.
 
@@ -250,16 +251,16 @@ To keep docs useful under high PR volume, we use these rules:
 
 ### Documentation System Map
 
-| Doc | Primary purpose | When to update |
-|---|---|---|
-| `docs/README.md` | canonical docs index and taxonomy | add/remove docs or change documentation ownership/navigation |
-| `docs/contributing/doc-template.md` | standard skeleton for new operational documentation | when required sections or documentation quality bar changes |
-| `CONTRIBUTING.md` | contributor contract and readiness baseline | contributor expectations or policy changes |
-| `docs/contributing/pr-workflow.md` | governance logic and merge contract | workflow/risk/merge gate changes |
-| `docs/contributing/reviewer-playbook.md` | reviewer operating checklist | review depth or triage behavior changes |
-| `docs/contributing/ci-map.md` | CI ownership and triage entry points | workflow trigger/job ownership changes |
-| `docs/ops/network-deployment.md` | runtime deployment and network operating guide | gateway/channel/tunnel/network runtime behavior changes |
-| `docs/ops/proxy-agent-playbook.md` | agent-operable proxy runbook and rollback recipes | proxy scope/selector/tooling behavior changes |
+| Doc                                      | Primary purpose                                     | When to update                                               |
+| ---------------------------------------- | --------------------------------------------------- | ------------------------------------------------------------ |
+| `docs/README.md`                         | canonical docs index and taxonomy                   | add/remove docs or change documentation ownership/navigation |
+| `docs/contributing/doc-template.md`      | standard skeleton for new operational documentation | when required sections or documentation quality bar changes  |
+| `CONTRIBUTING.md`                        | contributor contract and readiness baseline         | contributor expectations or policy changes                   |
+| `docs/contributing/pr-workflow.md`       | governance logic and merge contract                 | workflow/risk/merge gate changes                             |
+| `docs/contributing/reviewer-playbook.md` | reviewer operating checklist                        | review depth or triage behavior changes                      |
+| `docs/contributing/ci-map.md`            | CI ownership and triage entry points                | workflow trigger/job ownership changes                       |
+| `docs/ops/network-deployment.md`         | runtime deployment and network operating guide      | gateway/channel/tunnel/network runtime behavior changes      |
+| `docs/ops/proxy-agent-playbook.md`       | agent-operable proxy runbook and rollback recipes   | proxy scope/selector/tooling behavior changes                |
 
 ## PR Definition of Ready (DoR)
 
@@ -271,7 +272,7 @@ Before requesting review, ensure all of the following are true:
 - Security impact and rollback path are explicitly described.
 - No personal/sensitive data is introduced in code/docs/tests/fixtures/logs/examples/commit messages.
 - Tests/fixtures/examples use neutral project-scoped wording (no identity-specific or first-person phrasing).
-- If identity-like wording is required, use ZeroClaw-centric labels only (for example: `ZeroClawAgent`, `ZeroClawOperator`, `zeroclaw_user`).
+- If identity-like wording is required, use JhedaiClaw-centric labels only (for example: `JhedaiClawAgent`, `JhedaiClawOperator`, `jhedaiclaw_user`).
 - If docs were changed, update `docs/README.md` navigation and reciprocal links with related docs.
 - If a new operational doc was added, start from `docs/contributing/doc-template.md` and keep risk/rollback/troubleshooting sections where applicable.
 - Linked issue (or rationale for no issue) is included.
@@ -298,7 +299,7 @@ When PR traffic is high (especially with AI-assisted contributions), these rules
 - **Security-first review**: changes in `src/security/`, runtime, gateway, and CI need stricter validation.
 - **Risk-first triage**: use labels (`risk: high`, `risk: medium`, `risk: low`) to route review depth.
 - **Privacy-first hygiene**: redact/anonymize sensitive payloads and keep tests/examples neutral and project-scoped.
-- **Identity normalization**: when identity traits are unavoidable, use ZeroClaw/project-native roles instead of personal or real-world identities.
+- **Identity normalization**: when identity traits are unavoidable, use JhedaiClaw/project-native roles instead of personal or real-world identities.
 - **Supersede hygiene**: if your PR replaces an older open PR, add `Supersedes #...` and request maintainers close the outdated one.
 
 Full maintainer workflow: [`docs/contributing/pr-workflow.md`](docs/contributing/pr-workflow.md).
@@ -323,7 +324,7 @@ Agent implementation playbook lives in [`AGENTS.md`](AGENTS.md).
 
 ## Architecture: Trait-Based Pluggability
 
-ZeroClaw's architecture is built on **traits** — every subsystem is swappable. This means contributing a new integration is as simple as implementing a trait and registering it in the factory function.
+JhedaiClaw's architecture is built on **traits** — every subsystem is swappable. This means contributing a new integration is as simple as implementing a trait and registering it in the factory function.
 
 ```
 src/
@@ -345,7 +346,7 @@ Use these defaults unless an existing subsystem pattern clearly overrides them.
 - **Trait implementers**: keep predictable suffixes (`*Provider`, `*Channel`, `*Tool`, `*Memory`, `*Observer`, `*RuntimeAdapter`).
 - **Factory keys**: keep lowercase and stable (`openai`, `discord`, `shell`); avoid adding aliases without migration need.
 - **Tests**: use behavior-oriented names (`subject_expected_behavior`) and neutral project-scoped fixtures.
-- **Identity-like labels**: if unavoidable, use ZeroClaw-native identifiers only (`ZeroClawAgent`, `zeroclaw_user`, `zeroclaw_node`).
+- **Identity-like labels**: if unavoidable, use JhedaiClaw-native identifiers only (`JhedaiClawAgent`, `jhedaiclaw_user`, `jhedaiclaw_node`).
 
 ## Architecture Boundary Rules (Required)
 
@@ -371,7 +372,7 @@ Use these quick examples to align implementation choices before opening a PR.
 - **Good test name**: `allowlist_denies_unknown_user`, `provider_returns_error_on_invalid_model`
 
 - **Bad identity-like label**: `john_user`, `alice_bot`
-- **Good identity-like label**: `ZeroClawAgent`, `zeroclaw_user`, `zeroclaw_node`
+- **Good identity-like label**: `JhedaiClawAgent`, `jhedaiclaw_user`, `jhedaiclaw_node`
 
 ### Architecture boundary examples
 
@@ -531,7 +532,7 @@ impl Tool for YourTool {
 - [ ] Follows code naming conventions and architecture boundary rules in this guide
 - [ ] No personal/sensitive data in code/docs/tests/fixtures/logs/examples/commit messages
 - [ ] Test names/messages/fixtures/examples are neutral and project-focused
-- [ ] Any required identity-like wording uses ZeroClaw/project-native labels only
+- [ ] Any required identity-like wording uses JhedaiClaw/project-native labels only
 
 ## Commit Convention
 

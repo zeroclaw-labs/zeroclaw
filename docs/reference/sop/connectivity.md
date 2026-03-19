@@ -12,7 +12,7 @@ This document describes how external events trigger SOP runs.
 
 ## 1. Overview
 
-ZeroClaw routes MQTT/webhook/cron/peripheral events through a unified SOP dispatcher (`dispatch_sop_event`).
+JhedaiClaw routes MQTT/webhook/cron/peripheral events through a unified SOP dispatcher (`dispatch_sop_event`).
 
 Key behaviors:
 
@@ -29,7 +29,7 @@ Configure broker access in `config.toml`:
 ```toml
 [channels_config.mqtt]
 broker_url = "mqtts://broker.example.com:8883"  # use mqtt:// for plaintext
-client_id = "zeroclaw-agent-1"
+client_id = "jhedaiclaw-agent-1"
 topics = ["sensors/alert", "ops/deploy/#"]
 qos = 1
 username = "mqtt-user"      # optional
@@ -124,20 +124,20 @@ Cron expressions support 5, 6, or 7 fields.
 
 ## 5. Security Defaults
 
-| Feature | Mechanism |
-|---|---|
-| **MQTT transport** | `mqtts://` + `use_tls = true` for TLS transport |
-| **Webhook auth** | Pairing bearer token (default required), optional shared secret header |
-| **Rate limiting** | Per-client limits on webhook routes (`webhook_rate_limit_per_minute`, default `60`) |
-| **Idempotency** | Header-based dedup (`X-Idempotency-Key`, default TTL `300s`) |
-| **Cron validation** | Invalid cron expressions fail closed during parsing/cache build |
+| Feature             | Mechanism                                                                           |
+| ------------------- | ----------------------------------------------------------------------------------- |
+| **MQTT transport**  | `mqtts://` + `use_tls = true` for TLS transport                                     |
+| **Webhook auth**    | Pairing bearer token (default required), optional shared secret header              |
+| **Rate limiting**   | Per-client limits on webhook routes (`webhook_rate_limit_per_minute`, default `60`) |
+| **Idempotency**     | Header-based dedup (`X-Idempotency-Key`, default TTL `300s`)                        |
+| **Cron validation** | Invalid cron expressions fail closed during parsing/cache build                     |
 
 ## 6. Troubleshooting
 
-| Symptom | Likely Cause | Fix |
-|---|---|---|
-| **MQTT** connection errors | broker URL/TLS mismatch | Verify scheme + TLS flag pairing (`mqtt://`/`false`, `mqtts://`/`true`) |
-| **Webhook** `401 Unauthorized` | missing bearer or invalid secret | re-pair token (`POST /pair`) and verify `X-Webhook-Secret` if configured |
-| **`/sop/*` returns 404** | trigger path mismatch | ensure `SOP.toml` uses exact path (for example `/sop/deploy`) |
+| Symptom                               | Likely Cause                               | Fix                                                                      |
+| ------------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------ |
+| **MQTT** connection errors            | broker URL/TLS mismatch                    | Verify scheme + TLS flag pairing (`mqtt://`/`false`, `mqtts://`/`true`)  |
+| **Webhook** `401 Unauthorized`        | missing bearer or invalid secret           | re-pair token (`POST /pair`) and verify `X-Webhook-Secret` if configured |
+| **`/sop/*` returns 404**              | trigger path mismatch                      | ensure `SOP.toml` uses exact path (for example `/sop/deploy`)            |
 | **SOP started but step not executed** | headless trigger without active agent loop | run an agent loop for `ExecuteStep`, or design run to pause on approvals |
-| **Cron not firing** | daemon not running or invalid expression | run `zeroclaw daemon`; check logs for cron parse warnings |
+| **Cron not firing**                   | daemon not running or invalid expression   | run `jhedaiclaw daemon`; check logs for cron parse warnings              |

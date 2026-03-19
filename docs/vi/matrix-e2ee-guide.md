@@ -1,6 +1,6 @@
 # Hướng dẫn Matrix E2EE
 
-Hướng dẫn này giải thích cách chạy ZeroClaw ổn định trong các phòng Matrix, bao gồm các phòng mã hóa đầu cuối (E2EE).
+Hướng dẫn này giải thích cách chạy JhedaiClaw ổn định trong các phòng Matrix, bao gồm các phòng mã hóa đầu cuối (E2EE).
 
 Tài liệu tập trung vào lỗi phổ biến mà người dùng báo cáo:
 
@@ -26,7 +26,7 @@ Trước khi kiểm tra luồng tin nhắn, hãy đảm bảo tất cả các đ
 2. Access token thuộc về cùng tài khoản bot.
 3. `room_id` chính xác:
    - ưu tiên: canonical room ID (`!room:server`)
-   - được hỗ trợ: room alias (`#alias:server`) và ZeroClaw sẽ tự resolve
+   - được hỗ trợ: room alias (`#alias:server`) và JhedaiClaw sẽ tự resolve
 4. `allowed_users` cho phép người gửi (`["*"]` để kiểm tra mở).
 5. Với phòng E2EE, thiết bị bot đã nhận được encryption key cho phòng.
 
@@ -34,7 +34,7 @@ Trước khi kiểm tra luồng tin nhắn, hãy đảm bảo tất cả các đ
 
 ## 2. Cấu hình
 
-Dùng `~/.zeroclaw/config.toml`:
+Dùng `~/.jhedaiclaw/config.toml`:
 
 ```toml
 [channels_config.matrix]
@@ -42,7 +42,7 @@ homeserver = "https://matrix.example.com"
 access_token = "syt_your_token"
 
 # Optional but recommended for E2EE stability:
-user_id = "@zeroclaw:matrix.example.com"
+user_id = "@jhedaiclaw:matrix.example.com"
 device_id = "DEVICEID123"
 
 # Room ID or alias
@@ -55,7 +55,7 @@ allowed_users = ["*"]
 
 ### Về `user_id` và `device_id`
 
-- ZeroClaw cố đọc identity từ Matrix `/_matrix/client/v3/account/whoami`.
+- JhedaiClaw cố đọc identity từ Matrix `/_matrix/client/v3/account/whoami`.
 - Nếu `whoami` không trả về `device_id`, hãy đặt `device_id` thủ công.
 - Các gợi ý này đặc biệt quan trọng để khôi phục phiên E2EE.
 
@@ -66,13 +66,13 @@ allowed_users = ["*"]
 1. Chạy thiết lập channel và daemon:
 
 ```bash
-zeroclaw onboard --channels-only
-zeroclaw daemon
+jhedaiclaw onboard --channels-only
+jhedaiclaw daemon
 ```
 
 2. Gửi một tin nhắn văn bản thuần trong phòng Matrix đã cấu hình.
 
-3. Xác nhận log ZeroClaw có thông tin khởi động Matrix listener và không có lỗi sync/auth lặp lại.
+3. Xác nhận log JhedaiClaw có thông tin khởi động Matrix listener và không có lỗi sync/auth lặp lại.
 
 4. Trong phòng mã hóa, xác minh bot có thể đọc và phản hồi tin nhắn mã hóa từ các người dùng được phép.
 
@@ -114,9 +114,9 @@ curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
 
 ### E. Định dạng tin nhắn (Markdown)
 
-- ZeroClaw gửi phản hồi văn bản Matrix dưới dạng nội dung `m.room.message` hỗ trợ markdown.
+- JhedaiClaw gửi phản hồi văn bản Matrix dưới dạng nội dung `m.room.message` hỗ trợ markdown.
 - Các Matrix client hỗ trợ `formatted_body` sẽ render in đậm, danh sách và code block.
-- Nếu định dạng hiển thị dưới dạng văn bản thuần, kiểm tra khả năng của client trước, sau đó xác nhận ZeroClaw đang chạy bản build bao gồm Matrix output hỗ trợ markdown.
+- Nếu định dạng hiển thị dưới dạng văn bản thuần, kiểm tra khả năng của client trước, sau đó xác nhận JhedaiClaw đang chạy bản build bao gồm Matrix output hỗ trợ markdown.
 
 ### F. Kiểm tra fresh start
 

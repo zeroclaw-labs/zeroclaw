@@ -1,29 +1,31 @@
 # Raspberry Pi 5 Robot Setup Guide
 
-Complete guide to setting up a ZeroClaw-powered robot on Raspberry Pi 5.
+Complete guide to setting up a JhedaiClaw-powered robot on Raspberry Pi 5.
 
 ## Hardware Requirements
 
 ### Minimum Setup
-| Component | Recommended | Notes |
-|-----------|-------------|-------|
-| **Pi 5** | 8GB model | 4GB works but limits model size |
-| **Storage** | 64GB+ NVMe or SD | NVMe recommended for speed |
-| **Power** | 27W USB-C PSU | Official Pi 5 PSU recommended |
-| **Cooling** | Active cooler | Required for sustained inference |
+
+| Component   | Recommended      | Notes                            |
+| ----------- | ---------------- | -------------------------------- |
+| **Pi 5**    | 8GB model        | 4GB works but limits model size  |
+| **Storage** | 64GB+ NVMe or SD | NVMe recommended for speed       |
+| **Power**   | 27W USB-C PSU    | Official Pi 5 PSU recommended    |
+| **Cooling** | Active cooler    | Required for sustained inference |
 
 ### Robot Hardware
-| Component | Model | Connection | Price (approx) |
-|-----------|-------|------------|----------------|
-| **Motor Controller** | L298N or TB6612FNG | GPIO PWM | $5-15 |
-| **Motors** | 4× TT Motors + Omni wheels | Via controller | $30-50 |
-| **LIDAR** | RPLidar A1 | USB `/dev/ttyUSB0` | $100 |
-| **Camera** | Pi Camera 3 or USB webcam | CSI or USB | $25-50 |
-| **Microphone** | USB mic or ReSpeaker | USB | $10-30 |
-| **Speaker** | 3W amp + speaker | I2S or 3.5mm | $10-20 |
-| **E-Stop** | Big red mushroom button | GPIO 4 | $5 |
-| **Bump Sensors** | 2× Microswitches | GPIO 5, 6 | $3 |
-| **LED Matrix** | 8×8 WS2812B | GPIO 18 (PWM) | $10 |
+
+| Component            | Model                      | Connection         | Price (approx) |
+| -------------------- | -------------------------- | ------------------ | -------------- |
+| **Motor Controller** | L298N or TB6612FNG         | GPIO PWM           | $5-15          |
+| **Motors**           | 4× TT Motors + Omni wheels | Via controller     | $30-50         |
+| **LIDAR**            | RPLidar A1                 | USB `/dev/ttyUSB0` | $100           |
+| **Camera**           | Pi Camera 3 or USB webcam  | CSI or USB         | $25-50         |
+| **Microphone**       | USB mic or ReSpeaker       | USB                | $10-30         |
+| **Speaker**          | 3W amp + speaker           | I2S or 3.5mm       | $10-20         |
+| **E-Stop**           | Big red mushroom button    | GPIO 4             | $5             |
+| **Bump Sensors**     | 2× Microswitches           | GPIO 5, 6          | $3             |
+| **LED Matrix**       | 8×8 WS2812B                | GPIO 18 (PWM)      | $10            |
 
 ### Wiring Diagram
 
@@ -130,8 +132,8 @@ bash ./models/download-ggml-model.sh base
 
 # Install
 sudo cp main /usr/local/bin/whisper-cpp
-mkdir -p ~/.zeroclaw/models
-cp models/ggml-base.bin ~/.zeroclaw/models/
+mkdir -p ~/.jhedaiclaw/models
+cp models/ggml-base.bin ~/.jhedaiclaw/models/
 ```
 
 ### 5. Install Piper TTS (Text-to-Speech)
@@ -143,13 +145,13 @@ tar -xzf piper_arm64.tar.gz
 sudo cp piper/piper /usr/local/bin/
 
 # Download voice model
-mkdir -p ~/.zeroclaw/models/piper
-cd ~/.zeroclaw/models/piper
+mkdir -p ~/.jhedaiclaw/models/piper
+cd ~/.jhedaiclaw/models/piper
 wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx
 wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json
 
 # Test
-echo "Hello, I am your robot!" | piper --model ~/.zeroclaw/models/piper/en_US-lessac-medium.onnx --output_file test.wav
+echo "Hello, I am your robot!" | piper --model ~/.jhedaiclaw/models/piper/en_US-lessac-medium.onnx --output_file test.wav
 aplay test.wav
 ```
 
@@ -167,17 +169,17 @@ sudo usermod -aG dialout $USER
 # Logout and login for group change to take effect
 ```
 
-### 7. Build ZeroClaw Robot Kit
+### 7. Build JhedaiClaw Robot Kit
 
 ```bash
 # Clone repo (or copy from USB)
-git clone https://github.com/zeroclaw-labs/zeroclaw
-cd zeroclaw
+git clone https://github.com/jhedai/jhedaiclaw
+cd jhedaiclaw
 
 # Build robot kit
-cargo build --release -p zeroclaw-robot-kit
+cargo build --release -p jhedaiclaw-robot-kit
 
-# Build main zeroclaw (optional, if using as agent)
+# Build main jhedaiclaw (optional, if using as agent)
 cargo build --release
 ```
 
@@ -186,12 +188,12 @@ cargo build --release
 ### Create robot.toml
 
 ```bash
-mkdir -p ~/.zeroclaw
-nano ~/.zeroclaw/robot.toml
+mkdir -p ~/.jhedaiclaw
+nano ~/.jhedaiclaw/robot.toml
 ```
 
 ```toml
-# ~/.zeroclaw/robot.toml - Real Hardware Configuration
+# ~/.jhedaiclaw/robot.toml - Real Hardware Configuration
 
 # =============================================================================
 # DRIVE SYSTEM
@@ -292,7 +294,7 @@ arecord -D plughw:1,0 -f S16_LE -r 16000 -c 1 -d 3 test.wav
 aplay test.wav
 
 # Test speaker
-echo "Testing speaker" | piper --model ~/.zeroclaw/models/piper/en_US-lessac-medium.onnx --output_file - | aplay -D plughw:0,0
+echo "Testing speaker" | piper --model ~/.jhedaiclaw/models/piper/en_US-lessac-medium.onnx --output_file - | aplay -D plughw:0,0
 
 # Test Ollama
 curl http://localhost:11434/api/generate -d '{"model":"llama3.2:3b","prompt":"Say hello"}'
@@ -315,7 +317,7 @@ import json
 import time
 from rplidar import RPLidar
 
-FIFO_PATH = "/tmp/zeroclaw_sensors.fifo"
+FIFO_PATH = "/tmp/jhedaiclaw_sensors.fifo"
 
 def main():
     if not os.path.exists(FIFO_PATH):
@@ -354,11 +356,11 @@ chmod +x ~/sensor_loop.py
 nohup python3 ~/sensor_loop.py &
 ```
 
-### Start ZeroClaw Agent
+### Start JhedaiClaw Agent
 
 ```bash
-# Configure ZeroClaw to use robot tools
-cat > ~/.zeroclaw/config.toml << 'EOF'
+# Configure JhedaiClaw to use robot tools
+cat > ~/.jhedaiclaw/config.toml << 'EOF'
 api_key = ""  # Not needed for local Ollama
 default_provider = "ollama"
 default_model = "llama3.2:3b"
@@ -373,10 +375,10 @@ workspace_only = true
 EOF
 
 # Copy robot personality
-cp ~/zeroclaw/crates/robot-kit/SOUL.md ~/.zeroclaw/workspace/
+cp ~/jhedaiclaw/crates/robot-kit/SOUL.md ~/.jhedaiclaw/workspace/
 
 # Start agent
-./target/release/zeroclaw agent
+./target/release/jhedaiclaw agent
 ```
 
 ### Full Robot Startup Script
@@ -396,15 +398,15 @@ if ! pgrep -x "ollama" > /dev/null; then
 fi
 
 # Start sensor loop
-if [ ! -p /tmp/zeroclaw_sensors.fifo ]; then
-    mkfifo /tmp/zeroclaw_sensors.fifo
+if [ ! -p /tmp/jhedaiclaw_sensors.fifo ]; then
+    mkfifo /tmp/jhedaiclaw_sensors.fifo
 fi
 python3 ~/sensor_loop.py &
 SENSOR_PID=$!
 
-# Start zeroclaw
-cd ~/zeroclaw
-./target/release/zeroclaw daemon &
+# Start jhedaiclaw
+cd ~/jhedaiclaw
+./target/release/jhedaiclaw daemon &
 AGENT_PID=$!
 
 echo "Robot started!"
@@ -419,16 +421,16 @@ wait
 ## Systemd Services (Auto-Start on Boot)
 
 ```bash
-# /etc/systemd/system/zeroclaw-robot.service
-sudo tee /etc/systemd/system/zeroclaw-robot.service << 'EOF'
+# /etc/systemd/system/jhedaiclaw-robot.service
+sudo tee /etc/systemd/system/jhedaiclaw-robot.service << 'EOF'
 [Unit]
-Description=ZeroClaw Robot
+Description=JhedaiClaw Robot
 After=network.target ollama.service
 
 [Service]
 Type=simple
 User=pi
-WorkingDirectory=/home/pi/zeroclaw
+WorkingDirectory=/home/pi/jhedaiclaw
 ExecStart=/home/pi/start_robot.sh
 Restart=on-failure
 RestartSec=10
@@ -438,17 +440,18 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable zeroclaw-robot
-sudo systemctl start zeroclaw-robot
+sudo systemctl enable jhedaiclaw-robot
+sudo systemctl start jhedaiclaw-robot
 
 # Check status
-sudo systemctl status zeroclaw-robot
-journalctl -u zeroclaw-robot -f  # View logs
+sudo systemctl status jhedaiclaw-robot
+journalctl -u jhedaiclaw-robot -f  # View logs
 ```
 
 ## Troubleshooting
 
 ### LIDAR not detected
+
 ```bash
 ls -la /dev/ttyUSB*
 # If missing, check USB connection
@@ -459,6 +462,7 @@ sudo udevadm control --reload-rules
 ```
 
 ### Audio not working
+
 ```bash
 # List devices
 arecord -l
@@ -470,6 +474,7 @@ aplay -D plughw:0,0 /tmp/test.wav
 ```
 
 ### Ollama slow or OOM
+
 ```bash
 # Check memory
 free -h
@@ -483,6 +488,7 @@ export OLLAMA_MAX_LOADED_MODELS=1
 ```
 
 ### Motors not responding
+
 ```bash
 # Check serial connection
 ls -la /dev/ttyACM*

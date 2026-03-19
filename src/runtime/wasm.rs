@@ -9,7 +9,7 @@
 //!
 //! # Feature gate
 //! This module is only compiled when `--features runtime-wasm` is enabled.
-//! The default ZeroClaw binary excludes it to maintain the 4.6 MB size target.
+//! The default JhedaiClaw binary excludes it to maintain the 4.6 MB size target.
 
 use super::traits::RuntimeAdapter;
 use crate::config::WasmRuntimeConfig;
@@ -292,7 +292,7 @@ impl RuntimeAdapter for WasmRuntime {
     fn storage_path(&self) -> PathBuf {
         self.workspace_dir
             .as_ref()
-            .map_or_else(|| PathBuf::from(".zeroclaw"), |w| w.join(".zeroclaw"))
+            .map_or_else(|| PathBuf::from(".jhedaiclaw"), |w| w.join(".jhedaiclaw"))
     }
 
     fn supports_long_running(&self) -> bool {
@@ -385,13 +385,13 @@ mod tests {
     #[test]
     fn wasm_storage_path_default() {
         let rt = WasmRuntime::new(default_config());
-        assert!(rt.storage_path().to_string_lossy().contains("zeroclaw"));
+        assert!(rt.storage_path().to_string_lossy().contains("jhedaiclaw"));
     }
 
     #[test]
     fn wasm_storage_path_with_workspace() {
         let rt = WasmRuntime::with_workspace(default_config(), PathBuf::from("/home/user/project"));
-        assert_eq!(rt.storage_path(), PathBuf::from("/home/user/project/.zeroclaw"));
+        assert_eq!(rt.storage_path(), PathBuf::from("/home/user/project/.jhedaiclaw"));
     }
 
     // ── Config validation ──────────────────────────────────────

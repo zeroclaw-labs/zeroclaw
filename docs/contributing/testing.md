@@ -1,29 +1,29 @@
 # Testing Guide
 
-ZeroClaw uses a five-level testing taxonomy with filesystem-based organization.
+JhedaiClaw uses a five-level testing taxonomy with filesystem-based organization.
 
 ## Testing Taxonomy
 
-| Level | What it tests | External boundaries | Directory |
-|-------|--------------|-------------------|-----------|
-| **Unit** | Single function/struct | Everything mocked | `#[cfg(test)]` blocks in `src/**/*.rs` or separate `src/**/tests.rs` files |
-| **Component** | One subsystem within its own boundary | Subsystem real, everything else mocked | `tests/component/` |
-| **Integration** | Multiple internal components wired together | Real internals, external APIs mocked | `tests/integration/` |
-| **System** | Full request→response across ALL internal boundaries | Only external APIs mocked | `tests/system/` |
-| **Live** | Full stack with real external services | Nothing mocked, `#[ignore]` | `tests/live/` |
+| Level           | What it tests                                        | External boundaries                    | Directory                                                                  |
+| --------------- | ---------------------------------------------------- | -------------------------------------- | -------------------------------------------------------------------------- |
+| **Unit**        | Single function/struct                               | Everything mocked                      | `#[cfg(test)]` blocks in `src/**/*.rs` or separate `src/**/tests.rs` files |
+| **Component**   | One subsystem within its own boundary                | Subsystem real, everything else mocked | `tests/component/`                                                         |
+| **Integration** | Multiple internal components wired together          | Real internals, external APIs mocked   | `tests/integration/`                                                       |
+| **System**      | Full request→response across ALL internal boundaries | Only external APIs mocked              | `tests/system/`                                                            |
+| **Live**        | Full stack with real external services               | Nothing mocked, `#[ignore]`            | `tests/live/`                                                              |
 
 ## Directory Structure
 
-| Directory | Level | Description | Run command |
-|-----------|-------|-------------|-------------|
-| `src/**/*.rs` | Unit | Co-located `#[cfg(test)]` blocks or separate `tests.rs` files alongside source | `cargo test --lib` |
-| `tests/component/` | Component | One subsystem, real impl, mocked boundaries | `cargo test --test component` |
-| `tests/integration/` | Integration | Multiple components wired together | `cargo test --test integration` |
-| `tests/system/` | System | Full channel→agent→channel flow | `cargo test --test system` |
-| `tests/live/` | Live | Real external services, `#[ignore]` | `cargo test --test live -- --ignored` |
-| `tests/manual/` | — | Human-driven test scripts (shell, Python) | Run directly |
-| `tests/support/` | — | Shared mock infrastructure (not a test binary) | — |
-| `tests/fixtures/` | — | Test data files (JSON traces, media) | — |
+| Directory            | Level       | Description                                                                    | Run command                           |
+| -------------------- | ----------- | ------------------------------------------------------------------------------ | ------------------------------------- |
+| `src/**/*.rs`        | Unit        | Co-located `#[cfg(test)]` blocks or separate `tests.rs` files alongside source | `cargo test --lib`                    |
+| `tests/component/`   | Component   | One subsystem, real impl, mocked boundaries                                    | `cargo test --test component`         |
+| `tests/integration/` | Integration | Multiple components wired together                                             | `cargo test --test integration`       |
+| `tests/system/`      | System      | Full channel→agent→channel flow                                                | `cargo test --test system`            |
+| `tests/live/`        | Live        | Real external services, `#[ignore]`                                            | `cargo test --test live -- --ignored` |
+| `tests/manual/`      | —           | Human-driven test scripts (shell, Python)                                      | Run directly                          |
+| `tests/support/`     | —           | Shared mock infrastructure (not a test binary)                                 | —                                     |
+| `tests/fixtures/`    | —           | Test data files (JSON traces, media)                                           | —                                     |
 
 ## How to Run Tests
 
@@ -71,14 +71,14 @@ After creating a test file, add it to the appropriate `mod.rs` and use shared in
 
 All test binaries include `mod support;` making shared mocks available via `crate::support::*`.
 
-| Module | Contents |
-|--------|----------|
+| Module             | Contents                                                                                                          |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------- |
 | `mock_provider.rs` | `MockProvider` (FIFO scripted), `RecordingProvider` (captures requests), `TraceLlmProvider` (JSON fixture replay) |
-| `mock_tools.rs` | `EchoTool`, `CountingTool`, `FailingTool`, `RecordingTool` |
-| `mock_channel.rs` | `TestChannel` (captures sends, records typing events) |
-| `helpers.rs` | `make_memory()`, `make_observer()`, `build_agent()`, `text_response()`, `tool_response()`, `StaticMemoryLoader` |
-| `trace.rs` | `LlmTrace`, `TraceTurn`, `TraceStep` types + `LlmTrace::from_file()` |
-| `assertions.rs` | `verify_expects()` for declarative trace assertion |
+| `mock_tools.rs`    | `EchoTool`, `CountingTool`, `FailingTool`, `RecordingTool`                                                        |
+| `mock_channel.rs`  | `TestChannel` (captures sends, records typing events)                                                             |
+| `helpers.rs`       | `make_memory()`, `make_observer()`, `build_agent()`, `text_response()`, `tool_response()`, `StaticMemoryLoader`   |
+| `trace.rs`         | `LlmTrace`, `TraceTurn`, `TraceStep` types + `LlmTrace::from_file()`                                              |
+| `assertions.rs`    | `verify_expects()` for declarative trace assertion                                                                |
 
 ### Usage
 
@@ -134,16 +134,16 @@ Trace fixtures are canned LLM response scripts stored as JSON files in `tests/fi
 ## Live Test Conventions
 
 - All live tests must be `#[ignore]`
-- Use `env::var("ZEROCLAW_TEST_*")` for credentials
+- Use `env::var("JHEDAICLAW_TEST_*")` for credentials
 - Run with `cargo test --test live -- --ignored --nocapture`
 
 ## Manual Tests (`tests/manual/`)
 
 Scripts for human-driven testing that can't be automated via `cargo test`:
 
-| Directory/File | What it does |
-|---|---|
-| `manual/telegram/` | Telegram integration test suite, smoke tests, message generator |
-| `manual/test_dockerignore.sh` | Validates `.dockerignore` excludes sensitive paths |
+| Directory/File                | What it does                                                    |
+| ----------------------------- | --------------------------------------------------------------- |
+| `manual/telegram/`            | Telegram integration test suite, smoke tests, message generator |
+| `manual/test_dockerignore.sh` | Validates `.dockerignore` excludes sensitive paths              |
 
 For Telegram-specific testing details, see [testing-telegram.md](./testing-telegram.md).

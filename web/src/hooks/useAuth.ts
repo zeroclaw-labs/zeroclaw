@@ -5,15 +5,15 @@ import {
   useCallback,
   useEffect,
   type ReactNode,
-} from 'react';
-import React from 'react';
+} from "react";
+import React from "react";
 import {
   getToken as readToken,
   setToken as writeToken,
   clearToken as removeToken,
   isAuthenticated as checkAuth,
-} from '../lib/auth';
-import { pair as apiPair, getPublicHealth } from '../lib/api';
+} from "../lib/auth";
+import { pair as apiPair, getPublicHealth } from "../lib/api";
 
 // ---------------------------------------------------------------------------
 // Context shape
@@ -76,14 +76,14 @@ export function AuthProvider({ children }: AuthProviderProps) {
   // Keep state in sync if localStorage is changed in another tab
   useEffect(() => {
     const handler = (e: StorageEvent) => {
-      if (e.key === 'zeroclaw_token') {
+      if (e.key === "jhedaiclaw_token") {
         const t = readToken();
         setTokenState(t);
         setAuthenticated(t !== null && t.length > 0);
       }
     };
-    window.addEventListener('storage', handler);
-    return () => window.removeEventListener('storage', handler);
+    window.addEventListener("storage", handler);
+    return () => window.removeEventListener("storage", handler);
   }, []);
 
   const pair = useCallback(async (code: string): Promise<void> => {
@@ -122,7 +122,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
 export function useAuth(): AuthState {
   const ctx = useContext(AuthContext);
   if (!ctx) {
-    throw new Error('useAuth must be used within an <AuthProvider>');
+    throw new Error("useAuth must be used within an <AuthProvider>");
   }
   return ctx;
 }

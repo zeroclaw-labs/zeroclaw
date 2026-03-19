@@ -1,8 +1,8 @@
-//! Nevis IAM authentication provider for ZeroClaw.
+//! Nevis IAM authentication provider for JhedaiClaw.
 //!
 //! Integrates with Nevis Security Suite (Adnovum) for OAuth2/OIDC token
 //! validation, FIDO2/passkey verification, and session management. Maps Nevis
-//! roles to ZeroClaw tool permissions via [`super::iam_policy::IamPolicy`].
+//! roles to JhedaiClaw tool permissions via [`super::iam_policy::IamPolicy`].
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -420,7 +420,7 @@ mod tests {
         let result = NevisAuthProvider::new(
             "https://nevis.example.com".into(),
             "master".into(),
-            "zeroclaw-client".into(),
+            "jhedaiclaw-client".into(),
             None,
             "local",
             None, // no JWKS URL
@@ -436,7 +436,7 @@ mod tests {
         let provider = NevisAuthProvider::new(
             "https://nevis.example.com".into(),
             "master".into(),
-            "zeroclaw-client".into(),
+            "jhedaiclaw-client".into(),
             None,
             "remote",
             None,
@@ -451,7 +451,7 @@ mod tests {
         let provider = NevisAuthProvider::new(
             "https://nevis.example.com".into(),
             "test-realm".into(),
-            "zeroclaw-client".into(),
+            "jhedaiclaw-client".into(),
             Some("test-secret".into()),
             "remote",
             None,
@@ -471,7 +471,7 @@ mod tests {
         let provider = NevisAuthProvider::new(
             "https://nevis.example.com".into(),
             "test-realm".into(),
-            "zeroclaw-client".into(),
+            "jhedaiclaw-client".into(),
             Some("super-secret-value".into()),
             "remote",
             None,
@@ -496,7 +496,7 @@ mod tests {
         let provider = NevisAuthProvider::new(
             "https://nevis.example.com".into(),
             "master".into(),
-            "zeroclaw-client".into(),
+            "jhedaiclaw-client".into(),
             None,
             "remote",
             None,
@@ -514,7 +514,7 @@ mod tests {
         let provider = NevisAuthProvider::new(
             "https://nevis.example.com".into(),
             "master".into(),
-            "zeroclaw-client".into(),
+            "jhedaiclaw-client".into(),
             None,
             "remote",
             None,
@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn nevis_identity_serde_roundtrip() {
         let identity = NevisIdentity {
-            user_id: "zeroclaw_user".into(),
+            user_id: "jhedaiclaw_user".into(),
             roles: vec!["admin".into(), "operator".into()],
             scopes: vec!["openid".into(), "profile".into()],
             mfa_verified: true,
@@ -539,7 +539,7 @@ mod tests {
 
         let json = serde_json::to_string(&identity).unwrap();
         let parsed: NevisIdentity = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.user_id, "zeroclaw_user");
+        assert_eq!(parsed.user_id, "jhedaiclaw_user");
         assert_eq!(parsed.roles.len(), 2);
         assert!(parsed.mfa_verified);
     }
@@ -549,7 +549,7 @@ mod tests {
         let provider = NevisAuthProvider::new(
             "https://nevis.example.com".into(),
             "master".into(),
-            "zeroclaw-client".into(),
+            "jhedaiclaw-client".into(),
             None,
             "local",
             Some("https://nevis.example.com/.well-known/jwks.json".into()),
@@ -567,7 +567,7 @@ mod tests {
         let provider = NevisAuthProvider::new(
             "https://nevis.example.com".into(),
             "master".into(),
-            "zeroclaw-client".into(),
+            "jhedaiclaw-client".into(),
             None,
             "local",
             Some("https://nevis.example.com/.well-known/jwks.json".into()),

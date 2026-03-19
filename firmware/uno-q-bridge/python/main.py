@@ -1,11 +1,11 @@
-# ZeroClaw Bridge — socket server for GPIO control from ZeroClaw agent
+# JhedaiClaw Bridge — socket server for GPIO control from JhedaiClaw agent
 # SPDX-License-Identifier: MPL-2.0
 
 import socket
 import threading
 from arduino.app_utils import App, Bridge
 
-ZEROCLAW_PORT = 9999
+JHEDAICLAW_PORT = 9999
 
 def handle_client(conn):
     try:
@@ -54,7 +54,7 @@ def loop():
 def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("127.0.0.1", ZEROCLAW_PORT))
+    server.bind(("127.0.0.1", JHEDAICLAW_PORT))
     server.listen(5)
     server.settimeout(1.0)
     t = threading.Thread(target=accept_loop, args=(server,))

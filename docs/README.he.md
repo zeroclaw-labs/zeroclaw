@@ -1,4 +1,4 @@
-# מרכז התיעוד של ZeroClaw
+# מרכז התיעוד של JhedaiClaw
 
 דף זה הוא נקודת הכניסה הראשית למערכת התיעוד.
 
@@ -8,20 +8,20 @@
 
 ## התחילו כאן
 
-| אני רוצה…                                                          | קראו זאת                                                                      |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| להתקין ולהריץ את ZeroClaw במהירות                                   | [README.md (התחלה מהירה)](../README.md#quick-start)                            |
-| אתחול בפקודה אחת                                                   | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                  |
-| למצוא פקודות לפי משימה                                              | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| לבדוק במהירות מפתחות ובררות מחדל של הגדרות                         | [config-reference.md](reference/api/config-reference.md)                       |
-| להגדיר ספקים/נקודות קצה מותאמים אישית                               | [custom-providers.md](contributing/custom-providers.md)                        |
-| להגדיר את ספק Z.AI / GLM                                           | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                             |
-| להשתמש בתבניות שילוב LangGraph                                     | [langgraph-integration.md](contributing/langgraph-integration.md)              |
-| להפעיל את סביבת הריצה (runbook יום-2)                               | [operations-runbook.md](ops/operations-runbook.md)                             |
-| לפתור בעיות התקנה/סביבת ריצה/ערוץ                                   | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| להריץ הגדרה ואבחון של חדרים מוצפנים ב-Matrix                       | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                          |
-| לדפדף בתיעוד לפי קטגוריה                                           | [SUMMARY.md](SUMMARY.md)                                                      |
-| לראות תמונת מצב של PR/issues של הפרויקט                            | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| אני רוצה…                                    | קראו זאת                                                                                   |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| להתקין ולהריץ את JhedaiClaw במהירות          | [README.md (התחלה מהירה)](../README.md#quick-start)                                        |
+| אתחול בפקודה אחת                             | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| למצוא פקודות לפי משימה                       | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| לבדוק במהירות מפתחות ובררות מחדל של הגדרות   | [config-reference.md](reference/api/config-reference.md)                                   |
+| להגדיר ספקים/נקודות קצה מותאמים אישית        | [custom-providers.md](contributing/custom-providers.md)                                    |
+| להגדיר את ספק Z.AI / GLM                     | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| להשתמש בתבניות שילוב LangGraph               | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| להפעיל את סביבת הריצה (runbook יום-2)        | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| לפתור בעיות התקנה/סביבת ריצה/ערוץ            | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| להריץ הגדרה ואבחון של חדרים מוצפנים ב-Matrix | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| לדפדף בתיעוד לפי קטגוריה                     | [SUMMARY.md](SUMMARY.md)                                                                   |
+| לראות תמונת מצב של PR/issues של הפרויקט      | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## עץ החלטה מהיר (10 שניות)
 

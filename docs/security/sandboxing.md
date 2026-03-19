@@ -1,4 +1,4 @@
-# ZeroClaw Sandboxing Strategies
+# JhedaiClaw Sandboxing Strategies
 
 > ⚠️ **Status: Proposal / Roadmap**
 >
@@ -6,11 +6,13 @@
 > For current runtime behavior, see [config-reference.md](../reference/api/config-reference.md), [operations-runbook.md](../ops/operations-runbook.md), and [troubleshooting.md](../ops/troubleshooting.md).
 
 ## Problem
-ZeroClaw currently has application-layer security (allowlists, path blocking, command injection protection) but lacks OS-level containment. If an attacker is on the allowlist, they can run any allowed command with zeroclaw's user permissions.
+
+JhedaiClaw currently has application-layer security (allowlists, path blocking, command injection protection) but lacks OS-level containment. If an attacker is on the allowlist, they can run any allowed command with jhedaiclaw's user permissions.
 
 ## Proposed Solutions
 
 ### Option 1: Firejail Integration (Recommended for Linux)
+
 Firejail provides user-space sandboxing with minimal overhead.
 
 ```rust
@@ -64,6 +66,7 @@ impl FirejailSandbox {
 ```
 
 **Config option:**
+
 ```toml
 [security]
 enable_sandbox = true
@@ -73,6 +76,7 @@ sandbox_backend = "firejail"  # or "none", "bubblewrap", "docker"
 ---
 
 ### Option 2: Bubblewrap (Portable, no root required)
+
 Bubblewrap uses user namespaces to create containers.
 
 ```bash
@@ -93,6 +97,7 @@ bwrap --ro-bind /usr /usr \
 ---
 
 ### Option 3: Docker-in-Docker (Heavyweight but complete isolation)
+
 Run agent tools inside ephemeral containers.
 
 ```rust
@@ -123,6 +128,7 @@ impl DockerSandbox {
 ---
 
 ### Option 4: Landlock (Linux Kernel LSM, Rust native)
+
 Landlock provides file system access control without containers.
 
 ```rust
@@ -143,12 +149,12 @@ pub fn apply_landlock() -> Result<()> {
 
 ## Priority Implementation Order
 
-| Phase | Solution | Effort | Security Gain |
-|-------|----------|--------|---------------|
-| **P0** | Landlock (Linux only, native) | Low | High (filesystem) |
-| **P1** | Firejail integration | Low | Very High |
-| **P2** | Bubblewrap wrapper | Medium | Very High |
-| **P3** | Docker sandbox mode | High | Complete |
+| Phase  | Solution                      | Effort | Security Gain     |
+| ------ | ----------------------------- | ------ | ----------------- |
+| **P0** | Landlock (Linux only, native) | Low    | High (filesystem) |
+| **P1** | Firejail integration          | Low    | Very High         |
+| **P2** | Bubblewrap wrapper            | Medium | Very High         |
+| **P3** | Docker sandbox mode           | High   | Complete          |
 
 ## Config Schema Extension
 
@@ -164,7 +170,7 @@ extra_args = ["--seccomp", "--caps.drop=all"]
 # Landlock-specific
 [security.sandbox.landlock]
 readonly_paths = ["/usr", "/bin", "/lib"]
-readwrite_paths = ["$HOME/workspace", "/tmp/zeroclaw"]
+readwrite_paths = ["$HOME/workspace", "/tmp/jhedaiclaw"]
 ```
 
 ## Testing Strategy

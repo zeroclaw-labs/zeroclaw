@@ -1,6 +1,6 @@
-# ZeroClaw i18n Coverage and Structure
+# JhedaiClaw i18n Coverage and Structure
 
-This document defines the localization structure for ZeroClaw docs and tracks current coverage.
+This document defines the localization structure for JhedaiClaw docs and tracks current coverage.
 
 Last refreshed: **February 21, 2026**.
 
@@ -18,27 +18,27 @@ Use these i18n paths:
 
 ## Locale Coverage Matrix
 
-| Locale | Root README | Canonical Docs Hub | Commands Ref | Config Ref | Troubleshooting | Status |
-|---|---|---|---|---|---|---|
-| `en` | `README.md` | `docs/README.md` | `docs/commands-reference.md` | `docs/config-reference.md` | `docs/troubleshooting.md` | Source of truth |
-| `zh-CN` | `README.zh-CN.md` | `docs/README.zh-CN.md` | - | - | - | Hub-level localized |
-| `ja` | `README.ja.md` | `docs/README.ja.md` | - | - | - | Hub-level localized |
-| `ru` | `README.ru.md` | `docs/README.ru.md` | - | - | - | Hub-level localized |
-| `fr` | `README.fr.md` | `docs/README.fr.md` | - | - | - | Hub-level localized |
-| `vi` | `README.vi.md` | `docs/i18n/vi/README.md` | `docs/i18n/vi/commands-reference.md` | `docs/i18n/vi/config-reference.md` | `docs/i18n/vi/troubleshooting.md` | Full tree localized |
+| Locale  | Root README       | Canonical Docs Hub       | Commands Ref                         | Config Ref                         | Troubleshooting                   | Status              |
+| ------- | ----------------- | ------------------------ | ------------------------------------ | ---------------------------------- | --------------------------------- | ------------------- |
+| `en`    | `README.md`       | `docs/README.md`         | `docs/commands-reference.md`         | `docs/config-reference.md`         | `docs/troubleshooting.md`         | Source of truth     |
+| `zh-CN` | `README.zh-CN.md` | `docs/README.zh-CN.md`   | -                                    | -                                  | -                                 | Hub-level localized |
+| `ja`    | `README.ja.md`    | `docs/README.ja.md`      | -                                    | -                                  | -                                 | Hub-level localized |
+| `ru`    | `README.ru.md`    | `docs/README.ru.md`      | -                                    | -                                  | -                                 | Hub-level localized |
+| `fr`    | `README.fr.md`    | `docs/README.fr.md`      | -                                    | -                                  | -                                 | Hub-level localized |
+| `vi`    | `README.vi.md`    | `docs/i18n/vi/README.md` | `docs/i18n/vi/commands-reference.md` | `docs/i18n/vi/config-reference.md` | `docs/i18n/vi/troubleshooting.md` | Full tree localized |
 
 ## Root README Completeness
 
 Not all root READMEs are full translations of `README.md`:
 
-| Locale | Style | Approximate Coverage |
-|---|---|---|
-| `en` | Full source | 100% |
-| `zh-CN` | Hub-style entry point | ~26% |
-| `ja` | Hub-style entry point | ~26% |
-| `ru` | Hub-style entry point | ~26% |
-| `fr` | Near-complete translation | ~90% |
-| `vi` | Near-complete translation | ~90% |
+| Locale  | Style                     | Approximate Coverage |
+| ------- | ------------------------- | -------------------- |
+| `en`    | Full source               | 100%                 |
+| `zh-CN` | Hub-style entry point     | ~26%                 |
+| `ja`    | Hub-style entry point     | ~26%                 |
+| `ru`    | Hub-style entry point     | ~26%                 |
+| `fr`    | Near-complete translation | ~90%                 |
+| `vi`    | Near-complete translation | ~90%                 |
 
 Hub-style entry points provide quick-start orientation and language navigation but do not replicate the full English README content. This is an accurate status record, not a gap to be immediately resolved.
 

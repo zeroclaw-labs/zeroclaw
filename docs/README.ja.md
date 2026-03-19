@@ -1,4 +1,4 @@
-# ZeroClaw ドキュメントハブ（日本語）
+# JhedaiClaw ドキュメントハブ（日本語）
 
 このページは日本語のドキュメント入口です。
 
@@ -8,19 +8,19 @@
 
 ## すぐに参照したい項目
 
-| やりたいこと | 参照先 |
-|---|---|
-| すぐにセットアップしたい | [../README.ja.md](../README.ja.md) / [../README.md](../README.md) |
-| ワンコマンドで導入したい | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md) |
-| コマンドを用途別に確認したい | [commands-reference.md](reference/cli/commands-reference.md) |
-| 設定キーと既定値を確認したい | [config-reference.md](reference/api/config-reference.md) |
-| カスタム Provider / endpoint を追加したい | [custom-providers.md](contributing/custom-providers.md) |
-| Z.AI / GLM Provider を設定したい | [zai-glm-setup.md](setup-guides/zai-glm-setup.md) |
-| LangGraph ツール連携を使いたい | [langgraph-integration.md](contributing/langgraph-integration.md) |
-| 日常運用（runbook）を確認したい | [operations-runbook.md](ops/operations-runbook.md) |
-| インストール/実行トラブルを解決したい | [troubleshooting.md](ops/troubleshooting.md) |
-| 統合 TOC から探したい | [SUMMARY.md](SUMMARY.md) |
-| PR/Issue の現状を把握したい | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| やりたいこと                              | 参照先                                                                                     |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------ |
+| すぐにセットアップしたい                  | [../README.ja.md](../README.ja.md) / [../README.md](../README.md)                          |
+| ワンコマンドで導入したい                  | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| コマンドを用途別に確認したい              | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| 設定キーと既定値を確認したい              | [config-reference.md](reference/api/config-reference.md)                                   |
+| カスタム Provider / endpoint を追加したい | [custom-providers.md](contributing/custom-providers.md)                                    |
+| Z.AI / GLM Provider を設定したい          | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| LangGraph ツール連携を使いたい            | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| 日常運用（runbook）を確認したい           | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| インストール/実行トラブルを解決したい     | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| 統合 TOC から探したい                     | [SUMMARY.md](SUMMARY.md)                                                                   |
+| PR/Issue の現状を把握したい               | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## 10秒ルーティング（まずここ）
 

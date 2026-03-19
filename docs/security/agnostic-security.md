@@ -6,6 +6,7 @@
 > For current runtime behavior, see [config-reference.md](../reference/api/config-reference.md), [operations-runbook.md](../ops/operations-runbook.md), and [troubleshooting.md](../ops/troubleshooting.md).
 
 ## Core Question: Will security features break...
+
 1. ❓ Fast cross-compilation builds?
 2. ❓ Pluggable architecture (swap anything)?
 3. ❓ Hardware agnosticism (ARM, x86, RISC-V)?
@@ -170,15 +171,15 @@ pub fn create_sandbox() -> Box<dyn Sandbox> {
 
 ### Cross-Platform Behavior Matrix
 
-| Platform | Builds On | Runtime Behavior |
-|----------|-----------|------------------|
-| **Linux ARM** (Raspberry Pi) | ✅ Yes | Landlock → None (graceful) |
-| **Linux x86_64** | ✅ Yes | Landlock → Firejail → None |
-| **macOS ARM** (M1/M2) | ✅ Yes | Bubblewrap → None |
-| **macOS x86_64** | ✅ Yes | Bubblewrap → None |
-| **Windows ARM** | ✅ Yes | None (app-layer) |
-| **Windows x86_64** | ✅ Yes | None (app-layer) |
-| **RISC-V Linux** | ✅ Yes | Landlock → None |
+| Platform                     | Builds On | Runtime Behavior           |
+| ---------------------------- | --------- | -------------------------- |
+| **Linux ARM** (Raspberry Pi) | ✅ Yes    | Landlock → None (graceful) |
+| **Linux x86_64**             | ✅ Yes    | Landlock → Firejail → None |
+| **macOS ARM** (M1/M2)        | ✅ Yes    | Bubblewrap → None          |
+| **macOS x86_64**             | ✅ Yes    | Bubblewrap → None          |
+| **Windows ARM**              | ✅ Yes    | None (app-layer)           |
+| **Windows x86_64**           | ✅ Yes    | None (app-layer)           |
+| **RISC-V Linux**             | ✅ Yes    | Landlock → None            |
 
 ### How It Works: Runtime Detection
 
@@ -222,32 +223,32 @@ impl SandboxingStrategy {
 
 ### Binary Size Impact (Estimated)
 
-| Feature | Code Size | RAM Overhead | Status |
-|---------|-----------|--------------|--------|
-| **Base ZeroClaw** | 3.4MB | <5MB | ✅ Current |
-| **+ Landlock** | +50KB | +100KB | ✅ Linux 5.13+ |
-| **+ Firejail wrapper** | +20KB | +0KB (external) | ✅ Linux + firejail |
-| **+ Memory monitoring** | +30KB | +50KB | ✅ All platforms |
-| **+ Audit logging** | +40KB | +200KB (buffered) | ✅ All platforms |
-| **Full security** | +140KB | +350KB | ✅ Still <6MB total |
+| Feature                 | Code Size | RAM Overhead      | Status              |
+| ----------------------- | --------- | ----------------- | ------------------- |
+| **Base JhedaiClaw**     | 3.4MB     | <5MB              | ✅ Current          |
+| **+ Landlock**          | +50KB     | +100KB            | ✅ Linux 5.13+      |
+| **+ Firejail wrapper**  | +20KB     | +0KB (external)   | ✅ Linux + firejail |
+| **+ Memory monitoring** | +30KB     | +50KB             | ✅ All platforms    |
+| **+ Audit logging**     | +40KB     | +200KB (buffered) | ✅ All platforms    |
+| **Full security**       | +140KB    | +350KB            | ✅ Still <6MB total |
 
 ### $10 Hardware Compatibility
 
-| Hardware | RAM | ZeroClaw (base) | ZeroClaw (full security) | Status |
-|----------|-----|-----------------|--------------------------|--------|
-| **Raspberry Pi Zero** | 512MB | ✅ 2% | ✅ 2.5% | Works |
-| **Orange Pi Zero** | 512MB | ✅ 2% | ✅ 2.5% | Works |
-| **NanoPi NEO** | 256MB | ✅ 4% | ✅ 5% | Works |
-| **C.H.I.P.** | 512MB | ✅ 2% | ✅ 2.5% | Works |
-| **Rock64** | 1GB | ✅ 1% | ✅ 1.2% | Works |
+| Hardware              | RAM   | JhedaiClaw (base) | JhedaiClaw (full security) | Status |
+| --------------------- | ----- | ----------------- | -------------------------- | ------ |
+| **Raspberry Pi Zero** | 512MB | ✅ 2%             | ✅ 2.5%                    | Works  |
+| **Orange Pi Zero**    | 512MB | ✅ 2%             | ✅ 2.5%                    | Works  |
+| **NanoPi NEO**        | 256MB | ✅ 4%             | ✅ 5%                      | Works  |
+| **C.H.I.P.**          | 512MB | ✅ 2%             | ✅ 2.5%                    | Works  |
+| **Rock64**            | 1GB   | ✅ 1%             | ✅ 1.2%                    | Works  |
 
-**Even with full security, ZeroClaw uses <5% of RAM on $10 boards.**
+**Even with full security, JhedaiClaw uses <5% of RAM on $10 boards.**
 
 ---
 
 ## 5. Agnostic Swaps: Everything Remains Pluggable
 
-### ZeroClaw's Core Promise: Swap Anything
+### JhedaiClaw's Core Promise: Swap Anything
 
 ```rust
 // Providers (already pluggable)
@@ -295,6 +296,7 @@ backend = "docker"
 ## 6. Dependency Impact: Minimal New Deps
 
 ### Current Dependencies (for context)
+
 ```
 reqwest, tokio, serde, anyhow, uuid, chrono, rusqlite,
 axum, tracing, opentelemetry, ...
@@ -302,16 +304,17 @@ axum, tracing, opentelemetry, ...
 
 ### Security Feature Dependencies
 
-| Feature | New Dependencies | Platform |
-|---------|------------------|----------|
-| **Landlock** | `landlock` crate (pure Rust) | Linux only |
-| **Firejail** | None (external binary) | Linux only |
-| **Bubblewrap** | None (external binary) | macOS/Linux |
-| **Docker** | `bollard` crate (Docker API) | All platforms |
-| **Memory monitoring** | None (std::alloc) | All platforms |
-| **Audit logging** | None (already have hmac/sha2) | All platforms |
+| Feature               | New Dependencies              | Platform      |
+| --------------------- | ----------------------------- | ------------- |
+| **Landlock**          | `landlock` crate (pure Rust)  | Linux only    |
+| **Firejail**          | None (external binary)        | Linux only    |
+| **Bubblewrap**        | None (external binary)        | macOS/Linux   |
+| **Docker**            | `bollard` crate (Docker API)  | All platforms |
+| **Memory monitoring** | None (std::alloc)             | All platforms |
+| **Audit logging**     | None (already have hmac/sha2) | All platforms |
 
 **Result**: Most features add **zero new Rust dependencies** — they either:
+
 1. Use pure-Rust crates (landlock)
 2. Wrap external binaries (Firejail, Bubblewrap)
 3. Use existing deps (hmac, sha2 already in Cargo.toml)
@@ -320,15 +323,15 @@ axum, tracing, opentelemetry, ...
 
 ## Summary: Core Value Propositions Preserved
 
-| Value Prop | Before | After (with security) | Status |
-|------------|--------|----------------------|--------|
-| **<5MB RAM** | ✅ <5MB | ✅ <6MB (worst case) | ✅ Preserved |
-| **<10ms startup** | ✅ <10ms | ✅ <15ms (detection) | ✅ Preserved |
-| **3.4MB binary** | ✅ 3.4MB | ✅ 3.5MB (with all features) | ✅ Preserved |
-| **ARM + x86 + RISC-V** | ✅ All | ✅ All | ✅ Preserved |
-| **$10 hardware** | ✅ Works | ✅ Works | ✅ Preserved |
-| **Pluggable everything** | ✅ Yes | ✅ Yes (security too) | ✅ Enhanced |
-| **Cross-platform** | ✅ Yes | ✅ Yes | ✅ Preserved |
+| Value Prop               | Before   | After (with security)        | Status       |
+| ------------------------ | -------- | ---------------------------- | ------------ |
+| **<5MB RAM**             | ✅ <5MB  | ✅ <6MB (worst case)         | ✅ Preserved |
+| **<10ms startup**        | ✅ <10ms | ✅ <15ms (detection)         | ✅ Preserved |
+| **3.4MB binary**         | ✅ 3.4MB | ✅ 3.5MB (with all features) | ✅ Preserved |
+| **ARM + x86 + RISC-V**   | ✅ All   | ✅ All                       | ✅ Preserved |
+| **$10 hardware**         | ✅ Works | ✅ Works                     | ✅ Preserved |
+| **Pluggable everything** | ✅ Yes   | ✅ Yes (security too)        | ✅ Enhanced  |
+| **Cross-platform**       | ✅ Yes   | ✅ Yes                       | ✅ Preserved |
 
 ---
 

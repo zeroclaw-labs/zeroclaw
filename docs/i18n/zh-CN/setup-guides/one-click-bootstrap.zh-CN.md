@@ -1,20 +1,20 @@
 # 一键安装引导
 
-本页面介绍安装和初始化 ZeroClaw 的最快支持路径。
+本页面介绍安装和初始化 JhedaiClaw 的最快支持路径。
 
 最后验证时间：**2026年2月20日**。
 
 ## 选项 0：Homebrew（macOS/Linuxbrew）
 
 ```bash
-brew install zeroclaw
+brew install jhedaiclaw
 ```
 
 ## 选项 A（推荐）：克隆 + 本地脚本
 
 ```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/jhedai/jhedaiclaw.git
+cd jhedaiclaw
 ./install.sh
 ```
 
@@ -50,7 +50,7 @@ cd zeroclaw
 
 ## 双模式引导
 
-默认行为是**仅应用程序**（编译/安装 ZeroClaw），需要已存在 Rust 工具链。
+默认行为是**仅应用程序**（编译/安装 JhedaiClaw），需要已存在 Rust 工具链。
 
 对于全新机器，可以显式启用环境引导：
 
@@ -69,7 +69,7 @@ cd zeroclaw
 ## 选项 B：远程单行命令
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jhedai/jhedaiclaw/master/install.sh | bash
 ```
 
 对于高安全环境，推荐使用选项 A，这样你可以在执行前审查脚本内容。
@@ -84,13 +84,13 @@ curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 ./install.sh --docker
 ```
 
-这会构建本地 ZeroClaw 镜像并在容器内启动引导流程，同时将配置/工作区持久化到 `./.zeroclaw-docker`。
+这会构建本地 JhedaiClaw 镜像并在容器内启动引导流程，同时将配置/工作区持久化到 `./.jhedaiclaw-docker`。
 
-容器 CLI 默认为 `docker`。如果 Docker CLI 不可用且存在 `podman`，安装程序会自动回退到 `podman`。你也可以显式设置 `ZEROCLAW_CONTAINER_CLI`（例如：`ZEROCLAW_CONTAINER_CLI=podman ./install.sh --docker`）。
+容器 CLI 默认为 `docker`。如果 Docker CLI 不可用且存在 `podman`，安装程序会自动回退到 `podman`。你也可以显式设置 `JHEDAICLAW_CONTAINER_CLI`（例如：`JHEDAICLAW_CONTAINER_CLI=podman ./install.sh --docker`）。
 
 对于 Podman，安装程序会使用 `--userns keep-id` 和 `:Z` 卷标签，确保工作区/配置挂载在容器内保持可写。
 
-如果你添加 `--skip-build` 参数，安装程序会跳过本地镜像构建。它会首先尝试本地 Docker 标签（`ZEROCLAW_DOCKER_IMAGE`，默认：`zeroclaw-bootstrap:local`）；如果不存在，会拉取 `ghcr.io/zeroclaw-labs/zeroclaw:latest` 并在运行前打本地标签。
+如果你添加 `--skip-build` 参数，安装程序会跳过本地镜像构建。它会首先尝试本地 Docker 标签（`JHEDAICLAW_DOCKER_IMAGE`，默认：`jhedaiclaw-bootstrap:local`）；如果不存在，会拉取 `ghcr.io/jhedai/jhedaiclaw:latest` 并在运行前打本地标签。
 
 ### 快速引导（非交互式）
 
@@ -101,14 +101,14 @@ curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 或者使用环境变量：
 
 ```bash
-ZEROCLAW_API_KEY=\"sk-...\" ZEROCLAW_PROVIDER=\"openrouter\" ./install.sh
+JHEDAICLAW_API_KEY=\"sk-...\" JHEDAICLAW_PROVIDER=\"openrouter\" ./install.sh
 ```
 
 ## 有用的参数
 
 - `--install-system-deps`
 - `--install-rust`
-- `--skip-build`（在 `--docker` 模式下：如果存在使用本地镜像，否则拉取 `ghcr.io/zeroclaw-labs/zeroclaw:latest`）
+- `--skip-build`（在 `--docker` 模式下：如果存在使用本地镜像，否则拉取 `ghcr.io/jhedai/jhedaiclaw:latest`）
 - `--skip-install`
 - `--provider <id>`
 

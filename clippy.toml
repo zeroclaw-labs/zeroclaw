@@ -1,4 +1,4 @@
-# Clippy configuration for ZeroClaw.
+# Clippy configuration for JhedaiClaw.
 # Thresholds tuned to match codebase patterns and reduce noise from
 # existing allow-attributes while still catching genuinely complex code.
 

@@ -1,4 +1,4 @@
-# ZeroClaw दस्तावेज़ीकरण केंद्र
+# JhedaiClaw दस्तावेज़ीकरण केंद्र
 
 यह पृष्ठ दस्तावेज़ीकरण प्रणाली का प्राथमिक प्रवेश बिंदु है।
 
@@ -8,20 +8,20 @@
 
 ## यहाँ से शुरू करें
 
-| मैं चाहता/चाहती हूँ…                                                | यह पढ़ें                                                                       |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| ZeroClaw को जल्दी से इंस्टॉल और चलाना                              | [README.md (त्वरित प्रारंभ)](../README.md#quick-start)                         |
-| एक कमांड में बूटस्ट्रैप                                             | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                  |
-| कार्य के अनुसार कमांड खोजना                                         | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| कॉन्फ़िग कुंजियों और डिफ़ॉल्ट मानों को जल्दी जाँचना                | [config-reference.md](reference/api/config-reference.md)                       |
-| कस्टम प्रदाता/एंडपॉइंट कॉन्फ़िगर करना                              | [custom-providers.md](contributing/custom-providers.md)                        |
-| Z.AI / GLM प्रदाता कॉन्फ़िगर करना                                   | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                             |
-| LangGraph एकीकरण पैटर्न का उपयोग करना                               | [langgraph-integration.md](contributing/langgraph-integration.md)              |
-| रनटाइम संचालित करना (दिन-2 रनबुक)                                   | [operations-runbook.md](ops/operations-runbook.md)                             |
-| इंस्टॉलेशन/रनटाइम/चैनल समस्याओं का निवारण                         | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| Matrix एन्क्रिप्टेड कमरों का सेटअप और डायग्नोस्टिक्स चलाना        | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                          |
-| श्रेणी के अनुसार दस्तावेज़ ब्राउज़ करना                              | [SUMMARY.md](SUMMARY.md)                                                      |
-| प्रोजेक्ट PR/issues दस्तावेज़ स्नैपशॉट देखना                        | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| मैं चाहता/चाहती हूँ…                                       | यह पढ़ें                                                                                   |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| JhedaiClaw को जल्दी से इंस्टॉल और चलाना                    | [README.md (त्वरित प्रारंभ)](../README.md#quick-start)                                     |
+| एक कमांड में बूटस्ट्रैप                                    | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| कार्य के अनुसार कमांड खोजना                                | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| कॉन्फ़िग कुंजियों और डिफ़ॉल्ट मानों को जल्दी जाँचना        | [config-reference.md](reference/api/config-reference.md)                                   |
+| कस्टम प्रदाता/एंडपॉइंट कॉन्फ़िगर करना                      | [custom-providers.md](contributing/custom-providers.md)                                    |
+| Z.AI / GLM प्रदाता कॉन्फ़िगर करना                          | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| LangGraph एकीकरण पैटर्न का उपयोग करना                      | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| रनटाइम संचालित करना (दिन-2 रनबुक)                          | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| इंस्टॉलेशन/रनटाइम/चैनल समस्याओं का निवारण                  | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| Matrix एन्क्रिप्टेड कमरों का सेटअप और डायग्नोस्टिक्स चलाना | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| श्रेणी के अनुसार दस्तावेज़ ब्राउज़ करना                    | [SUMMARY.md](SUMMARY.md)                                                                   |
+| प्रोजेक्ट PR/issues दस्तावेज़ स्नैपशॉट देखना               | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## त्वरित निर्णय वृक्ष (10 सेकंड)
 

@@ -1,4 +1,4 @@
-# ZeroClaw 项目分类快照（2026-02-18）
+# JhedaiClaw 项目分类快照（2026-02-18）
 
 截止日期：**2026 年 2 月 18 日**。
 
@@ -6,7 +6,7 @@
 
 ## 数据来源
 
-通过 GitHub CLI 从 `zeroclaw-labs/zeroclaw` 收集：
+通过 GitHub CLI 从 `jhedai/jhedaiclaw` 收集：
 
 - `gh repo view ...`
 - `gh pr list --state open --limit 500 ...`
@@ -54,19 +54,19 @@
 
 ## 与文档相关的开放 PR
 
-- [#716](https://github.com/zeroclaw-labs/zeroclaw/pull/716) — OpenRC 支持（服务行为/文档影响）
-- [#725](https://github.com/zeroclaw-labs/zeroclaw/pull/725) — shell 补全命令（CLI 文档影响）
-- [#732](https://github.com/zeroclaw-labs/zeroclaw/pull/732) — CI Action 替换（贡献者工作流文档影响）
-- [#759](https://github.com/zeroclaw-labs/zeroclaw/pull/759) — 守护进程/渠道响应处理修复（渠道故障排除影响）
-- [#679](https://github.com/zeroclaw-labs/zeroclaw/pull/679) — 配对锁定计数变更（安全行为文档影响）
+- [#716](https://github.com/jhedai/jhedaiclaw/pull/716) — OpenRC 支持（服务行为/文档影响）
+- [#725](https://github.com/jhedai/jhedaiclaw/pull/725) — shell 补全命令（CLI 文档影响）
+- [#732](https://github.com/jhedai/jhedaiclaw/pull/732) — CI Action 替换（贡献者工作流文档影响）
+- [#759](https://github.com/jhedai/jhedaiclaw/pull/759) — 守护进程/渠道响应处理修复（渠道故障排除影响）
+- [#679](https://github.com/jhedai/jhedaiclaw/pull/679) — 配对锁定计数变更（安全行为文档影响）
 
 ## 与文档相关的开放 Issue
 
-- [#426](https://github.com/zeroclaw-labs/zeroclaw/issues/426) — 明确要求更清晰的功能文档
-- [#666](https://github.com/zeroclaw-labs/zeroclaw/issues/666) — 操作手册和告警/日志指南请求
-- [#745](https://github.com/zeroclaw-labs/zeroclaw/issues/745) — Docker 拉取失败（`ghcr.io`）表明有部署故障排除需求
-- [#761](https://github.com/zeroclaw-labs/zeroclaw/issues/761) — Armbian 编译错误凸显了平台故障排除需求
-- [#758](https://github.com/zeroclaw-labs/zeroclaw/issues/758) — 存储后端灵活性请求影响配置/参考文档
+- [#426](https://github.com/jhedai/jhedaiclaw/issues/426) — 明确要求更清晰的功能文档
+- [#666](https://github.com/jhedai/jhedaiclaw/issues/666) — 操作手册和告警/日志指南请求
+- [#745](https://github.com/jhedai/jhedaiclaw/issues/745) — Docker 拉取失败（`ghcr.io`）表明有部署故障排除需求
+- [#761](https://github.com/jhedai/jhedaiclaw/issues/761) — Armbian 编译错误凸显了平台故障排除需求
+- [#758](https://github.com/jhedai/jhedaiclaw/issues/758) — 存储后端灵活性请求影响配置/参考文档
 
 ## 推荐的文档待办事项（优先级顺序）
 

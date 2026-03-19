@@ -11,7 +11,7 @@
               {
                 "id": "call_1",
                 "name": "echo",
-                "arguments": {"message": "first"}
+                "arguments": { "message": "first" }
               }
             ],
             "input_tokens": 30,
@@ -25,7 +25,7 @@
               {
                 "id": "call_2",
                 "name": "echo",
-                "arguments": {"message": "second"}
+                "arguments": { "message": "second" }
               }
             ],
             "input_tokens": 60,
@@ -39,7 +39,7 @@
               {
                 "id": "call_3",
                 "name": "echo",
-                "arguments": {"message": "third"}
+                "arguments": { "message": "third" }
               }
             ],
             "input_tokens": 90,

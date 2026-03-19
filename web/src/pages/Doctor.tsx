@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState } from "react";
 import {
   Stethoscope,
   Play,
@@ -6,40 +6,40 @@ import {
   AlertTriangle,
   XCircle,
   Loader2,
-} from 'lucide-react';
-import type { DiagResult } from '@/types/api';
-import { runDoctor } from '@/lib/api';
+} from "lucide-react";
+import type { DiagResult } from "@/types/api";
+import { runDoctor } from "@/lib/api";
 
-function severityIcon(severity: DiagResult['severity']) {
+function severityIcon(severity: DiagResult["severity"]) {
   switch (severity) {
-    case 'ok':
+    case "ok":
       return <CheckCircle className="h-4 w-4 text-[#00e68a] flex-shrink-0" />;
-    case 'warn':
+    case "warn":
       return <AlertTriangle className="h-4 w-4 text-[#ffaa00] flex-shrink-0" />;
-    case 'error':
+    case "error":
       return <XCircle className="h-4 w-4 text-[#ff4466] flex-shrink-0" />;
   }
 }
 
-function severityBorder(severity: DiagResult['severity']): string {
+function severityBorder(severity: DiagResult["severity"]): string {
   switch (severity) {
-    case 'ok':
-      return 'border-[#00e68a20]';
-    case 'warn':
-      return 'border-[#ffaa0020]';
-    case 'error':
-      return 'border-[#ff446620]';
+    case "ok":
+      return "border-[#00e68a20]";
+    case "warn":
+      return "border-[#ffaa0020]";
+    case "error":
+      return "border-[#ff446620]";
   }
 }
 
-function severityBg(severity: DiagResult['severity']): string {
+function severityBg(severity: DiagResult["severity"]): string {
   switch (severity) {
-    case 'ok':
-      return 'rgba(0,230,138,0.04)';
-    case 'warn':
-      return 'rgba(255,170,0,0.04)';
-    case 'error':
-      return 'rgba(255,68,102,0.04)';
+    case "ok":
+      return "rgba(0,230,138,0.04)";
+    case "warn":
+      return "rgba(255,170,0,0.04)";
+    case "error":
+      return "rgba(255,68,102,0.04)";
   }
 }
 
@@ -56,15 +56,17 @@ export default function Doctor() {
       const data = await runDoctor();
       setResults(data);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to run diagnostics');
+      setError(
+        err instanceof Error ? err.message : "Failed to run diagnostics",
+      );
     } finally {
       setLoading(false);
     }
   };
 
-  const okCount = results?.filter((r) => r.severity === 'ok').length ?? 0;
-  const warnCount = results?.filter((r) => r.severity === 'warn').length ?? 0;
-  const errorCount = results?.filter((r) => r.severity === 'error').length ?? 0;
+  const okCount = results?.filter((r) => r.severity === "ok").length ?? 0;
+  const warnCount = results?.filter((r) => r.severity === "warn").length ?? 0;
+  const errorCount = results?.filter((r) => r.severity === "error").length ?? 0;
 
   const grouped =
     results?.reduce<Record<string, DiagResult[]>>((acc, item) => {
@@ -80,7 +82,9 @@ export default function Doctor() {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <Stethoscope className="h-5 w-5 text-[#0080ff]" />
-          <h2 className="text-sm font-semibold text-white uppercase tracking-wider">Diagnostics</h2>
+          <h2 className="text-sm font-semibold text-white uppercase tracking-wider">
+            Diagnostics
+          </h2>
         </div>
         <button
           onClick={handleRun}
@@ -134,9 +138,9 @@ export default function Doctor() {
             <div className="flex items-center gap-2">
               <AlertTriangle className="h-5 w-5 text-[#ffaa00]" />
               <span className="text-sm text-white font-medium">
-                {warnCount}{' '}
+                {warnCount}{" "}
                 <span className="text-[#556080] font-normal">
-                  warning{warnCount !== 1 ? 's' : ''}
+                  warning{warnCount !== 1 ? "s" : ""}
                 </span>
               </span>
             </div>
@@ -144,9 +148,9 @@ export default function Doctor() {
             <div className="flex items-center gap-2">
               <XCircle className="h-5 w-5 text-[#ff4466]" />
               <span className="text-sm text-white font-medium">
-                {errorCount}{' '}
+                {errorCount}{" "}
                 <span className="text-[#556080] font-normal">
-                  error{errorCount !== 1 ? 's' : ''}
+                  error{errorCount !== 1 ? "s" : ""}
                 </span>
               </span>
             </div>
@@ -154,15 +158,24 @@ export default function Doctor() {
             {/* Overall indicator */}
             <div className="ml-auto">
               {errorCount > 0 ? (
-                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-semibold border text-[#ff4466] border-[#ff446630]" style={{ background: 'rgba(255,68,102,0.06)' }}>
+                <span
+                  className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-semibold border text-[#ff4466] border-[#ff446630]"
+                  style={{ background: "rgba(255,68,102,0.06)" }}
+                >
                   Issues Found
                 </span>
               ) : warnCount > 0 ? (
-                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-semibold border text-[#ffaa00] border-[#ffaa0030]" style={{ background: 'rgba(255,170,0,0.06)' }}>
+                <span
+                  className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-semibold border text-[#ffaa00] border-[#ffaa0030]"
+                  style={{ background: "rgba(255,170,0,0.06)" }}
+                >
                   Warnings
                 </span>
               ) : (
-                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-semibold border text-[#00e68a] border-[#00e68a30]" style={{ background: 'rgba(0,230,138,0.06)' }}>
+                <span
+                  className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-semibold border text-[#00e68a] border-[#00e68a30]"
+                  style={{ background: "rgba(0,230,138,0.06)" }}
+                >
                   All Clear
                 </span>
               )}
@@ -173,7 +186,11 @@ export default function Doctor() {
           {Object.entries(grouped)
             .sort(([a], [b]) => a.localeCompare(b))
             .map(([category, items], catIdx) => (
-              <div key={category} className="animate-slide-in-up" style={{ animationDelay: `${(catIdx + 1) * 100}ms` }}>
+              <div
+                key={category}
+                className="animate-slide-in-up"
+                style={{ animationDelay: `${(catIdx + 1) * 100}ms` }}
+              >
                 <h3 className="text-[10px] font-semibold text-[#334060] uppercase tracking-wider mb-3 capitalize">
                   {category}
                 </h3>
@@ -202,12 +219,19 @@ export default function Doctor() {
       {/* Empty state */}
       {!results && !loading && !error && (
         <div className="flex flex-col items-center justify-center py-16 text-[#334060] animate-fade-in">
-          <div className="h-16 w-16 rounded-2xl flex items-center justify-center mb-4 animate-float" style={{ background: 'linear-gradient(135deg, #0080ff15, #0080ff08)' }}>
+          <div
+            className="h-16 w-16 rounded-2xl flex items-center justify-center mb-4 animate-float"
+            style={{
+              background: "linear-gradient(135deg, #0080ff15, #0080ff08)",
+            }}
+          >
             <Stethoscope className="h-8 w-8 text-[#0080ff]" />
           </div>
-          <p className="text-lg font-semibold text-white mb-1">System Diagnostics</p>
+          <p className="text-lg font-semibold text-white mb-1">
+            System Diagnostics
+          </p>
           <p className="text-sm text-[#556080]">
-            Click "Run Diagnostics" to check your ZeroClaw installation.
+            Click "Run Diagnostics" to check your JhedaiClaw installation.
           </p>
         </div>
       )}

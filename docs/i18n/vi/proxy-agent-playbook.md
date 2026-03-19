@@ -7,9 +7,9 @@ Dùng tài liệu này khi bạn muốn agent chuyển đổi phạm vi proxy nh
 ## 0. Tóm Tắt
 
 - **Mục đích:** cung cấp tool call sẵn sàng sử dụng để quản lý phạm vi proxy và rollback.
-- **Đối tượng:** operator và maintainer đang chạy ZeroClaw trong mạng có proxy.
+- **Đối tượng:** operator và maintainer đang chạy JhedaiClaw trong mạng có proxy.
 - **Phạm vi:** các hành động `proxy_config`, lựa chọn mode, quy trình xác minh và xử lý sự cố.
-- **Ngoài phạm vi:** gỡ lỗi mạng chung không liên quan đến hành vi runtime của ZeroClaw.
+- **Ngoài phạm vi:** gỡ lỗi mạng chung không liên quan đến hành vi runtime của JhedaiClaw.
 
 ---
 
@@ -17,15 +17,15 @@ Dùng tài liệu này khi bạn muốn agent chuyển đổi phạm vi proxy nh
 
 Dùng mục này để định tuyến vận hành nhanh.
 
-### 1.1 Chỉ proxy traffic nội bộ ZeroClaw
+### 1.1 Chỉ proxy traffic nội bộ JhedaiClaw
 
-1. Dùng scope `zeroclaw`.
+1. Dùng scope `jhedaiclaw`.
 2. Đặt `http_proxy`/`https_proxy` hoặc `all_proxy`.
 3. Xác minh bằng `{"action":"get"}`.
 
 Xem:
 
-- [Mục 4](#4-mode-a--chỉ-proxy-cho-nội-bộ-zeroclaw)
+- [Mục 4](#4-mode-a--chỉ-proxy-cho-nội-bộ-jhedaiclaw)
 
 ### 1.2 Chỉ proxy các dịch vụ được chọn
 
@@ -61,11 +61,11 @@ Xem:
 
 ## 2. Ma Trận Quyết Định Phạm Vi
 
-| Phạm vi | Ảnh hưởng | Xuất biến env | Trường hợp dùng điển hình |
-|---|---|---|---|
-| `zeroclaw` | Các HTTP client nội bộ ZeroClaw | Không | Proxying runtime thông thường không có tác dụng phụ cấp process |
-| `services` | Chỉ các service key/selector được chọn | Không | Định tuyến chi tiết cho provider/tool/channel cụ thể |
-| `environment` | Runtime + biến môi trường proxy của process | Có | Các tích hợp yêu cầu `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` |
+| Phạm vi       | Ảnh hưởng                                   | Xuất biến env | Trường hợp dùng điển hình                                       |
+| ------------- | ------------------------------------------- | ------------- | --------------------------------------------------------------- |
+| `jhedaiclaw`  | Các HTTP client nội bộ JhedaiClaw           | Không         | Proxying runtime thông thường không có tác dụng phụ cấp process |
+| `services`    | Chỉ các service key/selector được chọn      | Không         | Định tuyến chi tiết cho provider/tool/channel cụ thể            |
+| `environment` | Runtime + biến môi trường proxy của process | Có            | Các tích hợp yêu cầu `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`     |
 
 ---
 
@@ -88,20 +88,20 @@ Tool call:
 
 ---
 
-## 4. Mode A — Chỉ Proxy Cho Nội Bộ ZeroClaw
+## 4. Mode A — Chỉ Proxy Cho Nội Bộ JhedaiClaw
 
-Dùng khi traffic HTTP của provider/channel/tool ZeroClaw cần đi qua proxy mà không xuất biến env proxy cấp process.
+Dùng khi traffic HTTP của provider/channel/tool JhedaiClaw cần đi qua proxy mà không xuất biến env proxy cấp process.
 
 Tool call:
 
 ```json
-{"action":"set","enabled":true,"scope":"zeroclaw","http_proxy":"http://127.0.0.1:7890","https_proxy":"http://127.0.0.1:7890","no_proxy":["localhost","127.0.0.1"]}
+{"action":"set","enabled":true,"scope":"jhedaiclaw","http_proxy":"http://127.0.0.1:7890","https_proxy":"http://127.0.0.1:7890","no_proxy":["localhost","127.0.0.1"]}
 {"action":"get"}
 ```
 
 Hành vi kỳ vọng:
 
-- Runtime proxy hoạt động cho các HTTP client của ZeroClaw.
+- Runtime proxy hoạt động cho các HTTP client của JhedaiClaw.
 - Không cần xuất `HTTP_PROXY` / `HTTPS_PROXY` vào env của process.
 
 ---

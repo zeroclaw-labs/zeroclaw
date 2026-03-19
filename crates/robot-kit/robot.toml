@@ -1,5 +1,5 @@
-# ZeroClaw Robot Kit Configuration
-# Copy to ~/.zeroclaw/robot.toml
+# JhedaiClaw Robot Kit Configuration
+# Copy to ~/.jhedaiclaw/robot.toml
 
 # =============================================================================
 # DRIVE SYSTEM

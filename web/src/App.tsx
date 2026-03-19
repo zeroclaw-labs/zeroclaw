@@ -1,19 +1,20 @@
-import { Routes, Route, Navigate } from 'react-router-dom';
-import { useState, useEffect, createContext, useContext } from 'react';
-import Layout from './components/layout/Layout';
-import Dashboard from './pages/Dashboard';
-import AgentChat from './pages/AgentChat';
-import Tools from './pages/Tools';
-import Cron from './pages/Cron';
-import Integrations from './pages/Integrations';
-import Memory from './pages/Memory';
-import Config from './pages/Config';
-import Cost from './pages/Cost';
-import Logs from './pages/Logs';
-import Doctor from './pages/Doctor';
-import { AuthProvider, useAuth } from './hooks/useAuth';
-import { DraftContext, useDraftStore } from './hooks/useDraft';
-import { setLocale, type Locale } from './lib/i18n';
+import { Routes, Route, Navigate } from "react-router-dom";
+import { useState, useEffect, createContext, useContext } from "react";
+import Layout from "./components/layout/Layout";
+import Dashboard from "./pages/Dashboard";
+import AgentChat from "./pages/AgentChat";
+import Tools from "./pages/Tools";
+import Cron from "./pages/Cron";
+import Integrations from "./pages/Integrations";
+import Memory from "./pages/Memory";
+import Config from "./pages/Config";
+import Cost from "./pages/Cost";
+import Logs from "./pages/Logs";
+import Doctor from "./pages/Doctor";
+import GraphTab from "./pages/GraphTab";
+import { AuthProvider, useAuth } from "./hooks/useAuth";
+import { DraftContext, useDraftStore } from "./hooks/useDraft";
+import { setLocale, type Locale } from "./lib/i18n";
 
 // Locale context
 interface LocaleContextType {
@@ -22,49 +23,74 @@ interface LocaleContextType {
 }
 
 export const LocaleContext = createContext<LocaleContextType>({
-  locale: 'tr',
+  locale: "tr",
   setAppLocale: () => {},
 });
 
 export const useLocaleContext = () => useContext(LocaleContext);
 
 // Pairing dialog component
-function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) {
-  const [code, setCode] = useState('');
-  const [error, setError] = useState('');
+function PairingDialog({
+  onPair,
+}: {
+  onPair: (code: string) => Promise<void>;
+}) {
+  const [code, setCode] = useState("");
+  const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
-    setError('');
+    setError("");
     try {
       await onPair(code);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Pairing failed');
+      setError(err instanceof Error ? err.message : "Pairing failed");
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center" style={{ background: 'radial-gradient(ellipse at center, #0a0a20 0%, #050510 70%)' }}>
+    <div
+      className="min-h-screen flex items-center justify-center"
+      style={{
+        background:
+          "radial-gradient(ellipse at center, #0a0a20 0%, #050510 70%)",
+      }}
+    >
       {/* Ambient glow */}
-      <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[500px] h-[500px] rounded-full opacity-20 pointer-events-none" style={{ background: 'radial-gradient(circle, #0080ff 0%, transparent 70%)' }} />
+      <div
+        className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[500px] h-[500px] rounded-full opacity-20 pointer-events-none"
+        style={{
+          background: "radial-gradient(circle, #0080ff 0%, transparent 70%)",
+        }}
+      />
 
       <div className="relative glass-card p-8 w-full max-w-md animate-fade-in-scale">
         {/* Top glow accent */}
-        <div className="absolute -top-px left-1/4 right-1/4 h-px" style={{ background: 'linear-gradient(90deg, transparent, #0080ff, transparent)' }} />
+        <div
+          className="absolute -top-px left-1/4 right-1/4 h-px"
+          style={{
+            background:
+              "linear-gradient(90deg, transparent, #0080ff, transparent)",
+          }}
+        />
 
         <div className="text-center mb-8">
           <img
             src="/_app/logo.png"
-            alt="ZeroClaw"
+            alt="JhedaiClaw"
             className="h-20 w-20 rounded-2xl object-cover mx-auto mb-4 animate-float"
-            style={{ boxShadow: '0 0 30px rgba(0,128,255,0.3)' }}
+            style={{ boxShadow: "0 0 30px rgba(0,128,255,0.3)" }}
           />
-          <h1 className="text-2xl font-bold text-gradient-blue mb-2">ZeroClaw</h1>
-          <p className="text-[#556080] text-sm">Enter the pairing code from your terminal</p>
+          <h1 className="text-2xl font-bold text-gradient-blue mb-2">
+            JhedaiClaw
+          </h1>
+          <p className="text-[#556080] text-sm">
+            Enter the pairing code from your terminal
+          </p>
         </div>
         <form onSubmit={handleSubmit}>
           <input
@@ -77,7 +103,9 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
             autoFocus
           />
           {error && (
-            <p className="text-[#ff4466] text-sm mb-4 text-center animate-fade-in">{error}</p>
+            <p className="text-[#ff4466] text-sm mb-4 text-center animate-fade-in">
+              {error}
+            </p>
           )}
           <button
             type="submit"
@@ -89,7 +117,9 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
                 <span className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
                 Pairing...
               </span>
-            ) : 'Pair'}
+            ) : (
+              "Pair"
+            )}
           </button>
         </form>
       </div>
@@ -99,7 +129,7 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 
 function AppContent() {
   const { isAuthenticated, requiresPairing, loading, pair, logout } = useAuth();
-  const [locale, setLocaleState] = useState('tr');
+  const [locale, setLocaleState] = useState("tr");
   const draftStore = useDraftStore();
 
   const setAppLocale = (newLocale: string) => {
@@ -112,13 +142,19 @@ function AppContent() {
     const handler = () => {
       logout();
     };
-    window.addEventListener('zeroclaw-unauthorized', handler);
-    return () => window.removeEventListener('zeroclaw-unauthorized', handler);
+    window.addEventListener("jhedaiclaw-unauthorized", handler);
+    return () => window.removeEventListener("jhedaiclaw-unauthorized", handler);
   }, [logout]);
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center" style={{ background: 'radial-gradient(ellipse at center, #0a0a20 0%, #050510 70%)' }}>
+      <div
+        className="min-h-screen flex items-center justify-center"
+        style={{
+          background:
+            "radial-gradient(ellipse at center, #0a0a20 0%, #050510 70%)",
+        }}
+      >
         <div className="flex flex-col items-center gap-4 animate-fade-in">
           <div className="h-10 w-10 border-2 border-[#0080ff30] border-t-[#0080ff] rounded-full animate-spin" />
           <p className="text-[#556080] text-sm">Connecting...</p>
@@ -142,6 +178,7 @@ function AppContent() {
             <Route path="/cron" element={<Cron />} />
             <Route path="/integrations" element={<Integrations />} />
             <Route path="/memory" element={<Memory />} />
+            <Route path="/graph" element={<GraphTab active={true} />} />
             <Route path="/config" element={<Config />} />
             <Route path="/cost" element={<Cost />} />
             <Route path="/logs" element={<Logs />} />

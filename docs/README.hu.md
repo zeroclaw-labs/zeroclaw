@@ -1,4 +1,4 @@
-# ZeroClaw Dokumentációs Központ
+# JhedaiClaw Dokumentációs Központ
 
 Ez az oldal a dokumentációs rendszer fő belépési pontja.
 
@@ -8,21 +8,21 @@ Honosított központok: [简体中文](README.zh-CN.md) · [日本語](README.ja
 
 ## Kezdje itt
 
-| Szeretném…                                                          | Olvassa el                                                                     |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| Gyorsan telepíteni és futtatni a ZeroClaw-t                         | [README.md (Gyorsindítás)](../README.md#quick-start)                           |
-| Egylépéses bootstrap                                                | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                  |
-| Frissítés vagy eltávolítás macOS-en                                 | [macos-update-uninstall.md](setup-guides/macos-update-uninstall.md)            |
-| Parancsok keresése feladat szerint                                  | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| Konfigurációs alapértékek és kulcsok gyors ellenőrzése              | [config-reference.md](reference/api/config-reference.md)                       |
-| Egyéni szolgáltatók/végpontok beállítása                            | [custom-providers.md](contributing/custom-providers.md)                        |
-| Z.AI / GLM szolgáltató beállítása                                   | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                             |
-| LangGraph integrációs minták használata                             | [langgraph-integration.md](contributing/langgraph-integration.md)              |
-| Futtatókörnyezet üzemeltetése (2. napi kézikönyv)                  | [operations-runbook.md](ops/operations-runbook.md)                             |
-| Telepítési/futtatási/csatorna problémák elhárítása                  | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| Matrix titkosított szoba beállítás és diagnosztika futtatása        | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                          |
-| Dokumentáció böngészése kategória szerint                           | [SUMMARY.md](SUMMARY.md)                                                      |
-| Projekt PR/issue dokumentációs pillanatkép megtekintése             | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| Szeretném…                                                   | Olvassa el                                                                                 |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| Gyorsan telepíteni és futtatni a JhedaiClaw-t                | [README.md (Gyorsindítás)](../README.md#quick-start)                                       |
+| Egylépéses bootstrap                                         | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| Frissítés vagy eltávolítás macOS-en                          | [macos-update-uninstall.md](setup-guides/macos-update-uninstall.md)                        |
+| Parancsok keresése feladat szerint                           | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| Konfigurációs alapértékek és kulcsok gyors ellenőrzése       | [config-reference.md](reference/api/config-reference.md)                                   |
+| Egyéni szolgáltatók/végpontok beállítása                     | [custom-providers.md](contributing/custom-providers.md)                                    |
+| Z.AI / GLM szolgáltató beállítása                            | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| LangGraph integrációs minták használata                      | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| Futtatókörnyezet üzemeltetése (2. napi kézikönyv)            | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| Telepítési/futtatási/csatorna problémák elhárítása           | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| Matrix titkosított szoba beállítás és diagnosztika futtatása | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| Dokumentáció böngészése kategória szerint                    | [SUMMARY.md](SUMMARY.md)                                                                   |
+| Projekt PR/issue dokumentációs pillanatkép megtekintése      | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## Gyors Döntési Fa (10 másodperc)
 

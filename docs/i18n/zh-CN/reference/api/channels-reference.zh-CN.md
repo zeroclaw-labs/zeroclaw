@@ -1,8 +1,9 @@
 # 渠道参考文档
 
-本文档是 ZeroClaw 渠道配置的权威参考。
+本文档是 JhedaiClaw 渠道配置的权威参考。
 
 对于加密 Matrix 房间，还请阅读专用操作手册：
+
 - [Matrix E2EE（端到端加密）指南](../../security/matrix-e2ee-guide.zh-CN.md)
 
 ## 快速路径
@@ -22,13 +23,13 @@
 3. **令牌/账户不匹配**：令牌有效但属于另一个 Matrix 账户。
 4. **E2EE 设备身份缺口**：`whoami` 不返回 `device_id` 且配置未提供该值。
 5. **密钥共享/信任缺口**：房间密钥未共享给机器人设备，因此加密事件无法解密。
-6. **运行时状态陈旧**：配置已更改但 `zeroclaw daemon` 未重启。
+6. **运行时状态陈旧**：配置已更改但 `jhedaiclaw daemon` 未重启。
 
 ---
 
 ## 1. 配置命名空间
 
-所有渠道设置都位于 `~/.zeroclaw/config.toml` 的 `channels_config` 下。
+所有渠道设置都位于 `~/.jhedaiclaw/config.toml` 的 `channels_config` 下。
 
 ```toml
 [channels_config]
@@ -39,7 +40,7 @@ cli = true
 
 ## 聊天内运行时模型切换（Telegram / Discord）
 
-运行 `zeroclaw channel start`（或守护进程模式）时，Telegram 和 Discord 现在支持发送者范围的运行时切换：
+运行 `jhedaiclaw channel start`（或守护进程模式）时，Telegram 和 Discord 现在支持发送者范围的运行时切换：
 
 - `/models` — 显示可用提供商和当前选择
 - `/models <provider>` — 为当前发送者会话切换提供商
@@ -51,14 +52,14 @@ cli = true
 
 - 切换提供商或模型仅清除该发送者的内存中对话历史，以避免跨模型上下文污染。
 - `/new` 清除发送者的对话历史，但不改变提供商或模型选择。
-- 模型缓存预览来自 `zeroclaw models refresh --provider <ID>`。
+- 模型缓存预览来自 `jhedaiclaw models refresh --provider <ID>`。
 - 这些是运行时聊天命令，不是 CLI 子命令。
 
 ## 入站图像标记协议
 
-ZeroClaw 通过内联消息标记支持多模态输入：
+JhedaiClaw 通过内联消息标记支持多模态输入：
 
-- 语法：``[IMAGE:<source>]``
+- 语法：`[IMAGE:<source>]`
 - `<source>` 可以是：
   - 本地文件路径
   - 数据 URI（`data:image/...;base64,...`）
@@ -95,33 +96,33 @@ cargo check --features hardware,channel-matrix
 cargo check --features hardware,channel-lark
 ```
 
-如果存在 `[channels_config.matrix]`、`[channels_config.lark]` 或 `[channels_config.feishu]`，但对应的功能未编译进去，`zeroclaw channel list`、`zeroclaw channel doctor` 和 `zeroclaw channel start` 会报告该渠道在此构建中被故意跳过。
+如果存在 `[channels_config.matrix]`、`[channels_config.lark]` 或 `[channels_config.feishu]`，但对应的功能未编译进去，`jhedaiclaw channel list`、`jhedaiclaw channel doctor` 和 `jhedaiclaw channel start` 会报告该渠道在此构建中被故意跳过。
 
 ---
 
 ## 2. 交付模式概览
 
-| 渠道 | 接收模式 | 需要公共入站端口？ |
-|---|---|---|
-| CLI | 本地 stdin/stdout | 否 |
-| Telegram | 轮询 | 否 |
-| Discord | 网关/websocket | 否 |
-| Slack | 事件 API | 否（基于令牌的渠道流） |
-| Mattermost | 轮询 | 否 |
-| Matrix | 同步 API（支持 E2EE） | 否 |
-| Signal | signal-cli HTTP 桥接 | 否（本地桥接端点） |
-| WhatsApp | webhook（云 API）或 websocket（网页模式） | 云 API：是（公共 HTTPS 回调），网页模式：否 |
-| Nextcloud Talk | webhook（`/nextcloud-talk`） | 是（公共 HTTPS 回调） |
-| Webhook | 网关端点（`/webhook`） | 通常是 |
-| Email | IMAP 轮询 + SMTP 发送 | 否 |
-| IRC | IRC 套接字 | 否 |
-| Lark | websocket（默认）或 webhook | 仅 webhook 模式需要 |
-| Feishu | websocket（默认）或 webhook | 仅 webhook 模式需要 |
-| DingTalk | 流模式 | 否 |
-| QQ | 机器人网关 | 否 |
-| Linq | webhook（`/linq`） | 是（公共 HTTPS 回调） |
-| iMessage | 本地集成 | 否 |
-| Nostr | 中继 websocket（NIP-04 / NIP-17） | 否 |
+| 渠道           | 接收模式                                  | 需要公共入站端口？                          |
+| -------------- | ----------------------------------------- | ------------------------------------------- |
+| CLI            | 本地 stdin/stdout                         | 否                                          |
+| Telegram       | 轮询                                      | 否                                          |
+| Discord        | 网关/websocket                            | 否                                          |
+| Slack          | 事件 API                                  | 否（基于令牌的渠道流）                      |
+| Mattermost     | 轮询                                      | 否                                          |
+| Matrix         | 同步 API（支持 E2EE）                     | 否                                          |
+| Signal         | signal-cli HTTP 桥接                      | 否（本地桥接端点）                          |
+| WhatsApp       | webhook（云 API）或 websocket（网页模式） | 云 API：是（公共 HTTPS 回调），网页模式：否 |
+| Nextcloud Talk | webhook（`/nextcloud-talk`）              | 是（公共 HTTPS 回调）                       |
+| Webhook        | 网关端点（`/webhook`）                    | 通常是                                      |
+| Email          | IMAP 轮询 + SMTP 发送                     | 否                                          |
+| IRC            | IRC 套接字                                | 否                                          |
+| Lark           | websocket（默认）或 webhook               | 仅 webhook 模式需要                         |
+| Feishu         | websocket（默认）或 webhook               | 仅 webhook 模式需要                         |
+| DingTalk       | 流模式                                    | 否                                          |
+| QQ             | 机器人网关                                | 否                                          |
+| Linq           | webhook（`/linq`）                        | 是（公共 HTTPS 回调）                       |
+| iMessage       | 本地集成                                  | 否                                          |
+| Nostr          | 中继 websocket（NIP-04 / NIP-17）         | 否                                          |
 
 ---
 
@@ -205,7 +206,7 @@ allowed_users = [\"*\"]
 [channels_config.matrix]
 homeserver = \"https://matrix.example.com\"
 access_token = \"syt_...\"
-user_id = \"@zeroclaw:matrix.example.com\"   # 可选，推荐用于 E2EE
+user_id = \"@jhedaiclaw:matrix.example.com\"   # 可选，推荐用于 E2EE
 device_id = \"DEVICEID123\"                  # 可选，推荐用于 E2EE
 room_id = \"!room:matrix.example.com\"       # 或房间别名（#ops:matrix.example.com）
 allowed_users = [\"*\"]
@@ -227,7 +228,7 @@ ignore_stories = true
 
 ### 4.7 WhatsApp
 
-ZeroClaw 支持两个 WhatsApp 后端：
+JhedaiClaw 支持两个 WhatsApp 后端：
 
 - **云 API 模式**（`phone_number_id` + `access_token` + `verify_token`）
 - **WhatsApp 网页模式**（`session_path`，需要构建标志 `--features whatsapp-web`）
@@ -247,7 +248,7 @@ WhatsApp 网页模式：
 
 ```toml
 [channels_config.whatsapp]
-session_path = \"~/.zeroclaw/state/whatsapp-web/session.db\"
+session_path = \"~/.jhedaiclaw/state/whatsapp-web/session.db\"
 pair_phone = \"15551234567\"         # 可选; 省略使用二维码流程
 pair_code = \"\"                     # 可选自定义配对码
 allowed_numbers = [\"*\"]
@@ -294,9 +295,9 @@ allowed_senders = [\"*\"]
 [channels_config.irc]
 server = \"irc.libera.chat\"
 port = 6697
-nickname = \"zeroclaw-bot\"
-username = \"zeroclaw\"              # 可选
-channels = [\"#zeroclaw\"]
+nickname = \"jhedaiclaw-bot\"
+username = \"jhedaiclaw\"              # 可选
+channels = [\"#jhedaiclaw\"]
 allowed_users = [\"*\"]
 server_password = \"\"                # 可选
 nickserv_password = \"\"              # 可选
@@ -353,7 +354,7 @@ Nostr 同时支持 NIP-04（传统加密私信）和 NIP-17（礼物包装私有
 引导式设置支持：
 
 ```bash
-zeroclaw onboard
+jhedaiclaw onboard
 ```
 
 向导现在包含专用的 **Lark** 和 **Feishu** 步骤，包括：
@@ -401,7 +402,7 @@ allowed_users = [\"*\"]
 - 入站 webhook 端点：`POST /nextcloud-talk`。
 - 签名验证使用 `X-Nextcloud-Talk-Random` 和 `X-Nextcloud-Talk-Signature`。
 - 如果设置了 `webhook_secret`，无效签名会被拒绝并返回 `401`。
-- `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` 会覆盖配置中的密钥。
+- `JHEDAICLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` 会覆盖配置中的密钥。
 - 完整操作手册请参见 [nextcloud-talk-setup.md](../../setup-guides/nextcloud-talk-setup.zh-CN.md)。
 
 ### 4.16 Linq
@@ -420,7 +421,7 @@ allowed_senders = [\"*\"]
 - 入站 webhook 端点：`POST /linq`。
 - 签名验证使用 `X-Webhook-Signature`（HMAC-SHA256）和 `X-Webhook-Timestamp`。
 - 如果设置了 `signing_secret`，无效或过期（>300秒）的签名会被拒绝。
-- `ZEROCLAW_LINQ_SIGNING_SECRET` 会覆盖配置中的密钥。
+- `JHEDAICLAW_LINQ_SIGNING_SECRET` 会覆盖配置中的密钥。
 - `allowed_senders` 使用 E.164 电话号码格式（例如 `+1234567890`）。
 
 ### 4.17 iMessage
@@ -438,8 +439,8 @@ allowed_contacts = [\"*\"]
 2. 运行：
 
 ```bash
-zeroclaw onboard --channels-only
-zeroclaw daemon
+jhedaiclaw onboard --channels-only
+jhedaiclaw daemon
 ```
 
 3. 从预期的发送者发送消息。
@@ -458,9 +459,10 @@ zeroclaw daemon
 4. 确认传输模式假设：
    - 轮询/websocket 渠道不需要公共入站 HTTP
    - webhook 渠道需要可访问的 HTTPS 回调
-5. 配置更改后重启 `zeroclaw daemon`。
+5. 配置更改后重启 `jhedaiclaw daemon`。
 
 专门针对 Matrix 加密房间，请使用：
+
 - [Matrix E2EE 指南](../../security/matrix-e2ee-guide.zh-CN.md)
 
 ---
@@ -472,35 +474,35 @@ zeroclaw daemon
 ### 7.1 推荐捕获命令
 
 ```bash
-RUST_LOG=info zeroclaw daemon 2>&1 | tee /tmp/zeroclaw.log
+RUST_LOG=info jhedaiclaw daemon 2>&1 | tee /tmp/jhedaiclaw.log
 ```
 
 然后过滤渠道/网关事件：
 
 ```bash
-rg -n \"Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|Nostr|Webhook|Channel\" /tmp/zeroclaw.log
+rg -n \"Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|Nostr|Webhook|Channel\" /tmp/jhedaiclaw.log
 ```
 
 ### 7.2 关键词表
 
-| 组件 | 启动 / 健康信号 | 认证 / 策略信号 | 传输 / 失败信号 |
-|---|---|---|---|
-| Telegram | `Telegram channel listening for messages...` | `Telegram: ignoring message from unauthorized user:` | `Telegram poll error:` / `Telegram parse error:` / `Telegram polling conflict (409):` |
-| Discord | `Discord: connected and identified` | `Discord: ignoring message from unauthorized user:` | `Discord: received Reconnect (op 7)` / `Discord: received Invalid Session (op 9)` |
-| Slack | `Slack channel listening on #` / `Slack channel_id not set (or '*'); listening across all accessible channels.` | `Slack: ignoring message from unauthorized user:` | `Slack poll error:` / `Slack parse error:` / `Slack channel discovery failed:` |
-| Mattermost | `Mattermost channel listening on` | `Mattermost: ignoring message from unauthorized user:` | `Mattermost poll error:` / `Mattermost parse error:` |
-| Matrix | `Matrix channel listening on room` / `Matrix room ... is encrypted; E2EE decryption is enabled via matrix-sdk.` | `Matrix whoami failed; falling back to configured session hints for E2EE session restore:` / `Matrix whoami failed while resolving listener user_id; using configured user_id hint:` | `Matrix sync error: ... retrying...` |
-| Signal | `Signal channel listening via SSE on` |（白名单检查由 `allowed_from` 强制执行）| `Signal SSE returned ...` / `Signal SSE connect error:` |
-| WhatsApp（渠道）| `WhatsApp channel active (webhook mode).` / `WhatsApp Web connected successfully` | `WhatsApp: ignoring message from unauthorized number:` / `WhatsApp Web: message from ... not in allowed list` | `WhatsApp send failed:` / `WhatsApp Web stream error:` |
-| Webhook / WhatsApp（网关）| `WhatsApp webhook verified successfully` | `Webhook: rejected — not paired / invalid bearer token` / `Webhook: rejected request — invalid or missing X-Webhook-Secret` / `WhatsApp webhook verification failed — token mismatch` | `Webhook JSON parse error:` |
-| Email | `Email polling every ...` / `Email sent to ...` | `Blocked email from ...` | `Email poll failed:` / `Email poll task panicked:` |
-| IRC | `IRC channel connecting to ...` / `IRC registered as ...` |（白名单检查由 `allowed_users` 强制执行）| `IRC SASL authentication failed (...)` / `IRC server does not support SASL...` / `IRC nickname ... is in use, trying ...` |
-| Lark / Feishu | `Lark: WS connected` / `Lark event callback server listening on` | `Lark WS: ignoring ... (not in allowed_users)` / `Lark: ignoring message from unauthorized user:` | `Lark: ping failed, reconnecting` / `Lark: heartbeat timeout, reconnecting` / `Lark: WS read error:` |
-| DingTalk | `DingTalk: connected and listening for messages...` | `DingTalk: ignoring message from unauthorized user:` | `DingTalk WebSocket error:` / `DingTalk: message channel closed` |
-| QQ | `QQ: connected and identified` | `QQ: ignoring C2C message from unauthorized user:` / `QQ: ignoring group message from unauthorized user:` | `QQ: received Reconnect (op 7)` / `QQ: received Invalid Session (op 9)` / `QQ: message channel closed` |
-| Nextcloud Talk（网关）| `POST /nextcloud-talk — Nextcloud Talk bot webhook` | `Nextcloud Talk webhook signature verification failed` / `Nextcloud Talk: ignoring message from unauthorized actor:` | `Nextcloud Talk send failed:` / `LLM error for Nextcloud Talk message:` |
-| iMessage | `iMessage channel listening (AppleScript bridge)...` |（联系人白名单由 `allowed_contacts` 强制执行）| `iMessage poll error:` |
-| Nostr | `Nostr channel listening as npub1...` | `Nostr: ignoring NIP-04 message from unauthorized pubkey:` / `Nostr: ignoring NIP-17 message from unauthorized pubkey:` | `Failed to decrypt NIP-04 message:` / `Failed to unwrap NIP-17 gift wrap:` / `Nostr relay pool shut down` |
+| 组件                       | 启动 / 健康信号                                                                                                 | 认证 / 策略信号                                                                                                                                                                       | 传输 / 失败信号                                                                                                           |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| Telegram                   | `Telegram channel listening for messages...`                                                                    | `Telegram: ignoring message from unauthorized user:`                                                                                                                                  | `Telegram poll error:` / `Telegram parse error:` / `Telegram polling conflict (409):`                                     |
+| Discord                    | `Discord: connected and identified`                                                                             | `Discord: ignoring message from unauthorized user:`                                                                                                                                   | `Discord: received Reconnect (op 7)` / `Discord: received Invalid Session (op 9)`                                         |
+| Slack                      | `Slack channel listening on #` / `Slack channel_id not set (or '*'); listening across all accessible channels.` | `Slack: ignoring message from unauthorized user:`                                                                                                                                     | `Slack poll error:` / `Slack parse error:` / `Slack channel discovery failed:`                                            |
+| Mattermost                 | `Mattermost channel listening on`                                                                               | `Mattermost: ignoring message from unauthorized user:`                                                                                                                                | `Mattermost poll error:` / `Mattermost parse error:`                                                                      |
+| Matrix                     | `Matrix channel listening on room` / `Matrix room ... is encrypted; E2EE decryption is enabled via matrix-sdk.` | `Matrix whoami failed; falling back to configured session hints for E2EE session restore:` / `Matrix whoami failed while resolving listener user_id; using configured user_id hint:`  | `Matrix sync error: ... retrying...`                                                                                      |
+| Signal                     | `Signal channel listening via SSE on`                                                                           | （白名单检查由 `allowed_from` 强制执行）                                                                                                                                              | `Signal SSE returned ...` / `Signal SSE connect error:`                                                                   |
+| WhatsApp（渠道）           | `WhatsApp channel active (webhook mode).` / `WhatsApp Web connected successfully`                               | `WhatsApp: ignoring message from unauthorized number:` / `WhatsApp Web: message from ... not in allowed list`                                                                         | `WhatsApp send failed:` / `WhatsApp Web stream error:`                                                                    |
+| Webhook / WhatsApp（网关） | `WhatsApp webhook verified successfully`                                                                        | `Webhook: rejected — not paired / invalid bearer token` / `Webhook: rejected request — invalid or missing X-Webhook-Secret` / `WhatsApp webhook verification failed — token mismatch` | `Webhook JSON parse error:`                                                                                               |
+| Email                      | `Email polling every ...` / `Email sent to ...`                                                                 | `Blocked email from ...`                                                                                                                                                              | `Email poll failed:` / `Email poll task panicked:`                                                                        |
+| IRC                        | `IRC channel connecting to ...` / `IRC registered as ...`                                                       | （白名单检查由 `allowed_users` 强制执行）                                                                                                                                             | `IRC SASL authentication failed (...)` / `IRC server does not support SASL...` / `IRC nickname ... is in use, trying ...` |
+| Lark / Feishu              | `Lark: WS connected` / `Lark event callback server listening on`                                                | `Lark WS: ignoring ... (not in allowed_users)` / `Lark: ignoring message from unauthorized user:`                                                                                     | `Lark: ping failed, reconnecting` / `Lark: heartbeat timeout, reconnecting` / `Lark: WS read error:`                      |
+| DingTalk                   | `DingTalk: connected and listening for messages...`                                                             | `DingTalk: ignoring message from unauthorized user:`                                                                                                                                  | `DingTalk WebSocket error:` / `DingTalk: message channel closed`                                                          |
+| QQ                         | `QQ: connected and identified`                                                                                  | `QQ: ignoring C2C message from unauthorized user:` / `QQ: ignoring group message from unauthorized user:`                                                                             | `QQ: received Reconnect (op 7)` / `QQ: received Invalid Session (op 9)` / `QQ: message channel closed`                    |
+| Nextcloud Talk（网关）     | `POST /nextcloud-talk — Nextcloud Talk bot webhook`                                                             | `Nextcloud Talk webhook signature verification failed` / `Nextcloud Talk: ignoring message from unauthorized actor:`                                                                  | `Nextcloud Talk send failed:` / `LLM error for Nextcloud Talk message:`                                                   |
+| iMessage                   | `iMessage channel listening (AppleScript bridge)...`                                                            | （联系人白名单由 `allowed_contacts` 强制执行）                                                                                                                                        | `iMessage poll error:`                                                                                                    |
+| Nostr                      | `Nostr channel listening as npub1...`                                                                           | `Nostr: ignoring NIP-04 message from unauthorized pubkey:` / `Nostr: ignoring NIP-17 message from unauthorized pubkey:`                                                               | `Failed to decrypt NIP-04 message:` / `Failed to unwrap NIP-17 gift wrap:` / `Nostr relay pool shut down`                 |
 
 ### 7.3 运行时监管关键词
 

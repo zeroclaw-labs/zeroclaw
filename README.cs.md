@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="zeroclaw.png" alt="ZeroClaw" width="200" />
+  <img src="jhedaiclaw.png" alt="JhedaiClaw" width="200" />
 </p>
 
-<h1 align="center">ZeroClaw 🦀</h1>
+<h1 align="center">JhedaiClaw 🦀</h1>
 
 <p align="center">
   <strong>Nulová režie. Nulové kompromisy. 100% Rust. 100% Agnostický.</strong><br>
@@ -13,12 +13,12 @@
   <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
   <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
   <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
-  <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
-  <a href="https://zeroclawlabs.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
+  <a href="https://x.com/jhedaiclaw?s=21"><img src="https://img.shields.io/badge/X-%40jhedaiclaw-000000?style=flat&logo=x&logoColor=white" alt="X: @jhedaiclaw" /></a>
+  <a href="https://jhedaiclaw.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
   <a href="https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search"><img src="https://img.shields.io/badge/Xiaohongshu-Official-FF2442?style=flat" alt="Xiaohongshu: Official" /></a>
-  <a href="https://t.me/zeroclawlabs"><img src="https://img.shields.io/badge/Telegram-%40zeroclawlabs-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @zeroclawlabs" /></a>
-  <a href="https://www.facebook.com/groups/zeroclaw"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
-  <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
+  <a href="https://t.me/jhedaiclaw"><img src="https://img.shields.io/badge/Telegram-%40jhedaiclaw-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @jhedaiclaw" /></a>
+  <a href="https://www.facebook.com/groups/jhedaiclaw"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
+  <a href="https://www.reddit.com/r/jhedaiclaw/"><img src="https://img.shields.io/badge/Reddit-r%2Fjhedaiclaw-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/jhedaiclaw" /></a>
 </p>
 <p align="center">
 Postaveno studenty a členy komunit Harvard, MIT a Sundai.Club.
@@ -81,7 +81,7 @@ Postaveno studenty a členy komunit Harvard, MIT a Sundai.Club.
 </p>
 
 <p align="center">
-  ZeroClaw je <strong>operační systém runtime</strong> pro workflow agentů — infrastruktura která abstrahuje modely, nástroje, paměť a provádění pro stavbu agentů jednou a spouštění kdekoliv.
+  JhedaiClaw je <strong>operační systém runtime</strong> pro workflow agentů — infrastruktura která abstrahuje modely, nástroje, paměť a provádění pro stavbu agentů jednou a spouštění kdekoliv.
 </p>
 
 <p align="center"><code>Architektura založená na traitech · bezpečný runtime defaultně · vyměnitelný poskytovatel/kanál/nástroj · vše je připojitelné</code></p>
@@ -90,9 +90,9 @@ Postaveno studenty a členy komunit Harvard, MIT a Sundai.Club.
 
 ### 🚀 What's New in v0.3.1 (March 2026)
 
-| Area | Highlights |
-|---|---|
-| ci | add Termux (aarch64-linux-android) release target |
+| Area | Highlights                                        |
+| ---- | ------------------------------------------------- |
+| ci   | add Termux (aarch64-linux-android) release target |
 
 <!-- END:WHATS_NEW -->
 
@@ -100,11 +100,11 @@ Postaveno studenty a členy komunit Harvard, MIT a Sundai.Club.
 
 Použijte tuto tabulku pro důležitá oznámení (změny kompatibility, bezpečnostní upozornění, servisní okna a blokování verzí).
 
-| Datum (UTC) | Úroveň      | Oznámení                                                                                                                                                                                                                                                                                                                                                                                                              | Akce                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| ---------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2026-02-19 | _Kritické_  | **Nejsme propojeni** s `openagen/zeroclaw` nebo `zeroclaw.org`. Doména `zeroclaw.org` aktuálně směřuje na fork `openagen/zeroclaw`, a tato doména/repoziťář se vydává za náš oficiální web/projekt.                                                                                                                                                                                 | Nevěřte informacím, binárním souborům, fundraisingu nebo oznámením z těchto zdrojů. Používejte pouze [tento repoziťář](https://github.com/zeroclaw-labs/zeroclaw) a naše ověřené sociální účty.                                                                                                                                                                                                                                                                                                                                                          |
-| 2026-02-21 | _Důležité_ | Náš oficiální web je nyní online: [zeroclawlabs.ai](https://zeroclawlabs.ai). Děkujeme za trpělivost během čekání. Stále detekujeme pokusy o vydávání se: neúčastněte žádné investiční/fundraisingové aktivity ve jménu ZeroClaw pokud není publikována přes naše oficiální kanály.                                                                                                                   | Používejte [tento repoziťář](https://github.com/zeroclaw-labs/zeroclaw) jako jediný zdroj pravdy. Sledujte [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Telegram (@zeroclawlabs)](https://t.me/zeroclawlabs), [Facebook (skupina)](https://www.facebook.com/groups/zeroclaw), [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/), a [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) pro oficiální aktualizace. |
-| 2026-02-19 | _Důležité_ | Anthropic aktualizoval podmínky použití autentizace a přihlašovacích údajů dne 2026-02-19. OAuth autentizace (Free, Pro, Max) je výhradně pro Claude Code a Claude.ai; použití Claude Free/Pro/Max OAuth tokenů v jakémkoliv jiném produktu, nástroji nebo službě (včetně Agent SDK) není povoleno a může porušit Podmínky použití spotřebitele. | Prosím dočasně se vyhněte Claude Code OAuth integracím pro předcházení potenciálním ztrátám. Původní klauzule: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).                                                                                                                                                                                                                                                                                                                      |
+| Datum (UTC) | Úroveň     | Oznámení                                                                                                                                                                                                                                                                                                                                         | Akce                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ----------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2026-02-19  | _Kritické_ | **Nejsme propojeni** s `openagen/jhedaiclaw` nebo `jhedaiclaw.org`. Doména `jhedaiclaw.org` aktuálně směřuje na fork `openagen/jhedaiclaw`, a tato doména/repoziťář se vydává za náš oficiální web/projekt.                                                                                                                                      | Nevěřte informacím, binárním souborům, fundraisingu nebo oznámením z těchto zdrojů. Používejte pouze [tento repoziťář](https://github.com/jhedai/jhedaiclaw) a naše ověřené sociální účty.                                                                                                                                                                                                                                                                                                                                                  |
+| 2026-02-21  | _Důležité_ | Náš oficiální web je nyní online: [jhedaiclaw.ai](https://jhedaiclaw.ai). Děkujeme za trpělivost během čekání. Stále detekujeme pokusy o vydávání se: neúčastněte žádné investiční/fundraisingové aktivity ve jménu JhedaiClaw pokud není publikována přes naše oficiální kanály.                                                                | Používejte [tento repoziťář](https://github.com/jhedai/jhedaiclaw) jako jediný zdroj pravdy. Sledujte [X (@jhedaiclaw)](https://x.com/jhedaiclaw?s=21), [Telegram (@jhedaiclaw)](https://t.me/jhedaiclaw), [Facebook (skupina)](https://www.facebook.com/groups/jhedaiclaw), [Reddit (r/jhedaiclaw)](https://www.reddit.com/r/jhedaiclaw/), a [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) pro oficiální aktualizace. |
+| 2026-02-19  | _Důležité_ | Anthropic aktualizoval podmínky použití autentizace a přihlašovacích údajů dne 2026-02-19. OAuth autentizace (Free, Pro, Max) je výhradně pro Claude Code a Claude.ai; použití Claude Free/Pro/Max OAuth tokenů v jakémkoliv jiném produktu, nástroji nebo službě (včetně Agent SDK) není povoleno a může porušit Podmínky použití spotřebitele. | Prosím dočasně se vyhněte Claude Code OAuth integracím pro předcházení potenciálním ztrátám. Původní klauzule: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).                                                                                                                                                                                                                                                                                                 |
 
 ### ✨ Funkce
 
@@ -113,29 +113,29 @@ Použijte tuto tabulku pro důležitá oznámení (změny kompatibility, bezpeč
 - ⚡ **Rychlé studené starty:** Single-binary Rust runtime udržuje start příkazů a daemonů téměř okamžitý pro denní operace.
 - 🌍 **Přenosná architektura:** Single-binary workflow na ARM, x86 a RISC-V s vyměnitelným poskytovatelem/kanálem/nástrojem.
 
-### Proč týmy volí ZeroClaw
+### Proč týmy volí JhedaiClaw
 
 - **Lehký defaultně:** malý Rust binary, rychlý start, nízká paměťová stopa.
 - **Bezpečný designem:** párování, striktní sandboxing, explicitní allowlisty, workspace scope.
 - **Plně vyměnitelné:** jádrové systémy jsou traity (poskytovatelé, kanály, nástroje, paměť, tunely).
 - **Žádné vendor lock-in:** OpenAI-kompatibilní podpora poskytovatele + připojitelné vlastní endpointy.
 
-## Benchmark Snapshot (ZeroClaw vs OpenClaw, Reprodukovatelné)
+## Benchmark Snapshot (JhedaiClaw vs OpenClaw, Reprodukovatelné)
 
 Rychlý benchmark na lokálním stroji (macOS arm64, únor 2026) normalizovaný pro 0.8 GHz edge hardware.
 
-|                              | OpenClaw      | NanoBot        | PicoClaw        | ZeroClaw 🦀           |
-| ---------------------------- | ------------- | -------------- | --------------- | --------------------- |
-| **Jazyk**                  | TypeScript    | Python         | Go              | **Rust**              |
-| **RAM**                      | > 1 GB        | > 100 MB       | < 10 MB         | **< 5 MB**            |
-| **Start (0.8 GHz jádro)** | > 500s        | > 30s          | < 1s            | **< 10ms**            |
-| **Velikost Binary**           | ~28 MB (dist) | N/A (Skripty)  | ~8 MB           | **3.4 MB**            |
-| **Náklady**                     | Mac Mini $599 | Linux SBC ~$50 | Linux deska $10 | **Jakýkoliv hardware $10** |
+|                           | OpenClaw      | NanoBot        | PicoClaw        | JhedaiClaw 🦀              |
+| ------------------------- | ------------- | -------------- | --------------- | -------------------------- |
+| **Jazyk**                 | TypeScript    | Python         | Go              | **Rust**                   |
+| **RAM**                   | > 1 GB        | > 100 MB       | < 10 MB         | **< 5 MB**                 |
+| **Start (0.8 GHz jádro)** | > 500s        | > 30s          | < 1s            | **< 10ms**                 |
+| **Velikost Binary**       | ~28 MB (dist) | N/A (Skripty)  | ~8 MB           | **3.4 MB**                 |
+| **Náklady**               | Mac Mini $599 | Linux SBC ~$50 | Linux deska $10 | **Jakýkoliv hardware $10** |
 
-> Poznámky: Výsledky ZeroClaw jsou měřeny na produkčních buildech pomocí `/usr/bin/time -l`. OpenClaw vyžaduje Node.js runtime (typicky ~390 MB dodatečného paměťového režijního nákladu), zatímco NanoBot vyžaduje Python runtime. PicoClaw a ZeroClaw jsou statická binaria. Výše uvedené RAM čísla jsou runtime paměť; build-time kompilační požadavky jsou vyšší.
+> Poznámky: Výsledky JhedaiClaw jsou měřeny na produkčních buildech pomocí `/usr/bin/time -l`. OpenClaw vyžaduje Node.js runtime (typicky ~390 MB dodatečného paměťového režijního nákladu), zatímco NanoBot vyžaduje Python runtime. PicoClaw a JhedaiClaw jsou statická binaria. Výše uvedené RAM čísla jsou runtime paměť; build-time kompilační požadavky jsou vyšší.
 
 <p align="center">
-  <img src="zero-claw.jpeg" alt="Porovnání ZeroClaw vs OpenClaw" width="800" />
+  <img src="zero-claw.jpeg" alt="Porovnání JhedaiClaw vs OpenClaw" width="800" />
 </p>
 
 ### Reprodukovatelné lokální měření
@@ -144,17 +144,17 @@ Benchmark tvrzení se mohou měnit jak se kód a toolchainy vyvíjejí, takže v
 
 ```bash
 cargo build --release
-ls -lh target/release/zeroclaw
+ls -lh target/release/jhedaiclaw
 
-/usr/bin/time -l target/release/zeroclaw --help
-/usr/bin/time -l target/release/zeroclaw status
+/usr/bin/time -l target/release/jhedaiclaw --help
+/usr/bin/time -l target/release/jhedaiclaw status
 ```
 
 Ukázková vzorka (macOS arm64, měřeno 18. února 2026):
 
 - Velikost release binary: `8.8M`
-- `zeroclaw --help`: reálný čas přibližně `0.02s`, špičková paměťová stopa ~`3.9 MB`
-- `zeroclaw status`: reálný čas přibližně `0.01s`, špičková paměťová stopa ~`4.1 MB`
+- `jhedaiclaw --help`: reálný čas přibližně `0.02s`, špičková paměťová stopa ~`3.9 MB`
+- `jhedaiclaw status`: reálný čas přibližně `0.01s`, špičková paměťová stopa ~`4.1 MB`
 
 ## Předpoklady
 
@@ -165,25 +165,25 @@ Ukázková vzorka (macOS arm64, měřeno 18. února 2026):
 
 1. **Visual Studio Build Tools** (poskytuje MSVC linker a Windows SDK):
 
-    ```powershell
-    winget install Microsoft.VisualStudio.2022.BuildTools
-    ```
+   ```powershell
+   winget install Microsoft.VisualStudio.2022.BuildTools
+   ```
 
-    Během instalace (nebo přes Visual Studio Installer), vyberte workload **"Desktop development with C++"**.
+   Během instalace (nebo přes Visual Studio Installer), vyberte workload **"Desktop development with C++"**.
 
 2. **Rust Toolchain:**
 
-    ```powershell
-    winget install Rustlang.Rustup
-    ```
+   ```powershell
+   winget install Rustlang.Rustup
+   ```
 
-    Po instalaci otevřete nový terminál a spusťte `rustup default stable` pro zajištění, že stabilní toolchain je aktivní.
+   Po instalaci otevřete nový terminál a spusťte `rustup default stable` pro zajištění, že stabilní toolchain je aktivní.
 
 3. **Ověřte** že oba fungují:
-    ```powershell
-    rustc --version
-    cargo --version
-    ```
+   ```powershell
+   rustc --version
+   cargo --version
+   ```
 
 ### Windows — Volitelné
 
@@ -197,30 +197,30 @@ Ukázková vzorka (macOS arm64, měřeno 18. února 2026):
 ### Linux / macOS — Vyžadováno
 
 1. **Essenciální build nástroje:**
-    - **Linux (Debian/Ubuntu):** `sudo apt install build-essential pkg-config`
-    - **Linux (Fedora/RHEL):** `sudo dnf group install development-tools && sudo dnf install pkg-config`
-    - **macOS:** Nainstalujte Xcode Command Line Tools: `xcode-select --install`
+   - **Linux (Debian/Ubuntu):** `sudo apt install build-essential pkg-config`
+   - **Linux (Fedora/RHEL):** `sudo dnf group install development-tools && sudo dnf install pkg-config`
+   - **macOS:** Nainstalujte Xcode Command Line Tools: `xcode-select --install`
 
 2. **Rust Toolchain:**
 
-    ```bash
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-    ```
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   ```
 
-    Viz [rustup.rs](https://rustup.rs) pro detaily.
+   Viz [rustup.rs](https://rustup.rs) pro detaily.
 
 3. **Ověřte:**
-    ```bash
-    rustc --version
-    cargo --version
-    ```
+   ```bash
+   rustc --version
+   cargo --version
+   ```
 
 ### Linux / macOS — Volitelné
 
 - **Docker** — vyžadováno pouze pokud používáte [Docker sandboxed runtime](#aktuální-runtime-podpora) (`runtime.kind = "docker"`).
-    - **Linux (Debian/Ubuntu):** viz [docs.docker.com](https://docs.docker.com/engine/install/ubuntu/)
-    - **Linux (Fedora/RHEL):** viz [docs.docker.com](https://docs.docker.com/engine/install/fedora/)
-    - **macOS:** nainstalujte Docker Desktop přes [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/)
+  - **Linux (Debian/Ubuntu):** viz [docs.docker.com](https://docs.docker.com/engine/install/ubuntu/)
+  - **Linux (Fedora/RHEL):** viz [docs.docker.com](https://docs.docker.com/engine/install/fedora/)
+  - **macOS:** nainstalujte Docker Desktop přes [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/)
 
 </details>
 
@@ -228,22 +228,22 @@ Ukázková vzorka (macOS arm64, měřeno 18. února 2026):
 
 ### Možnost 1: Automatické nastavení (doporučeno)
 
-Skript `bootstrap.sh` nainstaluje Rust, naklonuje ZeroClaw, zkompiluje ho a nastaví vaše počáteční vývojové prostředí:
+Skript `bootstrap.sh` nainstaluje Rust, naklonuje JhedaiClaw, zkompiluje ho a nastaví vaše počáteční vývojové prostředí:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jhedai/jhedaiclaw/master/bootstrap.sh | bash
 ```
 
 Toto:
 
 1. Nainstaluje Rust (pokud chybí)
-2. Naklonuje ZeroClaw repoziťář
-3. Zkompiluje ZeroClaw v release módu
-4. Nainstaluje `zeroclaw` do `~/.cargo/bin/`
-5. Vytvoří výchozí workspace strukturu v `~/.zeroclaw/workspace/`
-6. Vygeneruje počáteční konfigurační soubor `~/.zeroclaw/workspace/config.toml`
+2. Naklonuje JhedaiClaw repoziťář
+3. Zkompiluje JhedaiClaw v release módu
+4. Nainstaluje `jhedaiclaw` do `~/.cargo/bin/`
+5. Vytvoří výchozí workspace strukturu v `~/.jhedaiclaw/workspace/`
+6. Vygeneruje počáteční konfigurační soubor `~/.jhedaiclaw/workspace/config.toml`
 
-Po bootstrapu znovu načtěte váš shell nebo spusťte `source ~/.cargo/env` pro použití příkazu `zeroclaw` globálně.
+Po bootstrapu znovu načtěte váš shell nebo spusťte `source ~/.cargo/env` pro použití příkazu `jhedaiclaw` globálně.
 
 ### Možnost 2: Manuální instalace
 
@@ -252,8 +252,8 @@ Po bootstrapu znovu načtěte váš shell nebo spusťte `source ~/.cargo/env` pr
 
 ```bash
 # 1. Naklonujte repoziťář
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/jhedai/jhedaiclaw.git
+cd jhedaiclaw
 
 # 2. Zkompilujte v release
 cargo build --release --locked
@@ -262,11 +262,11 @@ cargo build --release --locked
 cargo install --path . --locked
 
 # 4. Inicializujte workspace
-zeroclaw init
+jhedaiclaw init
 
 # 5. Ověřte instalaci
-zeroclaw --version
-zeroclaw status
+jhedaiclaw --version
+jhedaiclaw status
 ```
 
 </details>
@@ -276,7 +276,7 @@ zeroclaw status
 Jakmile nainstalováno (přes bootstrap nebo manuálně), měli byste vidět:
 
 ```
-~/.zeroclaw/workspace/
+~/.jhedaiclaw/workspace/
 ├── config.toml          # Hlavní konfigurace
 ├── .pairing             # Párovací tajemství (generováno při prvním spuštění)
 ├── logs/                # Daemon/agent logy
@@ -286,14 +286,14 @@ Jakmile nainstalováno (přes bootstrap nebo manuálně), měli byste vidět:
 
 **Další kroky:**
 
-1. Nakonfigurujte své AI poskytovatele v `~/.zeroclaw/workspace/config.toml`
+1. Nakonfigurujte své AI poskytovatele v `~/.jhedaiclaw/workspace/config.toml`
 2. Podívejte se na [konfigurační referenci](docs/config-reference.md) pro pokročilé možnosti
-3. Spusťte agenta: `zeroclaw agent start`
+3. Spusťte agenta: `jhedaiclaw agent start`
 4. Otestujte přes váš preferovaný kanál (viz [kanálová reference](docs/channels-reference.md))
 
 ## Konfigurace
 
-Upravte `~/.zeroclaw/workspace/config.toml` pro konfiguraci poskytovatelů, kanálů a chování systému.
+Upravte `~/.jhedaiclaw/workspace/config.toml` pro konfiguraci poskytovatelů, kanálů a chování systému.
 
 ### Rychlá konfigurační reference
 
@@ -332,7 +332,7 @@ kind = "native"    # nebo "docker" (vyžaduje Docker)
 
 ### Aktuální Runtime Podpora
 
-ZeroClaw podporuje dva backendy provádění kódu:
+JhedaiClaw podporuje dva backendy provádění kódu:
 
 - **`native`** (výchozí) — přímé provedení procesu, nejrychlejší cesta, ideální pro důvěryhodná prostředí
 - **`docker`** — plná kontejnerová izolace, zpřísněné bezpečnostní politiky, vyžaduje Docker
@@ -343,32 +343,32 @@ Použijte `runtime.kind = "docker"` pokud potřebujete striktní sandboxing nebo
 
 ```bash
 # Správa workspace
-zeroclaw init                # Inicializuje nový workspace
-zeroclaw status              # Zobrazuje stav daemon/agent
-zeroclaw config validate     # Ověřuje syntaxi a hodnoty config.toml
+jhedaiclaw init                # Inicializuje nový workspace
+jhedaiclaw status              # Zobrazuje stav daemon/agent
+jhedaiclaw config validate     # Ověřuje syntaxi a hodnoty config.toml
 
 # Správa daemon
-zeroclaw daemon start        # Spouští daemon na pozadí
-zeroclaw daemon stop         # Zastavuje běžící daemon
-zeroclaw daemon restart      # Restartuje daemon (znovunačtení config)
-zeroclaw daemon logs         # Zobrazuje daemon logy
+jhedaiclaw daemon start        # Spouští daemon na pozadí
+jhedaiclaw daemon stop         # Zastavuje běžící daemon
+jhedaiclaw daemon restart      # Restartuje daemon (znovunačtení config)
+jhedaiclaw daemon logs         # Zobrazuje daemon logy
 
 # Správa agent
-zeroclaw agent start         # Spouští agenta (vyžaduje běžící daemon)
-zeroclaw agent stop          # Zastavuje agenta
-zeroclaw agent restart       # Restartuje agenta (znovunačtení config)
+jhedaiclaw agent start         # Spouští agenta (vyžaduje běžící daemon)
+jhedaiclaw agent stop          # Zastavuje agenta
+jhedaiclaw agent restart       # Restartuje agenta (znovunačtení config)
 
 # Párovací operace
-zeroclaw pairing init        # Generuje nové párovací tajemství
-zeroclaw pairing rotate      # Rotuje existující párovací tajemství
+jhedaiclaw pairing init        # Generuje nové párovací tajemství
+jhedaiclaw pairing rotate      # Rotuje existující párovací tajemství
 
 # Tunneling (pro veřejnou expozici)
-zeroclaw tunnel start        # Spouští tunnel k lokálnímu daemon
-zeroclaw tunnel stop         # Zastavuje aktivní tunnel
+jhedaiclaw tunnel start        # Spouští tunnel k lokálnímu daemon
+jhedaiclaw tunnel stop         # Zastavuje aktivní tunnel
 
 # Diagnostika
-zeroclaw doctor              # Spouští kontroly zdraví systému
-zeroclaw version             # Zobrazuje verzi a build informace
+jhedaiclaw doctor              # Spouští kontroly zdraví systému
+jhedaiclaw version             # Zobrazuje verzi a build informace
 ```
 
 Viz [Příkazová reference](docs/commands-reference.md) pro kompletní možnosti a příklady.
@@ -406,9 +406,9 @@ Pro nasazení a runtime operace:
 - Průvodce síťovým nasazením: [docs/network-deployment.md](docs/network-deployment.md)
 - Proxy Agent Playbook: [docs/proxy-agent-playbook.md](docs/proxy-agent-playbook.md)
 
-## Podpořte ZeroClaw
+## Podpořte JhedaiClaw
 
-Pokud ZeroClaw pomáhá vaší práci a chcete podpořit pokračující vývoj, můžete darovat zde:
+Pokud JhedaiClaw pomáhá vaší práci a chcete podpořit pokračující vývoj, můžete darovat zde:
 
 <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=for-the-badge&logo=buy-me-a-coffee" alt="Kup Mi Kávu" /></a>
 
@@ -439,30 +439,30 @@ Thank you to everyone who opened issues, reviewed PRs, translated docs, and help
 
 ## ⚠️ Oficiální Repoziťář a Varování před Vydáváním se
 
-**Toto je jediný oficiální ZeroClaw repoziťář:**
+**Toto je jediný oficiální JhedaiClaw repoziťář:**
 
-> <https://github.com/zeroclaw-labs/zeroclaw>
+> <https://github.com/jhedai/jhedaiclaw>
 
-Jakýkoliv jiný repoziťář, organizace, doména nebo balík tvrdící že je "ZeroClaw" nebo naznačující afiliaci s ZeroClaw Labs je **neautorizovaný a není spojen s tímto projektem**. Známé neautorizované forky budou uvedeny v [TRADEMARK.md](TRADEMARK.md).
+Jakýkoliv jiný repoziťář, organizace, doména nebo balík tvrdící že je "JhedaiClaw" nebo naznačující afiliaci s JhedaiClaw Labs je **neautorizovaný a není spojen s tímto projektem**. Známé neautorizované forky budou uvedeny v [TRADEMARK.md](TRADEMARK.md).
 
-Pokud narazíte na vydávání se nebo zneužití ochranné známky, prosím [otevřete issue](https://github.com/zeroclaw-labs/zeroclaw/issues).
+Pokud narazíte na vydávání se nebo zneužití ochranné známky, prosím [otevřete issue](https://github.com/jhedai/jhedaiclaw/issues).
 
 ---
 
 ## Licence
 
-ZeroClaw je duálně licencován pro maximální otevřenost a ochranu přispěvatelů:
+JhedaiClaw je duálně licencován pro maximální otevřenost a ochranu přispěvatelů:
 
-| Licence                      | Případy použití                                            |
-| ---------------------------- | ------------------------------------------------------------ |
-| [MIT](LICENSE-MIT)               | Open-source, výzkum, akademické, osobní použití          |
+| Licence                      | Případy použití                                     |
+| ---------------------------- | --------------------------------------------------- |
+| [MIT](LICENSE-MIT)           | Open-source, výzkum, akademické, osobní použití     |
 | [Apache 2.0](LICENSE-APACHE) | Ochrana patentů, institucionální, komerční nasazení |
 
 Můžete si vybrat jednu z licencí. **Přispěvatelé automaticky udělují práva pod oběma** — viz [CLA.md](CLA.md) pro plnou dohodu přispěvatele.
 
 ### Ochranná známka
 
-Název **ZeroClaw** a logo jsou registrované ochranné známky ZeroClaw Labs. Tato licence neuděluje povolení je používat k naznačení schválení nebo afiliace. Viz [TRADEMARK.md](TRADEMARK.md) pro povolená a zakázaná použití.
+Název **JhedaiClaw** a logo jsou registrované ochranné známky JhedaiClaw Labs. Tato licence neuděluje povolení je používat k naznačení schválení nebo afiliace. Viz [TRADEMARK.md](TRADEMARK.md) pro povolená a zakázaná použití.
 
 ### Ochrany přispěvatelů
 
@@ -482,20 +482,20 @@ Viz [CONTRIBUTING.md](CONTRIBUTING.md) a [CLA.md](CLA.md). Implementujte trait, 
 - Nový `Tool` → `src/tools/`
 - Nová `Memory` → `src/memory/`
 - Nový `Tunnel` → `src/tunnel/`
-- Nová `Skill` → `~/.zeroclaw/workspace/skills/<n>/`
+- Nová `Skill` → `~/.jhedaiclaw/workspace/skills/<n>/`
 
 ---
 
-**ZeroClaw** — Nulová režie. Nulové kompromisy. Nasazujte kdekoliv. Měňte cokoliv. 🦀
+**JhedaiClaw** — Nulová režie. Nulové kompromisy. Nasazujte kdekoliv. Měňte cokoliv. 🦀
 
 ## Historie Hvězd
 
 <p align="center">
-  <a href="https://www.star-history.com/#zeroclaw-labs/zeroclaw&type=date&legend=top-left">
+  <a href="https://www.star-history.com/#jhedai/jhedaiclaw&type=date&legend=top-left">
     <picture>
-     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&theme=dark&legend=top-left" />
-     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
-     <img alt="Graf Historie Hvězd" src="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
+     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=jhedai/jhedaiclaw&type=date&theme=dark&legend=top-left" />
+     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=jhedai/jhedaiclaw&type=date&legend=top-left" />
+     <img alt="Graf Historie Hvězd" src="https://api.star-history.com/svg?repos=jhedai/jhedaiclaw&type=date&legend=top-left" />
     </picture>
   </a>
 </p>

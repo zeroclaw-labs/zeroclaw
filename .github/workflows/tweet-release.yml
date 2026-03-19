@@ -130,11 +130,11 @@ jobs:
             TOTAL_COUNT=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
               | sort -uf \
               | grep -v '^$' \
-              | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^ZeroClaw Bot|^ZeroClaw Runner|^ZeroClaw Agent|^blacksmith' \
+              | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^JhedaiClaw Bot|^JhedaiClaw Runner|^JhedaiClaw Agent|^blacksmith' \
               | grep -c . || echo "0")
 
             # Build tweet — new features, contributor count, hashtags
-            TWEET=$(printf "🦀 ZeroClaw %s\n\n%s\n\n🙌 %s contributors\n\n%s\n\n#zeroclaw #rust #ai #opensource" \
+            TWEET=$(printf "🦀 JhedaiClaw %s\n\n%s\n\n🙌 %s contributors\n\n%s\n\n#jhedaiclaw #rust #ai #opensource" \
               "$RELEASE_TAG" "$FEATURES" "$TOTAL_COUNT" "$RELEASE_URL")
           fi
 
@@ -307,7 +307,7 @@ jobs:
           if resp.status_code == 201:
               data = resp.json()
               tweet_id = data["data"]["id"]
-              print(f"Tweet posted: https://x.com/zeroclawlabs/status/{tweet_id}")
+              print(f"Tweet posted: https://x.com/jhedaiclaw/status/{tweet_id}")
           else:
               print(f"Failed to post tweet: {resp.status_code}", file=sys.stderr)
               print(resp.text, file=sys.stderr)

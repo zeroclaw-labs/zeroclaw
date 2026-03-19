@@ -1,4 +1,4 @@
-# Centro de Documentación ZeroClaw
+# Centro de Documentación JhedaiClaw
 
 Esta página es el punto de entrada principal del sistema de documentación.
 
@@ -8,20 +8,20 @@ Centros localizados: [简体中文](README.zh-CN.md) · [日本語](README.ja.md
 
 ## Comience Aquí
 
-| Quiero…                                                             | Leer esto                                                                      |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| Instalar y ejecutar ZeroClaw rápidamente                            | [README.md (Inicio Rápido)](../README.md#quick-start)                          |
-| Arranque con un solo comando                                        | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                  |
-| Encontrar comandos por tarea                                        | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| Verificar rápidamente claves y valores predeterminados de config    | [config-reference.md](reference/api/config-reference.md)                       |
-| Configurar proveedores/endpoints personalizados                     | [custom-providers.md](contributing/custom-providers.md)                        |
-| Configurar el proveedor Z.AI / GLM                                  | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                             |
-| Usar los patrones de integración LangGraph                          | [langgraph-integration.md](contributing/langgraph-integration.md)              |
-| Operar el runtime (runbook día-2)                                   | [operations-runbook.md](ops/operations-runbook.md)                             |
-| Solucionar problemas de instalación/runtime/canal                   | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| Ejecutar configuración y diagnósticos de salas cifradas Matrix      | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                          |
-| Navegar la documentación por categoría                              | [SUMMARY.md](SUMMARY.md)                                                      |
-| Ver la instantánea de docs de PR/issues del proyecto                | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| Quiero…                                                          | Leer esto                                                                                  |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Instalar y ejecutar JhedaiClaw rápidamente                       | [README.md (Inicio Rápido)](../README.md#quick-start)                                      |
+| Arranque con un solo comando                                     | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| Encontrar comandos por tarea                                     | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| Verificar rápidamente claves y valores predeterminados de config | [config-reference.md](reference/api/config-reference.md)                                   |
+| Configurar proveedores/endpoints personalizados                  | [custom-providers.md](contributing/custom-providers.md)                                    |
+| Configurar el proveedor Z.AI / GLM                               | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| Usar los patrones de integración LangGraph                       | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| Operar el runtime (runbook día-2)                                | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| Solucionar problemas de instalación/runtime/canal                | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| Ejecutar configuración y diagnósticos de salas cifradas Matrix   | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| Navegar la documentación por categoría                           | [SUMMARY.md](SUMMARY.md)                                                                   |
+| Ver la instantánea de docs de PR/issues del proyecto             | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## Árbol de Decisión Rápida (10 segundos)
 

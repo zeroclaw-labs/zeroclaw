@@ -1,4 +1,4 @@
-# Development Environment for ZeroClaw Agentic Testing
+# Development Environment for JhedaiClaw Agentic Testing
 #
 # Use this for:
 # - Running the agent in a sandboxed environment
@@ -8,37 +8,37 @@
 # Usage:
 #   cd dev && ./cli.sh up
 #   or from root: ./dev/cli.sh up
-name: zeroclaw-dev
+name: jhedaiclaw-dev
 services:
   # ── The Agent (Development Image) ──
   # Builds from source using the 'dev' stage of the root Dockerfile
-  zeroclaw-dev:
+  jhedaiclaw-dev:
     build:
       context: ..
       dockerfile: Dockerfile
       target: dev
-    container_name: zeroclaw-dev
+    container_name: jhedaiclaw-dev
     restart: unless-stopped
     environment:
-      - ZEROCLAW_GATEWAY_PORT=42617
-      - SANDBOX_HOST=zeroclaw-sandbox
+      - JHEDAICLAW_GATEWAY_PORT=42617
+      - SANDBOX_HOST=jhedaiclaw-sandbox
     secrets:
-      - source: zeroclaw_env
-        target: zeroclaw_env
+      - source: jhedaiclaw_env
+        target: jhedaiclaw_env
     entrypoint: ["/bin/bash", "-lc"]
     command:
       - |
-        if [ -f /run/secrets/zeroclaw_env ]; then
+        if [ -f /run/secrets/jhedaiclaw_env ]; then
           set -a
-          . /run/secrets/zeroclaw_env
+          . /run/secrets/jhedaiclaw_env
           set +a
         fi
-        exec zeroclaw gateway --port "${ZEROCLAW_GATEWAY_PORT:-42617}" --host "[::]"
+        exec jhedaiclaw gateway --port "${JHEDAICLAW_GATEWAY_PORT:-42617}" --host "[::]"
     volumes:
-      # Mount single config file (avoids shadowing other files in .zeroclaw)
-      - ../target/.zeroclaw/config.toml:/zeroclaw-data/.zeroclaw/config.toml
+      # Mount single config file (avoids shadowing other files in .jhedaiclaw)
+      - ../target/.jhedaiclaw/config.toml:/jhedaiclaw-data/.jhedaiclaw/config.toml
       # Mount shared workspace
-      - ../playground:/zeroclaw-data/workspace
+      - ../playground:/jhedaiclaw-data/workspace
     ports:
       - "127.0.0.1:42617:42617"
     networks:
@@ -50,7 +50,7 @@ services:
     build:
       context: sandbox # Context relative to dev/
       dockerfile: Dockerfile
-    container_name: zeroclaw-sandbox
+    container_name: jhedaiclaw-sandbox
     hostname: dev-box
     command: ["tail", "-f", "/dev/null"]
     working_dir: /home/developer/workspace
@@ -68,5 +68,5 @@ networks:
     driver: bridge
 
 secrets:
-  zeroclaw_env:
+  jhedaiclaw_env:
     file: ../.env

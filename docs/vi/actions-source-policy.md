@@ -29,8 +29,8 @@ Các mẫu allowlist được chọn:
 Dùng các lệnh sau để xuất chính sách hiệu lực hiện tại phục vụ kiểm toán/kiểm soát thay đổi:
 
 ```bash
-gh api repos/zeroclaw-labs/zeroclaw/actions/permissions
-gh api repos/zeroclaw-labs/zeroclaw/actions/permissions/selected-actions
+gh api repos/jhedai/jhedaiclaw/actions/permissions
+gh api repos/jhedai/jhedaiclaw/actions/permissions/selected-actions
 ```
 
 Ghi lại mỗi thay đổi chính sách với:
@@ -75,16 +75,16 @@ Nếu gặp phải, chỉ thêm action tin cậy còn thiếu cụ thể đó, c
 Ghi chú quét gần đây nhất:
 
 - 2026-02-17: Cache phụ thuộc Rust được migrate từ `Swatinem/rust-cache` sang `useblacksmith/rust-cache`
-    - Không cần mẫu allowlist mới (`useblacksmith/*` đã có trong allowlist)
+  - Không cần mẫu allowlist mới (`useblacksmith/*` đã có trong allowlist)
 - 2026-02-16: Phụ thuộc ẩn được phát hiện trong `release-beta-on-push.yml`: `sigstore/cosign-installer@...`
-    - Đã thêm mẫu allowlist: `sigstore/cosign-installer@*`
+  - Đã thêm mẫu allowlist: `sigstore/cosign-installer@*`
 - 2026-02-16: Migration Blacksmith chặn thực thi workflow
-    - Đã thêm mẫu allowlist: `useblacksmith/*` cho cơ sở hạ tầng self-hosted runner
-    - Actions: `useblacksmith/setup-docker-builder@v1`, `useblacksmith/build-push-action@v2`
+  - Đã thêm mẫu allowlist: `useblacksmith/*` cho cơ sở hạ tầng self-hosted runner
+  - Actions: `useblacksmith/setup-docker-builder@v1`, `useblacksmith/build-push-action@v2`
 - 2026-02-17: Cập nhật cân bằng tính tái tạo/độ tươi của security audit
-    - Đã thêm mẫu allowlist: `rustsec/audit-check@*`
-    - Thay thế thực thi nội tuyến `cargo install cargo-audit` bằng `rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998` được pin trong `security.yml`
-    - Supersedes đề xuất phiên bản nổi trong #588 trong khi giữ chính sách nguồn action rõ ràng
+  - Đã thêm mẫu allowlist: `rustsec/audit-check@*`
+  - Thay thế thực thi nội tuyến `cargo install cargo-audit` bằng `rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998` được pin trong `security.yml`
+  - Supersedes đề xuất phiên bản nổi trong #588 trong khi giữ chính sách nguồn action rõ ràng
 
 ## Rollback
 

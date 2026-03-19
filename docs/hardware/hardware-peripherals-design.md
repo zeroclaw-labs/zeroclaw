@@ -1,17 +1,18 @@
-# Hardware Peripherals Design — ZeroClaw
+# Hardware Peripherals Design — JhedaiClaw
 
-ZeroClaw enables microcontrollers (MCUs) and Single Board Computers (SBCs) to **dynamically interpret natural language commands**, generate hardware-specific code, and execute peripheral interactions in real-time.
+JhedaiClaw enables microcontrollers (MCUs) and Single Board Computers (SBCs) to **dynamically interpret natural language commands**, generate hardware-specific code, and execute peripheral interactions in real-time.
 
 ## 1. Vision
 
-**Goal:** ZeroClaw acts as a hardware-aware AI agent that:
+**Goal:** JhedaiClaw acts as a hardware-aware AI agent that:
+
 - Receives natural language triggers (e.g. "Move X arm", "Turn on LED") via channels (WhatsApp, Telegram)
 - Fetches accurate hardware documentation (datasheets, register maps)
 - Synthesizes Rust code/logic using an LLM (Gemini, local open-source models)
 - Executes the logic to manipulate peripherals (GPIO, I2C, SPI)
 - Persists optimized code for future reuse
 
-**Mental model:** ZeroClaw = brain that understands hardware. Peripherals = arms and legs it controls.
+**Mental model:** JhedaiClaw = brain that understands hardware. Peripherals = arms and legs it controls.
 
 ## 2. Two Modes of Operation
 
@@ -19,11 +20,11 @@ ZeroClaw enables microcontrollers (MCUs) and Single Board Computers (SBCs) to **
 
 **Target:** Wi-Fi-enabled boards (ESP32, Raspberry Pi).
 
-ZeroClaw runs **directly on the device**. The board spins up a gRPC/nanoRPC server and communicates with peripherals locally.
+JhedaiClaw runs **directly on the device**. The board spins up a gRPC/nanoRPC server and communicates with peripherals locally.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  ZeroClaw on ESP32 / Raspberry Pi (Edge-Native)                             │
+│  JhedaiClaw on ESP32 / Raspberry Pi (Edge-Native)                             │
 │                                                                             │
 │  ┌─────────────┐    ┌──────────────┐    ┌─────────────────────────────────┐ │
 │  │ Channels    │───►│ Agent Loop   │───►│ RAG: datasheets, register maps  │ │
@@ -40,8 +41,9 @@ ZeroClaw runs **directly on the device**. The board spins up a gRPC/nanoRPC serv
 ```
 
 **Workflow:**
-1. User sends WhatsApp: *"Turn on LED on pin 13"*
-2. ZeroClaw fetches board-specific docs (e.g. ESP32 GPIO mapping)
+
+1. User sends WhatsApp: _"Turn on LED on pin 13"_
+2. JhedaiClaw fetches board-specific docs (e.g. ESP32 GPIO mapping)
 3. LLM synthesizes Rust code
 4. Code runs in a sandbox (Wasm or dynamic linking)
 5. GPIO is toggled; result returned to user
@@ -53,11 +55,11 @@ ZeroClaw runs **directly on the device**. The board spins up a gRPC/nanoRPC serv
 
 **Target:** Hardware connected via USB / J-Link / Aardvark to a host (macOS, Linux).
 
-ZeroClaw runs on the **host** and maintains a hardware-aware link to the target. Used for development, introspection, and flashing.
+JhedaiClaw runs on the **host** and maintains a hardware-aware link to the target. Used for development, introspection, and flashing.
 
 ```
 ┌─────────────────────┐                    ┌──────────────────────────────────┐
-│  ZeroClaw on Mac    │   USB / J-Link /   │  STM32 Nucleo-F401RE              │
+│  JhedaiClaw on Mac    │   USB / J-Link /   │  STM32 Nucleo-F401RE              │
 │                     │   Aardvark         │  (or other MCU)                    │
 │  - Channels         │ ◄────────────────► │  - Memory map                     │
 │  - LLM              │                    │  - Peripherals (GPIO, ADC, I2C)    │
@@ -67,31 +69,34 @@ ZeroClaw runs on the **host** and maintains a hardware-aware link to the target.
 ```
 
 **Workflow:**
-1. User sends Telegram: *"What are the readable memory addresses on this USB device?"*
-2. ZeroClaw identifies connected hardware (VID/PID, architecture)
+
+1. User sends Telegram: _"What are the readable memory addresses on this USB device?"_
+2. JhedaiClaw identifies connected hardware (VID/PID, architecture)
 3. Performs memory mapping; suggests available address spaces
 4. Returns result to user
 
 **Or:**
-1. User: *"Flash this firmware to the Nucleo"*
-2. ZeroClaw writes/flashes via OpenOCD or probe-rs
+
+1. User: _"Flash this firmware to the Nucleo"_
+2. JhedaiClaw writes/flashes via OpenOCD or probe-rs
 3. Confirms success
 
 **Or:**
-1. ZeroClaw auto-discovers: *"STM32 Nucleo on /dev/ttyACM0, ARM Cortex-M4"*
-2. Suggests: *"I can read/write GPIO, ADC, flash. What would you like to do?"*
+
+1. JhedaiClaw auto-discovers: _"STM32 Nucleo on /dev/ttyACM0, ARM Cortex-M4"_
+2. Suggests: _"I can read/write GPIO, ADC, flash. What would you like to do?"_
 
 ---
 
 ### Mode Comparison
 
-| Aspect           | Edge-Native                    | Host-Mediated                    |
-|------------------|--------------------------------|----------------------------------|
-| ZeroClaw runs on | Device (ESP32, RPi)           | Host (Mac, Linux)                |
-| Hardware link    | Local (GPIO, I2C, SPI)        | USB, J-Link, Aardvark            |
-| LLM              | On-device or cloud (Gemini)   | Host (cloud or local)            |
-| Use case         | Production, standalone         | Dev, debug, introspection       |
-| Channels         | WhatsApp, etc. (via WiFi)      | Telegram, CLI, etc.              |
+| Aspect             | Edge-Native                 | Host-Mediated             |
+| ------------------ | --------------------------- | ------------------------- |
+| JhedaiClaw runs on | Device (ESP32, RPi)         | Host (Mac, Linux)         |
+| Hardware link      | Local (GPIO, I2C, SPI)      | USB, J-Link, Aardvark     |
+| LLM                | On-device or cloud (Gemini) | Host (cloud or local)     |
+| Use case           | Production, standalone      | Dev, debug, introspection |
+| Channels           | WhatsApp, etc. (via WiFi)   | Telegram, CLI, etc.       |
 
 ## 3. Legacy / Simpler Modes (Pre-LLM-on-Edge)
 
@@ -99,21 +104,21 @@ For boards without WiFi or before full Edge-Native is ready:
 
 ### Mode A: Host + Remote Peripheral (STM32 via serial)
 
-Host runs ZeroClaw; peripheral runs minimal firmware. Simple JSON over serial.
+Host runs JhedaiClaw; peripheral runs minimal firmware. Simple JSON over serial.
 
 ### Mode B: RPi as Host (Native GPIO)
 
-ZeroClaw on Pi; GPIO via rppal or sysfs. No separate firmware.
+JhedaiClaw on Pi; GPIO via rppal or sysfs. No separate firmware.
 
 ## 4. Technical Requirements
 
-| Requirement | Description |
-|-------------|-------------|
-| **Language** | Pure Rust. `no_std` where applicable for embedded targets (STM32, ESP32). |
-| **Communication** | Lightweight gRPC or nanoRPC stack for low-latency command processing. |
-| **Dynamic execution** | Safely run LLM-generated logic on-the-fly: Wasm runtime for isolation, or dynamic linking where supported. |
+| Requirement                 | Description                                                                                                            |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| **Language**                | Pure Rust. `no_std` where applicable for embedded targets (STM32, ESP32).                                              |
+| **Communication**           | Lightweight gRPC or nanoRPC stack for low-latency command processing.                                                  |
+| **Dynamic execution**       | Safely run LLM-generated logic on-the-fly: Wasm runtime for isolation, or dynamic linking where supported.             |
 | **Documentation retrieval** | RAG (Retrieval-Augmented Generation) pipeline to feed datasheet snippets, register maps, and pinouts into LLM context. |
-| **Hardware discovery** | VID/PID-based identification for USB devices; architecture detection (ARM Cortex-M, RISC-V, etc.). |
+| **Hardware discovery**      | VID/PID-based identification for USB devices; architecture detection (ARM Cortex-M, RISC-V, etc.).                     |
 
 ### RAG Pipeline (Datasheet Retrieval)
 
@@ -124,12 +129,12 @@ ZeroClaw on Pi; GPIO via rppal or sysfs. No separate firmware.
 
 ### Dynamic Execution Options
 
-| Option | Pros | Cons |
-|-------|------|------|
-| **Wasm** | Sandboxed, portable, no FFI | Overhead; limited HW access from Wasm |
-| **Dynamic linking** | Native speed, full HW access | Platform-specific; security concerns |
-| **Interpreted DSL** | Safe, auditable | Slower; limited expressiveness |
-| **Pre-compiled templates** | Fast, secure | Less flexible; requires template library |
+| Option                     | Pros                         | Cons                                     |
+| -------------------------- | ---------------------------- | ---------------------------------------- |
+| **Wasm**                   | Sandboxed, portable, no FFI  | Overhead; limited HW access from Wasm    |
+| **Dynamic linking**        | Native speed, full HW access | Platform-specific; security concerns     |
+| **Interpreted DSL**        | Safe, auditable              | Slower; limited expressiveness           |
+| **Pre-compiled templates** | Fast, secure                 | Less flexible; requires template library |
 
 **Recommendation:** Start with pre-compiled templates + parameterization; evolve to Wasm for user-defined logic once stable.
 
@@ -139,15 +144,15 @@ ZeroClaw on Pi; GPIO via rppal or sysfs. No separate firmware.
 
 ```bash
 # Edge-Native: run on device (ESP32, RPi)
-zeroclaw agent --mode edge
+jhedaiclaw agent --mode edge
 
 # Host-Mediated: connect to USB/J-Link target
-zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0
-zeroclaw agent --probe jlink
+jhedaiclaw agent --peripheral nucleo-f401re:/dev/ttyACM0
+jhedaiclaw agent --probe jlink
 
 # Hardware introspection
-zeroclaw hardware discover
-zeroclaw hardware introspect /dev/ttyACM0
+jhedaiclaw hardware discover
+jhedaiclaw hardware introspect /dev/ttyACM0
 ```
 
 ### Config (config.toml)
@@ -171,7 +176,7 @@ transport = "native"
 [[peripherals.boards]]
 board = "esp32"
 transport = "wifi"
-# Edge-Native: ZeroClaw runs on ESP32
+# Edge-Native: JhedaiClaw runs on ESP32
 ```
 
 ## 6. Architecture: Peripheral as Extension Point
@@ -194,7 +199,7 @@ pub trait Peripheral: Send + Sync {
 
 ### Flow
 
-1. **Startup:** ZeroClaw loads config, sees `peripherals.boards`.
+1. **Startup:** JhedaiClaw loads config, sees `peripherals.boards`.
 2. **Connect:** For each board, create a `Peripheral` impl, call `connect()`.
 3. **Tools:** Collect tools from all connected peripherals; merge with default tools.
 4. **Agent loop:** Agent can call `gpio_write`, `sensor_read`, etc. — these delegate to the peripheral.
@@ -202,17 +207,17 @@ pub trait Peripheral: Send + Sync {
 
 ### Board Support
 
-| Board              | Transport | Firmware / Driver      | Tools                    |
-|--------------------|-----------|------------------------|--------------------------|
-| nucleo-f401re      | serial    | Zephyr / Embassy       | gpio_read, gpio_write, adc_read |
-| rpi-gpio           | native    | rppal or sysfs         | gpio_read, gpio_write    |
-| esp32              | serial/ws | ESP-IDF / Embassy      | gpio, wifi, mqtt         |
+| Board         | Transport | Firmware / Driver | Tools                           |
+| ------------- | --------- | ----------------- | ------------------------------- |
+| nucleo-f401re | serial    | Zephyr / Embassy  | gpio_read, gpio_write, adc_read |
+| rpi-gpio      | native    | rppal or sysfs    | gpio_read, gpio_write           |
+| esp32         | serial/ws | ESP-IDF / Embassy | gpio, wifi, mqtt                |
 
 ## 7. Communication Protocols
 
 ### gRPC / nanoRPC (Edge-Native, Host-Mediated)
 
-For low-latency, typed RPC between ZeroClaw and peripherals:
+For low-latency, typed RPC between JhedaiClaw and peripherals:
 
 - **nanoRPC** or **tonic** (gRPC): Protobuf-defined services.
 - Methods: `GpioWrite`, `GpioRead`, `I2cTransfer`, `SpiTransfer`, `MemoryRead`, `FlashWrite`, etc.
@@ -223,36 +228,38 @@ For low-latency, typed RPC between ZeroClaw and peripherals:
 Simple JSON over serial for boards without gRPC support:
 
 **Request (host → peripheral):**
+
 ```json
-{"id":"1","cmd":"gpio_write","args":{"pin":13,"value":1}}
+{ "id": "1", "cmd": "gpio_write", "args": { "pin": 13, "value": 1 } }
 ```
 
 **Response (peripheral → host):**
+
 ```json
-{"id":"1","ok":true,"result":"done"}
+{ "id": "1", "ok": true, "result": "done" }
 ```
 
 ## 8. Firmware (Separate Repo or Crate)
 
-- **zeroclaw-firmware** or **zeroclaw-peripheral** — a separate crate/workspace.
+- **jhedaiclaw-firmware** or **jhedaiclaw-peripheral** — a separate crate/workspace.
 - Targets: `thumbv7em-none-eabihf` (STM32), `armv7-unknown-linux-gnueabihf` (RPi), etc.
 - Uses `embassy` or Zephyr for STM32.
 - Implements the protocol above.
-- User flashes this to the board; ZeroClaw connects and discovers capabilities.
+- User flashes this to the board; JhedaiClaw connects and discovers capabilities.
 
 ## 9. Implementation Phases
 
 ### Phase 1: Skeleton ✅ (Done)
 
-- [x] Add `Peripheral` trait, config schema, CLI (`zeroclaw peripheral list/add`)
+- [x] Add `Peripheral` trait, config schema, CLI (`jhedaiclaw peripheral list/add`)
 - [x] Add `--peripheral` flag to agent
 - [x] Document in AGENTS.md
 
 ### Phase 2: Host-Mediated — Hardware Discovery ✅ (Done)
 
-- [x] `zeroclaw hardware discover`: enumerate USB devices (VID/PID)
+- [x] `jhedaiclaw hardware discover`: enumerate USB devices (VID/PID)
 - [x] Board registry: map VID/PID → architecture, name (e.g. Nucleo-F401RE)
-- [x] `zeroclaw hardware introspect <path>`: memory map, peripheral list
+- [x] `jhedaiclaw hardware introspect <path>`: memory map, peripheral list
 
 ### Phase 3: Host-Mediated — Serial / J-Link
 
@@ -270,7 +277,7 @@ Simple JSON over serial for boards without gRPC support:
 
 ### Phase 5: Edge-Native — RPi ✅ (Done)
 
-- [x] ZeroClaw on Raspberry Pi (native GPIO via rppal)
+- [x] JhedaiClaw on Raspberry Pi (native GPIO via rppal)
 - [ ] gRPC/nanoRPC server for local peripheral access
 - [ ] Code persistence (store synthesized snippets)
 
@@ -279,7 +286,7 @@ Simple JSON over serial for boards without gRPC support:
 - [x] Host-mediated ESP32 (serial transport) — same JSON protocol as STM32
 - [x] `esp32` firmware crate (`firmware/esp32`) — GPIO over UART
 - [x] ESP32 in hardware registry (CH340 VID/PID)
-- [ ] ZeroClaw *on* ESP32 (WiFi + LLM, edge-native) — future
+- [ ] JhedaiClaw _on_ ESP32 (WiFi + LLM, edge-native) — future
 - [ ] Wasm or template-based execution for LLM-generated logic
 
 **Usage:** Flash `firmware/esp32` to ESP32, add `board = "esp32"`, `transport = "serial"`, `path = "/dev/ttyUSB0"` to config.
@@ -298,7 +305,7 @@ Simple JSON over serial for boards without gRPC support:
 
 ## 11. Non-Goals (For Now)
 
-- Running full ZeroClaw *on* bare STM32 (no WiFi, limited RAM) — use Host-Mediated instead
+- Running full JhedaiClaw _on_ bare STM32 (no WiFi, limited RAM) — use Host-Mediated instead
 - Real-time guarantees — peripherals are best-effort
 - Arbitrary native code execution from LLM — prefer Wasm or templates
 
@@ -319,6 +326,6 @@ Simple JSON over serial for boards without gRPC support:
 
 ## 14. Raw Prompt Summary
 
-> *"Boards like ESP, Raspberry Pi, or boards with WiFi can connect to an LLM (Gemini or open-source). ZeroClaw runs on the device, creates its own gRPC, spins it up, and communicates with peripherals. User asks via WhatsApp: 'move X arm' or 'turn on LED'. ZeroClaw gets accurate documentation, writes code, executes it, stores it optimally, runs it, and turns on the LED — all on the development board.*
+> _"Boards like ESP, Raspberry Pi, or boards with WiFi can connect to an LLM (Gemini or open-source). JhedaiClaw runs on the device, creates its own gRPC, spins it up, and communicates with peripherals. User asks via WhatsApp: 'move X arm' or 'turn on LED'. JhedaiClaw gets accurate documentation, writes code, executes it, stores it optimally, runs it, and turns on the LED — all on the development board._
 >
-> *For STM Nucleo connected via USB/J-Link/Aardvark to my Mac: ZeroClaw from my Mac accesses the hardware, installs or writes what it wants on the device, and returns the result. Example: 'Hey ZeroClaw, what are the available/readable addresses on this USB device?' It can figure out what's connected where and suggest."*
+> _For STM Nucleo connected via USB/J-Link/Aardvark to my Mac: JhedaiClaw from my Mac accesses the hardware, installs or writes what it wants on the device, and returns the result. Example: 'Hey JhedaiClaw, what are the available/readable addresses on this USB device?' It can figure out what's connected where and suggest."_

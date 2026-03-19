@@ -1,11 +1,10 @@
-# ZeroClaw ESP32 Firmware
+# JhedaiClaw ESP32 Firmware
 
-Peripheral firmware for ESP32 — speaks the same JSON-over-serial protocol as the STM32 firmware. Flash this to your ESP32, then configure ZeroClaw on the host to connect via serial.
+Peripheral firmware for ESP32 — speaks the same JSON-over-serial protocol as the STM32 firmware. Flash this to your ESP32, then configure JhedaiClaw on the host to connect via serial.
 
 **New to this?** See [SETUP.md](SETUP.md) for step-by-step commands and troubleshooting.
 
 ## Protocol
-
 
 - **Request** (host → ESP32): `{"id":"1","cmd":"gpio_write","args":{"pin":13,"value":1}}\n`
 - **Response** (ESP32 → host): `{"id":"1","ok":true,"result":"done"}\n`
@@ -17,21 +16,25 @@ Commands: `gpio_read`, `gpio_write`.
 1. **RISC-V ESP-IDF** (ESP32-C2/C3): Uses nightly Rust with `build-std`.
 
    **Python**: ESP-IDF requires Python 3.10–3.13 (not 3.14). If you have Python 3.14:
+
    ```sh
    brew install python@3.12
    ```
 
    **virtualenv** (needed by ESP-IDF tools; PEP 668 workaround on macOS):
+
    ```sh
    /opt/homebrew/opt/python@3.12/bin/python3.12 -m pip install virtualenv --break-system-packages
    ```
 
    **Rust tools**:
+
    ```sh
    cargo install espflash ldproxy
    ```
 
    The project's `rust-toolchain.toml` pins nightly + rust-src. `esp-idf-sys` downloads ESP-IDF automatically on first build. Use Python 3.12 for the build:
+
    ```sh
    export PATH="/opt/homebrew/opt/python@3.12/libexec/bin:$PATH"
    ```
@@ -77,4 +80,4 @@ Default GPIO 2 and 13 are configured for output. Edit `src/main.rs` to add more 
 
 ## Edge-Native (Future)
 
-Phase 6 also envisions ZeroClaw running *on* the ESP32 (WiFi + LLM). This firmware is the host-mediated serial peripheral; edge-native will be a separate crate.
+Phase 6 also envisions JhedaiClaw running _on_ the ESP32 (WiFi + LLM). This firmware is the host-mediated serial peripheral; edge-native will be a separate crate.

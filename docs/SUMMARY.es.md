@@ -1,4 +1,4 @@
-# Resumen de Documentación ZeroClaw (Tabla de Contenidos Unificada)
+# Resumen de Documentación JhedaiClaw (Tabla de Contenidos Unificada)
 
 Este archivo constituye la tabla de contenidos canónica del sistema de documentación.
 

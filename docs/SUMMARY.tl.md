@@ -1,4 +1,4 @@
-# Buod ng Dokumentasyon ng ZeroClaw (Pinag-isang Talaan ng Nilalaman)
+# Buod ng Dokumentasyon ng JhedaiClaw (Pinag-isang Talaan ng Nilalaman)
 
 Ang file na ito ang canonical na talaan ng nilalaman ng sistema ng dokumentasyon.
 

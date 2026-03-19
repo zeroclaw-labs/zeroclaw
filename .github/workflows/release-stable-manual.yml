@@ -124,7 +124,7 @@ jobs:
           ALL_CONTRIBUTORS=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
             | sort -uf \
             | grep -v '^$' \
-            | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^ZeroClaw Bot|^ZeroClaw Runner|^ZeroClaw Agent|^blacksmith' \
+            | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^JhedaiClaw Bot|^JhedaiClaw Runner|^JhedaiClaw Agent|^blacksmith' \
             | while IFS= read -r name; do echo "- ${name}"; done || true)
 
           BODY=$(cat <<NOTES_EOF
@@ -160,27 +160,27 @@ jobs:
           # ensuring compatibility with Ubuntu 22.04+ (#3573).
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            artifact: zeroclaw
+            artifact: jhedaiclaw
             ext: tar.gz
           - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
-            artifact: zeroclaw
+            artifact: jhedaiclaw
             ext: tar.gz
             cross_compiler: gcc-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
             linker: aarch64-linux-gnu-gcc
           - os: macos-14
             target: aarch64-apple-darwin
-            artifact: zeroclaw
+            artifact: jhedaiclaw
             ext: tar.gz
           - os: ubuntu-latest
             target: aarch64-linux-android
-            artifact: zeroclaw
+            artifact: jhedaiclaw
             ext: tar.gz
             ndk: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: zeroclaw.exe
+            artifact: jhedaiclaw.exe
             ext: zip
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -218,18 +218,18 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }}
+          tar czf ../../../jhedaiclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }}
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          7z a ../../../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }}
+          7z a ../../../jhedaiclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }}
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: zeroclaw-${{ matrix.target }}
-          path: zeroclaw-${{ matrix.target }}.${{ matrix.ext }}
+          name: jhedaiclaw-${{ matrix.target }}
+          path: jhedaiclaw-${{ matrix.target }}.${{ matrix.ext }}
           retention-days: 14
 
   publish:
@@ -241,7 +241,7 @@ jobs:
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: zeroclaw-*
+          pattern: jhedaiclaw-*
           path: artifacts
 
       - name: Generate checksums
@@ -325,8 +325,8 @@ jobs:
           curl -fsSL -X POST \
             -H "Authorization: token $PAT" \
             -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/zeroclaw-labs/zeroclaw-website/dispatches \
-            -d '{"event_type":"new-release","client_payload":{"install_script_url":"https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh"}}'
+            https://api.github.com/repos/jhedai/jhedaiclaw-website/dispatches \
+            -d '{"event_type":"new-release","client_payload":{"install_script_url":"https://raw.githubusercontent.com/jhedai/jhedaiclaw/master/install.sh"}}'
 
   docker:
     name: Push Docker Image
@@ -363,5 +363,5 @@ jobs:
     uses: ./.github/workflows/tweet-release.yml
     with:
       release_tag: ${{ needs.validate.outputs.tag }}
-      release_url: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/${{ needs.validate.outputs.tag }}
+      release_url: https://github.com/jhedai/jhedaiclaw/releases/tag/${{ needs.validate.outputs.tag }}
     secrets: inherit

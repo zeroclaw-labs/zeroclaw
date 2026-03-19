@@ -1,4 +1,4 @@
-# ZeroClaw Dokümantasyon Merkezi
+# JhedaiClaw Dokümantasyon Merkezi
 
 Bu sayfa, dokümantasyon sisteminin ana giriş noktasıdır.
 
@@ -8,20 +8,20 @@ Yerelleştirilmiş merkezler: [简体中文](README.zh-CN.md) · [日本語](REA
 
 ## Buradan Başlayın
 
-| Yapmak istediğim…                                                    | Bunu oku                                                                       |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| ZeroClaw'ı hızlıca kurup çalıştırmak                                | [README.md (Hızlı Başlangıç)](../README.md#quick-start)                        |
-| Tek komutla kurulum                                                  | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                   |
-| Göreve göre komut bulmak                                             | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| Yapılandırma anahtarlarını ve varsayılan değerleri hızlıca kontrol   | [config-reference.md](reference/api/config-reference.md)                       |
-| Özel sağlayıcı/endpoint yapılandırmak                               | [custom-providers.md](contributing/custom-providers.md)                         |
-| Z.AI / GLM sağlayıcısını yapılandırmak                              | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                              |
-| LangGraph entegrasyon kalıplarını kullanmak                          | [langgraph-integration.md](contributing/langgraph-integration.md)               |
-| Çalışma zamanını yönetmek (2. gün runbook)                          | [operations-runbook.md](ops/operations-runbook.md)                             |
-| Kurulum/çalışma zamanı/kanal sorunlarını gidermek                    | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| Şifreli Matrix odası kurulumu ve tanılama çalıştırmak                | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                           |
-| Dokümantasyonu kategoriye göre göz atmak                             | [SUMMARY.md](SUMMARY.md)                                                       |
-| Proje PR/sorun anlık görüntüsünü görmek                             | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| Yapmak istediğim…                                                  | Bunu oku                                                                                   |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| JhedaiClaw'ı hızlıca kurup çalıştırmak                             | [README.md (Hızlı Başlangıç)](../README.md#quick-start)                                    |
+| Tek komutla kurulum                                                | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| Göreve göre komut bulmak                                           | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| Yapılandırma anahtarlarını ve varsayılan değerleri hızlıca kontrol | [config-reference.md](reference/api/config-reference.md)                                   |
+| Özel sağlayıcı/endpoint yapılandırmak                              | [custom-providers.md](contributing/custom-providers.md)                                    |
+| Z.AI / GLM sağlayıcısını yapılandırmak                             | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| LangGraph entegrasyon kalıplarını kullanmak                        | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| Çalışma zamanını yönetmek (2. gün runbook)                         | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| Kurulum/çalışma zamanı/kanal sorunlarını gidermek                  | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| Şifreli Matrix odası kurulumu ve tanılama çalıştırmak              | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| Dokümantasyonu kategoriye göre göz atmak                           | [SUMMARY.md](SUMMARY.md)                                                                   |
+| Proje PR/sorun anlık görüntüsünü görmek                            | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## Hızlı Karar Ağacı (10 saniye)
 

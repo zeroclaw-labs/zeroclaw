@@ -1,4 +1,4 @@
-# Центр документації ZeroClaw
+# Центр документації JhedaiClaw
 
 Ця сторінка є основною точкою входу до системи документації.
 
@@ -8,20 +8,20 @@
 
 ## Почніть тут
 
-| Я хочу…                                                             | Читати це                                                                      |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| Швидко встановити та запустити ZeroClaw                               | [README.md (Швидкий старт)](../README.md#quick-start)                           |
-| Налаштування однією командою                                         | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                   |
-| Знайти команди за завданням                                          | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| Швидко перевірити ключі конфігурації та значення за замовчуванням     | [config-reference.md](reference/api/config-reference.md)                       |
-| Налаштувати власного провайдера/endpoint                             | [custom-providers.md](contributing/custom-providers.md)                         |
-| Налаштувати провайдера Z.AI / GLM                                   | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                              |
-| Використовувати шаблони інтеграції LangGraph                         | [langgraph-integration.md](contributing/langgraph-integration.md)               |
-| Керувати середовищем виконання (runbook 2-го дня)                    | [operations-runbook.md](ops/operations-runbook.md)                             |
-| Усунути проблеми встановлення/виконання/каналів                      | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| Запустити налаштування та діагностику зашифрованих кімнат Matrix      | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                           |
-| Переглянути документацію за категоріями                               | [SUMMARY.md](SUMMARY.md)                                                       |
-| Переглянути знімок PR/issues проекту                                 | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| Я хочу…                                                           | Читати це                                                                                  |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Швидко встановити та запустити JhedaiClaw                         | [README.md (Швидкий старт)](../README.md#quick-start)                                      |
+| Налаштування однією командою                                      | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| Знайти команди за завданням                                       | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| Швидко перевірити ключі конфігурації та значення за замовчуванням | [config-reference.md](reference/api/config-reference.md)                                   |
+| Налаштувати власного провайдера/endpoint                          | [custom-providers.md](contributing/custom-providers.md)                                    |
+| Налаштувати провайдера Z.AI / GLM                                 | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| Використовувати шаблони інтеграції LangGraph                      | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| Керувати середовищем виконання (runbook 2-го дня)                 | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| Усунути проблеми встановлення/виконання/каналів                   | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| Запустити налаштування та діагностику зашифрованих кімнат Matrix  | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| Переглянути документацію за категоріями                           | [SUMMARY.md](SUMMARY.md)                                                                   |
+| Переглянути знімок PR/issues проекту                              | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## Дерево швидких рішень (10 секунд)
 

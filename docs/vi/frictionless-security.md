@@ -6,6 +6,7 @@
 > Để biết hành vi runtime hiện tại, xem [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), và [troubleshooting.md](troubleshooting.md).
 
 ## Nguyên tắc cốt lõi
+
 > **"Các tính năng bảo mật nên như túi khí — luôn hiện diện, bảo vệ, và vô hình cho đến khi cần."**
 
 ## Thiết kế: tự động phát hiện âm thầm
@@ -124,23 +125,23 @@ impl SandboxConfig {
 ### 3. Lần chạy đầu: ghi log âm thầm
 
 ```bash
-$ zeroclaw agent -m "hello"
+$ jhedaiclaw agent -m "hello"
 
 # Lần đầu: phát hiện âm thầm
 [INFO] Detecting security features...
 [INFO] ✓ Landlock sandbox enabled (kernel 6.2+)
 [INFO] ✓ Memory monitoring active (512MB limit)
-[INFO] ✓ Audit logging enabled (~/.config/zeroclaw/audit.log)
+[INFO] ✓ Audit logging enabled (~/.config/jhedaiclaw/audit.log)
 
 # Các lần sau: yên lặng
-$ zeroclaw agent -m "hello"
+$ jhedaiclaw agent -m "hello"
 [agent] Thinking...
 ```
 
 ### 4. File config: tất cả giá trị mặc định được ẩn
 
 ```toml
-# ~/.config/zeroclaw/config.toml
+# ~/.config/jhedaiclaw/config.toml
 
 # Các section này KHÔNG được ghi trừ khi người dùng tùy chỉnh
 # [security.sandbox]
@@ -155,6 +156,7 @@ $ zeroclaw agent -m "hello"
 ```
 
 Chỉ khi người dùng thay đổi:
+
 ```toml
 [security.sandbox]
 enabled = false  # Người dùng tắt tường minh
@@ -167,31 +169,31 @@ max_memory_mb = 1024  # Người dùng tăng giới hạn
 
 ```bash
 # Kiểm tra trạng thái đang hoạt động
-$ zeroclaw security --status
+$ jhedaiclaw security --status
 Security Status:
   ✓ Sandbox: Landlock (Linux kernel 6.2)
   ✓ Memory monitoring: 512MB limit
-  ✓ Audit logging: ~/.config/zeroclaw/audit.log
+  ✓ Audit logging: ~/.config/jhedaiclaw/audit.log
   → 47 events logged today
 
 # Tắt sandbox tường minh (ghi vào config)
-$ zeroclaw config set security.sandbox.enabled false
+$ jhedaiclaw config set security.sandbox.enabled false
 
 # Bật backend cụ thể
-$ zeroclaw config set security.sandbox.backend firejail
+$ jhedaiclaw config set security.sandbox.backend firejail
 
 # Điều chỉnh giới hạn
-$ zeroclaw config set security.resources.max_memory_mb 2048
+$ jhedaiclaw config set security.resources.max_memory_mb 2048
 ```
 
 ### 6. Giảm cấp nhẹ nhàng
 
-| Nền tảng | Tốt nhất có thể | Fallback | Tệ nhất |
-|----------|---------------|----------|------------|
-| **Linux 5.13+** | Landlock | None | Chỉ App-layer |
-| **Linux (bất kỳ)** | Firejail | Landlock | Chỉ App-layer |
-| **macOS** | Bubblewrap | None | Chỉ App-layer |
-| **Windows** | None | - | Chỉ App-layer |
+| Nền tảng           | Tốt nhất có thể | Fallback | Tệ nhất       |
+| ------------------ | --------------- | -------- | ------------- |
+| **Linux 5.13+**    | Landlock        | None     | Chỉ App-layer |
+| **Linux (bất kỳ)** | Firejail        | Landlock | Chỉ App-layer |
+| **macOS**          | Bubblewrap      | None     | Chỉ App-layer |
+| **Windows**        | None            | -        | Chỉ App-layer |
 
 **App-layer security luôn hiện diện** — đây là allowlist/path blocking/injection protection hiện có, vốn đã toàn diện.
 
@@ -265,8 +267,9 @@ impl Default for SandboxBackend {
 ## So sánh trải nghiệm người dùng
 
 ### Trước (hiện tại)
+
 ```bash
-$ zeroclaw onboard
+$ jhedaiclaw onboard
 [1/9] Workspace Setup...
 [2/9] AI Provider...
 ...
@@ -275,8 +278,9 @@ $ zeroclaw onboard
 ```
 
 ### Sau (với bảo mật không gây cản trở)
+
 ```bash
-$ zeroclaw onboard
+$ jhedaiclaw onboard
 [1/9] Workspace Setup...
 [2/9] AI Provider...
 ...
@@ -289,12 +293,12 @@ $ zeroclaw onboard
 
 ## Tương thích ngược
 
-| Tình huống | Hành vi |
-|----------|----------|
-| **Config hiện có** | Hoạt động không thay đổi, tính năng mới là opt-in |
-| **Cài mới** | Tự phát hiện và bật bảo mật khả dụng |
-| **Không có sandbox** | Fallback về app-layer (vẫn an toàn) |
-| **Người dùng tắt** | Một flag config: `sandbox.enabled = false` |
+| Tình huống           | Hành vi                                           |
+| -------------------- | ------------------------------------------------- |
+| **Config hiện có**   | Hoạt động không thay đổi, tính năng mới là opt-in |
+| **Cài mới**          | Tự phát hiện và bật bảo mật khả dụng              |
+| **Không có sandbox** | Fallback về app-layer (vẫn an toàn)               |
+| **Người dùng tắt**   | Một flag config: `sandbox.enabled = false`        |
 
 ---
 
@@ -304,6 +308,6 @@ $ zeroclaw onboard
 ✅ **Không thêm prompt** — tự phát hiện âm thầm
 ✅ **Không breaking change** — tương thích ngược
 ✅ **Có thể opt-out** — flag config tường minh
-✅ **Hiển thị trạng thái** — `zeroclaw security --status`
+✅ **Hiển thị trạng thái** — `jhedaiclaw security --status`
 
 Wizard vẫn là "thiết lập nhanh ứng dụng phổ quát" — bảo mật chỉ **lặng lẽ tốt hơn**.

@@ -5,15 +5,15 @@
 //! external service dependencies. They complement the unit tests in
 //! `src/agent/tests.rs` by running at the integration test boundary.
 //!
-//! Ref: https://github.com/zeroclaw-labs/zeroclaw/issues/618 (item 6)
+//! Ref: https://github.com/jhedai/jhedaiclaw/issues/618 (item 6)
 
 use crate::support::helpers::{
     build_agent, build_agent_xml, build_recording_agent, text_response, tool_response,
     StaticMemoryLoader,
 };
 use crate::support::{CountingTool, EchoTool, MockProvider, RecordingProvider};
-use zeroclaw::providers::traits::ChatMessage;
-use zeroclaw::providers::{ChatResponse, ConversationMessage, ToolCall};
+use jhedaiclaw::providers::traits::ChatMessage;
+use jhedaiclaw::providers::{ChatResponse, ConversationMessage, ToolCall};
 
 // ═════════════════════════════════════════════════════════════════════════════
 // E2E smoke tests — full agent turn cycle
@@ -306,7 +306,7 @@ async fn e2e_multi_turn_with_memory_enrichment() {
     let (provider, recorded) =
         RecordingProvider::new(vec![text_response("answer 1"), text_response("answer 2")]);
 
-    let memory_context = "[Memory context]\n- project: zeroclaw\n\n";
+    let memory_context = "[Memory context]\n- project: jhedaiclaw\n\n";
     let loader = StaticMemoryLoader::new(memory_context);
 
     let mut agent = build_recording_agent(Box::new(provider), vec![], Some(Box::new(loader)));
@@ -323,7 +323,7 @@ async fn e2e_multi_turn_with_memory_enrichment() {
     // Turn 1: user message is enriched
     let req1_user = requests[0].iter().find(|m| m.role == "user").unwrap();
     assert!(req1_user.content.contains("[Memory context]"));
-    assert!(req1_user.content.contains("project: zeroclaw"));
+    assert!(req1_user.content.contains("project: jhedaiclaw"));
     assert!(req1_user.content.ends_with("first question"));
 
     // Turn 2: both user messages enriched, assistant from turn 1 present

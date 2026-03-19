@@ -1,6 +1,6 @@
 # Telegram Integration Testing Guide
 
-This guide covers testing the Telegram channel integration for ZeroClaw.
+This guide covers testing the Telegram channel integration for JhedaiClaw.
 
 ## 🚀 Quick Start
 
@@ -64,74 +64,74 @@ After running automated tests, perform these manual checks:
 
 1. **Basic messaging**
 
-    ```bash
-    zeroclaw channel start
-    ```
+   ```bash
+   jhedaiclaw channel start
+   ```
 
-    - Send "Hello bot!" in Telegram
-    - Verify response within 3 seconds
+   - Send "Hello bot!" in Telegram
+   - Verify response within 3 seconds
 
 2. **Long message splitting**
 
-    ```bash
-    # Generate 5000+ char message
-    python3 -c 'print("test " * 1000)'
-    ```
+   ```bash
+   # Generate 5000+ char message
+   python3 -c 'print("test " * 1000)'
+   ```
 
-    - Paste into Telegram
-    - Verify: Message split into chunks
-    - Verify: Markers show `(continues...)` and `(continued)`
-    - Verify: All chunks arrive in order
+   - Paste into Telegram
+   - Verify: Message split into chunks
+   - Verify: Markers show `(continues...)` and `(continued)`
+   - Verify: All chunks arrive in order
 
 3. **Unauthorized user blocking**
 
-    ```toml
-    # Edit ~/.zeroclaw/config.toml
-    allowed_users = ["999999999"]
-    ```
+   ```toml
+   # Edit ~/.jhedaiclaw/config.toml
+   allowed_users = ["999999999"]
+   ```
 
-    - Send message to bot
-    - Verify: Warning in logs
-    - Verify: Message ignored
-    - Restore correct user ID
+   - Send message to bot
+   - Verify: Warning in logs
+   - Verify: Message ignored
+   - Restore correct user ID
 
 4. **Rate limiting**
-    - Send 10 messages rapidly
-    - Verify: All processed
-    - Verify: No "Too Many Requests" errors
-    - Verify: Responses have delays
+   - Send 10 messages rapidly
+   - Verify: All processed
+   - Verify: No "Too Many Requests" errors
+   - Verify: Responses have delays
 
 5. **Mention-only mode (group chats)**
 
-    ```toml
-    # Edit ~/.zeroclaw/config.toml
-    [channels.telegram]
-    mention_only = true
-    ```
+   ```toml
+   # Edit ~/.jhedaiclaw/config.toml
+   [channels.telegram]
+   mention_only = true
+   ```
 
-    - Add bot to a group chat
-    - Send message without @botname mention
-    - Verify: Bot does not respond
-    - Send message with @botname mention
-    - Verify: Bot responds and mention is stripped
-    - DM/private chat should always work regardless of mention_only
+   - Add bot to a group chat
+   - Send message without @botname mention
+   - Verify: Bot does not respond
+   - Send message with @botname mention
+   - Verify: Bot responds and mention is stripped
+   - DM/private chat should always work regardless of mention_only
 
 6. **Error logging**
 
-    ```bash
-    RUST_LOG=debug zeroclaw channel start
-    ```
+   ```bash
+   RUST_LOG=debug jhedaiclaw channel start
+   ```
 
-    - Check for unexpected errors
-    - Verify proper error handling
+   - Check for unexpected errors
+   - Verify proper error handling
 
-6. **Health check timeout**
+7. **Health check timeout**
 
-    ```bash
-    time zeroclaw channel doctor
-    ```
+   ```bash
+   time jhedaiclaw channel doctor
+   ```
 
-    - Verify: Completes in <5 seconds
+   - Verify: Completes in <5 seconds
 
 ## 🔍 Test Results Interpretation
 
@@ -159,7 +159,7 @@ Solution: Check user allowlist
   1. Send message to bot
   2. Check logs for user_id
   3. Update config: allowed_users = ["YOUR_ID"]
-  4. Run: zeroclaw onboard --channels-only
+  4. Run: jhedaiclaw onboard --channels-only
 ```
 
 **Issue: Message splitting not working**
@@ -179,16 +179,16 @@ Solution: Verify code changes
 ./tests/telegram/test_telegram_integration.sh
 
 # 2. Configure Telegram
-zeroclaw onboard
+jhedaiclaw onboard
 # Select Telegram channel
 # Enter bot token (from @BotFather)
 # Enter your user ID
 
 # 3. Verify health
-zeroclaw channel doctor
+jhedaiclaw channel doctor
 
 # 4. Start channel
-zeroclaw channel start
+jhedaiclaw channel start
 
 # 5. Send test message in Telegram
 ```
@@ -203,7 +203,7 @@ zeroclaw channel start
 ./tests/telegram/test_telegram_integration.sh
 
 # 3. Manual smoke test
-zeroclaw channel start
+jhedaiclaw channel start
 # Send message in Telegram
 ```
 
@@ -223,24 +223,24 @@ for i in {1..100}; do
 done
 
 # 3. Monitor logs
-RUST_LOG=info zeroclaw daemon
+RUST_LOG=info jhedaiclaw daemon
 
 # 4. Check metrics
-zeroclaw status
+jhedaiclaw status
 ```
 
 ## 📊 Performance Benchmarks
 
 Expected values after all fixes:
 
-| Metric                 | Expected   | How to Measure                   |
-| ---------------------- | ---------- | -------------------------------- |
-| Health check time      | <5s        | `time zeroclaw channel doctor`   |
-| First response time    | <3s        | Time from sending to receiving   |
-| Message split overhead | <50ms      | Check logs for timing            |
-| Memory usage           | <10MB      | `ps aux \| grep zeroclaw`        |
-| Binary size            | ~3-4MB     | `ls -lh target/release/zeroclaw` |
-| Unit test coverage     | 61/61 pass | `cargo test telegram --lib`      |
+| Metric                 | Expected   | How to Measure                     |
+| ---------------------- | ---------- | ---------------------------------- |
+| Health check time      | <5s        | `time jhedaiclaw channel doctor`   |
+| First response time    | <3s        | Time from sending to receiving     |
+| Message split overhead | <50ms      | Check logs for timing              |
+| Memory usage           | <10MB      | `ps aux \| grep jhedaiclaw`        |
+| Binary size            | ~3-4MB     | `ls -lh target/release/jhedaiclaw` |
+| Unit test coverage     | 61/61 pass | `cargo test telegram --lib`        |
 
 ## 🐛 Debugging Failed Tests
 
@@ -261,14 +261,14 @@ cargo test telegram --lib -- --ignored
 
 ```bash
 # Maximum logging
-RUST_LOG=trace zeroclaw channel start
+RUST_LOG=trace jhedaiclaw channel start
 
 # Check Telegram API directly
 curl "https://api.telegram.org/bot<TOKEN>/getMe"
 curl "https://api.telegram.org/bot<TOKEN>/getUpdates"
 
 # Validate config
-cat ~/.zeroclaw/config.toml | grep -A 3 "\[channels_config.telegram\]"
+cat ~/.jhedaiclaw/config.toml | grep -A 3 "\[channels_config.telegram\]"
 ```
 
 ### Debug Build Issues
@@ -338,15 +338,15 @@ git revert <commit-hash>
 cargo build --release
 
 # 4. Restart service
-zeroclaw service restart
+jhedaiclaw service restart
 
 # 5. Verify
-zeroclaw channel doctor
+jhedaiclaw channel doctor
 ```
 
 ## 📚 Additional Resources
 
 - [Telegram Bot API Documentation](https://core.telegram.org/bots/api)
-- [ZeroClaw Main README](../../README.md)
+- [JhedaiClaw Main README](../../README.md)
 - [Contributing Guide](../../CONTRIBUTING.md)
-- [Issue Tracker](https://github.com/zeroclaw-labs/zeroclaw/issues)
+- [Issue Tracker](https://github.com/jhedai/jhedaiclaw/issues)

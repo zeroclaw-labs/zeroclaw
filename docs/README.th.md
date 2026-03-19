@@ -1,4 +1,4 @@
-# ศูนย์กลางเอกสาร ZeroClaw
+# ศูนย์กลางเอกสาร JhedaiClaw
 
 หน้านี้เป็นจุดเริ่มต้นหลักของระบบเอกสาร
 
@@ -8,20 +8,20 @@
 
 ## เริ่มต้นที่นี่
 
-| ฉันต้องการ…                                                          | อ่านสิ่งนี้                                                                    |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| ติดตั้งและรัน ZeroClaw อย่างรวดเร็ว                                    | [README.md (เริ่มต้นอย่างรวดเร็ว)](../README.md#quick-start)                    |
-| ติดตั้งด้วยคำสั่งเดียว                                                | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                   |
-| ค้นหาคำสั่งตามงาน                                                    | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| ตรวจสอบคีย์และค่าเริ่มต้นของการตั้งค่าอย่างรวดเร็ว                     | [config-reference.md](reference/api/config-reference.md)                       |
-| ตั้งค่าผู้ให้บริการ/endpoint แบบกำหนดเอง                               | [custom-providers.md](contributing/custom-providers.md)                         |
-| ตั้งค่าผู้ให้บริการ Z.AI / GLM                                        | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                              |
-| ใช้รูปแบบการรวม LangGraph                                            | [langgraph-integration.md](contributing/langgraph-integration.md)               |
-| ดำเนินงาน runtime (คู่มือปฏิบัติการวันที่ 2)                          | [operations-runbook.md](ops/operations-runbook.md)                             |
-| แก้ไขปัญหาการติดตั้ง/runtime/ช่องทาง                                  | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| รันการตั้งค่าและวินิจฉัยห้อง Matrix แบบเข้ารหัส                        | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                           |
-| เรียกดูเอกสารตามหมวดหมู่                                              | [SUMMARY.md](SUMMARY.md)                                                       |
-| ดูสแนปช็อตเอกสาร PR/issue ของโปรเจกต์                                 | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| ฉันต้องการ…                                        | อ่านสิ่งนี้                                                                                |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| ติดตั้งและรัน JhedaiClaw อย่างรวดเร็ว              | [README.md (เริ่มต้นอย่างรวดเร็ว)](../README.md#quick-start)                               |
+| ติดตั้งด้วยคำสั่งเดียว                             | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| ค้นหาคำสั่งตามงาน                                  | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| ตรวจสอบคีย์และค่าเริ่มต้นของการตั้งค่าอย่างรวดเร็ว | [config-reference.md](reference/api/config-reference.md)                                   |
+| ตั้งค่าผู้ให้บริการ/endpoint แบบกำหนดเอง           | [custom-providers.md](contributing/custom-providers.md)                                    |
+| ตั้งค่าผู้ให้บริการ Z.AI / GLM                     | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| ใช้รูปแบบการรวม LangGraph                          | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| ดำเนินงาน runtime (คู่มือปฏิบัติการวันที่ 2)       | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| แก้ไขปัญหาการติดตั้ง/runtime/ช่องทาง               | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| รันการตั้งค่าและวินิจฉัยห้อง Matrix แบบเข้ารหัส    | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| เรียกดูเอกสารตามหมวดหมู่                           | [SUMMARY.md](SUMMARY.md)                                                                   |
+| ดูสแนปช็อตเอกสาร PR/issue ของโปรเจกต์              | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## แผนผังการตัดสินใจอย่างรวดเร็ว (10 วินาที)
 

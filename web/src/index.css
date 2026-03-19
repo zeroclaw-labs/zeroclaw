@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 /*
- * ZeroClaw Electric Blue Theme
+ * JhedaiClaw Electric Blue Theme
  * Dark-mode with electric blue accents, glassmorphism, and animations.
  */
 
@@ -77,7 +77,11 @@ body {
 
 /* Card utility */
 .card {
-  background: linear-gradient(135deg, rgba(13, 13, 32, 0.8), rgba(10, 10, 26, 0.6));
+  background: linear-gradient(
+    135deg,
+    rgba(13, 13, 32, 0.8),
+    rgba(10, 10, 26, 0.6)
+  );
   border: 1px solid rgba(0, 128, 255, 0.1);
   border-radius: 1rem;
   backdrop-filter: blur(12px);
@@ -98,54 +102,109 @@ body {
 /* ========== ANIMATIONS ========== */
 
 @keyframes fadeIn {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 @keyframes fadeInScale {
-  from { opacity: 0; transform: scale(0.95); }
-  to { opacity: 1; transform: scale(1); }
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
 }
 
 @keyframes slideInLeft {
-  from { opacity: 0; transform: translateX(-16px); }
-  to { opacity: 1; transform: translateX(0); }
+  from {
+    opacity: 0;
+    transform: translateX(-16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
 }
 
 @keyframes slideInRight {
-  from { opacity: 0; transform: translateX(16px); }
-  to { opacity: 1; transform: translateX(0); }
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
 }
 
 @keyframes slideInUp {
-  from { opacity: 0; transform: translateY(16px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 @keyframes pulse-glow {
-  0%, 100% { box-shadow: 0 0 8px rgba(0, 128, 255, 0.3); }
-  50% { box-shadow: 0 0 20px rgba(0, 128, 255, 0.6); }
+  0%,
+  100% {
+    box-shadow: 0 0 8px rgba(0, 128, 255, 0.3);
+  }
+  50% {
+    box-shadow: 0 0 20px rgba(0, 128, 255, 0.6);
+  }
 }
 
 @keyframes shimmer {
-  0% { background-position: -200% 0; }
-  100% { background-position: 200% 0; }
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
 }
 
 @keyframes float {
-  0%, 100% { transform: translateY(0px); }
-  50% { transform: translateY(-4px); }
+  0%,
+  100% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(-4px);
+  }
 }
 
 @keyframes borderGlow {
-  0%, 100% { border-color: rgba(0, 128, 255, 0.15); }
-  50% { border-color: rgba(0, 128, 255, 0.35); }
+  0%,
+  100% {
+    border-color: rgba(0, 128, 255, 0.15);
+  }
+  50% {
+    border-color: rgba(0, 128, 255, 0.35);
+  }
 }
 
 @keyframes gradientShift {
-  0% { background-position: 0% 50%; }
-  50% { background-position: 100% 50%; }
-  100% { background-position: 0% 50%; }
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
 }
 
 /* Animation utility classes */
@@ -182,20 +241,44 @@ body {
 }
 
 /* Stagger delays for grid children */
-.stagger-children > *:nth-child(1) { animation-delay: 0ms; }
-.stagger-children > *:nth-child(2) { animation-delay: 60ms; }
-.stagger-children > *:nth-child(3) { animation-delay: 120ms; }
-.stagger-children > *:nth-child(4) { animation-delay: 180ms; }
-.stagger-children > *:nth-child(5) { animation-delay: 240ms; }
-.stagger-children > *:nth-child(6) { animation-delay: 300ms; }
-.stagger-children > *:nth-child(7) { animation-delay: 360ms; }
-.stagger-children > *:nth-child(8) { animation-delay: 420ms; }
-.stagger-children > *:nth-child(9) { animation-delay: 480ms; }
-.stagger-children > *:nth-child(10) { animation-delay: 540ms; }
+.stagger-children > *:nth-child(1) {
+  animation-delay: 0ms;
+}
+.stagger-children > *:nth-child(2) {
+  animation-delay: 60ms;
+}
+.stagger-children > *:nth-child(3) {
+  animation-delay: 120ms;
+}
+.stagger-children > *:nth-child(4) {
+  animation-delay: 180ms;
+}
+.stagger-children > *:nth-child(5) {
+  animation-delay: 240ms;
+}
+.stagger-children > *:nth-child(6) {
+  animation-delay: 300ms;
+}
+.stagger-children > *:nth-child(7) {
+  animation-delay: 360ms;
+}
+.stagger-children > *:nth-child(8) {
+  animation-delay: 420ms;
+}
+.stagger-children > *:nth-child(9) {
+  animation-delay: 480ms;
+}
+.stagger-children > *:nth-child(10) {
+  animation-delay: 540ms;
+}
 
 /* Glass card */
 .glass-card {
-  background: linear-gradient(135deg, rgba(13, 13, 32, 0.7), rgba(5, 5, 16, 0.5));
+  background: linear-gradient(
+    135deg,
+    rgba(13, 13, 32, 0.7),
+    rgba(5, 5, 16, 0.5)
+  );
   border: 1px solid rgba(0, 128, 255, 0.12);
   border-radius: 1rem;
   backdrop-filter: blur(16px);
@@ -204,7 +287,9 @@ body {
 
 .glass-card:hover {
   border-color: rgba(0, 128, 255, 0.3);
-  box-shadow: 0 4px 30px rgba(0, 128, 255, 0.1), 0 0 0 1px rgba(0, 128, 255, 0.05);
+  box-shadow:
+    0 4px 30px rgba(0, 128, 255, 0.1),
+    0 0 0 1px rgba(0, 128, 255, 0.05);
   transform: translateY(-1px);
 }
 
@@ -260,7 +345,9 @@ body {
 .input-electric:focus {
   outline: none;
   border-color: rgba(0, 128, 255, 0.5);
-  box-shadow: 0 0 0 3px rgba(0, 128, 255, 0.15), 0 0 20px rgba(0, 128, 255, 0.1);
+  box-shadow:
+    0 0 0 3px rgba(0, 128, 255, 0.15),
+    0 0 20px rgba(0, 128, 255, 0.1);
 }
 
 .input-electric::placeholder {
@@ -274,13 +361,18 @@ body {
 }
 
 .progress-bar-animated::after {
-  content: '';
+  content: "";
   position: absolute;
   top: 0;
   left: 0;
   right: 0;
   bottom: 0;
-  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.15), transparent);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.15),
+    transparent
+  );
   background-size: 200% 100%;
   animation: shimmer 2s infinite;
 }
@@ -325,5 +417,10 @@ body {
   top: 0;
   bottom: 0;
   width: 1px;
-  background: linear-gradient(180deg, transparent, rgba(0, 128, 255, 0.3), transparent);
+  background: linear-gradient(
+    180deg,
+    transparent,
+    rgba(0, 128, 255, 0.3),
+    transparent
+  );
 }

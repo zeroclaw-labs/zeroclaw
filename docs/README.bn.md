@@ -1,4 +1,4 @@
-# ZeroClaw ডকুমেন্টেশন হাব
+# JhedaiClaw ডকুমেন্টেশন হাব
 
 এই পৃষ্ঠাটি ডকুমেন্টেশন সিস্টেমের প্রধান প্রবেশ বিন্দু।
 
@@ -8,20 +8,20 @@
 
 ## এখান থেকে শুরু করুন
 
-| আমি চাই…                                                            | এটি পড়ুন                                                                      |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| দ্রুত ZeroClaw ইনস্টল ও চালু করতে                                   | [README.md (দ্রুত শুরু)](../README.md#quick-start)                             |
-| এক-ক্লিকে বুটস্ট্র্যাপ করতে                                        | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                   |
-| কাজ অনুযায়ী কমান্ড খুঁজতে                                          | [commands-reference.md](reference/cli/commands-reference.md)                   |
-| দ্রুত কনফিগ কী ও ডিফল্ট মান যাচাই করতে                             | [config-reference.md](reference/api/config-reference.md)                       |
-| কাস্টম প্রোভাইডার/এন্ডপয়েন্ট সেটআপ করতে                           | [custom-providers.md](contributing/custom-providers.md)                         |
-| Z.AI / GLM প্রোভাইডার সেটআপ করতে                                    | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                              |
-| LangGraph ইন্টিগ্রেশন প্যাটার্ন ব্যবহার করতে                       | [langgraph-integration.md](contributing/langgraph-integration.md)               |
-| রানটাইম পরিচালনা করতে (দৈনন্দিন অপারেশন গাইড)                      | [operations-runbook.md](ops/operations-runbook.md)                             |
-| ইনস্টলেশন/রানটাইম/চ্যানেল সমস্যা সমাধান করতে                       | [troubleshooting.md](ops/troubleshooting.md)                                   |
-| Matrix এনক্রিপ্টেড রুম সেটআপ ও ডায়াগনস্টিক চালাতে                 | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                           |
-| বিভাগ অনুযায়ী ডকুমেন্টেশন ব্রাউজ করতে                              | [SUMMARY.md](SUMMARY.md)                                                       |
-| প্রকল্পের PR/ইস্যু ডক স্ন্যাপশট দেখতে                              | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
+| আমি চাই…                                           | এটি পড়ুন                                                                                  |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| দ্রুত JhedaiClaw ইনস্টল ও চালু করতে                | [README.md (দ্রুত শুরু)](../README.md#quick-start)                                         |
+| এক-ক্লিকে বুটস্ট্র্যাপ করতে                        | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                              |
+| কাজ অনুযায়ী কমান্ড খুঁজতে                         | [commands-reference.md](reference/cli/commands-reference.md)                               |
+| দ্রুত কনফিগ কী ও ডিফল্ট মান যাচাই করতে             | [config-reference.md](reference/api/config-reference.md)                                   |
+| কাস্টম প্রোভাইডার/এন্ডপয়েন্ট সেটআপ করতে           | [custom-providers.md](contributing/custom-providers.md)                                    |
+| Z.AI / GLM প্রোভাইডার সেটআপ করতে                   | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                                          |
+| LangGraph ইন্টিগ্রেশন প্যাটার্ন ব্যবহার করতে       | [langgraph-integration.md](contributing/langgraph-integration.md)                          |
+| রানটাইম পরিচালনা করতে (দৈনন্দিন অপারেশন গাইড)      | [operations-runbook.md](ops/operations-runbook.md)                                         |
+| ইনস্টলেশন/রানটাইম/চ্যানেল সমস্যা সমাধান করতে       | [troubleshooting.md](ops/troubleshooting.md)                                               |
+| Matrix এনক্রিপ্টেড রুম সেটআপ ও ডায়াগনস্টিক চালাতে | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                                      |
+| বিভাগ অনুযায়ী ডকুমেন্টেশন ব্রাউজ করতে             | [SUMMARY.md](SUMMARY.md)                                                                   |
+| প্রকল্পের PR/ইস্যু ডক স্ন্যাপশট দেখতে              | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
 ## দ্রুত সিদ্ধান্ত গাছ (১০ সেকেন্ড)
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# ZeroClaw Telegram Integration Test Suite
+# JhedaiClaw Telegram Integration Test Suite
 # Automated testing script for Telegram channel functionality
 
 set -e  # Exit on error
@@ -140,9 +140,9 @@ fi
 
 # Test 8: Binary size check
 print_test "Binary size verification"
-if [ -f "target/release/zeroclaw" ]; then
-    BINARY_SIZE=$(ls -lh target/release/zeroclaw | awk '{print $5}')
-    SIZE_BYTES=$(stat -f%z target/release/zeroclaw 2>/dev/null || stat -c%s target/release/zeroclaw)
+if [ -f "target/release/jhedaiclaw" ]; then
+    BINARY_SIZE=$(ls -lh target/release/jhedaiclaw | awk '{print $5}')
+    SIZE_BYTES=$(stat -f%z target/release/jhedaiclaw 2>/dev/null || stat -c%s target/release/jhedaiclaw)
     SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
 
     if [ $SIZE_MB -le 10 ]; then
@@ -162,7 +162,7 @@ print_header "Phase 3: Configuration Tests"
 
 # Test 9: Config file existence
 print_test "Configuration file check"
-CONFIG_PATH="$HOME/.zeroclaw/config.toml"
+CONFIG_PATH="$HOME/.jhedaiclaw/config.toml"
 if [ -f "$CONFIG_PATH" ]; then
     pass "Config file exists at $CONFIG_PATH"
 
@@ -187,10 +187,10 @@ if [ -f "$CONFIG_PATH" ]; then
             warn "User allowlist not set"
         fi
     else
-        warn "Telegram not configured - run 'zeroclaw onboard' first"
+        warn "Telegram not configured - run 'jhedaiclaw onboard' first"
     fi
 else
-    warn "No config file found - run 'zeroclaw onboard' first"
+    warn "No config file found - run 'jhedaiclaw onboard' first"
 fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -202,7 +202,7 @@ print_header "Phase 4: Health Check Tests"
 # Test 13: Health check timeout
 print_test "Health check timeout (should complete in <5s)"
 START_TIME=$(date +%s)
-HEALTH_OUTPUT=$(timeout 10 target/release/zeroclaw channel doctor 2>&1 || true)
+HEALTH_OUTPUT=$(timeout 10 target/release/jhedaiclaw channel doctor 2>&1 || true)
 END_TIME=$(date +%s)
 HEALTH_TIME=$((END_TIME - START_TIME))
 
@@ -290,7 +290,7 @@ cat << 'EOF'
 📱 Manual Test Checklist:
 
 1. [ ] Start the channel:
-   zeroclaw channel start
+   jhedaiclaw channel start
 
 2. [ ] Send a short message to your bot in Telegram:
    "Hello bot!"
@@ -315,7 +315,7 @@ cat << 'EOF'
    ✓ Verify: Responses have delays
 
 6. [ ] Check logs for errors:
-   RUST_LOG=debug zeroclaw channel start
+   RUST_LOG=debug jhedaiclaw channel start
    ✓ Verify: No unexpected errors
    ✓ Verify: "missing chat_id" appears for malformed messages
    ✓ Verify: Health check logs show "timed out" if needed

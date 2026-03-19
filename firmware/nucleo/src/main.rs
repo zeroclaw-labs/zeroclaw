@@ -1,4 +1,4 @@
-//! ZeroClaw Nucleo-F401RE firmware — JSON-over-serial peripheral.
+//! JhedaiClaw Nucleo-F401RE firmware — JSON-over-serial peripheral.
 //!
 //! Listens for newline-delimited JSON on USART2 (PA2=TX, PA3=RX).
 //! USART2 is connected to ST-Link VCP — host sees /dev/ttyACM0 (Linux) or /dev/cu.usbmodem* (macOS).
@@ -114,7 +114,7 @@ async fn main(_spawner: Spawner) {
     let mut usart = Uart::new_blocking(p.USART2, p.PA3, p.PA2, config).unwrap();
     let mut led = Output::new(p.PA5, Level::Low, Speed::Low);
 
-    info!("ZeroClaw Nucleo firmware ready on USART2 (115200)");
+    info!("JhedaiClaw Nucleo firmware ready on USART2 (115200)");
 
     let mut line_buf: heapless::Vec<u8, 256> = heapless::Vec::new();
     let mut id_buf = [0u8; 16];

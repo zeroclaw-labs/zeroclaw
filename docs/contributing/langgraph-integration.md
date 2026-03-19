@@ -1,10 +1,10 @@
 # LangGraph Integration Guide
 
-This guide explains how to use the `zeroclaw-tools` Python package for consistent tool calling with any OpenAI-compatible LLM provider.
+This guide explains how to use the `jhedaiclaw-tools` Python package for consistent tool calling with any OpenAI-compatible LLM provider.
 
 ## Background
 
-Some LLM providers, particularly Chinese models like GLM-5 (Zhipu AI), have inconsistent tool calling behavior when using text-based tool invocation. ZeroClaw's Rust core uses structured tool calling via the OpenAI API format, but some models respond better to a different approach.
+Some LLM providers, particularly Chinese models like GLM-5 (Zhipu AI), have inconsistent tool calling behavior when using text-based tool invocation. JhedaiClaw's Rust core uses structured tool calling via the OpenAI API format, but some models respond better to a different approach.
 
 LangGraph provides a stateful graph execution engine that guarantees consistent tool calling behavior regardless of the underlying model's native capabilities.
 
@@ -14,7 +14,7 @@ LangGraph provides a stateful graph execution engine that guarantees consistent 
 ┌─────────────────────────────────────────────────────────────┐
 │                      Your Application                        │
 ├─────────────────────────────────────────────────────────────┤
-│                   zeroclaw-tools Agent                       │
+│                   jhedaiclaw-tools Agent                       │
 │                                                              │
 │   ┌─────────────────────────────────────────────────────┐   │
 │   │              LangGraph StateGraph                    │   │
@@ -44,14 +44,14 @@ LangGraph provides a stateful graph execution engine that guarantees consistent 
 ### Installation
 
 ```bash
-pip install zeroclaw-tools
+pip install jhedaiclaw-tools
 ```
 
 ### Basic Usage
 
 ```python
 import asyncio
-from zeroclaw_tools import create_agent, shell, file_read, file_write
+from jhedaiclaw_tools import create_agent, shell, file_read, file_write
 from langchain_core.messages import HumanMessage
 
 async def main():
@@ -61,11 +61,11 @@ async def main():
         api_key="your-api-key",
         base_url="https://api.z.ai/api/coding/paas/v4"
     )
-    
+
     result = await agent.ainvoke({
         "messages": [HumanMessage(content="Read /etc/hostname and tell me the machine name")]
     })
-    
+
     print(result["messages"][-1].content)
 
 asyncio.run(main())
@@ -75,27 +75,27 @@ asyncio.run(main())
 
 ### Core Tools
 
-| Tool | Description |
-|------|-------------|
-| `shell` | Execute shell commands |
-| `file_read` | Read file contents |
+| Tool         | Description            |
+| ------------ | ---------------------- |
+| `shell`      | Execute shell commands |
+| `file_read`  | Read file contents     |
 | `file_write` | Write content to files |
 
 ### Extended Tools
 
-| Tool | Description |
-|------|-------------|
-| `web_search` | Search the web (requires `BRAVE_API_KEY`) |
-| `http_request` | Make HTTP requests |
-| `memory_store` | Store data in persistent memory |
-| `memory_recall` | Recall stored data |
+| Tool            | Description                               |
+| --------------- | ----------------------------------------- |
+| `web_search`    | Search the web (requires `BRAVE_API_KEY`) |
+| `http_request`  | Make HTTP requests                        |
+| `memory_store`  | Store data in persistent memory           |
+| `memory_recall` | Recall stored data                        |
 
 ## Custom Tools
 
 Create your own tools with the `@tool` decorator:
 
 ```python
-from zeroclaw_tools import tool, create_agent
+from jhedaiclaw_tools import tool, create_agent
 
 @tool
 def get_weather(city: str) -> str:
@@ -161,7 +161,7 @@ agent = create_agent(
 
 ```python
 import os
-from zeroclaw_tools.integrations import DiscordBot
+from jhedaiclaw_tools.integrations import DiscordBot
 
 bot = DiscordBot(
     token=os.environ["DISCORD_TOKEN"],
@@ -182,29 +182,31 @@ export API_KEY="your-key"
 export BRAVE_API_KEY="your-brave-key"  # Optional, for web search
 
 # Single message
-zeroclaw-tools "What is the current date?"
+jhedaiclaw-tools "What is the current date?"
 
 # Interactive mode
-zeroclaw-tools -i
+jhedaiclaw-tools -i
 ```
 
-## Comparison with Rust ZeroClaw
+## Comparison with Rust JhedaiClaw
 
-| Aspect | Rust ZeroClaw | zeroclaw-tools |
-|--------|---------------|-----------------|
-| **Performance** | Ultra-fast (~10ms startup) | Python startup (~500ms) |
-| **Memory** | <5 MB | ~50 MB |
-| **Binary size** | ~3.4 MB | pip package |
-| **Tool consistency** | Model-dependent | LangGraph guarantees |
-| **Extensibility** | Rust traits | Python decorators |
-| **Ecosystem** | Rust crates | PyPI packages |
+| Aspect               | Rust JhedaiClaw            | jhedaiclaw-tools        |
+| -------------------- | -------------------------- | ----------------------- |
+| **Performance**      | Ultra-fast (~10ms startup) | Python startup (~500ms) |
+| **Memory**           | <5 MB                      | ~50 MB                  |
+| **Binary size**      | ~3.4 MB                    | pip package             |
+| **Tool consistency** | Model-dependent            | LangGraph guarantees    |
+| **Extensibility**    | Rust traits                | Python decorators       |
+| **Ecosystem**        | Rust crates                | PyPI packages           |
 
-**When to use Rust ZeroClaw:**
+**When to use Rust JhedaiClaw:**
+
 - Production edge deployments
 - Resource-constrained environments (Raspberry Pi, etc.)
 - Maximum performance requirements
 
-**When to use zeroclaw-tools:**
+**When to use jhedaiclaw-tools:**
+
 - Models with inconsistent native tool calling
 - Python-centric development
 - Rapid prototyping

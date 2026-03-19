@@ -1,20 +1,20 @@
 # Cài đặt một lệnh
 
-Cách cài đặt và khởi tạo ZeroClaw nhanh nhất.
+Cách cài đặt và khởi tạo JhedaiClaw nhanh nhất.
 
 Xác minh lần cuối: **2026-02-20**.
 
 ## Cách 0: Homebrew (macOS/Linuxbrew)
 
 ```bash
-brew install zeroclaw
+brew install jhedaiclaw
 ```
 
 ## Cách A (Khuyến nghị): Clone + chạy script cục bộ
 
 ```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/jhedai/jhedaiclaw.git
+cd jhedaiclaw
 ./install.sh
 ```
 
@@ -50,7 +50,7 @@ Bỏ qua binary dựng sẵn, buộc build từ mã nguồn:
 
 ## Bootstrap kép
 
-Mặc định là **chỉ ứng dụng** (build/cài ZeroClaw), yêu cầu Rust toolchain sẵn có.
+Mặc định là **chỉ ứng dụng** (build/cài JhedaiClaw), yêu cầu Rust toolchain sẵn có.
 
 Với máy mới, bật bootstrap môi trường:
 
@@ -69,7 +69,7 @@ Lưu ý:
 ## Cách B: Lệnh từ xa một dòng
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jhedai/jhedaiclaw/master/install.sh | bash
 ```
 
 Với môi trường yêu cầu bảo mật cao, nên dùng Cách A để kiểm tra script trước khi chạy.
@@ -84,7 +84,7 @@ Nếu chạy Cách B ngoài thư mục repo, bootstrap script sẽ tự clone wo
 ./install.sh --docker
 ```
 
-Lệnh này build image ZeroClaw cục bộ và chạy thiết lập trong container, lưu config/workspace vào `./.zeroclaw-docker`.
+Lệnh này build image JhedaiClaw cục bộ và chạy thiết lập trong container, lưu config/workspace vào `./.jhedaiclaw-docker`.
 
 ### Thiết lập nhanh (không tương tác)
 
@@ -95,7 +95,7 @@ Lệnh này build image ZeroClaw cục bộ và chạy thiết lập trong conta
 Hoặc dùng biến môi trường:
 
 ```bash
-ZEROCLAW_API_KEY="sk-..." ZEROCLAW_PROVIDER="openrouter" ./install.sh
+JHEDAICLAW_API_KEY="sk-..." JHEDAICLAW_PROVIDER="openrouter" ./install.sh
 ```
 
 ## Các cờ hữu ích

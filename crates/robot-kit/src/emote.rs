@@ -123,8 +123,8 @@ pub struct EmoteTool {
 impl EmoteTool {
     pub fn new(config: RobotConfig) -> Self {
         let sounds_dir = directories::UserDirs::new()
-            .map(|d| d.home_dir().join(".zeroclaw/sounds"))
-            .unwrap_or_else(|| PathBuf::from("/usr/local/share/zeroclaw/sounds"));
+            .map(|d| d.home_dir().join(".jhedaiclaw/sounds"))
+            .unwrap_or_else(|| PathBuf::from("/usr/local/share/jhedaiclaw/sounds"));
 
         Self { config, sounds_dir }
     }
@@ -139,14 +139,14 @@ impl EmoteTool {
 
         // Try to write to LED controller
         // Option 1: Write to FIFO/socket if LED daemon is running
-        let led_fifo = PathBuf::from("/tmp/zeroclaw_led.fifo");
+        let led_fifo = PathBuf::from("/tmp/jhedaiclaw_led.fifo");
         if led_fifo.exists() {
             tokio::fs::write(&led_fifo, pattern_json).await?;
             return Ok(());
         }
 
         // Option 2: Shell out to LED control script
-        let output = tokio::process::Command::new("zeroclaw-led")
+        let output = tokio::process::Command::new("jhedaiclaw-led")
             .args(["--pattern", &format!("{:?}", expr)])
             .output()
             .await;

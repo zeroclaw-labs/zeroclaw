@@ -6,11 +6,13 @@
 > Để biết hành vi runtime hiện tại, xem [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), và [troubleshooting.md](troubleshooting.md).
 
 ## Vấn đề
-ZeroClaw hiện có application-layer security (allowlists, path blocking, command injection protection) nhưng thiếu cơ chế cách ly cấp hệ điều hành. Nếu kẻ tấn công nằm trong allowlist, họ có thể chạy bất kỳ lệnh nào được cho phép với quyền của user zeroclaw.
+
+JhedaiClaw hiện có application-layer security (allowlists, path blocking, command injection protection) nhưng thiếu cơ chế cách ly cấp hệ điều hành. Nếu kẻ tấn công nằm trong allowlist, họ có thể chạy bất kỳ lệnh nào được cho phép với quyền của user jhedaiclaw.
 
 ## Các giải pháp đề xuất
 
 ### Tùy chọn 1: tích hợp Firejail (khuyến nghị cho Linux)
+
 Firejail cung cấp sandboxing ở user-space với overhead tối thiểu.
 
 ```rust
@@ -64,6 +66,7 @@ impl FirejailSandbox {
 ```
 
 **Tùy chọn config:**
+
 ```toml
 [security]
 enable_sandbox = true
@@ -73,6 +76,7 @@ sandbox_backend = "firejail"  # hoặc "none", "bubblewrap", "docker"
 ---
 
 ### Tùy chọn 2: Bubblewrap (di động, không cần root)
+
 Bubblewrap dùng user namespaces để tạo container.
 
 ```bash
@@ -93,6 +97,7 @@ bwrap --ro-bind /usr /usr \
 ---
 
 ### Tùy chọn 3: Docker-in-Docker (nặng nhưng cách ly hoàn toàn)
+
 Chạy các công cụ agent trong container tạm thời.
 
 ```rust
@@ -123,6 +128,7 @@ impl DockerSandbox {
 ---
 
 ### Tùy chọn 4: Landlock (Linux kernel LSM, Rust native)
+
 Landlock cung cấp kiểm soát truy cập hệ thống file mà không cần container.
 
 ```rust
@@ -143,12 +149,12 @@ pub fn apply_landlock() -> Result<()> {
 
 ## Thứ tự triển khai ưu tiên
 
-| Giai đoạn | Giải pháp | Công sức | Tăng cường bảo mật |
-|-------|----------|--------|---------------|
-| **P0** | Landlock (chỉ Linux, native) | Thấp | Cao (filesystem) |
-| **P1** | Tích hợp Firejail | Thấp | Rất cao |
-| **P2** | Bubblewrap wrapper | Trung bình | Rất cao |
-| **P3** | Docker sandbox mode | Cao | Hoàn toàn |
+| Giai đoạn | Giải pháp                    | Công sức   | Tăng cường bảo mật |
+| --------- | ---------------------------- | ---------- | ------------------ |
+| **P0**    | Landlock (chỉ Linux, native) | Thấp       | Cao (filesystem)   |
+| **P1**    | Tích hợp Firejail            | Thấp       | Rất cao            |
+| **P2**    | Bubblewrap wrapper           | Trung bình | Rất cao            |
+| **P3**    | Docker sandbox mode          | Cao        | Hoàn toàn          |
 
 ## Mở rộng config schema
 
@@ -164,7 +170,7 @@ extra_args = ["--seccomp", "--caps.drop=all"]
 # Dành riêng cho Landlock
 [security.sandbox.landlock]
 readonly_paths = ["/usr", "/bin", "/lib"]
-readwrite_paths = ["$HOME/workspace", "/tmp/zeroclaw"]
+readwrite_paths = ["$HOME/workspace", "/tmp/jhedaiclaw"]
 ```
 
 ## Chiến lược kiểm thử
