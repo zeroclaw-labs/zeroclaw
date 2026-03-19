@@ -521,6 +521,7 @@ impl Observer for NoopObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::schema::{DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS, DEFAULT_DELEGATE_TIMEOUT_SECS};
     use crate::providers::{ChatRequest, ChatResponse, ToolCall};
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use anyhow::anyhow;
@@ -1263,11 +1264,11 @@ mod tests {
             timeout_secs: None,
             agentic_timeout_secs: None,
         };
-        assert_eq!(config.timeout_secs.unwrap_or(DELEGATE_TIMEOUT_SECS), 120);
+        assert_eq!(config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS), 120);
         assert_eq!(
             config
                 .agentic_timeout_secs
-                .unwrap_or(DELEGATE_AGENTIC_TIMEOUT_SECS),
+                .unwrap_or(DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS),
             300
         );
     }
@@ -1287,11 +1288,11 @@ mod tests {
             timeout_secs: Some(60),
             agentic_timeout_secs: Some(600),
         };
-        assert_eq!(config.timeout_secs.unwrap_or(DELEGATE_TIMEOUT_SECS), 60);
+        assert_eq!(config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS), 60);
         assert_eq!(
             config
                 .agentic_timeout_secs
-                .unwrap_or(DELEGATE_AGENTIC_TIMEOUT_SECS),
+                .unwrap_or(DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS),
             600
         );
     }
