@@ -281,4 +281,88 @@ mod tests {
         // Tool should now be activated
         assert!(activated.lock().unwrap().is_activated("fs__read"));
     }
+
+    /// Verify tool_search works with stubs from multiple MCP servers,
+    /// simulating a daemon-mode setup where several servers are deferred.
+    #[tokio::test]
+    async fn multiple_servers_stubs_all_searchable() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let stubs = vec![
+            make_stub("server_a__list_files", "List files on server A"),
+            make_stub("server_a__read_file", "Read file on server A"),
+            make_stub("server_b__query_db", "Query database on server B"),
+            make_stub("server_b__insert_row", "Insert row on server B"),
+        ];
+        let tool = ToolSearchTool::new(make_deferred_set(stubs).await, Arc::clone(&activated));
+
+        // Search should find tools across both servers
+        let result = tool
+            .execute(serde_json::json!({"query": "file"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("server_a__list_files"));
+        assert!(result.output.contains("server_a__read_file"));
+
+        // Server B tools should also be searchable
+        let result = tool
+            .execute(serde_json::json!({"query": "database query"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("server_b__query_db"));
+    }
+
+    /// Verify select mode activates tools and they stay activated across calls,
+    /// matching the daemon-mode pattern where a single ActivatedToolSet persists.
+    #[tokio::test]
+    async fn select_activates_and_persists_across_calls() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let stubs = vec![
+            make_stub("srv__tool_a", "Tool A"),
+            make_stub("srv__tool_b", "Tool B"),
+        ];
+        let tool = ToolSearchTool::new(make_deferred_set(stubs).await, Arc::clone(&activated));
+
+        // Activate tool_a
+        let result = tool
+            .execute(serde_json::json!({"query": "select:srv__tool_a"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(activated.lock().unwrap().is_activated("srv__tool_a"));
+        assert!(!activated.lock().unwrap().is_activated("srv__tool_b"));
+
+        // Activate tool_b in a separate call
+        let result = tool
+            .execute(serde_json::json!({"query": "select:srv__tool_b"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        // Both should remain activated
+        let guard = activated.lock().unwrap();
+        assert!(guard.is_activated("srv__tool_a"));
+        assert!(guard.is_activated("srv__tool_b"));
+        assert_eq!(guard.tool_specs().len(), 2);
+    }
+
+    /// Verify re-activating an already-activated tool does not duplicate it.
+    #[tokio::test]
+    async fn reactivation_is_idempotent() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let tool = ToolSearchTool::new(
+            make_deferred_set(vec![make_stub("srv__tool", "A tool")]).await,
+            Arc::clone(&activated),
+        );
+
+        tool.execute(serde_json::json!({"query": "select:srv__tool"}))
+            .await
+            .unwrap();
+        tool.execute(serde_json::json!({"query": "select:srv__tool"}))
+            .await
+            .unwrap();
+
+        assert_eq!(activated.lock().unwrap().tool_specs().len(), 1);
+    }
 }

@@ -76,7 +76,7 @@ Operational note for container users:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `compact_context` | `false` | When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models |
+| `compact_context` | `true` | When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models |
 | `max_tool_iterations` | `10` | Maximum tool-call loop turns per user message across CLI, gateway, and channels |
 | `max_history_messages` | `50` | Maximum conversation history messages retained per session |
 | `parallel_tools` | `false` | Enable parallel tool execution within a single iteration |
@@ -183,6 +183,8 @@ Delegate sub-agent configurations. Each key under `[agents]` defines a named sub
 | `agentic` | `false` | Enable multi-turn tool-call loop mode for the sub-agent |
 | `allowed_tools` | `[]` | Tool allowlist for agentic mode |
 | `max_iterations` | `10` | Max tool-call iterations for agentic mode |
+| `timeout_secs` | `120` | Timeout in seconds for non-agentic provider calls (1–3600) |
+| `agentic_timeout_secs` | `300` | Timeout in seconds for agentic sub-agent loops (1–3600) |
 
 Notes:
 
@@ -199,11 +201,13 @@ max_depth = 2
 agentic = true
 allowed_tools = ["web_search", "http_request", "file_read"]
 max_iterations = 8
+agentic_timeout_secs = 600
 
 [agents.coder]
 provider = "ollama"
 model = "qwen2.5-coder:32b"
 temperature = 0.2
+timeout_secs = 60
 ```
 
 ## `[runtime]`

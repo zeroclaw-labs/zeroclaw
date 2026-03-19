@@ -146,6 +146,12 @@ jobs:
           perl -0pi -e "s|^  sha256 \".*\"|  sha256 \"${tarball_sha}\"|m" "$formula_file"
           perl -0pi -e "s|^  license \".*\"|  license \"Apache-2.0 OR MIT\"|m" "$formula_file"
 
+          # Ensure Node.js build dependency is declared so that build.rs can
+          # run `npm ci && npm run build` to produce the web frontend assets.
+          if ! grep -q 'depends_on "node" => :build' "$formula_file"; then
+            perl -0pi -e 's|(  depends_on "rust" => :build\n)|\1  depends_on "node" => :build\n|m' "$formula_file"
+          fi
+
           git -C "$repo_dir" diff -- "$FORMULA_PATH" > "$tmp_repo/formula.diff"
           if [[ ! -s "$tmp_repo/formula.diff" ]]; then
             echo "::error::No formula changes generated. Nothing to publish."

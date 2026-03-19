@@ -1119,7 +1119,10 @@ fn create_provider_with_url_and_options(
             )?))
         }
         // ── Primary providers (custom implementations) ───────
-        "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
+        "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(
+            key,
+            options.provider_timeout_secs,
+        ))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
         "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
@@ -1320,11 +1323,12 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("llama.cpp");
-            Ok(compat(OpenAiCompatibleProvider::new(
+            Ok(compat(OpenAiCompatibleProvider::new_with_vision(
                 "llama.cpp",
                 base_url,
                 Some(llama_cpp_key),
                 AuthStyle::Bearer,
+                true,
             )))
         }
         "sglang" => {
