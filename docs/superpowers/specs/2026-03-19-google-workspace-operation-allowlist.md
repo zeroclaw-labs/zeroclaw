@@ -1,7 +1,7 @@
 # Google Workspace Operation Allowlist
 
 Date: 2026-03-19
-Status: Proposed and in implementation
+Status: Implemented
 Scope: `google_workspace` wrapper only
 
 ## Problem
@@ -29,7 +29,6 @@ The current wrapper supports:
 
 It does not currently support:
 
-- method-level allowlists
 - declared credential profiles for `google_workspace`
 - startup verification of granted OAuth scopes
 - separate credential files per trust tier as a first-class config concept

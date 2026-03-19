@@ -79,11 +79,20 @@ impl GoogleWorkspaceTool {
         }
     }
 
-    fn is_operation_allowed(&self, service: &str, resource: &str, method: &str) -> bool {
+    fn is_operation_allowed(
+        &self,
+        service: &str,
+        resource: &str,
+        sub_resource: Option<&str>,
+        method: &str,
+    ) -> bool {
         if self.allowed_operations.is_empty() {
             return true;
         }
-
+        // Sub-resources are not modeled in the allowlist; deny nested operations fail-closed.
+        if sub_resource.is_some() {
+            return false;
+        }
         self.allowed_operations.iter().any(|operation| {
             operation.service.trim() == service
                 && operation.resource.trim() == resource
@@ -167,6 +176,37 @@ impl Tool for GoogleWorkspaceTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'method' parameter"))?;
 
+        // Extract and validate sub_resource early so the allowlist check can account for it.
+        let sub_resource: Option<&str> = if let Some(sub_resource_value) = args.get("sub_resource")
+        {
+            let s = match sub_resource_value.as_str() {
+                Some(s) => s,
+                None => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some("'sub_resource' must be a string".into()),
+                    })
+                }
+            };
+            if !s
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(
+                        "Invalid characters in 'sub_resource': only alphanumeric, underscore, and hyphen are allowed"
+                            .into(),
+                    ),
+                });
+            }
+            Some(s)
+        } else {
+            None
+        };
+
         // Security checks
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
@@ -177,7 +217,7 @@ impl Tool for GoogleWorkspaceTool {
         }
 
         // Validate service is in the allowlist
-        if !self.allowed_services.iter().any(|s| s == service) {
+        if !self.allowed_services.iter().any(|s| s.trim() == service) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -189,7 +229,7 @@ impl Tool for GoogleWorkspaceTool {
             });
         }
 
-        if !self.is_operation_allowed(service, resource, method) {
+        if !self.is_operation_allowed(service, resource, sub_resource, method) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -222,31 +262,8 @@ impl Tool for GoogleWorkspaceTool {
         // Build the gws command — validate all optional fields before consuming budget
         let mut cmd_args: Vec<String> = vec![service.to_string(), resource.to_string()];
 
-        if let Some(sub_resource_value) = args.get("sub_resource") {
-            let sub_resource = match sub_resource_value.as_str() {
-                Some(s) => s,
-                None => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some("'sub_resource' must be a string".into()),
-                    })
-                }
-            };
-            if !sub_resource
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-            {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(
-                        "Invalid characters in 'sub_resource': only alphanumeric, underscore, and hyphen are allowed"
-                            .into(),
-                    ),
-                });
-            }
-            cmd_args.push(sub_resource.to_string());
+        if let Some(sub) = sub_resource {
+            cmd_args.push(sub.to_string());
         }
 
         cmd_args.push(method.to_string());
@@ -742,7 +759,7 @@ mod tests {
     fn operation_allowlist_defaults_to_allow_all() {
         let tool =
             GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
-        assert!(tool.is_operation_allowed("gmail", "messages", "send"));
+        assert!(tool.is_operation_allowed("gmail", "messages", None, "send"));
     }
 
     #[test]
@@ -762,9 +779,9 @@ mod tests {
             false,
         );
 
-        assert!(tool.is_operation_allowed("gmail", "drafts", "create"));
-        assert!(!tool.is_operation_allowed("gmail", "drafts", "send"));
-        assert!(!tool.is_operation_allowed("gmail", "messages", "get"));
+        assert!(tool.is_operation_allowed("gmail", "drafts", None, "create"));
+        assert!(!tool.is_operation_allowed("gmail", "drafts", None, "send"));
+        assert!(!tool.is_operation_allowed("gmail", "messages", None, "get"));
     }
 
     #[tokio::test]
@@ -799,5 +816,27 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("allowed operations list"));
+    }
+
+    #[test]
+    fn operation_allowlist_rejects_sub_resource_when_operations_configured() {
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec!["drive".into()],
+            vec![GoogleWorkspaceAllowedOperation {
+                service: "drive".into(),
+                resource: "files".into(),
+                methods: vec!["list".into()],
+            }],
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
+        // With a non-empty allowlist, any sub_resource must be denied fail-closed.
+        assert!(!tool.is_operation_allowed("drive", "files", Some("permissions"), "list"));
+        // Without sub_resource, the listed operation is still allowed.
+        assert!(tool.is_operation_allowed("drive", "files", None, "list"));
     }
 }
