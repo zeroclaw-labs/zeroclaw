@@ -324,6 +324,10 @@ pub struct Config {
     #[serde(default)]
     pub notion: NotionConfig,
 
+    /// Jira integration configuration (`[jira]`).
+    #[serde(default)]
+    pub jira: JiraConfig,
+
     /// Secure inter-node transport configuration (`[node_transport]`).
     #[serde(default)]
     pub node_transport: NodeTransportConfig,
@@ -5751,6 +5755,66 @@ impl Default for NotionConfig {
     }
 }
 
+/// Jira integration configuration (`[jira]`).
+///
+/// When `enabled = true`, registers the `jira` tool which can get tickets,
+/// search with JQL, and add comments. Requires `base_url` and `api_token`
+/// (or the `JIRA_API_TOKEN` env var).
+///
+/// ## Defaults
+/// - `enabled`: `false`
+/// - `allowed_actions`: `["get_ticket"]` — read-only by default.
+///   Add `"search_tickets"` or `"comment_ticket"` to unlock them.
+/// - `timeout_secs`: `30`
+///
+/// ## Auth
+/// Jira Cloud uses HTTP Basic auth: `email` + `api_token`.
+/// `api_token` is stored encrypted at rest; set it here or via `JIRA_API_TOKEN`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct JiraConfig {
+    /// Enable the `jira` tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Atlassian instance base URL, e.g. `https://yourco.atlassian.net`.
+    #[serde(default)]
+    pub base_url: String,
+    /// Jira account email used for Basic auth.
+    #[serde(default)]
+    pub email: String,
+    /// Jira API token. Encrypted at rest. Falls back to `JIRA_API_TOKEN` env var.
+    #[serde(default)]
+    pub api_token: String,
+    /// Actions the agent is permitted to call.
+    /// Valid values: `"get_ticket"`, `"search_tickets"`, `"comment_ticket"`.
+    /// Defaults to `["get_ticket"]` (read-only).
+    #[serde(default = "default_jira_allowed_actions")]
+    pub allowed_actions: Vec<String>,
+    /// Request timeout in seconds. Default: `30`.
+    #[serde(default = "default_jira_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_jira_allowed_actions() -> Vec<String> {
+    vec!["get_ticket".to_string()]
+}
+
+fn default_jira_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for JiraConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            email: String::new(),
+            api_token: String::new(),
+            allowed_actions: default_jira_allowed_actions(),
+            timeout_secs: default_jira_timeout_secs(),
+        }
+    }
+}
+
 ///
 /// Controls the read-only cloud transformation analysis tools:
 /// IaC review, migration assessment, cost analysis, and architecture review.
@@ -6048,6 +6112,7 @@ impl Default for Config {
             nodes: NodesConfig::default(),
             workspace: WorkspaceConfig::default(),
             notion: NotionConfig::default(),
+            jira: JiraConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -6878,6 +6943,11 @@ impl Config {
                 decrypt_secret(&store, &mut config.notion.api_key, "config.notion.api_key")?;
             }
 
+            // Jira API token
+            if !config.jira.api_token.is_empty() {
+                decrypt_secret(&store, &mut config.jira.api_token, "config.jira.api_token")?;
+            }
+
             config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
@@ -7350,6 +7420,26 @@ impl Config {
             }
             if self.notion.result_property.trim().is_empty() {
                 anyhow::bail!("notion.result_property must not be empty");
+            }
+        }
+
+        // Jira
+        if self.jira.enabled {
+            if self.jira.base_url.trim().is_empty() {
+                anyhow::bail!("jira.base_url must not be empty when jira.enabled = true");
+            }
+            if self.jira.email.trim().is_empty() {
+                anyhow::bail!("jira.email must not be empty when jira.enabled = true");
+            }
+            let valid_actions = ["get_ticket", "search_tickets", "comment_ticket"];
+            for action in &self.jira.allowed_actions {
+                if !valid_actions.contains(&action.as_str()) {
+                    anyhow::bail!(
+                        "jira.allowed_actions contains unknown action: '{}'. \
+                         Valid: get_ticket, search_tickets, comment_ticket",
+                        action
+                    );
+                }
             }
         }
 
@@ -8085,6 +8175,15 @@ impl Config {
             )?;
         }
 
+        // Jira API token
+        if !config_to_save.jira.api_token.is_empty() {
+            encrypt_secret(
+                &store,
+                &mut config_to_save.jira.api_token,
+                "config.jira.api_token",
+            )?;
+        }
+
         let toml_str =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
 
@@ -8555,6 +8654,7 @@ default_temperature = 0.7
             nodes: NodesConfig::default(),
             workspace: WorkspaceConfig::default(),
             notion: NotionConfig::default(),
+            jira: JiraConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -8889,6 +8989,7 @@ tool_dispatcher = "xml"
             nodes: NodesConfig::default(),
             workspace: WorkspaceConfig::default(),
             notion: NotionConfig::default(),
+            jira: JiraConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
