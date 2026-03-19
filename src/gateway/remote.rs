@@ -56,6 +56,9 @@ const DEVICE_CHANNEL_BUFFER: usize = 256;
 /// How long to wait for a device response before timing out.
 const DEVICE_RESPONSE_TIMEOUT_SECS: u64 = 120;
 
+/// Public alias for device relay timeout (used by ws.rs auto-relay).
+pub const DEVICE_RESPONSE_TIMEOUT_SECS_PUB: u64 = DEVICE_RESPONSE_TIMEOUT_SECS;
+
 /// Maximum login attempts per IP before lockout.
 const MAX_LOGIN_ATTEMPTS: u32 = 10;
 
@@ -1072,7 +1075,7 @@ async fn handle_device_link_socket(
 ///
 /// This is a process-global registry because messages may cross
 /// multiple async task boundaries.
-static REMOTE_RESPONSE_CHANNELS: std::sync::LazyLock<
+pub static REMOTE_RESPONSE_CHANNELS: std::sync::LazyLock<
     Mutex<HashMap<String, mpsc::Sender<RoutedMessage>>>,
 > = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 

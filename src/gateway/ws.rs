@@ -443,27 +443,189 @@ pub async fn handle_ws_chat(
 ) -> impl IntoResponse {
     let query_params = parse_ws_query_params(query.as_deref());
     // Auth via Authorization header or websocket protocol token.
-    if state.pairing.require_pairing() {
-        let token =
-            extract_ws_bearer_token(&headers, query_params.token.as_deref()).unwrap_or_default();
-        if !state.pairing.is_authenticated(&token) {
-            return (
-                axum::http::StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide Authorization: Bearer <token>, Sec-WebSocket-Protocol: bearer.<token>, or ?token=<token>",
-            )
-                .into_response();
-        }
+    let auth_token = extract_ws_bearer_token(&headers, query_params.token.as_deref())
+        .unwrap_or_default()
+        .to_string();
+    if state.pairing.require_pairing() && !state.pairing.is_authenticated(&auth_token) {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            "Unauthorized — provide Authorization: Bearer <token>, Sec-WebSocket-Protocol: bearer.<token>, or ?token=<token>",
+        )
+            .into_response();
     }
+
+    // Resolve user_id from session token (for device routing).
+    let user_id = state
+        .auth_store
+        .as_ref()
+        .and_then(|store| store.validate_session(&auth_token))
+        .map(|session| session.user_id);
 
     let session_id = query_params
         .session_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, user_id))
         .into_response()
 }
 
-async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: String) {
+/// Attempt to relay a chat message to the user's local MoA device.
+///
+/// Returns `true` if the message was successfully relayed and the response
+/// has been forwarded back to the web client. Returns `false` if no local
+/// device is available (caller should fall back to server-side processing).
+///
+/// This implements the "local API key first" design:
+///   App Chat flow: Browser → Railway → user's local device (uses local API key) → response
+///   Fallback:      Browser → Railway processes directly (uses operator key, 2.2× credits)
+async fn try_relay_to_local_device(
+    state: &AppState,
+    socket: &mut WebSocket,
+    user_id: Option<&str>,
+    content: &str,
+    _session_id: &str,
+) -> bool {
+    // Need both device_router and auth_store to find user's devices
+    let (device_router, auth_store) =
+        match (state.device_router.as_ref(), state.auth_store.as_ref()) {
+            (Some(dr), Some(auth)) => (dr, auth),
+            _ => return false,
+        };
+
+    let user_id = match user_id {
+        Some(uid) => uid,
+        None => return false,
+    };
+
+    // Find user's devices and check if any are online
+    let devices = match auth_store.list_devices(user_id) {
+        Ok(devs) => devs,
+        Err(_) => return false,
+    };
+
+    // Find the first online device
+    let online_device = devices
+        .iter()
+        .find(|d| device_router.is_device_online(&d.device_id));
+
+    let device = match online_device {
+        Some(d) => d,
+        None => return false, // No local device online — fall back to server
+    };
+
+    tracing::info!(
+        user_id = user_id,
+        device_id = device.device_id.as_str(),
+        device_name = device.device_name.as_str(),
+        "Relaying chat message to user's local device (local API key)"
+    );
+
+    // Create a response channel for this message
+    let msg_id = uuid::Uuid::new_v4().to_string();
+    let (resp_tx, mut resp_rx) =
+        tokio::sync::mpsc::channel::<super::remote::RoutedMessage>(64);
+
+    // Register in the global response channel map
+    {
+        use super::remote::REMOTE_RESPONSE_CHANNELS;
+        REMOTE_RESPONSE_CHANNELS.lock().insert(msg_id.clone(), resp_tx);
+    }
+
+    // Send message to the device
+    let routed_msg = super::remote::RoutedMessage {
+        id: msg_id.clone(),
+        direction: "to_device".to_string(),
+        content: content.to_string(),
+        msg_type: "message".to_string(),
+    };
+
+    if let Err(e) = device_router.send_to_device(&device.device_id, routed_msg).await {
+        tracing::warn!(
+            error = e.as_str(),
+            device_id = device.device_id.as_str(),
+            "Failed to relay to local device"
+        );
+        // Clean up response channel
+        {
+            use super::remote::REMOTE_RESPONSE_CHANNELS;
+            REMOTE_RESPONSE_CHANNELS.lock().remove(&msg_id);
+        }
+        return false;
+    }
+
+    // Wait for device responses and forward to the web client
+    let timeout =
+        tokio::time::Duration::from_secs(super::remote::DEVICE_RESPONSE_TIMEOUT_SECS_PUB);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut got_response = false;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            if !got_response {
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": "Local device did not respond in time. Please check that MoA is running on your device.",
+                });
+                let _ = socket.send(Message::Text(err.to_string().into())).await;
+            }
+            break;
+        }
+
+        match tokio::time::timeout(remaining, resp_rx.recv()).await {
+            Ok(Some(resp)) => {
+                got_response = true;
+                // Forward device response to the web client as-is
+                let frame = serde_json::json!({
+                    "type": resp.msg_type,
+                    "content": resp.content,
+                });
+                let _ = socket.send(Message::Text(frame.to_string().into())).await;
+                // If this is a "done" message, relay is complete
+                if resp.msg_type == "done" {
+                    break;
+                }
+            }
+            Ok(None) => {
+                // Channel closed — device disconnected
+                if !got_response {
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": "Local device disconnected during processing.",
+                    });
+                    let _ = socket.send(Message::Text(err.to_string().into())).await;
+                }
+                break;
+            }
+            Err(_) => {
+                // Timeout
+                if !got_response {
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": "Local device did not respond in time.",
+                    });
+                    let _ = socket.send(Message::Text(err.to_string().into())).await;
+                }
+                break;
+            }
+        }
+    }
+
+    // Clean up
+    {
+        use super::remote::REMOTE_RESPONSE_CHANNELS;
+        REMOTE_RESPONSE_CHANNELS.lock().remove(&msg_id);
+    }
+
+    got_response
+}
+
+async fn handle_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    session_id: String,
+    user_id: Option<String>,
+) {
     let ws_session_id = format!("ws_{}", Uuid::new_v4());
 
     // Build system prompt once for the session
@@ -591,6 +753,23 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
             }
         };
         if let Some(provider_name) = credential_missing {
+            // ── Try to relay to user's local device if online ──
+            // This implements the "local key first" design: if the user has a
+            // MoA device running locally with its own API key, route the request
+            // there instead of using the operator's key on Railway.
+            let relayed = try_relay_to_local_device(
+                &state,
+                &mut socket,
+                user_id.as_deref(),
+                &content,
+                &session_id,
+            )
+            .await;
+            if relayed {
+                continue; // Response already sent via device relay
+            }
+
+            // No local device available — report missing API key
             let env_hint = match provider_name.as_str() {
                 "anthropic" => "ANTHROPIC_API_KEY",
                 "openai" => "OPENAI_API_KEY",
@@ -605,6 +784,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Strin
                     provider_name, env_hint
                 ),
                 "fallback_to_relay": true,
+                "device_online": false,
             });
             let _ = socket.send(Message::Text(err.to_string().into())).await;
             continue;
