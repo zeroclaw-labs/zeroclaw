@@ -10754,7 +10754,7 @@ default_model = "persisted-profile"
         let dispatch = tracing::Dispatch::new(subscriber);
         let guard = tracing::dispatcher::set_default(&dispatch);
 
-        let config = Config::load_or_init().await.unwrap();
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
 
         drop(guard);
         let logs = capture.captured();
