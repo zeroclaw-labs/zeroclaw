@@ -7890,6 +7890,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                mattermost: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
