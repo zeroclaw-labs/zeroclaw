@@ -753,7 +753,6 @@ async fn handle_socket(
         }
 
         // ── Apply client-provided overrides (provider, model) ──
-        // This mirrors the logic in openclaw_compat.rs for the HTTP /api/chat handler.
         {
             let mut config_guard = state.config.lock();
 
@@ -770,14 +769,56 @@ async fn handle_socket(
             }
         }
 
-        // ── Resolve API key: client-provided > provider_api_keys > env ──
-        // Priority: client api_key > server-side provider_api_keys > env vars.
-        {
-            let mut config_guard = state.config.lock();
-            let provider_name = config_guard
+        // ── ★ MoA Smart API Key Routing ──
+        // Priority: LOCAL device key FIRST → operator key SECOND.
+        //
+        // 1. Always try user's local device first (free for user)
+        // 2. Only fall back to operator key if local device is offline
+        //    or has no valid key (credits deducted at 2.2×)
+        //
+        // Railway ALWAYS has operator API keys pre-configured, so
+        // "credential_missing" on Railway should never happen in normal
+        // operation. The key question is whether to use the FREE local
+        // key or the PAID operator key.
+
+        let provider_name = {
+            let config_guard = state.config.lock();
+            config_guard
                 .default_provider
                 .clone()
-                .unwrap_or_else(|| "gemini".to_string());
+                .unwrap_or_else(|| "gemini".to_string())
+        };
+
+        // ── Step 1: Try user's local device FIRST (free path) ──
+        // Check if user's local MoA device is online AND has a valid
+        // API key for the requested provider. If so, relay the message
+        // to the local device — the user pays nothing.
+        let relay_result = try_relay_to_local_device(
+            &state,
+            &mut socket,
+            user_id.as_deref(),
+            &content,
+            &session_id,
+            &provider_name,
+        )
+        .await;
+
+        match relay_result {
+            DeviceRelayResult::Relayed => {
+                // ✅ Response streamed from local device using local key.
+                // No cost to user. Skip all server-side processing.
+                continue;
+            }
+            DeviceRelayResult::NoLocalKey | DeviceRelayResult::NoDevice => {
+                // Local device is offline or has no valid key for this provider.
+                // Fall through to Step 2: use operator key on Railway.
+            }
+        }
+
+        // ── Step 2: Use operator key on Railway (paid path, 2.2×) ──
+        // Resolve API key: client-provided > provider_api_keys > env > admin key.
+        {
+            let mut config_guard = state.config.lock();
 
             let client_key = parsed["api_key"]
                 .as_str()
@@ -785,6 +826,7 @@ async fn handle_socket(
                 .filter(|k| !k.is_empty());
 
             if let Some(key) = client_key {
+                // Client explicitly provided a key in the message
                 config_guard.api_key = Some(key.to_string());
             } else if let Some(stored_key) =
                 config_guard.provider_api_keys.get(&provider_name).cloned()
@@ -792,113 +834,73 @@ async fn handle_socket(
                 if !stored_key.trim().is_empty() {
                     config_guard.api_key = Some(stored_key);
                 } else {
-                    // Clear stale key from a different provider
                     config_guard.api_key = None;
                 }
             } else {
-                // No key found for this provider — clear any previous
-                // provider's key so we don't send a mismatched key.
-                // The provider factory will check env vars as fallback.
                 config_guard.api_key = None;
             }
         }
 
-        // ── Validate API key for cloud providers ──
+        // Validate that we have a credential for the provider
         let credential_missing = {
             let config_guard = state.config.lock();
-            let provider_name = config_guard
-                .default_provider
-                .as_deref()
-                .unwrap_or("gemini")
-                .to_string();
-
             if crate::providers::provider_requires_credential(&provider_name) {
                 let has_key = crate::providers::has_provider_credential(
                     &provider_name,
                     config_guard.api_key.as_deref(),
                 );
-                if !has_key {
-                    Some(provider_name)
-                } else {
-                    None
-                }
+                !has_key
             } else {
-                None
+                false
             }
         };
-        if let Some(provider_name) = credential_missing {
-            // ── Try to relay to user's local device if online ──
-            // Flow:
-            //   1. Device online + has local API key → relay to device (free)
-            //   2. Device online + no local key → fall through to operator key (2.2×)
-            //   3. Device offline → fall through to operator key (2.2×)
-            let relay_result = try_relay_to_local_device(
-                &state,
-                &mut socket,
-                user_id.as_deref(),
-                &content,
-                &session_id,
-                &provider_name,
-            )
-            .await;
 
-            match relay_result {
-                DeviceRelayResult::Relayed => {
-                    // Response already streamed from local device (local key, free)
-                    continue;
-                }
-                DeviceRelayResult::NoLocalKey | DeviceRelayResult::NoDevice => {
-                    // Device has no key or is offline — try operator key on Railway.
-                    // Check if operator admin keys are available in env vars.
-                    let admin_env_var = match provider_name.as_str() {
-                        "anthropic" => "ADMIN_ANTHROPIC_API_KEY",
-                        "openai" => "ADMIN_OPENAI_API_KEY",
-                        "gemini" | "google" | "google-gemini" => "ADMIN_GEMINI_API_KEY",
-                        "perplexity" => "ADMIN_PERPLEXITY_API_KEY",
-                        _ => "",
-                    };
-                    let operator_key = if !admin_env_var.is_empty() {
-                        std::env::var(admin_env_var).ok().filter(|k| !k.trim().is_empty())
-                    } else {
-                        None
-                    };
+        if credential_missing {
+            // Try ADMIN_*_API_KEY env vars (operator's pre-configured keys)
+            let admin_env_var = match provider_name.as_str() {
+                "anthropic" => "ADMIN_ANTHROPIC_API_KEY",
+                "openai" => "ADMIN_OPENAI_API_KEY",
+                "gemini" | "google" | "google-gemini" => "ADMIN_GEMINI_API_KEY",
+                "perplexity" => "ADMIN_PERPLEXITY_API_KEY",
+                _ => "",
+            };
+            let operator_key = if !admin_env_var.is_empty() {
+                std::env::var(admin_env_var).ok().filter(|k| !k.trim().is_empty())
+            } else {
+                None
+            };
 
-                    if let Some(key) = operator_key {
-                        // Use operator key — credits will be deducted at 2.2×
-                        tracing::info!(
-                            provider = provider_name.as_str(),
-                            source = if matches!(relay_result, DeviceRelayResult::NoLocalKey) {
-                                "device_no_key"
-                            } else {
-                                "device_offline"
-                            },
-                            "Using operator API key (credits will be deducted at 2.2×)"
-                        );
-                        let mut config_guard = state.config.lock();
-                        config_guard.api_key = Some(key);
-                        // Fall through to normal processing below
+            if let Some(key) = operator_key {
+                tracing::info!(
+                    provider = provider_name.as_str(),
+                    source = if matches!(relay_result, DeviceRelayResult::NoLocalKey) {
+                        "device_no_key"
                     } else {
-                        // No operator key either — truly no key available
-                        let env_hint = match provider_name.as_str() {
-                            "anthropic" => "ANTHROPIC_API_KEY",
-                            "openai" => "OPENAI_API_KEY",
-                            "gemini" | "google" | "google-gemini" => "GEMINI_API_KEY",
-                            _ => "<PROVIDER>_API_KEY",
-                        };
-                        let err = serde_json::json!({
-                            "type": "error",
-                            "code": "missing_api_key",
-                            "message": format!(
-                                "No API key configured for provider '{}'. Please add your API key in Settings or set {} env var.",
-                                provider_name, env_hint
-                            ),
-                            "fallback_to_relay": true,
-                            "device_online": matches!(relay_result, DeviceRelayResult::NoLocalKey),
-                        });
-                        let _ = socket.send(Message::Text(err.to_string().into())).await;
-                        continue;
-                    }
-                }
+                        "device_offline"
+                    },
+                    "Using operator API key (credits will be deducted at 2.2×)"
+                );
+                let mut config_guard = state.config.lock();
+                config_guard.api_key = Some(key);
+                // Fall through to normal LLM processing below
+            } else {
+                // No key at all — shouldn't happen if operator set up Railway
+                let env_hint = match provider_name.as_str() {
+                    "anthropic" => "ANTHROPIC_API_KEY",
+                    "openai" => "OPENAI_API_KEY",
+                    "gemini" | "google" | "google-gemini" => "GEMINI_API_KEY",
+                    _ => "<PROVIDER>_API_KEY",
+                };
+                let err = serde_json::json!({
+                    "type": "error",
+                    "code": "missing_api_key",
+                    "message": format!(
+                        "No API key configured for provider '{}'. Please add your API key in Settings or set {} env var.",
+                        provider_name, env_hint
+                    ),
+                });
+                let _ = socket.send(Message::Text(err.to_string().into())).await;
+                continue;
             }
         }
 
