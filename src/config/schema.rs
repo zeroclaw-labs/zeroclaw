@@ -3317,6 +3317,65 @@ impl Default for QdrantConfig {
     }
 }
 
+/// Configuration for the mem0 (OpenMemory) memory backend.
+///
+/// Connects to a self-hosted OpenMemory server via its REST API.
+/// Deploy OpenMemory with `docker compose up` from the mem0 repo,
+/// then point `url` at the API (default `http://localhost:8765`).
+///
+/// ```toml
+/// [memory]
+/// backend = "mem0"
+///
+/// [memory.mem0]
+/// url = "http://localhost:8765"
+/// user_id = "zeroclaw"
+/// app_name = "zeroclaw"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Mem0Config {
+    /// OpenMemory server URL (e.g. `http://localhost:8765`).
+    /// Falls back to `MEM0_URL` env var if not set.
+    #[serde(default = "default_mem0_url")]
+    pub url: String,
+    /// User ID for scoping memories within mem0.
+    /// Falls back to `MEM0_USER_ID` env var, or default `"zeroclaw"`.
+    #[serde(default = "default_mem0_user_id")]
+    pub user_id: String,
+    /// Application name registered in mem0.
+    /// Falls back to `MEM0_APP_NAME` env var, or default `"zeroclaw"`.
+    #[serde(default = "default_mem0_app_name")]
+    pub app_name: String,
+    /// Whether mem0 should use its built-in LLM to extract facts from
+    /// stored text (`infer = true`) or store raw text as-is (`false`).
+    #[serde(default = "default_mem0_infer")]
+    pub infer: bool,
+}
+
+fn default_mem0_url() -> String {
+    std::env::var("MEM0_URL").unwrap_or_else(|_| "http://localhost:8765".into())
+}
+fn default_mem0_user_id() -> String {
+    std::env::var("MEM0_USER_ID").unwrap_or_else(|_| "zeroclaw".into())
+}
+fn default_mem0_app_name() -> String {
+    std::env::var("MEM0_APP_NAME").unwrap_or_else(|_| "zeroclaw".into())
+}
+fn default_mem0_infer() -> bool {
+    true
+}
+
+impl Default for Mem0Config {
+    fn default() -> Self {
+        Self {
+            url: default_mem0_url(),
+            user_id: default_mem0_user_id(),
+            app_name: default_mem0_app_name(),
+            infer: default_mem0_infer(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
@@ -3402,6 +3461,13 @@ pub struct MemoryConfig {
     /// Only used when `backend = "qdrant"`.
     #[serde(default)]
     pub qdrant: QdrantConfig,
+
+    // ── Mem0 backend options ─────────────────────────────────
+    /// Configuration for mem0 (OpenMemory) backend.
+    /// Only used when `backend = "mem0"`.
+    /// Requires `--features memory-mem0` at build time.
+    #[serde(default)]
+    pub mem0: Mem0Config,
 }
 
 fn default_embedding_provider() -> String {
@@ -3477,6 +3543,7 @@ impl Default for MemoryConfig {
             auto_hydrate: true,
             sqlite_open_timeout_secs: None,
             qdrant: QdrantConfig::default(),
+            mem0: Mem0Config::default(),
         }
     }
 }
@@ -6586,8 +6653,31 @@ impl Config {
             )
             .context("Failed to deserialize config file")?;
 
-            // Warn about each unknown config key
+            // Warn about each unknown config key.
+            // serde_ignored + #[serde(default)] on nested structs can produce
+            // false positives: parent-level fields get re-reported under the
+            // nested key (e.g. "memory.mem0.auto_hydrate" even though
+            // auto_hydrate belongs to MemoryConfig, not Mem0Config).  We
+            // suppress these by checking whether the leaf key is a known field
+            // on the parent struct.
+            let known_memory_fields: &[&str] = &[
+                "backend", "auto_save", "hygiene_enabled", "archive_after_days",
+                "purge_after_days", "conversation_retention_days", "embedding_provider",
+                "embedding_model", "embedding_dimensions", "vector_weight", "keyword_weight",
+                "min_relevance_score", "embedding_cache_size", "chunk_max_tokens",
+                "response_cache_enabled", "response_cache_ttl_minutes",
+                "response_cache_max_entries", "response_cache_hot_entries",
+                "snapshot_enabled", "snapshot_on_hygiene", "auto_hydrate",
+                "sqlite_open_timeout_secs",
+            ];
             for path in ignored_paths {
+                // Skip false positives from nested memory sub-sections
+                if path.starts_with("memory.mem0.") || path.starts_with("memory.qdrant.") {
+                    let leaf = path.rsplit('.').next().unwrap_or("");
+                    if known_memory_fields.contains(&leaf) {
+                        continue;
+                    }
+                }
                 tracing::warn!(
                     "Unknown config key ignored: \"{}\". Check config.toml for typos or deprecated options.",
                     path
