@@ -63,6 +63,7 @@ mod tests {
             guild_id: Some("123".into()),
             allowed_users: vec![],
             listen_to_bots: false,
+            interrupt_on_new_message: false,
             mention_only: false,
         };
 
