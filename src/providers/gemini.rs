@@ -1194,6 +1194,7 @@ impl Provider for GeminiProvider {
         crate::providers::traits::ProviderCapabilities {
             vision: true,
             native_tool_calling: false,
+            prompt_caching: false,
         }
     }
 
