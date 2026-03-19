@@ -311,7 +311,8 @@ async fn pm_09_validate_key() {
         lower.contains("invalid") || lower.contains("невалид") || lower.contains("ошибк")
             || lower.contains("fail") || lower.contains("401") || lower.contains("неверн")
             || lower.contains("dead") || lower.contains("не работает")
-            || lower.contains("unauthorized") || lower.contains("false"),
+            || lower.contains("unauthorized") || lower.contains("false")
+            || lower.contains("недействит"),
         "Response should indicate invalid key: {resp}"
     );
 }
