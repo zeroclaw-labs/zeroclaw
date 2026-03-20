@@ -79,6 +79,7 @@ pub mod swarm;
 pub mod text_browser;
 pub mod tool_search;
 pub mod traits;
+pub mod verifiable_intent;
 pub mod web_fetch;
 pub mod web_search_tool;
 pub mod workspace_tool;
@@ -147,6 +148,7 @@ pub use tool_search::ToolSearchTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
+pub use verifiable_intent::VerifiableIntentTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 pub use workspace_tool::WorkspaceTool;
@@ -697,6 +699,18 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(WorkspaceTool::new(
             Arc::new(tokio::sync::RwLock::new(ws_manager)),
             security.clone(),
+        )));
+    }
+
+    // Verifiable Intent tool (opt-in via config)
+    if root_config.verifiable_intent.enabled {
+        let strictness = match root_config.verifiable_intent.strictness.as_str() {
+            "permissive" => crate::verifiable_intent::StrictnessMode::Permissive,
+            _ => crate::verifiable_intent::StrictnessMode::Strict,
+        };
+        tool_arcs.push(Arc::new(VerifiableIntentTool::new(
+            security.clone(),
+            strictness,
         )));
     }
 
