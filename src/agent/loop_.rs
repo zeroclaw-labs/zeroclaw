@@ -3083,6 +3083,7 @@ pub async fn run(
     } else {
         (None, None)
     };
+    let runtime_for_skills = std::sync::Arc::clone(&runtime);
     let (mut tools_registry, delegate_handle) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
@@ -3253,6 +3254,46 @@ pub async fn run(
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+
+    // ── Register skill shell tools ──────────────────────────────────────────
+    {
+        let mut seen_names = std::collections::HashSet::new();
+        let mut registered = 0usize;
+        for skill in &skills {
+            for tool_def in &skill.tools {
+                if tool_def.kind != "shell" {
+                    tracing::debug!(
+                        skill = %skill.name,
+                        tool = %tool_def.name,
+                        kind = %tool_def.kind,
+                        "Skipping non-shell skill tool (only shell kind supported)"
+                    );
+                    continue;
+                }
+                let tool = crate::tools::skill_shell::SkillShellTool::new(
+                    &skill.name,
+                    tool_def.clone(),
+                    std::sync::Arc::clone(&security),
+                    std::sync::Arc::clone(&runtime_for_skills),
+                );
+                let name = tool.name().to_string();
+                if !seen_names.insert(name.clone()) {
+                    tracing::warn!(
+                        name = %name,
+                        skill = %skill.name,
+                        "Duplicate skill tool name — skipping"
+                    );
+                    continue;
+                }
+                tools_registry.push(Box::new(tool));
+                registered += 1;
+            }
+        }
+        if registered > 0 {
+            tracing::info!(count = registered, "Skill shell tools registered");
+        }
+    }
+
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (
             "shell",
@@ -3720,6 +3761,7 @@ pub async fn process_message(
     } else {
         (None, None)
     };
+    let runtime_for_skills = std::sync::Arc::clone(&runtime);
     let (mut tools_registry, delegate_handle_pm) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
@@ -3821,6 +3863,46 @@ pub async fn process_message(
         .collect();
 
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+
+    // ── Register skill shell tools ──────────────────────────────────────────
+    {
+        let mut seen_names = std::collections::HashSet::new();
+        let mut registered = 0usize;
+        for skill in &skills {
+            for tool_def in &skill.tools {
+                if tool_def.kind != "shell" {
+                    tracing::debug!(
+                        skill = %skill.name,
+                        tool = %tool_def.name,
+                        kind = %tool_def.kind,
+                        "Skipping non-shell skill tool (only shell kind supported)"
+                    );
+                    continue;
+                }
+                let tool = crate::tools::skill_shell::SkillShellTool::new(
+                    &skill.name,
+                    tool_def.clone(),
+                    std::sync::Arc::clone(&security),
+                    std::sync::Arc::clone(&runtime_for_skills),
+                );
+                let name = tool.name().to_string();
+                if !seen_names.insert(name.clone()) {
+                    tracing::warn!(
+                        name = %name,
+                        skill = %skill.name,
+                        "Duplicate skill tool name — skipping"
+                    );
+                    continue;
+                }
+                tools_registry.push(Box::new(tool));
+                registered += 1;
+            }
+        }
+        if registered > 0 {
+            tracing::info!(count = registered, "Skill shell tools registered");
+        }
+    }
+
     let mut tool_descs: Vec<(&str, &str)> = vec![
         ("shell", "Execute terminal commands."),
         ("file_read", "Read file contents."),
