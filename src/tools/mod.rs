@@ -60,6 +60,7 @@ pub mod shell;
 pub mod tool_search;
 pub mod traits;
 pub mod web_fetch;
+mod web_search_provider_routing;
 pub mod web_search_tool;
 
 pub use browser::{BrowserTool, ComputerUseConfig};

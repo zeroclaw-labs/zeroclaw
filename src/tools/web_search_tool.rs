@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use super::web_search_provider_routing::{resolve_web_search_provider, WebSearchProviderRoute};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
@@ -13,6 +14,7 @@ use std::time::Duration;
 /// `[web_search] brave_api_key` field, and uses the result. This ensures that
 /// keys set or rotated after boot, and encrypted keys, are correctly picked up.
 pub struct WebSearchTool {
+    /// Provider selector as configured by user. Routed via provider aliases at runtime.
     provider: String,
     /// Boot-time key snapshot (may be `None` if not yet configured at startup).
     boot_brave_api_key: Option<String>,
@@ -300,13 +302,18 @@ impl Tool for WebSearchTool {
 
         tracing::info!("Searching web for: {}", query);
 
-        let result = match self.provider.as_str() {
-            "duckduckgo" | "ddg" => self.search_duckduckgo(query).await?,
-            "brave" => self.search_brave(query).await?,
-            _ => anyhow::bail!(
-                "Unknown search provider: '{}'. Set tools.web_search.provider to 'duckduckgo' or 'brave' in config.toml",
-                self.provider
-            ),
+        let resolution = resolve_web_search_provider(&self.provider);
+        if resolution.used_fallback {
+            tracing::warn!(
+                "Unknown web search provider '{}'; falling back to '{}'",
+                self.provider,
+                resolution.canonical_provider
+            );
+        }
+
+        let result = match resolution.route {
+            WebSearchProviderRoute::DuckDuckGo => self.search_duckduckgo(query).await?,
+            WebSearchProviderRoute::Brave => self.search_brave(query).await?,
         };
 
         Ok(ToolResult {
