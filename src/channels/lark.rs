@@ -1023,6 +1023,7 @@ impl LarkChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: None,
+                        observe_group: false,
                         interruption_scope_id: None,
                     attachments: vec![],
                     };
@@ -1759,6 +1760,7 @@ impl LarkChannel {
             channel: self.channel_name().to_string(),
             timestamp,
             thread_ts: None,
+            observe_group: false,
             interruption_scope_id: None,
             attachments: vec![],
         });
