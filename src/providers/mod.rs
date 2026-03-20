@@ -135,10 +135,7 @@ pub(crate) fn is_moonshot_alias(name: &str) -> bool {
 }
 
 pub(crate) fn is_qwen_cn_alias(name: &str) -> bool {
-    matches!(
-        name,
-        "qwen" | "dashscope" | "qwen-cn" | "dashscope-cn"
-    )
+    matches!(name, "qwen" | "dashscope" | "qwen-cn" | "dashscope-cn")
 }
 
 pub(crate) fn is_qwen_intl_alias(name: &str) -> bool {

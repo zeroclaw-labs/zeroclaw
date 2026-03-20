@@ -4255,8 +4255,6 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     mention_only,
                     ignore_attachments,
                     ignore_stories,
-                    streaming: false,
-                    streaming_chunk_size: 200,
                 });
 
                 println!("  {} Signal configured", style("✅").green().bold());
@@ -4355,8 +4353,6 @@ fn setup_channels() -> Result<ChannelsConfig> {
                             .then(|| pair_code.trim().to_string()),
                         allowed_numbers,
                         mention_only: false,
-                        streaming: false,
-                        streaming_chunk_size: 200,
                     });
 
                     println!(
@@ -4459,8 +4455,6 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     pair_code: None,
                     allowed_numbers,
                     mention_only: false,
-                    streaming: false,
-                    streaming_chunk_size: 200,
                 });
             }
             ChannelMenuChoice::Linq => {
@@ -7393,8 +7387,6 @@ mod tests {
             mention_only: false,
             ignore_attachments: false,
             ignore_stories: true,
-            streaming: false,
-            streaming_chunk_size: 200,
         });
         assert!(has_launchable_channels(&channels));
 
