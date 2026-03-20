@@ -709,6 +709,8 @@ impl ModelRoutingConfigTool {
                 max_parallel_tool_calls: None,
                 max_tool_result_chars: None,
                 iteration_cooldown_ms: None,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             });
 
         next_agent.provider = provider;

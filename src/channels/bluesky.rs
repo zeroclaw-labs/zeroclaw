@@ -252,6 +252,7 @@ impl BlueskyChannel {
             timestamp,
             thread_ts: Some(notif.uri.clone()),
             reply_to_message_id: None,
+            interruption_scope_id: None,
         })
     }
 

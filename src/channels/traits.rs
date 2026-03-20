@@ -15,6 +15,12 @@ pub struct ChannelMessage {
     /// Platform-specific message ID for reply-to (e.g. Telegram `message_id`).
     /// Filled by the channel's `listen()` so callers don't need to parse the `id` field.
     pub reply_to_message_id: Option<String>,
+
+    /// Thread scope identifier for interruption/cancellation grouping.
+    /// Distinct from `thread_ts` (reply anchor): this is `Some` only when the message
+    /// is genuinely inside a reply thread and should be isolated from other threads.
+    /// `None` means top-level — scope is sender+channel only.
+    pub interruption_scope_id: Option<String>,
 }
 
 /// Message to send through a channel
@@ -215,6 +221,7 @@ mod tests {
                 timestamp: 123,
                 thread_ts: None,
                 reply_to_message_id: None,
+                interruption_scope_id: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -232,6 +239,7 @@ mod tests {
             timestamp: 999,
             thread_ts: None,
             reply_to_message_id: None,
+            interruption_scope_id: None,
         };
 
         let cloned = message.clone();

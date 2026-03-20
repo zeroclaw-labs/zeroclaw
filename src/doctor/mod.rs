@@ -1285,6 +1285,8 @@ mod tests {
                 max_parallel_tool_calls: None,
                 max_tool_result_chars: None,
                 iteration_cooldown_ms: None,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
         config.agents.insert(
@@ -1303,6 +1305,8 @@ mod tests {
                 max_parallel_tool_calls: None,
                 max_tool_result_chars: None,
                 iteration_cooldown_ms: None,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
 

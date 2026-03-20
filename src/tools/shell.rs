@@ -1,5 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
+use crate::security::traits::Sandbox;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -44,11 +45,28 @@ const SAFE_ENV_VARS: &[&str] = &[
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    sandbox: Arc<dyn Sandbox>,
 }
 
 impl ShellTool {
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
-        Self { security, runtime }
+        Self {
+            security,
+            runtime,
+            sandbox: Arc::new(crate::security::NoopSandbox),
+        }
+    }
+
+    pub fn new_with_sandbox(
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        sandbox: Arc<dyn Sandbox>,
+    ) -> Self {
+        Self {
+            security,
+            runtime,
+            sandbox,
+        }
     }
 }
 
@@ -169,6 +187,14 @@ impl Tool for ShellTool {
                 });
             }
         };
+
+        // Apply sandbox wrapping before execution.
+        // The Sandbox trait operates on std::process::Command, so use as_std_mut()
+        // to get a mutable reference to the underlying command.
+        self.sandbox
+            .wrap_command(cmd.as_std_mut())
+            .map_err(|e| anyhow::anyhow!("Sandbox error: {}", e))?;
+
         cmd.env_clear();
 
         for var in collect_allowed_shell_env_vars(&self.security) {
@@ -689,5 +715,60 @@ mod tests {
             r2.error.as_deref().unwrap_or("").contains("Rate limit")
                 || r2.error.as_deref().unwrap_or("").contains("budget")
         );
+    }
+
+    // ── Sandbox integration tests ────────────────────────
+
+    #[test]
+    fn shell_tool_can_be_constructed_with_sandbox() {
+        use crate::security::NoopSandbox;
+
+        let sandbox: Arc<dyn Sandbox> = Arc::new(NoopSandbox);
+        let tool = ShellTool::new_with_sandbox(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            sandbox,
+        );
+        assert_eq!(tool.name(), "shell");
+    }
+
+    #[test]
+    fn noop_sandbox_does_not_modify_command() {
+        use crate::security::NoopSandbox;
+
+        let sandbox = NoopSandbox;
+        let mut cmd = std::process::Command::new("echo");
+        cmd.arg("hello");
+
+        let program_before = cmd.get_program().to_os_string();
+        let args_before: Vec<_> = cmd.get_args().map(|a| a.to_os_string()).collect();
+
+        sandbox
+            .wrap_command(&mut cmd)
+            .expect("wrap_command should succeed");
+
+        assert_eq!(cmd.get_program(), program_before);
+        assert_eq!(
+            cmd.get_args().map(|a| a.to_os_string()).collect::<Vec<_>>(),
+            args_before
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_executes_with_sandbox() {
+        use crate::security::NoopSandbox;
+
+        let sandbox: Arc<dyn Sandbox> = Arc::new(NoopSandbox);
+        let tool = ShellTool::new_with_sandbox(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            sandbox,
+        );
+        let result = tool
+            .execute(json!({"command": "echo sandbox_test"}))
+            .await
+            .expect("command with sandbox should succeed");
+        assert!(result.success);
+        assert!(result.output.contains("sandbox_test"));
     }
 }

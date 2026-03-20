@@ -267,6 +267,7 @@ impl SignalChannel {
             timestamp: timestamp / 1000, // millis → secs
             thread_ts: None,
             reply_to_message_id: None,
+            interruption_scope_id: None,
         })
     }
 }

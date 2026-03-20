@@ -194,6 +194,7 @@ impl NextcloudTalkChannel {
             timestamp: Self::now_unix_secs(),
             thread_ts: None,
             reply_to_message_id: None,
+            interruption_scope_id: None,
         });
 
         messages
@@ -296,6 +297,7 @@ impl NextcloudTalkChannel {
             timestamp,
             thread_ts: None,
             reply_to_message_id: None,
+            interruption_scope_id: None,
         });
 
         messages

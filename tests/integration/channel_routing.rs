@@ -26,6 +26,7 @@ fn channel_message_sender_field_holds_platform_user_id() {
         timestamp: 1700000000,
         thread_ts: None,
         reply_to_message_id: None,
+        interruption_scope_id: None,
     };
 
     assert_eq!(msg.sender, "123456789");
@@ -49,6 +50,7 @@ fn channel_message_reply_target_distinct_from_sender() {
         timestamp: 1700000000,
         thread_ts: None,
         reply_to_message_id: None,
+        interruption_scope_id: None,
     };
 
     assert_ne!(
@@ -70,6 +72,7 @@ fn channel_message_fields_not_swapped() {
         timestamp: 1700000000,
         thread_ts: None,
         reply_to_message_id: None,
+        interruption_scope_id: None,
     };
 
     assert_eq!(
@@ -97,6 +100,7 @@ fn channel_message_preserves_all_fields_on_clone() {
         timestamp: 1700000001,
         thread_ts: None,
         reply_to_message_id: None,
+        interruption_scope_id: None,
     };
 
     let cloned = original.clone();
@@ -191,6 +195,7 @@ impl Channel for CapturingChannel {
             timestamp: 1700000000,
             thread_ts: None,
             reply_to_message_id: None,
+            interruption_scope_id: None,
         })
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))

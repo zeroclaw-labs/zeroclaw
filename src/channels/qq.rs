@@ -115,6 +115,7 @@ fn build_channel_message(
         timestamp: current_unix_timestamp_secs(),
         thread_ts: (!msg_id.is_empty()).then(|| msg_id.to_string()),
         reply_to_message_id: None,
+        interruption_scope_id: None,
     }
 }
 
@@ -589,6 +590,7 @@ impl Channel for QQChannel {
                                     .as_secs(),
                                 thread_ts: None,
                                 reply_to_message_id: None,
+                                interruption_scope_id: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {
@@ -628,6 +630,7 @@ impl Channel for QQChannel {
                                     .as_secs(),
                                 thread_ts: None,
                                 reply_to_message_id: None,
+                                interruption_scope_id: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {
