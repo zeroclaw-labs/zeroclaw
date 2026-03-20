@@ -2007,13 +2007,6 @@ async fn process_channel_message(
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
-    let had_prior_history = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&history_key)
-        .is_some_and(|turns| !turns.is_empty());
-
     // Preserve user turn before the LLM call so interrupted requests keep context.
     append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
 
@@ -2072,25 +2065,58 @@ async fn process_channel_message(
         );
     }
 
-    // Only enrich with memory context when there is no prior conversation
-    // history. Follow-up turns already include context from previous messages.
-    if !had_prior_history {
-        let memory_context = build_memory_context(
+    // ── Dual-scope memory recall ──────────────────────────────────
+    // Always recall before each LLM call (not just first turn).
+    // For group chats: merge sender-scope + group-scope memories.
+    // For DMs: sender-scope only.
+    let is_group_chat =
+        msg.reply_target.contains("@g.us") || msg.reply_target.starts_with("group:");
+
+    let mem_recall_start = Instant::now();
+    let sender_memory_fut = build_memory_context(
+        ctx.memory.as_ref(),
+        &msg.content,
+        ctx.min_relevance_score,
+        Some(&msg.sender),
+    );
+
+    let (sender_memory, group_memory) = if is_group_chat {
+        let group_memory_fut = build_memory_context(
             ctx.memory.as_ref(),
             &msg.content,
             ctx.min_relevance_score,
             Some(&history_key),
-        )
-        .await;
-        if let Some(last_turn) = prior_turns.last_mut() {
-            if last_turn.role == "user" && !memory_context.is_empty() {
-                last_turn.content = format!("{memory_context}{}", msg.content);
-            }
-        }
+        );
+        tokio::join!(sender_memory_fut, group_memory_fut)
+    } else {
+        (sender_memory_fut.await, String::new())
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    let mem_recall_ms = mem_recall_start.elapsed().as_millis() as u64;
+    tracing::info!(
+        mem_recall_ms,
+        sender_empty = sender_memory.is_empty(),
+        group_empty = group_memory.is_empty(),
+        "⏱ Memory recall completed"
+    );
+
+    // Merge sender + group memories, avoiding duplicates
+    let memory_context = if group_memory.is_empty() {
+        sender_memory
+    } else if sender_memory.is_empty() {
+        group_memory
+    } else {
+        format!("{sender_memory}\n{group_memory}")
+    };
+
+    // Inject memory into system prompt (not user message) so it
+    // doesn't pollute session history and is re-fetched each turn.
+    let mut system_prompt =
+        build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
+    if !memory_context.is_empty() {
+        let _ = write!(system_prompt, "\n\n{memory_context}");
     }
 
-    let system_prompt =
-        build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let use_streaming = target_channel
@@ -2224,6 +2250,10 @@ async fn process_channel_message(
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
+    let llm_call_start = Instant::now();
+    #[allow(clippy::cast_possible_truncation)]
+    let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
+    tracing::info!(elapsed_before_llm_ms, "⏱ Starting LLM call");
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
@@ -2270,6 +2300,12 @@ async fn process_channel_message(
     if let Some(handle) = notify_task {
         let _ = handle.await;
     }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let llm_call_ms = llm_call_start.elapsed().as_millis() as u64;
+    #[allow(clippy::cast_possible_truncation)]
+    let total_ms = started_at.elapsed().as_millis() as u64;
+    tracing::info!(llm_call_ms, total_ms, "⏱ LLM call completed");
 
     if let Some(token) = typing_cancellation.as_ref() {
         token.cancel();
@@ -2379,6 +2415,7 @@ async fn process_channel_message(
             } else {
                 sanitized_response
             };
+
             runtime_trace::record_event(
                 "channel_message_outbound",
                 Some(msg.channel.as_str()),
@@ -2453,7 +2490,7 @@ async fn process_channel_message(
                     }
                 } else if let Err(e) = channel
                     .send(
-                        &SendMessage::new(delivered_response, &msg.reply_target)
+                        &SendMessage::new(&delivered_response, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone()),
                     )
                     .await

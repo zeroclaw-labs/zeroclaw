@@ -20,6 +20,7 @@ pub struct Mem0Memory {
     user_id: String,
     app_name: String,
     infer: bool,
+    extraction_prompt: Option<String>,
 }
 
 // ── mem0 API request/response types ────────────────────────────────
@@ -33,6 +34,8 @@ struct AddMemoryRequest<'a> {
     infer: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     app: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    custom_instructions: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -108,6 +111,7 @@ impl Mem0Memory {
             user_id: config.user_id.clone(),
             app_name: config.app_name.clone(),
             infer: config.infer,
+            extraction_prompt: config.extraction_prompt.clone(),
         })
     }
 
@@ -336,6 +340,7 @@ impl Memory for Mem0Memory {
             }),
             infer: self.infer,
             app: Some(&self.app_name),
+            custom_instructions: self.extraction_prompt.as_deref(),
         };
 
         let resp = self
@@ -476,6 +481,7 @@ mod tests {
             user_id: "test-user".into(),
             app_name: "test-app".into(),
             infer: true,
+            extraction_prompt: None,
         }
     }
 
