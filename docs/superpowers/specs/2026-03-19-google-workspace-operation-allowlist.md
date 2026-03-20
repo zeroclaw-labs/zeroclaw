@@ -191,14 +191,16 @@ When you need to confirm whether a less-common operation exists:
 
 Validation order inside `google_workspace`:
 
-1. Check rate limits.
-2. Check `service` against `allowed_services`.
-3. Extract and validate `sub_resource` if present (character check, type check).
-4. Check `(service, resource, sub_resource, method)` against `allowed_operations`
+1. Extract `service`, `resource`, `method` from args (required).
+2. Extract and validate `sub_resource` if present (type check, character check).
+3. Check rate limits.
+4. Check `service` against `allowed_services`.
+5. Check `(service, resource, sub_resource, method)` against `allowed_operations`
    when configured. Unmatched combinations are denied fail-closed.
-5. Validate `service`, `resource`, and `method` for shell-safe characters.
-6. Build and execute the `gws` command.
-7. Charge action budget (only after all validation passes).
+6. Validate `service`, `resource`, and `method` for shell-safe characters.
+7. Build optional args (`params`, `body`, `format`, `page_all`, `page_limit`).
+8. Charge action budget (only after all validation passes).
+9. Execute the `gws` command.
 
 This must be fail-closed. A missing operation match is a hard deny, not a warning.
 

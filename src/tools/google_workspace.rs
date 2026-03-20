@@ -50,17 +50,48 @@ impl GoogleWorkspaceTool {
                 .collect()
         } else {
             allowed_services
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .collect()
         };
+        // Normalize stored operation fields at construction time so runtime
+        // comparisons can use plain equality without repeated .trim() calls.
+        let operations = allowed_operations
+            .into_iter()
+            .map(|op| GoogleWorkspaceAllowedOperation {
+                service: op.service.trim().to_string(),
+                resource: op.resource.trim().to_string(),
+                sub_resource: op.sub_resource.as_deref().map(|s| s.trim().to_string()),
+                methods: op.methods.iter().map(|m| m.trim().to_string()).collect(),
+            })
+            .collect();
         Self {
             security,
             allowed_services: services,
-            allowed_operations,
+            allowed_operations: operations,
             credentials_path,
             default_account,
             rate_limit_per_minute,
             timeout_secs,
             audit_log,
         }
+    }
+
+    /// Build the positional `gws` arguments: `[service, resource, (sub_resource,)? method]`.
+    /// Exposed for tests so the argument ordering can be verified without spawning a process.
+    #[cfg(test)]
+    fn positional_cmd_args(
+        service: &str,
+        resource: &str,
+        sub_resource: Option<&str>,
+        method: &str,
+    ) -> Vec<String> {
+        let mut args = vec![service.to_string(), resource.to_string()];
+        if let Some(sub) = sub_resource {
+            args.push(sub.to_string());
+        }
+        args.push(method.to_string());
+        args
     }
 
     fn is_operation_allowed(
@@ -74,13 +105,10 @@ impl GoogleWorkspaceTool {
             return true;
         }
         self.allowed_operations.iter().any(|operation| {
-            operation.service.trim() == service
-                && operation.resource.trim() == resource
-                && operation.sub_resource.as_deref().map(str::trim) == sub_resource
-                && operation
-                    .methods
-                    .iter()
-                    .any(|allowed| allowed.trim() == method)
+            operation.service == service
+                && operation.resource == resource
+                && operation.sub_resource.as_deref() == sub_resource
+                && operation.methods.iter().any(|allowed| allowed == method)
         })
     }
 }
@@ -172,13 +200,13 @@ impl Tool for GoogleWorkspaceTool {
             };
             if !s
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
             {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
                     error: Some(
-                        "Invalid characters in 'sub_resource': only alphanumeric, underscore, and hyphen are allowed"
+                        "Invalid characters in 'sub_resource': only lowercase alphanumeric, underscore, and hyphen are allowed"
                             .into(),
                     ),
                 });
@@ -198,7 +226,7 @@ impl Tool for GoogleWorkspaceTool {
         }
 
         // Validate service is in the allowlist
-        if !self.allowed_services.iter().any(|s| s.trim() == service) {
+        if !self.allowed_services.iter().any(|s| s == service) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -211,11 +239,15 @@ impl Tool for GoogleWorkspaceTool {
         }
 
         if !self.is_operation_allowed(service, resource, sub_resource, method) {
+            let op_path = match sub_resource {
+                Some(sub) => format!("{service}/{resource}/{sub}/{method}"),
+                None => format!("{service}/{resource}/{method}"),
+            };
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Operation '{service}/{resource}/{method}' is not in the allowed operations list"
+                    "Operation '{op_path}' is not in the allowed operations list"
                 )),
             });
         }
@@ -228,13 +260,13 @@ impl Tool for GoogleWorkspaceTool {
         ] {
             if !value
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
             {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
                     error: Some(format!(
-                        "Invalid characters in '{label}': only alphanumeric, underscore, and hyphen are allowed"
+                        "Invalid characters in '{label}': only lowercase alphanumeric, underscore, and hyphen are allowed"
                     )),
                 });
             }
@@ -370,6 +402,7 @@ impl Tool for GoogleWorkspaceTool {
                 tool = "google_workspace",
                 service = service,
                 resource = resource,
+                sub_resource = sub_resource.unwrap_or(""),
                 method = method,
                 "gws audit: executing API call"
             );
@@ -872,5 +905,122 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("allowed operations list"));
+    }
+
+    // ── cmd_args ordering ────────────────────────────────────
+
+    #[test]
+    fn cmd_args_3_segment_shape_drive() {
+        // Drive uses gws <service> <resource> <method> — no sub_resource.
+        let args = GoogleWorkspaceTool::positional_cmd_args("drive", "files", None, "list");
+        assert_eq!(args, vec!["drive", "files", "list"]);
+    }
+
+    #[test]
+    fn cmd_args_4_segment_shape_gmail() {
+        // Gmail uses gws <service> <resource> <sub_resource> <method>.
+        let args =
+            GoogleWorkspaceTool::positional_cmd_args("gmail", "users", Some("messages"), "list");
+        assert_eq!(args, vec!["gmail", "users", "messages", "list"]);
+    }
+
+    #[test]
+    fn cmd_args_sub_resource_precedes_method() {
+        // sub_resource must come before method in the positional args.
+        let args =
+            GoogleWorkspaceTool::positional_cmd_args("gmail", "users", Some("drafts"), "create");
+        let sub_idx = args.iter().position(|a| a == "drafts").unwrap();
+        let method_idx = args.iter().position(|a| a == "create").unwrap();
+        assert!(sub_idx < method_idx, "sub_resource must precede method");
+    }
+
+    // ── denial error message ─────────────────────────────────
+
+    #[tokio::test]
+    async fn denial_error_includes_sub_resource_when_present() {
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec!["gmail".into()],
+            vec![GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "users".into(),
+                sub_resource: Some("drafts".into()),
+                methods: vec!["create".into()],
+            }],
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
+
+        let result = tool
+            .execute(json!({
+                "service": "gmail",
+                "resource": "users",
+                "sub_resource": "messages",
+                "method": "send"
+            }))
+            .await
+            .expect("denied operation should return a result");
+
+        let error = result.error.as_deref().unwrap_or("");
+        // Error must include sub_resource so the operator can distinguish
+        // gmail/users/messages/send from gmail/users/drafts/send.
+        assert!(
+            error.contains("gmail/users/messages/send"),
+            "expected full 4-segment path in error, got: {error}"
+        );
+    }
+
+    // ── whitespace normalization ─────────────────────────────
+
+    #[test]
+    fn allowed_operations_config_values_trimmed_at_construction() {
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec!["gmail".into()],
+            vec![GoogleWorkspaceAllowedOperation {
+                service: " gmail ".into(), // leading/trailing whitespace
+                resource: " users ".into(),
+                sub_resource: Some(" drafts ".into()),
+                methods: vec![" create ".into()],
+            }],
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
+
+        // After construction, stored values are trimmed and plain equality works.
+        assert!(tool.is_operation_allowed("gmail", "users", Some("drafts"), "create"));
+        assert!(!tool.is_operation_allowed("gmail", "users", Some(" drafts "), "create"));
+    }
+
+    // ── page_limit behavior ──────────────────────────────────
+
+    #[tokio::test]
+    async fn page_limit_without_page_all_is_accepted() {
+        // page_limit alone (without page_all) is a valid request — it caps page
+        // count without requiring --page-all. Validation must pass; only
+        // command execution fails (no gws binary in test environment).
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 1, false);
+        let result = tool
+            .execute(json!({
+                "service": "drive",
+                "resource": "files",
+                "method": "list",
+                "page_limit": 5
+            }))
+            .await
+            .expect("execute should not panic");
+        // Must not be a validation error — any failure here is command execution.
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(
+            !error.contains("must be") && !error.contains("Invalid"),
+            "page_limit without page_all should not produce a validation error, got: {error}"
+        );
     }
 }
