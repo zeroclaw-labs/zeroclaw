@@ -6285,8 +6285,7 @@ async fn load_persisted_workspace_dirs(
         return Ok(None);
     }
 
-    let expanded_dir = shellexpand::tilde(raw_config_dir);
-    let parsed_dir = PathBuf::from(expanded_dir.as_ref());
+    let parsed_dir = expand_tilde_path(raw_config_dir);
     let config_dir = if parsed_dir.is_absolute() {
         parsed_dir
     } else {
@@ -6422,6 +6421,35 @@ impl ConfigResolutionSource {
     }
 }
 
+/// Expand tilde in paths, falling back to `UserDirs` when HOME is unset.
+///
+/// In non-TTY environments (e.g. cron), HOME may not be set, causing
+/// `shellexpand::tilde` to return the literal `~` unexpanded. This helper
+/// detects that case and uses `directories::UserDirs` as a fallback.
+fn expand_tilde_path(path: &str) -> PathBuf {
+    let expanded = shellexpand::tilde(path);
+    let expanded_str = expanded.as_ref();
+
+    // If the path still starts with '~', tilde expansion failed (HOME unset)
+    if expanded_str.starts_with('~') {
+        if let Some(user_dirs) = UserDirs::new() {
+            let home = user_dirs.home_dir();
+            // Replace leading ~ with home directory
+            if let Some(rest) = expanded_str.strip_prefix('~') {
+                return home.join(rest.trim_start_matches(['/', '\\']));
+            }
+        }
+        // If UserDirs also fails, log a warning and use the literal path
+        tracing::warn!(
+            path = path,
+            "Failed to expand tilde: HOME environment variable is not set and UserDirs failed. \
+             In cron/non-TTY environments, use absolute paths or set HOME explicitly."
+        );
+    }
+
+    PathBuf::from(expanded_str)
+}
+
 async fn resolve_runtime_config_dirs(
     default_zeroclaw_dir: &Path,
     default_workspace_dir: &Path,
@@ -6429,7 +6457,7 @@ async fn resolve_runtime_config_dirs(
     if let Ok(custom_config_dir) = std::env::var("ZEROCLAW_CONFIG_DIR") {
         let custom_config_dir = custom_config_dir.trim();
         if !custom_config_dir.is_empty() {
-            let zeroclaw_dir = PathBuf::from(shellexpand::tilde(custom_config_dir).as_ref());
+            let zeroclaw_dir = expand_tilde_path(custom_config_dir);
             return Ok((
                 zeroclaw_dir.clone(),
                 zeroclaw_dir.join("workspace"),
@@ -6440,9 +6468,8 @@ async fn resolve_runtime_config_dirs(
 
     if let Ok(custom_workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
         if !custom_workspace.is_empty() {
-            let expanded = shellexpand::tilde(&custom_workspace);
-            let (zeroclaw_dir, workspace_dir) =
-                resolve_config_dir_for_workspace(&PathBuf::from(expanded.as_ref()));
+            let expanded = expand_tilde_path(&custom_workspace);
+            let (zeroclaw_dir, workspace_dir) = resolve_config_dir_for_workspace(&expanded);
             return Ok((
                 zeroclaw_dir,
                 workspace_dir,
@@ -7694,9 +7721,8 @@ impl Config {
         // Workspace directory: ZEROCLAW_WORKSPACE
         if let Ok(workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
             if !workspace.is_empty() {
-                let expanded = shellexpand::tilde(&workspace);
-                let (_, workspace_dir) =
-                    resolve_config_dir_for_workspace(&PathBuf::from(expanded.as_ref()));
+                let expanded = expand_tilde_path(&workspace);
+                let (_, workspace_dir) = resolve_config_dir_for_workspace(&expanded);
                 self.workspace_dir = workspace_dir;
             }
         }
@@ -8448,6 +8474,35 @@ mod tests {
     use tokio::test;
     use tokio_stream::wrappers::ReadDirStream;
     use tokio_stream::StreamExt;
+
+    // ── Tilde expansion ───────────────────────────────────────
+
+    #[test]
+    async fn expand_tilde_path_handles_absolute_path() {
+        let path = expand_tilde_path("/absolute/path");
+        assert_eq!(path, PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    async fn expand_tilde_path_handles_relative_path() {
+        let path = expand_tilde_path("relative/path");
+        assert_eq!(path, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    async fn expand_tilde_path_expands_tilde_when_home_set() {
+        // This test verifies that tilde expansion works when HOME is set.
+        // In normal environments, HOME is set, so ~ should expand.
+        let path = expand_tilde_path("~/.zeroclaw");
+        // The path should not literally start with '~' if HOME is set
+        // (it should be expanded to the actual home directory)
+        if std::env::var("HOME").is_ok() {
+            assert!(
+                !path.to_string_lossy().starts_with('~'),
+                "Tilde should be expanded when HOME is set"
+            );
+        }
+    }
 
     // ── Defaults ─────────────────────────────────────────────
 
