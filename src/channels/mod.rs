@@ -406,7 +406,13 @@ fn followup_thread_id(msg: &traits::ChannelMessage) -> Option<String> {
 }
 
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
-    format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
+    match &msg.interruption_scope_id {
+        Some(scope) => format!(
+            "{}_{}_{}_{}",
+            msg.channel, msg.reply_target, msg.sender, scope
+        ),
+        None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
+    }
 }
 
 /// Returns `true` when `content` is a `/stop` command (with optional `@botname` suffix).
@@ -5586,6 +5592,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -5664,6 +5671,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -5756,6 +5764,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -5833,6 +5842,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -5920,6 +5930,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -6028,6 +6039,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -6117,6 +6129,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -6221,6 +6234,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 4,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -6310,6 +6324,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -6389,6 +6404,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -6578,6 +6594,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
+            interruption_scope_id: None,
         })
         .await
         .unwrap();
@@ -6589,6 +6606,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 2,
             thread_ts: None,
+            interruption_scope_id: None,
         })
         .await
         .unwrap();
@@ -6677,6 +6695,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             })
             .await
             .unwrap();
@@ -6689,6 +6708,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                interruption_scope_id: None,
             })
             .await
             .unwrap();
@@ -6790,6 +6810,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "slack".to_string(),
                 timestamp: 1,
                 thread_ts: Some("1741234567.100001".to_string()),
+                interruption_scope_id: Some("1741234567.100001".to_string()),
             })
             .await
             .unwrap();
@@ -6802,6 +6823,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "slack".to_string(),
                 timestamp: 2,
                 thread_ts: Some("1741234567.100001".to_string()),
+                interruption_scope_id: Some("1741234567.100001".to_string()),
             })
             .await
             .unwrap();
@@ -6900,6 +6922,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             })
             .await
             .unwrap();
@@ -6912,6 +6935,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                interruption_scope_id: None,
             })
             .await
             .unwrap();
@@ -6992,6 +7016,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -7069,6 +7094,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -7590,6 +7616,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            interruption_scope_id: None,
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -7605,6 +7632,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: Some("1741234567.123456".into()),
+            interruption_scope_id: None,
         };
 
         assert_eq!(
@@ -7623,6 +7651,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "cli".into(),
             timestamp: 1,
             thread_ts: None,
+            interruption_scope_id: None,
         };
 
         assert_eq!(followup_thread_id(&msg).as_deref(), Some("msg_abc123"));
@@ -7638,6 +7667,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            interruption_scope_id: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -7647,6 +7677,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
+            interruption_scope_id: None,
         };
 
         assert_ne!(
@@ -7668,6 +7699,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            interruption_scope_id: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -7677,6 +7709,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
+            interruption_scope_id: None,
         };
 
         mem.store(
@@ -7822,6 +7855,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -7837,6 +7871,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -7949,6 +7984,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -7980,6 +8016,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -8017,6 +8054,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -8115,6 +8153,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -8218,6 +8257,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -8787,6 +8827,7 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -8870,6 +8911,7 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -8885,6 +8927,7 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -9028,6 +9071,7 @@ This is an example JSON object for profile settings."#;
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -9136,6 +9180,7 @@ This is an example JSON object for profile settings."#;
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -9236,6 +9281,7 @@ This is an example JSON object for profile settings."#;
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -9356,6 +9402,7 @@ This is an example JSON object for profile settings."#;
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -9493,5 +9540,152 @@ This is an example JSON object for profile settings."#;
             mattermost: false,
         };
         assert!(!cfg.enabled_for_channel("discord"));
+    }
+
+    // ── interruption_scope_key tests ──────────────────────────────────────
+
+    #[test]
+    fn interruption_scope_key_without_scope_id_is_three_component() {
+        let msg = traits::ChannelMessage {
+            id: "1".into(),
+            sender: "alice".into(),
+            reply_target: "room".into(),
+            content: "hi".into(),
+            channel: "matrix".into(),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+        };
+        assert_eq!(interruption_scope_key(&msg), "matrix_room_alice");
+    }
+
+    #[test]
+    fn interruption_scope_key_with_scope_id_is_four_component() {
+        let msg = traits::ChannelMessage {
+            id: "1".into(),
+            sender: "alice".into(),
+            reply_target: "room".into(),
+            content: "hi".into(),
+            channel: "matrix".into(),
+            timestamp: 0,
+            thread_ts: Some("$thread1".into()),
+            interruption_scope_id: Some("$thread1".into()),
+        };
+        assert_eq!(interruption_scope_key(&msg), "matrix_room_alice_$thread1");
+    }
+
+    #[test]
+    fn interruption_scope_key_thread_ts_alone_does_not_affect_key() {
+        // thread_ts used for reply anchoring should not bleed into scope key
+        let msg = traits::ChannelMessage {
+            id: "1".into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: "hi".into(),
+            channel: "slack".into(),
+            timestamp: 0,
+            thread_ts: Some("1234567890.000100".into()), // Slack top-level fallback
+            interruption_scope_id: None,                 // but NOT a thread reply
+        };
+        assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_different_threads_do_not_cancel_each_other() {
+        let channel_impl = Arc::new(SlackRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(SlowProvider {
+                delay: Duration::from_millis(150),
+            }),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: true,
+                discord: false,
+                mattermost: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
+        let send_task = tokio::spawn(async move {
+            // Two messages from same sender but in different Slack threads —
+            // they must NOT cancel each other.
+            tx.send(traits::ChannelMessage {
+                id: "1741234567.100001".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "C123".to_string(),
+                content: "thread-a question".to_string(),
+                channel: "slack".to_string(),
+                timestamp: 1,
+                thread_ts: Some("1741234567.100001".to_string()),
+                interruption_scope_id: Some("1741234567.100001".to_string()),
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send(traits::ChannelMessage {
+                id: "1741234567.200002".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "C123".to_string(),
+                content: "thread-b question".to_string(),
+                channel: "slack".to_string(),
+                timestamp: 2,
+                thread_ts: Some("1741234567.200002".to_string()),
+                interruption_scope_id: Some("1741234567.200002".to_string()),
+            })
+            .await
+            .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+        send_task.await.unwrap();
+
+        // Both tasks should have completed — different threads, no cancellation.
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.len(),
+            2,
+            "both Slack thread messages should complete, got: {sent_messages:?}"
+        );
     }
 }

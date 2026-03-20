@@ -1142,6 +1142,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
+            interruption_scope_id: None,
         })
     }
 
@@ -1264,6 +1265,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
+            interruption_scope_id: None,
         })
     }
 
@@ -1425,6 +1427,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
+            interruption_scope_id: None,
         })
     }
 
