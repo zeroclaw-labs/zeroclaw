@@ -473,6 +473,9 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
 /// Check if the current process is running as root (Unix only)
 #[cfg(unix)]
 fn is_root() -> bool {
+    // SAFETY: `getuid()` is a simple system call that returns the real user ID of the calling
+    // process. It is always safe to call as it takes no arguments and returns a scalar value.
+    // This is a well-established pattern in Rust for getting the current user ID.
     unsafe { libc::getuid() == 0 }
 }
 
@@ -1192,6 +1195,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn is_root_matches_system_uid() {
+        // SAFETY: `getuid()` is a simple system call that returns the real user ID of the calling
+        // process. It is always safe to call as it takes no arguments and returns a scalar value.
+        // This test verifies our `is_root()` wrapper returns the same result as the raw syscall.
         assert_eq!(is_root(), unsafe { libc::getuid() == 0 });
     }
 
