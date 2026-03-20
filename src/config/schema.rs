@@ -12433,7 +12433,7 @@ require_otp_to_resume = true
 
         let err = cfg.validate().unwrap_err().to_string();
         assert!(
-            err.contains("not in allowed_services"),
+            err.contains("not in the effective allowed_services"),
             "expected not-in-allowed_services error, got: {err}"
         );
     }
