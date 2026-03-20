@@ -73,8 +73,19 @@ pub fn normalize_expression(expression: &str) -> Result<String> {
 
     match field_count {
         // standard crontab syntax: minute hour day month weekday
-        5 => Ok(format!("0 {expression}")),
+        // The `cron` crate uses 1-indexed weekdays (1=Sunday..7=Saturday),
+        // but standard crontab uses 0-indexed (0=Sunday..6=Saturday, 7=Sunday).
+        // We must remap the weekday field before prepending the seconds field.
+        5 => {
+            let fields: Vec<&str> = expression.split_whitespace().collect();
+            let converted_weekday = convert_weekday_field(fields[4]);
+            Ok(format!(
+                "0 {} {} {} {} {}",
+                fields[0], fields[1], fields[2], fields[3], converted_weekday
+            ))
+        }
         // crate-native syntax includes seconds (+ optional year)
+        // Users of 6/7-field syntax are already using crate semantics — no conversion.
         6 | 7 => Ok(expression.to_string()),
         _ => anyhow::bail!(
             "Invalid cron expression: {expression} (expected 5, 6, or 7 fields, got {field_count})"
@@ -82,10 +93,139 @@ pub fn normalize_expression(expression: &str) -> Result<String> {
     }
 }
 
+/// Convert a standard-crontab weekday field to `cron`-crate semantics.
+///
+/// Standard crontab: 0=Sunday, 1=Monday … 6=Saturday, 7=Sunday (alias)
+/// `cron` crate:     1=Sunday, 2=Monday … 7=Saturday
+///
+/// Handles: single numbers (`5`), ranges (`1-5`), lists (`1,3,5`),
+/// step values (`1-5/2`), wildcards (`*`, `?`), and named days (`MON-FRI`).
+/// Named days are left untouched because the crate handles them correctly.
+fn convert_weekday_field(field: &str) -> String {
+    // Split on comma to handle lists like "1,3,5" or "1-3,5"
+    field
+        .split(',')
+        .map(convert_weekday_part)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Convert a single comma-separated part of a weekday field.
+/// E.g. "1-5", "1-5/2", "5", "*", "*/2", "MON-FRI"
+fn convert_weekday_part(part: &str) -> String {
+    // Wildcards pass through
+    if part == "*" || part == "?" {
+        return part.to_string();
+    }
+
+    // Handle step suffix: "1-5/2" → convert "1-5", keep "/2"
+    let (base, step) = match part.split_once('/') {
+        Some((b, s)) => (b, Some(s)),
+        None => (part, None),
+    };
+
+    let converted_base = if base == "*" || base == "?" {
+        base.to_string()
+    } else if let Some((start, end)) = base.split_once('-') {
+        // Range: "1-5"
+        let new_start = remap_weekday_number(start);
+        let new_end = remap_weekday_number(end);
+        format!("{new_start}-{new_end}")
+    } else {
+        // Single value: "5"
+        remap_weekday_number(base)
+    };
+
+    match step {
+        Some(s) => format!("{converted_base}/{s}"),
+        None => converted_base,
+    }
+}
+
+/// Remap a single weekday token from standard-crontab to crate semantics.
+/// If the token is a named day (e.g. "MON") or not a valid number, return as-is.
+fn remap_weekday_number(token: &str) -> String {
+    match token.parse::<u8>() {
+        Ok(n) => {
+            let remapped = match n {
+                0 | 7 => 1, // Sunday
+                1..=6 => n + 1,
+                _ => return token.to_string(), // out of range — let crate validate
+            };
+            remapped.to_string()
+        }
+        Err(_) => token.to_string(), // named day like MON, TUE — pass through
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn weekday_single_numbers() {
+        assert_eq!(convert_weekday_field("0"), "1"); // Sun → Sun
+        assert_eq!(convert_weekday_field("1"), "2"); // Mon → Mon
+        assert_eq!(convert_weekday_field("5"), "6"); // Fri → Fri
+        assert_eq!(convert_weekday_field("6"), "7"); // Sat → Sat
+        assert_eq!(convert_weekday_field("7"), "1"); // Sun alias → Sun
+    }
+
+    #[test]
+    fn weekday_ranges() {
+        assert_eq!(convert_weekday_field("1-5"), "2-6"); // Mon-Fri
+        assert_eq!(convert_weekday_field("0-6"), "1-7"); // Sun-Sat
+        assert_eq!(convert_weekday_field("0-4"), "1-5"); // Sun-Thu
+    }
+
+    #[test]
+    fn weekday_lists() {
+        assert_eq!(convert_weekday_field("1,3,5"), "2,4,6"); // Mon,Wed,Fri
+        assert_eq!(convert_weekday_field("0,6"), "1,7"); // Sun,Sat
+    }
+
+    #[test]
+    fn weekday_steps() {
+        assert_eq!(convert_weekday_field("1-5/2"), "2-6/2"); // Mon-Fri step 2
+        assert_eq!(convert_weekday_field("*/2"), "*/2"); // wildcard step
+    }
+
+    #[test]
+    fn weekday_wildcards() {
+        assert_eq!(convert_weekday_field("*"), "*");
+        assert_eq!(convert_weekday_field("?"), "?");
+    }
+
+    #[test]
+    fn weekday_named_days() {
+        assert_eq!(convert_weekday_field("MON-FRI"), "MON-FRI");
+        assert_eq!(convert_weekday_field("MON"), "MON");
+        assert_eq!(convert_weekday_field("SUN,SAT"), "SUN,SAT");
+    }
+
+    #[test]
+    fn weekday_mixed_list() {
+        assert_eq!(convert_weekday_field("1,3-5,7"), "2,4-6,1");
+    }
+
+    #[test]
+    fn normalize_5field_converts_weekday() {
+        // "0 9 * * 1-5" (Mon-Fri at 9am) → "0 0 9 * * 2-6"
+        assert_eq!(
+            normalize_expression("0 9 * * 1-5").unwrap(),
+            "0 0 9 * * 2-6"
+        );
+    }
+
+    #[test]
+    fn normalize_6field_unchanged() {
+        // 6-field uses crate semantics directly — no conversion
+        assert_eq!(
+            normalize_expression("0 0 9 * * 1-5").unwrap(),
+            "0 0 9 * * 1-5"
+        );
+    }
 
     #[test]
     fn next_run_for_schedule_supports_every_and_at() {
