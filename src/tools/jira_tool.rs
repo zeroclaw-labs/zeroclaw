@@ -3,7 +3,7 @@ use crate::security::{policy::ToolOperation, SecurityPolicy};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 const JIRA_SEARCH_PAGE_SIZE: u32 = 100;
@@ -21,10 +21,12 @@ enum LevelOfDetails {
 
 /// Tool for interacting with the Jira REST API v3.
 ///
-/// Supports three actions gated by `[jira].allowed_actions` in config:
-/// - `get_ticket`   — always in the default allowlist; read-only.
+/// Supports five actions gated by `[jira].allowed_actions` in config:
+/// - `get_ticket`     — always in the default allowlist; read-only.
 /// - `search_tickets` — requires explicit opt-in; read-only.
 /// - `comment_ticket` — requires explicit opt-in; mutating (Act policy).
+/// - `list_projects`  — requires explicit opt-in; read-only.
+/// - `myself`         — requires explicit opt-in; read-only. Verifies credentials.
 pub struct JiraTool {
     base_url: String,
     email: String,
@@ -253,6 +255,174 @@ impl JiraTool {
         })
     }
 
+    async fn list_projects(&self) -> anyhow::Result<ToolResult> {
+        let url = format!("{}/rest/api/3/project", self.base_url);
+
+        let resp = self
+            .http
+            .get(&url)
+            .basic_auth(&self.email, Some(&self.api_token))
+            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Jira list_projects request failed: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Jira list_projects failed ({status}): {}",
+                crate::util::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS)
+            );
+        }
+
+        let projects: Vec<Value> = resp
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse Jira list_projects response: {e}"))?;
+
+        let keys: Vec<String> = projects
+            .iter()
+            .filter_map(|p| p["key"].as_str().map(String::from))
+            .collect();
+
+        const STATUS_CONCURRENCY: usize = 5;
+
+        let users_url = format!(
+            "{}/rest/api/3/user/assignable/multiProjectSearch",
+            self.base_url
+        );
+
+        let users_resp = self
+            .http
+            .get(&users_url)
+            .basic_auth(&self.email, Some(&self.api_token))
+            .query(&[
+                ("projectKeys", keys.join(",").as_str()),
+                ("maxResults", "50"),
+            ])
+            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Jira list_projects users request failed: {e}"))?;
+
+        let users: Vec<Value> = if users_resp.status().is_success() {
+            users_resp.json().await.map_err(|e| {
+                anyhow::anyhow!("Failed to parse Jira list_projects users response: {e}")
+            })?
+        } else {
+            let status = users_resp.status();
+            let text = users_resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Jira list_projects users failed ({status}): {}",
+                crate::util::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS)
+            );
+        };
+
+        let mut set: tokio::task::JoinSet<(usize, anyhow::Result<Value>)> =
+            tokio::task::JoinSet::new();
+        let mut statuses_results = vec![json!([]); keys.len()];
+
+        for (i, key) in keys.iter().enumerate() {
+            if set.len() >= STATUS_CONCURRENCY {
+                if let Some(Ok((idx, result))) = set.join_next().await {
+                    statuses_results[idx] =
+                        result.map_err(|e| anyhow::anyhow!("Jira statuses failed: {e}"))?;
+                }
+            }
+
+            let client = self.http.clone();
+            let request_url = format!("{url}/{key}/statuses");
+            let email = self.email.clone();
+            let token = self.api_token.clone();
+            let timeout = self.timeout_secs;
+
+            set.spawn(async move {
+                let result = async {
+                    let resp = client
+                        .get(&request_url)
+                        .basic_auth(&email, Some(&token))
+                        .timeout(std::time::Duration::from_secs(timeout))
+                        .send()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("statuses request failed: {e}"))?;
+
+                    if !resp.status().is_success() {
+                        anyhow::bail!("statuses request returned {}", resp.status());
+                    }
+
+                    resp.json::<Value>()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to parse statuses response: {e}"))
+                }
+                .await;
+                (i, result)
+            });
+        }
+
+        while let Some(Ok((idx, result))) = set.join_next().await {
+            statuses_results[idx] =
+                result.map_err(|e| anyhow::anyhow!("Jira statuses failed: {e}"))?;
+        }
+
+        let shaped_projects = shape_projects(&projects, &statuses_results);
+        let shaped_users: Vec<Value> = users
+            .iter()
+            .filter_map(|u| {
+                let display = u["displayName"].as_str()?;
+                let email = u["emailAddress"].as_str()?;
+                Some(json!({ "displayName": display, "emailAddress": email }))
+            })
+            .collect();
+
+        let output = json!({ "projects": shaped_projects, "users": shaped_users });
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
+            error: None,
+        })
+    }
+
+    async fn get_myself(&self) -> anyhow::Result<ToolResult> {
+        let url = format!("{}/rest/api/3/myself", self.base_url);
+
+        let resp = self
+            .http
+            .get(&url)
+            .basic_auth(&self.email, Some(&self.api_token))
+            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Jira myself request failed: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Jira myself failed ({status}): {}",
+                crate::util::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS)
+            );
+        }
+
+        let raw: Value = resp
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse Jira myself response: {e}"))?;
+
+        let shaped = json!({
+            "accountId":    raw["accountId"],
+            "displayName":  raw["displayName"],
+            "emailAddress": raw["emailAddress"],
+            "active":       raw["active"],
+        });
+
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&shaped).unwrap_or_else(|_| shaped.to_string()),
+            error: None,
+        })
+    }
+
     async fn resolve_email(&self, email: &str) -> Option<(String, String)> {
         let url = format!("{}/rest/api/3/user/search", self.base_url);
         let result = self
@@ -289,7 +459,7 @@ impl Tool for JiraTool {
     }
 
     fn description(&self) -> &str {
-        "Interact with Jira: get tickets with configurable detail level, search issues with JQL, and add comments with mention and formatting support."
+        "Interact with Jira: get tickets with configurable detail level, search issues with JQL, add comments with mention and formatting support."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -298,8 +468,8 @@ impl Tool for JiraTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["get_ticket", "search_tickets", "comment_ticket"],
-                    "description": "The Jira action to perform. Enabled actions are configured in [jira].allowed_actions."
+                    "enum": ["get_ticket", "search_tickets", "comment_ticket", "list_projects", "myself"],
+                    "description": "The Jira action to perform. Enabled actions are configured in [jira].allowed_actions. Use 'myself' to verify that credentials are valid and the Jira connection is working."
                 },
                 "issue_key": {
                     "type": "string",
@@ -342,12 +512,15 @@ impl Tool for JiraTool {
 
         // Reject unknown actions before the allowlist check so typos produce a
         // clear "unknown action" error rather than a misleading "not enabled" one.
-        if !matches!(action, "get_ticket" | "search_tickets" | "comment_ticket") {
+        if !matches!(
+            action,
+            "get_ticket" | "search_tickets" | "comment_ticket" | "list_projects" | "myself"
+        ) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Unknown action: '{action}'. Valid actions: get_ticket, search_tickets, comment_ticket"
+                    "Unknown action: '{action}'. Valid actions: get_ticket, search_tickets, comment_ticket, list_projects, myself"
                 )),
             });
         }
@@ -365,7 +538,7 @@ impl Tool for JiraTool {
         }
 
         let operation = match action {
-            "get_ticket" | "search_tickets" => ToolOperation::Read,
+            "get_ticket" | "search_tickets" | "list_projects" | "myself" => ToolOperation::Read,
             "comment_ticket" => ToolOperation::Act,
             _ => unreachable!(),
         };
@@ -415,6 +588,8 @@ impl Tool for JiraTool {
                     .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
                 self.search_tickets(jql, max_results).await
             }
+            "myself" => self.get_myself().await,
+            "list_projects" => self.list_projects().await,
             "comment_ticket" => {
                 let issue_key = match args.get("issue_key").and_then(|v| v.as_str()) {
                     Some(k) => k,
@@ -579,6 +754,44 @@ fn shape_comment_response(raw: &Value) -> Value {
         "author":  raw["author"]["displayName"],
         "created": date_prefix(raw["created"].as_str().unwrap_or("")),
     })
+}
+
+fn shape_projects(projects: &[Value], statuses_per_project: &[Value]) -> Vec<Value> {
+    projects
+        .iter()
+        .zip(statuses_per_project.iter())
+        .map(|(p, statuses)| {
+            let mut issue_types: Vec<String> = Vec::new();
+            let mut all_statuses: HashSet<String> = HashSet::new();
+
+            if let Some(arr) = statuses.as_array() {
+                for it in arr {
+                    if let Some(name) = it["name"].as_str() {
+                        issue_types.push(name.to_string());
+                    }
+                    if let Some(ss) = it["statuses"].as_array() {
+                        for s in ss {
+                            if let Some(sn) = s["name"].as_str() {
+                                all_statuses.insert(sn.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut ordered: Vec<String> = all_statuses.into_iter().collect();
+            ordered.sort();
+
+            json!({
+                "key":         p["key"],
+                "name":        p["name"],
+                "projectType": p["projectTypeKey"],
+                "style":       p["style"],
+                "issueTypes":  issue_types,
+                "statuses":    ordered,
+            })
+        })
+        .collect()
 }
 
 // ── Comment / ADF builder ─────────────────────────────────────────────────────
@@ -889,6 +1102,50 @@ mod tests {
         assert!(result.error.as_deref().unwrap().contains("read-only"));
     }
 
+    // ── myself action ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parameters_schema_includes_myself_action() {
+        let schema = test_tool(vec!["myself"]).parameters_schema();
+        let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
+        let action_strs: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
+        assert!(action_strs.contains(&"myself"));
+    }
+
+    #[tokio::test]
+    async fn execute_myself_disallowed_returns_error() {
+        let result = test_tool(vec!["get_ticket"])
+            .execute(json!({"action": "myself"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(err.contains("not enabled"));
+        assert!(err.contains("allowed_actions"));
+    }
+
+    #[tokio::test]
+    async fn execute_myself_not_blocked_in_readonly_mode() {
+        // myself is a Read operation — the security policy should not block it.
+        // The call will fail at the HTTP level (no real server), not at the
+        // policy level, so the error must NOT contain "read-only".
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = JiraTool::new(
+            "https://test.atlassian.net".into(),
+            "test@example.com".into(),
+            "token".into(),
+            vec!["myself".into()],
+            security,
+            30,
+        );
+        let result = tool.execute(json!({"action": "myself"})).await.unwrap();
+        assert!(!result.success);
+        assert!(!result.error.as_deref().unwrap_or("").contains("read-only"));
+    }
+
     // ── Issue key validation ──────────────────────────────────────────────────
 
     #[test]
@@ -1115,5 +1372,152 @@ mod tests {
         assert_eq!(shaped["comments"][0]["body"], "Bob's body");
         assert_eq!(shaped["comments"][1]["author"], "Alice");
         assert_eq!(shaped["comments"][1]["body"], "Alice's body");
+    }
+
+    // ── list_projects action ────────────────────────────────────────────────
+
+    #[test]
+    fn parameters_schema_includes_list_projects_action() {
+        let schema = test_tool(vec!["list_projects"]).parameters_schema();
+        let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
+        let action_strs: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
+        assert!(action_strs.contains(&"list_projects"));
+    }
+
+    #[tokio::test]
+    async fn execute_list_projects_disallowed_returns_error() {
+        let result = test_tool(vec!["get_ticket"])
+            .execute(json!({"action": "list_projects"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(err.contains("not enabled"));
+        assert!(err.contains("allowed_actions"));
+    }
+
+    #[tokio::test]
+    async fn execute_list_projects_not_blocked_in_readonly_mode() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = JiraTool::new(
+            "https://127.0.0.1:1".into(),
+            "test@example.com".into(),
+            "token".into(),
+            vec!["list_projects".into()],
+            security,
+            30,
+        );
+        let result = tool
+            .execute(json!({"action": "list_projects"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            !result.error.as_deref().unwrap_or("").contains("read-only"),
+            "error should not mention read-only policy: {:?}",
+            result.error
+        );
+    }
+
+    #[test]
+    fn shape_projects_extracts_expected_fields() {
+        let projects = json!([
+            { "key": "AT", "name": "ALL TASKS", "projectTypeKey": "business", "style": "next-gen" },
+            { "key": "GP", "name": "G-PROJECT", "projectTypeKey": "software", "style": "next-gen" }
+        ]);
+        let statuses: Vec<Value> = vec![
+            json!([
+                { "name": "Task", "statuses": [
+                    { "name": "To Do" }, { "name": "In Progress" }, { "name": "Collecting Intel" }, { "name": "Done" }
+                ]},
+                { "name": "Sub-task", "statuses": [
+                    { "name": "To Do" }, { "name": "Verification" }
+                ]}
+            ]),
+            json!([
+                { "name": "Task", "statuses": [
+                    { "name": "To Do" }, { "name": "Design" }, { "name": "Done" }
+                ]},
+                { "name": "Epic", "statuses": [
+                    { "name": "To Do" }, { "name": "Done" }
+                ]}
+            ]),
+        ];
+        let shaped = shape_projects(projects.as_array().unwrap(), &statuses);
+        let arr = &shaped;
+
+        assert_eq!(arr.len(), 2);
+
+        assert_eq!(arr[0]["key"], "AT");
+        assert_eq!(arr[0]["name"], "ALL TASKS");
+        assert_eq!(arr[0]["projectType"], "business");
+        let at_statuses: Vec<&str> = arr[0]["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            at_statuses,
+            vec![
+                "Collecting Intel",
+                "Done",
+                "In Progress",
+                "To Do",
+                "Verification",
+            ]
+        );
+        let at_types: Vec<&str> = arr[0]["issueTypes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(at_types.contains(&"Task"));
+        assert!(at_types.contains(&"Sub-task"));
+
+        assert_eq!(arr[1]["key"], "GP");
+        assert_eq!(arr[1]["projectType"], "software");
+        let gp_statuses: Vec<&str> = arr[1]["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(gp_statuses, vec!["Design", "Done", "To Do"]);
+
+        assert!(
+            arr[0].get("users").is_none(),
+            "users should not be in per-project data"
+        );
+    }
+
+    #[test]
+    fn shape_projects_sorts_statuses_alphabetically() {
+        let projects = json!([
+            { "key": "P", "name": "P", "projectTypeKey": "software", "style": "next-gen" }
+        ]);
+        let statuses: Vec<Value> = vec![json!([
+            { "name": "Task", "statuses": [
+                { "name": "Done" }, { "name": "Custom" }, { "name": "To Do" }, { "name": "Alpha" }
+            ]}
+        ])];
+        let shaped = shape_projects(projects.as_array().unwrap(), &statuses);
+        let ordered: Vec<&str> = shaped[0]["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(ordered, vec!["Alpha", "Custom", "Done", "To Do"]);
+    }
+
+    #[test]
+    fn shape_projects_empty_inputs() {
+        let shaped = shape_projects(&[], &[]);
+        assert_eq!(shaped.len(), 0);
     }
 }
