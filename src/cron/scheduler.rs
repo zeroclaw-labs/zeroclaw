@@ -455,7 +455,7 @@ pub(crate) async fn deliver_announcement(
                 sg.allowed_from.clone(),
                 sg.mention_only,
                 sg.ignore_attachments,
-                false,
+                sg.download_attachments.unwrap_or(false),
                 sg.ignore_stories,
             );
             channel.send(&SendMessage::new(output, target)).await?;

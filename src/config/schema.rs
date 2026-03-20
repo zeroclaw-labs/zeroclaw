@@ -5211,9 +5211,13 @@ pub struct SignalConfig {
     /// Direct messages bypass this gate.
     #[serde(default)]
     pub mention_only: bool,
-    /// Skip messages that are attachment-only (no text body).
+    /// Skip attachment-only messages (no text body).
     #[serde(default)]
     pub ignore_attachments: bool,
+    /// Download incoming attachments with `getAttachment` and expose their local paths to the agent.
+    /// Defaults to disabled for backward compatibility.
+    #[serde(default)]
+    pub download_attachments: Option<bool>,
     /// Skip incoming story messages.
     #[serde(default)]
     pub ignore_stories: bool,
@@ -10036,6 +10040,7 @@ allowed_users = ["@ops:matrix.org"]
             allowed_from: vec!["+1111111111".into()],
             mention_only: true,
             ignore_attachments: true,
+            download_attachments: Some(true),
             ignore_stories: false,
             streaming: false,
             streaming_chunk_size: 200,
@@ -10048,6 +10053,7 @@ allowed_users = ["@ops:matrix.org"]
         assert_eq!(parsed.allowed_from.len(), 1);
         assert!(parsed.mention_only);
         assert!(parsed.ignore_attachments);
+        assert_eq!(parsed.download_attachments, Some(true));
         assert!(!parsed.ignore_stories);
     }
 
@@ -10060,6 +10066,7 @@ allowed_users = ["@ops:matrix.org"]
             allowed_from: vec!["*".into()],
             mention_only: false,
             ignore_attachments: false,
+            download_attachments: Some(false),
             ignore_stories: true,
             streaming: false,
             streaming_chunk_size: 200,
@@ -10069,6 +10076,7 @@ allowed_users = ["@ops:matrix.org"]
         assert_eq!(parsed.http_url, "http://localhost:8080");
         assert_eq!(parsed.account, "+9876543210");
         assert!(parsed.group_id.is_none());
+        assert_eq!(parsed.download_attachments, Some(false));
         assert!(parsed.ignore_stories);
     }
 
@@ -10080,6 +10088,7 @@ allowed_users = ["@ops:matrix.org"]
         assert!(parsed.allowed_from.is_empty());
         assert!(!parsed.mention_only);
         assert!(!parsed.ignore_attachments);
+        assert!(parsed.download_attachments.is_none());
         assert!(!parsed.ignore_stories);
         assert!(!parsed.streaming);
         assert_eq!(parsed.streaming_chunk_size, 200);

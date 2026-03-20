@@ -204,6 +204,7 @@ account = "+1234567890"
 group_id = "dm"                    # tùy chọn: "dm" / group id / bỏ qua
 allowed_from = ["*"]
 ignore_attachments = false
+download_attachments = false       # tùy chọn: tải tệp đính kèm và cung cấp đường dẫn cục bộ cho agent
 ignore_stories = true
 ```
 

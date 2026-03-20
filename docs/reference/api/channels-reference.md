@@ -223,6 +223,7 @@ account = "+1234567890"
 group_id = "dm"                    # optional: "dm" / group id / omitted
 allowed_from = ["*"]
 ignore_attachments = false
+download_attachments = false       # optional: fetch attachments and expose local file paths
 ignore_stories = true
 ```
 

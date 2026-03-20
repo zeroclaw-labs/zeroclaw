@@ -223,6 +223,7 @@ account = \"+1234567890\"
 group_id = \"dm\"                    # 可选: \"dm\" / 群组 ID / 省略
 allowed_from = [\"*\"]
 ignore_attachments = false
+download_attachments = false       # 可选：下载附件并向代理暴露本地文件路径
 ignore_stories = true
 ```
 

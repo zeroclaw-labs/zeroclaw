@@ -4245,6 +4245,11 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .default(false)
                     .interact()?;
 
+                let download_attachments = Confirm::new()
+                    .with_prompt("  Download incoming attachments and expose local file paths?")
+                    .default(false)
+                    .interact()?;
+
                 let ignore_stories = Confirm::new()
                     .with_prompt("  Ignore incoming stories?")
                     .default(true)
@@ -4257,6 +4262,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_from,
                     mention_only,
                     ignore_attachments,
+                    download_attachments: Some(download_attachments),
                     ignore_stories,
                     streaming: false,
                     streaming_chunk_size: 200,
@@ -7395,6 +7401,7 @@ mod tests {
             allowed_from: vec!["*".into()],
             mention_only: false,
             ignore_attachments: false,
+            download_attachments: Some(false),
             ignore_stories: true,
             streaming: false,
             streaming_chunk_size: 200,
