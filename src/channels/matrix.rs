@@ -331,7 +331,12 @@ impl MatrixChannel {
 
     fn is_help_command(body: &str) -> bool {
         let t = body.trim().to_lowercase();
-        t == "help" || t == "!help" || t == "/help" || t == "commands" || t == "!commands" || t == "command"
+        t == "help"
+            || t == "!help"
+            || t == "/help"
+            || t == "commands"
+            || t == "!commands"
+            || t == "command"
     }
 
     fn handle_help_command() -> String {
@@ -339,6 +344,8 @@ impl MatrixChannel {
             "**Zero-token commands** _(no LLM, instant)_",
             "",
             "**usage** — Claude Code quota bars with reset dates",
+            "**cron** — list cron jobs for this room (checks tmux for pending questions)",
+            "**cron all** — list cron jobs for all rooms",
             "**peek** `[N]` — last N lines of this room's tmux pane (default 20)",
             "**history** `[N]` — last N Matrix messages in this room (default 10)",
             "**ticket** `<subcommand>` — ticket management (`ticket help` for details)",
@@ -352,10 +359,7 @@ impl MatrixChannel {
 
     fn is_history_command(body: &str) -> bool {
         let t = body.trim().to_lowercase();
-        t == "history"
-            || t == "!history"
-            || t.starts_with("history ")
-            || t.starts_with("!history ")
+        t == "history" || t == "!history" || t.starts_with("history ") || t.starts_with("!history ")
     }
 
     async fn fetch_room_messages(
@@ -395,7 +399,11 @@ impl MatrixChannel {
                 continue;
             }
             let sender = ev.get("sender").and_then(|s| s.as_str()).unwrap_or("?");
-            let sender_short = sender.trim_start_matches('@').split(':').next().unwrap_or(sender);
+            let sender_short = sender
+                .trim_start_matches('@')
+                .split(':')
+                .next()
+                .unwrap_or(sender);
             let body = ev
                 .get("content")
                 .and_then(|c| c.get("body"))
@@ -412,7 +420,11 @@ impl MatrixChannel {
         if lines.is_empty() {
             "No recent messages.".to_string()
         } else {
-            format!("**Room history** (last {}):\n\n{}", lines.len(), lines.join("\n"))
+            format!(
+                "**Room history** (last {}):\n\n{}",
+                lines.len(),
+                lines.join("\n")
+            )
         }
     }
 
@@ -443,7 +455,12 @@ impl MatrixChannel {
     async fn fetch_oauth_usage() -> Option<String> {
         // Retrieve the OAuth access token from macOS Keychain.
         let keychain_output = tokio::process::Command::new("security")
-            .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+            .args([
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+            ])
             .output()
             .await
             .ok()?;
@@ -483,7 +500,12 @@ impl MatrixChannel {
         let fmt_bar = |pct: f64| -> String {
             let filled = ((pct / 100.0) * 20.0).round() as usize;
             let filled = filled.min(20);
-            format!("{}{} {:.0}%", "█".repeat(filled), "░".repeat(20 - filled), pct)
+            format!(
+                "{}{} {:.0}%",
+                "█".repeat(filled),
+                "░".repeat(20 - filled),
+                pct
+            )
         };
 
         let fmt_reset = |resets_at: Option<&str>| -> String {
@@ -499,33 +521,58 @@ impl MatrixChannel {
         let mut out = String::from("**Claude Code Usage**\n\n");
 
         if let Some(fh) = data.get("five_hour") {
-            let pct = fh.get("utilization").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let pct = fh
+                .get("utilization")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
             let reset = fh.get("resets_at").and_then(|v| v.as_str());
-            out.push_str(&format!("**Session (5h)**\n`{}`\n_{}_\n\n", fmt_bar(pct), fmt_reset(reset)));
+            out.push_str(&format!(
+                "**Session (5h)**\n`{}`\n_{}_\n\n",
+                fmt_bar(pct),
+                fmt_reset(reset)
+            ));
         }
 
         if let Some(sd) = data.get("seven_day") {
-            let pct = sd.get("utilization").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let pct = sd
+                .get("utilization")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
             let reset = sd.get("resets_at").and_then(|v| v.as_str());
-            out.push_str(&format!("**Week (all models)**\n`{}`\n_{}_\n\n", fmt_bar(pct), fmt_reset(reset)));
+            out.push_str(&format!(
+                "**Week (all models)**\n`{}`\n_{}_\n\n",
+                fmt_bar(pct),
+                fmt_reset(reset)
+            ));
         }
 
         for (key, label) in &[
             ("seven_day_sonnet", "Week (Sonnet)"),
-            ("seven_day_opus",   "Week (Opus)"),
+            ("seven_day_opus", "Week (Opus)"),
         ] {
             if let Some(bucket) = data.get(key) {
                 if let Some(pct) = bucket.get("utilization").and_then(|v| v.as_f64()) {
                     let reset = bucket.get("resets_at").and_then(|v| v.as_str());
-                    out.push_str(&format!("**{}**\n`{}`\n_{}_\n\n", label, fmt_bar(pct), fmt_reset(reset)));
+                    out.push_str(&format!(
+                        "**{}**\n`{}`\n_{}_\n\n",
+                        label,
+                        fmt_bar(pct),
+                        fmt_reset(reset)
+                    ));
                 }
             }
         }
 
         if let Some(extra) = data.get("extra_usage") {
-            let enabled = extra.get("is_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            let enabled = extra
+                .get("is_enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if enabled {
-                let pct = extra.get("utilization").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let pct = extra
+                    .get("utilization")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
                 out.push_str(&format!("**Extra usage**\n`{}`\n\n", fmt_bar(pct)));
             } else {
                 out.push_str("**Extra usage:** not enabled\n");
@@ -536,7 +583,13 @@ impl MatrixChannel {
     }
 
     /// Estimate cost in USD from token counts based on model name.
-    fn estimate_cost(model: &str, input: u64, output: u64, cache_read: u64, cache_creation: u64) -> f64 {
+    fn estimate_cost(
+        model: &str,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_creation: u64,
+    ) -> f64 {
         // Prices per million tokens (as of mid-2025)
         let (inp_pm, out_pm, cr_pm, cc_pm) = if model.contains("opus") {
             (15.0, 75.0, 1.50, 18.75)
@@ -592,7 +645,9 @@ impl MatrixChannel {
 
         let project_dirs = match std::fs::read_dir(&projects_dir) {
             Ok(d) => d,
-            Err(_) => return "Usage data unavailable: cannot read `~/.claude/projects`.".to_string(),
+            Err(_) => {
+                return "Usage data unavailable: cannot read `~/.claude/projects`.".to_string()
+            }
         };
 
         // Deduplicate by message ID: streaming JSONL writes multiple partial records
@@ -645,8 +700,15 @@ impl MatrixChannel {
                         Some(u) => u,
                         None => continue,
                     };
-                    let mid = msg.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let out = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let mid = msg
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let out = usage
+                        .get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
 
                     // Skip partial streaming records (no output yet)
                     if out == 0 && mid.is_empty() {
@@ -655,14 +717,34 @@ impl MatrixChannel {
 
                     let existing_out = best.get(&mid).map(|r| r.out).unwrap_or(0);
                     if out >= existing_out {
-                        best.insert(mid, MsgRecord {
-                            ts: entry.get("timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
-                            model: msg.get("model").and_then(|m| m.as_str()).unwrap_or("unknown").to_string(),
-                            inp: usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                            out,
-                            cr: usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                            cc: usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                        });
+                        best.insert(
+                            mid,
+                            MsgRecord {
+                                ts: entry
+                                    .get("timestamp")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                model: msg
+                                    .get("model")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string(),
+                                inp: usage
+                                    .get("input_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
+                                out,
+                                cr: usage
+                                    .get("cache_read_input_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
+                                cc: usage
+                                    .get("cache_creation_input_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
+                            },
+                        );
                     }
                 }
             }
@@ -742,12 +824,18 @@ impl MatrixChannel {
 
         if !model_map.is_empty() {
             let mut models: Vec<_> = model_map.iter().collect();
-            models.sort_by(|a, b| b.1.cost_usd.partial_cmp(&a.1.cost_usd).unwrap_or(std::cmp::Ordering::Equal));
+            models.sort_by(|a, b| {
+                b.1.cost_usd
+                    .partial_cmp(&a.1.cost_usd)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             out.push_str("\n**By model:**\n");
             for (model, b) in models.iter().take(5) {
                 out.push_str(&format!(
                     "- `{}` — {} msgs · {}\n",
-                    model, b.messages, fmt_cost(b.cost_usd)
+                    model,
+                    b.messages,
+                    fmt_cost(b.cost_usd)
                 ));
             }
         }
@@ -763,7 +851,12 @@ impl MatrixChannel {
         &self,
         accepted_rooms: &HashSet<OwnedRoomId>,
         my_user_id: &str,
-        dedupe: &Arc<Mutex<(std::collections::VecDeque<String>, std::collections::HashSet<String>)>>,
+        dedupe: &Arc<
+            Mutex<(
+                std::collections::VecDeque<String>,
+                std::collections::HashSet<String>,
+            )>,
+        >,
         tx: &mpsc::Sender<ChannelMessage>,
     ) {
         let cutoff_ms = chrono::Utc::now().timestamp_millis() - 86_400_000;

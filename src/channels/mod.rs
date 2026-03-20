@@ -1278,12 +1278,215 @@ const TICKET_SUBCOMMANDS: &[&str] = &[
     "closed", "create", "help", "tree", "dep", "edit",
 ];
 
+fn is_cron_command(content: &str) -> bool {
+    let lower = content.trim().to_lowercase();
+    lower == "cron" || lower == "cron all" || lower == "cron --all" || lower.starts_with("cron ")
+}
+
+fn format_cron_listing(
+    jobs: &[crate::cron::CronJob],
+    show_all: bool,
+    room_id: &str,
+) -> String {
+    if jobs.is_empty() {
+        return if show_all {
+            "No cron jobs scheduled.".to_string()
+        } else {
+            format!(
+                "No cron jobs scheduled for this room (`{room_id}`).\n\nUse `cron all` to list all rooms."
+            )
+        };
+    }
+
+    let header = if show_all {
+        format!("**Cron jobs** ({} total):\n", jobs.len())
+    } else {
+        format!("**Cron jobs for this room** ({}):\n", jobs.len())
+    };
+
+    let rows: Vec<String> = jobs
+        .iter()
+        .map(|job| {
+            let name = job.name.as_deref().unwrap_or(&job.id[..8]);
+            let status = if job.enabled { "" } else { " _(disabled)_" };
+            let next = job.next_run.format("%Y-%m-%d %H:%M UTC").to_string();
+            let kind = match job.job_type {
+                crate::cron::JobType::Shell => "shell",
+                crate::cron::JobType::Agent => "agent",
+            };
+            let cmd = if job.command.len() > 70 {
+                format!("{}…", &job.command[..67])
+            } else {
+                job.command.clone()
+            };
+            let room_part = if show_all {
+                job.delivery
+                    .to
+                    .as_deref()
+                    .map(|r| format!(" → `{r}`"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let last_part = match (&job.last_status, job.last_run) {
+                (Some(s), Some(t)) => format!(
+                    "  last: `{}` at {}",
+                    s,
+                    t.format("%m-%d %H:%M")
+                ),
+                _ => String::new(),
+            };
+            format!(
+                "**{name}**{status} — `{}` ({kind}){room_part}\n  next: {next}  cmd: `{cmd}`{last_part}",
+                job.expression
+            )
+        })
+        .collect();
+
+    format!("{}{}", header, rows.join("\n\n"))
+}
+
+/// Returns true if the last non-empty lines of a tmux pane look like an
+/// unanswered question from a Claude Code session.
+fn tmux_pane_has_pending_question(pane: &str) -> bool {
+    let last: Vec<&str> = pane
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(15)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    for line in &last {
+        let lower = line.to_lowercase();
+        if lower.contains("[y/n]")
+            || lower.contains("[yes/no]")
+            || lower.contains("[y/n/s]")
+            || lower.contains("(y/n)")
+        {
+            return true;
+        }
+        if (lower.contains("do you want")
+            || lower.contains("would you like")
+            || lower.contains("should i ")
+            || lower.contains("shall i "))
+            && lower.contains('?')
+        {
+            return true;
+        }
+        // Claude Code tool approval lines
+        if lower.contains("allow") && lower.ends_with('?') {
+            return true;
+        }
+    }
+    false
+}
+
+async fn check_tmux_pending_questions(
+    tmux_targets: Arc<HashMap<String, String>>,
+    channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
+) {
+    let Some(matrix_channel) = channels_by_name.get("matrix").cloned() else {
+        return;
+    };
+
+    for (room_id, tmux_target) in tmux_targets.iter() {
+        let out = match tokio::process::Command::new("tmux")
+            .args(["capture-pane", "-p", "-t", tmux_target])
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => out,
+            _ => continue,
+        };
+
+        let content = String::from_utf8_lossy(&out.stdout);
+        if tmux_pane_has_pending_question(&content) {
+            let reply_target = format!("cron-watch||{room_id}");
+            let msg = format!(
+                "⚠️ **Pending question in tmux** (`{tmux_target}`)\n\nThe Claude Code session appears to be waiting for input. Use `peek` to see the current state or `tmux` to send a reply."
+            );
+            if let Err(e) = matrix_channel
+                .send(&SendMessage::new(msg, &reply_target))
+                .await
+            {
+                tracing::warn!(
+                    "Failed to send pending-question notice to {room_id}: {e}"
+                );
+            }
+        }
+    }
+}
+
+async fn handle_cron_command_if_needed(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> bool {
+    if !is_cron_command(&msg.content) {
+        return false;
+    }
+
+    let Some(channel) = target_channel else {
+        return true;
+    };
+
+    let lower = msg.content.trim().to_lowercase();
+    let rest = lower.strip_prefix("cron").unwrap_or("").trim().to_string();
+    let show_all = rest == "all" || rest == "--all";
+
+    let room_id = extract_room_id(&msg.reply_target).to_string();
+
+    let jobs = match crate::cron::list_jobs_in_workspace(&ctx.workspace_dir) {
+        Ok(j) => j,
+        Err(e) => {
+            let _ = channel
+                .send(
+                    &SendMessage::new(
+                        format!("Failed to load cron jobs: {e}"),
+                        &msg.reply_target,
+                    )
+                    .in_thread(msg.thread_ts.clone()),
+                )
+                .await;
+            return true;
+        }
+    };
+
+    let filtered: Vec<crate::cron::CronJob> = if show_all {
+        jobs
+    } else {
+        jobs.into_iter()
+            .filter(|j| {
+                j.delivery.to.as_deref() == Some(&room_id)
+                    || j.delivery.to.as_deref() == Some(&msg.channel)
+            })
+            .collect()
+    };
+
+    let response = format_cron_listing(&filtered, show_all, &room_id);
+
+    if let Err(e) = channel
+        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .await
+    {
+        tracing::warn!("Failed to send cron listing: {e}");
+    }
+
+    // Side effect: check every tmux pane for pending questions.
+    tokio::spawn(check_tmux_pending_questions(
+        Arc::clone(&ctx.channel_tmux_targets),
+        Arc::clone(&ctx.channels_by_name),
+    ));
+
+    true
+}
+
 fn is_peek_command(content: &str) -> bool {
     let lower = content.trim().to_lowercase();
-    lower == "peek"
-        || lower.starts_with("peek ")
-        || lower == "!peek"
-        || lower.starts_with("!peek ")
+    lower == "peek" || lower.starts_with("peek ") || lower == "!peek" || lower.starts_with("!peek ")
 }
 
 async fn handle_peek_command_if_needed(
@@ -1381,11 +1584,7 @@ fn parse_ticket_args(content: &str) -> TicketAction {
         return TicketAction::Help;
     }
 
-    let first_word = rest
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
+    let first_word = rest.split_whitespace().next().unwrap_or("").to_lowercase();
 
     if first_word == "help" {
         return TicketAction::Help;
@@ -1736,34 +1935,26 @@ async fn handle_ticket_command_if_needed(
                 while i < args.len() {
                     match args[i].as_str() {
                         "--type" | "-t" if i + 1 < args.len() => {
-                            conditions
-                                .push(format!(".type == \"{}\"", args[i + 1]));
+                            conditions.push(format!(".type == \"{}\"", args[i + 1]));
                             i += 2;
                         }
                         "--tag" | "-T" if i + 1 < args.len() => {
-                            conditions.push(format!(
-                                "(.tags // [] | any(. == \"{}\"))",
-                                args[i + 1]
-                            ));
+                            conditions
+                                .push(format!("(.tags // [] | any(. == \"{}\"))", args[i + 1]));
                             i += 2;
                         }
                         "--priority" | "-P" if i + 1 < args.len() => {
-                            conditions
-                                .push(format!(".priority == {}", args[i + 1]));
+                            conditions.push(format!(".priority == {}", args[i + 1]));
                             i += 2;
                         }
                         "--assignee" | "-a" if i + 1 < args.len() => {
-                            conditions
-                                .push(format!(".assignee == \"{}\"", args[i + 1]));
+                            conditions.push(format!(".assignee == \"{}\"", args[i + 1]));
                             i += 2;
                         }
                         _ => i += 1,
                     }
                 }
-                (
-                    vec!["query".to_string(), conditions.join(" and ")],
-                    "list",
-                )
+                (vec!["query".to_string(), conditions.join(" and ")], "list")
             } else {
                 (args.clone(), subcommand)
             };
@@ -2397,6 +2588,9 @@ async fn process_channel_message(
     if handle_ticket_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
     }
+    if handle_cron_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        return;
+    }
     if handle_peek_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
     }
@@ -2429,7 +2623,8 @@ async fn process_channel_message(
         ctx.query_classification.classifier_model.as_ref(),
     ) {
         // Model-based classification: use a lightweight model to classify the message.
-        let available_hints: Vec<String> = ctx.model_routes.iter().map(|r| r.hint.clone()).collect();
+        let available_hints: Vec<String> =
+            ctx.model_routes.iter().map(|r| r.hint.clone()).collect();
         if let Ok(provider) = get_or_create_provider(ctx.as_ref(), cls_provider).await {
             crate::agent::classifier::classify_with_model(
                 &ctx.query_classification,
@@ -9349,14 +9544,27 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn ticket_args_routing() {
         // Subcommands route to tk directly
-        assert!(matches!(parse_ticket_args("ticket list"), TicketAction::Command(a) if a[0] == "list"));
-        assert!(matches!(parse_ticket_args("ticket show abc"), TicketAction::Command(a) if a[0] == "show" && a[1] == "abc"));
-        assert!(matches!(parse_ticket_args("ticket stats"), TicketAction::Command(a) if a[0] == "stats"));
-        assert!(matches!(parse_ticket_args("ticket create fix bug"), TicketAction::Command(a) if a[0] == "create" && a[1] == "fix bug"));
+        assert!(
+            matches!(parse_ticket_args("ticket list"), TicketAction::Command(a) if a[0] == "list")
+        );
+        assert!(
+            matches!(parse_ticket_args("ticket show abc"), TicketAction::Command(a) if a[0] == "show" && a[1] == "abc")
+        );
+        assert!(
+            matches!(parse_ticket_args("ticket stats"), TicketAction::Command(a) if a[0] == "stats")
+        );
+        assert!(
+            matches!(parse_ticket_args("ticket create fix bug"), TicketAction::Command(a) if a[0] == "create" && a[1] == "fix bug")
+        );
         // Implicit create
-        assert!(matches!(parse_ticket_args("ticket fix the bug"), TicketAction::Command(a) if a[0] == "create"));
+        assert!(
+            matches!(parse_ticket_args("ticket fix the bug"), TicketAction::Command(a) if a[0] == "create")
+        );
         // Help
-        assert!(matches!(parse_ticket_args("ticket help"), TicketAction::Help));
+        assert!(matches!(
+            parse_ticket_args("ticket help"),
+            TicketAction::Help
+        ));
         assert!(matches!(parse_ticket_args("ticket"), TicketAction::Help));
     }
 
@@ -9377,7 +9585,9 @@ This is an example JSON object for profile settings."#;
 
     #[test]
     fn ticket_content_parsing_multiline() {
-        let (title, desc) = parse_ticket_content("ticket add dark mode\nIt should use prefers-color-scheme and persist the choice.");
+        let (title, desc) = parse_ticket_content(
+            "ticket add dark mode\nIt should use prefers-color-scheme and persist the choice.",
+        );
         assert_eq!(title, "add dark mode");
         assert_eq!(
             desc.as_deref(),
