@@ -411,6 +411,30 @@ allowed_roots = [\"~/Desktop/projects\", \"/opt/shared-repo\"]
 
 - 内存上下文注入忽略旧的 `assistant_resp*` 自动保存键，以防止旧模型生成的摘要被视为事实。
 
+### `[memory.mem0]`
+
+Mem0 (OpenMemory) 后端 — 连接自托管 mem0 服务器，提供基于向量的记忆存储和 LLM 事实提取。构建时需要 `memory-mem0` feature flag，配置需设置 `backend = "mem0"`。
+
+| 键 | 默认值 | 环境变量 | 用途 |
+|---|---|---|---|
+| `url` | `http://localhost:8765` | `MEM0_URL` | OpenMemory 服务器地址 |
+| `user_id` | `zeroclaw` | `MEM0_USER_ID` | 记忆作用域的用户 ID |
+| `app_name` | `zeroclaw` | `MEM0_APP_NAME` | 在 mem0 中注册的应用名称 |
+| `infer` | `true` | — | 使用 LLM 从存储文本中提取事实 (`true`) 或原样存储 (`false`) |
+| `extraction_prompt` | 未设置 | `MEM0_EXTRACTION_PROMPT` | 自定义 LLM 事实提取提示词（如适用于非英文内容） |
+
+```toml
+[memory]
+backend = "mem0"
+
+[memory.mem0]
+url = "http://192.168.0.171:8765"
+user_id = "zeroclaw-bot"
+extraction_prompt = "用原始语言提取事实..."
+```
+
+服务器部署脚本位于 `deploy/mem0/`。
+
 ## `[[model_routes]]` 和 `[[embedding_routes]]`
 
 使用路由提示，以便集成可以在模型 ID 演变时保持稳定的名称。

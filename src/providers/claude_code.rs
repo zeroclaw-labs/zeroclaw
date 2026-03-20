@@ -90,17 +90,31 @@ impl ClaudeCodeProvider {
             .any(|v| (temperature - v).abs() < TEMP_EPSILON)
     }
 
-    fn validate_temperature(temperature: f64) -> anyhow::Result<()> {
+    fn validate_temperature(temperature: f64) -> anyhow::Result<f64> {
         if !temperature.is_finite() {
             anyhow::bail!("Claude Code provider received non-finite temperature value");
         }
-        if !Self::supports_temperature(temperature) {
-            anyhow::bail!(
-                "temperature unsupported by Claude Code CLI: {temperature}. \
-                 Supported values: 0.7 or 1.0"
-            );
+        if Self::supports_temperature(temperature) {
+            return Ok(temperature);
         }
-        Ok(())
+        // Clamp to the nearest supported value — the CLI ignores temperature
+        // anyway, so a hard error just blocks callers like memory consolidation
+        // that legitimately request low temperatures.
+        let clamped = *CLAUDE_CODE_SUPPORTED_TEMPERATURES
+            .iter()
+            .min_by(|a, b| {
+                (temperature - **a)
+                    .abs()
+                    .partial_cmp(&(temperature - **b).abs())
+                    .unwrap()
+            })
+            .unwrap();
+        tracing::debug!(
+            requested = temperature,
+            clamped = clamped,
+            "Clamped unsupported temperature to nearest Claude Code CLI value"
+        );
+        Ok(clamped)
     }
 
     fn redact_stderr(stderr: &[u8]) -> String {
@@ -353,11 +367,18 @@ mod tests {
     }
 
     #[test]
-    fn validate_temperature_rejects_custom_value() {
-        let err = ClaudeCodeProvider::validate_temperature(0.2).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("temperature unsupported by Claude Code CLI"));
+    fn validate_temperature_clamps_custom_value() {
+        let clamped = ClaudeCodeProvider::validate_temperature(0.2).unwrap();
+        assert!((clamped - 0.7).abs() < 1e-9, "0.2 should clamp to 0.7");
+
+        let clamped = ClaudeCodeProvider::validate_temperature(0.9).unwrap();
+        assert!((clamped - 1.0).abs() < 1e-9, "0.9 should clamp to 1.0");
+    }
+
+    #[test]
+    fn validate_temperature_rejects_non_finite() {
+        assert!(ClaudeCodeProvider::validate_temperature(f64::NAN).is_err());
+        assert!(ClaudeCodeProvider::validate_temperature(f64::INFINITY).is_err());
     }
 
     #[tokio::test]
@@ -471,10 +492,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_with_history_rejects_bad_temperature() {
+    async fn chat_with_history_clamps_bad_temperature() {
         let provider = echo_provider();
         let messages = vec![ChatMessage::user("test")];
         let result = provider.chat_with_history(&messages, "default", 0.5).await;
-        assert!(result.is_err());
+        assert!(
+            result.is_ok(),
+            "unsupported temperature should be clamped, not rejected"
+        );
     }
 }
