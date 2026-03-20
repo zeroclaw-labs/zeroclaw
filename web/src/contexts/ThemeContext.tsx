@@ -3,6 +3,7 @@ import { ThemeContext, type ThemeContextValue } from './ThemeContextDef';
 import { loadStored, STORAGE_KEY } from './themeStorage';
 import type { ThemeName, AccentColor, UiFont, MonoFont } from './ThemeContextDef';
 import { uiFontStacks, monoFontStacks } from './ThemeContextDef';
+import { loadUiFont, loadMonoFont } from './fontLoader';
 
 type ConcreteTheme = 'dark' | 'light' | 'oled';
 
@@ -197,6 +198,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   const setUiFont = useCallback((f: UiFont) => {
     setUiFontState(f);
+    loadUiFont(f);
     const next: ThemeSettings = { theme, accent, uiFont: f, monoFont, uiFontSize, monoFontSize };
     applyAll(next);
     persist(next);
@@ -204,6 +206,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   const setMonoFont = useCallback((f: MonoFont) => {
     setMonoFontState(f);
+    loadMonoFont(f);
     const next: ThemeSettings = { theme, accent, uiFont, monoFont: f, uiFontSize, monoFontSize };
     applyAll(next);
     persist(next);
@@ -227,6 +230,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     applyAll({ theme, accent, uiFont, monoFont, uiFontSize, monoFontSize });
+    loadUiFont(uiFont);
+    loadMonoFont(monoFont);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
