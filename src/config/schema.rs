@@ -4816,6 +4816,10 @@ pub struct MatrixConfig {
     pub room_id: String,
     /// Allowed Matrix user IDs. Empty = deny all.
     pub allowed_users: Vec<String>,
+    /// When `true`, a new message from the same sender interrupts the
+    /// in-flight request and re-uses the accumulated context.
+    #[serde(default)]
+    pub interrupt_on_new_message: bool,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -9485,6 +9489,7 @@ tool_dispatcher = "xml"
             device_id: Some("DEVICE123".into()),
             room_id: "!room123:matrix.org".into(),
             allowed_users: vec!["@user:matrix.org".into()],
+            interrupt_on_new_message: false,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -9505,6 +9510,7 @@ tool_dispatcher = "xml"
             device_id: None,
             room_id: "!abc:synapse.local".into(),
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
+            interrupt_on_new_message: false,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -9525,6 +9531,32 @@ allowed_users = ["@ops:matrix.org"]
         assert_eq!(parsed.homeserver, "https://matrix.org");
         assert!(parsed.user_id.is_none());
         assert!(parsed.device_id.is_none());
+        assert!(!parsed.interrupt_on_new_message);
+    }
+
+    #[test]
+    async fn matrix_config_interrupt_on_new_message_defaults_false() {
+        let json = r#"{
+            "homeserver": "https://matrix.org",
+            "access_token": "tok",
+            "room_id": "!r:matrix.org",
+            "allowed_users": []
+        }"#;
+        let parsed: MatrixConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.interrupt_on_new_message);
+    }
+
+    #[test]
+    async fn matrix_config_interrupt_on_new_message_when_true() {
+        let json = r#"{
+            "homeserver": "https://matrix.org",
+            "access_token": "tok",
+            "room_id": "!r:matrix.org",
+            "allowed_users": [],
+            "interrupt_on_new_message": true
+        }"#;
+        let parsed: MatrixConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.interrupt_on_new_message);
     }
 
     #[test]
@@ -9594,6 +9626,7 @@ allowed_users = ["@ops:matrix.org"]
                 device_id: None,
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
+                interrupt_on_new_message: false,
             }),
             signal: None,
             whatsapp: None,
