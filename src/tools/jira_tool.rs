@@ -3,7 +3,7 @@ use crate::security::{policy::ToolOperation, SecurityPolicy};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 const JIRA_SEARCH_PAGE_SIZE: u32 = 100;
@@ -21,10 +21,12 @@ enum LevelOfDetails {
 
 /// Tool for interacting with the Jira REST API v3.
 ///
-/// Supports three actions gated by `[jira].allowed_actions` in config:
-/// - `get_ticket`   — always in the default allowlist; read-only.
+/// Supports five actions gated by `[jira].allowed_actions` in config:
+/// - `get_ticket`     — always in the default allowlist; read-only.
 /// - `search_tickets` — requires explicit opt-in; read-only.
 /// - `comment_ticket` — requires explicit opt-in; mutating (Act policy).
+/// - `list_projects`  — requires explicit opt-in; read-only.
+/// - `myself`         — requires explicit opt-in; read-only. Verifies credentials.
 pub struct JiraTool {
     base_url: String,
     email: String,
@@ -253,6 +255,92 @@ impl JiraTool {
         })
     }
 
+    async fn list_projects(&self) -> anyhow::Result<ToolResult> {
+        let url = format!("{}/rest/api/3/project", self.base_url);
+
+        let resp = self
+            .http
+            .get(&url)
+            .basic_auth(&self.email, Some(&self.api_token))
+            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Jira list_projects request failed: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Jira list_projects failed ({status}): {}",
+                crate::util::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS)
+            );
+        }
+
+        let projects: Vec<Value> = resp
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse Jira list_projects response: {e}"))?;
+
+        let keys: Vec<String> = projects
+            .iter()
+            .filter_map(|p| p["key"].as_str().map(String::from))
+            .collect();
+
+        let users_url = format!(
+            "{}/rest/api/3/user/assignable/multiProjectSearch",
+            self.base_url
+        );
+
+        let mut statuses_futs = Vec::new();
+        for key in &keys {
+            statuses_futs.push(
+                self.http
+                    .get(format!("{url}/{key}/statuses"))
+                    .basic_auth(&self.email, Some(&self.api_token))
+                    .timeout(std::time::Duration::from_secs(self.timeout_secs))
+                    .send(),
+            );
+        }
+
+        let users_resp = self
+            .http
+            .get(&users_url)
+            .basic_auth(&self.email, Some(&self.api_token))
+            .query(&[
+                ("projectKeys", keys.join(",").as_str()),
+                ("maxResults", "50"),
+            ])
+            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Jira list_projects users request failed: {e}"))?;
+
+        let users: Vec<Value> = if users_resp.status().is_success() {
+            users_resp.json().await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let mut statuses_results = Vec::new();
+        for fut in statuses_futs {
+            let result: Value = match fut.await {
+                Ok(resp) if resp.status().is_success() => {
+                    resp.json().await.unwrap_or_else(|_| json!([]))
+                }
+                _ => json!([]),
+            };
+            statuses_results.push(result);
+        }
+
+        let shaped = shape_projects(&projects, &statuses_results, &users);
+
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&shaped).unwrap_or_else(|_| shaped.to_string()),
+            error: None,
+        })
+    }
+
     async fn get_myself(&self) -> anyhow::Result<ToolResult> {
         let url = format!("{}/rest/api/3/myself", self.base_url);
 
@@ -338,7 +426,7 @@ impl Tool for JiraTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["get_ticket", "search_tickets", "comment_ticket", "myself"],
+                    "enum": ["get_ticket", "search_tickets", "comment_ticket", "list_projects", "myself"],
                     "description": "The Jira action to perform. Enabled actions are configured in [jira].allowed_actions. Use 'myself' to verify that credentials are valid and the Jira connection is working."
                 },
                 "issue_key": {
@@ -382,12 +470,15 @@ impl Tool for JiraTool {
 
         // Reject unknown actions before the allowlist check so typos produce a
         // clear "unknown action" error rather than a misleading "not enabled" one.
-        if !matches!(action, "get_ticket" | "search_tickets" | "comment_ticket" | "myself") {
+        if !matches!(
+            action,
+            "get_ticket" | "search_tickets" | "comment_ticket" | "list_projects" | "myself"
+        ) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Unknown action: '{action}'. Valid actions: get_ticket, search_tickets, comment_ticket, myself"
+                    "Unknown action: '{action}'. Valid actions: get_ticket, search_tickets, comment_ticket, list_projects, myself"
                 )),
             });
         }
@@ -405,7 +496,7 @@ impl Tool for JiraTool {
         }
 
         let operation = match action {
-            "get_ticket" | "search_tickets" | "myself" => ToolOperation::Read,
+            "get_ticket" | "search_tickets" | "list_projects" | "myself" => ToolOperation::Read,
             "comment_ticket" => ToolOperation::Act,
             _ => unreachable!(),
         };
@@ -456,6 +547,7 @@ impl Tool for JiraTool {
                 self.search_tickets(jql, max_results).await
             }
             "myself" => self.get_myself().await,
+            "list_projects" => self.list_projects().await,
             "comment_ticket" => {
                 let issue_key = match args.get("issue_key").and_then(|v| v.as_str()) {
                     Some(k) => k,
@@ -620,6 +712,73 @@ fn shape_comment_response(raw: &Value) -> Value {
         "author":  raw["author"]["displayName"],
         "created": date_prefix(raw["created"].as_str().unwrap_or("")),
     })
+}
+
+fn shape_projects(projects: &[Value], statuses_per_project: &[Value], users: &[Value]) -> Value {
+    let known_order = [
+        "To Do",
+        "In Progress",
+        "Collecting Intel",
+        "Design",
+        "Verification",
+        "Done",
+    ];
+
+    let shaped: Vec<Value> = projects
+        .iter()
+        .zip(statuses_per_project.iter())
+        .map(|(p, statuses)| {
+            let mut issue_types: Vec<String> = Vec::new();
+            let mut all_statuses: HashSet<String> = HashSet::new();
+
+            if let Some(arr) = statuses.as_array() {
+                for it in arr {
+                    if let Some(name) = it["name"].as_str() {
+                        issue_types.push(name.to_string());
+                    }
+                    if let Some(ss) = it["statuses"].as_array() {
+                        for s in ss {
+                            if let Some(sn) = s["name"].as_str() {
+                                all_statuses.insert(sn.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut ordered: Vec<&str> = known_order
+                .iter()
+                .filter(|s| all_statuses.contains(**s))
+                .copied()
+                .collect();
+            let mut remaining: Vec<String> = all_statuses
+                .iter()
+                .filter(|s| !known_order.contains(&s.as_str()))
+                .cloned()
+                .collect();
+            remaining.sort();
+            ordered.extend(remaining.iter().map(String::as_str));
+
+            json!({
+                "key":         p["key"],
+                "name":        p["name"],
+                "projectType": p["projectTypeKey"],
+                "style":       p["style"],
+                "issueTypes":  issue_types,
+                "statuses":    ordered,
+                "users":       users.iter().filter_map(|u| {
+                    let display = u["displayName"].as_str()?;
+                    let email = u["emailAddress"].as_str()?;
+                    Some(json!({
+                        "displayName":  display,
+                        "emailAddress": email,
+                    }))
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    json!(shaped)
 }
 
 // ── Comment / ADF builder ─────────────────────────────────────────────────────
@@ -969,10 +1128,7 @@ mod tests {
             security,
             30,
         );
-        let result = tool
-            .execute(json!({"action": "myself"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"action": "myself"})).await.unwrap();
         assert!(!result.success);
         assert!(!result.error.as_deref().unwrap_or("").contains("read-only"));
     }
@@ -1203,5 +1359,158 @@ mod tests {
         assert_eq!(shaped["comments"][0]["body"], "Bob's body");
         assert_eq!(shaped["comments"][1]["author"], "Alice");
         assert_eq!(shaped["comments"][1]["body"], "Alice's body");
+    }
+
+    // ── list_projects action ────────────────────────────────────────────────
+
+    #[test]
+    fn parameters_schema_includes_list_projects_action() {
+        let schema = test_tool(vec!["list_projects"]).parameters_schema();
+        let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
+        let action_strs: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
+        assert!(action_strs.contains(&"list_projects"));
+    }
+
+    #[tokio::test]
+    async fn execute_list_projects_disallowed_returns_error() {
+        let result = test_tool(vec!["get_ticket"])
+            .execute(json!({"action": "list_projects"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(err.contains("not enabled"));
+        assert!(err.contains("allowed_actions"));
+    }
+
+    #[tokio::test]
+    async fn execute_list_projects_not_blocked_in_readonly_mode() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = JiraTool::new(
+            "https://127.0.0.1:1".into(),
+            "test@example.com".into(),
+            "token".into(),
+            vec!["list_projects".into()],
+            security,
+            30,
+        );
+        let result = tool
+            .execute(json!({"action": "list_projects"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            !result.error.as_deref().unwrap_or("").contains("read-only"),
+            "error should not mention read-only policy: {:?}",
+            result.error
+        );
+    }
+
+    #[test]
+    fn shape_projects_extracts_expected_fields() {
+        let projects = json!([
+            { "key": "AT", "name": "ALL TASKS", "projectTypeKey": "business", "style": "next-gen" },
+            { "key": "GP", "name": "G-PROJECT", "projectTypeKey": "software", "style": "next-gen" }
+        ]);
+        let statuses: Vec<Value> = vec![
+            json!([
+                { "name": "Task", "statuses": [
+                    { "name": "To Do" }, { "name": "In Progress" }, { "name": "Collecting Intel" }, { "name": "Done" }
+                ]},
+                { "name": "Sub-task", "statuses": [
+                    { "name": "To Do" }, { "name": "Verification" }
+                ]}
+            ]),
+            json!([
+                { "name": "Task", "statuses": [
+                    { "name": "To Do" }, { "name": "Design" }, { "name": "Done" }
+                ]},
+                { "name": "Epic", "statuses": [
+                    { "name": "To Do" }, { "name": "Done" }
+                ]}
+            ]),
+        ];
+        let users = json!([
+            { "displayName": "Anatolii Fesiuk", "emailAddress": "a@b.com" }
+        ]);
+
+        let shaped = shape_projects(
+            projects.as_array().unwrap(),
+            &statuses,
+            users.as_array().unwrap(),
+        );
+        let arr = shaped.as_array().unwrap();
+
+        assert_eq!(arr.len(), 2);
+
+        assert_eq!(arr[0]["key"], "AT");
+        assert_eq!(arr[0]["name"], "ALL TASKS");
+        assert_eq!(arr[0]["projectType"], "business");
+        let at_statuses: Vec<&str> = arr[0]["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            at_statuses,
+            vec![
+                "To Do",
+                "In Progress",
+                "Collecting Intel",
+                "Verification",
+                "Done"
+            ]
+        );
+        let at_types: Vec<&str> = arr[0]["issueTypes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(at_types.contains(&"Task"));
+        assert!(at_types.contains(&"Sub-task"));
+
+        assert_eq!(arr[1]["key"], "GP");
+        assert_eq!(arr[1]["projectType"], "software");
+        let gp_statuses: Vec<&str> = arr[1]["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(gp_statuses, vec!["To Do", "Design", "Done"]);
+
+        assert_eq!(arr[0]["users"].as_array().unwrap().len(), 1);
+        assert_eq!(arr[0]["users"][0]["displayName"], "Anatolii Fesiuk");
+    }
+
+    #[test]
+    fn shape_projects_orders_known_statuses_first() {
+        let projects = json!([
+            { "key": "P", "name": "P", "projectTypeKey": "software", "style": "next-gen" }
+        ]);
+        let statuses: Vec<Value> = vec![json!([
+            { "name": "Task", "statuses": [
+                { "name": "Done" }, { "name": "Custom" }, { "name": "To Do" }, { "name": "Alpha" }
+            ]}
+        ])];
+        let shaped = shape_projects(projects.as_array().unwrap(), &statuses, &[]);
+        let ordered: Vec<&str> = shaped[0]["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(ordered, vec!["To Do", "Done", "Alpha", "Custom"]);
+    }
+
+    #[test]
+    fn shape_projects_empty_inputs() {
+        let shaped = shape_projects(&[], &[], &[]);
+        assert_eq!(shaped.as_array().unwrap().len(), 0);
     }
 }
