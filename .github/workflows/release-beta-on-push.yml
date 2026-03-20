@@ -16,6 +16,7 @@ env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  RELEASE_CARGO_FEATURES: channel-matrix,channel-lark,memory-postgres
 
 jobs:
   version:
@@ -168,6 +169,13 @@ jobs:
             cross_compiler: gcc-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
             linker: aarch64-linux-gnu-gcc
+          - os: ubuntu-22.04
+            target: armv7-unknown-linux-gnueabihf
+            artifact: zeroclaw
+            ext: tar.gz
+            cross_compiler: gcc-arm-linux-gnueabihf
+            linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
+            linker: arm-linux-gnueabihf-gcc
           - os: macos-14
             target: aarch64-apple-darwin
             artifact: zeroclaw
@@ -213,7 +221,7 @@ jobs:
           if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
           fi
-          cargo build --release --locked --features channel-matrix,memory-postgres --target ${{ matrix.target }}
+          cargo build --release --locked --features "${{ env.RELEASE_CARGO_FEATURES }}" --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -345,8 +353,6 @@ jobs:
         with:
           context: docker-ctx
           push: true
-          build-args: |
-            ZEROCLAW_CARGO_FEATURES=channel-matrix,memory-postgres
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:beta

@@ -360,6 +360,7 @@ impl Channel for NotionChannel {
                                 channel: "notion".into(),
                                 timestamp,
                                 thread_ts: None,
+                                interruption_scope_id: None,
                             })
                             .await
                             .is_err()

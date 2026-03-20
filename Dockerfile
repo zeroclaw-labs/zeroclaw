@@ -116,7 +116,7 @@ EXPOSE 42617
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
     CMD ["zeroclaw", "status", "--format=exit-code"]
 ENTRYPOINT ["zeroclaw"]
-CMD ["gateway"]
+CMD ["daemon"]
 
 # ── Stage 3: Production Runtime (Distroless) ─────────────────
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS release
@@ -142,4 +142,4 @@ EXPOSE 42617
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
     CMD ["zeroclaw", "status", "--format=exit-code"]
 ENTRYPOINT ["zeroclaw"]
-CMD ["gateway"]
+CMD ["daemon"]

@@ -186,6 +186,12 @@ impl OpenAiCompatibleProvider {
         }
     }
 
+    /// Disable native tool calling, forcing prompt-guided tool use instead.
+    pub fn without_native_tools(mut self) -> Self {
+        self.native_tool_calling = false;
+        self
+    }
+
     /// Override the HTTP request timeout for LLM API calls.
     pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = timeout_secs;
@@ -335,6 +341,23 @@ impl OpenAiCompatibleProvider {
         !path.is_empty() && path != "/"
     }
 
+    fn requires_tool_stream(&self) -> bool {
+        let host_requires_tool_stream = reqwest::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .is_some_and(|host| host == "api.z.ai" || host.ends_with(".z.ai"));
+
+        host_requires_tool_stream || matches!(self.name.as_str(), "zai" | "z.ai")
+    }
+
+    fn tool_stream_for_tools(&self, has_tools: bool) -> Option<bool> {
+        if has_tools && self.requires_tool_stream() {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
     /// Build the full URL for responses API, detecting if base_url already includes the path.
     fn responses_url(&self) -> String {
         if self.path_ends_with("/responses") {
@@ -391,6 +414,8 @@ struct ApiChatRequest {
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -589,6 +614,8 @@ struct NativeChatRequest {
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1264,6 +1291,7 @@ impl Provider for OpenAiCompatibleProvider {
             temperature,
             stream: Some(false),
             reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: None,
             tools: None,
             tool_choice: None,
         };
@@ -1387,6 +1415,7 @@ impl Provider for OpenAiCompatibleProvider {
             temperature,
             stream: Some(false),
             reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: None,
             tools: None,
             tool_choice: None,
         };
@@ -1498,6 +1527,7 @@ impl Provider for OpenAiCompatibleProvider {
             temperature,
             stream: Some(false),
             reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: self.tool_stream_for_tools(!tools.is_empty()),
             tools: if tools.is_empty() {
                 None
             } else {
@@ -1604,6 +1634,8 @@ impl Provider for OpenAiCompatibleProvider {
             temperature,
             stream: Some(false),
             reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: self
+                .tool_stream_for_tools(tools.as_ref().is_some_and(|tools| !tools.is_empty())),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
@@ -1748,6 +1780,7 @@ impl Provider for OpenAiCompatibleProvider {
             temperature,
             stream: Some(options.enabled),
             reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: None,
             tools: None,
             tool_choice: None,
         };
@@ -1890,6 +1923,7 @@ mod tests {
             temperature: 0.4,
             stream: Some(false),
             reasoning_effort: None,
+            tool_stream: None,
             tools: None,
             tool_choice: None,
         };
@@ -2671,6 +2705,7 @@ mod tests {
             temperature: 0.7,
             stream: Some(false),
             reasoning_effort: None,
+            tool_stream: None,
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
         };
@@ -2678,6 +2713,78 @@ mod tests {
         assert!(json.contains("\"tools\""));
         assert!(json.contains("get_weather"));
         assert!(json.contains("\"tool_choice\":\"auto\""));
+    }
+
+    #[test]
+    fn zai_tool_requests_enable_tool_stream() {
+        let provider = make_provider("zai", "https://api.z.ai/api/paas/v4", None);
+        let req = ApiChatRequest {
+            model: "glm-5".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("List /tmp".to_string()),
+            }],
+            temperature: 0.7,
+            stream: Some(false),
+            reasoning_effort: None,
+            tool_stream: provider.tool_stream_for_tools(true),
+            tools: Some(vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "shell",
+                    "description": "Run a shell command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"}
+                        }
+                    }
+                }
+            })]),
+            tool_choice: Some("auto".to_string()),
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"tool_stream\":true"));
+    }
+
+    #[test]
+    fn non_zai_tool_requests_omit_tool_stream() {
+        let provider = make_provider("test", "https://api.example.com/v1", None);
+        let req = ApiChatRequest {
+            model: "test-model".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("List /tmp".to_string()),
+            }],
+            temperature: 0.7,
+            stream: Some(false),
+            reasoning_effort: None,
+            tool_stream: provider.tool_stream_for_tools(true),
+            tools: Some(vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "shell",
+                    "description": "Run a shell command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"}
+                        }
+                    }
+                }
+            })]),
+            tool_choice: Some("auto".to_string()),
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("\"tool_stream\""));
+    }
+
+    #[test]
+    fn z_ai_host_enables_tool_stream_for_custom_profiles() {
+        let provider = make_provider("custom", "https://api.z.ai/api/coding/paas/v4", None);
+        assert_eq!(provider.tool_stream_for_tools(true), Some(true));
     }
 
     #[test]
