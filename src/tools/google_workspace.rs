@@ -118,7 +118,7 @@ impl Tool for GoogleWorkspaceTool {
             "properties": {
                 "service": {
                     "type": "string",
-                    "description": "Google Workspace service (e.g. drive, gmail, calendar, sheets, docs, slides, tasks, people, chat, forms, keep, meet)"
+                    "description": "Google Workspace service (e.g. drive, gmail, calendar, sheets, docs, slides, tasks, people, chat, classroom, forms, keep, meet, events)"
                 },
                 "resource": {
                     "type": "string",
