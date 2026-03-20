@@ -3,6 +3,7 @@
 //! Each tool implements the [`Tool`] trait defined in [`traits`], which requires
 //! a name, description, JSON parameter schema, and an async `execute` method.
 
+pub mod brain_yaml;
 pub mod browser;
 pub mod browser_open;
 pub mod content_search;
@@ -23,6 +24,7 @@ pub mod traits;
 pub mod web_fetch;
 pub mod web_search;
 
+pub use brain_yaml::BrainYamlTool;
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use content_search::ContentSearchTool;
@@ -170,6 +172,7 @@ pub fn all_tools_with_runtime(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
+        Arc::new(BrainYamlTool::new(security.clone(), brain_dir())),
     ];
 
     if browser_config.enabled {
@@ -237,6 +240,20 @@ pub fn all_tools_with_runtime(
     }
 
     boxed_registry_from_arcs(tool_arcs)
+}
+
+/// Resolve the brain directory: $BRAIN env var, else ~/.brain/
+fn brain_dir() -> std::path::PathBuf {
+    if let Ok(val) = std::env::var("BRAIN") {
+        return std::path::PathBuf::from(val);
+    }
+    dirs_sys_home()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join(".brain")
+}
+
+fn dirs_sys_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
 /// Wrapper around lightwave_macos to implement the Tool trait.

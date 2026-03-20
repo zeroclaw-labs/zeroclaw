@@ -35,6 +35,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+serde_yaml = "0.9"
 serde_ignored = "0.1"
 
 # Config
