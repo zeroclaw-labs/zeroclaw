@@ -367,6 +367,10 @@ pub struct Config {
     /// `LANG`, or `LC_ALL` environment variables (defaulting to `"en"`).
     #[serde(default)]
     pub locale: Option<String>,
+
+    /// Verifiable Intent (VI) credential verification and issuance (`[verifiable_intent]`).
+    #[serde(default)]
+    pub verifiable_intent: VerifiableIntentConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -871,6 +875,33 @@ impl Default for McpConfig {
             enabled: false,
             deferred_loading: default_deferred_loading(),
             servers: Vec::new(),
+        }
+    }
+}
+
+/// Verifiable Intent (VI) credential verification and issuance (`[verifiable_intent]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VerifiableIntentConfig {
+    /// Enable VI credential verification on commerce tool calls (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Strictness mode for constraint evaluation: "strict" (fail-closed on unknown
+    /// constraint types) or "permissive" (skip unknown types with a warning).
+    /// Default: "strict".
+    #[serde(default = "default_vi_strictness")]
+    pub strictness: String,
+}
+
+fn default_vi_strictness() -> String {
+    "strict".to_owned()
+}
+
+impl Default for VerifiableIntentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strictness: default_vi_strictness(),
         }
     }
 }
@@ -6345,6 +6376,7 @@ impl Default for Config {
             linkedin: LinkedInConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
+            verifiable_intent: VerifiableIntentConfig::default(),
         }
     }
 }
@@ -9190,6 +9222,7 @@ default_temperature = 0.7
             linkedin: LinkedInConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
+            verifiable_intent: VerifiableIntentConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -9527,6 +9560,7 @@ tool_dispatcher = "xml"
             linkedin: LinkedInConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
+            verifiable_intent: VerifiableIntentConfig::default(),
         };
 
         config.save().await.unwrap();
