@@ -11,23 +11,7 @@ const DEFAULT_GWS_TIMEOUT_SECS: u64 = 30;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 
-/// Allowed Google Workspace services that gws can target.
-const DEFAULT_ALLOWED_SERVICES: &[&str] = &[
-    "drive",
-    "sheets",
-    "gmail",
-    "calendar",
-    "docs",
-    "slides",
-    "tasks",
-    "people",
-    "chat",
-    "classroom",
-    "forms",
-    "keep",
-    "meet",
-    "events",
-];
+use crate::config::DEFAULT_GWS_SERVICES;
 
 /// Google Workspace CLI (`gws`) integration tool.
 ///
@@ -60,7 +44,7 @@ impl GoogleWorkspaceTool {
         audit_log: bool,
     ) -> Self {
         let services = if allowed_services.is_empty() {
-            DEFAULT_ALLOWED_SERVICES
+            DEFAULT_GWS_SERVICES
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect()

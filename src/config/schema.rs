@@ -2240,6 +2240,29 @@ impl Default for DataRetentionConfig {
 
 // ── Google Workspace ─────────────────────────────────────────────
 
+/// Built-in default service allowlist for the `google_workspace` tool.
+///
+/// Applied when `allowed_services` is empty. Defined here (not in the tool layer)
+/// so that config validation can cross-check `allowed_operations` entries against
+/// the effective service set in all cases, including when the operator relies on
+/// the default.
+pub const DEFAULT_GWS_SERVICES: &[&str] = &[
+    "drive",
+    "sheets",
+    "gmail",
+    "calendar",
+    "docs",
+    "slides",
+    "tasks",
+    "people",
+    "chat",
+    "classroom",
+    "forms",
+    "keep",
+    "meet",
+    "events",
+];
+
 /// Google Workspace CLI (`gws`) tool configuration (`[google_workspace]` section).
 ///
 /// ## Defaults
@@ -7383,20 +7406,18 @@ impl Config {
         }
 
         // Build the effective allowed-services set for cross-validation.
-        // Only validate when allowed_services is explicitly configured; when it is
-        // empty the tool falls back to a built-in default list defined in the tool
-        // layer, so we cannot enumerate it here without duplicating that constant.
-        let explicit_services: Option<std::collections::HashSet<&str>> =
+        // When the operator leaves allowed_services empty the tool falls back to
+        // DEFAULT_GWS_SERVICES; use the same constant here so validation is
+        // consistent in both cases.
+        let effective_services: std::collections::HashSet<&str> =
             if self.google_workspace.allowed_services.is_empty() {
-                None
+                DEFAULT_GWS_SERVICES.iter().copied().collect()
             } else {
-                Some(
-                    self.google_workspace
-                        .allowed_services
-                        .iter()
-                        .map(|s| s.trim())
-                        .collect(),
-                )
+                self.google_workspace
+                    .allowed_services
+                    .iter()
+                    .map(|s| s.trim())
+                    .collect()
             };
 
         let mut seen_gws_operations = std::collections::HashSet::new();
@@ -7413,13 +7434,11 @@ impl Config {
                 );
             }
 
-            if let Some(ref allowed) = explicit_services {
-                if !allowed.contains(service) {
-                    anyhow::bail!(
-                        "google_workspace.allowed_operations[{i}].service '{service}' is not in \
-                         allowed_services; this entry can never match at runtime"
-                    );
-                }
+            if !effective_services.contains(service) {
+                anyhow::bail!(
+                    "google_workspace.allowed_operations[{i}].service '{service}' is not in the \
+                     effective allowed_services; this entry can never match at runtime"
+                );
             }
             if !service
                 .chars()
@@ -12420,12 +12439,12 @@ require_otp_to_resume = true
     }
 
     #[test]
-    async fn config_validate_skips_service_cross_check_when_allowed_services_empty() {
-        // When allowed_services is empty, the tool uses a built-in default list.
-        // Validation cannot enumerate that list, so it skips the cross-check.
+    async fn config_validate_accepts_default_service_when_allowed_services_empty() {
+        // When allowed_services is empty the validator uses DEFAULT_GWS_SERVICES.
+        // A known default service must pass.
         let mut cfg = Config::default();
         cfg.google_workspace.enabled = true;
-        // allowed_services deliberately left empty
+        // allowed_services deliberately left empty (falls back to defaults)
         cfg.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
             service: "drive".into(),
             resource: "files".into(),
@@ -12434,6 +12453,28 @@ require_otp_to_resume = true
         }];
 
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    async fn config_validate_rejects_unknown_service_when_allowed_services_empty() {
+        // Even with allowed_services empty (using defaults), an operation whose
+        // service is not in DEFAULT_GWS_SERVICES must fail validation — not silently
+        // pass through to be rejected at runtime.
+        let mut cfg = Config::default();
+        cfg.google_workspace.enabled = true;
+        // allowed_services deliberately left empty
+        cfg.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
+            service: "not_a_real_service".into(),
+            resource: "files".into(),
+            sub_resource: None,
+            methods: vec!["list".into()],
+        }];
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("not in the effective allowed_services"),
+            "expected effective-allowed_services error, got: {err}"
+        );
     }
 
     // ── Bootstrap files ─────────────────────────────────────
