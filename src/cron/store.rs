@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::cron::{
-    next_run_for_schedule, schedule_cron_expression, validate_schedule, CronJob, CronJobPatch,
-    CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
+    next_run_for_schedule, schedule_cron_expression, validate_delivery_config, validate_schedule,
+    CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -24,7 +24,7 @@ pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJ
         expr: expression.to_string(),
         tz: None,
     };
-    add_shell_job(config, None, schedule, command)
+    add_shell_job(config, None, schedule, command, None)
 }
 
 pub fn add_shell_job(
@@ -32,13 +32,16 @@ pub fn add_shell_job(
     name: Option<String>,
     schedule: Schedule,
     command: &str,
+    delivery: Option<DeliveryConfig>,
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
+    validate_delivery_config(delivery.as_ref())?;
     let next_run = next_run_for_schedule(&schedule, now)?;
     let id = Uuid::new_v4().to_string();
     let expression = schedule_cron_expression(&schedule).unwrap_or_default();
     let schedule_json = serde_json::to_string(&schedule)?;
+    let delivery = delivery.unwrap_or_default();
 
     let delete_after_run = matches!(schedule, Schedule::At { .. });
 
@@ -54,7 +57,7 @@ pub fn add_shell_job(
                 command,
                 schedule_json,
                 name,
-                serde_json::to_string(&DeliveryConfig::default())?,
+                serde_json::to_string(&delivery)?,
                 if delete_after_run { 1 } else { 0 },
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
@@ -81,6 +84,7 @@ pub fn add_agent_job(
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
+    validate_delivery_config(delivery.as_ref())?;
     let next_run = next_run_for_schedule(&schedule, now)?;
     let id = Uuid::new_v4().to_string();
     let expression = schedule_cron_expression(&schedule).unwrap_or_default();
@@ -694,6 +698,7 @@ mod tests {
                 at: Utc::now() + ChronoDuration::minutes(10),
             },
             "echo once",
+            None,
         )
         .unwrap();
         assert!(one_shot.delete_after_run);
@@ -703,9 +708,96 @@ mod tests {
             None,
             Schedule::Every { every_ms: 60_000 },
             "echo recurring",
+            None,
         )
         .unwrap();
         assert!(!recurring.delete_after_run);
+    }
+
+    #[test]
+    fn add_shell_job_persists_delivery() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_shell_job(
+            &config,
+            Some("deliver-shell".into()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo delivered",
+            Some(DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("discord".into()),
+                to: Some("1234567890".into()),
+                best_effort: true,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(job.delivery.mode, "announce");
+        assert_eq!(job.delivery.channel.as_deref(), Some("discord"));
+        assert_eq!(job.delivery.to.as_deref(), Some("1234567890"));
+
+        let stored = get_job(&config, &job.id).unwrap();
+        assert_eq!(stored.delivery.mode, "announce");
+        assert_eq!(stored.delivery.channel.as_deref(), Some("discord"));
+        assert_eq!(stored.delivery.to.as_deref(), Some("1234567890"));
+    }
+
+    #[test]
+    fn add_agent_job_rejects_invalid_announce_delivery() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let err = add_agent_job(
+            &config,
+            Some("deliver-agent".into()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "summarize logs",
+            SessionTarget::Isolated,
+            None,
+            Some(DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("discord".into()),
+                to: None,
+                best_effort: true,
+            }),
+            false,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("delivery.to is required"));
+    }
+
+    #[test]
+    fn add_shell_job_rejects_invalid_delivery_mode() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let err = add_shell_job(
+            &config,
+            Some("deliver-shell".into()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo delivered",
+            Some(DeliveryConfig {
+                mode: "annouce".into(),
+                channel: Some("discord".into()),
+                to: Some("1234567890".into()),
+                best_effort: true,
+            }),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unsupported delivery mode"));
     }
 
     #[test]
@@ -1034,7 +1126,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let at = Utc::now() + ChronoDuration::minutes(10);
-        let job = add_shell_job(&config, None, Schedule::At { at }, "echo once").unwrap();
+        let job = add_shell_job(&config, None, Schedule::At { at }, "echo once", None).unwrap();
 
         reschedule_after_run(&config, &job, true, "done").unwrap();
 
@@ -1051,7 +1143,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let at = Utc::now() + ChronoDuration::minutes(10);
-        let job = add_shell_job(&config, None, Schedule::At { at }, "echo once").unwrap();
+        let job = add_shell_job(&config, None, Schedule::At { at }, "echo once", None).unwrap();
 
         reschedule_after_run(&config, &job, false, "failed").unwrap();
 
