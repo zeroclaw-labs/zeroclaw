@@ -48,6 +48,43 @@ const SLACK_ATTACHMENT_FILENAME_MAX_CHARS: usize = 128;
 const SLACK_USER_CACHE_MAX_ENTRIES: usize = 1000;
 const SLACK_ATTACHMENT_SAVE_SUBDIR: &str = "slack_files";
 const SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE: usize = 8;
+
+/// Extract the Slack message timestamp from a ZeroClaw message ID.
+///
+/// Message IDs follow the format `slack_{channel_id}_{ts}` where `ts`
+/// contains a dot (e.g. `"1234567890.123456"`). If the format is
+/// unrecognised the raw `message_id` is returned as-is.
+fn extract_slack_ts(message_id: &str) -> &str {
+    message_id
+        .strip_prefix("slack_")
+        .and_then(|rest| {
+            rest.find('.').map(|dot_pos| {
+                let underscore = rest[..dot_pos].rfind('_').unwrap_or(0);
+                &rest[underscore + 1..]
+            })
+        })
+        .unwrap_or(message_id)
+}
+
+/// Map a Unicode emoji to its Slack short-name.
+///
+/// The orchestration layer passes Unicode characters (e.g. `"\u{1F440}"`).
+/// Slack's reactions API expects colon-free short-names (`"eyes"`).
+fn unicode_emoji_to_slack_name(emoji: &str) -> &str {
+    match emoji {
+        "\u{1F440}" => "eyes",                        // 👀
+        "\u{2705}" => "white_check_mark",             // ✅
+        "\u{26A0}\u{FE0F}" | "\u{26A0}" => "warning", // ⚠️
+        "\u{274C}" => "x",                            // ❌
+        "\u{1F44D}" => "thumbsup",                    // 👍
+        "\u{1F44E}" => "thumbsdown",                  // 👎
+        "\u{2B50}" => "star",                         // ⭐
+        "\u{1F389}" => "tada",                        // 🎉
+        "\u{1F914}" => "thinking_face",               // 🤔
+        "\u{1F525}" => "fire",                        // 🔥
+        _ => emoji.trim_matches(':'),
+    }
+}
 const SLACK_ATTACHMENT_RENDER_CONCURRENCY: usize = 3;
 const SLACK_POLL_ACTIVE_THREAD_MAX: usize = 50;
 const SLACK_POLL_THREAD_EXPIRE_SECS: u64 = 24 * 60 * 60;
@@ -2234,6 +2271,96 @@ impl Channel for SlackChannel {
         Ok(())
     }
 
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let ts = extract_slack_ts(message_id);
+        let name = unicode_emoji_to_slack_name(emoji);
+
+        let body = serde_json::json!({
+            "channel": channel_id,
+            "timestamp": ts,
+            "name": name
+        });
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/reactions.add")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+
+        if !status.is_success() {
+            let sanitized = crate::providers::sanitize_api_error(&text);
+            anyhow::bail!("Slack reactions.add failed ({status}): {sanitized}");
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = parsed
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            if err != "already_reacted" {
+                anyhow::bail!("Slack reactions.add failed: {err}");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let ts = extract_slack_ts(message_id);
+        let name = unicode_emoji_to_slack_name(emoji);
+
+        let body = serde_json::json!({
+            "channel": channel_id,
+            "timestamp": ts,
+            "name": name
+        });
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/reactions.remove")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+
+        if !status.is_success() {
+            let sanitized = crate::providers::sanitize_api_error(&text);
+            anyhow::bail!("Slack reactions.remove failed ({status}): {sanitized}");
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = parsed
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            if err != "no_reaction" {
+                anyhow::bail!("Slack reactions.remove failed: {err}");
+            }
+        }
+
+        Ok(())
+    }
+
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let bot_user_id = self.get_bot_user_id().await.unwrap_or_default();
         let scoped_channels = self.scoped_channel_ids();
@@ -3294,6 +3421,48 @@ mod tests {
         assert!(!SlackChannel::is_supported_message_subtype(Some(
             "message_replied"
         )));
+    }
+
+    #[test]
+    fn extract_slack_ts_from_standard_message_id() {
+        assert_eq!(
+            extract_slack_ts("slack_C1234567890_1234567890.123456"),
+            "1234567890.123456"
+        );
+    }
+
+    #[test]
+    fn extract_slack_ts_from_raw_ts_passthrough() {
+        assert_eq!(extract_slack_ts("1234567890.123456"), "1234567890.123456");
+    }
+
+    #[test]
+    fn extract_slack_ts_from_unprefixed_id() {
+        assert_eq!(extract_slack_ts("unknown_format"), "unknown_format");
+    }
+
+    #[test]
+    fn unicode_emoji_maps_to_slack_eyes() {
+        assert_eq!(unicode_emoji_to_slack_name("\u{1F440}"), "eyes");
+    }
+
+    #[test]
+    fn unicode_emoji_maps_to_slack_check_mark() {
+        assert_eq!(unicode_emoji_to_slack_name("\u{2705}"), "white_check_mark");
+    }
+
+    #[test]
+    fn unicode_emoji_maps_to_slack_warning() {
+        assert_eq!(unicode_emoji_to_slack_name("\u{26A0}\u{FE0F}"), "warning");
+        assert_eq!(unicode_emoji_to_slack_name("\u{26A0}"), "warning");
+    }
+
+    #[test]
+    fn unicode_emoji_colon_wrapped_passthrough() {
+        assert_eq!(
+            unicode_emoji_to_slack_name(":custom_emoji:"),
+            "custom_emoji"
+        );
     }
 
     #[test]
