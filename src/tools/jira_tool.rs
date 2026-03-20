@@ -286,21 +286,12 @@ impl JiraTool {
             .filter_map(|p| p["key"].as_str().map(String::from))
             .collect();
 
+        const STATUS_CONCURRENCY: usize = 5;
+
         let users_url = format!(
             "{}/rest/api/3/user/assignable/multiProjectSearch",
             self.base_url
         );
-
-        let mut statuses_futs = Vec::new();
-        for key in &keys {
-            statuses_futs.push(
-                self.http
-                    .get(format!("{url}/{key}/statuses"))
-                    .basic_auth(&self.email, Some(&self.api_token))
-                    .timeout(std::time::Duration::from_secs(self.timeout_secs))
-                    .send(),
-            );
-        }
 
         let users_resp = self
             .http
@@ -316,27 +307,79 @@ impl JiraTool {
             .map_err(|e| anyhow::anyhow!("Jira list_projects users request failed: {e}"))?;
 
         let users: Vec<Value> = if users_resp.status().is_success() {
-            users_resp.json().await.unwrap_or_default()
+            users_resp
+                .json()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to parse Jira list_projects users response: {e}"))?
         } else {
-            Vec::new()
+            let status = users_resp.status();
+            let text = users_resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Jira list_projects users failed ({status}): {}",
+                crate::util::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS)
+            );
         };
 
-        let mut statuses_results = Vec::new();
-        for fut in statuses_futs {
-            let result: Value = match fut.await {
-                Ok(resp) if resp.status().is_success() => {
-                    resp.json().await.unwrap_or_else(|_| json!([]))
+        let mut set: tokio::task::JoinSet<(usize, anyhow::Result<Value>)> =
+            tokio::task::JoinSet::new();
+        let mut statuses_results = vec![json!([]); keys.len()];
+
+        for (i, key) in keys.iter().enumerate() {
+            if set.len() >= STATUS_CONCURRENCY {
+                if let Some(Ok((idx, result))) = set.join_next().await {
+                    statuses_results[idx] =
+                        result.map_err(|e| anyhow::anyhow!("Jira statuses failed: {e}"))?;
                 }
-                _ => json!([]),
-            };
-            statuses_results.push(result);
+            }
+
+            let client = self.http.clone();
+            let request_url = format!("{url}/{key}/statuses");
+            let email = self.email.clone();
+            let token = self.api_token.clone();
+            let timeout = self.timeout_secs;
+
+            set.spawn(async move {
+                let result = async {
+                    let resp = client
+                        .get(&request_url)
+                        .basic_auth(&email, Some(&token))
+                        .timeout(std::time::Duration::from_secs(timeout))
+                        .send()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("statuses request failed: {e}"))?;
+
+                    if !resp.status().is_success() {
+                        anyhow::bail!("statuses request returned {}", resp.status());
+                    }
+
+                    resp.json::<Value>()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to parse statuses response: {e}"))
+                }
+                .await;
+                (i, result)
+            });
         }
 
-        let shaped = shape_projects(&projects, &statuses_results, &users);
+        while let Some(Ok((idx, result))) = set.join_next().await {
+            statuses_results[idx] =
+                result.map_err(|e| anyhow::anyhow!("Jira statuses failed: {e}"))?;
+        }
 
+        let shaped_projects = shape_projects(&projects, &statuses_results);
+        let shaped_users: Vec<Value> = users
+            .iter()
+            .filter_map(|u| {
+                let display = u["displayName"].as_str()?;
+                let email = u["emailAddress"].as_str()?;
+                Some(json!({ "displayName": display, "emailAddress": email }))
+            })
+            .collect();
+
+        let output = json!({ "projects": shaped_projects, "users": shaped_users });
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&shaped).unwrap_or_else(|_| shaped.to_string()),
+            output: serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
             error: None,
         })
     }
@@ -714,8 +757,8 @@ fn shape_comment_response(raw: &Value) -> Value {
     })
 }
 
-fn shape_projects(projects: &[Value], statuses_per_project: &[Value], users: &[Value]) -> Value {
-    let shaped: Vec<Value> = projects
+fn shape_projects(projects: &[Value], statuses_per_project: &[Value]) -> Vec<Value> {
+    projects
         .iter()
         .zip(statuses_per_project.iter())
         .map(|(p, statuses)| {
@@ -747,19 +790,9 @@ fn shape_projects(projects: &[Value], statuses_per_project: &[Value], users: &[V
                 "style":       p["style"],
                 "issueTypes":  issue_types,
                 "statuses":    ordered,
-                "users":       users.iter().filter_map(|u| {
-                    let display = u["displayName"].as_str()?;
-                    let email = u["emailAddress"].as_str()?;
-                    Some(json!({
-                        "displayName":  display,
-                        "emailAddress": email,
-                    }))
-                }).collect::<Vec<_>>(),
             })
         })
-        .collect();
-
-    json!(shaped)
+        .collect()
 }
 
 // ── Comment / ADF builder ─────────────────────────────────────────────────────
@@ -1414,16 +1447,8 @@ mod tests {
                 ]}
             ]),
         ];
-        let users = json!([
-            { "displayName": "Anatolii Fesiuk", "emailAddress": "a@b.com" }
-        ]);
-
-        let shaped = shape_projects(
-            projects.as_array().unwrap(),
-            &statuses,
-            users.as_array().unwrap(),
-        );
-        let arr = shaped.as_array().unwrap();
+        let shaped = shape_projects(projects.as_array().unwrap(), &statuses);
+        let arr = &shaped;
 
         assert_eq!(arr.len(), 2);
 
@@ -1465,8 +1490,7 @@ mod tests {
             .collect();
         assert_eq!(gp_statuses, vec!["Design", "Done", "To Do"]);
 
-        assert_eq!(arr[0]["users"].as_array().unwrap().len(), 1);
-        assert_eq!(arr[0]["users"][0]["displayName"], "Anatolii Fesiuk");
+        assert!(arr[0].get("users").is_none(), "users should not be in per-project data");
     }
 
     #[test]
@@ -1479,7 +1503,7 @@ mod tests {
                 { "name": "Done" }, { "name": "Custom" }, { "name": "To Do" }, { "name": "Alpha" }
             ]}
         ])];
-        let shaped = shape_projects(projects.as_array().unwrap(), &statuses, &[]);
+        let shaped = shape_projects(projects.as_array().unwrap(), &statuses);
         let ordered: Vec<&str> = shaped[0]["statuses"]
             .as_array()
             .unwrap()
@@ -1491,7 +1515,7 @@ mod tests {
 
     #[test]
     fn shape_projects_empty_inputs() {
-        let shaped = shape_projects(&[], &[], &[]);
-        assert_eq!(shaped.as_array().unwrap().len(), 0);
+        let shaped = shape_projects(&[], &[]);
+        assert_eq!(shaped.len(), 0);
     }
 }
