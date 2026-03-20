@@ -731,6 +731,120 @@ fn parse_stream_entries(entries: &[redis::Value]) -> Option<OrchestratorTask> {
     })
 }
 
+// =============================================================================
+// Orchestrator Inbox — Augusta → Orchestrator bridge
+// =============================================================================
+
+/// Inbox stream where Augusta publishes messages for orchestrator routing.
+const INBOX_STREAM: &str = "orchestrator:inbox";
+/// Results stream prefix where orchestrator publishes responses back.
+const INBOX_RESULTS_PREFIX: &str = "augusta:results";
+
+/// Publish a channel message to the orchestrator inbox and wait for a response.
+///
+/// Used by iMessage (and future channels) to forward messages through the
+/// orchestrator's VCore routing instead of handling them locally.
+///
+/// Returns the orchestrator's response text, or an error if unreachable/timeout.
+#[cfg(feature = "orchestrator")]
+pub async fn publish_to_inbox(
+    redis_url: &str,
+    message: &super::traits::ChannelMessage,
+    timeout_ms: u64,
+) -> Result<String> {
+    let client = redis::Client::open(redis_url)
+        .map_err(|e| anyhow::anyhow!("Inbox Redis connect failed: {e}"))?;
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(|e| anyhow::anyhow!("Inbox Redis async connect failed: {e}"))?;
+
+    let message_id = &message.id;
+
+    // Publish to orchestrator:inbox
+    let _: String = redis::cmd("XADD")
+        .arg(INBOX_STREAM)
+        .arg("*")
+        .arg("message_id")
+        .arg(message_id)
+        .arg("source_channel")
+        .arg(&message.channel)
+        .arg("sender_id")
+        .arg(&message.sender)
+        .arg("chat_id")
+        .arg(format!("{}:{}", message.channel, message.sender))
+        .arg("content")
+        .arg(&message.content)
+        .arg("timestamp")
+        .arg(message.timestamp.to_string())
+        .arg("reply_channel")
+        .arg(&message.channel)
+        .arg("reply_target")
+        .arg(&message.reply_target)
+        .query_async(&mut conn)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to publish to inbox: {e}"))?;
+
+    tracing::info!(
+        message_id = %message_id,
+        channel = %message.channel,
+        sender = %message.sender,
+        "Published to orchestrator inbox"
+    );
+
+    // Wait for response on augusta:results:{message_id}
+    let result_stream = format!("{INBOX_RESULTS_PREFIX}:{message_id}");
+    let redix_timeout = timeout_ms + 5_000;
+
+    let result: redis::RedisResult<Vec<redis::Value>> = redis::cmd("XREAD")
+        .arg("BLOCK")
+        .arg(timeout_ms.to_string())
+        .arg("STREAMS")
+        .arg(&result_stream)
+        .arg("0")
+        .query_async(&mut conn)
+        .await;
+
+    // Cleanup the result stream
+    let _: redis::RedisResult<i32> = redis::cmd("DEL")
+        .arg(&result_stream)
+        .query_async(&mut conn)
+        .await;
+
+    match result {
+        Ok(entries) if !entries.is_empty() => {
+            if let Some(fields) = parse_stream_fields(&entries) {
+                let output = fields
+                    .get("output")
+                    .or_else(|| fields.get("content"))
+                    .cloned()
+                    .unwrap_or_else(|| "No response content".to_string());
+                Ok(output)
+            } else {
+                anyhow::bail!("Failed to parse orchestrator response")
+            }
+        }
+        Ok(_) => anyhow::bail!("Orchestrator response timeout ({timeout_ms}ms)"),
+        Err(e) => anyhow::bail!("Failed to read orchestrator response: {e}"),
+    }
+}
+
+/// Check if the orchestrator is reachable via Redis.
+#[cfg(feature = "orchestrator")]
+pub async fn orchestrator_reachable(redis_url: &str) -> bool {
+    let client = match redis::Client::open(redis_url) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    match client.get_multiplexed_async_connection().await {
+        Ok(mut conn) => {
+            let result: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut conn).await;
+            result.is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

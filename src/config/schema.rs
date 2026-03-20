@@ -3147,6 +3147,16 @@ impl ChannelConfig for WebhookConfig {
 pub struct IMessageConfig {
     /// Allowed iMessage contacts (phone numbers or email addresses). Empty = deny all.
     pub allowed_contacts: Vec<String>,
+    /// Poll interval in seconds for checking new messages. Default: 2.
+    #[serde(default = "default_imessage_poll_interval")]
+    pub poll_interval_secs: u64,
+    /// Custom path to Messages chat.db. Default: ~/Library/Messages/chat.db
+    #[serde(default)]
+    pub db_path: Option<String>,
+}
+
+fn default_imessage_poll_interval() -> u64 {
+    2
 }
 
 impl ChannelConfig for IMessageConfig {
@@ -6233,17 +6243,23 @@ tool_dispatcher = "xml"
     async fn imessage_config_serde() {
         let ic = IMessageConfig {
             allowed_contacts: vec!["+1234567890".into(), "user@icloud.com".into()],
+            poll_interval_secs: 2,
+            db_path: None,
         };
         let json = serde_json::to_string(&ic).unwrap();
         let parsed: IMessageConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.allowed_contacts.len(), 2);
         assert_eq!(parsed.allowed_contacts[0], "+1234567890");
+        assert_eq!(parsed.poll_interval_secs, 2);
+        assert!(parsed.db_path.is_none());
     }
 
     #[test]
     async fn imessage_config_empty_contacts() {
         let ic = IMessageConfig {
             allowed_contacts: vec![],
+            poll_interval_secs: 2,
+            db_path: None,
         };
         let json = serde_json::to_string(&ic).unwrap();
         let parsed: IMessageConfig = serde_json::from_str(&json).unwrap();
@@ -6254,6 +6270,8 @@ tool_dispatcher = "xml"
     async fn imessage_config_wildcard() {
         let ic = IMessageConfig {
             allowed_contacts: vec!["*".into()],
+            poll_interval_secs: 5,
+            db_path: None,
         };
         let toml_str = toml::to_string(&ic).unwrap();
         let parsed: IMessageConfig = toml::from_str(&toml_str).unwrap();
@@ -6370,6 +6388,8 @@ allowed_users = ["@ops:matrix.org"]
             webhook: None,
             imessage: Some(IMessageConfig {
                 allowed_contacts: vec!["+1".into()],
+                poll_interval_secs: 2,
+                db_path: None,
             }),
             matrix: Some(MatrixConfig {
                 homeserver: "https://m.org".into(),
