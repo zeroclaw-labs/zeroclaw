@@ -69,6 +69,7 @@ const QWEN_US_BASE_URL: &str = "https://dashscope-us.aliyuncs.com/compatible-mod
 const QWEN_CODING_INTL_BASE_URL: &str = "https://coding-intl.dashscope.aliyuncs.com/v1";
 const QWEN_CODING_CN_BASE_URL: &str = "https://coding.dashscope.aliyuncs.com/v1";
 const QWEN_OAUTH_BASE_FALLBACK_URL: &str = QWEN_CN_BASE_URL;
+const BAILIAN_BASE_URL: &str = "https://coding.dashscope.aliyuncs.com/v1";
 const QWEN_OAUTH_TOKEN_ENDPOINT: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
 const QWEN_OAUTH_PLACEHOLDER: &str = "qwen-oauth";
 const QWEN_OAUTH_TOKEN_ENV: &str = "QWEN_OAUTH_TOKEN";
@@ -136,7 +137,7 @@ pub(crate) fn is_moonshot_alias(name: &str) -> bool {
 pub(crate) fn is_qwen_cn_alias(name: &str) -> bool {
     matches!(
         name,
-        "qwen" | "dashscope" | "qwen-cn" | "dashscope-cn" | "bailian"
+        "qwen" | "dashscope" | "qwen-cn" | "dashscope-cn"
     )
 }
 
@@ -168,6 +169,10 @@ pub(crate) fn is_qwen_us_alias(name: &str) -> bool {
 
 pub(crate) fn is_qwen_oauth_alias(name: &str) -> bool {
     matches!(name, "qwen-code" | "qwen-oauth" | "qwen_oauth")
+}
+
+pub(crate) fn is_bailian_alias(name: &str) -> bool {
+    matches!(name, "bailian" | "aliyun-bailian" | "aliyun")
 }
 
 pub(crate) fn is_qwen_alias(name: &str) -> bool {
@@ -643,6 +648,8 @@ pub(crate) fn canonical_china_provider_name(name: &str) -> Option<&'static str> 
         Some("qianfan")
     } else if is_doubao_alias(name) {
         Some("doubao")
+    } else if is_bailian_alias(name) {
+        Some("bailian")
     } else {
         None
     }
@@ -936,6 +943,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
             "BAILIAN_API_KEY",
         ],
         name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY", "BAILIAN_API_KEY"],
+        name if is_bailian_alias(name) => vec!["BAILIAN_API_KEY", "DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
@@ -1327,6 +1335,16 @@ fn create_provider_with_url_and_options(
                 Some(&anthropic_url),
             )))
         }
+        name if is_bailian_alias(name) => Ok(Box::new(
+            OpenAiCompatibleProvider::new_with_user_agent_and_vision(
+                "Bailian",
+                BAILIAN_BASE_URL,
+                key,
+                AuthStyle::Bearer,
+                "openclaw",
+                true,
+            )
+        )),
         name if qwen_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new_with_vision(
             "Qwen",
             qwen_base_url(name).expect("checked in guard"),
@@ -1973,6 +1991,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "bailian",
+            display_name: "Bailian (Aliyun)",
+            aliases: &["aliyun-bailian", "aliyun"],
+            local: false,
+        },
+        ProviderInfo {
             name: "groq",
             display_name: "Groq",
             aliases: &[],
@@ -2448,6 +2472,12 @@ mod tests {
         assert_eq!(canonical_china_provider_name("baidu"), Some("qianfan"));
         assert_eq!(canonical_china_provider_name("doubao"), Some("doubao"));
         assert_eq!(canonical_china_provider_name("volcengine"), Some("doubao"));
+        assert_eq!(canonical_china_provider_name("bailian"), Some("bailian"));
+        assert_eq!(
+            canonical_china_provider_name("aliyun-bailian"),
+            Some("bailian")
+        );
+        assert_eq!(canonical_china_provider_name("aliyun"), Some("bailian"));
         assert_eq!(canonical_china_provider_name("openai"), None);
     }
 
