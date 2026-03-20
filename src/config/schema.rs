@@ -5412,6 +5412,10 @@ fn default_otp_gated_actions() -> Vec<String> {
     ]
 }
 
+fn default_otp_challenge_max_attempts() -> u32 {
+    3
+}
+
 impl Default for OtpConfig {
     fn default() -> Self {
         Self {
@@ -7417,6 +7421,9 @@ impl Config {
             anyhow::bail!(
                 "security.otp.cache_valid_secs must be greater than or equal to security.otp.token_ttl_secs"
             );
+        }
+        if self.security.otp.challenge_max_attempts == 0 {
+            anyhow::bail!("security.otp.challenge_max_attempts must be greater than 0");
         }
         for (i, action) in self.security.otp.gated_actions.iter().enumerate() {
             let normalized = action.trim();
