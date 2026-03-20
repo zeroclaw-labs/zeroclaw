@@ -131,6 +131,73 @@ pub fn hybrid_merge(
     results
 }
 
+/// Reciprocal Rank Fusion (RRF) merge for vector + keyword ranked lists.
+///
+/// Classic RRF formula: `score = Σ 1 / (k + rank_i)` where k=60 (standard constant).
+/// Items appearing in both lists receive contributions from each rank list.
+/// Items only in one list still get their single RRF score.
+///
+/// Unlike `hybrid_merge` (weighted score fusion), RRF is robust to score scale
+/// differences and rewards results that rank highly across multiple retrieval methods.
+pub fn rrf_merge(
+    vector_results: &[(String, f32)],  // (id, cosine_similarity) — ordered by caller
+    keyword_results: &[(String, f32)], // (id, bm25_score) — ordered by caller
+    limit: usize,
+) -> Vec<ScoredResult> {
+    use std::collections::HashMap;
+
+    const K: f32 = 60.0;
+
+    let mut map: HashMap<String, ScoredResult> = HashMap::new();
+
+    // Sort vector results descending (highest cosine = rank 1)
+    let mut vec_sorted = vector_results.to_vec();
+    vec_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    for (rank, (id, score)) in vec_sorted.iter().enumerate() {
+        let rrf_score = 1.0 / (K + rank as f32 + 1.0);
+        map.entry(id.clone())
+            .and_modify(|r| {
+                r.vector_score = Some(*score);
+                r.final_score += rrf_score;
+            })
+            .or_insert_with(|| ScoredResult {
+                id: id.clone(),
+                vector_score: Some(*score),
+                keyword_score: None,
+                final_score: rrf_score,
+            });
+    }
+
+    // Sort keyword results descending (highest BM25 = rank 1)
+    let mut kw_sorted = keyword_results.to_vec();
+    kw_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    for (rank, (id, score)) in kw_sorted.iter().enumerate() {
+        let rrf_score = 1.0 / (K + rank as f32 + 1.0);
+        map.entry(id.clone())
+            .and_modify(|r| {
+                r.keyword_score = Some(*score);
+                r.final_score += rrf_score;
+            })
+            .or_insert_with(|| ScoredResult {
+                id: id.clone(),
+                vector_score: None,
+                keyword_score: Some(*score),
+                final_score: rrf_score,
+            });
+    }
+
+    let mut results: Vec<ScoredResult> = map.into_values().collect();
+    results.sort_by(|a, b| {
+        b.final_score
+            .partial_cmp(&a.final_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.truncate(limit);
+    results
+}
+
 #[cfg(test)]
 #[allow(
     clippy::float_cmp,

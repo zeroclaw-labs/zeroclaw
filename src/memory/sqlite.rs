@@ -509,7 +509,8 @@ impl Memory for SqliteMemory {
                 Vec::new()
             };
 
-            // Hybrid merge
+            // RRF merge: use rank-position fusion when both sources have results;
+            // fall back to keyword-only when embeddings are unavailable.
             let merged = if vector_results.is_empty() {
                 keyword_results
                     .iter()
@@ -521,11 +522,9 @@ impl Memory for SqliteMemory {
                     })
                     .collect::<Vec<_>>()
             } else {
-                vector::hybrid_merge(
+                vector::rrf_merge(
                     &vector_results,
                     &keyword_results,
-                    vector_weight,
-                    keyword_weight,
                     limit,
                 )
             };

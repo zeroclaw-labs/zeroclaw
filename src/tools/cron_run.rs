@@ -1,6 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron;
+use crate::memory::Memory;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
@@ -8,11 +9,12 @@ use std::sync::Arc;
 
 pub struct CronRunTool {
     config: Arc<Config>,
+    mem: Arc<dyn Memory>,
 }
 
 impl CronRunTool {
-    pub fn new(config: Arc<Config>) -> Self {
-        Self { config }
+    pub fn new(config: Arc<Config>, mem: Arc<dyn Memory>) -> Self {
+        Self { config, mem }
     }
 }
 
@@ -68,7 +70,7 @@ impl Tool for CronRunTool {
         };
 
         let started_at = Utc::now();
-        let (success, output) = cron::scheduler::execute_job_now(&self.config, &job).await;
+        let (success, output) = cron::scheduler::execute_job_now(&self.config, &job, Arc::clone(&self.mem)).await;
         let finished_at = Utc::now();
         let duration_ms = (finished_at - started_at).num_milliseconds();
         let status = if success { "ok" } else { "error" };
@@ -124,7 +126,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
         let job = cron::add_job(&cfg, "*/5 * * * *", "echo run-now").unwrap();
-        let tool = CronRunTool::new(cfg.clone());
+        let tool = CronRunTool::new(cfg.clone(), Arc::new(crate::memory::NoneMemory::new()));
 
         let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
         assert!(result.success, "{:?}", result.error);
@@ -137,7 +139,7 @@ mod tests {
     async fn errors_for_missing_job() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let tool = CronRunTool::new(cfg);
+        let tool = CronRunTool::new(cfg, Arc::new(crate::memory::NoneMemory::new()));
 
         let result = tool
             .execute(json!({ "job_id": "missing-job-id" }))

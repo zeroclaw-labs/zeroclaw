@@ -1,3 +1,4 @@
+use crate::memory::Memory;
 use crate::channels::{
     Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
 };
@@ -31,7 +32,7 @@ static DELIVERY_DEDUP_CACHE: LazyLock<Mutex<HashMap<String, DateTime<Utc>>>> =
 static PROACTIVE_WINDOW_CACHE: LazyLock<Mutex<HashMap<String, DateTime<Utc>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-pub async fn run(config: Config) -> Result<()> {
+pub async fn run(config: Config, memory: Arc<dyn Memory>) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
     let security = Arc::new(SecurityPolicy::from_config(
@@ -57,19 +58,20 @@ pub async fn run(config: Config) -> Result<()> {
         // when there are no due jobs.
         crate::health::mark_component_ok("scheduler");
 
-        process_due_jobs(&config, &security, jobs).await;
+        process_due_jobs(&config, &security, jobs, Arc::clone(&memory)).await;
     }
 }
 
-pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
+pub async fn execute_job_now(config: &Config, job: &CronJob, memory: Arc<dyn Memory>) -> (bool, String) {
     let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-    execute_job_with_retry(config, &security, job).await
+    execute_job_with_retry(config, &security, job, memory).await
 }
 
 async fn execute_job_with_retry(
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
+    memory: Arc<dyn Memory>,
 ) -> (bool, String) {
     if should_suppress_for_same_window(job) {
         return (
@@ -94,7 +96,7 @@ async fn execute_job_with_retry(
     for attempt in 0..=retries {
         let (success, output) = match job.job_type {
             JobType::Shell => run_job_command(config, security, job).await,
-            JobType::Agent => run_agent_job(config, job).await,
+            JobType::Agent => run_agent_job(config, job, Arc::clone(&memory)).await,
         };
         last_output = output;
 
@@ -117,12 +119,13 @@ async fn execute_job_with_retry(
     (false, last_output)
 }
 
-async fn process_due_jobs(config: &Config, security: &Arc<SecurityPolicy>, jobs: Vec<CronJob>) {
+async fn process_due_jobs(config: &Config, security: &Arc<SecurityPolicy>, jobs: Vec<CronJob>, memory: Arc<dyn Memory>) {
     let max_concurrent = config.scheduler.max_concurrent.max(1);
     let mut in_flight = stream::iter(jobs.into_iter().map(|job| {
         let config = config.clone();
         let security = Arc::clone(security);
-        async move { execute_and_persist_job(&config, security.as_ref(), &job).await }
+        let memory = Arc::clone(&memory);
+        async move { execute_and_persist_job(&config, security.as_ref(), &job, memory).await }
     }))
     .buffer_unordered(max_concurrent);
 
@@ -137,19 +140,20 @@ async fn execute_and_persist_job(
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
+    memory: Arc<dyn Memory>,
 ) -> (String, bool) {
     crate::health::mark_component_ok("scheduler");
     warn_if_high_frequency_agent_job(job);
 
     let started_at = Utc::now();
-    let (success, output) = execute_job_with_retry(config, security, job).await;
+    let (success, output) = execute_job_with_retry(config, security, job, memory).await;
     let finished_at = Utc::now();
     let success = persist_job_result(config, job, success, &output, started_at, finished_at).await;
 
     (job.id.clone(), success)
 }
 
-async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String) {
+async fn run_agent_job(config: &Config, job: &CronJob, memory: Arc<dyn Memory>) -> (bool, String) {
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let mut prompt = job.prompt.clone().unwrap_or_default();
 
@@ -171,6 +175,7 @@ async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String) {
                 model_override,
                 config.default_temperature,
                 vec![],
+                Some(Arc::clone(&memory)),
             )
             .await
         }
@@ -825,7 +830,7 @@ mod tests {
         .unwrap();
         let job = test_job("sh ./retry-once.sh");
 
-        let (success, output) = execute_job_with_retry(&config, &security, &job).await;
+        let (success, output) = execute_job_with_retry(&config, &security, &job, Arc::new(crate::memory::NoneMemory::new())).await;
         assert!(success);
         assert!(output.contains("recovered"));
     }
@@ -840,7 +845,7 @@ mod tests {
 
         let job = test_job("ls always_missing_for_retry_test");
 
-        let (success, output) = execute_job_with_retry(&config, &security, &job).await;
+        let (success, output) = execute_job_with_retry(&config, &security, &job, Arc::new(crate::memory::NoneMemory::new())).await;
         assert!(!success);
         assert!(output.contains("always_missing_for_retry_test"));
     }
@@ -853,7 +858,7 @@ mod tests {
         job.job_type = JobType::Agent;
         job.prompt = Some("Say hello".into());
 
-        let (success, output) = run_agent_job(&config, &job).await;
+        let (success, output) = run_agent_job(&config, &job, Arc::new(crate::memory::NoneMemory::new())).await;
         assert!(!success, "Agent job without provider key should fail");
         assert!(
             !output.is_empty(),

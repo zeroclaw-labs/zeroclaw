@@ -401,11 +401,9 @@ impl Agent {
             return results;
         }
 
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            results.push(self.execute_tool_call(call).await);
-        }
-        results
+        // Fire all tool calls concurrently and collect in original order.
+        let futures: Vec<_> = calls.iter().map(|call| self.execute_tool_call(call)).collect();
+        futures::future::join_all(futures).await
     }
 
     fn classify_model(&self, user_message: &str) -> String {
