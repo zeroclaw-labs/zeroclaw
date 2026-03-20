@@ -1160,9 +1160,12 @@ fn create_provider_with_url_and_options(
         "telnyx" => Ok(Box::new(telnyx::TelnyxProvider::new(key))),
 
         // ── OpenAI-compatible providers ──────────────────────
-        "venice" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Venice", "https://api.venice.ai", key, AuthStyle::Bearer,
-        ))),
+        "venice" => Ok(compat(
+            OpenAiCompatibleProvider::new(
+                "Venice", "https://api.venice.ai", key, AuthStyle::Bearer,
+            )
+            .without_native_tools(),
+        )),
         "vercel" | "vercel-ai" => Ok(compat(OpenAiCompatibleProvider::new(
             "Vercel AI Gateway",
             VERCEL_AI_GATEWAY_BASE_URL,
@@ -2457,7 +2460,11 @@ mod tests {
 
     #[test]
     fn factory_venice() {
-        assert!(create_provider("venice", Some("vn-key")).is_ok());
+        let provider = create_provider("venice", Some("vn-key")).unwrap();
+        assert!(
+            !provider.capabilities().native_tool_calling,
+            "Venice should use prompt-guided tools, not native tool calling"
+        );
     }
 
     #[test]
