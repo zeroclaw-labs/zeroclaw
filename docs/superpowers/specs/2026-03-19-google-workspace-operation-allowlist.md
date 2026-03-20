@@ -236,7 +236,7 @@ pub allowed_operations: Vec<GoogleWorkspaceAllowedOperation>
 1. Add config validation tests for invalid `allowed_operations`.
 2. Add tool tests for allow-all fallback when `allowed_operations` is empty.
 3. Add tool tests for exact allowlist matching.
-4. Add tool tests that deny unlisted operations such as `gmail/drafts/send`.
+4. Add tool tests that deny unlisted operations such as `gmail/users/drafts/send`.
 5. Implement the config model and runtime checks.
 6. Update docs with the new config shape and the Gmail draft-only pattern.
 
