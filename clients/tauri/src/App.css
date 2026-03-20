@@ -870,6 +870,107 @@ html, body {
   color: #f87171;
 }
 
+/* Sidebar popup overlay (for Channels / Tools) */
+.sidebar-popup-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.sidebar-popup {
+  background: #1f2937;
+  border: 1px solid #374151;
+  border-radius: 12px;
+  width: 90%;
+  max-width: 480px;
+  max-height: 80vh;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+.sidebar-popup-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #374151;
+}
+
+.sidebar-popup-header h3 {
+  font-size: 14px;
+  font-weight: 600;
+  color: #f3f4f6;
+}
+
+.sidebar-popup-header button {
+  background: none;
+  border: none;
+  color: #9ca3af;
+  cursor: pointer;
+  font-size: 18px;
+  padding: 4px;
+}
+
+.sidebar-popup-body {
+  font-size: 13px;
+}
+
+/* LLM Model selector */
+.sidebar-model-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar-model-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  color: #d1d5db;
+  border: none;
+  background: none;
+  width: 100%;
+  text-align: left;
+  transition: background 0.15s;
+}
+
+.sidebar-model-item:hover {
+  background: rgba(59, 130, 246, 0.1);
+}
+
+.sidebar-model-item.active {
+  background: rgba(59, 130, 246, 0.15);
+  color: #60a5fa;
+}
+
+.sidebar-model-tier {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-left: auto;
+}
+
+.sidebar-model-tier.premium { background: #7c3aed20; color: #a78bfa; }
+.sidebar-model-tier.standard { background: #2563eb20; color: #60a5fa; }
+.sidebar-model-tier.fast { background: #10b98120; color: #34d399; }
+
+.sidebar-model-provider {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #6b7280;
+  padding: 8px 8px 4px;
+}
+
 /* Workspace connect buttons */
 .sidebar-workspace-btn {
   display: flex;
@@ -947,6 +1048,23 @@ html, body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.chat-header-info {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 11px;
+  color: #9ca3af;
+  margin-left: 8px;
+}
+
+.chat-header-device,
+.chat-header-model {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
 }
 
 .chat-header-status {

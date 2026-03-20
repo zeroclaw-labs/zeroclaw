@@ -134,6 +134,7 @@ const MAX_WS_SESSION_ID_LEN: usize = 128;
 struct WsQueryParams {
     token: Option<String>,
     session_id: Option<String>,
+    target_device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -184,6 +185,9 @@ fn parse_ws_query_params(raw_query: Option<&str>) -> WsQueryParams {
             }
             "session_id" if params.session_id.is_none() => {
                 params.session_id = normalize_ws_session_id(Some(value));
+            }
+            "target_device_id" if params.target_device_id.is_none() => {
+                params.target_device_id = Some(value.to_string());
             }
             _ => {}
         }
@@ -464,8 +468,9 @@ pub async fn handle_ws_chat(
     let session_id = query_params
         .session_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let target_device_id = query_params.target_device_id;
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, user_id))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, user_id, target_device_id))
         .into_response()
 }
 
@@ -498,6 +503,7 @@ async fn try_relay_to_local_device(
     content: &str,
     _session_id: &str,
     provider_name: &str,
+    target_device_id: Option<&str>,
 ) -> DeviceRelayResult {
     // Need both device_router and auth_store to find user's devices
     let (device_router, auth_store) =
@@ -517,10 +523,16 @@ async fn try_relay_to_local_device(
         Err(_) => return DeviceRelayResult::NoDevice,
     };
 
-    // Find the first online device
-    let online_device = devices
-        .iter()
-        .find(|d| device_router.is_device_online(&d.device_id));
+    // Find the target device (if specified) or the first online device
+    let online_device = if let Some(target_id) = target_device_id {
+        devices
+            .iter()
+            .find(|d| d.device_id == target_id && device_router.is_device_online(&d.device_id))
+    } else {
+        devices
+            .iter()
+            .find(|d| device_router.is_device_online(&d.device_id))
+    };
 
     let device = match online_device {
         Some(d) => d,
@@ -741,6 +753,7 @@ async fn try_relay_to_local_device_with_proxy(
     content: &str,
     _session_id: &str,
     provider_name: &str,
+    target_device_id: Option<&str>,
 ) -> DeviceRelayResult {
     let (device_router, auth_store) =
         match (state.device_router.as_ref(), state.auth_store.as_ref()) {
@@ -758,12 +771,22 @@ async fn try_relay_to_local_device_with_proxy(
         Err(_) => return DeviceRelayResult::NoDevice,
     };
 
-    let device = match devices
-        .iter()
-        .find(|d| device_router.is_device_online(&d.device_id))
-    {
-        Some(d) => d,
-        None => return DeviceRelayResult::NoDevice,
+    let device = if let Some(target_id) = target_device_id {
+        match devices
+            .iter()
+            .find(|d| d.device_id == target_id && device_router.is_device_online(&d.device_id))
+        {
+            Some(d) => d,
+            None => return DeviceRelayResult::NoDevice,
+        }
+    } else {
+        match devices
+            .iter()
+            .find(|d| device_router.is_device_online(&d.device_id))
+        {
+            Some(d) => d,
+            None => return DeviceRelayResult::NoDevice,
+        }
     };
 
     // Issue a short-lived proxy token (15 minutes) for LLM proxy calls.
@@ -890,6 +913,7 @@ async fn handle_socket(
     state: AppState,
     session_id: String,
     user_id: Option<String>,
+    target_device_id: Option<String>,
 ) {
     let ws_session_id = format!("ws_{}", Uuid::new_v4());
 
@@ -991,6 +1015,7 @@ async fn handle_socket(
             &content,
             &session_id,
             &provider_name,
+            target_device_id.as_deref(),
         )
         .await;
 
@@ -1026,6 +1051,7 @@ async fn handle_socket(
                         &content,
                         &session_id,
                         &provider_name,
+                        target_device_id.as_deref(),
                     )
                     .await;
                     match hybrid_result {

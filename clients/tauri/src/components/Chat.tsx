@@ -79,6 +79,8 @@ interface ChatProps {
   onOpenInterpreter?: () => void;
   onToggleSidebar: () => void;
   sidebarOpen: boolean;
+  currentDeviceName?: string;
+  currentModel?: string;
 }
 
 export function Chat({
@@ -91,6 +93,8 @@ export function Chat({
   onOpenInterpreter: _onOpenInterpreter,
   onToggleSidebar,
   sidebarOpen,
+  currentDeviceName = "",
+  currentModel = "",
 }: ChatProps) {
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -421,6 +425,12 @@ export function Chat({
                 : t("new_chat", locale)))
             : t("app_title", locale)}
         </span>
+        {(currentDeviceName || currentModel) && (
+          <div className="chat-header-info">
+            {currentDeviceName && <span className="chat-header-device">{"\uD83D\uDCF1"} {currentDeviceName}</span>}
+            {currentModel && <span className="chat-header-model">{"\uD83E\uDD16"} {currentModel}</span>}
+          </div>
+        )}
         <div className="chat-header-status">
           <div className={`status-dot ${isConnected ? "connected" : ""}`} />
           <span>{isConnected ? t("connected", locale) : t("disconnected", locale)}</span>
