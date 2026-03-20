@@ -22,10 +22,11 @@ pub struct GenImageTool {
 
 /// Build a structured success result with JSON metadata + `[IMAGE:path]` marker.
 fn success_result(path: &std::path::Path) -> ToolResult {
-    let display = path.display();
+    let path_str = path.display().to_string();
+    let meta = json!({"ok": true, "file": path_str});
     ToolResult {
         success: true,
-        output: format!("{{\"ok\":true,\"file\":\"{display}\"}}\n[IMAGE:{display}]"),
+        output: format!("{meta}\n[IMAGE:{path_str}]"),
         error: None,
     }
 }
