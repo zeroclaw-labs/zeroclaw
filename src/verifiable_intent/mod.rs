@@ -34,6 +34,4 @@ pub mod issuance;
 pub mod types;
 pub mod verification;
 
-pub use error::{ViError, ViErrorKind};
-pub use types::*;
-pub use verification::{ChainVerificationResult, ConstraintCheckResult, StrictnessMode};
+pub use verification::StrictnessMode;
