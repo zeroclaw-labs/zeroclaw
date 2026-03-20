@@ -40,9 +40,26 @@ const BACKEND_OPTIONS = [
   "none",
 ];
 
+const MEMORY_TAB_KEY = "jhedaiclaw_memory_tab";
+
 export default function Memory() {
-  // Tab state
-  const [activeTab, setActiveTab] = useState<"store" | "graph">("store");
+  // Tab state — persisted in localStorage
+  const [activeTab, setActiveTab] = useState<"store" | "graph">(() => {
+    try {
+      const saved = localStorage.getItem(MEMORY_TAB_KEY);
+      return saved === "graph" ? "graph" : "store";
+    } catch {
+      return "store";
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(MEMORY_TAB_KEY, activeTab);
+    } catch {
+      // ignore
+    }
+  }, [activeTab]);
 
   // Backend selector
   const [currentBackend, setCurrentBackend] = useState<string>("sqlite");

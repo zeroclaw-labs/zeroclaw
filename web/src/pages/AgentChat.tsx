@@ -1,32 +1,18 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Send, Bot, User, AlertCircle, Copy, Check } from "lucide-react";
-import type { WsMessage } from "@/types/api";
-import { WebSocketClient } from "@/lib/ws";
-import { generateUUID } from "@/lib/uuid";
 import { useDraft } from "@/hooks/useDraft";
-
-interface ChatMessage {
-  id: string;
-  role: "user" | "agent";
-  content: string;
-  timestamp: Date;
-}
+import { useChatSocket } from "@/hooks/useChatSocket";
 
 const DRAFT_KEY = "agent-chat";
 
 export default function AgentChat() {
   const { draft, saveDraft, clearDraft } = useDraft(DRAFT_KEY);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [input, setInput] = useState(draft);
-  const [typing, setTyping] = useState(false);
-  const [connected, setConnected] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const { messages, connected, typing, error, sendMessage } = useChatSocket();
 
-  const wsRef = useRef<WebSocketClient | null>(null);
+  const [input, setInput] = useState(draft);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const pendingContentRef = useRef("");
 
   // Persist draft to in-memory store so it survives route changes
   useEffect(() => {
@@ -34,122 +20,14 @@ export default function AgentChat() {
   }, [input, saveDraft]);
 
   useEffect(() => {
-    const ws = new WebSocketClient();
-
-    ws.onOpen = () => {
-      setConnected(true);
-      setError(null);
-    };
-
-    ws.onClose = () => {
-      setConnected(false);
-    };
-
-    ws.onError = () => {
-      setError("Connection error. Attempting to reconnect...");
-    };
-
-    ws.onMessage = (msg: WsMessage) => {
-      switch (msg.type) {
-        case "chunk":
-          setTyping(true);
-          pendingContentRef.current += msg.content ?? "";
-          break;
-
-        case "message":
-        case "done": {
-          const content =
-            msg.full_response ?? msg.content ?? pendingContentRef.current;
-          if (content) {
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: generateUUID(),
-                role: "agent",
-                content,
-                timestamp: new Date(),
-              },
-            ]);
-          }
-          pendingContentRef.current = "";
-          setTyping(false);
-          break;
-        }
-
-        case "tool_call":
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: generateUUID(),
-              role: "agent",
-              content: `[Tool Call] ${msg.name ?? "unknown"}(${JSON.stringify(msg.args ?? {})})`,
-              timestamp: new Date(),
-            },
-          ]);
-          break;
-
-        case "tool_result":
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: generateUUID(),
-              role: "agent",
-              content: `[Tool Result] ${msg.output ?? ""}`,
-              timestamp: new Date(),
-            },
-          ]);
-          break;
-
-        case "error":
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: generateUUID(),
-              role: "agent",
-              content: `[Error] ${msg.message ?? "Unknown error"}`,
-              timestamp: new Date(),
-            },
-          ]);
-          setTyping(false);
-          pendingContentRef.current = "";
-          break;
-      }
-    };
-
-    ws.connect();
-    wsRef.current = ws;
-
-    return () => {
-      ws.disconnect();
-    };
-  }, []);
-
-  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, typing]);
 
   const handleSend = () => {
     const trimmed = input.trim();
-    if (!trimmed || !wsRef.current?.connected) return;
+    if (!trimmed || !connected) return;
 
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: generateUUID(),
-        role: "user",
-        content: trimmed,
-        timestamp: new Date(),
-      },
-    ]);
-
-    try {
-      wsRef.current.sendMessage(trimmed);
-      setTyping(true);
-      pendingContentRef.current = "";
-    } catch {
-      setError("Failed to send message. Please try again.");
-    }
-
+    sendMessage(trimmed);
     setInput("");
     clearDraft();
     if (inputRef.current) {
@@ -261,7 +139,7 @@ export default function AgentChat() {
                     msg.role === "user" ? "text-white/50" : "text-[#334060]"
                   }`}
                 >
-                  {msg.timestamp.toLocaleTimeString()}
+                  {new Date(msg.timestamp).toLocaleTimeString()}
                 </p>
               </div>
               <button
