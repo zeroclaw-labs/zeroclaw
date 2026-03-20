@@ -4870,7 +4870,7 @@ impl EmotionStickerConfig {
 const EMOTION_CLASSIFY_SYSTEM: &str = "Classify the emotion in this assistant reply. Return ONLY one word: happy, sad, excited, thinking, proud, amused, sympathetic, surprised, confused, angry, love, cool, or 'none' if no strong emotion.";
 
 /// Known valid emotion labels.
-const EMOTION_LABELS: &[&str] = &[
+pub const EMOTION_LABELS: &[&str] = &[
     "happy",
     "sad",
     "excited",
@@ -5082,7 +5082,13 @@ pub async fn append_emotion_sticker(
                         return format!("{response}\n[EMOTION_STICKER:{send_path}]");
                     }
                 }
-                tracing::warn!("Emotion sticker: gen_image did not produce file for '{emotion}'");
+                tracing::warn!(
+                    emotion = %emotion,
+                    success = result.success,
+                    output = %result.output,
+                    error = ?result.error,
+                    "Emotion sticker: gen_image did not produce file"
+                );
             }
             Ok(Err(e)) => {
                 tracing::warn!("Emotion sticker: gen_image generation failed: {e}");
