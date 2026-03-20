@@ -5500,10 +5500,6 @@ fn default_otp_gated_actions() -> Vec<String> {
     ]
 }
 
-fn default_otp_challenge_max_attempts() -> u32 {
-    3
-}
-
 impl Default for OtpConfig {
     fn default() -> Self {
         Self {
