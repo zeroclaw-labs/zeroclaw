@@ -559,26 +559,16 @@ pub fn skills_to_prompt_with_mode(
         );
         write_xml_text_element(&mut prompt, 4, "location", &location);
 
-        if matches!(mode, crate::config::SkillsPromptInjectionMode::Full) {
-            if !skill.prompts.is_empty() {
-                let _ = writeln!(prompt, "    <instructions>");
-                for instruction in &skill.prompts {
-                    write_xml_text_element(&mut prompt, 6, "instruction", instruction);
-                }
-                let _ = writeln!(prompt, "    </instructions>");
+        // Skill tools are registered as API tool specs (SkillShellTool) — not
+        // rendered as prompt XML, to avoid duplication with function-calling tools.
+        if matches!(mode, crate::config::SkillsPromptInjectionMode::Full)
+            && !skill.prompts.is_empty()
+        {
+            let _ = writeln!(prompt, "    <instructions>");
+            for instruction in &skill.prompts {
+                write_xml_text_element(&mut prompt, 6, "instruction", instruction);
             }
-
-            if !skill.tools.is_empty() {
-                let _ = writeln!(prompt, "    <tools>");
-                for tool in &skill.tools {
-                    let _ = writeln!(prompt, "      <tool>");
-                    write_xml_text_element(&mut prompt, 8, "name", &tool.name);
-                    write_xml_text_element(&mut prompt, 8, "description", &tool.description);
-                    write_xml_text_element(&mut prompt, 8, "kind", &tool.kind);
-                    let _ = writeln!(prompt, "      </tool>");
-                }
-                let _ = writeln!(prompt, "    </tools>");
-            }
+            let _ = writeln!(prompt, "    </instructions>");
         }
 
         let _ = writeln!(prompt, "  </skill>");
@@ -1303,9 +1293,60 @@ description = "Bare minimum"
         }];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("weather"));
-        assert!(prompt.contains("<name>get_weather</name>"));
-        assert!(prompt.contains("<description>Fetch forecast</description>"));
-        assert!(prompt.contains("<kind>shell</kind>"));
+        // Skill tools are registered as API tool specs — not rendered as prompt XML.
+        assert!(
+            !prompt.contains("<tools>"),
+            "tools XML must not appear in Full mode prompt"
+        );
+        assert!(
+            !prompt.contains("<tool>"),
+            "tool element must not appear in Full mode prompt"
+        );
+        assert!(
+            !prompt.contains("<kind>shell</kind>"),
+            "kind element must not appear in Full mode prompt"
+        );
+    }
+
+    #[test]
+    fn skills_prompt_full_mode_omits_tools_xml() {
+        let skills = vec![Skill {
+            name: "test-skill".into(),
+            description: "A test skill".into(),
+            version: "1.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![SkillTool {
+                name: "test-tool".into(),
+                description: "A test tool".into(),
+                kind: "shell".into(),
+                command: "echo test".into(),
+                args: HashMap::new(),
+            }],
+            prompts: vec!["Do the thing".into()],
+            location: None,
+        }];
+        let output = skills_to_prompt_with_mode(
+            &skills,
+            Path::new("/tmp"),
+            crate::config::SkillsPromptInjectionMode::Full,
+        );
+        assert!(
+            output.contains("<instructions>"),
+            "instructions should be present"
+        );
+        assert!(
+            output.contains("Do the thing"),
+            "instruction content should be present"
+        );
+        assert!(
+            !output.contains("<tools>"),
+            "tools XML should NOT be in Full mode prompt"
+        );
+        assert!(
+            !output.contains("</tools>"),
+            "tools closing tag should NOT be in Full mode prompt"
+        );
     }
 
     #[test]

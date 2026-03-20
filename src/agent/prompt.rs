@@ -386,8 +386,15 @@ mod tests {
         assert!(output.contains("<available_skills>"));
         assert!(output.contains("<name>deploy</name>"));
         assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
-        assert!(output.contains("<name>release_checklist</name>"));
-        assert!(output.contains("<kind>shell</kind>"));
+        // Skill tools are registered as API tool specs — not rendered as prompt XML.
+        assert!(
+            !output.contains("<name>release_checklist</name>"),
+            "tool name XML must not appear in Full mode prompt"
+        );
+        assert!(
+            !output.contains("<kind>shell</kind>"),
+            "tool kind XML must not appear in Full mode prompt"
+        );
     }
 
     #[test]
@@ -486,9 +493,15 @@ mod tests {
         assert!(prompt.contains(
             "<description>Review &quot;unsafe&quot; and &apos;risky&apos; bits</description>"
         ));
-        assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
-        assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
-        assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
+        // Skill tools are registered as API tool specs — not rendered as prompt XML.
+        assert!(
+            !prompt.contains("<name>run&quot;linter&quot;</name>"),
+            "tool name XML must not appear in Full mode prompt"
+        );
+        assert!(
+            !prompt.contains("<kind>shell&amp;exec</kind>"),
+            "tool kind XML must not appear in Full mode prompt"
+        );
         assert!(prompt.contains(
             "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
         ));

@@ -6855,9 +6855,15 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("<instructions>"));
         assert!(prompt
             .contains("<instruction>Always run cargo test before final response.</instruction>"));
-        assert!(prompt.contains("<tools>"));
-        assert!(prompt.contains("<name>lint</name>"));
-        assert!(prompt.contains("<kind>shell</kind>"));
+        // Skill tools are registered as API tool specs — not rendered as prompt XML.
+        assert!(
+            !prompt.contains("<tools>"),
+            "tools XML must not appear in Full mode prompt"
+        );
+        assert!(
+            !prompt.contains("<kind>shell</kind>"),
+            "kind element must not appear in Full mode prompt"
+        );
         assert!(!prompt.contains("loaded on demand"));
     }
 
@@ -6928,9 +6934,15 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains(
             "<description>Review &quot;unsafe&quot; and &apos;risky&apos; bits</description>"
         ));
-        assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
-        assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
-        assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
+        // Skill tools are registered as API tool specs — not rendered as prompt XML.
+        assert!(
+            !prompt.contains("<name>run&quot;linter&quot;</name>"),
+            "tool name XML must not appear in Full mode prompt"
+        );
+        assert!(
+            !prompt.contains("<kind>shell&amp;exec</kind>"),
+            "tool kind XML must not appear in Full mode prompt"
+        );
         assert!(prompt.contains(
             "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
         ));
