@@ -19,6 +19,7 @@ pub mod backup_tool;
 pub mod browser;
 pub mod browser_delegate;
 pub mod browser_open;
+pub mod calculator;
 pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
@@ -46,6 +47,7 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod jira_tool;
 pub mod knowledge_tool;
 pub mod linkedin;
 pub mod linkedin_client;
@@ -59,12 +61,14 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod microsoft365;
 pub mod model_routing_config;
+pub mod model_switch;
 pub mod node_tool;
 pub mod notion_tool;
 pub mod pdf_read;
 pub mod project_intel;
 pub mod proxy_config;
 pub mod pushover;
+pub mod read_skill;
 pub mod report_templates;
 pub mod schedule;
 pub mod schema;
@@ -72,6 +76,7 @@ pub mod screenshot;
 pub mod security_ops;
 pub mod shell;
 pub mod swarm;
+pub mod text_browser;
 pub mod tool_search;
 pub mod traits;
 pub mod web_fetch;
@@ -83,6 +88,7 @@ pub use browser::{BrowserTool, ComputerUseConfig};
 #[allow(unused_imports)]
 pub use browser_delegate::{BrowserDelegateConfig, BrowserDelegateTool};
 pub use browser_open::BrowserOpenTool;
+pub use calculator::CalculatorTool;
 pub use cloud_ops::CloudOpsTool;
 pub use cloud_patterns::CloudPatternsTool;
 pub use composio::ComposioTool;
@@ -109,6 +115,7 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+pub use jira_tool::JiraTool;
 pub use knowledge_tool::KnowledgeTool;
 pub use linkedin::LinkedInTool;
 pub use mcp_client::McpRegistry;
@@ -119,6 +126,7 @@ pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use microsoft365::Microsoft365Tool;
 pub use model_routing_config::ModelRoutingConfigTool;
+pub use model_switch::ModelSwitchTool;
 #[allow(unused_imports)]
 pub use node_tool::NodeTool;
 pub use notion_tool::NotionTool;
@@ -126,6 +134,7 @@ pub use pdf_read::PdfReadTool;
 pub use project_intel::ProjectIntelTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
+pub use read_skill::ReadSkillTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
@@ -133,6 +142,7 @@ pub use screenshot::ScreenshotTool;
 pub use security_ops::SecurityOpsTool;
 pub use shell::ShellTool;
 pub use swarm::SwarmTool;
+pub use text_browser::TextBrowserTool;
 pub use tool_search::ToolSearchTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
@@ -144,7 +154,7 @@ pub use workspace_tool::WorkspaceTool;
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
-use crate::security::SecurityPolicy;
+use crate::security::{create_sandbox, SecurityPolicy};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -281,8 +291,13 @@ pub fn all_tools_with_runtime(
     root_config: &crate::config::Config,
 ) -> (Vec<Box<dyn Tool>>, Option<DelegateParentToolsHandle>) {
     let has_shell_access = runtime.has_shell_access();
+    let sandbox = create_sandbox(&root_config.security);
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new(security.clone(), runtime)),
+        Arc::new(ShellTool::new_with_sandbox(
+            security.clone(),
+            runtime,
+            sandbox,
+        )),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
@@ -302,6 +317,7 @@ pub fn all_tools_with_runtime(
             config.clone(),
             security.clone(),
         )),
+        Arc::new(ModelSwitchTool::new(security.clone())),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
         Arc::new(GitOperationsTool::new(
             security.clone(),
@@ -311,7 +327,19 @@ pub fn all_tools_with_runtime(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
+        Arc::new(CalculatorTool::new()),
     ];
+
+    if matches!(
+        root_config.skills.prompt_injection_mode,
+        crate::config::SkillsPromptInjectionMode::Compact
+    ) {
+        tool_arcs.push(Arc::new(ReadSkillTool::new(
+            workspace_dir.to_path_buf(),
+            root_config.skills.open_skills_enabled,
+            root_config.skills.open_skills_dir.clone(),
+        )));
+    }
 
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
@@ -374,6 +402,15 @@ pub fn all_tools_with_runtime(
         )));
     }
 
+    // Text browser tool (headless text-based browser rendering)
+    if root_config.text_browser.enabled {
+        tool_arcs.push(Arc::new(TextBrowserTool::new(
+            security.clone(),
+            root_config.text_browser.preferred_browser.clone(),
+            root_config.text_browser.timeout_secs,
+        )));
+    }
+
     // Web search tool (enabled by default for GLM and other models)
     if root_config.web_search.enabled {
         tool_arcs.push(Arc::new(WebSearchTool::new_with_config(
@@ -399,6 +436,33 @@ pub fn all_tools_with_runtime(
             );
         } else {
             tool_arcs.push(Arc::new(NotionTool::new(notion_api_key, security.clone())));
+        }
+    }
+
+    // Jira integration (config-gated)
+    if root_config.jira.enabled {
+        let api_token = if root_config.jira.api_token.trim().is_empty() {
+            std::env::var("JIRA_API_TOKEN").unwrap_or_default()
+        } else {
+            root_config.jira.api_token.trim().to_string()
+        };
+        if api_token.trim().is_empty() {
+            tracing::warn!(
+                "Jira tool enabled but no API token found (set jira.api_token or JIRA_API_TOKEN env var)"
+            );
+        } else if root_config.jira.base_url.trim().is_empty() {
+            tracing::warn!("Jira tool enabled but jira.base_url is empty — skipping registration");
+        } else if root_config.jira.email.trim().is_empty() {
+            tracing::warn!("Jira tool enabled but jira.email is empty — skipping registration");
+        } else {
+            tool_arcs.push(Arc::new(JiraTool::new(
+                root_config.jira.base_url.trim().to_string(),
+                root_config.jira.email.trim().to_string(),
+                api_token,
+                root_config.jira.allowed_actions.clone(),
+                security.clone(),
+                root_config.jira.timeout_secs,
+            )));
         }
     }
 
@@ -445,6 +509,7 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(GoogleWorkspaceTool::new(
             security.clone(),
             root_config.google_workspace.allowed_services.clone(),
+            root_config.google_workspace.allowed_operations.clone(),
             root_config.google_workspace.credentials_path.clone(),
             root_config.google_workspace.default_account.clone(),
             root_config.google_workspace.rate_limit_per_minute,
@@ -597,7 +662,8 @@ pub fn all_tools_with_runtime(
             provider_runtime_options.clone(),
         )
         .with_parent_tools(Arc::clone(&parent_tools))
-        .with_multimodal_config(root_config.multimodal.clone());
+        .with_multimodal_config(root_config.multimodal.clone())
+        .with_delegate_config(root_config.delegate.clone());
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };
@@ -914,6 +980,8 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
             },
         );
 
@@ -966,5 +1034,73 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
+    }
+
+    #[test]
+    fn all_tools_includes_read_skill_in_compact_mode() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Compact;
+
+        let (tools, _) = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"read_skill"));
+    }
+
+    #[test]
+    fn all_tools_excludes_read_skill_in_full_mode() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Full;
+
+        let (tools, _) = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(!names.contains(&"read_skill"));
     }
 }

@@ -1,4 +1,5 @@
 use crate::config::IdentityConfig;
+use crate::i18n::ToolDescriptions;
 use crate::identity;
 use crate::skills::Skill;
 use crate::tools::Tool;
@@ -17,6 +18,14 @@ pub struct PromptContext<'a> {
     pub skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     pub identity_config: Option<&'a IdentityConfig>,
     pub dispatcher_instructions: &'a str,
+    /// Locale-aware tool descriptions. When present, tool descriptions in
+    /// prompts are resolved from the locale file instead of hardcoded values.
+    pub tool_descriptions: Option<&'a ToolDescriptions>,
+    /// Pre-rendered security policy summary for inclusion in the Safety
+    /// prompt section.  When present, the LLM sees the concrete constraints
+    /// (allowed commands, forbidden paths, autonomy level) so it can plan
+    /// tool calls without trial-and-error.  See issue #2404.
+    pub security_summary: Option<String>,
 }
 
 pub trait PromptSection: Send + Sync {
@@ -34,6 +43,7 @@ impl SystemPromptBuilder {
         Self {
             sections: vec![
                 Box::new(IdentitySection),
+                Box::new(ToolHonestySection),
                 Box::new(ToolsSection),
                 Box::new(SafetySection),
                 Box::new(SkillsSection),
@@ -65,6 +75,7 @@ impl SystemPromptBuilder {
 }
 
 pub struct IdentitySection;
+pub struct ToolHonestySection;
 pub struct ToolsSection;
 pub struct SafetySection;
 pub struct SkillsSection;
@@ -116,6 +127,22 @@ impl PromptSection for IdentitySection {
     }
 }
 
+impl PromptSection for ToolHonestySection {
+    fn name(&self) -> &str {
+        "tool_honesty"
+    }
+
+    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
+        Ok(
+            "## CRITICAL: Tool Honesty\n\n\
+             - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
+             - If a tool call fails, report the error — never make up data to fill the gap.\n\
+             - When unsure whether a tool call succeeded, ask the user rather than guessing."
+                .into(),
+        )
+    }
+}
+
 impl PromptSection for ToolsSection {
     fn name(&self) -> &str {
         "tools"
@@ -124,11 +151,15 @@ impl PromptSection for ToolsSection {
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         let mut out = String::from("## Tools\n\n");
         for tool in ctx.tools {
+            let desc = ctx
+                .tool_descriptions
+                .and_then(|td: &ToolDescriptions| td.get(tool.name()))
+                .unwrap_or_else(|| tool.description());
             let _ = writeln!(
                 out,
                 "- **{}**: {}\n  Parameters: `{}`",
                 tool.name(),
-                tool.description(),
+                desc,
                 tool.parameters_schema()
             );
         }
@@ -145,8 +176,25 @@ impl PromptSection for SafetySection {
         "safety"
     }
 
-    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
-        Ok("## Safety\n\n- Do not exfiltrate private data.\n- Do not run destructive commands without asking.\n- Do not bypass oversight or approval mechanisms.\n- Prefer `trash` over `rm`.\n- When in doubt, ask before acting externally.".into())
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        let mut out = String::from(
+            "## Safety\n\n\
+             - Do not exfiltrate private data.\n\
+             - Do not run destructive commands without asking.\n\
+             - Do not bypass oversight or approval mechanisms.\n\
+             - Prefer `trash` over `rm`.\n\
+             - When in doubt, ask before acting externally.",
+        );
+
+        // Append concrete security policy constraints when available (#2404).
+        // This tells the LLM exactly what commands are allowed, which paths
+        // are off-limits, etc. — preventing wasteful trial-and-error.
+        if let Some(ref summary) = ctx.security_summary {
+            out.push_str("\n\n### Active Security Policy\n\n");
+            out.push_str(summary);
+        }
+
+        Ok(out)
     }
 }
 
@@ -317,6 +365,8 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: Some(&identity_config),
             dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: None,
         };
 
         let section = IdentitySection;
@@ -345,6 +395,8 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
+            tool_descriptions: None,
+            security_summary: None,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Tools"));
@@ -380,6 +432,8 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -391,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn skills_section_compact_mode_omits_instructions_and_tools() {
+    fn skills_section_compact_mode_omits_instructions_but_keeps_tools() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
@@ -418,14 +472,20 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Compact,
             identity_config: None,
             dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
         assert!(output.contains("<available_skills>"));
         assert!(output.contains("<name>deploy</name>"));
         assert!(output.contains("<location>skills/deploy/SKILL.md</location>"));
+        assert!(output.contains("read_skill(name)"));
         assert!(!output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
-        assert!(!output.contains("<tools>"));
+        // Compact mode should still include tools so the LLM knows about them
+        assert!(output.contains("<tools>"));
+        assert!(output.contains("<name>release_checklist</name>"));
+        assert!(output.contains("<kind>shell</kind>"));
     }
 
     #[test]
@@ -439,6 +499,8 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
+            tool_descriptions: None,
+            security_summary: None,
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
@@ -477,6 +539,8 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -492,5 +556,68 @@ mod tests {
         assert!(prompt.contains(
             "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
         ));
+    }
+
+    #[test]
+    fn safety_section_includes_security_summary_when_present() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let summary = "**Autonomy level**: Supervised\n\
+                        **Allowed shell commands**: `git`, `ls`.\n"
+            .to_string();
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: Some(summary.clone()),
+        };
+
+        let output = SafetySection.build(&ctx).unwrap();
+        assert!(
+            output.contains("## Safety"),
+            "should contain base safety header"
+        );
+        assert!(
+            output.contains("### Active Security Policy"),
+            "should contain security policy header"
+        );
+        assert!(
+            output.contains("Autonomy level"),
+            "should contain autonomy level from summary"
+        );
+        assert!(
+            output.contains("`git`"),
+            "should contain allowed commands from summary"
+        );
+    }
+
+    #[test]
+    fn safety_section_omits_security_policy_when_none() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: None,
+        };
+
+        let output = SafetySection.build(&ctx).unwrap();
+        assert!(
+            output.contains("## Safety"),
+            "should contain base safety header"
+        );
+        assert!(
+            !output.contains("### Active Security Policy"),
+            "should NOT contain security policy header when None"
+        );
     }
 }

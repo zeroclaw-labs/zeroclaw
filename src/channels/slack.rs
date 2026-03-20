@@ -25,6 +25,7 @@ pub struct SlackChannel {
     channel_id: Option<String>,
     channel_ids: Vec<String>,
     allowed_users: Vec<String>,
+    thread_replies: bool,
     mention_only: bool,
     group_reply_allowed_sender_ids: Vec<String>,
     user_display_name_cache: Mutex<HashMap<String, CachedSlackDisplayName>>,
@@ -75,6 +76,7 @@ impl SlackChannel {
             channel_id,
             channel_ids,
             allowed_users,
+            thread_replies: true,
             mention_only: false,
             group_reply_allowed_sender_ids: Vec::new(),
             user_display_name_cache: Mutex::new(HashMap::new()),
@@ -91,6 +93,12 @@ impl SlackChannel {
         self.mention_only = mention_only;
         self.group_reply_allowed_sender_ids =
             Self::normalize_group_reply_allowed_sender_ids(allowed_sender_ids);
+        self
+    }
+
+    /// Configure whether outbound replies stay in the originating Slack thread.
+    pub fn with_thread_replies(mut self, thread_replies: bool) -> Self {
+        self.thread_replies = thread_replies;
         self
     }
 
@@ -122,6 +130,14 @@ impl SlackChannel {
             .any(|entry| entry == "*" || entry == user_id)
     }
 
+    fn outbound_thread_ts<'a>(&self, message: &'a SendMessage) -> Option<&'a str> {
+        if self.thread_replies {
+            message.thread_ts.as_deref()
+        } else {
+            None
+        }
+    }
+
     /// Get the bot's own user ID so we can ignore our own messages
     async fn get_bot_user_id(&self) -> Option<String> {
         let resp: serde_json::Value = self
@@ -146,6 +162,34 @@ impl SlackChannel {
         msg.get("thread_ts")
             .and_then(|t| t.as_str())
             .or(if ts.is_empty() { None } else { Some(ts) })
+            .map(str::to_string)
+    }
+
+    /// Like `inbound_thread_ts`, but only returns a value when Slack's own
+    /// `thread_ts` field is present (genuine thread reply). Does **not** fall
+    /// back to the message's `ts`, so top-level messages get `None`. Used when
+    /// `thread_replies=false` so that all top-level messages from the same user
+    /// share a single conversation session key.
+    fn inbound_thread_ts_genuine_only(msg: &serde_json::Value) -> Option<String> {
+        msg.get("thread_ts")
+            .and_then(|t| t.as_str())
+            .map(str::to_string)
+    }
+
+    /// Returns the interruption scope identifier for a Slack message.
+    ///
+    /// Returns `Some(thread_ts)` only when the message is a genuine thread reply
+    /// (Slack's `thread_ts` field is present and differs from the message's own `ts`).
+    /// Returns `None` for top-level messages and thread parent messages (where
+    /// `thread_ts == ts`), placing them in the 3-component scope key
+    /// (`channel_reply_target_sender`).
+    ///
+    /// Intentional: top-level messages and threaded replies are separate conversational
+    /// scopes and should not cancel each other's in-flight tasks.
+    fn inbound_interruption_scope_id(msg: &serde_json::Value, ts: &str) -> Option<String> {
+        msg.get("thread_ts")
+            .and_then(|t| t.as_str())
+            .filter(|&t| t != ts)
             .map(str::to_string)
     }
 
@@ -1775,7 +1819,12 @@ impl SlackChannel {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs(),
-                    thread_ts: Self::inbound_thread_ts(event, ts),
+                    thread_ts: if self.thread_replies {
+                        Self::inbound_thread_ts(event, ts)
+                    } else {
+                        Self::inbound_thread_ts_genuine_only(event)
+                    },
+                    interruption_scope_id: Self::inbound_interruption_scope_id(event, ts),
                 };
 
                 if tx.send(channel_msg).await.is_err() {
@@ -2149,7 +2198,7 @@ impl Channel for SlackChannel {
             "text": message.content
         });
 
-        if let Some(ref ts) = message.thread_ts {
+        if let Some(ts) = self.outbound_thread_ts(message) {
             body["thread_ts"] = serde_json::json!(ts);
         }
 
@@ -2339,7 +2388,12 @@ impl Channel for SlackChannel {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs(),
-                            thread_ts: Self::inbound_thread_ts(msg, ts),
+                            thread_ts: if self.thread_replies {
+                                Self::inbound_thread_ts(msg, ts)
+                            } else {
+                                Self::inbound_thread_ts_genuine_only(msg)
+                            },
+                            interruption_scope_id: Self::inbound_interruption_scope_id(msg, ts),
                         };
 
                         if tx.send(channel_msg).await.is_err() {
@@ -2424,6 +2478,7 @@ impl Channel for SlackChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: Some(thread_ts.clone()),
+                        interruption_scope_id: Some(thread_ts.clone()),
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -2484,8 +2539,28 @@ mod tests {
     #[test]
     fn slack_group_reply_policy_defaults_to_all_messages() {
         let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()]);
+        assert!(ch.thread_replies);
         assert!(!ch.mention_only);
         assert!(ch.group_reply_allowed_sender_ids.is_empty());
+    }
+
+    #[test]
+    fn with_thread_replies_sets_flag() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![])
+            .with_thread_replies(false);
+        assert!(!ch.thread_replies);
+    }
+
+    #[test]
+    fn outbound_thread_ts_respects_thread_replies_setting() {
+        let msg = SendMessage::new("hello", "C123").in_thread(Some("1741234567.100001".into()));
+
+        let threaded = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
+        assert_eq!(threaded.outbound_thread_ts(&msg), Some("1741234567.100001"));
+
+        let channel_root = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![])
+            .with_thread_replies(false);
+        assert_eq!(channel_root.outbound_thread_ts(&msg), None);
     }
 
     #[test]
@@ -3230,5 +3305,79 @@ mod tests {
         });
         let thread_ts = SlackChannel::inbound_thread_ts(&reply, "200.000");
         assert_eq!(thread_ts.as_deref(), Some("100.000"));
+    }
+
+    #[test]
+    fn inbound_thread_ts_genuine_only_returns_none_for_top_level() {
+        // Top-level messages don't have thread_ts in Slack's API.
+        let msg = serde_json::json!({
+            "ts": "100.000",
+            "text": "hello"
+        });
+        assert_eq!(SlackChannel::inbound_thread_ts_genuine_only(&msg), None);
+    }
+
+    #[test]
+    fn inbound_thread_ts_genuine_only_returns_thread_ts_for_replies() {
+        // Thread replies have thread_ts pointing to the parent message.
+        let reply = serde_json::json!({
+            "ts": "200.000",
+            "thread_ts": "100.000",
+            "text": "a reply"
+        });
+        assert_eq!(
+            SlackChannel::inbound_thread_ts_genuine_only(&reply).as_deref(),
+            Some("100.000")
+        );
+    }
+
+    #[test]
+    fn session_key_stable_without_thread_replies() {
+        // When thread_replies=false, top-level messages from the same user should
+        // produce the same conversation_history_key (thread_ts=None).
+        use crate::channels::traits::ChannelMessage;
+
+        let make_msg = |ts: &str| ChannelMessage {
+            id: format!("slack_C123_{ts}"),
+            sender: "U_alice".into(),
+            reply_target: "C123".into(),
+            content: "text".into(),
+            channel: "slack".into(),
+            timestamp: 0,
+            thread_ts: None, // thread_replies=false → no fallback to ts
+            interruption_scope_id: None,
+        };
+
+        let msg1 = make_msg("100.000");
+        let msg2 = make_msg("200.000");
+
+        let key1 = super::super::conversation_history_key(&msg1);
+        let key2 = super::super::conversation_history_key(&msg2);
+        assert_eq!(key1, key2, "session key should be stable across messages");
+    }
+
+    #[test]
+    fn session_key_varies_with_thread_replies() {
+        // When thread_replies=true, top-level messages get thread_ts=Some(ts),
+        // giving each its own session key (thread isolation).
+        use crate::channels::traits::ChannelMessage;
+
+        let make_msg = |ts: &str| ChannelMessage {
+            id: format!("slack_C123_{ts}"),
+            sender: "U_alice".into(),
+            reply_target: "C123".into(),
+            content: "text".into(),
+            channel: "slack".into(),
+            timestamp: 0,
+            thread_ts: Some(ts.to_string()), // thread_replies=true → ts as thread_ts
+            interruption_scope_id: None,
+        };
+
+        let msg1 = make_msg("100.000");
+        let msg2 = make_msg("200.000");
+
+        let key1 = super::super::conversation_history_key(&msg1);
+        let key2 = super::super::conversation_history_key(&msg2);
+        assert_ne!(key1, key2, "session key should differ per thread");
     }
 }

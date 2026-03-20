@@ -315,7 +315,10 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
         // ── Phase 1: LLM decision (two-phase mode) ──────────────
         let tasks_to_run = if two_phase {
-            let decision_prompt = HeartbeatEngine::build_decision_prompt(&tasks);
+            let decision_prompt = format!(
+                "[Heartbeat Task | decision] {}",
+                HeartbeatEngine::build_decision_prompt(&tasks),
+            );
             match Box::pin(crate::agent::run(
                 config.clone(),
                 Some(decision_prompt),
@@ -642,6 +645,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            ack_reactions: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -667,6 +671,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             thread_replies: Some(true),
             mention_only: Some(false),
+            interrupt_on_new_message: false,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -755,6 +760,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            ack_reactions: None,
         });
 
         let target = resolve_heartbeat_delivery(&config).unwrap();
@@ -771,6 +777,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            ack_reactions: None,
         });
 
         let target = resolve_heartbeat_delivery(&config).unwrap();
