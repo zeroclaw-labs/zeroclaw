@@ -186,6 +186,12 @@ impl OpenAiCompatibleProvider {
         }
     }
 
+    /// Disable native tool calling, forcing prompt-guided tool use instead.
+    pub fn without_native_tools(mut self) -> Self {
+        self.native_tool_calling = false;
+        self
+    }
+
     /// Override the HTTP request timeout for LLM API calls.
     pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = timeout_secs;
