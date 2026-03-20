@@ -1462,6 +1462,11 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::NewSession => {
             clear_sender_history(ctx, &sender_key);
+            if let Some(ref store) = ctx.session_store {
+                if let Err(e) = store.delete_session(&sender_key) {
+                    tracing::warn!("Failed to delete persisted session for {sender_key}: {e}");
+                }
+            }
             mark_sender_for_new_session(ctx, &sender_key);
             "Conversation history cleared. Starting fresh.".to_string()
         }
