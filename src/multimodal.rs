@@ -125,9 +125,7 @@ pub fn strip_nonexistent_image_markers(content: &str) -> String {
             result.push_str(&content[start..=end]);
         } else {
             // Local path does NOT exist — drop the marker.
-            tracing::warn!(
-                "Stripped outbound [IMAGE:] marker for non-existent file: {candidate}"
-            );
+            tracing::warn!("Stripped outbound [IMAGE:] marker for non-existent file: {candidate}");
         }
 
         cursor = end + 1;

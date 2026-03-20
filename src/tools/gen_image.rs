@@ -25,9 +25,7 @@ fn success_result(path: &std::path::Path) -> ToolResult {
     let display = path.display();
     ToolResult {
         success: true,
-        output: format!(
-            "{{\"ok\":true,\"file\":\"{display}\"}}\n[IMAGE:{display}]"
-        ),
+        output: format!("{{\"ok\":true,\"file\":\"{display}\"}}\n[IMAGE:{display}]"),
         error: None,
     }
 }
@@ -711,7 +709,9 @@ mod tests {
         let result = success_result(&path);
         assert!(result.success);
         assert!(result.output.contains("\"ok\":true"));
-        assert!(result.output.contains("[IMAGE:/tmp/workspace/gen_20260101.png]"));
+        assert!(result
+            .output
+            .contains("[IMAGE:/tmp/workspace/gen_20260101.png]"));
         assert!(result.error.is_none());
     }
 
