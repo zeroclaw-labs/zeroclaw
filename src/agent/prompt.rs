@@ -1,6 +1,7 @@
 use crate::config::IdentityConfig;
 use crate::i18n::ToolDescriptions;
 use crate::identity;
+use crate::security::AutonomyLevel;
 use crate::skills::Skill;
 use crate::tools::Tool;
 use anyhow::Result;
@@ -26,6 +27,10 @@ pub struct PromptContext<'a> {
     /// (allowed commands, forbidden paths, autonomy level) so it can plan
     /// tool calls without trial-and-error.  See issue #2404.
     pub security_summary: Option<String>,
+    /// Autonomy level from config. Controls whether the safety section
+    /// includes "ask before acting" instructions. Full autonomy omits them
+    /// so the model executes tools directly without simulating approval.
+    pub autonomy_level: AutonomyLevel,
 }
 
 pub trait PromptSection: Send + Sync {
@@ -177,14 +182,39 @@ impl PromptSection for SafetySection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        let mut out = String::from(
-            "## Safety\n\n\
-             - Do not exfiltrate private data.\n\
-             - Do not run destructive commands without asking.\n\
-             - Do not bypass oversight or approval mechanisms.\n\
-             - Prefer `trash` over `rm`.\n\
-             - When in doubt, ask before acting externally.",
-        );
+        let mut out = String::from("## Safety\n\n- Do not exfiltrate private data.\n");
+
+        // Omit "ask before acting" instructions when autonomy is Full —
+        // mirrors build_system_prompt_with_mode_and_autonomy. See #3952.
+        if ctx.autonomy_level != AutonomyLevel::Full {
+            out.push_str(
+                "- Do not run destructive commands without asking.\n\
+                 - Do not bypass oversight or approval mechanisms.\n",
+            );
+        }
+
+        out.push_str("- Prefer `trash` over `rm`.\n");
+        out.push_str(match ctx.autonomy_level {
+            AutonomyLevel::Full => {
+                "- Respect the runtime autonomy policy: if a tool or action is allowed, \
+                 execute it directly instead of asking the user for extra approval.\n\
+                 - If a tool or action is blocked by policy or unavailable, explain that \
+                 concrete restriction instead of simulating an approval dialog."
+            }
+            AutonomyLevel::ReadOnly => {
+                "- This runtime is read-only for side effects unless a tool explicitly \
+                 reports otherwise.\n\
+                 - If a requested action is blocked by policy, explain the restriction \
+                 directly instead of simulating an approval dialog."
+            }
+            AutonomyLevel::Supervised => {
+                "- When in doubt, ask before acting externally.\n\
+                 - Respect the runtime autonomy policy: ask for approval only when the \
+                 current runtime policy actually requires it.\n\
+                 - If a tool or action is blocked by policy or unavailable, explain that \
+                 concrete restriction instead of simulating an approval dialog."
+            }
+        });
 
         // Append concrete security policy constraints when available (#2404).
         // This tells the LLM exactly what commands are allowed, which paths
@@ -367,6 +397,7 @@ mod tests {
             dispatcher_instructions: "",
             tool_descriptions: None,
             security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
         };
 
         let section = IdentitySection;
@@ -397,6 +428,7 @@ mod tests {
             dispatcher_instructions: "instr",
             tool_descriptions: None,
             security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Tools"));
@@ -434,6 +466,7 @@ mod tests {
             dispatcher_instructions: "",
             tool_descriptions: None,
             security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -474,6 +507,7 @@ mod tests {
             dispatcher_instructions: "",
             tool_descriptions: None,
             security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -498,6 +532,7 @@ mod tests {
             dispatcher_instructions: "instr",
             tool_descriptions: None,
             security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
@@ -538,6 +573,7 @@ mod tests {
             dispatcher_instructions: "",
             tool_descriptions: None,
             security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -571,6 +607,7 @@ mod tests {
             dispatcher_instructions: "",
             tool_descriptions: None,
             security_summary: Some(summary.clone()),
+            autonomy_level: AutonomyLevel::Supervised,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -605,6 +642,7 @@ mod tests {
             dispatcher_instructions: "",
             tool_descriptions: None,
             security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -615,6 +653,68 @@ mod tests {
         assert!(
             !output.contains("### Active Security Policy"),
             "should NOT contain security policy header when None"
+        );
+    }
+
+    #[test]
+    fn safety_section_full_autonomy_omits_approval_instructions() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Full,
+        };
+
+        let output = SafetySection.build(&ctx).unwrap();
+        assert!(
+            !output.contains("without asking"),
+            "full autonomy should NOT include 'ask before acting' instructions"
+        );
+        assert!(
+            !output.contains("bypass oversight"),
+            "full autonomy should NOT include 'bypass oversight' instructions"
+        );
+        assert!(
+            output.contains("execute it directly"),
+            "full autonomy should instruct to execute directly"
+        );
+        assert!(
+            output.contains("Do not exfiltrate"),
+            "full autonomy should still include data exfiltration guard"
+        );
+    }
+
+    #[test]
+    fn safety_section_supervised_includes_approval_instructions() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+        };
+
+        let output = SafetySection.build(&ctx).unwrap();
+        assert!(
+            output.contains("without asking"),
+            "supervised should include 'ask before acting' instructions"
+        );
+        assert!(
+            output.contains("bypass oversight"),
+            "supervised should include 'bypass oversight' instructions"
         );
     }
 }
