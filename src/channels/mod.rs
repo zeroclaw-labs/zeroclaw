@@ -2777,10 +2777,7 @@ async fn run_message_dispatch_loop(
         String,
         InFlightSenderTaskState,
     >::new()));
-    #[cfg(target_has_atomic = "64")]
     let task_sequence = Arc::new(AtomicU64::new(1));
-    #[cfg(not(target_has_atomic = "64"))]
-    let task_sequence = Arc::new(AtomicU32::new(1));
 
     while let Some(msg) = rx.recv().await {
         // Fast path: /stop cancels the in-flight task for this sender scope without
