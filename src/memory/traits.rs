@@ -1,6 +1,18 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// A single message in a conversation trace for procedural memory.
+///
+/// Used to capture "how to" patterns from tool-calling turns so that
+/// backends that support procedural storage (e.g. mem0) can learn from them.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProceduralMessage {
+    pub role: String,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 /// A single memory entry
 #[derive(Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
@@ -109,6 +121,19 @@ pub trait Memory: Send + Sync {
 
     /// Health check
     async fn health_check(&self) -> bool;
+
+    /// Store a conversation trace as procedural memory.
+    ///
+    /// Backends that support procedural storage (e.g. mem0) override this
+    /// to extract "how to" patterns from tool-calling turns.  The default
+    /// implementation is a no-op.
+    async fn store_procedural(
+        &self,
+        _messages: &[ProceduralMessage],
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
