@@ -89,6 +89,9 @@ indicatif = "0.18"
 # Temp files (update pipeline rollback)
 tempfile = "3.26"
 
+# Zip extraction for ClawhHub / OpenClaw registry installers
+zip = { version = "8.1", default-features = false, features = ["deflate"] }
+
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
