@@ -715,15 +715,6 @@ fn shape_comment_response(raw: &Value) -> Value {
 }
 
 fn shape_projects(projects: &[Value], statuses_per_project: &[Value], users: &[Value]) -> Value {
-    let known_order = [
-        "To Do",
-        "In Progress",
-        "Collecting Intel",
-        "Design",
-        "Verification",
-        "Done",
-    ];
-
     let shaped: Vec<Value> = projects
         .iter()
         .zip(statuses_per_project.iter())
@@ -746,18 +737,8 @@ fn shape_projects(projects: &[Value], statuses_per_project: &[Value], users: &[V
                 }
             }
 
-            let mut ordered: Vec<&str> = known_order
-                .iter()
-                .filter(|s| all_statuses.contains(**s))
-                .copied()
-                .collect();
-            let mut remaining: Vec<String> = all_statuses
-                .iter()
-                .filter(|s| !known_order.contains(&s.as_str()))
-                .cloned()
-                .collect();
-            remaining.sort();
-            ordered.extend(remaining.iter().map(String::as_str));
+            let mut ordered: Vec<String> = all_statuses.into_iter().collect();
+            ordered.sort();
 
             json!({
                 "key":         p["key"],
@@ -1458,11 +1439,11 @@ mod tests {
         assert_eq!(
             at_statuses,
             vec![
-                "To Do",
-                "In Progress",
                 "Collecting Intel",
+                "Done",
+                "In Progress",
+                "To Do",
                 "Verification",
-                "Done"
             ]
         );
         let at_types: Vec<&str> = arr[0]["issueTypes"]
@@ -1482,14 +1463,14 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        assert_eq!(gp_statuses, vec!["To Do", "Design", "Done"]);
+        assert_eq!(gp_statuses, vec!["Design", "Done", "To Do"]);
 
         assert_eq!(arr[0]["users"].as_array().unwrap().len(), 1);
         assert_eq!(arr[0]["users"][0]["displayName"], "Anatolii Fesiuk");
     }
 
     #[test]
-    fn shape_projects_orders_known_statuses_first() {
+    fn shape_projects_sorts_statuses_alphabetically() {
         let projects = json!([
             { "key": "P", "name": "P", "projectTypeKey": "software", "style": "next-gen" }
         ]);
@@ -1505,7 +1486,7 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        assert_eq!(ordered, vec!["To Do", "Done", "Alpha", "Custom"]);
+        assert_eq!(ordered, vec!["Alpha", "Custom", "Done", "To Do"]);
     }
 
     #[test]
