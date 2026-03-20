@@ -235,6 +235,19 @@ impl Tool for CronAddTool {
             .get("approved")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        let delivery = match args.get("delivery") {
+            Some(v) => match serde_json::from_value::<DeliveryConfig>(v.clone()) {
+                Ok(cfg) => Some(cfg),
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Invalid delivery config: {e}")),
+                    });
+                }
+            },
+            None => None,
+        };
 
         let result = match job_type {
             JobType::Shell => {
@@ -261,7 +274,14 @@ impl Tool for CronAddTool {
                     return Ok(blocked);
                 }
 
-                cron::add_shell_job_with_approval(&self.config, name, schedule, command, approved)
+                cron::add_shell_job_with_approval(
+                    &self.config,
+                    name,
+                    schedule,
+                    command,
+                    delivery,
+                    approved,
+                )
             }
             JobType::Agent => {
                 let prompt = match args.get("prompt").and_then(serde_json::Value::as_str) {
@@ -301,20 +321,6 @@ impl Tool for CronAddTool {
                                 success: false,
                                 output: String::new(),
                                 error: Some(format!("Invalid allowed_tools: {e}")),
-                            });
-                        }
-                    },
-                    None => None,
-                };
-
-                let delivery = match args.get("delivery") {
-                    Some(v) => match serde_json::from_value::<DeliveryConfig>(v.clone()) {
-                        Ok(cfg) => Some(cfg),
-                        Err(e) => {
-                            return Ok(ToolResult {
-                                success: false,
-                                output: String::new(),
-                                error: Some(format!("Invalid delivery config: {e}")),
                             });
                         }
                     },
@@ -404,6 +410,36 @@ mod tests {
 
         assert!(result.success, "{:?}", result.error);
         assert!(result.output.contains("next_run"));
+    }
+
+    #[tokio::test]
+    async fn shell_job_persists_delivery() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "echo ok",
+                "delivery": {
+                    "mode": "announce",
+                    "channel": "discord",
+                    "to": "1234567890",
+                    "best_effort": true
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+
+        let jobs = cron::list_jobs(&cfg).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].delivery.mode, "announce");
+        assert_eq!(jobs[0].delivery.channel.as_deref(), Some("discord"));
+        assert_eq!(jobs[0].delivery.to.as_deref(), Some("1234567890"));
+        assert!(jobs[0].delivery.best_effort);
     }
 
     #[tokio::test]
