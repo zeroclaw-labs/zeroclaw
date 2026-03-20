@@ -1119,13 +1119,10 @@ fn create_provider_with_url_and_options(
             )?))
         }
         // ── Primary providers (custom implementations) ───────
-        "openrouter" => {
-            let mut p = openrouter::OpenRouterProvider::new(key);
-            if let Some(t) = options.provider_timeout_secs {
-                p = p.with_timeout_secs(t);
-            }
-            Ok(Box::new(p))
-        }
+        "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(
+            key,
+            options.provider_timeout_secs,
+        ))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
         "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
